@@ -166,12 +166,13 @@ Bootstrap state (until all are done, CD dispatches fail or no-op):
 ## Working conventions
 
 - **Migrations**: plain SQL in `server/src/main/resources/db/migration/`.
-  **Pre-release: one squashed `V1__init.sql`** — edit it directly and
-  keep `schema.sql` identical (the equivalence test enforces it). The
-  chain becomes append-only at the first real release. FKs with
-  CASCADE, partial indexes for hot predicates, CHECK-constrained
-  vocabularies (deliberate choice over PG enums while the vocabulary
-  churns). No migration ledger hacks — Flyway owns it.
+  **The chain is append-only as of v1.0.0** (2026-09-11, the Gigahog
+  deploy): `V1__init.sql` is FROZEN — never edit it; schema changes are
+  new `V<n>__` migrations, and `schema.sql` must equal the fold of the
+  whole chain (the equivalence test enforces it). FKs with CASCADE,
+  partial indexes for hot predicates, CHECK-constrained vocabularies
+  (deliberate choice over PG enums while the vocabulary churns). No
+  migration ledger hacks — Flyway owns it.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`.

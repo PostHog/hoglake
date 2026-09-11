@@ -1,3 +1,7 @@
+-- FROZEN at v1.0.0 (2026-09-11, the Gigahog deploy). This file is
+-- append-only history from here: do NOT edit it. Schema changes go in
+-- new V<n>__ migrations; schema.sql tracks the fold of the chain
+-- (SchemaEquivalenceIntegrationTest enforces equivalence).
 -- hoglake catalog schema v1.
 --
 -- Pre-release: migrations are squashed into this single file (decision
