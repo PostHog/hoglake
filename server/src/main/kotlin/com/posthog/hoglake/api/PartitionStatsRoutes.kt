@@ -76,6 +76,7 @@ data class PartitionStatsReportDto(
     val partitions: List<PartitionDebtDto>,
     val truncated: Boolean,
     val staleSpecGroups: Long,
+    val smallFileThresholdBytes: Long,
 )
 
 fun PartitionValue.toDto() = PartitionValueDto(field = field, value = value)
@@ -101,4 +102,5 @@ fun PartitionStatsReport.toDto() =
         partitions = partitions.map { it.toDto() },
         truncated = truncated,
         staleSpecGroups = staleSpecGroups,
+        smallFileThresholdBytes = smallFileThresholdBytes,
     )

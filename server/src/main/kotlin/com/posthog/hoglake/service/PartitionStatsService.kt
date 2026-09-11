@@ -81,6 +81,7 @@ class PartitionStatsService(
                 partitions = rows.map { it.toDebt(fieldNames) },
                 truncated = (rows.firstOrNull()?.totalGroups ?: 0L) > cappedLimit,
                 staleSpecGroups = rows.firstOrNull()?.staleSpecGroups ?: 0L,
+                smallFileThresholdBytes = smallFileThresholdBytes,
             )
         }
     }

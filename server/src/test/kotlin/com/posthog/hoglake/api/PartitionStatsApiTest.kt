@@ -133,10 +133,21 @@ class PartitionStatsApiTest {
             val node = body(r)
 
             assertThat(node.fieldNames().asSequence().toSet())
-                .isEqualTo(setOf("partitions", "truncated", "stale_spec_groups"))
+                .isEqualTo(
+                    setOf(
+                        "partitions",
+                        "truncated",
+                        "stale_spec_groups",
+                        "small_file_threshold_bytes",
+                    ),
+                )
             assertThat(node["truncated"].isBoolean).isTrue()
             assertThat(node["truncated"].asBoolean()).isFalse()
             assertThat(node["stale_spec_groups"].asLong()).isEqualTo(0)
+            // The threshold the report was computed with — the webui
+            // renders it in the small-files definition tooltip.
+            assertThat(node["small_file_threshold_bytes"].isIntegralNumber).isTrue()
+            assertThat(node["small_file_threshold_bytes"].asLong()).isPositive()
 
             val partitions = node["partitions"]
             assertThat(partitions.isArray).isTrue()

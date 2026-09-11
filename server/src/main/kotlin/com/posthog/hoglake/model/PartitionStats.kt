@@ -56,4 +56,10 @@ data class PartitionStatsReport(
      * partitions a spec change left behind.
      */
     val staleSpecGroups: Long,
+    /**
+     * The small-file threshold the report was computed with (the
+     * compaction target size, strict <) — shipped so displays can say
+     * what "small" means in bytes.
+     */
+    val smallFileThresholdBytes: Long,
 )

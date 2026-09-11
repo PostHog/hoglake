@@ -205,6 +205,32 @@ h3 {
 .data-table th.num {
   text-align: right;
 }
+/* Sortable headers render as buttons; keep the th look, not the accent
+   button look. The th's padding moves onto the button so the whole
+   header cell stays clickable. */
+.data-table th.sortable {
+  padding: 0;
+}
+.data-table th.sortable button.th-sort {
+  background: transparent;
+  border: none;
+  color: inherit;
+  font: inherit;
+  text-transform: inherit;
+  letter-spacing: inherit;
+  text-align: inherit;
+  width: 100%;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+.data-table th.num.sortable button.th-sort {
+  text-align: right;
+}
+/* Dotted underline marks a header with a definition tooltip. */
+.th-hint {
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
 .data-table td {
   padding: 5px 10px;
   border-bottom: 1px solid var(--border);
