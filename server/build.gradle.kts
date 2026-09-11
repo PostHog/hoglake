@@ -203,8 +203,9 @@ tasks.register("checkOpenapiVersion") {
     inputs.file(specFile)
     doLast {
         val spec = specFile.asFile.readText()
-        val match = Regex("""(?m)^\s{2}version:\s*(\S+)\s*$""").find(spec)
-            ?: error("openapi/hoglake.yaml: info.version not found")
+        val match =
+            Regex("""(?m)^\s{2}version:\s*(\S+)\s*$""").find(spec)
+                ?: error("openapi/hoglake.yaml: info.version not found")
         val actual = match.groupValues[1]
         if (actual != expected) {
             error("openapi/hoglake.yaml info.version is $actual; project.version is $expected")
