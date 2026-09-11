@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.0.0"
+version = "1.0.1-dev"
 
 repositories {
     mavenCentral()
@@ -191,3 +191,24 @@ tasks.register<JavaExec>("generateFuzzSeeds") {
         layout.projectDirectory.file("../pyhoglake/tests/vectors/bounds_vectors.json").asFile.absolutePath,
     )
 }
+
+// The OpenAPI spec's info.version must match the server version. The
+// v1.0.0 tag shipped a spec that still said 0.1.0 because nothing
+// enforced the pairing; this check makes the drift a build failure.
+tasks.register("checkOpenapiVersion") {
+    description = "Verify openapi/hoglake.yaml info.version matches project.version"
+    group = "verification"
+    val specFile = layout.projectDirectory.file("src/main/resources/openapi/hoglake.yaml")
+    val expected = version.toString()
+    inputs.file(specFile)
+    doLast {
+        val spec = specFile.asFile.readText()
+        val match = Regex("""(?m)^\s{2}version:\s*(\S+)\s*$""").find(spec)
+            ?: error("openapi/hoglake.yaml: info.version not found")
+        val actual = match.groupValues[1]
+        if (actual != expected) {
+            error("openapi/hoglake.yaml info.version is $actual; project.version is $expected")
+        }
+    }
+}
+tasks.named("check") { dependsOn("checkOpenapiVersion") }

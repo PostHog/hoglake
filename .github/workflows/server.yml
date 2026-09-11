@@ -42,7 +42,7 @@ jobs:
       # (fold(migrations) == schema.sql).
       - name: Server tests + ktlint
         working-directory: server
-        run: ./gradlew --no-daemon :test :ktlintCheck
+        run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
 
   # The trino-test job is gone: the connector moved to PostHog/trino
   # (repo PR #1) and :trino:test now refuses to run without a fork

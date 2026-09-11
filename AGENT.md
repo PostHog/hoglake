@@ -107,6 +107,22 @@ Bootstrap state (until all are done, CD dispatches fail or no-op):
 - [ ] Dependency Graph (+ GHAS for internal repos) enabled — the
       dependency-review workflow errors on every PR without it
 
+### Versioning
+
+Images deploy per-commit by SHA+digest (above); semver is release-only.
+Between releases, main carries the NEXT patch version with a dev
+suffix — `X.Y.Z-dev` in gradle/npm/the OpenAPI spec, `X.Y.Z.dev0`
+(PEP 440) in the Python trees — so an unreleased build never claims a
+released number. Cutting a release = one PR that strips the suffix
+(bumping minor/major if warranted) across all six version strings
+(server + trino build.gradle.kts, webui package.json, pyhoglake +
+hedgerow pyproject.toml, spec `info.version`), tag it (`vX.Y.Z`;
+`pyhoglake-vX.Y.Z` additionally publishes to PyPI), then a follow-up
+commit restores the next `-dev`. The `:checkOpenapiVersion` gradle task
+(in CI) keeps the spec's `info.version` locked to the server version;
+the pyhoglake publish workflow refuses a tag that mismatches its
+pyproject.
+
 ## Invariants (violating any of these is a bug, full stop)
 
 1. **Snapshot ids are dense per catalog** and ordered with commit order
