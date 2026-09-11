@@ -11,7 +11,8 @@ obligations — all of which are prerequisites here).
 
 ## 0. Native connector read contract (interim, until the facade lands)
 
-A native connector exists today (`server/trino/`) and commits to:
+The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
+`server/trino/` retains the server integration tests. Its read contract is:
 
 - **One query, one snapshot.** `getTableHandle` resolves the catalog
   head once and pins snapshot id, `table_uuid`, and the column list

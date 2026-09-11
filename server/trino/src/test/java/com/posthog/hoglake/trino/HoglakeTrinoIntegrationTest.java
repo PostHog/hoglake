@@ -8,7 +8,6 @@ import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
-import org.testcontainers.containers.BindMode;
 import org.testcontainers.containers.MinIOContainer;
 import org.testcontainers.containers.PostgreSQLContainer;
 import org.testcontainers.containers.TrinoContainer;
@@ -43,8 +42,8 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * The milestone gate: Trino reads a hoglake table through the native
  * connector. Full stack — Postgres + the hoglake server in-process,
  * MinIO holding real parquet (written with Hardwood, the same writer the
- * root hydrator tests use), and a trinodb/trino:446 container with the
- * assembled plugin directory mounted, its catalog pointed back at the
+ * root hydrator tests use), and a Trino fork image containing the
+ * bundled Hoglake connector, its catalog pointed back at the
  * host via host.testcontainers.internal.
  */
 @Tag("integration")
@@ -217,8 +216,8 @@ class HoglakeTrinoIntegrationTest
 
     private static void startTrino()
     {
-        String pluginDir = System.getProperty("hoglake.trino.plugin.dir");
-        assertThat(pluginDir).as("hoglake.trino.plugin.dir system property").isNotNull();
+        String image = System.getProperty("hoglake.trino.image");
+        assertThat(image).as("hoglake.trino.image system property").isNotBlank();
 
         int minioPort = minio.getMappedPort(9000);
         org.testcontainers.Testcontainers.exposeHostPorts(server.getPort(), minioPort);
@@ -234,8 +233,7 @@ class HoglakeTrinoIntegrationTest
                 hoglake.s3.path-style=true
                 """.formatted(server.getPort(), minioPort, minio.getUserName(), minio.getPassword());
 
-        trino = new TrinoContainer(DockerImageName.parse("trinodb/trino:446"))
-                .withFileSystemBind(pluginDir, "/usr/lib/trino/plugin/hoglake", BindMode.READ_ONLY)
+        trino = new TrinoContainer(DockerImageName.parse(image).asCompatibleSubstituteFor("trinodb/trino"))
                 .withCopyToContainer(
                         Transferable.of(catalogProperties.getBytes(UTF_8)),
                         "/etc/trino/catalog/hoglake.properties")
@@ -406,7 +404,7 @@ class HoglakeTrinoIntegrationTest
         List<Map<String, Object>> rows = query(
                 "SELECT id, title FROM hoglake.analytics.renamed_events ORDER BY id");
 
-        // S2 (agreed connector behavior; see HoglakeParquetBindingTest for
+        // S2 (agreed connector behavior; see TestHoglakeParquetBinding in PostHog/trino for
         // the unit-level matrix): the data exists in the file under the old
         // name "name", but the file has no field ids, the name fallback
         // misses, and every row of the renamed column reads NULL. The fix
