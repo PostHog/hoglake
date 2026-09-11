@@ -44,26 +44,10 @@ jobs:
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck
 
-  trino-test:
-    # Parallel to `test`: boots the hoglake server in-process plus the
-    # ~1GB trinodb/trino:446 container — the slowest, flakiest pull.
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    concurrency:
-      group: server-trino-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
-        with:
-          distribution: temurin
-          java-version: "21"
-          cache: gradle
-
-      - name: Trino connector tests
-        working-directory: server
-        run: ./gradlew --no-daemon :trino:test
+  # The trino-test job is gone: the connector moved to PostHog/trino
+  # (repo PR #1) and :trino:test now refuses to run without a fork
+  # image (HOGLAKE_TRINO_IMAGE). The harness runs manually against a
+  # fork build — see server/trino/README.md.
 
   image:
     # The deployable image must assemble and BOOT from every PR —
@@ -116,7 +100,7 @@ jobs:
     # GATED ON CI: a main push deploys only after both suites pass —
     # a deliberate deviation from the millpond/duckgres convention of
     # running CD in parallel with CI (decided 2026-09-11).
-    needs: [test, trino-test]
+    needs: [test]
     # Forks must not push images or deployment dispatches.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
