@@ -74,13 +74,13 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_DB: hoglake
           POSTGRES_USER: hoglake
           POSTGRES_PASSWORD: hoglake
         ports:
-          - 5432:5432
+          - 127.0.0.1:5432:5432
         options: >-
           --health-cmd "pg_isready -U hoglake" --health-interval 5s
           --health-timeout 5s --health-retries 10

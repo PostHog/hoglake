@@ -19,7 +19,6 @@ server {
     # Same-origin API paths, mirroring vite.config.ts's dev proxy.
     location /v1/ {
         proxy_pass ${HOGLAKE_API};
-        proxy_set_header Host $host;
         # Snapshot listings and scan plans can be slow on big catalogs;
         # keep the proxy budget above the server's own work, not at
         # nginx's 60s default.
