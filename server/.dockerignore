@@ -1,0 +1,10 @@
+build/
+.gradle/
+.kotlin/
+.flox/
+.cifuzz-corpus/
+trino/build/
+trino/src/
+*.log
+compose.yaml
+schema.sql

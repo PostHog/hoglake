@@ -18,3 +18,8 @@ dev:
 
 build:
     {{_npm}} run build
+
+# Build the deployable console image (static build + nginx proxying
+# /v1, /healthz, /metrics, /openapi.yaml to $HOGLAKE_API).
+docker-build tag="hoglake-webui:dev":
+    docker build -t {{tag}} {{source_directory()}}

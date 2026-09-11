@@ -1,0 +1,32 @@
+# Substituted by the nginx image entrypoint (envsubst on
+# /etc/nginx/templates/*.template): ${HOGLAKE_API} is the control-plane
+# base URL.
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # SPA routes: anything that is not a file falls back to index.html.
+    location / {
+        try_files $uri /index.html;
+    }
+
+    # Same-origin API paths, mirroring vite.config.ts's dev proxy.
+    location /v1/ {
+        proxy_pass ${HOGLAKE_API};
+        proxy_set_header Host $host;
+        # Snapshot listings and scan plans can be slow on big catalogs;
+        # keep the proxy budget above the server's own work, not at
+        # nginx's 60s default.
+        proxy_read_timeout 120s;
+    }
+    location = /healthz {
+        proxy_pass ${HOGLAKE_API};
+    }
+    location = /metrics {
+        proxy_pass ${HOGLAKE_API};
+    }
+    location = /openapi.yaml {
+        proxy_pass ${HOGLAKE_API};
+    }
+}

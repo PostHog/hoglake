@@ -61,3 +61,8 @@ docs:
 
 docs-down:
     docker rm -f hoglake-swagger
+
+# Build the deployable control-plane image (multi-stage; no tests —
+# CI green-gates separately).
+docker-build tag="hoglake-server:dev":
+    docker build -t {{tag}} {{source_directory()}}
