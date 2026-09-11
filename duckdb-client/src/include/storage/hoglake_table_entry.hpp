@@ -16,7 +16,7 @@ class HoglakeCatalog;
 class HoglakeTableEntry : public TableCatalogEntry {
 public:
 	HoglakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                  HoglakeTableInfo table_info, HoglakeTravel travel = HoglakeTravel(), bool travel_pinned = false);
+	                  HoglakeTableInfo table_info, HoglakeTravel read_travel, bool writes_refused);
 
 	const HoglakeTableInfo &GetWireInfo() const {
 		return table_info;
@@ -24,13 +24,16 @@ public:
 	const string &GetTableUUID() const {
 		return table_info.table_uuid;
 	}
-	//! set for entries bound via AT (VERSION/TIMESTAMP): reads plan at
-	//! this travel and writes/DDL are refused
-	const HoglakeTravel &GetTravel() const {
-		return travel;
+	//! Every entry reads at a fixed travel: the transaction pin for
+	//! ordinary entries, the DDL commit's snapshot for tables
+	//! created/altered inside the transaction, the AT clause for
+	//! travel-pinned entries.
+	const HoglakeTravel &GetReadTravel() const {
+		return read_travel;
 	}
+	//! true for AT (VERSION/TIMESTAMP) entries: writes are refused
 	bool IsTravelPinned() const {
-		return travel_pinned;
+		return writes_refused;
 	}
 
 public:
@@ -44,8 +47,8 @@ public:
 
 private:
 	HoglakeTableInfo table_info;
-	HoglakeTravel travel;
-	bool travel_pinned = false;
+	HoglakeTravel read_travel;
+	bool writes_refused = false;
 };
 
 } // namespace duckdb

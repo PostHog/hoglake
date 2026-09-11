@@ -121,30 +121,83 @@ id at first catalog touch (GET `/catalogs/{c}` head; explicit
 transaction carries `?snapshot=<pinned>`, giving multi-table-consistent
 reads — the property DuckLake got from being inside one Postgres
 transaction. Catalog entries (schemas/tables) are cached per
-transaction, keyed by snapshot.
+transaction; the caches are guarded by recursive mutexes (parallel
+pipeline inits hit them concurrently — DuckDB does not serialize
+catalog scans for extensions), entries are retired rather than
+destroyed while the transaction lives, and the lock order is
+schema-entry lock before transaction lock (ScanSchemas snapshots its
+entry list and runs callbacks unlocked to keep the order acyclic).
 
 Writes buffer in the transaction: INSERTs write parquet immediately
 (data plane), and file registrations accumulate. On DuckDB COMMIT, one
 `POST /catalogs/{c}/commit` ships every buffered `TableAppend` +
-`TableDeletes` with `read_snapshot = pinned` — multi-statement,
-multi-table atomicity comes from the wire contract itself (one
-CommitRequest = one snapshot). On conflict (409) the commit loop
-refreshes the snapshot, revalidates buffered work (schema unchanged for
-touched tables — else abort), and retries; appends without deletes may
-omit `read_snapshot` (blind append, no conflict window) — controlled by
-whether any conflict-sensitive op is buffered. ROLLBACK drops the
-registrations; uploaded parquet is orphaned (cleanup's problem, never
-the catalog's — the pyhoglake position).
+`TableDeletes` — multi-statement, multi-table atomicity comes from the
+wire contract itself (one CommitRequest = one snapshot). Append-only
+commits are blind (no `read_snapshot`); commits with deletes carry
+`read_snapshot = pinned`. A 409 on an append-only commit retries with
+backoff; a 409 with deletes is NOT auto-retried (the superseded
+deletion vectors would have to be rebuilt against the new state — the
+statement must be re-run), and the "table was recreated" refusal never
+retries. ROLLBACK drops the registrations; uploaded parquet/puffin is
+orphaned (cleanup's problem, never the catalog's — the pyhoglake
+position).
 
-**DDL is not transactional (documented divergence).** Every hoglake DDL
-endpoint (create/drop/alter table, create/drop view, create namespace)
+**One deletion vector per data file per commit.** Deletes buffer
+per-(table, data_file_id): each DELETE/UPDATE statement merges the
+server-live DV, the positions already buffered by earlier statements
+of the same transaction, and its own new positions into one superseding
+puffin file, and the registration REPLACES the earlier buffered one.
+The server's one-live-DV-per-data-file invariant therefore holds for
+any multi-statement DML transaction (`hoglake_txn.test`).
+
+## Transactions and eager DDL
+
+Every hoglake DDL endpoint (create/drop/alter table, create namespace)
 is its own server-side commit producing its own snapshot. The extension
 executes DDL eagerly at statement time; a subsequent ROLLBACK does not
-undo it. DuckLake could hold DDL inside the metadata transaction;
-hoglake's service contract cannot, short of a wire change (a staged-DDL
-commit body — noted as a server finding, not required for parity of
-practical use). CREATE TABLE AS works: eager create, then buffered
-insert committing on COMMIT.
+undo it (DuckLake could hold DDL inside the metadata transaction;
+hoglake's service contract cannot, short of a wire change — server
+finding 3). Two rules keep this honest instead of quietly broken:
+
+1. **DDL on a table with buffered writes is refused** with a clear
+   TransactionException ("COMMIT or ROLLBACK first"). Without the
+   refusal, INSERT t; DROP t; COMMIT would abort at commit (append for
+   a nonexistent table) with the drop already persisted, and
+   DELETE t; ALTER t; COMMIT would always 409 against the
+   transaction's own alter. DDL on OTHER tables stays allowed — the
+   server's conflict check is table-scoped.
+2. **Tables created or altered inside the transaction read at the
+   post-DDL snapshot**, not the (older) transaction pin: their entry
+   carries a fixed `read_travel` of the head observed right after the
+   DDL. Without this, SELECT after CREATE in the same transaction
+   404s (the pin predates the table). The rest of the transaction
+   keeps the original pin; this is the honest per-table cost of
+   non-transactional wire DDL, and it is deterministic.
+
+CREATE TABLE AS works: eager create, then buffered insert committing
+on COMMIT (the CTAS child plan is cast to the wire types first —
+TINYINT/SMALLINT widen to the wire "int"; feeding narrower vectors
+into the copy corrupts data silently).
+
+Read-your-own-writes is NOT provided: uncommitted inserts/deletes are
+invisible to the transaction's own scans (a created-in-txn table reads
+as empty until COMMIT). DELETE therefore cannot target rows inserted
+in the same transaction.
+
+## Identifier case
+
+DuckDB identifiers are case-insensitive and case-preserving; the
+hoglake server matches names case-sensitively (`tv.name = :name`). The
+bridge: table identifiers are resolved through the server listing —
+every lookup and every DDL/DML wire call CI-resolves the typed
+identifier to the server's exact name and sends THAT (never the typed
+case). Creates send the typed case (case-preserving); CI-equal names
+are duplicates, DuckDB-style. Two server tables whose names differ
+only by case are unaddressable from DuckDB and reported as ambiguous.
+Column identifiers resolve the same way against the wire columns
+(`hoglake_case.test` covers cold-cache lookups, DDL, DML, and the
+conflict check). Namespaces already resolve through the listing-backed
+schema cache.
 
 ## Read path
 
@@ -291,7 +344,9 @@ loops.
 ## Test strategy
 
 1. **sqllogictests** (`test/sql/`): the primary suite, run via
-   `make test`. Integration tests `require-env HOGLAKE_URL` (+ MinIO
+   `make test` — or `test/run-live-tests.sh`, which chains fixtures,
+   the suite (with the fixture-exported time-travel snapshot ids in
+   the environment), and the cross-client wire check. Integration tests `require-env HOGLAKE_URL` (+ MinIO
    creds env) and run against the live dev stack
    (`http://localhost:8080` + MinIO `http://localhost:19000`,
    creds hoglake/hoglake123 — pyhoglake's conventions); they
@@ -299,10 +354,14 @@ loops.
    `duckext-itest` bucket. Skip cleanly when no server is up — a green
    run without the env is NOT a full verification (repo rule; report
    which ran).
-2. **Codec vectors**: `tests/vectors/bounds_vectors.json` replayed
-   against the C++ bounds codec through a hidden scalar function
-   (`hoglake_debug_encode_bound`) exercised from sqllogictests — the
-   cross-language guarantee pyhoglake already participates in.
+2. **Cross-client wire vectors**: `test/run-live-tests.sh` runs
+   `test/fixtures/verify_partition_wire.py` after the suite — it
+   asserts extension-written and pyhoglake-written files with the same
+   logical partition value land in byte-identical partition string
+   groups (int/date/timestamp-with-fractional-seconds/boolean). The
+   bounds codec (`tests/vectors/bounds_vectors.json`) has NO C++
+   counterpart yet: stats ship deferred, so no bounds are encoded
+   client-side; the vector harness lands with the bounds codec.
 3. **Semantics cross-check**: pyhoglake's integration tests are the
    executable spec; each milestone ports the relevant behaviors
    (append/commit shapes, alter flows, expiry 410s, incarnation guard).

@@ -1,6 +1,10 @@
 #include "common/hoglake_types.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/time.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 
 namespace duckdb {
 
@@ -107,6 +111,30 @@ HoglakeColumnDef HoglakeTypes::FromDuckDBType(const string &name, const LogicalT
 		    type.ToString());
 	}
 	return def;
+}
+
+string HoglakeTypes::CanonicalTimestamp(timestamp_t timestamp) {
+	date_t date;
+	dtime_t time;
+	Timestamp::Convert(timestamp, date, time);
+	int32_t hh, mm, ss, micros;
+	Time::Convert(time, hh, mm, ss, micros);
+	auto result = StringUtil::Format("%sT%02d:%02d:%02d", CanonicalDate(date), hh, mm, ss);
+	if (micros != 0) {
+		result += StringUtil::Format(".%06d", micros);
+	}
+	return result;
+}
+
+string HoglakeTypes::CanonicalDate(date_t date) {
+	int32_t yyyy, mm, dd;
+	Date::Convert(date, yyyy, mm, dd);
+	if (yyyy < 0 || yyyy > 9999) {
+		// python datetime cannot represent these either; refuse rather
+		// than silently diverge from the isoformat convention
+		throw InvalidInputException("hoglake: partition value year %d is outside the wire's isoformat range", yyyy);
+	}
+	return StringUtil::Format("%04d-%02d-%02d", yyyy, mm, dd);
 }
 
 } // namespace duckdb

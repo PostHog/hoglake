@@ -159,3 +159,26 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   same hydrator env gap) — the explicit _hog_row_id read path remains
   untested against real compaction output.
 - Verified: full suite 237 assertions pass (5 test files) 2026-09-11.
+
+## Review round 1 — all 14 confirmed findings fixed, 7 overflow items assessed: DONE
+- Dispositions with tests: REVIEW-FINDINGS.md ("Round-1 fix
+  dispositions"). Highlights: per-data-file DV merging across
+  statements (multi-statement DML transactions commit), recursive
+  mutexes + retire-not-destroy on the catalog caches (SHOW ALL TABLES
+  race repro now 6/6 green), listing-based CI identifier resolution
+  (DuckDB case semantics over the case-sensitive server), CTAS cast
+  projection to wire types (silent-corruption repro fixed), genuine
+  time-travel tests via fixture-exported snapshot ids, eager-DDL vs
+  buffered-writes refusal policy + post-DDL read travel (DESIGN.md
+  "Transactions and eager DDL"), pyhoglake-byte-identical
+  date/timestamp partition wire strings verified cross-client,
+  yyjson/puffin/retry-clamp hardening, maintenance mutations moved
+  from bind to execution, and a PARITY.md/DESIGN.md audit so no claim
+  exceeds what tests prove.
+- New test surface: hoglake_txn.test, hoglake_case.test,
+  hoglake_types.test, test/run-live-tests.sh (fixtures -> suite ->
+  verify_partition_wire.py cross-client check), fixture-exported
+  live-env.sh for time travel.
+- Verified 2026-09-11: ./test/run-live-tests.sh fully green — 8
+  sqllogictest files / 406 assertions + 4 cross-client partition
+  groups byte-shared.

@@ -1,0 +1,162 @@
+# name: test/sql/hoglake_txn.test
+# description: transaction semantics — multi-statement DML over shared
+#   files commits as ONE deletion vector per data file; eager DDL vs
+#   buffered writes is refused with a clear error; a table created in a
+#   transaction is readable in the same transaction (post-DDL read
+#   travel).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.txn_t
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.txn_created
+
+statement ok
+CREATE TABLE lake.ns1.txn_t (a BIGINT)
+
+# one file holds all five rows
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (1), (2), (3), (4), (5)
+
+# ---- multi-statement DML on the SAME parquet file in one transaction:
+# before the DV-merge fix this commit was permanently uncommittable
+# (two live-DV registrations for one data_file_id) ----
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 1
+----
+1
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 2
+----
+1
+
+query I
+UPDATE lake.ns1.txn_t SET a = 30 WHERE a = 3
+----
+1
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.txn_t ORDER BY a
+----
+4
+5
+30
+
+# ---- eager DDL over buffered writes for the same table is refused
+# (would otherwise abort at COMMIT after the DDL already persisted) ----
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (100)
+
+statement error
+DROP TABLE lake.ns1.txn_t
+----
+<REGEX>:.*uncommitted writes.*
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 4
+----
+1
+
+statement error
+ALTER TABLE lake.ns1.txn_t ADD COLUMN c INTEGER
+----
+<REGEX>:.*uncommitted writes.*
+
+statement ok
+ROLLBACK
+
+# the rollback discarded the buffered delete
+query I
+SELECT count(*) FROM lake.ns1.txn_t
+----
+3
+
+# DDL on a DIFFERENT table than the buffered writes is allowed
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (200)
+
+statement ok
+CREATE TABLE lake.ns1.txn_created (x BIGINT)
+
+# a table created in this transaction is readable in the same
+# transaction (its entry reads at the post-create snapshot, not the
+# pre-create pin): 0 rows, not a 404
+query I
+SELECT count(*) FROM lake.ns1.txn_created
+----
+0
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM lake.ns1.txn_t WHERE a = 200
+----
+1
+
+# ---- rollback of pure DML discards everything buffered ----
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_created VALUES (1)
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 200
+----
+1
+
+statement ok
+ROLLBACK
+
+query II
+SELECT (SELECT count(*) FROM lake.ns1.txn_created), (SELECT count(*) FROM lake.ns1.txn_t WHERE a = 200)
+----
+0	1
+
+statement ok
+DETACH lake

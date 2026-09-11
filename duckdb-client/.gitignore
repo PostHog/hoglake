@@ -7,3 +7,4 @@
 /duckdb_unittest_tempdir/
 .DS_Store
 /.cache/
+test/fixtures/live-env.sh

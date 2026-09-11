@@ -13,6 +13,8 @@
 #include "duckdb/parser/parsed_data/copy_info.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "common/hoglake_types.hpp"
+#include "duckdb/common/types/date.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "storage/hoglake_catalog.hpp"
 #include "storage/hoglake_schema_entry.hpp"
 #include "storage/hoglake_table_entry.hpp"
@@ -63,12 +65,17 @@ static Value IdentityWireString(const HoglakeColumn &column, const Value &value)
 		return Value(StringValue::Get(value.DefaultCastAs(LogicalType::VARCHAR)));
 	}
 	if (type == "date") {
-		return Value(value.DefaultCastAs(LogicalType::VARCHAR).ToString());
+		// date.isoformat(), byte-identical to pyhoglake's wire_string
+		return Value(HoglakeTypes::CanonicalDate(DateValue::Get(value.DefaultCastAs(LogicalType::DATE))));
 	}
 	if (type == "timestamp") {
-		// pyhoglake uses datetime.isoformat(): 'T' separator
-		auto str = value.DefaultCastAs(LogicalType::VARCHAR).ToString();
-		return Value(StringUtil::Replace(str, " ", "T"));
+		// datetime.isoformat(), byte-identical to pyhoglake's
+		// wire_string: 'T' separator, microseconds as .%06d or absent —
+		// NEVER DuckDB's VARCHAR cast, which trims trailing zeros
+		// ('.900000' -> '.9') and would split partition groups across
+		// clients
+		return Value(
+		    HoglakeTypes::CanonicalTimestamp(TimestampValue::Get(value.DefaultCastAs(LogicalType::TIMESTAMP))));
 	}
 	throw NotImplementedException(
 	    "hoglake: INSERT into a table identity-partitioned on a %s column is not supported yet "
@@ -155,7 +162,11 @@ SinkResultType HoglakeInsert::Sink(ExecutionContext &context, DataChunk &chunk, 
 					                        key_column.name);
 				}
 				auto &raw = entry->second;
-				if (raw.IsNull() || StringValue::Get(raw) == "__HIVE_DEFAULT_PARTITION__") {
+				// NULL partition values stay NULL Values in the stats
+				// map (the __HIVE_DEFAULT_PARTITION__ sentinel is only a
+				// directory-name artifact; as a map VALUE it is a
+				// legitimate user string)
+				if (raw.IsNull()) {
 					file.partition_values.push_back(Value(LogicalType::VARCHAR));
 					continue;
 				}
@@ -176,7 +187,8 @@ SinkFinalizeType HoglakeInsert::Finalize(Pipeline &pipeline, Event &event, Clien
 	auto &gstate = input.global_state.Cast<HoglakeInsertGlobalState>();
 	auto &transaction = HoglakeTransaction::Get(context, gstate.table.ParentCatalog());
 	auto ns = gstate.table.ParentSchema().name.GetIdentifierName();
-	transaction.AddAppend(ns, gstate.table.name.GetIdentifierName(), gstate.table.GetTableUUID(),
+	// the wire name is the server's exact (case-preserved) table name
+	transaction.AddAppend(ns, gstate.table.GetWireInfo().name, gstate.table.GetTableUUID(),
 	                      std::move(gstate.written_files));
 	return SinkFinalizeType::READY;
 }
@@ -245,7 +257,7 @@ PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlan
 		data_path += "/";
 	}
 	auto ns = table.ParentSchema().name.GetIdentifierName();
-	auto file_path = data_path + "data/" + ns + "/" + table.name.GetIdentifierName();
+	auto file_path = data_path + "data/" + ns + "/" + table.GetWireInfo().name;
 	info->file_path = file_path;
 	info->format = "parquet";
 	info->is_from = false;

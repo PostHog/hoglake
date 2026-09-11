@@ -16,9 +16,10 @@
 namespace duckdb {
 
 HoglakeTableEntry::HoglakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                     HoglakeTableInfo table_info_p, HoglakeTravel travel_p, bool travel_pinned_p)
-    : TableCatalogEntry(catalog, schema, info), table_info(std::move(table_info_p)), travel(std::move(travel_p)),
-      travel_pinned(travel_pinned_p) {
+                                     HoglakeTableInfo table_info_p, HoglakeTravel read_travel_p,
+                                     bool writes_refused_p)
+    : TableCatalogEntry(catalog, schema, info), table_info(std::move(table_info_p)),
+      read_travel(std::move(read_travel_p)), writes_refused(writes_refused_p) {
 }
 
 unique_ptr<BaseStatistics> HoglakeTableEntry::GetStatistics(ClientContext &context, column_t column_id) {

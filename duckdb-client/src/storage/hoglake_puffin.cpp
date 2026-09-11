@@ -153,6 +153,11 @@ void HoglakePuffin::DecodeBlob(const_data_ptr_t blob_start, idx_t blob_length, c
 		auto key = Load<int32_t>(ptr);
 		ptr += sizeof(int32_t);
 		remaining -= sizeof(int32_t);
+		if (key < 0) {
+			// a negative high-32 key would sign-extend into a garbage
+			// position; no valid file position has bit 63 set
+			throw InvalidInputException("Deletion vector in \"%s\" is corrupt - negative bucket key %d", path, key);
+		}
 		auto bitmap_size = roaring::api::roaring_bitmap_portable_deserialize_size(const_char_ptr_cast(ptr), remaining);
 		if (bitmap_size == 0 || bitmap_size > remaining) {
 			throw InvalidInputException("Deletion vector in \"%s\" is corrupt - bucket %llu bitmap out of range", path,

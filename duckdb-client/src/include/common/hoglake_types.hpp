@@ -17,6 +17,13 @@ struct HoglakeTypes {
 	//! Throws InvalidInputException for types outside the hoglake set
 	//! (nested types included — the wire schema is flat).
 	static HoglakeColumnDef FromDuckDBType(const string &name, const LogicalType &type, bool nullable);
+
+	//! Canonical wire timestamp string, byte-identical to Python's
+	//! datetime.isoformat() (pyhoglake's wire_string convention):
+	//! YYYY-MM-DDTHH:MM:SS, plus .%06d only when microseconds != 0.
+	static string CanonicalTimestamp(timestamp_t timestamp);
+	//! Canonical wire date string (date.isoformat(): YYYY-MM-DD).
+	static string CanonicalDate(date_t date);
 };
 
 } // namespace duckdb

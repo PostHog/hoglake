@@ -72,11 +72,26 @@ SELECT count(*) > 0 FROM hoglake_snapshots('lake')
 ----
 true
 
-# the newest snapshot records the insert into tt as a typed change
+# pagination: a 2-per-page walk returns exactly the same set as one
+# big page (this catalog has far more than 2 snapshots, so the walk
+# crosses many page boundaries)
 query I
-SELECT len(changes) >= 1 FROM hoglake_snapshots('lake') ORDER BY snapshot_id DESC LIMIT 1
+SELECT (SELECT count(*) FROM hoglake_snapshots('lake', page_size => 2)) =
+       (SELECT count(*) FROM hoglake_snapshots('lake'))
 ----
 true
+
+query I
+SELECT count(*) = count(DISTINCT snapshot_id) FROM hoglake_snapshots('lake', page_size => 2)
+----
+true
+
+# the newest snapshot records the insert into tt as a TYPED change:
+# kind table_inserted_into, with a real object id
+query II
+SELECT changes[1].kind, changes[1].object_id > 0 FROM hoglake_snapshots('lake') ORDER BY snapshot_id DESC LIMIT 1
+----
+table_inserted_into	true
 
 query I
 SELECT (SELECT id FROM hoglake_current_snapshot('lake')) = (SELECT max(snapshot_id) FROM hoglake_snapshots('lake'))
@@ -88,22 +103,36 @@ SELECT namespace, table_name, record_count FROM hoglake_table_info('lake') WHERE
 ----
 ns1	tt	3
 
-# ---- maintenance passthroughs (server-side; results are JSON) ----
+# ---- maintenance passthroughs (server-side; results are JSON).
+# NOTE: these assert the wire round trip and result SHAPE; this dev
+# catalog has no retention configured and no hydrated stats, so expiry
+# expires nothing and compaction finds no groups — the numbers are
+# asserted as present-and-zero, not as real maintenance effects. ----
 
-query I
-SELECT json_valid(result::VARCHAR) FROM hoglake_expire('lake')
-----
-true
+# planning a maintenance function must NOT run the mutation (the POST
+# happens at execution, not bind)
+statement ok
+EXPLAIN SELECT * FROM hoglake_expire('lake')
 
-query I
-SELECT (result -> '$.groups_compacted') IS NOT NULL FROM hoglake_compact('lake')
+query II
+SELECT result ->> '$.snapshots_expired' IS NOT NULL, result ->> '$.new_earliest_snapshot_id' IS NOT NULL
+    FROM hoglake_expire('lake')
 ----
-true
+true	true
 
-query I
-SELECT json_valid(result::VARCHAR) FROM hoglake_cleanup('lake', batch => 100)
+query III
+SELECT result ->> '$.groups_compacted' IS NOT NULL, result ->> '$.files_in' IS NOT NULL,
+       result ->> '$.skipped_conflicts' IS NOT NULL
+    FROM hoglake_compact('lake')
 ----
-true
+true	true	true
+
+query III
+SELECT result ->> '$.removed' IS NOT NULL, result ->> '$.missing' IS NOT NULL,
+       result ->> '$.still_referenced' IS NOT NULL
+    FROM hoglake_cleanup('lake', batch => 100)
+----
+true	true	true
 
 query I
 SELECT result ->> '$.status' FROM hoglake_verify('lake')

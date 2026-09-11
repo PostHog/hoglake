@@ -10,6 +10,8 @@
 #include "duckdb/planner/operator/logical_insert.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/expression/bound_cast_expression.hpp"
+#include "duckdb/execution/operator/projection/physical_projection.hpp"
 #include "duckdb/planner/operator/logical_delete.hpp"
 #include "duckdb/planner/operator/logical_update.hpp"
 #include "storage/hoglake_delete.hpp"
@@ -113,7 +115,39 @@ PhysicalOperator &HoglakeCatalog::PlanCreateTableAs(ClientContext &context, Phys
 		throw CatalogException("hoglake: CREATE TABLE AS failed to create the table");
 	}
 	auto &table = entry->Cast<HoglakeTableEntry>();
-	return HoglakeInsert::PlanInsert(context, planner, table, &plan);
+
+	// the created table's types are the WIRE types, which can be wider
+	// than the SELECT's (TINYINT/SMALLINT both map to wire "int" ->
+	// INTEGER). The child plan must be cast to the wire types before it
+	// reaches the parquet copy, or its narrower vectors are consumed at
+	// the declared width (silent corruption)
+	auto expected_types = table.GetTypes();
+	if (expected_types.size() != plan.types.size()) {
+		throw InternalException("hoglake: CTAS column count mismatch");
+	}
+	optional_ptr<PhysicalOperator> child = &plan;
+	bool needs_cast = false;
+	for (idx_t i = 0; i < expected_types.size(); i++) {
+		if (expected_types[i] != plan.types[i]) {
+			needs_cast = true;
+			break;
+		}
+	}
+	if (needs_cast) {
+		vector<unique_ptr<Expression>> cast_exprs;
+		for (idx_t i = 0; i < expected_types.size(); i++) {
+			unique_ptr<Expression> expr = make_uniq<BoundReferenceExpression>(plan.types[i], i);
+			if (expected_types[i] != plan.types[i]) {
+				expr = BoundCastExpression::AddCastToType(context, std::move(expr), expected_types[i]);
+			}
+			cast_exprs.push_back(std::move(expr));
+		}
+		auto &proj =
+		    planner.Make<PhysicalProjection>(expected_types, std::move(cast_exprs), plan.estimated_cardinality);
+		proj.children.push_back(plan);
+		child = &proj;
+	}
+	return HoglakeInsert::PlanInsert(context, planner, table, child);
 }
 
 PhysicalOperator &HoglakeCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,

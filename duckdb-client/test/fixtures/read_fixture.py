@@ -17,6 +17,7 @@ http://localhost:19000), HOGLAKE_S3_ACCESS_KEY / _SECRET_KEY
 """
 
 import os
+import sys
 from datetime import UTC, datetime
 
 import pyarrow as pa
@@ -122,6 +123,94 @@ def main() -> None:
         )
         print(f"fixture ready: {CATALOG}/ns1.part_points snapshot {rp.snapshot_id} "
               f"files {len(rp.files)}")
+
+        # schema-evolution history for time-travel tests: batch1 under
+        # the 1-column schema (snapshot E1), then ADD COLUMN, then
+        # batch2 under the 2-column schema
+        try:
+            ns.table("points_evo").drop()
+        except NotFoundError:
+            pass
+        evo = ns.create_table(
+            "points_evo", pa.schema([pa.field("id", pa.int64(), nullable=False)])
+        )
+        e1 = evo.append(pa.table({"id": pa.array([1, 2, 3], pa.int64())}))
+        evo.alter([ops.add_column("v", pa.string())])
+        e2 = evo.append(
+            pa.table(
+                {"id": pa.array([4], pa.int64()), "v": ["four"]},
+                schema=pa.schema(
+                    [pa.field("id", pa.int64(), nullable=False), pa.field("v", pa.string())]
+                ),
+            )
+        )
+        print(f"fixture ready: {CATALOG}/ns1.points_evo snapshots {e1.snapshot_id},{e2.snapshot_id}")
+
+        # cross-client partition-grouping fixtures: pyhoglake writes one
+        # file per key value; the extension's sqllogictests insert the
+        # SAME logical values, and verify_partition_wire.py asserts both
+        # clients' files land in identical partition string groups
+        xclient = {
+            "xclient_int": (pa.int64(), pa.array([7, 42], pa.int64())),
+            "xclient_date": (
+                pa.date32(),
+                pa.array([datetime(2026, 3, 1).date(), datetime(2026, 3, 2).date()], pa.date32()),
+            ),
+            "xclient_ts": (
+                pa.timestamp("us"),
+                pa.array(
+                    [datetime(2026, 1, 2, 3, 4, 5, 900000), datetime(2026, 1, 2, 3, 4, 5)],
+                    pa.timestamp("us"),
+                ),
+            ),
+            "xclient_bool": (pa.bool_(), pa.array([True, False], pa.bool_())),
+        }
+        for tname, (ktype, kvals) in xclient.items():
+            try:
+                ns.table(tname).drop()
+            except NotFoundError:
+                pass
+            t = ns.create_table(
+                tname,
+                pa.schema([pa.field("k", ktype), pa.field("src", pa.string())]),
+            )
+            k_field = next(c for c in t.columns if c.name == "k")
+            t.alter([ops.set_partition_spec([ops.partition_field(k_field.field_id, "identity")])])
+            t.append(
+                pa.table(
+                    {"k": kvals, "src": ["py"] * len(kvals)},
+                    schema=pa.schema([pa.field("k", ktype), pa.field("src", pa.string())]),
+                )
+            )
+            print(f"fixture ready: {CATALOG}/ns1.{tname}")
+
+        # time-travel env for the sqllogictests: genuinely historical
+        # snapshot ids and a timestamp BETWEEN the two points batches
+        # (proves timestamp resolution picks the earlier snapshot).
+        # points batch2 (r2) has a strictly later snapshot_time than
+        # batch1 (r1); a timestamp equal to r1's snapshot_time resolves
+        # to r1 per the wire contract (largest snapshot_time <= t).
+        snap_times = {}
+        for snap in catalog.snapshots(after=max(0, r1.snapshot_id - 1)):
+            snap_times[snap.snapshot_id] = snap.snapshot_time
+            if snap.snapshot_id >= r2.snapshot_id:
+                break
+        t1 = snap_times[r1.snapshot_id]
+        # DuckDB-natural local format (no zone, space separator): the
+        # attach path must normalize it to an ISO instant itself
+        t1_natural = t1.strftime("%Y-%m-%d %H:%M:%S.%f")
+        env_lines = [
+            f"export DUCKEXT_POINTS_SNAP_V1={r1.snapshot_id}",
+            f"export DUCKEXT_POINTS_SNAP_V2={r2.snapshot_id}",
+            f"export DUCKEXT_POINTS_T1='{t1_natural}'",
+            f"export DUCKEXT_EVO_SNAP_V1={e1.snapshot_id}",
+        ]
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live-env.sh")
+        with open(env_path, "w") as f:
+            f.write("\n".join(env_lines) + "\n")
+        print(f"wrote {env_path}")
+        for line in env_lines:
+            print("  " + line)
 
 
 if __name__ == "__main__":

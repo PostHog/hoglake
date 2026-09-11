@@ -5,6 +5,7 @@
 #include "duckdb/main/attached_database.hpp"
 #include "duckdb/parser/parsed_data/attach_info.hpp"
 #include "duckdb/main/client_context.hpp"
+#include "common/hoglake_types.hpp"
 #include "storage/hoglake_catalog.hpp"
 #include "storage/hoglake_transaction_manager.hpp"
 
@@ -27,7 +28,11 @@ static void HandleHoglakeOption(HoglakeOptions &options, const string &option, c
 		if (options.snapshot_version.IsValid()) {
 			throw InvalidInputException("Cannot specify both SNAPSHOT_VERSION and SNAPSHOT_TIME");
 		}
-		options.snapshot_time = value.ToString();
+		// normalize to the ISO-8601 instant the server's Instant.parse
+		// accepts (same canonicalization as the AT (TIMESTAMP =>) path);
+		// a naive timestamp is taken as UTC
+		auto utc = value.DefaultCastAs(LogicalType::TIMESTAMP);
+		options.snapshot_time = HoglakeTypes::CanonicalTimestamp(TimestampValue::Get(utc)) + "Z";
 	} else {
 		throw NotImplementedException("Unsupported option %s for hoglake", option);
 	}

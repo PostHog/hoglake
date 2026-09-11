@@ -1,0 +1,102 @@
+# name: test/sql/hoglake_case.test
+# description: identifier case policy — DuckDB identifiers are
+#   case-insensitive and case-preserving; the server matches names
+#   case-sensitively. Every lookup/DDL resolves the typed identifier to
+#   the server's exact name through the listing, cold cache included
+#   (each autocommit statement is a fresh transaction, so these tests
+#   exercise cold resolution by construction).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.case_t
+
+# create with mixed case: the typed case is preserved on the wire
+statement ok
+CREATE TABLE lake.NS1.Case_T (Id BIGINT, NaMe VARCHAR)
+
+# the server holds the typed case verbatim
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'ns1' AND lower(table_name) = 'case_t'
+----
+Case_T
+
+# CI conflict: a differently-cased duplicate is a duplicate
+statement error
+CREATE TABLE lake.ns1.CASE_T (x BIGINT)
+----
+<REGEX>:.*already exists.*
+
+statement ok
+CREATE TABLE IF NOT EXISTS lake.ns1.case_t (x BIGINT)
+
+# rename a column via a differently-cased identifier (cold cache:
+# autocommit statement)
+statement ok
+ALTER TABLE lake.ns1.case_T RENAME COLUMN ID TO id2
+
+# insert / select / delete through scrambled-case identifiers, each in
+# its own cold transaction
+statement ok
+INSERT INTO lake.ns1.CASE_T VALUES (1, 'x'), (2, 'y')
+
+query II
+SELECT ID2, NAME FROM lake.ns1.cAsE_t ORDER BY id2
+----
+1	x
+2	y
+
+query I
+DELETE FROM lake.ns1.CaSe_T WHERE ID2 = 1
+----
+1
+
+query I
+SELECT count(*) FROM lake.ns1.case_t
+----
+1
+
+# time travel through a scrambled-case identifier
+query I
+SELECT count(*) FROM lake.ns1.CASE_t AT (TIMESTAMP => TIMESTAMP '2100-01-01')
+----
+1
+
+# drop through a scrambled-case identifier; the drop hits the server's
+# exact name (a case-mismatched wire call would 404)
+statement ok
+DROP TABLE lake.ns1.cASe_T
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND lower(table_name) = 'case_t'
+----
+0
+
+# and the drop is durable server-side: a fresh lookup misses
+statement error
+SELECT * FROM lake.ns1.case_t
+----
+<REGEX>:.*does not exist.*
+
+statement ok
+DETACH lake

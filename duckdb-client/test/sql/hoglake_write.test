@@ -124,5 +124,23 @@ SELECT count(DISTINCT snapshot_id) FROM lake.ns1.w_test
 ----
 2
 
+# CTAS from types NARROWER than their wire mapping (TINYINT/SMALLINT ->
+# wire "int" -> INTEGER) must cast before the parquet copy — without
+# the cast projection these read back as garbage (int8/int16 buffers
+# consumed at int32 width)
+statement ok
+DROP TABLE IF EXISTS lake.ns1.w_narrow
+
+statement ok
+CREATE TABLE lake.ns1.w_narrow AS SELECT (t+1)::TINYINT AS a, (t*10+7)::SMALLINT AS b FROM range(4) tbl(t)
+
+query II
+SELECT a, b FROM lake.ns1.w_narrow ORDER BY a
+----
+1	7
+2	17
+3	27
+4	37
+
 statement ok
 DETACH lake

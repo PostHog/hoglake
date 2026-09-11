@@ -211,8 +211,12 @@ HoglakeDataFile ParseDataFile(yyjson_val *obj) {
 		yyjson_arr_foreach(values, idx, max, val) {
 			if (yyjson_is_null(val)) {
 				file.partition_values.push_back(Value(LogicalType::VARCHAR));
-			} else {
+			} else if (yyjson_is_str(val)) {
 				file.partition_values.push_back(Value(string(yyjson_get_str(val), yyjson_get_len(val))));
+			} else {
+				// never construct string(nullptr, n) from a non-string
+				// element: fail like every other field in this parser
+				throw IOException("hoglake: malformed partition_values in server response (non-string element)");
 			}
 		}
 	}

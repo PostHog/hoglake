@@ -5,6 +5,7 @@
 #include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
@@ -35,10 +36,55 @@ HoglakeTransaction &HoglakeSchemaEntry::Transaction(CatalogTransaction &transact
 }
 
 //===--------------------------------------------------------------------===//
+// Identifier resolution (DuckDB CI semantics over a case-sensitive
+// server; see the header comment)
+//===--------------------------------------------------------------------===//
+
+void HoglakeSchemaEntry::EnsureTableNamesInternal(HoglakeTransaction &transaction) {
+	if (table_names_loaded) {
+		return;
+	}
+	auto ns = name.GetIdentifierName();
+	// NOTE (wire): the table listing is head-only; per-table fetches are
+	// at the pinned travel (DESIGN.md server findings)
+	for (auto &summary : transaction.Api().ListTables(ns)) {
+		if (dropped_tables.find(summary.name) != dropped_tables.end()) {
+			continue;
+		}
+		table_names[summary.name].push_back(summary.name);
+	}
+	table_names_loaded = true;
+}
+
+string HoglakeSchemaEntry::ResolveTableNameInternal(HoglakeTransaction &transaction, const string &typed_name) {
+	EnsureTableNamesInternal(transaction);
+	auto entry = table_names.find(typed_name);
+	if (entry == table_names.end() || entry->second.empty()) {
+		return string();
+	}
+	auto &candidates = entry->second;
+	if (candidates.size() > 1) {
+		// two server-side tables whose names differ only by case:
+		// DuckDB identifiers cannot distinguish them
+		throw CatalogException("hoglake: identifier \"%s\" is ambiguous in namespace \"%s\": the server holds "
+		                       "multiple tables whose names differ only by case (%s). Rename one via another "
+		                       "client to make the namespace addressable from DuckDB",
+		                       typed_name, name.GetIdentifierName(), StringUtil::Join(candidates, ", "));
+	}
+	return candidates[0];
+}
+
+string HoglakeSchemaEntry::ResolveTableName(HoglakeTransaction &transaction, const string &typed_name) {
+	std::lock_guard<std::recursive_mutex> guard(entry_lock);
+	return ResolveTableNameInternal(transaction, typed_name);
+}
+
+//===--------------------------------------------------------------------===//
 // Table loading
 //===--------------------------------------------------------------------===//
 
-CatalogEntry &HoglakeSchemaEntry::CacheTable(HoglakeTransaction &transaction, HoglakeTableInfo table_info) {
+CatalogEntry &HoglakeSchemaEntry::CacheTableInternal(HoglakeTransaction &transaction, HoglakeTableInfo table_info,
+                                                     const HoglakeTravel &read_travel, bool writes_refused) {
 	auto columns = table_info.columns;
 	std::sort(columns.begin(), columns.end(),
 	          [](const HoglakeColumn &a, const HoglakeColumn &b) { return a.ordinal < b.ordinal; });
@@ -56,46 +102,70 @@ CatalogEntry &HoglakeSchemaEntry::CacheTable(HoglakeTransaction &transaction, Ho
 	for (auto idx : not_null) {
 		create_info.constraints.push_back(make_uniq<NotNullConstraint>(idx));
 	}
-	auto entry = make_uniq<HoglakeTableEntry>(catalog, *this, create_info, std::move(table_info));
+	auto entry =
+	    make_uniq<HoglakeTableEntry>(catalog, *this, create_info, std::move(table_info), read_travel, writes_refused);
 	auto &result = *entry;
+	if (writes_refused) {
+		// AT-clause entries live in the travel map, keyed by the caller
+		throw InternalException("hoglake: travel entries are cached by LookupTableAtInternal");
+	}
+	auto existing = tables.find(table_name);
+	if (existing != tables.end()) {
+		// never destroy an entry mid-transaction: another thread (or the
+		// current statement) may still hold a reference
+		retired.push_back(std::move(existing->second));
+		tables.erase(existing);
+	}
 	tables[table_name] = std::move(entry);
 	return result;
 }
 
-optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTable(HoglakeTransaction &transaction, const string &entry_name) {
-	auto existing = tables.find(entry_name);
+optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableInternal(HoglakeTransaction &transaction,
+                                                                   const string &typed_name) {
+	auto resolved = ResolveTableNameInternal(transaction, typed_name);
+	if (resolved.empty()) {
+		return nullptr;
+	}
+	auto existing = tables.find(resolved);
 	if (existing != tables.end()) {
 		return existing->second.get();
 	}
 	if (all_tables_loaded) {
+		// listed at head but not visible at the pinned travel
 		return nullptr;
 	}
 	auto ns = name.GetIdentifierName();
-	auto table_info = transaction.Api().TryGetTable(ns, entry_name, transaction.Travel());
+	auto travel = transaction.Travel();
+	auto table_info = transaction.Api().TryGetTable(ns, resolved, travel);
 	if (!table_info) {
 		return nullptr;
 	}
-	return &CacheTable(transaction, std::move(*table_info));
+	return &CacheTableInternal(transaction, std::move(*table_info), travel, false);
 }
 
-void HoglakeSchemaEntry::LoadAllTables(HoglakeTransaction &transaction) {
+void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) {
 	if (all_tables_loaded) {
 		return;
 	}
+	EnsureTableNamesInternal(transaction);
 	auto ns = name.GetIdentifierName();
-	// NOTE (wire): the table listing is head-only; per-table fetches are
-	// at the pinned snapshot (DESIGN.md server findings).
-	auto summaries = transaction.Api().ListTables(ns);
-	for (auto &summary : summaries) {
-		if (tables.find(summary.name) != tables.end()) {
+	auto travel = transaction.Travel();
+	for (auto &entry : table_names) {
+		if (entry.second.size() != 1) {
+			// CI-ambiguous pair: unaddressable from DuckDB (lookup
+			// throws); skip in listings for consistency
 			continue;
 		}
-		auto table_info = transaction.Api().TryGetTable(ns, summary.name, transaction.Travel());
+		auto &exact = entry.second[0];
+		if (tables.find(exact) != tables.end()) {
+			continue;
+		}
+		auto table_info = transaction.Api().TryGetTable(ns, exact, travel);
 		if (!table_info) {
-			// listed at head but missing at the pinned snapshot
+			// listed at head but missing at the pinned travel
 			continue;
 		}
-		CacheTable(transaction, std::move(*table_info));
+		CacheTableInternal(transaction, std::move(*table_info), travel, false);
 	}
 	all_tables_loaded = true;
 }
@@ -110,25 +180,33 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupEntry(CatalogTransaction tr
 	if (catalog_type != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
+	auto &hoglake_transaction = Transaction(transaction);
+	std::lock_guard<std::recursive_mutex> guard(entry_lock);
 	auto at_clause = lookup_info.GetAtClause();
 	if (at_clause) {
-		auto &hoglake_transaction = Transaction(transaction);
 		auto travel = hoglake_transaction.TravelFor(at_clause);
-		return LookupTableAt(hoglake_transaction, lookup_info.GetEntryName(), travel);
+		return LookupTableAtInternal(hoglake_transaction, lookup_info.GetEntryName(), travel);
 	}
-	return LookupTable(Transaction(transaction), lookup_info.GetEntryName());
+	return LookupTableInternal(hoglake_transaction, lookup_info.GetEntryName());
 }
 
-optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableAt(HoglakeTransaction &transaction,
-                                                             const string &entry_name, const HoglakeTravel &travel) {
-	auto key = entry_name + "@" + travel.CacheKey();
+optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableAtInternal(HoglakeTransaction &transaction,
+                                                                     const string &typed_name,
+                                                                     const HoglakeTravel &travel) {
+	// resolve via the head listing; fall back to the typed name for
+	// tables that no longer exist at head under that name
+	auto resolved = ResolveTableNameInternal(transaction, typed_name);
+	if (resolved.empty()) {
+		resolved = typed_name;
+	}
+	auto key = resolved + "@" + travel.CacheKey();
 	auto existing = travel_tables.find(key);
 	if (existing != travel_tables.end()) {
 		return existing->second.get();
 	}
 	auto ns = name.GetIdentifierName();
 	// a 410 (below the expiry floor) surfaces as InvalidInputException
-	auto table_info = transaction.Api().TryGetTable(ns, entry_name, travel);
+	auto table_info = transaction.Api().TryGetTable(ns, resolved, travel);
 	if (!table_info) {
 		return nullptr;
 	}
@@ -162,11 +240,21 @@ void HoglakeSchemaEntry::Scan(ClientContext &context, CatalogType type,
 		return;
 	}
 	auto &transaction = HoglakeTransaction::Get(context, catalog);
-	LoadAllTables(transaction);
-	for (auto &entry : tables) {
-		if (entry.second) {
-			callback(*entry.second);
+	// snapshot the entry pointers under the lock, run callbacks
+	// unlocked: callbacks (duckdb_columns etc.) may re-enter lookups.
+	// Entries are retired, never destroyed, so the pointers stay valid.
+	vector<CatalogEntry *> entries;
+	{
+		std::lock_guard<std::recursive_mutex> guard(entry_lock);
+		LoadAllTablesInternal(transaction);
+		for (auto &entry : tables) {
+			if (entry.second) {
+				entries.push_back(entry.second.get());
+			}
 		}
+	}
+	for (auto entry : entries) {
+		callback(*entry);
 	}
 }
 
@@ -175,10 +263,17 @@ void HoglakeSchemaEntry::Scan(CatalogType type, const std::function<void(Catalog
 	if (type != CatalogType::TABLE_ENTRY) {
 		return;
 	}
-	for (auto &entry : tables) {
-		if (entry.second) {
-			callback(*entry.second);
+	vector<CatalogEntry *> entries;
+	{
+		std::lock_guard<std::recursive_mutex> guard(entry_lock);
+		for (auto &entry : tables) {
+			if (entry.second) {
+				entries.push_back(entry.second.get());
+			}
 		}
+	}
+	for (auto entry : entries) {
+		callback(*entry);
 	}
 }
 
@@ -186,22 +281,33 @@ void HoglakeSchemaEntry::Scan(CatalogType type, const std::function<void(Catalog
 // DDL
 //===--------------------------------------------------------------------===//
 
+//! read travel for an entry whose table was created/altered by THIS
+//! transaction: the pin predates the DDL, so those entries read at the
+//! post-DDL head instead (DESIGN.md, "Transactions and eager DDL")
+static HoglakeTravel PostDDLTravel(HoglakeTransaction &transaction) {
+	auto info = transaction.Api().GetCatalog();
+	return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(info.head_snapshot_id));
+}
+
 optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction transaction,
                                                            BoundCreateTableInfo &info) {
 	auto &hoglake_transaction = Transaction(transaction);
 	auto &base_info = info.Base();
 	auto table_name = base_info.GetTableName().GetIdentifierName();
+	auto ns = name.GetIdentifierName();
 
-	auto existing = LookupTable(hoglake_transaction, table_name);
-	if (existing) {
+	std::lock_guard<std::recursive_mutex> guard(entry_lock);
+	auto resolved = ResolveTableNameInternal(hoglake_transaction, table_name);
+	if (!resolved.empty()) {
 		if (base_info.on_conflict == OnCreateConflict::IGNORE_ON_CONFLICT) {
 			return nullptr;
 		}
 		if (base_info.on_conflict == OnCreateConflict::ERROR_ON_CONFLICT) {
-			throw CatalogException("hoglake: table \"%s.%s\" already exists", name.GetIdentifierName(), table_name);
+			throw CatalogException("hoglake: table \"%s.%s\" already exists", ns, resolved);
 		}
 		throw NotImplementedException("CREATE OR REPLACE TABLE is not supported for hoglake");
 	}
+	hoglake_transaction.RequireDDLAllowed(ns, table_name, "CREATE");
 
 	// collect NOT NULL columns
 	unordered_set<idx_t> not_null;
@@ -217,7 +323,7 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction tr
 	vector<HoglakeColumnDef> defs;
 	for (auto &col : base_info.columns.Logical()) {
 		auto col_name = col.Name().GetIdentifierName();
-		if (StringUtil::StartsWith(col_name, RESERVED_COLUMN_PREFIX)) {
+		if (StringUtil::StartsWith(StringUtil::Lower(col_name), RESERVED_COLUMN_PREFIX)) {
 			throw InvalidInputException("hoglake: column name \"%s\" uses the reserved \"%s\" prefix "
 			                            "(hoglake internal columns, e.g. _hog_row_id)",
 			                            col_name, RESERVED_COLUMN_PREFIX);
@@ -227,28 +333,50 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction tr
 	}
 
 	// eager DDL: the server commit happens NOW (its own snapshot) and
-	// survives a rollback of the surrounding transaction (DESIGN.md)
-	auto created = hoglake_transaction.Api().CreateTable(name.GetIdentifierName(), table_name, defs);
-	return &CacheTable(hoglake_transaction, std::move(created));
+	// survives a rollback of the surrounding transaction (DESIGN.md).
+	// The typed case is preserved on the wire (DuckDB semantics).
+	auto created = hoglake_transaction.Api().CreateTable(ns, table_name, defs);
+	// the transaction pin predates this create; the new entry reads at
+	// the post-create head so same-transaction SELECTs work
+	auto read_travel = PostDDLTravel(hoglake_transaction);
+	dropped_tables.erase(created.name);
+	table_names[created.name].push_back(created.name);
+	return &CacheTableInternal(hoglake_transaction, std::move(created), read_travel, false);
 }
 
 void HoglakeSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	if (info.cascade) {
 		throw NotImplementedException("DROP ... CASCADE is not supported for hoglake");
 	}
-	auto entry_name = info.GetQualifiedName().Name().GetIdentifierName();
+	auto typed_name = info.GetQualifiedName().Name().GetIdentifierName();
 	auto &transaction = HoglakeTransaction::Get(context, catalog);
+	auto ns = name.GetIdentifierName();
 	switch (info.type) {
 	case CatalogType::TABLE_ENTRY: {
-		auto entry = LookupTable(transaction, entry_name);
+		std::lock_guard<std::recursive_mutex> guard(entry_lock);
+		auto entry = LookupTableInternal(transaction, typed_name);
 		if (!entry) {
 			if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 				return;
 			}
-			throw CatalogException("hoglake: table \"%s.%s\" does not exist", name.GetIdentifierName(), entry_name);
+			throw CatalogException("hoglake: table \"%s.%s\" does not exist", ns, typed_name);
 		}
-		transaction.Api().DropTable(name.GetIdentifierName(), entry_name);
-		tables.erase(entry_name);
+		// the entry's wire name is the server's exact name
+		auto &exact = entry->Cast<HoglakeTableEntry>().GetWireInfo().name;
+		transaction.RequireDDLAllowed(ns, exact, "DROP");
+		transaction.Api().DropTable(ns, exact);
+		// forget the name: the pin predates the drop, so server reads
+		// would resurrect it without this
+		auto names_entry = table_names.find(exact);
+		if (names_entry != table_names.end()) {
+			table_names.erase(names_entry);
+		}
+		dropped_tables[exact] = true;
+		auto existing = tables.find(exact);
+		if (existing != tables.end()) {
+			retired.push_back(std::move(existing->second));
+			tables.erase(existing);
+		}
 		return;
 	}
 	default:
@@ -260,18 +388,32 @@ void HoglakeSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 // ALTER
 //===--------------------------------------------------------------------===//
 
-static int64_t FindFieldId(const HoglakeTableInfo &wire, const string &column_name) {
+//! CI-resolve a typed column identifier to the wire column's exact name
+static const HoglakeColumn &ResolveWireColumn(const HoglakeTableInfo &wire, const string &typed_name) {
+	optional_ptr<const HoglakeColumn> match;
 	for (auto &col : wire.columns) {
-		if (StringUtil::CIEquals(col.name, column_name)) {
-			return col.field_id;
+		if (StringUtil::CIEquals(col.name, typed_name)) {
+			if (match) {
+				throw CatalogException("hoglake: column identifier \"%s\" is ambiguous in table \"%s\" (names "
+				                       "differing only by case)",
+				                       typed_name, wire.name);
+			}
+			match = &col;
 		}
 	}
-	throw BinderException("hoglake: column \"%s\" does not exist in table \"%s\"", column_name, wire.name);
+	if (!match) {
+		throw BinderException("hoglake: column \"%s\" does not exist in table \"%s\"", typed_name, wire.name);
+	}
+	return *match;
+}
+
+static int64_t FindFieldId(const HoglakeTableInfo &wire, const string &column_name) {
+	return ResolveWireColumn(wire, column_name).field_id;
 }
 
 //! Parse a partition-key expression into a wire PartitionField:
 //! a bare column ref = identity; year/month/day/hour(col) and
-//! bucket(col, n) map to the transform vocabulary.
+//! bucket(n, col) map to the transform vocabulary.
 static HoglakePartitionField ParsePartitionExpression(const HoglakeTableInfo &wire, ParsedExpression &expr) {
 	HoglakePartitionField field;
 	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
@@ -313,26 +455,47 @@ static HoglakePartitionField ParsePartitionExpression(const HoglakeTableInfo &wi
 	                      expr.ToString());
 }
 
+//! True iff the ALTER COLUMN TYPE expression is the implicit cast of
+//! the column itself (possibly nested casts). Anything else (USING with
+//! a real expression) must be rejected: promote_column is metadata-only
+//! and would silently skip the transform.
+static bool IsSimpleCast(const ParsedExpression &expr, const string &column_name) {
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr.Cast<ColumnRefExpression>();
+		return StringUtil::CIEquals(col_ref.GetColumnName().GetIdentifierName(), column_name);
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::CAST) {
+		auto &cast = expr.Cast<CastExpression>();
+		return IsSimpleCast(cast.Child(), column_name);
+	}
+	return false;
+}
+
 void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
 	if (info.type != AlterType::ALTER_TABLE) {
 		throw NotImplementedException("hoglake: only ALTER TABLE is supported");
 	}
 	auto &hoglake_transaction = Transaction(transaction);
 	auto &alter_table = info.Cast<AlterTableInfo>();
-	auto table_name = alter_table.GetQualifiedName().Name().GetIdentifierName();
-	auto entry = LookupTable(hoglake_transaction, table_name);
+	auto typed_name = alter_table.GetQualifiedName().Name().GetIdentifierName();
+	auto ns = name.GetIdentifierName();
+
+	std::lock_guard<std::recursive_mutex> guard(entry_lock);
+	auto entry = LookupTableInternal(hoglake_transaction, typed_name);
 	if (!entry) {
 		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
 			return;
 		}
-		throw CatalogException("hoglake: table \"%s.%s\" does not exist", name.GetIdentifierName(), table_name);
+		throw CatalogException("hoglake: table \"%s.%s\" does not exist", ns, typed_name);
 	}
 	auto &table = entry->Cast<HoglakeTableEntry>();
 	auto &wire = table.GetWireInfo();
+	//! the server's exact table name
+	auto exact_name = wire.name;
+	hoglake_transaction.RequireDDLAllowed(ns, exact_name, "ALTER");
 
 	HoglakeAlterOp op;
-	(void)table;
-	string new_entry_name = table_name;
+	string new_entry_name = exact_name;
 	switch (alter_table.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {
 		auto &rename = alter_table.Cast<RenameTableInfo>();
@@ -344,7 +507,7 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 	case AlterTableType::RENAME_COLUMN: {
 		auto &rename = alter_table.Cast<RenameColumnInfo>();
 		op.op = "rename_column";
-		op.from = rename.old_name.GetIdentifierName();
+		op.from = ResolveWireColumn(wire, rename.old_name.GetIdentifierName()).name;
 		op.to = rename.new_name.GetIdentifierName();
 		break;
 	}
@@ -368,13 +531,22 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 			return;
 		}
 		op.op = "drop_column";
-		op.name = remove.removed_column.GetIdentifierName();
+		op.name = ResolveWireColumn(wire, remove.removed_column.GetIdentifierName()).name;
 		break;
 	}
 	case AlterTableType::ALTER_COLUMN_TYPE: {
 		auto &change = alter_table.Cast<ChangeColumnTypeInfo>();
+		auto typed_column = change.column_name.GetIdentifierName();
+		if (change.expression && !IsSimpleCast(*change.expression, typed_column)) {
+			// promote_column is metadata-only: a USING expression would
+			// be silently dropped, leaving every row untransformed
+			throw NotImplementedException(
+			    "hoglake: ALTER COLUMN ... TYPE with a USING expression is not supported (the wire's "
+			    "promote_column is metadata-only and cannot transform data); only plain type promotions "
+			    "(e.g. INTEGER -> BIGINT) are possible");
+		}
 		op.op = "promote_column";
-		op.name = change.column_name.GetIdentifierName();
+		op.name = ResolveWireColumn(wire, typed_column).name;
 		// the server's promotion lattice validates the target
 		op.to = HoglakeTypes::FromDuckDBType(op.name, change.target_type, true).type;
 		break;
@@ -410,21 +582,29 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 	}
 
 	// eager DDL: one atomic /alter commit (its own server snapshot)
-	auto ns = name.GetIdentifierName();
-	auto altered = hoglake_transaction.Api().AlterTable(ns, table_name, {op});
+	auto altered = hoglake_transaction.Api().AlterTable(ns, exact_name, {op});
+
+	// the pin predates the alter; the evolved entry reads at the
+	// post-alter head so the new schema and its files line up
+	auto read_travel = PostDDLTravel(hoglake_transaction);
 
 	// swap the cached entry for the evolved table; the old entry stays
 	// alive (retired) because the statement may still reference it
-	auto existing = tables.find(table_name);
+	auto altered_name = altered.name;
+	auto existing = tables.find(exact_name);
 	if (existing != tables.end()) {
 		retired.push_back(std::move(existing->second));
 		tables.erase(existing);
 	}
-	CacheTable(hoglake_transaction, std::move(altered));
-	if (!StringUtil::CIEquals(new_entry_name, table_name)) {
-		// rename: the response carries the new name; drop the old key
-		tables.erase(table_name);
+	if (!StringUtil::CIEquals(new_entry_name, exact_name)) {
+		// rename: re-key the CI name index
+		auto names_entry = table_names.find(exact_name);
+		if (names_entry != table_names.end()) {
+			table_names.erase(names_entry);
+		}
+		table_names[altered_name].push_back(altered_name);
 	}
+	CacheTableInternal(hoglake_transaction, std::move(altered), read_travel, false);
 }
 
 //===--------------------------------------------------------------------===//
@@ -432,7 +612,7 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 //===--------------------------------------------------------------------===//
 
 optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateView(CatalogTransaction transaction, CreateViewInfo &info) {
-	throw NotImplementedException("CREATE VIEW is not supported for hoglake yet (lands in M5)");
+	throw NotImplementedException("CREATE VIEW is not supported for hoglake yet");
 }
 
 optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateFunction(CatalogTransaction transaction,

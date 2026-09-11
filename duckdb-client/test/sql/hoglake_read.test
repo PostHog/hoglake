@@ -137,3 +137,93 @@ SELECT sum(n) FROM lake.ns1.part_points WHERE team = 'a' OR team = 'c'
 
 statement ok
 DETACH lake
+
+# ---- genuine time travel (snapshot ids exported by the fixture:
+# DUCKEXT_POINTS_SNAP_V1 = the first batch's commit, V2 = the second's;
+# head has 5 rows, V1 has 3 — a head-reading AT implementation FAILS
+# these) ----
+
+require-env DUCKEXT_POINTS_SNAP_V1
+
+require-env DUCKEXT_POINTS_SNAP_V2
+
+require-env DUCKEXT_POINTS_T1
+
+require-env DUCKEXT_EVO_SNAP_V1
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lake (ENDPOINT '{HOGLAKE_URL}')
+
+query I
+SELECT id FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V1}) ORDER BY id
+----
+1
+2
+3
+
+query I
+SELECT count(*) FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V2})
+----
+5
+
+# timestamp travel: the fixture exports batch1's snapshot_time in
+# DuckDB-natural format (space separator, no zone); resolution must
+# pick batch1, not head
+query I
+SELECT count(*) FROM lake.ns1.points AT (TIMESTAMP => TIMESTAMP '{DUCKEXT_POINTS_T1}')
+----
+3
+
+# historical SCHEMA: points_evo had ONE column (id) at V1; the later
+# ADD COLUMN must not leak into the historical read (SELECT * shape)
+query I
+SELECT * FROM lake.ns1.points_evo AT (VERSION => {DUCKEXT_EVO_SNAP_V1}) ORDER BY id
+----
+1
+2
+3
+
+query II
+SELECT id, v FROM lake.ns1.points_evo ORDER BY id
+----
+1	NULL
+2	NULL
+3	NULL
+4	four
+
+statement ok
+DETACH lake
+
+# ---- attach-level pins ----
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakev
+    (ENDPOINT '{HOGLAKE_URL}', SNAPSHOT_VERSION {DUCKEXT_POINTS_SNAP_V1}, READ_ONLY)
+
+query I
+SELECT count(*) FROM lakev.ns1.points
+----
+3
+
+# a pinned attach is read-only: writes are refused
+statement error
+INSERT INTO lakev.ns1.points VALUES (99, 'z', 0.0, NULL)
+----
+<REGEX>:.*read-only.*
+
+statement ok
+DETACH lakev
+
+# SNAPSHOT_TIME in DuckDB-natural format is normalized to the ISO
+# instant the server requires
+statement ok
+ATTACH 'hoglake:duckext-read' AS laket
+    (ENDPOINT '{HOGLAKE_URL}', SNAPSHOT_TIME '{DUCKEXT_POINTS_T1}', READ_ONLY)
+
+query I
+SELECT count(*) FROM laket.ns1.points
+----
+3
+
+statement ok
+DETACH laket

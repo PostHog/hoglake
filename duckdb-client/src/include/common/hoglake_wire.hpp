@@ -9,6 +9,7 @@
 #include "duckdb/common/optional_idx.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/types/value.hpp"
+#include "duckdb/common/set.hpp"
 
 namespace duckdb {
 
@@ -175,6 +176,10 @@ struct HoglakeDeleteFileRegistration {
 	//! TOTAL deleted positions in the DV (cumulative)
 	int64_t delete_count = 0;
 	int64_t file_size_bytes = 0;
+	//! CLIENT-SIDE ONLY (never serialized): the complete position set
+	//! this DV holds, so a later statement in the same transaction can
+	//! merge and supersede it (one live DV per data file per commit).
+	set<idx_t> positions;
 };
 
 struct HoglakeTableDeletes {

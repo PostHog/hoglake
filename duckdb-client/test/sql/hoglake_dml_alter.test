@@ -204,5 +204,46 @@ statement error
 ALTER TABLE lake.ns1.rename_t SET DEFAULT 1 FOR b
 ----
 
+# ALTER COLUMN TYPE with a USING expression is refused: promote_column
+# is metadata-only and would silently skip the transform
+statement error
+ALTER TABLE lake.ns1.rename_t ALTER COLUMN a2 SET DATA TYPE BIGINT USING a2 * 1000
+----
+<REGEX>:.*USING expression is not supported.*
+
+# a plain re-typed cast of the column itself is the allowed form
+statement ok
+ALTER TABLE lake.ns1.rename_t ALTER COLUMN a2 SET DATA TYPE BIGINT
+
+# ---- the hive NULL-directory sentinel is a legitimate STRING value;
+# it must not be misregistered as a NULL partition value ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.hive_sentinel
+
+statement ok
+CREATE TABLE lake.ns1.hive_sentinel (k VARCHAR, n BIGINT)
+
+statement ok
+ALTER TABLE lake.ns1.hive_sentinel SET PARTITIONED BY (k)
+
+statement ok
+INSERT INTO lake.ns1.hive_sentinel VALUES ('__HIVE_DEFAULT_PARTITION__', 1), (NULL, 2)
+
+query I
+SELECT n FROM lake.ns1.hive_sentinel WHERE k = '__HIVE_DEFAULT_PARTITION__'
+----
+1
+
+query I
+SELECT n FROM lake.ns1.hive_sentinel WHERE k IS NULL
+----
+2
+
+query I
+SELECT n FROM lake.ns1.hive_sentinel WHERE k IS NOT NULL
+----
+1
+
 statement ok
 DETACH lake

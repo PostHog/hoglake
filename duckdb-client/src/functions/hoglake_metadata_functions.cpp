@@ -40,6 +40,9 @@ struct HoglakeSnapshotsData : public TableFunctionData {
 	explicit HoglakeSnapshotsData(HoglakeCatalog &catalog) : catalog(catalog) {
 	}
 	HoglakeCatalog &catalog;
+	//! page size for /snapshots (default 1000; settable for tests to
+	//! force page-boundary crossings)
+	idx_t page_size = 1000;
 };
 
 struct HoglakeSnapshotsState : public GlobalTableFunctionState {
@@ -52,6 +55,15 @@ struct HoglakeSnapshotsState : public GlobalTableFunctionState {
 static unique_ptr<FunctionData> SnapshotsBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &catalog = GetHoglakeCatalog(context, input.inputs[0]);
+	auto result = make_uniq<HoglakeSnapshotsData>(catalog);
+	auto page_size_entry = input.named_parameters.find("page_size");
+	if (page_size_entry != input.named_parameters.end() && !page_size_entry->second.IsNull()) {
+		auto page_size = BigIntValue::Get(page_size_entry->second.DefaultCastAs(LogicalType::BIGINT));
+		if (page_size < 1 || page_size > 10000) {
+			throw BinderException("hoglake_snapshots: page_size must be in [1, 10000]");
+		}
+		result->page_size = NumericCast<idx_t>(page_size);
+	}
 	names = StringsToIdentifiers({"snapshot_id", "snapshot_time", "schema_version", "author", "message", "changes"});
 	return_types = {LogicalType::BIGINT,
 	                LogicalType::TIMESTAMP_TZ,
@@ -60,7 +72,7 @@ static unique_ptr<FunctionData> SnapshotsBind(ClientContext &context, TableFunct
 	                LogicalType::VARCHAR,
 	                LogicalType::LIST(LogicalType::STRUCT(
 	                    {{"kind", LogicalType::VARCHAR}, {"object_id", LogicalType::BIGINT}}))};
-	return make_uniq<HoglakeSnapshotsData>(catalog);
+	return std::move(result);
 }
 
 static unique_ptr<GlobalTableFunctionState> SnapshotsInit(ClientContext &context, TableFunctionInitInput &input) {
@@ -77,7 +89,7 @@ static void SnapshotsExecute(ClientContext &context, TableFunctionInput &data, D
 			if (state.exhausted) {
 				break;
 			}
-			auto page = bind_data.catalog.Api().ListSnapshots(state.after, 1000);
+			auto page = bind_data.catalog.Api().ListSnapshots(state.after, bind_data.page_size);
 			state.buffered = std::move(page.snapshots);
 			state.buffer_offset = 0;
 			if (!state.buffered.empty()) {
@@ -129,18 +141,31 @@ struct HoglakeTableInfoRow {
 };
 
 struct HoglakeTableInfoData : public TableFunctionData {
-	vector<HoglakeTableInfoRow> rows;
+	explicit HoglakeTableInfoData(HoglakeCatalog &catalog) : catalog(catalog) {
+	}
+	HoglakeCatalog &catalog;
 };
 
 struct HoglakeTableInfoState : public GlobalTableFunctionState {
+	vector<HoglakeTableInfoRow> rows;
 	idx_t offset = 0;
 };
 
 static unique_ptr<FunctionData> TableInfoBind(ClientContext &context, TableFunctionBindInput &input,
                                               vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &catalog = GetHoglakeCatalog(context, input.inputs[0]);
+	names = StringsToIdentifiers(
+	    {"namespace", "table_name", "table_uuid", "record_count", "file_count", "file_size_bytes"});
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UUID,
+	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};
+	return make_uniq<HoglakeTableInfoData>(catalog);
+}
+
+static unique_ptr<GlobalTableFunctionState> TableInfoInit(ClientContext &context, TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<HoglakeTableInfoData>();
+	auto &catalog = bind_data.catalog;
 	auto &transaction = HoglakeTransaction::Get(context, catalog);
-	auto result = make_uniq<HoglakeTableInfoData>();
+	auto result = make_uniq<HoglakeTableInfoState>();
 	for (auto &ns : catalog.Api().ListNamespaces()) {
 		for (auto &summary : catalog.Api().ListTables(ns)) {
 			auto table = catalog.Api().TryGetTable(ns, summary.name, transaction.Travel());
@@ -157,23 +182,14 @@ static unique_ptr<FunctionData> TableInfoBind(ClientContext &context, TableFunct
 			result->rows.push_back(std::move(row));
 		}
 	}
-	names = StringsToIdentifiers(
-	    {"namespace", "table_name", "table_uuid", "record_count", "file_count", "file_size_bytes"});
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UUID,
-	                LogicalType::BIGINT,  LogicalType::BIGINT,  LogicalType::BIGINT};
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> TableInfoInit(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<HoglakeTableInfoState>();
-}
-
 static void TableInfoExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<HoglakeTableInfoData>();
 	auto &state = data.global_state->Cast<HoglakeTableInfoState>();
 	idx_t count = 0;
-	while (count < STANDARD_VECTOR_SIZE && state.offset < bind_data.rows.size()) {
-		auto &row = bind_data.rows[state.offset++];
+	while (count < STANDARD_VECTOR_SIZE && state.offset < state.rows.size()) {
+		auto &row = state.rows[state.offset++];
 		output.SetValue(0, count, Value(row.namespace_name));
 		output.SetValue(1, count, Value(row.table_name));
 		output.SetValue(2, count, Value(row.table_uuid).DefaultCastAs(LogicalType::UUID));
@@ -190,37 +206,42 @@ static void TableInfoExecute(ClientContext &context, TableFunctionInput &data, D
 //===--------------------------------------------------------------------===//
 
 struct HoglakeCurrentSnapshotData : public TableFunctionData {
-	idx_t snapshot_id = 0;
+	explicit HoglakeCurrentSnapshotData(HoglakeCatalog &catalog) : catalog(catalog) {
+	}
+	HoglakeCatalog &catalog;
 };
 
 struct HoglakeOneRowState : public GlobalTableFunctionState {
 	bool done = false;
+	//! the JSON payload / snapshot id produced at INIT time
+	string result_json;
+	idx_t snapshot_id = 0;
 };
 
 static unique_ptr<FunctionData> CurrentSnapshotBind(ClientContext &context, TableFunctionBindInput &input,
                                                     vector<LogicalType> &return_types, vector<Identifier> &names) {
 	auto &catalog = GetHoglakeCatalog(context, input.inputs[0]);
-	auto &transaction = HoglakeTransaction::Get(context, catalog);
-	auto result = make_uniq<HoglakeCurrentSnapshotData>();
-	result->snapshot_id = transaction.GetSnapshot();
 	names = StringsToIdentifiers({"id"});
 	return_types = {LogicalType::UBIGINT};
+	return make_uniq<HoglakeCurrentSnapshotData>(catalog);
+}
+
+static unique_ptr<GlobalTableFunctionState> CurrentSnapshotInit(ClientContext &context,
+                                                                TableFunctionInitInput &input) {
+	auto &bind_data = input.bind_data->Cast<HoglakeCurrentSnapshotData>();
+	auto result = make_uniq<HoglakeOneRowState>();
+	result->snapshot_id = HoglakeTransaction::Get(context, bind_data.catalog).GetSnapshot();
 	return std::move(result);
 }
 
-static unique_ptr<GlobalTableFunctionState> OneRowInit(ClientContext &context, TableFunctionInitInput &input) {
-	return make_uniq<HoglakeOneRowState>();
-}
-
 static void CurrentSnapshotExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<HoglakeCurrentSnapshotData>();
 	auto &state = data.global_state->Cast<HoglakeOneRowState>();
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
 	state.done = true;
-	output.SetValue(0, 0, Value::UBIGINT(bind_data.snapshot_id));
+	output.SetValue(0, 0, Value::UBIGINT(state.snapshot_id));
 	output.SetCardinality(1);
 }
 
@@ -230,34 +251,45 @@ static void CurrentSnapshotExecute(ClientContext &context, TableFunctionInput &d
 //===--------------------------------------------------------------------===//
 
 struct HoglakeMaintenanceData : public TableFunctionData {
-	string result_json;
+	HoglakeMaintenanceData(HoglakeCatalog &catalog, const char *verb) : catalog(catalog), verb(verb) {
+	}
+	HoglakeCatalog &catalog;
+	const char *verb;
+	optional_idx batch;
 };
 
 static unique_ptr<FunctionData> MaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<Identifier> &names,
                                                 const char *verb) {
 	auto &catalog = GetHoglakeCatalog(context, input.inputs[0]);
-	optional_idx batch;
+	auto result = make_uniq<HoglakeMaintenanceData>(catalog, verb);
 	auto entry = input.named_parameters.find("batch");
 	if (entry != input.named_parameters.end() && !entry->second.IsNull()) {
-		batch = NumericCast<idx_t>(BigIntValue::Get(entry->second.DefaultCastAs(LogicalType::BIGINT)));
+		result->batch = NumericCast<idx_t>(BigIntValue::Get(entry->second.DefaultCastAs(LogicalType::BIGINT)));
 	}
-	auto result = make_uniq<HoglakeMaintenanceData>();
-	result->result_json = catalog.Api().RunMaintenance(verb, batch);
 	names = StringsToIdentifiers({"result"});
 	return_types = {LogicalType::JSON()};
 	return std::move(result);
 }
 
+static unique_ptr<GlobalTableFunctionState> MaintenanceInit(ClientContext &context, TableFunctionInitInput &input) {
+	// the server-side mutation runs HERE (execution), never at bind:
+	// EXPLAIN / prepare of a maintenance function must not mutate the
+	// catalog
+	auto &bind_data = input.bind_data->Cast<HoglakeMaintenanceData>();
+	auto result = make_uniq<HoglakeOneRowState>();
+	result->result_json = bind_data.catalog.Api().RunMaintenance(bind_data.verb, bind_data.batch);
+	return std::move(result);
+}
+
 static void MaintenanceExecute(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-	auto &bind_data = data.bind_data->Cast<HoglakeMaintenanceData>();
 	auto &state = data.global_state->Cast<HoglakeOneRowState>();
 	if (state.done) {
 		output.SetCardinality(0);
 		return;
 	}
 	state.done = true;
-	output.SetValue(0, 0, Value(bind_data.result_json).DefaultCastAs(LogicalType::JSON()));
+	output.SetValue(0, 0, Value(state.result_json).DefaultCastAs(LogicalType::JSON()));
 	output.SetCardinality(1);
 }
 
@@ -279,6 +311,7 @@ static constexpr const char VERIFY_VERB[] = "verify";
 void HoglakeMetadataFunctions::Register(ExtensionLoader &loader) {
 	TableFunction snapshots("hoglake_snapshots", {LogicalType::VARCHAR}, SnapshotsExecute, SnapshotsBind,
 	                        SnapshotsInit);
+	snapshots.named_parameters["page_size"] = LogicalType::BIGINT;
 	loader.RegisterFunction(snapshots);
 
 	TableFunction table_info("hoglake_table_info", {LogicalType::VARCHAR}, TableInfoExecute, TableInfoBind,
@@ -286,26 +319,26 @@ void HoglakeMetadataFunctions::Register(ExtensionLoader &loader) {
 	loader.RegisterFunction(table_info);
 
 	TableFunction current_snapshot("hoglake_current_snapshot", {LogicalType::VARCHAR}, CurrentSnapshotExecute,
-	                               CurrentSnapshotBind, OneRowInit);
+	                               CurrentSnapshotBind, CurrentSnapshotInit);
 	loader.RegisterFunction(current_snapshot);
 
 	TableFunction expire("hoglake_expire", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                     MaintenanceBindFor<EXPIRE_VERB>, OneRowInit);
+	                     MaintenanceBindFor<EXPIRE_VERB>, MaintenanceInit);
 	expire.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(expire);
 
 	TableFunction compact("hoglake_compact", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                      MaintenanceBindFor<COMPACT_VERB>, OneRowInit);
+	                      MaintenanceBindFor<COMPACT_VERB>, MaintenanceInit);
 	compact.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(compact);
 
 	TableFunction cleanup("hoglake_cleanup", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                      MaintenanceBindFor<CLEANUP_VERB>, OneRowInit);
+	                      MaintenanceBindFor<CLEANUP_VERB>, MaintenanceInit);
 	cleanup.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(cleanup);
 
 	TableFunction verify("hoglake_verify", {LogicalType::VARCHAR}, MaintenanceExecute, MaintenanceBindFor<VERIFY_VERB>,
-	                     OneRowInit);
+	                     MaintenanceInit);
 	loader.RegisterFunction(verify);
 }
 

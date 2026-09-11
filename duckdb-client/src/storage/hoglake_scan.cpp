@@ -80,12 +80,14 @@ HoglakeFunctionInfo::HoglakeFunctionInfo(HoglakeTableEntry &table_p, HoglakeTran
 
 shared_ptr<HoglakeFunctionInfo> HoglakeFunctionInfo::Create(HoglakeTableEntry &table, HoglakeTransaction &transaction) {
 	auto result = make_shared_ptr<HoglakeFunctionInfo>(table, transaction);
-	result->table_name = table.name.GetIdentifierName();
+	// the server's exact (case-preserved) table name — every wire call
+	// uses it, never the user-typed identifier
+	result->table_name = table.GetWireInfo().name;
 	for (auto &col : table.GetColumns().Logical()) {
 		result->column_names.push_back(col.Name().GetIdentifierName());
 		result->column_types.push_back(col.Type());
 	}
-	result->travel = table.IsTravelPinned() ? table.GetTravel() : transaction.Travel();
+	result->travel = table.GetReadTravel();
 	return result;
 }
 
