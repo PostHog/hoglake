@@ -182,3 +182,22 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
 - Verified 2026-09-11: ./test/run-live-tests.sh fully green — 8
   sqllogictest files / 406 assertions + 4 cross-client partition
   groups byte-shared.
+
+## Review round 2 — all 13 confirmed findings fixed, 5 overflow lows assessed: DONE
+- Dispositions: REVIEW-FINDINGS-R2.md ("Round-2 fix dispositions").
+  Headlines: read-your-own-DELETES via scan-side buffered-DV merge
+  (both live corruption repros — resurrect and double — now commit
+  correct data), instant-semantics timestamp parsing on AT()/
+  SNAPSHOT_TIME (explicit offsets never dropped; tested at +02:00 on
+  both paths), symmetric DML-after-DDL refusal rules (ALTER-then-
+  DELETE self-conflict closed; ALTER-then-INSERT still commits),
+  CI-conflict checks on every ALTER target + unrepresentable-table
+  containment (listings survive), namespace ambiguity policy,
+  read-only refusal for mutating maintenance (pin-forced included),
+  failed-commit transaction-map leak fix, puffin range-check UB fix,
+  base64 BLOB partition decode, GetSnapshot-under-time-pin honesty,
+  and a permanent 8-round concurrency regression test for the round-1
+  UAF fix. Round-1 disposition #12's false claim corrected in place.
+- Verified 2026-09-11: ./test/run-live-tests.sh fully green — 9
+  sqllogictest files / 515 assertions + 4 cross-client partition
+  groups byte-shared.

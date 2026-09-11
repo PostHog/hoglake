@@ -149,6 +149,8 @@ require-env DUCKEXT_POINTS_SNAP_V2
 
 require-env DUCKEXT_POINTS_T1
 
+require-env DUCKEXT_POINTS_T1_PLUS2
+
 require-env DUCKEXT_EVO_SNAP_V1
 
 statement ok
@@ -225,5 +227,66 @@ SELECT count(*) FROM laket.ns1.points
 ----
 3
 
+# a SNAPSHOT_TIME attach has no client-resolved snapshot id (wire gap):
+# asking for one errors instead of reporting head
+statement error
+SELECT * FROM hoglake_current_snapshot('laket')
+----
+<REGEX>:.*cannot resolve a timestamp to a snapshot id.*
+
 statement ok
 DETACH laket
+
+# ---- explicit UTC offsets are INSTANT-parsed, never dropped:
+# DUCKEXT_POINTS_T1_PLUS2 is the SAME instant as T1 written at +02:00.
+# An offset-dropping client reads head (5 rows) instead of 3. ----
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakeo (ENDPOINT '{HOGLAKE_URL}')
+
+query I
+SELECT count(*) FROM lakeo.ns1.points AT (TIMESTAMP => '{DUCKEXT_POINTS_T1_PLUS2}')
+----
+3
+
+statement ok
+DETACH lakeo
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakeo2
+    (ENDPOINT '{HOGLAKE_URL}', SNAPSHOT_TIME '{DUCKEXT_POINTS_T1_PLUS2}', READ_ONLY)
+
+query I
+SELECT count(*) FROM lakeo2.ns1.points
+----
+3
+
+statement ok
+DETACH lakeo2
+
+# ---- the PIN ITSELF forces read-only (no explicit READ_ONLY flag):
+# this is the extension's enforcement, not DuckDB's flag handling ----
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakenf
+    (ENDPOINT '{HOGLAKE_URL}', SNAPSHOT_VERSION {DUCKEXT_POINTS_SNAP_V1})
+
+query I
+SELECT count(*) FROM lakenf.ns1.points
+----
+3
+
+statement error
+INSERT INTO lakenf.ns1.points VALUES (99, 'z', 0.0, NULL)
+----
+<REGEX>:.*read-only.*
+
+statement ok
+DETACH lakenf
+
+# an explicit READ_WRITE + pin is refused at attach
+statement error
+ATTACH 'hoglake:duckext-read' AS lakerw
+    (ENDPOINT '{HOGLAKE_URL}', SNAPSHOT_VERSION {DUCKEXT_POINTS_SNAP_V1}, READ_WRITE)
+----
+<REGEX>:.*read-only mode.*

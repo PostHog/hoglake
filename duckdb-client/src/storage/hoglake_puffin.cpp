@@ -337,12 +337,19 @@ vector<idx_t> HoglakePuffin::ReadDeletionVector(ClientContext &context, const st
 		}
 		auto raw_offset = yyjson_get_sint(offset_val);
 		auto raw_length = yyjson_get_sint(length_val);
-		if (raw_offset < NumericCast<int64_t>(PUFFIN_MAGIC_SIZE) || raw_length < 12 ||
-		    NumericCast<idx_t>(raw_offset + raw_length) > blob_section_end) {
+		if (raw_offset < NumericCast<int64_t>(PUFFIN_MAGIC_SIZE) || raw_length < 12) {
 			throw InvalidInputException("Puffin file \"%s\" is corrupt - blob range out of bounds", path);
 		}
-		blob_offset = NumericCast<idx_t>(raw_offset);
-		blob_length = NumericCast<idx_t>(raw_length);
+		// range-check WITHOUT adding the two untrusted values (a signed
+		// int64 add of hostile offset+length is UB before the check
+		// could reject it)
+		auto checked_offset = NumericCast<idx_t>(raw_offset);
+		auto checked_length = NumericCast<idx_t>(raw_length);
+		if (checked_length > blob_section_end || checked_offset > blob_section_end - checked_length) {
+			throw InvalidInputException("Puffin file \"%s\" is corrupt - blob range out of bounds", path);
+		}
+		blob_offset = checked_offset;
+		blob_length = checked_length;
 		dv_blobs++;
 	}
 	if (dv_blobs != 1) {

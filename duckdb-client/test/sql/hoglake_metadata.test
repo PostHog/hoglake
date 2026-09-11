@@ -109,10 +109,15 @@ ns1	tt	3
 # expires nothing and compaction finds no groups — the numbers are
 # asserted as present-and-zero, not as real maintenance effects. ----
 
-# planning a maintenance function must NOT run the mutation (the POST
-# happens at execution, not bind)
+# smoke-only: EXPLAIN exercises the bind path of a maintenance
+# function. HONESTY NOTE: on this dev stack a stray bind-time POST
+# /maintenance/expire would be a silent no-op (no retention
+# configured), so this statement CANNOT detect a
+# mutation-at-bind regression — the guarantee lives in the code
+# (MaintenanceInit) and the read-only refusal test below.
 statement ok
 EXPLAIN SELECT * FROM hoglake_expire('lake')
+
 
 query II
 SELECT result ->> '$.snapshots_expired' IS NOT NULL, result ->> '$.new_earliest_snapshot_id' IS NOT NULL
@@ -146,3 +151,32 @@ SELECT * FROM hoglake_snapshots('not_attached')
 
 statement ok
 DETACH lake
+
+# a read-only attach refuses mutating maintenance outright (and a
+# SNAPSHOT pin forces read-only, so pinned readers are covered too);
+# hoglake_verify stays allowed (read-only server op)
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake_ro (ENDPOINT '{HOGLAKE_URL}', READ_ONLY)
+
+statement error
+SELECT * FROM hoglake_expire('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+statement error
+SELECT * FROM hoglake_compact('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+statement error
+SELECT * FROM hoglake_cleanup('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+query I
+SELECT result ->> '$.status' FROM hoglake_verify('lake_ro')
+----
+pass
+
+statement ok
+DETACH lake_ro

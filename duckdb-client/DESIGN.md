@@ -150,6 +150,19 @@ puffin file, and the registration REPLACES the earlier buffered one.
 The server's one-live-DV-per-data-file invariant therefore holds for
 any multi-statement DML transaction (`hoglake_txn.test`).
 
+**Read-your-own-DELETES (and only deletes).** Every same-transaction
+scan merges the transaction's buffered delete positions into its
+delete mask (AT-clause reads stay historical), so a later statement
+never re-reads a row this transaction already deleted — without this,
+DELETE-then-UPDATE resurrected the deleted row and UPDATE-then-UPDATE
+doubled the table, silently, at commit. Uncommitted INSERTS remain
+invisible: a second unpredicated UPDATE in one transaction therefore
+reports 0 rows (the first UPDATE's rewrites are unreadable inserts,
+its sources are masked deletes) and the +N of the second UPDATE is not
+applied — visible in the statement's row count, tested in
+`hoglake_txn.test`, and the honest consequence of buffering inserts
+while masking deletes.
+
 ## Transactions and eager DDL
 
 Every hoglake DDL endpoint (create/drop/alter table, create namespace)
@@ -166,13 +179,27 @@ finding 3). Two rules keep this honest instead of quietly broken:
    DELETE t; ALTER t; COMMIT would always 409 against the
    transaction's own alter. DDL on OTHER tables stays allowed — the
    server's conflict check is table-scoped.
+1b. **The mirror order is refused too.** The server's conflict check
+   runs iff the commit carries deletes and scans
+   `table_dropped`/`table_altered` changes after `read_snapshot` over
+   every touched table (appends and deletes alike). So after an eager
+   ALTER on table x in this transaction: DELETE/UPDATE on x is
+   refused; DELETE/UPDATE anywhere is refused while buffered appends
+   target x; INSERT into x is refused while buffered deletes exist.
+   ALTER x; INSERT x; COMMIT stays legal (append-only commits are
+   blind). `table_created` is NOT conflict-scanned, so tables created
+   in the transaction are freely writable.
 2. **Tables created or altered inside the transaction read at the
    post-DDL snapshot**, not the (older) transaction pin: their entry
    carries a fixed `read_travel` of the head observed right after the
    DDL. Without this, SELECT after CREATE in the same transaction
    404s (the pin predates the table). The rest of the transaction
-   keeps the original pin; this is the honest per-table cost of
-   non-transactional wire DDL, and it is deterministic.
+   keeps the original pin. Because the create/alter wire responses
+   carry no snapshot id (unlike drop — server finding 9), "right
+   after" is a separate GET /catalogs/{c}: a foreign commit landing
+   inside that one-RTT window becomes visible through the DDL-touched
+   entry. Unfixable client-side; the entry's travel already includes
+   every foreign commit between the pin and the DDL by design.
 
 CREATE TABLE AS works: eager create, then buffered insert committing
 on COMMIT (the CTAS child plan is cast to the wire types first —
@@ -194,10 +221,16 @@ identifier to the server's exact name and sends THAT (never the typed
 case). Creates send the typed case (case-preserving); CI-equal names
 are duplicates, DuckDB-style. Two server tables whose names differ
 only by case are unaddressable from DuckDB and reported as ambiguous.
-Column identifiers resolve the same way against the wire columns
-(`hoglake_case.test` covers cold-cache lookups, DDL, DML, and the
-conflict check). Namespaces already resolve through the listing-backed
-schema cache.
+Column identifiers resolve the same way against the wire columns, and
+DDL TARGETS are CI-conflict-checked before the eager server commit
+(ADD/RENAME COLUMN, RENAME TABLE — the server checks exact case only,
+and a committed CI column collision is unrepresentable in DuckDB's
+ColumnList; self case-change renames stay legal). Case-colliding
+pairs created by other clients error as ambiguous on lookup and are
+skipped in listings — for tables, columns (a targeted per-table
+error; the rest of the catalog stays browsable), and namespaces
+alike. `hoglake_case.test` covers cold-cache lookups, DDL, DML, the
+conflict checks, and the fixture-created ambiguous pairs.
 
 ## Read path
 
@@ -299,7 +332,7 @@ DuckLake function → hoglake equivalent:
 | `ducklake_table_deletions` | `delete_files` half of `/changes` | positions only; row materialization = read data file + DV diff |
 | `ducklake_merge_adjacent_files` | `hoglake_compact(cat)` | POST `/maintenance/compact` (server-side — the whole point) |
 | `ducklake_rewrite_data_files` | server compaction policy | no client knob; N/A |
-| `ducklake_expire_snapshots` | `hoglake_expire(cat)` | POST `/maintenance/expire` |
+| `ducklake_expire_snapshots` | `hoglake_expire(cat)` | POST `/maintenance/expire`; all mutating maintenance functions refuse read-only attaches (incl. pin-forced read-only) |
 | `ducklake_cleanup_old_files` | `hoglake_cleanup(cat)` | POST `/maintenance/cleanup` (liveness-checked server-side) |
 | `ducklake_delete_orphaned_files` | — | server concern; not exposed |
 | `ducklake_flush_inlined_data` | — | N/A (no inlining in hoglake, by design) |
@@ -396,7 +429,18 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    preserve row identity (ducklake preserves; hoglake UPDATE assigns
    new row ids). If preserved-rowid updates matter, the commit needs
    the flag (plus the row-id-tiling exemption compaction outputs get).
-8. Environment (not wire): the local dev stack's hydrator hydrates
+8. `POST .../tables/{t}` (create) and `.../alter` responses carry no
+   snapshot_id (drop's CommitResult does): the client cannot learn its
+   own DDL commit's snapshot and papers over it with a racy
+   GET /catalogs — return CommitResult-style snapshot info on
+   create/alter for a deterministic post-DDL read pin.
+9. No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
+   attach can never produce a client-side snapshot id (reads stay
+   consistent because the server re-resolves the same timestamp to the
+   same snapshot; `hoglake_current_snapshot` errors instead of lying).
+   Returning the resolved snapshot id on time-travel responses (or a
+   resolve endpoint) would close this.
+10. Environment (not wire): the local dev stack's hydrator hydrates
    nothing — every deferred-stats file stays `pending` forever
    (pyhoglake deferred appends included). Blocks rename-column on
    tables with live client-written files and starves compaction of

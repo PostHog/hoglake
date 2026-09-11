@@ -6,6 +6,7 @@
 #include "duckdb/optimizer/filter_combiner.hpp"
 #include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/table_filter.hpp"
+#include "duckdb/common/types/blob.hpp"
 #include "common/hoglake_types.hpp"
 #include "storage/hoglake_table_entry.hpp"
 #include "storage/hoglake_transaction.hpp"
@@ -135,6 +136,21 @@ unique_ptr<MultiFileList> HoglakeMultiFileList::ComplexFilterPushdown(ClientCont
 				Value typed_value;
 				if (wire_value.IsNull()) {
 					typed_value = Value(key_filter.type);
+				} else if (key_filter.type.id() == LogicalTypeId::BLOB) {
+					// pyhoglake's wire encoding for binary identity
+					// partition values is BASE64 (transforms.wire_string);
+					// a VARCHAR->BLOB cast would keep the base64 TEXT
+					// bytes and mis-prune. Decode; fail open on garbage.
+					try {
+						auto &b64 = StringValue::Get(wire_value);
+						string_t b64_str(b64.c_str(), NumericCast<uint32_t>(b64.size()));
+						auto decoded_size = Blob::FromBase64Size(b64_str);
+						auto decoded = make_unsafe_uniq_array<data_t>(decoded_size);
+						Blob::FromBase64(b64_str, decoded.get(), decoded_size);
+						typed_value = Value::BLOB(decoded.get(), decoded_size);
+					} catch (...) {
+						continue;
+					}
 				} else if (!wire_value.DefaultTryCastAs(key_filter.type, typed_value, nullptr)) {
 					continue;
 				}

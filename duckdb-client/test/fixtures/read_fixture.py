@@ -18,7 +18,7 @@ http://localhost:19000), HOGLAKE_S3_ACCESS_KEY / _SECRET_KEY
 
 import os
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pyarrow as pa
 
@@ -184,6 +184,44 @@ def main() -> None:
             )
             print(f"fixture ready: {CATALOG}/ns1.{tname}")
 
+        # binary identity partition (pyhoglake-only: the extension
+        # refuses binary partition WRITES; its pruning must still read
+        # these correctly — the wire value is base64)
+        try:
+            ns.table("part_bin").drop()
+        except NotFoundError:
+            pass
+        pb = ns.create_table(
+            "part_bin", pa.schema([pa.field("k", pa.binary()), pa.field("n", pa.int64())])
+        )
+        k_field = next(c for c in pb.columns if c.name == "k")
+        pb.alter([ops.set_partition_spec([ops.partition_field(k_field.field_id, "identity")])])
+        pb.append(
+            pa.table(
+                {"k": pa.array([b"hello", b"\x00\x01"], pa.binary()), "n": pa.array([1, 2], pa.int64())},
+                schema=pa.schema([pa.field("k", pa.binary()), pa.field("n", pa.int64())]),
+            )
+        )
+        print(f"fixture ready: {CATALOG}/ns1.part_bin")
+
+        # case-colliding pairs the EXTENSION refuses to create but other
+        # clients legally can: a table pair (ambiguity errors + listings
+        # must survive) and a namespace pair. Idempotent; namespaces
+        # cannot be dropped on the wire, so the pair persists.
+        for tname in ("ambig_t", "Ambig_T"):
+            try:
+                ns.table(tname).drop()
+            except NotFoundError:
+                pass
+            ns.create_table(tname, pa.schema([pa.field("x", pa.int64())]))
+        print(f"fixture ready: {CATALOG}/ns1.ambig_t + Ambig_T (CI-colliding pair)")
+        for nsname in ("ambigns", "AmbigNs"):
+            try:
+                catalog.create_namespace(nsname)
+            except AlreadyExistsError:
+                pass
+        print(f"fixture ready: {CATALOG} namespaces ambigns + AmbigNs (CI-colliding pair)")
+
         # time-travel env for the sqllogictests: genuinely historical
         # snapshot ids and a timestamp BETWEEN the two points batches
         # (proves timestamp resolution picks the earlier snapshot).
@@ -199,10 +237,14 @@ def main() -> None:
         # DuckDB-natural local format (no zone, space separator): the
         # attach path must normalize it to an ISO instant itself
         t1_natural = t1.strftime("%Y-%m-%d %H:%M:%S.%f")
+        # the same instant as T1 expressed at +02:00 (offset handling:
+        # a client that drops the offset reads head instead of batch1)
+        t1_plus2 = (t1 + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S.%f") + "+02:00"
         env_lines = [
             f"export DUCKEXT_POINTS_SNAP_V1={r1.snapshot_id}",
             f"export DUCKEXT_POINTS_SNAP_V2={r2.snapshot_id}",
             f"export DUCKEXT_POINTS_T1='{t1_natural}'",
+            f"export DUCKEXT_POINTS_T1_PLUS2='{t1_plus2}'",
             f"export DUCKEXT_EVO_SNAP_V1={e1.snapshot_id}",
         ]
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live-env.sh")

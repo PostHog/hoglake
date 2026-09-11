@@ -219,6 +219,9 @@ PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlan
 	if (table.IsTravelPinned()) {
 		throw BinderException("hoglake: cannot INSERT into a table pinned with AT (VERSION/TIMESTAMP)");
 	}
+	auto &plan_transaction = HoglakeTransaction::Get(context, table.ParentCatalog());
+	plan_transaction.RequireDMLAllowed(table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name,
+	                                   false /* is_delete */);
 	auto &wire = table.GetWireInfo();
 
 	auto columns = wire.columns;

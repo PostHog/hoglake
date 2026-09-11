@@ -158,5 +158,135 @@ SELECT (SELECT count(*) FROM lake.ns1.txn_created), (SELECT count(*) FROM lake.n
 ----
 0	1
 
+# ---- read-your-own-DELETES: later statements in a transaction must
+# not re-read rows the transaction already deleted (pre-fix, (a)
+# resurrected the deleted row and (b) doubled the table — both
+# committed silently wrong data) ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_txn_a
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_txn_b
+
+statement ok
+CREATE TABLE lake.ns1.ryo_txn_a (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_a VALUES (1), (2), (3)
+
+statement ok
+CREATE TABLE lake.ns1.ryo_txn_b (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (1), (2), (3)
+
+# (a) DELETE then unpredicated UPDATE: the deleted row must NOT be
+# resurrected
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 3
+----
+1
+
+query I
+UPDATE lake.ns1.ryo_txn_a SET a = a + 10
+----
+2
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.ryo_txn_a ORDER BY a
+----
+11
+12
+
+# (b) two unpredicated UPDATEs: no doubling. The second UPDATE reports
+# 0 rows — the first UPDATE's rewritten rows are uncommitted INSERTS,
+# which this transaction's scans do not see (documented divergence;
+# DESIGN.md "Transactions and snapshot pinning")
+statement ok
+BEGIN
+
+query I
+UPDATE lake.ns1.ryo_txn_b SET a = a + 10
+----
+3
+
+query I
+UPDATE lake.ns1.ryo_txn_b SET a = a + 100
+----
+0
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.ryo_txn_b ORDER BY a
+----
+11
+12
+13
+
+# ---- DML after eager DDL on the same table: a commit carrying
+# deletes would 409 against the transaction's own ALTER — refused
+# loudly instead (mirror order of the DDL-after-writes rule) ----
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_a ADD COLUMN c INTEGER
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+<REGEX>:.*already ran DDL on it.*
+
+statement ok
+ROLLBACK
+
+# ALTER then INSERT (no deletes anywhere) commits fine: append-only
+# commits are blind and never conflict-checked
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b ADD COLUMN c INTEGER
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (99, 7)
+
+statement ok
+COMMIT
+
+query II
+SELECT a, c FROM lake.ns1.ryo_txn_b WHERE a = 99
+----
+99	7
+
+# ALTER x + INSERT x + DELETE y: the delete would drag the altered
+# table into the conflict check — refused
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b DROP COLUMN c
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (100)
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+<REGEX>:.*inserted into table.*after running DDL.*
+
+statement ok
+ROLLBACK
+
 statement ok
 DETACH lake

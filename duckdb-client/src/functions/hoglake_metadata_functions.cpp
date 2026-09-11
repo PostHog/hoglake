@@ -260,8 +260,17 @@ struct HoglakeMaintenanceData : public TableFunctionData {
 
 static unique_ptr<FunctionData> MaintenanceBind(ClientContext &context, TableFunctionBindInput &input,
                                                 vector<LogicalType> &return_types, vector<Identifier> &names,
-                                                const char *verb) {
+                                                const char *verb, bool mutating) {
 	auto &catalog = GetHoglakeCatalog(context, input.inputs[0]);
+	if (mutating && catalog.GetAttached().IsReadOnly()) {
+		// covers explicit READ_ONLY attaches AND SNAPSHOT_VERSION/
+		// SNAPSHOT_TIME pins (which force read-only): a pinned reader
+		// must never trigger destructive server-side maintenance
+		throw InvalidInputException(
+		    "hoglake: %s runs server-side catalog maintenance (a mutation) and catalog \"%s\" is attached "
+		    "read-only",
+		    verb, catalog.GetOptions().catalog_name);
+	}
 	auto result = make_uniq<HoglakeMaintenanceData>(catalog, verb);
 	auto entry = input.named_parameters.find("batch");
 	if (entry != input.named_parameters.end() && !entry->second.IsNull()) {
@@ -293,10 +302,10 @@ static void MaintenanceExecute(ClientContext &context, TableFunctionInput &data,
 	output.SetCardinality(1);
 }
 
-template <const char *VERB>
+template <const char *VERB, bool MUTATING>
 static unique_ptr<FunctionData> MaintenanceBindFor(ClientContext &context, TableFunctionBindInput &input,
                                                    vector<LogicalType> &return_types, vector<Identifier> &names) {
-	return MaintenanceBind(context, input, return_types, names, VERB);
+	return MaintenanceBind(context, input, return_types, names, VERB, MUTATING);
 }
 
 static constexpr const char EXPIRE_VERB[] = "expire";
@@ -323,21 +332,21 @@ void HoglakeMetadataFunctions::Register(ExtensionLoader &loader) {
 	loader.RegisterFunction(current_snapshot);
 
 	TableFunction expire("hoglake_expire", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                     MaintenanceBindFor<EXPIRE_VERB>, MaintenanceInit);
+	                     MaintenanceBindFor<EXPIRE_VERB, true>, MaintenanceInit);
 	expire.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(expire);
 
 	TableFunction compact("hoglake_compact", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                      MaintenanceBindFor<COMPACT_VERB>, MaintenanceInit);
+	                      MaintenanceBindFor<COMPACT_VERB, true>, MaintenanceInit);
 	compact.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(compact);
 
 	TableFunction cleanup("hoglake_cleanup", {LogicalType::VARCHAR}, MaintenanceExecute,
-	                      MaintenanceBindFor<CLEANUP_VERB>, MaintenanceInit);
+	                      MaintenanceBindFor<CLEANUP_VERB, true>, MaintenanceInit);
 	cleanup.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(cleanup);
 
-	TableFunction verify("hoglake_verify", {LogicalType::VARCHAR}, MaintenanceExecute, MaintenanceBindFor<VERIFY_VERB>,
+	TableFunction verify("hoglake_verify", {LogicalType::VARCHAR}, MaintenanceExecute, MaintenanceBindFor<VERIFY_VERB, false>,
 	                     MaintenanceInit);
 	loader.RegisterFunction(verify);
 }

@@ -18,6 +18,9 @@ public:
 
 	idx_t Filter(row_t start_row_index, idx_t count, SelectionVector &result_sel) override;
 	void Initialize(ClientContext &context, const HoglakeDeleteFile &delete_file);
+	//! Merge additional deleted positions (this transaction's buffered
+	//! deletes) into the mask.
+	void MergePositions(const set<idx_t> &positions);
 };
 
 } // namespace duckdb

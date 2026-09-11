@@ -29,10 +29,10 @@ static void HandleHoglakeOption(HoglakeOptions &options, const string &option, c
 			throw InvalidInputException("Cannot specify both SNAPSHOT_VERSION and SNAPSHOT_TIME");
 		}
 		// normalize to the ISO-8601 instant the server's Instant.parse
-		// accepts (same canonicalization as the AT (TIMESTAMP =>) path);
-		// a naive timestamp is taken as UTC
-		auto utc = value.DefaultCastAs(LogicalType::TIMESTAMP);
-		options.snapshot_time = HoglakeTypes::CanonicalTimestamp(TimestampValue::Get(utc)) + "Z";
+		// accepts, with INSTANT semantics (explicit offsets convert to
+		// UTC instead of being dropped; naive timestamps follow the
+		// session TimeZone — UTC by default)
+		options.snapshot_time = HoglakeTypes::CanonicalInstant(value);
 	} else {
 		throw NotImplementedException("Unsupported option %s for hoglake", option);
 	}

@@ -16,14 +16,18 @@ Transaction &HoglakeTransactionManager::StartTransaction(ClientContext &context)
 
 ErrorData HoglakeTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	auto &hoglake_transaction = transaction.Cast<HoglakeTransaction>();
+	ErrorData result;
 	try {
 		hoglake_transaction.Commit(context);
 	} catch (std::exception &ex) {
-		return ErrorData(ex);
+		result = ErrorData(ex);
 	}
+	// erase on BOTH paths: DuckDB does not call RollbackTransaction for
+	// a transaction whose commit returned an error, so keeping it in the
+	// map would leak it (and its catalog entry caches) until DETACH
 	lock_guard<mutex> l(transaction_lock);
 	transactions.erase(transaction);
-	return ErrorData();
+	return result;
 }
 
 void HoglakeTransactionManager::RollbackTransaction(Transaction &transaction) {

@@ -98,5 +98,85 @@ SELECT * FROM lake.ns1.case_t
 ----
 <REGEX>:.*does not exist.*
 
+# ---- CI-conflict checks on DDL TARGETS (the server checks exact case
+# only; a committed collision would poison the table/catalog for every
+# DuckDB client) ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ci_target_a
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ci_target_b
+
+statement ok
+CREATE TABLE lake.ns1.ci_target_a (team VARCHAR, n BIGINT)
+
+statement ok
+CREATE TABLE lake.ns1.ci_target_b (x BIGINT)
+
+statement error
+ALTER TABLE lake.ns1.ci_target_a ADD COLUMN Team INTEGER
+----
+<REGEX>:.*already exists.*case-insensitive.*
+
+statement error
+ALTER TABLE lake.ns1.ci_target_a RENAME COLUMN n TO TEAM
+----
+<REGEX>:.*already exists.*case-insensitive.*
+
+statement error
+ALTER TABLE lake.ns1.ci_target_a RENAME TO CI_TARGET_B
+----
+<REGEX>:.*already exists.*case-insensitive.*
+
+# renaming a table/column onto ITS OWN name with a case change is fine
+statement ok
+ALTER TABLE lake.ns1.ci_target_a RENAME TO Ci_Target_A
+
+statement ok
+ALTER TABLE lake.ns1.ci_target_a RENAME COLUMN n TO N
+
+statement ok
+DROP TABLE lake.ns1.ci_target_a
+
+statement ok
+DROP TABLE lake.ns1.ci_target_b
+
 statement ok
 DETACH lake
+
+# ---- case-colliding pairs created by OTHER clients (fixture): the
+# extension reports ambiguity and keeps the rest of the catalog
+# browsable ----
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakef (ENDPOINT '{HOGLAKE_URL}')
+
+statement error
+SELECT * FROM lakef.ns1.ambig_t
+----
+<REGEX>:.*ambiguous.*differ only by case.*
+
+statement error
+SELECT * FROM lakef.ns1."Ambig_T"
+----
+<REGEX>:.*ambiguous.*
+
+statement error
+SELECT * FROM lakef.ambigns.anything
+----
+<REGEX>:.*namespace identifier.*ambiguous.*
+
+# the ambiguous pair is skipped; every other table still lists
+query I
+SELECT count(*) >= 8 FROM duckdb_tables() WHERE database_name = 'lakef'
+----
+true
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lakef' AND lower(table_name) = 'ambig_t'
+----
+0
+
+statement ok
+DETACH lakef

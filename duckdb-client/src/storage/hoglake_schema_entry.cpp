@@ -90,6 +90,21 @@ CatalogEntry &HoglakeSchemaEntry::CacheTableInternal(HoglakeTransaction &transac
 	          [](const HoglakeColumn &a, const HoglakeColumn &b) { return a.ordinal < b.ordinal; });
 
 	auto table_name = table_info.name;
+	// a server table with case-colliding column names cannot be
+	// represented by DuckDB's case-insensitive ColumnList; throw a
+	// TARGETED error before ColumnList::AddColumn does (listings skip
+	// such tables; direct lookups surface this message)
+	{
+		case_insensitive_map_t<bool> seen_columns;
+		for (auto &col : columns) {
+			if (!seen_columns.emplace(col.name, true).second) {
+				throw CatalogException(
+				    "hoglake: table \"%s.%s\" has columns whose names differ only by case (\"%s\"), which DuckDB "
+				    "cannot represent. Repair the table via another client",
+				    name.GetIdentifierName(), table_name, col.name);
+			}
+		}
+	}
 	CreateTableInfo create_info(*this, Identifier(table_name));
 	vector<LogicalIndex> not_null;
 	for (auto &col : columns) {
@@ -165,7 +180,14 @@ void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) 
 			// listed at head but missing at the pinned travel
 			continue;
 		}
-		CacheTableInternal(transaction, std::move(*table_info), travel, false);
+		try {
+			CacheTableInternal(transaction, std::move(*table_info), travel, false);
+		} catch (CatalogException &) {
+			// unrepresentable table (e.g. case-colliding columns):
+			// direct lookup surfaces the targeted error; the LISTING
+			// must not break for every other table
+			continue;
+		}
 	}
 	all_tables_loaded = true;
 }
@@ -501,6 +523,17 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		auto &rename = alter_table.Cast<RenameTableInfo>();
 		op.op = "rename_table";
 		op.new_name = rename.new_table_name.GetIdentifierName();
+		// CI-conflict check on the TARGET (the server checks exact-case
+		// only): renaming onto a name that CI-resolves to a DIFFERENT
+		// table would create a case-colliding pair the extension then
+		// reports ambiguous and hides — refuse up front. A CI-self
+		// resolve is a plain case-change rename and is fine.
+		auto target_resolved = ResolveTableNameInternal(hoglake_transaction, op.new_name);
+		if (!target_resolved.empty() && !StringUtil::CIEquals(target_resolved, exact_name)) {
+			throw CatalogException("hoglake: cannot rename table \"%s.%s\" to \"%s\": table \"%s\" already "
+			                       "exists (identifiers are case-insensitive)",
+			                       ns, exact_name, op.new_name, target_resolved);
+		}
 		new_entry_name = op.new_name;
 		break;
 	}
@@ -509,6 +542,17 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		op.op = "rename_column";
 		op.from = ResolveWireColumn(wire, rename.old_name.GetIdentifierName()).name;
 		op.to = rename.new_name.GetIdentifierName();
+		// CI-conflict check on the target (server checks exact-case
+		// only; a committed collision makes the table unrepresentable
+		// in DuckDB). Renaming a column onto its own name with a case
+		// change is fine.
+		for (auto &col : wire.columns) {
+			if (StringUtil::CIEquals(col.name, op.to) && !StringUtil::CIEquals(col.name, op.from)) {
+				throw CatalogException("hoglake: cannot rename column \"%s\" to \"%s\" in table \"%s.%s\": "
+				                       "column \"%s\" already exists (identifiers are case-insensitive)",
+				                       op.from, op.to, ns, exact_name, col.name);
+			}
+		}
 		break;
 	}
 	case AlterTableType::ADD_COLUMN: {
@@ -516,6 +560,16 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		auto &col = add.new_column;
 		if (add.if_column_not_exists && table.ColumnExists(col.Name())) {
 			return;
+		}
+		// CI-conflict check BEFORE the eager server commit (the server
+		// checks exact-case only; a committed CI collision poisons the
+		// table for every DuckDB client)
+		for (auto &wire_col : wire.columns) {
+			if (StringUtil::CIEquals(wire_col.name, col.Name().GetIdentifierName())) {
+				throw CatalogException("hoglake: column \"%s\" already exists in table \"%s.%s\" (identifiers "
+				                       "are case-insensitive)",
+				                       col.Name().GetIdentifierName(), ns, exact_name);
+			}
 		}
 		if (col.HasDefaultValue()) {
 			throw NotImplementedException("hoglake: ADD COLUMN with DEFAULT is not supported (the wire contract "
@@ -583,6 +637,12 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 
 	// eager DDL: one atomic /alter commit (its own server snapshot)
 	auto altered = hoglake_transaction.Api().AlterTable(ns, exact_name, {op});
+	// the table now carries a post-pin table_altered change: commits
+	// with deletes must not touch it (RequireDMLAllowed)
+	hoglake_transaction.RecordAlteredTable(ns, exact_name);
+	if (!StringUtil::CIEquals(new_entry_name, exact_name)) {
+		hoglake_transaction.RecordAlteredTable(ns, altered.name);
+	}
 
 	// the pin predates the alter; the evolved entry reads at the
 	// post-alter head so the new schema and its files line up

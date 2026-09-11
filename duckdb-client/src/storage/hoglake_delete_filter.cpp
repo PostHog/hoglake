@@ -4,6 +4,7 @@
 #include "storage/hoglake_puffin.hpp"
 
 #include <algorithm>
+#include <iterator>
 
 namespace duckdb {
 
@@ -18,6 +19,17 @@ void HoglakeDeleteFilter::Initialize(ClientContext &context, const HoglakeDelete
 		                            "delete_count %lld",
 		                            delete_file.path, deleted_rows.size(), delete_file.delete_count);
 	}
+}
+
+void HoglakeDeleteFilter::MergePositions(const set<idx_t> &positions) {
+	if (positions.empty()) {
+		return;
+	}
+	vector<idx_t> merged;
+	merged.reserve(deleted_rows.size() + positions.size());
+	std::set_union(deleted_rows.begin(), deleted_rows.end(), positions.begin(), positions.end(),
+	               std::back_inserter(merged));
+	deleted_rows = std::move(merged);
 }
 
 idx_t HoglakeDeleteFilter::Filter(row_t start_row_index, idx_t count, SelectionVector &result_sel) {

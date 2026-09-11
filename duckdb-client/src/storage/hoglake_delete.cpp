@@ -150,6 +150,9 @@ PhysicalOperator &HoglakeDelete::PlanDelete(ClientContext &context, PhysicalPlan
 	if (table.IsTravelPinned()) {
 		throw BinderException("hoglake: cannot DELETE from a table pinned with AT (VERSION/TIMESTAMP)");
 	}
+	auto &transaction = HoglakeTransaction::Get(context, table.ParentCatalog());
+	transaction.RequireDMLAllowed(table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name,
+	                              true /* is_delete */);
 	vector<LogicalType> return_types;
 	return_types.emplace_back(LogicalType::BIGINT);
 	auto &delete_op = planner.Make<HoglakeDelete>(return_types, table, std::move(row_id_indexes));

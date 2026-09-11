@@ -3,6 +3,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include <chrono>
@@ -33,6 +34,16 @@ HoglakeApiClient &HoglakeTransaction::Api() {
 idx_t HoglakeTransaction::GetSnapshotInternal() {
 	if (pinned_snapshot.IsValid()) {
 		return pinned_snapshot.GetIndex();
+	}
+	if (!hoglake_catalog.AttachSnapshotTime().empty()) {
+		// a SNAPSHOT_TIME attach has no client-resolved snapshot id (the
+		// wire offers no timestamp->snapshot resolution; reads re-send
+		// at_timestamp and the server resolves it consistently). Pinning
+		// head here would LIE to anything that asks for the snapshot id.
+		throw NotImplementedException(
+		    "hoglake: this attach is pinned by SNAPSHOT_TIME; the wire cannot resolve a timestamp to a snapshot id "
+		    "client-side (reads are still consistently pinned server-side). Attach with SNAPSHOT_VERSION for an "
+		    "explicit snapshot id");
 	}
 	auto attach_pin = hoglake_catalog.AttachSnapshotVersion();
 	if (attach_pin.IsValid()) {
@@ -70,11 +81,11 @@ HoglakeTravel HoglakeTransaction::TravelFor(optional_ptr<BoundAtClause> at_claus
 		return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(BigIntValue::Get(version)));
 	}
 	if (unit == "timestamp") {
-		// server wants an ISO-8601 instant WITH offset; normalize the
-		// TIMESTAMPTZ to a canonical UTC instant string
-		auto utc = at_clause->GetValue().DefaultCastAs(LogicalType::TIMESTAMP);
+		// server wants an ISO-8601 instant WITH offset; parse with
+		// INSTANT semantics (TIMESTAMP_TZ) so explicit offsets convert
+		// instead of being dropped, then send the canonical UTC form
 		HoglakeTravel travel;
-		travel.at_timestamp = HoglakeTypes::CanonicalTimestamp(TimestampValue::Get(utc)) + "Z";
+		travel.at_timestamp = HoglakeTypes::CanonicalInstant(at_clause->GetValue());
 		return travel;
 	}
 	throw BinderException("hoglake: unsupported AT unit \"%s\" (VERSION or TIMESTAMP)", unit);
@@ -177,6 +188,57 @@ bool HoglakeTransaction::HasBufferedWritesFor(const string &ns, const string &ta
 		}
 	}
 	return false;
+}
+
+void HoglakeTransaction::RecordAlteredTable(const string &ns, const string &table) {
+	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
+	altered_tables[ns + "." + table] = true;
+}
+
+bool HoglakeTransaction::IsAlteredTable(const string &ns, const string &table) {
+	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
+	return altered_tables.find(ns + "." + table) != altered_tables.end();
+}
+
+//! Self-conflict prevention: the server's commit conflict check (runs
+//! iff the commit carries deletes) scans table_dropped/table_altered
+//! changes after read_snapshot over every TOUCHED table (appends and
+//! deletes alike). An eager ALTER inside this transaction mints such a
+//! change AFTER the pin, so a later commit-with-deletes touching that
+//! table would deterministically 409 against our own DDL. These rules
+//! keep touched∩altered empty whenever deletes are present.
+void HoglakeTransaction::RequireDMLAllowed(const string &ns, const string &table, bool is_delete) {
+	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
+	if (is_delete) {
+		if (altered_tables.find(ns + "." + table) != altered_tables.end()) {
+			throw TransactionException(
+			    "hoglake: cannot DELETE/UPDATE table \"%s.%s\": this transaction already ran DDL on it, and a "
+			    "delete commit would conflict with the transaction's own (eager, already-persisted) DDL. COMMIT or "
+			    "ROLLBACK first (see DESIGN.md, \"Transactions and eager DDL\")",
+			    ns, table);
+		}
+		for (auto &append : buffered_appends) {
+			auto key = append.namespace_name + "." + append.table_name;
+			if (altered_tables.find(key) != altered_tables.end()) {
+				throw TransactionException(
+				    "hoglake: cannot DELETE/UPDATE in this transaction: it inserted into table \"%s\" after "
+				    "running DDL on it, and a commit carrying deletes would conflict with the transaction's own "
+				    "(eager, already-persisted) DDL. COMMIT or ROLLBACK first (see DESIGN.md, \"Transactions and "
+				    "eager DDL\")",
+				    key);
+			}
+		}
+		return;
+	}
+	// insert: only a problem when the commit will carry deletes AND the
+	// target table was altered in this transaction
+	if (!buffered_deletes.empty() && altered_tables.find(ns + "." + table) != altered_tables.end()) {
+		throw TransactionException(
+		    "hoglake: cannot INSERT into table \"%s.%s\": this transaction ran DDL on it and also holds buffered "
+		    "deletes — the commit's conflict check would 409 against the transaction's own (eager, "
+		    "already-persisted) DDL. COMMIT or ROLLBACK first (see DESIGN.md, \"Transactions and eager DDL\")",
+		    ns, table);
+	}
 }
 
 void HoglakeTransaction::RequireDDLAllowed(const string &ns, const string &table, const char *what) {
@@ -305,7 +367,20 @@ void HoglakeTransaction::LoadSchemas() {
 	// versioned by the pinned snapshot. Tables ARE fetched at the pinned
 	// snapshot. Documented as a server finding in DESIGN.md.
 	auto names = Api().ListNamespaces();
+	// group CI-equal names first: a case-colliding namespace pair is
+	// unaddressable from DuckDB and must error as ambiguous (same
+	// policy as tables), never silently bind first-listed-wins
+	case_insensitive_map_t<vector<string>> grouped;
 	for (auto &ns : names) {
+		grouped[ns].push_back(ns);
+	}
+	for (auto &group : grouped) {
+		auto &exact_names = group.second;
+		if (exact_names.size() > 1) {
+			ambiguous_schemas[exact_names[0]] = exact_names;
+			continue;
+		}
+		auto &ns = exact_names[0];
 		if (schemas.find(ns) != schemas.end()) {
 			continue;
 		}
@@ -320,15 +395,17 @@ void HoglakeTransaction::LoadSchemas() {
 
 optional_ptr<HoglakeSchemaEntry> HoglakeTransaction::GetSchema(const string &name) {
 	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
+	if (!schemas_loaded) {
+		LoadSchemas();
+	}
+	auto ambiguous = ambiguous_schemas.find(name);
+	if (ambiguous != ambiguous_schemas.end()) {
+		throw CatalogException("hoglake: namespace identifier \"%s\" is ambiguous: the server holds multiple "
+		                       "namespaces whose names differ only by case (%s). Rename one via another client to "
+		                       "make them addressable from DuckDB",
+		                       name, StringUtil::Join(ambiguous->second, ", "));
+	}
 	auto entry = schemas.find(name);
-	if (entry != schemas.end()) {
-		return entry->second.get();
-	}
-	if (schemas_loaded) {
-		return nullptr;
-	}
-	LoadSchemas();
-	entry = schemas.find(name);
 	if (entry != schemas.end()) {
 		return entry->second.get();
 	}

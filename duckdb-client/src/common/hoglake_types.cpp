@@ -126,6 +126,16 @@ string HoglakeTypes::CanonicalTimestamp(timestamp_t timestamp) {
 	return result;
 }
 
+string HoglakeTypes::CanonicalInstant(const Value &value) {
+	// TIMESTAMP_TZ parsing has instant semantics: '...+02:00' converts
+	// to the UTC instant instead of silently dropping the offset (which
+	// a naive-TIMESTAMP cast does). The stored representation IS micros
+	// since epoch UTC.
+	auto tz_value = value.DefaultCastAs(LogicalType::TIMESTAMP_TZ);
+	auto micros = TimestampTZValue::Get(tz_value);
+	return CanonicalTimestamp(timestamp_t(micros.value)) + "Z";
+}
+
 string HoglakeTypes::CanonicalDate(date_t date) {
 	int32_t yyyy, mm, dd;
 	Date::Convert(date, yyyy, mm, dd);

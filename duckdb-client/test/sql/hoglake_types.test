@@ -146,5 +146,24 @@ SELECT count(DISTINCT src) FROM lakef.ns1.xclient_bool WHERE k = false
 ----
 2
 
+# ---- binary identity partitions (pyhoglake-written; the wire value is
+# BASE64): pruning must decode, not cast the base64 text into the BLOB,
+# or these filters silently return zero rows ----
+
+query I
+SELECT n FROM lakef.ns1.part_bin WHERE k = '\x68\x65\x6C\x6C\x6F'::BLOB
+----
+1
+
+query I
+SELECT n FROM lakef.ns1.part_bin WHERE k = '\x00\x01'::BLOB
+----
+2
+
+query I
+SELECT count(*) FROM lakef.ns1.part_bin WHERE k IS NOT NULL
+----
+2
+
 statement ok
 DETACH lakef

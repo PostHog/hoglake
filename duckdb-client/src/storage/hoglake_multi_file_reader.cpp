@@ -10,6 +10,7 @@
 #include "storage/hoglake_multi_file_list.hpp"
 #include "storage/hoglake_table_entry.hpp"
 #include "storage/hoglake_transaction.hpp"
+#include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 
 namespace duckdb {
 
@@ -71,9 +72,28 @@ ReaderInitializeType HoglakeMultiFileReader::InitializeReader(MultiFileReaderDat
 	auto &reader = *reader_data.reader;
 	auto file_idx = reader.file_list_idx.GetIndex();
 	auto &file_entry = file_list.GetFileEntry(file_idx);
-	if (file_entry.has_delete_file) {
+
+	// read-your-own-DELETES: merge the positions this transaction has
+	// already buffered for the file (earlier DELETE/UPDATE statements)
+	// into the scan's delete mask — without this, a later DML statement
+	// re-reads rows the transaction deleted and COMMITS resurrected /
+	// doubled data. AT-clause (travel-pinned) entries stay historical:
+	// uncommitted deletes never apply to them.
+	set<idx_t> buffered;
+	if (!read_info.table.IsTravelPinned()) {
+		auto transaction = read_info.GetTransaction();
+		auto ns = read_info.table.ParentSchema().name.GetIdentifierName();
+		buffered =
+		    transaction->GetBufferedDeletePositions(ns, read_info.table_name, file_entry.data_file.data_file_id);
+	}
+	if (file_entry.has_delete_file || !buffered.empty()) {
 		auto delete_filter = make_uniq<HoglakeDeleteFilter>();
-		delete_filter->Initialize(context, file_entry.delete_file);
+		if (file_entry.has_delete_file) {
+			delete_filter->Initialize(context, file_entry.delete_file);
+		}
+		if (!buffered.empty()) {
+			delete_filter->MergePositions(buffered);
+		}
 		reader.deletion_filter = std::move(delete_filter);
 	}
 	return MultiFileReader::InitializeReader(reader_data, bind_data, global_columns, global_column_ids, table_filters,

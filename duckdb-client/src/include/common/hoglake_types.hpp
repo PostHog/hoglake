@@ -24,6 +24,11 @@ struct HoglakeTypes {
 	static string CanonicalTimestamp(timestamp_t timestamp);
 	//! Canonical wire date string (date.isoformat(): YYYY-MM-DD).
 	static string CanonicalDate(date_t date);
+	//! Canonical ISO-8601 UTC instant ("...Z") from ANY timestamp-ish
+	//! Value, parsed with INSTANT semantics via TIMESTAMP_TZ: explicit
+	//! numeric offsets are honored (never dropped), naive inputs follow
+	//! the session TimeZone (UTC unless ICU changes it).
+	static string CanonicalInstant(const Value &value);
 };
 
 } // namespace duckdb

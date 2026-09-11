@@ -70,6 +70,14 @@ public:
 	//! Throw a clear TransactionException when DDL on (ns, table) is not
 	//! allowed in this transaction's current state.
 	void RequireDDLAllowed(const string &ns, const string &table, const char *what);
+	//! Record that this transaction ran an eager ALTER on (ns, table)
+	//! (renames record both names): its table_altered change postdates
+	//! the pin, so later commits carrying deletes must not touch it.
+	void RecordAlteredTable(const string &ns, const string &table);
+	bool IsAlteredTable(const string &ns, const string &table);
+	//! Throw when a DML statement would make the eventual commit
+	//! self-conflict with this transaction's own eager DDL.
+	void RequireDMLAllowed(const string &ns, const string &table, bool is_delete);
 
 	//! Commit buffered work: the footer-shipping OCC commit with the
 	//! retry loop (409 conflict / 503 backpressure). DDL is eager and
@@ -96,11 +104,17 @@ private:
 	optional_idx pinned_snapshot;
 	bool schemas_loaded = false;
 	case_insensitive_map_t<unique_ptr<HoglakeSchemaEntry>> schemas;
+	//! CI-colliding namespace groups: lookups throw ambiguity; listings
+	//! skip them (same policy as tables)
+	case_insensitive_map_t<vector<string>> ambiguous_schemas;
 	//! buffered appends, one entry per (namespace, table)
 	vector<HoglakeTableAppend> buffered_appends;
 	//! buffered deletes, one entry per (namespace, table); at most one
 	//! file registration per data_file_id
 	vector<HoglakeTableDeletes> buffered_deletes;
+	//! tables this transaction ran eager ALTERs on ("ns.table" keys;
+	//! renames record both names)
+	case_insensitive_map_t<bool> altered_tables;
 };
 
 } // namespace duckdb
