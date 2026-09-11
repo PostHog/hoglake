@@ -55,7 +55,7 @@ function InstanceTotals() {
       title={
         `${data.total_size_bytes} bytes, ${formatCount(data.total_rows)} ` +
         "rows registered across all live data files (rows are gross of " +
-        "deletion-vector masking; server-cached, ~60s)"
+        "deletion-vector masking; refreshed by the server's metrics sampler)"
       }
     >
       {formatBytes(data.total_size_bytes)} ·{" "}

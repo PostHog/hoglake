@@ -9,6 +9,9 @@ import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import java.util.concurrent.atomic.AtomicLong
 
+/** Instance-wide live-data totals, refreshed by the metrics sampler. */
+data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
+
 /**
  * Catalog-health gauges (README.md §8 — the catalog reports on itself,
  * retiring the metrics-cron layer). A lightweight periodic sampler
@@ -40,6 +43,11 @@ import java.util.concurrent.atomic.AtomicLong
  *    visible; hoglake_metrics_sample_errors_total counts failed samples.
  */
 class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry) {
+    /** Null until the first successful sample (boot runs one immediately). */
+    @Volatile
+    var latestTotals: InstanceTotals? = null
+        private set
+
     private fun multiGauge(
         name: String,
         description: String,
@@ -67,6 +75,10 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
             "hoglake_missing_field_id_files",
             "Live data files whose parquet schema lacks field ids (rename-blocking)",
         )
+    private val liveRows =
+        multiGauge("hoglake_live_rows", "Live registered rows per catalog (gross of DV masking)")
+    private val liveBytes =
+        multiGauge("hoglake_live_bytes", "Live data-file bytes per catalog")
     private val tableCount =
         multiGauge("hoglake_table_count", "Live (non-dropped) tables")
     private val consumerLag =
@@ -102,6 +114,8 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
         val statsFailed: Long,
         val missingFieldIds: Long,
         val tables: Long,
+        val liveRows: Long,
+        val liveBytes: Long,
     )
 
     /** One sample: refresh every gauge from the catalog. Safe to call concurrently with traffic. */
@@ -131,6 +145,13 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
         statsFailedFiles.register(rowsOf { it.statsFailed }, true)
         missingFieldIdFiles.register(rowsOf { it.missingFieldIds }, true)
         tableCount.register(rowsOf { it.tables }, true)
+        liveRows.register(rowsOf { it.liveRows }, true)
+        liveBytes.register(rowsOf { it.liveBytes }, true)
+
+        // Instance-wide totals for /v1/info: served from this sample,
+        // never computed per call (a manifest sum per request would tax
+        // the same RDS that serves the commit tail at fleet scale).
+        latestTotals = InstanceTotals(rows.sumOf { it.liveRows }, rows.sumOf { it.liveBytes })
 
         val headByCatalog = rows.associate { it.name to it.head }
         val byCatalog = offsets.groupBy { it.first }
@@ -184,7 +205,13 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
                            AND f.end_snapshot IS NULL) AS missing_field_ids,
                        (SELECT count(*) FROM hog_table t
                          WHERE t.catalog_id = c.catalog_id
-                           AND t.dropped_snapshot IS NULL) AS table_count
+                           AND t.dropped_snapshot IS NULL) AS table_count,
+                       (SELECT COALESCE(SUM(f.record_count), 0) FROM hog_data_file f
+                         WHERE f.catalog_id = c.catalog_id
+                           AND f.end_snapshot IS NULL) AS live_rows,
+                       (SELECT COALESCE(SUM(f.file_size_bytes), 0) FROM hog_data_file f
+                         WHERE f.catalog_id = c.catalog_id
+                           AND f.end_snapshot IS NULL) AS live_bytes
                   FROM hog_catalog c
                 """,
                 )
@@ -202,6 +229,8 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
                             statsFailed = rs.getLong("stats_failed"),
                             missingFieldIds = rs.getLong("missing_field_ids"),
                             tables = rs.getLong("table_count"),
+                            liveRows = rs.getLong("live_rows"),
+                            liveBytes = rs.getLong("live_bytes"),
                         )
                     }
                     .list()

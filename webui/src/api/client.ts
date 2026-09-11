@@ -236,8 +236,9 @@ export function listConsumers(catalog: string): Promise<ConsumerList> {
 
 export interface InstanceInfo {
   name?: string;
-  total_rows: Int64;
-  total_size_bytes: Int64;
+  // Absent in the boot window before the server's first metrics sample.
+  total_rows?: Int64;
+  total_size_bytes?: Int64;
 }
 
 export function getInstanceInfo(): Promise<InstanceInfo> {

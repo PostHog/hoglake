@@ -24,19 +24,19 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
-import java.time.Instant
 
 /**
  * Wire-level pinning for GET /v1/info totals — the webui header builds
- * against exactly this shape. Semantics pinned: totals sum LIVE data
- * files only (a dropped table's files leave the totals), and the cache
- * only recomputes after the TTL (driven via instanceTotals(now)).
+ * against exactly this shape. Semantics pinned: totals come from the
+ * metrics sampler's last pass (never computed per request), the fields
+ * are ABSENT before the first sample, they sum live data files only,
+ * and a dropped table's files leave the totals on the next sample.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class InstanceInfoApiTest {
     private val db = PgTestSupport.freshDatabase()
-    private val app = App.build(Config(hydratorIntervalMs = 0), db.jdbi)
+    private val app = App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0), db.jdbi)
     private val json = ObjectMapper()
 
     private val catalogs = CatalogService(db.jdbi)
@@ -84,39 +84,41 @@ class InstanceInfoApiTest {
     }
 
     @Test
-    fun `info carries live totals with verbatim field names`() =
+    fun `totals are absent before the first sample and sampled values after`() =
         api { client ->
+            // The sampler loop is off (metricsIntervalMs = 0) and nothing
+            // has called sampleOnce: the fields must be ABSENT, not zero —
+            // zeros would read as "empty warehouse" during boot.
+            val before = body(client.get("/v1/info"))
+            assertThat(before.has("total_rows")).isFalse()
+            assertThat(before.has("total_size_bytes")).isFalse()
+
             seed("info-totals")
+            app.catalogMetrics.sampleOnce()
 
             val res = client.get("/v1/info")
             assertThat(res.status).isEqualTo(HttpStatusCode.OK)
             val root = body(res)
-            assertThat(root.has("total_rows")).isTrue()
-            assertThat(root.has("total_size_bytes")).isTrue()
             assertThat(root["total_rows"].isIntegralNumber).isTrue()
             assertThat(root["total_rows"].asLong()).isEqualTo(15)
             assertThat(root["total_size_bytes"].asLong()).isEqualTo(1_050_624)
         }
 
     @Test
-    fun `totals cache serves stale until the ttl passes and drops dead files after`() {
-        val cat = "info-totals-ttl"
+    fun `totals hold the last sample until the next one and drop dead files then`() {
+        val cat = "info-totals-resample"
         seed(cat)
-        val t0 = Instant.now()
-
-        val fresh = catalogs.instanceTotals(t0)
-        // seed() above plus the first test's catalog may both be present;
-        // assert deltas, not absolutes.
-        val rowsBefore = fresh.totalRows
+        app.catalogMetrics.sampleOnce()
+        val before = app.catalogMetrics.latestTotals!!
 
         catalogs.dropTable(cat, "analytics", "events")
 
-        // Within the TTL the cached value still includes the dropped
-        // table's files.
-        assertThat(catalogs.instanceTotals(t0.plusSeconds(1)).totalRows).isEqualTo(rowsBefore)
+        // No resample yet: the drop is invisible.
+        assertThat(app.catalogMetrics.latestTotals).isEqualTo(before)
 
-        // Past the TTL the recompute sees only live files.
-        assertThat(catalogs.instanceTotals(t0.plusSeconds(61)).totalRows)
-            .isEqualTo(rowsBefore - 15)
+        app.catalogMetrics.sampleOnce()
+        assertThat(app.catalogMetrics.latestTotals!!.totalRows).isEqualTo(before.totalRows - 15)
+        assertThat(app.catalogMetrics.latestTotals!!.totalSizeBytes)
+            .isEqualTo(before.totalSizeBytes - 1_050_624)
     }
 }

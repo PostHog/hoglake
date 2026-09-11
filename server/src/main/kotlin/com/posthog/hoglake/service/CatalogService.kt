@@ -28,11 +28,7 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
-import java.time.Duration
 import java.time.Instant
-
-/** Instance-wide live-data totals for the webui header. */
-data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
 
 /**
  * Catalog DDL + read paths. Every DDL operation is one transaction that
@@ -45,41 +41,6 @@ data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
  * begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
 class CatalogService(private val jdbi: Jdbi) {
-    @Volatile private var totalsCache: Pair<Instant, InstanceTotals>? = null
-
-    /**
-     * Live-data totals across every catalog, summed over live manifest
-     * rows (end_snapshot IS NULL). hog_table_stats is NOT usable here:
-     * its counters are gross append rollups that compaction inflates.
-     * record_count is gross of DV masking. Cached for [TOTALS_TTL] —
-     * these are display numbers and must not cost a manifest scan per
-     * call. [now] is a parameter so tests can drive cache expiry.
-     */
-    fun instanceTotals(now: Instant = Instant.now()): InstanceTotals {
-        totalsCache?.let { (at, totals) ->
-            if (Duration.between(at, now) < TOTALS_TTL) return totals
-        }
-        val totals =
-            jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT COALESCE(SUM(record_count), 0) AS total_rows,
-                           COALESCE(SUM(file_size_bytes), 0) AS total_size_bytes
-                      FROM hog_data_file
-                     WHERE end_snapshot IS NULL
-                    """,
-                ).map { rs, _ ->
-                    InstanceTotals(rs.getLong("total_rows"), rs.getLong("total_size_bytes"))
-                }.one()
-            }
-        totalsCache = now to totals
-        return totals
-    }
-
-    private companion object {
-        val TOTALS_TTL: Duration = Duration.ofSeconds(60)
-    }
-
     // ---- catalogs --------------------------------------------------------
 
     fun createCatalog(
