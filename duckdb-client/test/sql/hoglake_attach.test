@@ -5,6 +5,8 @@
 
 require hoglake
 
+require parquet
+
 # integration test: needs the live dev stack (hoglake server; see
 # DESIGN.md test strategy). Skips cleanly when the env is absent —
 # a green run without HOGLAKE_URL is NOT a full verification.

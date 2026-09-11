@@ -15,7 +15,7 @@ namespace duckdb {
 class HoglakeCatalog;
 class HoglakeSchemaEntry;
 
-class HoglakeTransaction : public Transaction {
+class HoglakeTransaction : public Transaction, public enable_shared_from_this<HoglakeTransaction> {
 public:
 	HoglakeTransaction(HoglakeCatalog &hoglake_catalog, TransactionManager &manager, ClientContext &context);
 	~HoglakeTransaction() override;

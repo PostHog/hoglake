@@ -40,7 +40,43 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
 - Verified: `HOGLAKE_URL=http://localhost:8080 make test` → all pass
   (37 assertions) on 2026-09-11 against the live dev server.
 
-## M2 — read path: NOT STARTED
+## M2 — read path: DONE
+- [x] SELECT over tables: parquet_scan cloned with a
+      HoglakeMultiFileReader (ducklake's pattern); file list from
+      GET /scan at the pinned snapshot; field-id column mapping
+      (BY_FIELD_ID; BY_NAME fallback for id-less registered files)
+- [x] snapshot pinning per transaction (M1's pin feeds the scan)
+- [x] partition pruning: ComplexFilterPushdown evaluates pushed
+      filters against identity-transform partition_values via
+      TableFilter::ToExpression + constant folding; files under a
+      non-live spec never pruned; conservative on any doubt.
+      Verified: filter on a partitioned column changes the plan's
+      file list (~0 rows when every partition prunes)
+- [x] deletion vectors: puffin deletion-vector-v1 reader (roaring via
+      vcpkg; hoglake requires a real container with exactly ONE DV
+      blob — bare-blob and multi-blob forms are ducklake-isms) +
+      HoglakeDeleteFilter positional mask. NOT yet exercised by tests:
+      nothing writes DVs until M4 (pyhoglake is append-only) — M4's
+      DELETE round-trips it
+- [x] rowid virtual column: row_id_start + file_row_number, or the
+      physical _hog_row_id column (field id 2147483646) for
+      explicit_row_ids compaction outputs (untested until a compacted
+      fixture exists); filename/snapshot_id/file_row_number virtual
+      columns
+- Build now needs vcpkg (roaring) and, for the integration tests,
+  httpfs: `VCPKG_OVERLAY_TRIPLETS=$PWD/vcpkg-triplets
+  VCPKG_TOOLCHAIN_PATH=~/.vcpkg/scripts/buildsystems/vcpkg.cmake
+  BUILD_EXTENSION_TEST_DEPS=full make release GEN=ninja`.
+  The overlay triplet pins HAVE_PIPE2=0 (macOS SDK declares pipe2 as
+  macOS-27; curl's detection otherwise breaks the vcpkg build).
+- Fixtures: test/fixtures/read_fixture.py (run via pyhoglake:
+  `cd ~/src/hoglake/pyhoglake && HOGLAKE_S3_ENDPOINT=http://localhost:9000
+  uv run python .../read_fixture.py`) builds duckext-read/ns1.points
+  (2 batches) and ns1.part_points (identity(team), 4 files incl. null
+  partition).
+- Verified: `HOGLAKE_URL=http://localhost:8080
+  DUCKEXT_S3_ENDPOINT=localhost:9000 make test` → 101 assertions pass
+  (2026-09-11, live dev stack; MinIO is on port 9000, not 19000).
 ## M3 — write path: NOT STARTED
 ## M4 — update/delete/alter/drop: NOT STARTED
 ## M5 — time travel + metadata functions + parity checklist: NOT STARTED
