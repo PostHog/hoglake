@@ -322,8 +322,7 @@ class CatalogServiceIntegrationTest {
         // whitespace/dot segments survive into reader URIs.
         for (bad in listOf(
             "s3://",
-            "s3://bucket",
-            "s3://bucket/",
+            "s3:///prefix",
             "gs://bucket/prefix",
             "/var/data",
             "s3://bucket/pre fix",
@@ -347,10 +346,16 @@ class CatalogServiceIntegrationTest {
                 .isInstanceOf(HoglakeException.Validation::class.java)
                 .hasMessageContaining("overlaps catalog 'dp-base'")
         }
+        // Bucket-root parent overlaps everything in the bucket.
         assertThatThrownBy { svc.createCatalog("dp-parent", "s3://ovl") }
             .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("overlaps")
         // Sibling prefixes stay legal, including the sneaky
         // shares-a-string-prefix sibling.
         svc.createCatalog("dp-sib", "s3://ovl/base2")
+        // Bucket-root data_path is legal on its own bucket — the fleet
+        // convention (megaduck-shaped catalogs own a bucket).
+        svc.createCatalog("dp-root", "s3://own-bucket")
+        svc.createCatalog("dp-root-slash", "s3://own-bucket-2/")
     }
 }

@@ -82,15 +82,16 @@ class CatalogService(private val jdbi: Jdbi) {
         }
 
     /**
-     * data_path shape: `s3://<bucket>/<key-prefix>` with a non-empty
-     * bucket AND a non-empty key prefix, no whitespace/control chars,
-     * no dot segments. The commit-time path guard is a prefix
-     * comparison against this value, so a degenerate data_path is a
-     * guard bypass: `s3://` normalizes to a prefix every s3 URI starts
-     * with, and a bucket-only path admits sibling catalogs' objects.
-     * Non-s3 schemes are refused because the hydrator/cleanup object
-     * store only speaks s3 — a catalog with an unparseable data_path
-     * poisons the removal queue (rows retry forever).
+     * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
+     * bucket, no whitespace/control chars, no dot segments. The
+     * commit-time path guard is a prefix comparison against this
+     * value, so a degenerate data_path is a guard bypass: `s3://`
+     * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
+     * data_path is legal — it is the fleet convention (a catalog owns
+     * its bucket); the overlap check above keeps other catalogs off
+     * it. Non-s3 schemes are refused because the hydrator/cleanup
+     * object store only speaks s3 — a catalog with an unparseable
+     * data_path poisons the removal queue (rows retry forever).
      */
     private fun validateDataPath(dataPath: String) {
         if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
@@ -99,12 +100,11 @@ class CatalogService(private val jdbi: Jdbi) {
         }
         val rest =
             dataPath.removePrefix("s3://").takeIf { it != dataPath }
-                ?: throw HoglakeException.Validation("data_path must be an s3://<bucket>/<prefix> URI")
+                ?: throw HoglakeException.Validation("data_path must be an s3://<bucket>[/<prefix>] URI")
         val bucket = rest.substringBefore('/')
-        val prefix = rest.substringAfter('/', "")
-        if (bucket.isEmpty() || prefix.trimEnd('/').isEmpty()) {
+        if (bucket.isEmpty()) {
             throw HoglakeException.Validation(
-                "data_path must be s3://<bucket>/<prefix> with a non-empty bucket and key prefix, got '$dataPath'",
+                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, got '$dataPath'",
             )
         }
         if (rest.split('/').any { it == "." || it == ".." }) {

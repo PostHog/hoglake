@@ -15,8 +15,8 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
-import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
