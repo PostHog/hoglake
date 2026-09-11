@@ -29,6 +29,16 @@ struct HoglakeTravel {
 	bool IsHead() const {
 		return !snapshot.IsValid() && at_timestamp.empty();
 	}
+	//! stable cache key ("" = head)
+	string CacheKey() const {
+		if (snapshot.IsValid()) {
+			return "v" + std::to_string(snapshot.GetIndex());
+		}
+		if (!at_timestamp.empty()) {
+			return "t" + at_timestamp;
+		}
+		return string();
+	}
 };
 
 //! One client per attached catalog. Every method throws a duckdb
@@ -77,6 +87,18 @@ public:
 
 	// -- read planning -----------------------------------------------------
 	vector<HoglakeScanFile> PlanScan(const string &ns, const string &table, const HoglakeTravel &travel);
+
+	// -- snapshots ---------------------------------------------------------
+	struct SnapshotPage {
+		vector<HoglakeSnapshotInfo> snapshots;
+		bool has_more = false;
+	};
+	SnapshotPage ListSnapshots(idx_t after, idx_t limit);
+
+	// -- maintenance -------------------------------------------------------
+	//! POST /maintenance/{verb}?batch=; returns the raw JSON body (the
+	//! result shapes differ per verb; surfaced as-is)
+	string RunMaintenance(const string &verb, optional_idx batch);
 
 	// -- commits -----------------------------------------------------------
 	//! One commit attempt; never throws for commit-taxonomy failures

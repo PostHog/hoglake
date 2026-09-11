@@ -8,6 +8,7 @@
 
 #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
 #include "common/hoglake_wire.hpp"
+#include "rest/hoglake_api_client.hpp"
 
 namespace duckdb {
 class HoglakeCatalog;
@@ -15,13 +16,21 @@ class HoglakeCatalog;
 class HoglakeTableEntry : public TableCatalogEntry {
 public:
 	HoglakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                  HoglakeTableInfo table_info);
+	                  HoglakeTableInfo table_info, HoglakeTravel travel = HoglakeTravel(), bool travel_pinned = false);
 
 	const HoglakeTableInfo &GetWireInfo() const {
 		return table_info;
 	}
 	const string &GetTableUUID() const {
 		return table_info.table_uuid;
+	}
+	//! set for entries bound via AT (VERSION/TIMESTAMP): reads plan at
+	//! this travel and writes/DDL are refused
+	const HoglakeTravel &GetTravel() const {
+		return travel;
+	}
+	bool IsTravelPinned() const {
+		return travel_pinned;
 	}
 
 public:
@@ -35,6 +44,8 @@ public:
 
 private:
 	HoglakeTableInfo table_info;
+	HoglakeTravel travel;
+	bool travel_pinned = false;
 };
 
 } // namespace duckdb

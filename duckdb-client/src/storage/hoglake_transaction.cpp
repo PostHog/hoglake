@@ -2,6 +2,7 @@
 
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/transaction_exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/main/client_context.hpp"
 #include <chrono>
@@ -51,6 +52,26 @@ HoglakeTravel HoglakeTransaction::Travel() {
 		return travel;
 	}
 	return HoglakeTravel::AtSnapshot(GetSnapshot());
+}
+
+HoglakeTravel HoglakeTransaction::TravelFor(optional_ptr<BoundAtClause> at_clause) {
+	if (!at_clause) {
+		return Travel();
+	}
+	auto unit = StringUtil::Lower(at_clause->Unit().GetIdentifierName());
+	if (unit == "version") {
+		auto version = at_clause->GetValue().DefaultCastAs(LogicalType::BIGINT);
+		return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(BigIntValue::Get(version)));
+	}
+	if (unit == "timestamp") {
+		// server wants an ISO-8601 instant WITH offset; normalize the
+		// TIMESTAMPTZ to a UTC instant string
+		auto utc = at_clause->GetValue().DefaultCastAs(LogicalType::TIMESTAMP);
+		HoglakeTravel travel;
+		travel.at_timestamp = StringUtil::Replace(utc.ToString(), " ", "T") + "Z";
+		return travel;
+	}
+	throw BinderException("hoglake: unsupported AT unit \"%s\" (VERSION or TIMESTAMP)", unit);
 }
 
 void HoglakeTransaction::AddAppend(const string &ns, const string &table, const string &expected_table_uuid,

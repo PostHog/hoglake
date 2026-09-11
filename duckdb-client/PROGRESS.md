@@ -142,4 +142,20 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   files 409s (idless_files_present names not-yet-hydrated files).
   Surfaced cleanly; the sqllogictest renames on an empty table.
 - Verified: full suite 214 assertions pass (4 test files) 2026-09-11.
-## M5 — time travel + metadata functions + parity checklist: NOT STARTED
+## M5 — time travel + metadata functions + parity checklist: DONE
+- [x] AT (VERSION => n) / AT (TIMESTAMP => t): per-lookup table
+      entries fetched at the historical schema (cached per travel),
+      scans plan at the entry's travel, writes refused; out-of-range /
+      below-floor errors surface cleanly. Attach-level
+      SNAPSHOT_VERSION/SNAPSHOT_TIME verified
+- [x] hoglake_snapshots (paginated — never the full catalog in one
+      response), hoglake_table_info, hoglake_current_snapshot
+- [x] maintenance passthroughs: hoglake_expire/compact/cleanup
+      (batch => n) + hoglake_verify, returning the server's JSON
+      report (verify: status pass asserted in tests)
+- [x] PARITY.md: full DuckLake-capability checklist with
+      DONE/PARTIAL/WIRE GAP/N-A/TODO statuses
+- Compaction on the dev stack returns 0 groups (pending-stats files;
+  same hydrator env gap) — the explicit _hog_row_id read path remains
+  untested against real compaction output.
+- Verified: full suite 237 assertions pass (5 test files) 2026-09-11.

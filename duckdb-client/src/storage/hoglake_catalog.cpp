@@ -86,10 +86,8 @@ optional_ptr<SchemaCatalogEntry> HoglakeCatalog::LookupSchema(CatalogTransaction
                                                               const EntryLookupInfo &schema_lookup,
                                                               OnEntryNotFound if_not_found) {
 	auto &schema_name = schema_lookup.GetEntryName();
-	if (schema_lookup.GetAtClause()) {
-		throw NotImplementedException("hoglake: per-lookup AT (VERSION/TIMESTAMP) is not supported yet; "
-		                              "attach with SNAPSHOT_VERSION / SNAPSHOT_TIME instead");
-	}
+	// namespace listing is head-only on the wire; the AT clause applies
+	// at the TABLE lookup (HoglakeSchemaEntry::LookupEntry)
 	auto &hoglake_transaction = transaction.transaction->Cast<HoglakeTransaction>();
 	auto entry = hoglake_transaction.GetSchema(schema_name);
 	if (!entry) {

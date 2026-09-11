@@ -313,6 +313,11 @@ loops.
 
 Tracked in [PROGRESS.md](PROGRESS.md).
 
+## Parity status
+
+See [PARITY.md](PARITY.md) for the per-capability checklist
+(implemented / partial / wire gap / not-carried-over / todo).
+
 ## Findings for the server (no server changes made)
 
 1. `/scan` (`ScanFile`) carries no per-file column bounds → no
@@ -324,3 +329,16 @@ Tracked in [PROGRESS.md](PROGRESS.md).
 4. `/changes` has no update pre/post-image semantics (append-only v1)
    → `ducklake_table_changes` parity is partial by wire design.
 5. No comment/tag storage for tables/columns → `COMMENT ON` gap.
+6. `/namespaces` and `.../tables` listings are head-only (no
+   `snapshot=` param) → catalog listings inside a pinned transaction
+   can drift from the pinned snapshot (per-table fetches are pinned).
+7. `FileRegistration` has no `explicit_row_ids` → clients cannot
+   register explicit-row-id files, so client-side UPDATE cannot
+   preserve row identity (ducklake preserves; hoglake UPDATE assigns
+   new row ids). If preserved-rowid updates matter, the commit needs
+   the flag (plus the row-id-tiling exemption compaction outputs get).
+8. Environment (not wire): the local dev stack's hydrator hydrates
+   nothing — every deferred-stats file stays `pending` forever
+   (pyhoglake deferred appends included). Blocks rename-column on
+   tables with live client-written files and starves compaction of
+   candidates. Worth a look at the dev-server S3 config.

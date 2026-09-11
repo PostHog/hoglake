@@ -8,6 +8,7 @@
 
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/main/database.hpp"
+#include "rest/hoglake_api_client.hpp"
 
 namespace duckdb {
 class HoglakeTableEntry;
@@ -23,8 +24,9 @@ struct HoglakeFunctionInfo : public TableFunctionInfo {
 	string table_name;
 	vector<string> column_names;
 	vector<LogicalType> column_types;
-	//! the snapshot the scan is planned at
-	idx_t snapshot_id;
+	//! the travel the scan is planned at (the transaction pin, or the
+	//! entry's AT (VERSION/TIMESTAMP) pin)
+	HoglakeTravel travel;
 
 	shared_ptr<HoglakeTransaction> GetTransaction();
 };

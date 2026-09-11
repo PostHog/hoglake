@@ -172,8 +172,7 @@ void HoglakeMultiFileList::LoadFileList() const {
 	auto transaction = read_info.GetTransaction();
 	auto &table = read_info.table;
 	auto ns = table.ParentSchema().name.GetIdentifierName();
-	files = transaction->Api().PlanScan(ns, read_info.table_name,
-	                                    HoglakeTravel::AtSnapshot(read_info.snapshot_id));
+	files = transaction->Api().PlanScan(ns, read_info.table_name, read_info.travel);
 	read_file_list = true;
 }
 

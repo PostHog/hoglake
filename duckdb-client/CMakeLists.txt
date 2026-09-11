@@ -35,6 +35,7 @@ include_directories(${ROARING_INCLUDE_DIRS})
 set(EXTENSION_SOURCES
     src/hoglake_extension.cpp
     src/common/hoglake_types.cpp
+    src/functions/hoglake_metadata_functions.cpp
     src/rest/hoglake_api_client.cpp
     src/storage/hoglake_catalog.cpp
     src/storage/hoglake_delete.cpp

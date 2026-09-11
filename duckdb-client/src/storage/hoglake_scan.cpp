@@ -75,7 +75,7 @@ unique_ptr<FunctionData> HoglakeFunctions::BindHoglakeScan(ClientContext &contex
 }
 
 HoglakeFunctionInfo::HoglakeFunctionInfo(HoglakeTableEntry &table_p, HoglakeTransaction &transaction_p)
-    : table(table_p), transaction(transaction_p.shared_from_this()), snapshot_id(0) {
+    : table(table_p), transaction(transaction_p.shared_from_this()) {
 }
 
 shared_ptr<HoglakeFunctionInfo> HoglakeFunctionInfo::Create(HoglakeTableEntry &table, HoglakeTransaction &transaction) {
@@ -85,7 +85,7 @@ shared_ptr<HoglakeFunctionInfo> HoglakeFunctionInfo::Create(HoglakeTableEntry &t
 		result->column_names.push_back(col.Name().GetIdentifierName());
 		result->column_types.push_back(col.Type());
 	}
-	result->snapshot_id = transaction.GetSnapshot();
+	result->travel = table.IsTravelPinned() ? table.GetTravel() : transaction.Travel();
 	return result;
 }
 

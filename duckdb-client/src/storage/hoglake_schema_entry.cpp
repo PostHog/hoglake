@@ -110,11 +110,50 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupEntry(CatalogTransaction tr
 	if (catalog_type != CatalogType::TABLE_ENTRY) {
 		return nullptr;
 	}
-	if (lookup_info.GetAtClause()) {
-		throw NotImplementedException("hoglake: per-lookup AT (VERSION/TIMESTAMP) is not supported yet; "
-		                              "attach with SNAPSHOT_VERSION / SNAPSHOT_TIME instead");
+	auto at_clause = lookup_info.GetAtClause();
+	if (at_clause) {
+		auto &hoglake_transaction = Transaction(transaction);
+		auto travel = hoglake_transaction.TravelFor(at_clause);
+		return LookupTableAt(hoglake_transaction, lookup_info.GetEntryName(), travel);
 	}
 	return LookupTable(Transaction(transaction), lookup_info.GetEntryName());
+}
+
+optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableAt(HoglakeTransaction &transaction,
+                                                             const string &entry_name, const HoglakeTravel &travel) {
+	auto key = entry_name + "@" + travel.CacheKey();
+	auto existing = travel_tables.find(key);
+	if (existing != travel_tables.end()) {
+		return existing->second.get();
+	}
+	auto ns = name.GetIdentifierName();
+	// a 410 (below the expiry floor) surfaces as InvalidInputException
+	auto table_info = transaction.Api().TryGetTable(ns, entry_name, travel);
+	if (!table_info) {
+		return nullptr;
+	}
+	// build the entry at the historical schema; reads plan at `travel`
+	// and writes are refused
+	auto columns = table_info->columns;
+	std::sort(columns.begin(), columns.end(),
+	          [](const HoglakeColumn &a, const HoglakeColumn &b) { return a.ordinal < b.ordinal; });
+	auto table_name = table_info->name;
+	CreateTableInfo create_info(*this, Identifier(table_name));
+	vector<LogicalIndex> not_null;
+	for (auto &col : columns) {
+		ColumnDefinition column(Identifier(col.name), HoglakeTypes::ToDuckDBType(col));
+		if (!col.nullable) {
+			not_null.push_back(LogicalIndex(create_info.columns.LogicalColumnCount()));
+		}
+		create_info.columns.AddColumn(std::move(column));
+	}
+	for (auto idx : not_null) {
+		create_info.constraints.push_back(make_uniq<NotNullConstraint>(idx));
+	}
+	auto entry = make_uniq<HoglakeTableEntry>(catalog, *this, create_info, std::move(*table_info), travel, true);
+	auto &result = *entry;
+	travel_tables[key] = std::move(entry);
+	return &result;
 }
 
 void HoglakeSchemaEntry::Scan(ClientContext &context, CatalogType type,
@@ -292,6 +331,7 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 	auto &wire = table.GetWireInfo();
 
 	HoglakeAlterOp op;
+	(void)table;
 	string new_entry_name = table_name;
 	switch (alter_table.alter_table_type) {
 	case AlterTableType::RENAME_TABLE: {

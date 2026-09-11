@@ -3,6 +3,7 @@
 #include "duckdb/catalog/catalog_entry/copy_function_catalog_entry.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
@@ -203,6 +204,9 @@ static Value WrittenFieldIds(const vector<HoglakeColumn> &columns) {
 PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner,
                                             HoglakeTableEntry &table, optional_ptr<PhysicalOperator> plan) {
 	auto &catalog = table.ParentCatalog().Cast<HoglakeCatalog>();
+	if (table.IsTravelPinned()) {
+		throw BinderException("hoglake: cannot INSERT into a table pinned with AT (VERSION/TIMESTAMP)");
+	}
 	auto &wire = table.GetWireInfo();
 
 	auto columns = wire.columns;

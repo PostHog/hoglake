@@ -1,0 +1,119 @@
+# name: test/sql/hoglake_metadata.test
+# description: M5 against the live dev stack: time travel
+#   (AT VERSION/TIMESTAMP, attach-level pins), metadata functions,
+#   maintenance passthroughs.
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require json
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.tt
+
+statement ok
+CREATE TABLE lake.ns1.tt (id BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.tt VALUES (1), (2)
+
+statement ok
+INSERT INTO lake.ns1.tt VALUES (3)
+
+# ---- time travel ----
+
+# a future timestamp resolves to head (per the wire contract)
+query I
+SELECT count(*) FROM lake.ns1.tt AT (TIMESTAMP => TIMESTAMP '2100-01-01')
+----
+3
+
+# the snapshot before the last insert has 2 rows: derive it via the
+# snapshot_id virtual column (deterministic across reruns)
+query I
+SELECT count(*) FROM lake.ns1.tt WHERE snapshot_id < (SELECT max(snapshot_id) FROM lake.ns1.tt)
+----
+2
+
+# out-of-range version errors cleanly
+statement error
+SELECT count(*) FROM lake.ns1.tt AT (VERSION => 99999999)
+----
+<REGEX>:.*out of range.*
+
+# a timestamp before the catalog existed errors (below the floor)
+statement error
+SELECT count(*) FROM lake.ns1.tt AT (TIMESTAMP => TIMESTAMP '2000-01-01')
+----
+
+# ---- metadata functions ----
+
+query I
+SELECT count(*) > 0 FROM hoglake_snapshots('lake')
+----
+true
+
+# the newest snapshot records the insert into tt as a typed change
+query I
+SELECT len(changes) >= 1 FROM hoglake_snapshots('lake') ORDER BY snapshot_id DESC LIMIT 1
+----
+true
+
+query I
+SELECT (SELECT id FROM hoglake_current_snapshot('lake')) = (SELECT max(snapshot_id) FROM hoglake_snapshots('lake'))
+----
+true
+
+query III
+SELECT namespace, table_name, record_count FROM hoglake_table_info('lake') WHERE table_name = 'tt'
+----
+ns1	tt	3
+
+# ---- maintenance passthroughs (server-side; results are JSON) ----
+
+query I
+SELECT json_valid(result::VARCHAR) FROM hoglake_expire('lake')
+----
+true
+
+query I
+SELECT (result -> '$.groups_compacted') IS NOT NULL FROM hoglake_compact('lake')
+----
+true
+
+query I
+SELECT json_valid(result::VARCHAR) FROM hoglake_cleanup('lake', batch => 100)
+----
+true
+
+query I
+SELECT result ->> '$.status' FROM hoglake_verify('lake')
+----
+pass
+
+# unknown catalogs error cleanly
+statement error
+SELECT * FROM hoglake_snapshots('not_attached')
+----
+
+statement ok
+DETACH lake

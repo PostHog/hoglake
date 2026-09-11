@@ -6,6 +6,7 @@
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/storage/storage_extension.hpp"
 #include "storage/hoglake_storage.hpp"
+#include "functions/hoglake_metadata_functions.hpp"
 
 namespace duckdb {
 
@@ -26,6 +27,8 @@ static void LoadInternal(ExtensionLoader &loader) {
 	config.AddExtensionOption("hoglake_retry_backoff",
 	                          "Backoff factor for exponentially increasing commit retry wait time",
 	                          LogicalType::DOUBLE, Value::DOUBLE(1.5), nullptr, SetScope::GLOBAL);
+
+	HoglakeMetadataFunctions::Register(loader);
 }
 
 void HoglakeExtension::Load(ExtensionLoader &loader) {

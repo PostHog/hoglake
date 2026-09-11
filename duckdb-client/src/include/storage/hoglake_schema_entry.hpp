@@ -8,6 +8,7 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
+#include "rest/hoglake_api_client.hpp"
 
 namespace duckdb {
 class HoglakeCatalog;
@@ -41,6 +42,8 @@ public:
 private:
 	HoglakeTransaction &Transaction(CatalogTransaction &transaction);
 	optional_ptr<CatalogEntry> LookupTable(HoglakeTransaction &transaction, const string &entry_name);
+	optional_ptr<CatalogEntry> LookupTableAt(HoglakeTransaction &transaction, const string &entry_name,
+	                                         const HoglakeTravel &travel);
 	void LoadAllTables(HoglakeTransaction &transaction);
 	//! Wrap a wire table into a HoglakeTableEntry and cache it.
 	CatalogEntry &CacheTable(HoglakeTransaction &transaction, struct HoglakeTableInfo table_info);
@@ -52,6 +55,8 @@ private:
 	//! superseded entries (ALTER replaces them); kept alive because the
 	//! binder may still hold references for the duration of the statement
 	vector<unique_ptr<CatalogEntry>> retired;
+	//! AT (VERSION/TIMESTAMP) entries, keyed "<name>@<travel key>"
+	case_insensitive_map_t<unique_ptr<CatalogEntry>> travel_tables;
 };
 
 } // namespace duckdb

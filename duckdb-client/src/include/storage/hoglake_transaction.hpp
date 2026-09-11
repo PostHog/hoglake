@@ -10,6 +10,7 @@
 #include "duckdb/transaction/transaction.hpp"
 #include "duckdb/common/case_insensitive_map.hpp"
 #include "rest/hoglake_api_client.hpp"
+#include "duckdb/planner/tableref/bound_at_clause.hpp"
 
 namespace duckdb {
 class HoglakeCatalog;
@@ -32,6 +33,9 @@ public:
 	idx_t GetSnapshot();
 	//! The travel selector for metadata reads in this transaction.
 	HoglakeTravel Travel();
+	//! Travel for an optional AT (VERSION/TIMESTAMP) clause; nullptr =
+	//! the transaction's pinned travel.
+	HoglakeTravel TravelFor(optional_ptr<BoundAtClause> at_clause);
 
 	//! Buffer a table append (files already uploaded to object storage);
 	//! shipped as ONE CommitRequest at COMMIT (multi-statement,

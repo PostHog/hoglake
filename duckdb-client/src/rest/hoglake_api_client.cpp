@@ -750,4 +750,57 @@ HoglakeTableInfo HoglakeApiClient::AlterTable(const string &ns, const string &ta
 	return ParseTableInfo(ParseObjectResponse(doc, "alter table"));
 }
 
+
+//===--------------------------------------------------------------------===//
+// Snapshots / maintenance
+//===--------------------------------------------------------------------===//
+
+HoglakeApiClient::SnapshotPage HoglakeApiClient::ListSnapshots(idx_t after, idx_t limit) {
+	auto path = CatalogPath("/snapshots") + "?after=" + to_string(after) + "&limit=" + to_string(limit);
+	auto response = Request("GET", path, string());
+	if (response.status != 200) {
+		ThrowFor(response, "list snapshots");
+	}
+	JsonDoc doc(response.body);
+	auto root = ParseObjectResponse(doc, "list snapshots");
+	SnapshotPage page;
+	page.has_more = GetBool(root, "has_more", false);
+	auto snapshots = yyjson_obj_get(root, "snapshots");
+	size_t idx, max;
+	yyjson_val *snap;
+	yyjson_arr_foreach(snapshots, idx, max, snap) {
+		HoglakeSnapshotInfo info;
+		info.snapshot_id = GetInt(snap, "snapshot_id");
+		info.snapshot_time = GetString(snap, "snapshot_time");
+		info.schema_version = GetInt(snap, "schema_version");
+		info.author = GetString(snap, "author");
+		info.message = GetString(snap, "message");
+		auto changes = yyjson_obj_get(snap, "changes");
+		if (changes && yyjson_is_arr(changes)) {
+			size_t c_idx, c_max;
+			yyjson_val *change;
+			yyjson_arr_foreach(changes, c_idx, c_max, change) {
+				HoglakeSnapshotChange parsed;
+				parsed.kind = GetString(change, "kind");
+				parsed.object_id = GetInt(change, "object_id");
+				info.changes.push_back(std::move(parsed));
+			}
+		}
+		page.snapshots.push_back(std::move(info));
+	}
+	return page;
+}
+
+string HoglakeApiClient::RunMaintenance(const string &verb, optional_idx batch) {
+	auto path = CatalogPath("/maintenance/" + verb);
+	if (batch.IsValid()) {
+		path += "?batch=" + to_string(batch.GetIndex());
+	}
+	auto response = Request("POST", path, string());
+	if (response.status != 200) {
+		ThrowFor(response, "maintenance " + verb);
+	}
+	return response.body;
+}
+
 } // namespace duckdb
