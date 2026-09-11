@@ -57,7 +57,16 @@ jobs:
 
       - name: Fuzz all targets
         working-directory: server
-        run: ./gradlew --no-daemon fuzz -PfuzzSeconds=${{ github.event.inputs.fuzz_seconds || '600' }}
+        # The dispatch input reaches the shell through env, never by
+        # template interpolation into run: (semgrep run-shell-injection),
+        # and must be a plain integer.
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '600' }}
+        run: |
+          case "$FUZZ_SECONDS" in
+            ''|*[!0-9]*) echo "fuzz_seconds must be an integer, got '$FUZZ_SECONDS'" >&2; exit 1 ;;
+          esac
+          ./gradlew --no-daemon fuzz -PfuzzSeconds="$FUZZ_SECONDS"
 
       # jazzer-junit writes crashing inputs into the committed seed
       # corpus directories — on a red run, ship exactly those new files
