@@ -5,6 +5,11 @@
 #include "duckdb/parser/parsed_data/drop_info.hpp"
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/storage/database_size.hpp"
+#include "duckdb/execution/physical_plan_generator.hpp"
+#include "duckdb/planner/operator/logical_create_table.hpp"
+#include "duckdb/planner/operator/logical_insert.hpp"
+#include "storage/hoglake_insert.hpp"
+#include "storage/hoglake_table_entry.hpp"
 #include "storage/hoglake_schema_entry.hpp"
 #include "storage/hoglake_transaction.hpp"
 
@@ -93,12 +98,33 @@ optional_ptr<SchemaCatalogEntry> HoglakeCatalog::LookupSchema(CatalogTransaction
 
 PhysicalOperator &HoglakeCatalog::PlanCreateTableAs(ClientContext &context, PhysicalPlanGenerator &planner,
                                                     LogicalCreateTable &op, PhysicalOperator &plan) {
-	throw NotImplementedException("CREATE TABLE AS is not supported for hoglake yet (write path lands in M3)");
+	// eager DDL: the table is created NOW (its own server snapshot, not
+	// undone by rollback; the inserted rows still commit atomically at
+	// COMMIT). Caveat: re-executing a cached plan (prepared statement)
+	// re-runs the create and errors on the duplicate.
+	auto &schema = op.schema.Cast<HoglakeSchemaEntry>();
+	auto transaction = GetCatalogTransaction(context);
+	auto entry = schema.CreateTable(transaction, *op.info);
+	if (!entry) {
+		throw CatalogException("hoglake: CREATE TABLE AS failed to create the table");
+	}
+	auto &table = entry->Cast<HoglakeTableEntry>();
+	return HoglakeInsert::PlanInsert(context, planner, table, &plan);
 }
 
 PhysicalOperator &HoglakeCatalog::PlanInsert(ClientContext &context, PhysicalPlanGenerator &planner, LogicalInsert &op,
                                              optional_ptr<PhysicalOperator> plan) {
-	throw NotImplementedException("INSERT is not supported for hoglake yet (write path lands in M3)");
+	if (op.return_chunk) {
+		throw BinderException("RETURNING clause not yet supported for insertion into hoglake tables");
+	}
+	if (op.on_conflict_info.action_type != OnConflictAction::THROW) {
+		throw BinderException("ON CONFLICT clause not supported for insertion into hoglake tables");
+	}
+	if (!op.column_index_map.empty()) {
+		plan = planner.ResolveDefaultsProjection(op, *plan);
+	}
+	auto &table = op.table.Cast<HoglakeTableEntry>();
+	return HoglakeInsert::PlanInsert(context, planner, table, plan);
 }
 
 PhysicalOperator &HoglakeCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,

@@ -144,6 +144,49 @@ struct HoglakeSnapshotInfo {
 	vector<HoglakeSnapshotChange> changes;
 };
 
+//! FileRegistration (client -> server): one client-written parquet
+//! file in a footer-shipping commit. column_stats omitted for now
+//! (stats_mode=deferred: the server hydrator reads footers async).
+struct HoglakeFileRegistration {
+	string path;
+	int64_t record_count = 0;
+	int64_t file_size_bytes = 0;
+	optional_idx footer_size;
+	//! set when the table is partitioned: transformed values by
+	//! key_index (VARCHAR values; null partition value = NULL Value)
+	bool has_partition_values = false;
+	vector<Value> partition_values;
+};
+
+//! TableAppend (client -> server).
+struct HoglakeTableAppend {
+	string namespace_name;
+	string table_name;
+	//! incarnation guard; empty = name-only resolution
+	string expected_table_uuid;
+	vector<HoglakeFileRegistration> files;
+};
+
+//! CommitRequest (client -> server): appends only for now (deletes in M4).
+struct HoglakeCommitRequest {
+	//! invalid = blind append (no conflict window)
+	optional_idx read_snapshot;
+	vector<HoglakeTableAppend> appends;
+	string author;
+	string message;
+};
+
+//! Outcome of a commit attempt (the retry loop decides what to do).
+struct HoglakeCommitOutcome {
+	bool success = false;
+	int status = 0;
+	HoglakeCommitResult result;
+	string error;
+	string detail;
+	//! Retry-After (503 backpressure); 0 when absent
+	idx_t retry_after_seconds = 0;
+};
+
 //! CreateTableRequest column def (client -> server; no field_id yet).
 struct HoglakeColumnDef {
 	string name;

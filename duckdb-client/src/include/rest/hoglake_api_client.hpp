@@ -75,6 +75,11 @@ public:
 	// -- read planning -----------------------------------------------------
 	vector<HoglakeScanFile> PlanScan(const string &ns, const string &table, const HoglakeTravel &travel);
 
+	// -- commits -----------------------------------------------------------
+	//! One commit attempt; never throws for commit-taxonomy failures
+	//! (409/422/503) — the caller's retry loop classifies the outcome.
+	HoglakeCommitOutcome TryCommit(const HoglakeCommitRequest &request);
+
 public:
 	//! Percent-encode one URL path segment (identifiers are user data).
 	static string EncodeSegment(const string &segment);
@@ -83,6 +88,8 @@ private:
 	struct Response {
 		int status = 0;
 		string body;
+		//! Retry-After header in seconds (0 when absent)
+		idx_t retry_after_seconds = 0;
 	};
 
 	Response Request(const string &method, const string &path, const string &json_body);

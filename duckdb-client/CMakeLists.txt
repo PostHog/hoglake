@@ -38,6 +38,7 @@ set(EXTENSION_SOURCES
     src/rest/hoglake_api_client.cpp
     src/storage/hoglake_catalog.cpp
     src/storage/hoglake_delete_filter.cpp
+    src/storage/hoglake_insert.cpp
     src/storage/hoglake_multi_file_list.cpp
     src/storage/hoglake_multi_file_reader.cpp
     src/storage/hoglake_puffin.cpp

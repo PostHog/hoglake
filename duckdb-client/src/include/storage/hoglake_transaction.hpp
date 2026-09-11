@@ -33,9 +33,19 @@ public:
 	//! The travel selector for metadata reads in this transaction.
 	HoglakeTravel Travel();
 
-	//! Commit buffered work (M3+: the footer-shipping commit); currently
-	//! DDL is eager, so this is a no-op.
-	void Commit();
+	//! Buffer a table append (files already uploaded to object storage);
+	//! shipped as ONE CommitRequest at COMMIT (multi-statement,
+	//! multi-table atomicity comes from the wire contract).
+	void AddAppend(const string &ns, const string &table, const string &expected_table_uuid,
+	               vector<HoglakeFileRegistration> files);
+	bool HasBufferedWrites() const {
+		return !buffered_appends.empty();
+	}
+
+	//! Commit buffered work: the footer-shipping OCC commit with the
+	//! retry loop (409 conflict / 503 backpressure). DDL is eager and
+	//! not part of this.
+	void Commit(ClientContext &context);
 	void Rollback();
 
 	// -- catalog entry cache ----------------------------------------------
@@ -55,6 +65,8 @@ private:
 	optional_idx pinned_snapshot;
 	bool schemas_loaded = false;
 	case_insensitive_map_t<unique_ptr<HoglakeSchemaEntry>> schemas;
+	//! buffered appends, one entry per (namespace, table)
+	vector<HoglakeTableAppend> buffered_appends;
 };
 
 } // namespace duckdb

@@ -77,6 +77,39 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
 - Verified: `HOGLAKE_URL=http://localhost:8080
   DUCKEXT_S3_ENDPOINT=localhost:9000 make test` → 101 assertions pass
   (2026-09-11, live dev stack; MinIO is on port 9000, not 19000).
-## M3 — write path: NOT STARTED
+## M3 — write path: DONE
+- [x] INSERT: child PhysicalCopyToFile (parquet with hoglake field ids
+      via the field_ids option, hive-partitioned under the live spec,
+      rotating at 512MB) -> HoglakeInsert sink consumes
+      WRITTEN_FILE_STATISTICS rows into buffered FileRegistrations;
+      footer_size is the copy's footer_size_bytes (== thrift length,
+      the bugs.md #7 convention)
+- [x] footer-shipping commit at COMMIT: one CommitRequest for all
+      buffered (multi-table) appends -> atomic snapshot; blind append
+      (no read_snapshot); expected_table_uuid incarnation guard rides
+      every append; ROLLBACK drops registrations (uploaded parquet
+      orphaned by design)
+- [x] OCC retry loop: 409 conflict retries with backoff
+      (hoglake_max_retry_count/_retry_wait_ms/_retry_backoff), the
+      "the table was recreated" 409 never retries, 503
+      commit_queue_timeout honors Retry-After
+- [x] stats_mode=deferred: commits ship no column_stats; the server
+      hydrator reads footers async (stats_state pending->provided).
+      Client-side NOT NULL enforcement from written null counts
+      (note: parquet stats keys are QUOTED column paths — unquote)
+- [x] CTAS (eager create at plan time; documented caveat: re-executing
+      a cached prepared plan re-runs the create)
+- [x] partitioned INSERT: identity transforms only; partition_values
+      re-encoded from hive partition keys to pyhoglake's wire_string
+      conventions (boolean/int/long/string/date/timestamp; other
+      identity types and bucket/year/month/day/hour transforms throw
+      NotImplemented — port of transforms + murmur3 is the follow-up);
+      verified manually against part_points incl. the NULL group
+- Read-your-own-writes within a transaction is NOT implemented:
+  uncommitted inserts are invisible to the transaction's own scans
+  (ducklake shows transaction-local files; documented divergence,
+  candidate for M5+)
+- Verified: full suite 143 assertions pass (3 test files) against the
+  live dev stack 2026-09-11.
 ## M4 — update/delete/alter/drop: NOT STARTED
 ## M5 — time travel + metadata functions + parity checklist: NOT STARTED

@@ -328,6 +328,14 @@ HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const
 	Response response;
 	response.status = result->status;
 	response.body = result->body;
+	if (result->has_header("Retry-After")) {
+		auto retry_after = result->get_header_value("Retry-After");
+		char *end = nullptr;
+		auto parsed = std::strtoull(retry_after.c_str(), &end, 10);
+		if (end == retry_after.c_str() + retry_after.size()) {
+			response.retry_after_seconds = parsed;
+		}
+	}
 	return response;
 }
 
@@ -585,6 +593,79 @@ vector<HoglakeScanFile> HoglakeApiClient::PlanScan(const string &ns, const strin
 		result.push_back(std::move(scan_file));
 	}
 	return result;
+}
+
+
+//===--------------------------------------------------------------------===//
+// Commits
+//===--------------------------------------------------------------------===//
+
+HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &request) {
+	JsonMutDoc body;
+	auto root = yyjson_mut_obj(body.doc);
+	yyjson_mut_doc_set_root(body.doc, root);
+	if (request.read_snapshot.IsValid()) {
+		yyjson_mut_obj_add_int(body.doc, root, "read_snapshot",
+		                       NumericCast<int64_t>(request.read_snapshot.GetIndex()));
+	}
+	auto appends = yyjson_mut_obj_add_arr(body.doc, root, "appends");
+	for (auto &append : request.appends) {
+		auto append_obj = yyjson_mut_arr_add_obj(body.doc, appends);
+		yyjson_mut_obj_add_strcpy(body.doc, append_obj, "namespace", append.namespace_name.c_str());
+		yyjson_mut_obj_add_strcpy(body.doc, append_obj, "table", append.table_name.c_str());
+		if (!append.expected_table_uuid.empty()) {
+			yyjson_mut_obj_add_strcpy(body.doc, append_obj, "expected_table_uuid",
+			                          append.expected_table_uuid.c_str());
+		}
+		auto files = yyjson_mut_obj_add_arr(body.doc, append_obj, "files");
+		for (auto &file : append.files) {
+			auto file_obj = yyjson_mut_arr_add_obj(body.doc, files);
+			yyjson_mut_obj_add_strcpy(body.doc, file_obj, "path", file.path.c_str());
+			yyjson_mut_obj_add_int(body.doc, file_obj, "record_count", file.record_count);
+			yyjson_mut_obj_add_int(body.doc, file_obj, "file_size_bytes", file.file_size_bytes);
+			if (file.footer_size.IsValid()) {
+				yyjson_mut_obj_add_int(body.doc, file_obj, "footer_size",
+				                       NumericCast<int64_t>(file.footer_size.GetIndex()));
+			}
+			if (file.has_partition_values) {
+				auto values = yyjson_mut_obj_add_arr(body.doc, file_obj, "partition_values");
+				for (auto &value : file.partition_values) {
+					if (value.IsNull()) {
+						yyjson_mut_arr_add_null(body.doc, values);
+					} else {
+						yyjson_mut_arr_add_strcpy(body.doc, values, StringValue::Get(value).c_str());
+					}
+				}
+			}
+		}
+	}
+	if (!request.author.empty()) {
+		yyjson_mut_obj_add_strcpy(body.doc, root, "author", request.author.c_str());
+	}
+	if (!request.message.empty()) {
+		yyjson_mut_obj_add_strcpy(body.doc, root, "message", request.message.c_str());
+	}
+
+	auto response = Request("POST", CatalogPath("/commit"), body.Write());
+	HoglakeCommitOutcome outcome;
+	outcome.status = response.status;
+	outcome.retry_after_seconds = response.retry_after_seconds;
+	if (response.status == 200) {
+		outcome.success = true;
+		JsonDoc doc(response.body);
+		outcome.result = ParseCommitResult(ParseObjectResponse(doc, "commit"));
+		return outcome;
+	}
+	JsonDoc doc(response.body);
+	auto error_root = doc.Root();
+	if (error_root && yyjson_is_obj(error_root)) {
+		outcome.error = GetString(error_root, "error");
+		outcome.detail = GetString(error_root, "detail");
+	}
+	if (outcome.error.empty()) {
+		outcome.error = StringUtil::Format("HTTP %d", response.status);
+	}
+	return outcome;
 }
 
 } // namespace duckdb

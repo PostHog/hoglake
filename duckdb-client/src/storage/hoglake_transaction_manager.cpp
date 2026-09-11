@@ -17,7 +17,7 @@ Transaction &HoglakeTransactionManager::StartTransaction(ClientContext &context)
 ErrorData HoglakeTransactionManager::CommitTransaction(ClientContext &context, Transaction &transaction) {
 	auto &hoglake_transaction = transaction.Cast<HoglakeTransaction>();
 	try {
-		hoglake_transaction.Commit();
+		hoglake_transaction.Commit(context);
 	} catch (std::exception &ex) {
 		return ErrorData(ex);
 	}
