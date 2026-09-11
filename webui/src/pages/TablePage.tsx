@@ -129,7 +129,12 @@ function SchemaTab({ table }: { table: Table }) {
               <td className="num mono">{c.field_id}</td>
               <td>{c.name}</td>
               <td className="mono">{c.type}</td>
-              <td>{c.nullable === false ? "not null" : "nullable"}</td>
+              <td
+                className="nullable-mark"
+                title={c.nullable === false ? "not null" : "nullable"}
+              >
+                {c.nullable === false ? "✗" : "✓"}
+              </td>
               <td className="num mono">{c.ordinal}</td>
             </tr>
           ))}

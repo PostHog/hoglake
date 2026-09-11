@@ -34,7 +34,12 @@ describe("TablePage", () => {
     expect(screen.getByText("ts")).toBeInTheDocument();
     expect(screen.getByText("timestamptz")).toBeInTheDocument();
     expect(screen.getByText("user_id")).toBeInTheDocument();
-    expect(screen.getAllByText("not null")).toHaveLength(2);
+    // Nullability renders as marks (✗ not null / ✓ nullable); the words
+    // live on the cell tooltip.
+    expect(screen.getAllByTitle("not null")).toHaveLength(2);
+    for (const cell of screen.getAllByTitle("not null")) {
+      expect(cell).toHaveTextContent("✗");
+    }
 
     // Partition spec rendering, source field resolved to column names.
     expect(screen.getByText("day(ts)")).toBeInTheDocument();

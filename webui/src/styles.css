@@ -231,6 +231,11 @@ h3 {
   text-decoration: underline dotted;
   text-underline-offset: 3px;
 }
+
+/* Schema nullability: ✓ nullable / ✗ not null, tooltip carries words. */
+td.nullable-mark {
+  color: var(--text-dim);
+}
 .data-table td {
   padding: 5px 10px;
   border-bottom: 1px solid var(--border);
