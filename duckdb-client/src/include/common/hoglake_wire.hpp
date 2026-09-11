@@ -1,0 +1,156 @@
+//===----------------------------------------------------------------------===//
+// hoglake wire DTOs — mirror the schemas of openapi/hoglake.yaml.
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/common/string.hpp"
+#include "duckdb/common/vector.hpp"
+#include "duckdb/common/optional_idx.hpp"
+#include "duckdb/common/types.hpp"
+#include "duckdb/common/types/value.hpp"
+
+namespace duckdb {
+
+struct HoglakeCatalogInfo {
+	string name;
+	string data_path;
+	int64_t head_snapshot_id = 0;
+	int64_t schema_version = 0;
+	//! null when expiry never advanced the floor
+	string earliest_snapshot_time;
+};
+
+//! Column (wire): ColumnDef + field_id + ordinal.
+struct HoglakeColumn {
+	string name;
+	//! hoglake type enum string (boolean,int,long,float,double,decimal,
+	//! date,time,timestamp,timestamptz,string,uuid,binary)
+	string type;
+	//! decimal only: type_params.precision / .scale
+	int32_t precision = 0;
+	int32_t scale = 0;
+	bool nullable = true;
+	int64_t field_id = 0;
+	int32_t ordinal = 0;
+};
+
+struct HoglakePartitionField {
+	int64_t source_field_id = 0;
+	//! identity, bucket, year, month, day, hour
+	string transform;
+	//! bucket(n) only
+	int32_t transform_param = 0;
+};
+
+struct HoglakePartitionSpec {
+	int64_t spec_id = 0;
+	vector<HoglakePartitionField> fields;
+};
+
+struct HoglakeSortField {
+	int64_t source_field_id = 0;
+	//! asc | desc
+	string direction;
+	//! nulls_first | nulls_last
+	string null_order;
+};
+
+struct HoglakeSortSpec {
+	int64_t sort_id = 0;
+	vector<HoglakeSortField> fields;
+};
+
+struct HoglakeTableInfo {
+	string name;
+	string namespace_name;
+	string table_uuid;
+	vector<HoglakeColumn> columns;
+	int64_t record_count = 0;
+	int64_t file_count = 0;
+	int64_t file_size_bytes = 0;
+	bool has_partition_spec = false;
+	HoglakePartitionSpec partition_spec;
+	bool has_sort_spec = false;
+	HoglakeSortSpec sort_spec;
+};
+
+struct HoglakeTableSummary {
+	string name;
+	string table_uuid;
+};
+
+struct HoglakeViewInfo {
+	string name;
+	string namespace_name;
+	string view_uuid;
+	string dialect;
+	string sql;
+};
+
+struct HoglakeCommitResult {
+	int64_t snapshot_id = 0;
+	int64_t schema_version = 0;
+};
+
+//! DataFile (wire) — scan planning unit.
+struct HoglakeDataFile {
+	int64_t data_file_id = 0;
+	string path;
+	string file_format;
+	int64_t record_count = 0;
+	int64_t file_size_bytes = 0;
+	int64_t footer_size = 0;
+	int64_t row_id_start = 0;
+	//! provided | pending | failed
+	string stats_state;
+	int64_t begin_snapshot = 0;
+	optional_idx spec_id;
+	//! transformed partition values by key_index; entries may be null
+	vector<Value> partition_values;
+	//! compaction outputs: row ids ride the _hog_row_id column
+	bool explicit_row_ids = false;
+};
+
+//! DeleteFile (wire) — a live puffin deletion vector over one data file.
+struct HoglakeDeleteFile {
+	int64_t delete_file_id = 0;
+	int64_t data_file_id = 0;
+	string path;
+	string file_format;
+	int64_t delete_count = 0;
+	int64_t file_size_bytes = 0;
+	int64_t begin_snapshot = 0;
+};
+
+struct HoglakeScanFile {
+	HoglakeDataFile data_file;
+	bool has_delete_file = false;
+	HoglakeDeleteFile delete_file;
+};
+
+struct HoglakeSnapshotChange {
+	string kind;
+	int64_t object_id = 0;
+};
+
+struct HoglakeSnapshotInfo {
+	int64_t snapshot_id = 0;
+	//! ISO-8601 instant
+	string snapshot_time;
+	int64_t schema_version = 0;
+	string author;
+	string message;
+	vector<HoglakeSnapshotChange> changes;
+};
+
+//! CreateTableRequest column def (client -> server; no field_id yet).
+struct HoglakeColumnDef {
+	string name;
+	string type;
+	int32_t precision = 0;
+	int32_t scale = 0;
+	bool nullable = true;
+};
+
+} // namespace duckdb

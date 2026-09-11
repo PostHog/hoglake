@@ -87,14 +87,20 @@ max 10 / 100 ms / backoff 1.5 with jitter (DuckLake's numbers), settings
 ## ATTACH
 
 ```sql
-ATTACH 'hoglake:http://localhost:8080/analytics' AS lake;
--- equivalently
-ATTACH 'analytics' AS lake (TYPE hoglake, ENDPOINT 'http://localhost:8080');
+ATTACH 'hoglake:analytics' AS lake (ENDPOINT 'http://localhost:8080');
+-- or, with a session default:
+SET hoglake_default_endpoint = 'http://localhost:8080';
+ATTACH 'hoglake:analytics' AS lake;
 ```
 
-Payload = `hoglake:<endpoint>/<catalog>`; the last path segment is the
-catalog name, the rest the server base URL (`/v1` appended by the
-client, as in pyhoglake). Options:
+The attach payload is the **catalog name, never a URI** (the
+duckdb-read-extension.md sketch's call, confirmed the hard way: a URI
+payload trips DuckDB's remote-file detection in
+`DatabaseManager::AttachDatabase`, which demands httpfs and bumps the
+attach to READ_ONLY before the storage extension ever sees it). The
+endpoint comes from the `ENDPOINT` option or the
+`hoglake_default_endpoint` setting (`/v1` appended by the client, as in
+pyhoglake). Options:
 
 | Option | Meaning |
 |---|---|

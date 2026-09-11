@@ -1,0 +1,115 @@
+# name: test/sql/hoglake_attach.test
+# description: ATTACH a hoglake catalog against the live dev server;
+#   catalog browsing (SHOW TABLES / DESCRIBE) and eager DDL.
+# group: [hoglake]
+
+require hoglake
+
+# integration test: needs the live dev stack (hoglake server; see
+# DESIGN.md test strategy). Skips cleanly when the env is absent —
+# a green run without HOGLAKE_URL is NOT a full verification.
+require-env HOGLAKE_URL
+
+# the attach payload is the catalog NAME, not a URI
+statement error
+ATTACH 'hoglake:http://localhost:8080/somecat' AS bad1
+----
+
+# no endpoint anywhere -> clear error
+statement error
+ATTACH 'hoglake:nocatalog' AS bad2
+----
+<REGEX>:.*no endpoint.*
+
+# attaching a catalog that does not exist fails cleanly
+statement error
+ATTACH 'hoglake:duckext-does-not-exist' AS missing (ENDPOINT '{HOGLAKE_URL}')
+----
+<REGEX>:.*does not exist.*
+
+# create-on-attach (idempotent across test runs: finds the existing
+# catalog on reruns)
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+# clean slate for the table fixtures (eager DDL; reruns tolerated)
+statement ok
+DROP TABLE IF EXISTS lake.ns1.people
+
+statement ok
+CREATE TABLE lake.ns1.people (
+    id BIGINT NOT NULL,
+    name VARCHAR,
+    height DOUBLE,
+    born DATE,
+    balance DECIMAL(12, 3),
+    tag UUID
+)
+
+query I
+SELECT table_name FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'ns1' AND table_name = 'people'
+----
+people
+
+query III
+SELECT column_name, column_type, "null" FROM (DESCRIBE lake.ns1.people)
+----
+id	BIGINT	NO
+name	VARCHAR	YES
+height	DOUBLE	YES
+born	DATE	YES
+balance	DECIMAL(12,3)	YES
+tag	UUID	YES
+
+# duplicate create errors; IF NOT EXISTS is a no-op
+statement error
+CREATE TABLE lake.ns1.people (id BIGINT)
+----
+<REGEX>:.*already exists.*
+
+statement ok
+CREATE TABLE IF NOT EXISTS lake.ns1.people (id BIGINT)
+
+# the reserved column prefix fast-fails client-side
+statement error
+CREATE TABLE lake.ns1.reserved_cols (_hog_row_id BIGINT)
+----
+<REGEX>:.*reserved.*
+
+# nested types are outside the (flat) hoglake type set
+statement error
+CREATE TABLE lake.ns1.nested (s STRUCT(a INTEGER))
+----
+<REGEX>:.*not supported.*
+
+# unsupported DDL fails loudly, not silently
+statement error
+DROP SCHEMA lake.ns1
+----
+<REGEX>:.*no namespace-drop.*
+
+# drop + re-create round-trip
+statement ok
+DROP TABLE lake.ns1.people
+
+query I
+SELECT count(*) FROM duckdb_tables() WHERE database_name = 'lake' AND schema_name = 'ns1' AND table_name = 'people'
+----
+0
+
+statement ok
+DETACH lake
+
+# the endpoint-default setting works too
+statement ok
+SET hoglake_default_endpoint = '{HOGLAKE_URL}'
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake2
+
+statement ok
+DETACH lake2

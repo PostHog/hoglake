@@ -1,0 +1,9 @@
+# Pinned dependency clones (see scripts/fetch-deps.sh); become git
+# submodules when this extension moves to its own repo.
+/duckdb/
+/extension-ci-tools/
+/build/
+/testext
+/duckdb_unittest_tempdir/
+.DS_Store
+/.cache/

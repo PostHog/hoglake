@@ -1,0 +1,36 @@
+//===----------------------------------------------------------------------===//
+// HoglakeTableEntry: a hoglake table bound at the transaction's pinned
+// snapshot. Carries the wire identity (table_uuid, field ids, specs)
+// the scan/write paths need.
+//===----------------------------------------------------------------------===//
+
+#pragma once
+
+#include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+#include "common/hoglake_wire.hpp"
+
+namespace duckdb {
+class HoglakeCatalog;
+
+class HoglakeTableEntry : public TableCatalogEntry {
+public:
+	HoglakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
+	                  HoglakeTableInfo table_info);
+
+	const HoglakeTableInfo &GetWireInfo() const {
+		return table_info;
+	}
+	const string &GetTableUUID() const {
+		return table_info.table_uuid;
+	}
+
+public:
+	unique_ptr<BaseStatistics> GetStatistics(ClientContext &context, column_t column_id) override;
+	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
+	TableStorageInfo GetStorageInfo(ClientContext &context) override;
+
+private:
+	HoglakeTableInfo table_info;
+};
+
+} // namespace duckdb
