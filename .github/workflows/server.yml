@@ -42,7 +42,7 @@ jobs:
       # (fold(migrations) == schema.sql).
       - name: Server tests + ktlint
         working-directory: server
-        run: ./gradlew --no-daemon :test :ktlintCheck
+        run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
 
   trino-test:
     # Parallel to `test`: boots the hoglake server in-process plus the

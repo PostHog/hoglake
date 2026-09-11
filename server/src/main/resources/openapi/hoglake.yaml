@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 0.1.0
+  version: 1.0.1-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object

@@ -1,6 +1,6 @@
 [project]
 name = "hedgerow"
-version = "1.0.0"
+version = "1.0.1.dev0"
 description = "hoglake-native replication daemon: one source table -> one destination table, append-only, at-least-once"
 readme = "README.md"
 requires-python = ">=3.11"
