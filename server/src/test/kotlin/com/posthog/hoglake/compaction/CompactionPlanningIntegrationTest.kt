@@ -16,6 +16,7 @@ import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -58,7 +59,19 @@ class CompactionPlanningIntegrationTest {
 
     private fun fixture(columns: List<ColumnDef> = listOf(ColumnDef("id", ColType.LONG))): String {
         val cat = "plan-cat-${counter.incrementAndGet()}"
-        catalogs.createCatalog(cat, "s3://bucket")
+        db.jdbi.useHandleUnchecked { h ->
+            // Raw insert: this suite tests compaction planning, not catalog validation.
+            // The shared "s3://bucket" data_path (files at s3://bucket/x/)
+            // would trip the creation-time shape/overlap rules.
+            val id =
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
+                ).bind(0, cat).bind(1, "s3://bucket").mapTo(Long::class.java).one()
+            h.execute(
+                "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 0, 0)",
+                id,
+            )
+        }
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(cat, "ns", "t", columns)
         return cat

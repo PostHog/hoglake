@@ -281,6 +281,26 @@ class CommitRetentionAndPathGuardIntegrationTest {
     }
 
     @Test
+    fun `dot segments, empty segments, and whitespace under the prefix are 422`() {
+        // startsWith alone admits these; reader stacks that normalize
+        // dot segments would re-address the object OUTSIDE the prefix.
+        val cat = fixture()
+        for (bad in listOf(
+            "s3://bucket/$cat/../evil/f.parquet",
+            "s3://bucket/$cat/./f.parquet",
+            "s3://bucket/$cat//f.parquet",
+            "s3://bucket/$cat/f .parquet",
+            "s3://bucket/$cat/f\tparquet",
+            "s3://bucket/$cat/",
+        )) {
+            assertThatThrownBy { append(cat, bad) }
+                .`as`("path %s", bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+        }
+        assertThat(dataFileCount(cat)).isEqualTo(0)
+    }
+
+    @Test
     fun `trailing slash on data_path is equivalent to none`() {
         val cat = "cg-slash-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://bucket/$cat/")

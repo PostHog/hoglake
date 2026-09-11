@@ -16,9 +16,12 @@
 [Ss]unday.md
 
 # flox: env definitions (.flox/env*, env.json) are tracked; per-machine
-# state is not. flox writes its own .flox/.gitignore for run/cache/log.
+# state is not. flox writes its own .flox/.gitignore for run/cache/log,
+# but a stray activation can create a bare .flox/log/ without it (the
+# tracked-flox-log incident, 2026-09-11).
 **/.flox/telemetry_id
 **/.flox/.DS_Store
+**/.flox/log/
 
 # Python (pyhoglake, hedgerow, bench)
 __pycache__/

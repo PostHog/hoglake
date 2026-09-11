@@ -6,5 +6,5 @@ build/
 trino/build/
 trino/src/
 *.log
-compose.yaml
+docker-compose.yml
 schema.sql

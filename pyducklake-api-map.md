@@ -416,7 +416,7 @@ missing configuration layer:
 | `arrow_large_buffer_size` | `true` | 32-bit Arrow string offsets cap an exported buffer at 2 GiB; a 12.5M-file seed scan died. |
 | `enable_progress_bar(_print)` | `true`/`false` | DuckDB only computes progress when the bar is on. |
 | **`enable_external_file_cache`** | **`false`** | "climbed at ~5 GiB/h ... hit the container's 48 GiB limit in ~8h". |
-| `ducklake_max_retry_count`/`ducklake_retry_wait_ms`/`ducklake_retry_backoff` | `20`/`50`/`1.0` | Extension retry loop is "the ONLY layer that can retry a commit cheaply"; backoff=1.0 defeats the uncapped exponent ([`ducklake_transaction.cpp:2669`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L2669)). |
+| `ducklake_max_retry_count`/`ducklake_retry_wait_ms`/`ducklake_retry_backoff` | `20`/`50`/`1.0` | Extension retry loop is "the ONLY layer that can retry a commit cheaply"; backoff=1.0 defeats the uncapped exponent ([`ducklake_transaction.cpp:2669`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L2669)). |
 | `temp_directory` | fresh `mkdtemp` per connection | Spill filenames carry no instance token; two instances sharing a temp dir corrupt temp accounting and crash. `sweep_spill_dirs()` at process start. |
 
 Connection caching/pooling also lives caller-side: destination catalog
