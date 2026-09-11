@@ -295,8 +295,8 @@ Key moves:
   precedent**: the quack backend's server-side commit — client stages
   the whole commit into `ducklake_staged_*` temp tables and calls
   `ducklake_commit()`, which runs the full OCC retry loop inside the
-  metadata server ([`src/functions/ducklake_commit.cpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/functions/ducklake_commit.cpp),
-  [`ducklake_server_side_commit.hpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/include/storage/ducklake_server_side_commit.hpp)). Hoglake's commit endpoint is
+  metadata server ([`src/functions/ducklake_commit.cpp`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/functions/ducklake_commit.cpp),
+  [`ducklake_server_side_commit.hpp`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/include/storage/ducklake_server_side_commit.hpp)). Hoglake's commit endpoint is
   that idea promoted from "one backend's optimization" to the only
   path, with a real wire API instead of staged temp tables. See
   [ducklake-api-map.md](ducklake-api-map.md) §5 for the ~18-closure commit context the

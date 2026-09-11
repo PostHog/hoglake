@@ -56,14 +56,14 @@ class QeAdversarialStateTest {
     fun `catalog name regex boundaries - 63 ok, 64 rejected, shape edges`() {
         val ok63 = "a" + "b".repeat(62)
         assertThat(ok63).hasSize(63)
-        assertThat(catalogs.createCatalog(ok63, "s3://qe/adv").name).isEqualTo(ok63)
+        assertThat(catalogs.createCatalog(ok63, "s3://qe/adv-63").name).isEqualTo(ok63)
 
         val bad64 = "a" + "b".repeat(63)
-        assertThatThrownBy { catalogs.createCatalog(bad64, "s3://qe/adv") }
+        assertThatThrownBy { catalogs.createCatalog(bad64, "s3://qe/adv-64") }
             .isInstanceOf(HoglakeException.Validation::class.java)
 
         for (bad in listOf("1abc", "Abc", "abC", "-abc", "_abc", "", "a b", "a.b", "abé")) {
-            assertThatThrownBy { catalogs.createCatalog(bad, "s3://qe/adv") }
+            assertThatThrownBy { catalogs.createCatalog(bad, "s3://qe/adv-$bad") }
                 .describedAs("catalog name '%s' must be rejected", bad)
                 .isInstanceOf(HoglakeException.Validation::class.java)
         }

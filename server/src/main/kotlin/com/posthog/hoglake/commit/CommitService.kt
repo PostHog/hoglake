@@ -423,16 +423,35 @@ class CommitService(
                 req.appends.flatMap { a -> a.files.map { it.path } } +
                     req.deletes.flatMap { d -> d.files.map { it.path } }
             )
-                .filter { !it.startsWith(prefix) }
+                .filter { !pathStaysUnder(it, prefix) }
                 .distinct()
         if (offending.isNotEmpty()) {
             throw HoglakeException.Validation(
                 "path(s) outside the catalog data_path '$prefix': " +
                     offending.sorted().take(5).joinToString(", ") +
                     (if (offending.size > 5) " (+${offending.size - 5} more)" else "") +
-                    "; registered files must live under the catalog's data_path",
+                    "; registered files must live under the catalog's data_path, " +
+                    "with no whitespace, dot, or empty path segments",
             )
         }
+    }
+
+    /**
+     * A literal startsWith is not enough: `s3://b/demo/../victim/x` starts
+     * with `s3://b/demo/` but some reader stacks normalize dot segments,
+     * re-addressing the object OUTSIDE the prefix. Whitespace/control
+     * characters are refused outright (they survive into removal-queue
+     * rows and reader URIs), as are empty and dot segments.
+     */
+    private fun pathStaysUnder(
+        path: String,
+        prefix: String,
+    ): Boolean {
+        if (!path.startsWith(prefix)) return false
+        if (path.any { it.isWhitespace() || it.isISOControl() }) return false
+        val relative = path.removePrefix(prefix)
+        if (relative.isEmpty()) return false
+        return relative.split('/').none { it.isEmpty() || it == "." || it == ".." }
     }
 
     /**

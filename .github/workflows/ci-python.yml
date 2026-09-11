@@ -1,0 +1,66 @@
+name: CI python
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyhoglake/**"
+      - "hedgerow/**"
+      - "bench/**"
+      # The OpenAPI spec is the wire contract the clients conform to.
+      - "server/src/main/resources/openapi/hoglake.yaml"
+      - ".github/workflows/ci-python.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "pyhoglake/**"
+      - "hedgerow/**"
+      - "bench/**"
+      - "server/src/main/resources/openapi/hoglake.yaml"
+      - ".github/workflows/ci-python.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-python-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: pyhoglake
+            lint: "true"
+          - component: hedgerow
+            lint: "true"
+          # bench passes `ruff check` but carries a formatting backlog;
+          # lint joins when that lands as its own diff (AGENT.md open
+          # items).
+          - component: bench
+            lint: "false"
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+
+      - run: uv sync
+
+      - name: Lint (ruff, pinned in dev deps)
+        if: matrix.lint == 'true'
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      # Integration tests skip cleanly without a live server; this job
+      # is the unit/mocked layer. The live layer runs via `just dev` +
+      # full suites locally (AGENT.md pre-push checklist).
+      - name: Tests
+        run: uv run pytest -q

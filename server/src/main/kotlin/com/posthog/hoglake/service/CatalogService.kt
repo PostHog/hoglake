@@ -48,14 +48,69 @@ class CatalogService(private val jdbi: Jdbi) {
         dataPath: String,
     ): CatalogInfo =
         Audit.audited("catalog_create", name, null, detail = { "data_path=$dataPath" }) {
-            if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
+            validateDataPath(dataPath)
             jdbi.inTransactionUnchecked { h ->
+                // data_path prefix-overlap with ANY existing catalog is
+                // refused, both directions: cleanup's drain-time liveness
+                // check is per-catalog, so two catalogs sharing a prefix
+                // let catalog A's drain physically delete an object
+                // catalog B still references (invariant 4, made global
+                // here at the only place overlap can be introduced).
+                // Runs inside the insert transaction; the hog_catalog
+                // name-unique insert serializes concurrent creates enough
+                // for this dev-era check.
+                val newPrefix = dataPath.trimEnd('/') + "/"
+                CatalogRepo.listAll(h).forEach { existing ->
+                    // Same-name recreate falls through to the insert's
+                    // unique constraint -> AlreadyExists (409), the
+                    // canonical duplicate answer; overlap 422s are for
+                    // OTHER catalogs' prefixes.
+                    if (existing.name == name) return@forEach
+                    val theirPrefix = existing.dataPath.trimEnd('/') + "/"
+                    if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
+                        throw HoglakeException.Validation(
+                            "data_path '$dataPath' overlaps catalog '${existing.name}' " +
+                                "(data_path '${existing.dataPath}'); catalog data_paths must be disjoint",
+                        )
+                    }
+                }
                 val info = CatalogRepo.insert(h, name, dataPath)
                 // Snapshot 0: the empty catalog at schema_version 0, no changes.
                 SnapshotRepo.insert(h, info.catalogId, 0, 0)
                 info
             }
         }
+
+    /**
+     * data_path shape: `s3://<bucket>[/<key-prefix>]` with a non-empty
+     * bucket, no whitespace/control chars, no dot segments. The
+     * commit-time path guard is a prefix comparison against this
+     * value, so a degenerate data_path is a guard bypass: `s3://`
+     * normalizes to a prefix every s3 URI starts with. A bucket-ROOT
+     * data_path is legal — it is the fleet convention (a catalog owns
+     * its bucket); the overlap check above keeps other catalogs off
+     * it. Non-s3 schemes are refused because the hydrator/cleanup
+     * object store only speaks s3 — a catalog with an unparseable
+     * data_path poisons the removal queue (rows retry forever).
+     */
+    private fun validateDataPath(dataPath: String) {
+        if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
+        if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
+            throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
+        }
+        val rest =
+            dataPath.removePrefix("s3://").takeIf { it != dataPath }
+                ?: throw HoglakeException.Validation("data_path must be an s3://<bucket>[/<prefix>] URI")
+        val bucket = rest.substringBefore('/')
+        if (bucket.isEmpty()) {
+            throw HoglakeException.Validation(
+                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, got '$dataPath'",
+            )
+        }
+        if (rest.split('/').any { it == "." || it == ".." }) {
+            throw HoglakeException.Validation("data_path must not contain '.' or '..' segments")
+        }
+    }
 
     fun getCatalog(name: String): CatalogInfo = jdbi.withHandleUnchecked { h -> requireCatalog(h, name) }
 

@@ -26,7 +26,7 @@ class OptionsServiceIntegrationTest {
 
     @Test
     fun `new catalog defaults - no retention, consumer floor on, earliest 0`() {
-        catalogs.createCatalog("opt-defaults", "s3://b/p")
+        catalogs.createCatalog("opt-defaults", "s3://b/opt-defaults")
         val opts = svc.get("opt-defaults")
         assertThat(opts.snapshotRetentionSeconds).isNull()
         assertThat(opts.consumerFloor).isTrue()
@@ -35,7 +35,7 @@ class OptionsServiceIntegrationTest {
 
     @Test
     fun `patch value sets retention and leaves the absent field untouched`() {
-        catalogs.createCatalog("opt-set", "s3://b/p")
+        catalogs.createCatalog("opt-set", "s3://b/opt-set")
         val patched = svc.patch("opt-set", PatchField.Set(3_600L), consumerFloor = null)
         assertThat(patched.snapshotRetentionSeconds).isEqualTo(3_600L)
         assertThat(patched.consumerFloor).isTrue() // absent -> unchanged
@@ -53,7 +53,7 @@ class OptionsServiceIntegrationTest {
 
     @Test
     fun `patch explicit null disables expiry`() {
-        catalogs.createCatalog("opt-null", "s3://b/p")
+        catalogs.createCatalog("opt-null", "s3://b/opt-null")
         svc.patch("opt-null", PatchField.Set(60L), consumerFloor = null)
         assertThat(svc.get("opt-null").snapshotRetentionSeconds).isEqualTo(60L)
 
@@ -64,7 +64,7 @@ class OptionsServiceIntegrationTest {
 
     @Test
     fun `patch with both fields absent is a no-op read`() {
-        catalogs.createCatalog("opt-noop", "s3://b/p")
+        catalogs.createCatalog("opt-noop", "s3://b/opt-noop")
         svc.patch("opt-noop", PatchField.Set(120L), consumerFloor = false)
         val opts = svc.patch("opt-noop", PatchField.Absent, consumerFloor = null)
         assertThat(opts.snapshotRetentionSeconds).isEqualTo(120L)
@@ -73,7 +73,7 @@ class OptionsServiceIntegrationTest {
 
     @Test
     fun `non-positive retention is rejected without touching the row`() {
-        catalogs.createCatalog("opt-invalid", "s3://b/p")
+        catalogs.createCatalog("opt-invalid", "s3://b/opt-invalid")
         svc.patch("opt-invalid", PatchField.Set(60L), consumerFloor = null)
 
         for (bad in listOf(0L, -1L)) {

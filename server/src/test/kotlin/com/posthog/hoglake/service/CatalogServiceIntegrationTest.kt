@@ -311,4 +311,51 @@ class CatalogServiceIntegrationTest {
         assertThatThrownBy { svc.getTable("range-cat", "ns", "t", snapshot = -1) }
             .isInstanceOf(HoglakeException.Validation::class.java)
     }
+
+    // ---- data_path validation (QE review 2026-09-11) ---------------------
+
+    @Test
+    fun `degenerate and hostile data_paths are 422 - the commit path guard depends on this`() {
+        // Each would defeat or poison downstream machinery: "s3://"
+        // normalizes to a prefix every s3 URI matches; bucket-only admits
+        // sibling catalogs; non-s3 schemes poison the removal queue;
+        // whitespace/dot segments survive into reader URIs.
+        for (bad in listOf(
+            "s3://",
+            "s3:///prefix",
+            "gs://bucket/prefix",
+            "/var/data",
+            "s3://bucket/pre fix",
+            "s3://bucket/a/../b",
+            "s3://bucket/a	b",
+        )) {
+            assertThatThrownBy { svc.createCatalog("dp-bad", bad) }
+                .`as`("data_path %s", bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+        }
+    }
+
+    @Test
+    fun `overlapping data_paths are refused in both directions`() {
+        svc.createCatalog("dp-base", "s3://ovl/base")
+        // Equal, nested-under, and parent-of are all refused; the
+        // trailing-slash form is the same prefix.
+        for (bad in listOf("s3://ovl/base", "s3://ovl/base/", "s3://ovl/base/deeper")) {
+            assertThatThrownBy { svc.createCatalog("dp-clash", bad) }
+                .`as`("overlap %s", bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("overlaps catalog 'dp-base'")
+        }
+        // Bucket-root parent overlaps everything in the bucket.
+        assertThatThrownBy { svc.createCatalog("dp-parent", "s3://ovl") }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("overlaps")
+        // Sibling prefixes stay legal, including the sneaky
+        // shares-a-string-prefix sibling.
+        svc.createCatalog("dp-sib", "s3://ovl/base2")
+        // Bucket-root data_path is legal on its own bucket — the fleet
+        // convention (megaduck-shaped catalogs own a bucket).
+        svc.createCatalog("dp-root", "s3://own-bucket")
+        svc.createCatalog("dp-root-slash", "s3://own-bucket-2/")
+    }
 }

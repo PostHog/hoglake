@@ -1,0 +1,138 @@
+name: Webui
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "webui/**"
+      # The OpenAPI spec is the wire contract the console conforms to.
+      - "server/src/main/resources/openapi/hoglake.yaml"
+      - ".github/workflows/webui.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "webui/**"
+      - "server/src/main/resources/openapi/hoglake.yaml"
+      - ".github/workflows/webui.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: webui-test-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: webui
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: webui/package-lock.json
+
+      - run: npm ci
+
+      # `build` runs tsc -b first — the type gate.
+      - name: Typecheck + build
+        run: npm run build
+
+      - name: Tests
+        run: npm test
+
+      - name: Docker build + boot smoke
+        if: github.event_name == 'pull_request'
+        working-directory: .
+        run: |
+          docker build -t hoglake-webui:ci webui/
+          # Static proxy_pass resolves the upstream name at boot; give
+          # nginx a resolvable alias so the smoke tests OUR config, not
+          # DNS.
+          docker network create smoke-net
+          docker run -d --name fake-api --network smoke-net --network-alias hoglake-server alpine sleep 300
+          docker run -d --name smoke --network smoke-net -p 8081:8080 hoglake-webui:ci
+          for _ in $(seq 1 15); do
+            if curl -fsS -m 2 http://localhost:8081/ >/dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          docker logs smoke | tail -5
+          [ "${ok:-}" = "1" ]
+
+  deploy:
+    # GATED ON CI — see server.yml's deploy job for the decision note.
+    needs: [test]
+    if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: webui-deploy
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: webui
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/posthog/hoglake-webui:${{ github.sha }}
+            ghcr.io/posthog/hoglake-webui:latest
+          cache-from: type=gha,scope=webui
+          cache-to: type=gha,scope=webui,mode=max
+
+      - name: Get image digest
+        id: digest
+        run: |
+          digest=$(docker buildx imagetools inspect --raw ghcr.io/posthog/hoglake-webui:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Get deployer token
+        id: deployer
+        uses: getsentry/action-github-app-token@d4b5da6c5e37703f8c3b3e43abb5705b46e159cc # v3.0.0
+        with:
+          app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
+          private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
+
+      - name: Trigger deployment via Charts repo
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697 # v4.0.1
+        with:
+          token: ${{ steps.deployer.outputs.token }}
+          repository: PostHog/charts
+          event-type: commit_state_update
+          client-payload: |
+            {
+              "values": {
+                "image": {
+                  "sha": "${{ github.sha }}@${{ steps.digest.outputs.digest }}"
+                }
+              },
+              "release": "gigahog-webui",
+              "commit": ${{ toJson(github.event.head_commit) }},
+              "repository": ${{ toJson(github.repository) }},
+              "labels": [],
+              "timestamp": "${{ github.event.head_commit.timestamp }}"
+            }

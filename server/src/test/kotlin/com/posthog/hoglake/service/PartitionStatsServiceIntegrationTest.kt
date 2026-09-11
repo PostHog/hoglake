@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -48,7 +49,19 @@ class PartitionStatsServiceIntegrationTest {
         table: String = "t",
     ): String {
         val cat = "pstats-cat-${counter.incrementAndGet()}"
-        catalogs.createCatalog(cat, "s3://bucket")
+        db.jdbi.useHandleUnchecked { h ->
+            // Raw insert: this suite tests partition stats, not catalog validation.
+            // The shared "s3://bucket" data_path (files at s3://bucket/x/)
+            // would trip the creation-time shape/overlap rules.
+            val id =
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
+                ).bind(0, cat).bind(1, "s3://bucket").mapTo(Long::class.java).one()
+            h.execute(
+                "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 0, 0)",
+                id,
+            )
+        }
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(cat, "ns", table, columns)
         return cat
@@ -262,7 +275,19 @@ class PartitionStatsServiceIntegrationTest {
     @Test
     fun `namespace and table filters scope the ranking, and half a scope is refused`() {
         val cat = "pstats-cat-${counter.incrementAndGet()}"
-        catalogs.createCatalog(cat, "s3://bucket")
+        db.jdbi.useHandleUnchecked { h ->
+            // Raw insert: this suite tests partition stats, not catalog validation.
+            // The shared "s3://bucket" data_path (files at s3://bucket/x/)
+            // would trip the creation-time shape/overlap rules.
+            val id =
+                h.createQuery(
+                    "INSERT INTO hog_catalog (name, data_path) VALUES (?, ?) RETURNING catalog_id",
+                ).bind(0, cat).bind(1, "s3://bucket").mapTo(Long::class.java).one()
+            h.execute(
+                "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) VALUES (?, 0, 0)",
+                id,
+            )
+        }
         catalogs.createNamespace(cat, "ns1")
         catalogs.createNamespace(cat, "ns2")
         val cols = listOf(ColumnDef("id", ColType.LONG))

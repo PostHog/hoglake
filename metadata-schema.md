@@ -8,9 +8,9 @@ the inventory of the hoglake schema as built (`hog_*`), kept in sync
 with [`server/schema.sql`](server/schema.sql) — which, not this doc, is
 the authoritative artifact.
 
-Source of truth: [`src/storage/ducklake_metadata_manager.cpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp)
+Source of truth: [`src/storage/ducklake_metadata_manager.cpp`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp)
 (`GetCreateTableStatements`, lines 237–310) plus the v1.1 overlay in
-[`src/metadata_manager/ducklake_metadata_manager_v1_1.cpp`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/ducklake_metadata_manager_v1_1.cpp). There are no
+[`src/metadata_manager/ducklake_metadata_manager_v1_1.cpp`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/ducklake_metadata_manager_v1_1.cpp). There are no
 `.sql` files — the entire schema is C++ string literals with a
 `{METADATA_CATALOG}` placeholder substituted per backend. Types are
 DuckDB-dialect DDL handed verbatim to the metadata store.
@@ -54,7 +54,7 @@ DuckDB-dialect DDL handed verbatim to the metadata store.
 |---|---|---|---|
 | `ducklake_data_file` | `data_file_id PK`, `table_id`, `begin_snapshot`, `end_snapshot`, `file_order`, `path`, `path_is_relative`, `file_format`, `record_count`, `file_size_bytes`, `footer_size`, `row_id_start`, `partition_id`, `encryption_key`, `mapping_id`, `partial_max`, `row_group_count` (v1.1) | PK | The file manifest; alive for `[begin_snapshot, end_snapshot)`. `row_id_start` anchors the global row-id range; `mapping_id` links name mappings for externally-added files; `partial_max` marks multi-snapshot files. DDL `:223` / v1.1 `:10`. |
 | `ducklake_delete_file` | `delete_file_id PK`, `table_id`, `begin_snapshot`, `end_snapshot`, `data_file_id`, `path`, `path_is_relative`, `format`, `delete_count`, `file_size_bytes`, `footer_size`, `encryption_key`, `partial_max`, `row_group_count` (v1.1) | PK | Positional delete files (Parquet or Puffin); each points at one `data_file_id`; at most one live delete file per data file per range. |
-| `ducklake_file_column_stats` | `data_file_id`, `table_id`, `column_id`, `column_size_bytes`, `value_count`, `null_count`, `min_value VARCHAR`, `max_value VARCHAR`, `contains_nan`, `extra_stats` | none | Per-file zone maps — the hot pruning table (`GenerateFileColumnStatsCTEBody` `:1636`; PG override [`postgres_metadata_manager.cpp:134`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/postgres_metadata_manager.cpp#L134)). Min/max as text, cast in generated SQL. Renamed from `..._statistics` in 0.2→0.3 (`:366`). |
+| `ducklake_file_column_stats` | `data_file_id`, `table_id`, `column_id`, `column_size_bytes`, `value_count`, `null_count`, `min_value VARCHAR`, `max_value VARCHAR`, `contains_nan`, `extra_stats` | none | Per-file zone maps — the hot pruning table (`GenerateFileColumnStatsCTEBody` `:1636`; PG override [`postgres_metadata_manager.cpp:134`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/postgres_metadata_manager.cpp#L134)). Min/max as text, cast in generated SQL. Renamed from `..._statistics` in 0.2→0.3 (`:366`). |
 | `ducklake_file_variant_stats` | same + `variant_path`, `shredded_type` | none | Per shredded VARIANT sub-path (0.3→0.4, `:383`). |
 | `ducklake_table_stats` | `table_id`, `record_count`, `next_row_id`, `file_size_bytes` | none | Table rollup and the **row-id allocator**. Hand-rolled upsert (`UpdateGlobalTableStatsSql` `:4932`). |
 | `ducklake_table_column_stats` | `table_id`, `column_id`, `contains_null`, `contains_nan`, `min_value`, `max_value`, `extra_stats` | none | All-files column stats for metadata-answered MIN/MAX (`GlobalTableStatsQuery` `:1185`). |
@@ -89,7 +89,7 @@ DuckDB-dialect DDL handed verbatim to the metadata store.
 | `ducklake_inlined_data_tables` | `table_id`, `table_name`, `schema_version` | Registry of physical inlined-data tables. |
 | `ducklake_inlined_data_<table_id>_<schema_version>` | `_ducklake_row_id`, `_ducklake_begin_snapshot`, `_ducklake_end_snapshot`, + user columns | **Dynamically created per table+schema version — user data living in the catalog DB.** Name `InlinedTableNameFor` `:2816`; DDL `:2824`. The `_ducklake_` prefix is a v1.1 rename (`MigrateInlinedColumnNames` `:449`). |
 | `ducklake_inlined_delete_<table_id>` | `file_id`, `row_id`, `begin_snapshot` | Dynamic, per table: small deletes against Parquet files as rows. Created lazily; existence probed by running a SELECT and inspecting the error — flagged fragile in-source (`:3381`). |
-| `ducklake_staged_*` (16 names) | see [`ducklake_staged_commit.cpp:27-59`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_staged_commit.cpp#L27-L59) | **Not catalog tables** — temp staging for server-side `ducklake_commit()` (quack only). |
+| `ducklake_staged_*` (16 names) | see [`ducklake_staged_commit.cpp:27-59`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_staged_commit.cpp#L27-L59) | **Not catalog tables** — temp staging for server-side `ducklake_commit()` (quack only). |
 
 ---
 
@@ -97,7 +97,7 @@ DuckDB-dialect DDL handed verbatim to the metadata store.
 
 **Version location**: one `ducklake_metadata` row, `key='version'`,
 value ∈ `0.1, 0.2, 0.3-dev1, 0.3, 0.4-dev1, 0.4, 1.0, 1.1-dev1`
-([`common/ducklake_version.cpp:6-55`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/common/ducklake_version.cpp#L6-L55);
+([`common/ducklake_version.cpp:6-55`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/common/ducklake_version.cpp#L6-L55);
 `DUCKLAKE_LATEST_VERSION = V1_1_DEV_1`).
 
 **Migration is imperative, forward-only, in the metadata manager.**
@@ -119,7 +119,7 @@ is no applied-migrations ledger, no advisory lock, and no per-step
 transaction boundary.** Mid-migration failure leaves a partially
 migrated catalog reconstructable only from the version string.
 
-**Mismatch behavior** ([`ducklake_initializer.cpp:187-286`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_initializer.cpp#L187-L286)): newer
+**Mismatch behavior** ([`ducklake_initializer.cpp:187-286`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_initializer.cpp#L187-L286)): newer
 catalog → "Cannot downgrade"; older without `AUTOMATIC_MIGRATION` →
 error; target resolution: explicit `ducklake_version` wins, else
 automatic ⇒ latest, else catalog's own if ≥1.0, else hard error.
@@ -161,7 +161,7 @@ file physically carries a row-id column
 (`multi_file_reader.cpp:589-694`). `row_id_start` is nullable
 (externally-added files); reading such a row id throws (`:602`).
 Flushing inlined data preserves original row ids via
-`flush_row_id_start` ([`ducklake_insert.cpp:170`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_insert.cpp#L170)).
+`flush_row_id_start` ([`ducklake_insert.cpp:170`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_insert.cpp#L170)).
 
 **Partial files (`partial_max`)**: a file whose rows span several
 snapshots stores the max contributing snapshot; at read,
@@ -190,7 +190,7 @@ exactly where FK `ON DELETE CASCADE` takes over in the rebuild.
 
 - Postgres does **not** execute through the attached-catalog path:
   `PostgresMetadataManager::ExecuteQuery`
-  ([`postgres_metadata_manager.cpp:83`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/postgres_metadata_manager.cpp#L83)) substitutes placeholders and
+  ([`postgres_metadata_manager.cpp:83`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/metadata_manager/postgres_metadata_manager.cpp#L83)) substitutes placeholders and
   wraps the batch in `CALL postgres_execute('<catalog>', '<sql>')`
   (`:113`) — native execution inside Postgres. Reads use the base query
   path; two reads rewritten to `postgres_query(...)` pushdown:
@@ -209,15 +209,15 @@ exactly where FK `ON DELETE CASCADE` takes over in the rebuild.
 - `SupportsAppender() → false` (SQL-batch path always);
   `MaxIdentifierLength() → 63`; `pg_experimental_filter_pushdown`
   disabled on the metadata connection
-  ([`ducklake_transaction.cpp:819-824`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L819-L824)); attach scoped with
+  ([`ducklake_transaction.cpp:819-824`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L819-L824)); attach scoped with
   `SCHEMA '<metadata_schema>'` when unset
-  ([`ducklake_initializer.cpp:51-60`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_initializer.cpp#L51-L60)).
+  ([`ducklake_initializer.cpp:51-60`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_initializer.cpp#L51-L60)).
 - Dialect accommodations in shared code: ANSI `CAST` not `::` (SQLite),
   one UPDATE per column instead of `UPDATE ... FROM (VALUES ...)`
   (`:4957-4976`), bucket pruning by string equality only
-  ([`ducklake_metadata_manager.hpp:524-528`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/include/storage/ducklake_metadata_manager.hpp#L524-L528)).
+  ([`ducklake_metadata_manager.hpp:524-528`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/include/storage/ducklake_metadata_manager.hpp#L524-L528)).
 - **Transactions/locking**: one metadata-DB transaction per DuckLake
-  transaction ([`ducklake_transaction.cpp:825`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L825)), purely optimistic —
+  transaction ([`ducklake_transaction.cpp:825`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction.cpp#L825)), purely optimistic —
   snapshot-id PK collision fails the commit; retry re-runs
   `CheckForConflicts` with jittered exponential backoff. No
   `SELECT ... FOR UPDATE`, no advisory locks, no serializable request.

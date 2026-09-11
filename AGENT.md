@@ -1,8 +1,9 @@
 # Hoglake — Postgres-Native Lakehouse Catalog Control Plane
 
-Agent guidance for the `hoglake/` subtree. The enclosing repo is the
-PostHog DuckLake C++ fork; everything hoglake lives under this
-directory and does not touch the fork's `src/`.
+Agent guidance for this repo (github.com/PostHog/hoglake — the
+standalone hoglake monorepo; the codebase began life as a subtree of
+the PostHog DuckLake fork, now PostHog/ducklake, whose history holds
+the pre-split commits).
 
 ## Pre-push checklist
 
@@ -63,6 +64,48 @@ The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
 — it is the single source of truth for wire shapes; server routes,
 pyhoglake, webui fixtures, and hedgerow all conform to it. Change the
 spec and the implementations together.
+
+## CI/CD and deploys (Gigahog)
+
+The production deployment of hoglake is **Gigahog** (deploy targets
+`gigahog-server` / `gigahog-webui` in PostHog/charts). CI is
+path-scoped per component, posthog-monorepo style:
+
+| Workflow | Paths | Runs |
+|---|---|---|
+| `server.yml` | `server/**`, codec vectors | test + ktlint and :trino:test as parallel jobs (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job |
+| `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
+| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest (unit/mocked layer — live integration is local, per the pre-push checklist) |
+| `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
+| `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
+
+CD is the charts state-file mechanism (same as duckgres, millpond,
+viaduck): a push to main touching `server/**` or `webui/**` runs the
+`deploy` job of `server.yml` / `webui.yml`, which builds a
+**multi-arch** image (build stages are pinned to `$BUILDPLATFORM`; the
+mw fleet runs Graviton), push `ghcr.io/posthog/hoglake-server|-webui`,
+and dispatch `commit_state_update` with the multi-arch MANIFEST digest
+(never a per-arch digest) to `state/gigahog-server.yaml` /
+`state/gigahog-webui.yaml`. Dev auto-promotes; prod goes through the
+charts `promote-to-prod.yml` workflow behind the
+`prod-promote-managed-warehouse` approval gate. Unlike millpond and
+duckgres (where CD runs in parallel with CI), the deploy job is GATED:
+it `needs` the test jobs, so a red main push never builds, publishes,
+or dispatches (decided 2026-09-11). A flaky-failure rerun that goes
+green deploys on the rerun — the procedure in
+millpond's AGENT.md applies verbatim with `app=gigahog-server` /
+`app=gigahog-webui`.
+
+Bootstrap state (until all are done, CD dispatches fail or no-op):
+
+- [ ] repo secrets `GH_APP_CHARTS_DEPLOYER_APP_ID` /
+      `GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY` exposed to this repo
+- [ ] charts side: golden-chart apps + `state/gigahog-*.yaml` seeded
+      AFTER the first image push (the seed digest must postdate the
+      code — docs/claude/new-app-image-releases.md in charts)
+- [ ] first images published (needs the repo visible to GHCR consumers)
+- [ ] Dependency Graph (+ GHAS for internal repos) enabled — the
+      dependency-review workflow errors on every PR without it
 
 ## Invariants (violating any of these is a bug, full stop)
 
@@ -164,7 +207,8 @@ spec and the implementations together.
   planning is metadata-only (live, same spec + partition values, under
   target bytes; adjacency NOT required), rewrite via **parquet-java**
   (the project's one parquet library — decision 2026-09-05: Hardwood is
-  out entirely; parquet-java handles footer reads in the hydrator AND
+  out of main code entirely (the trino test fixtures still use
+  hardwood-core to produce id-less parquet — deliberately); parquet-java handles footer reads in the hydrator AND
   the compaction writer), commit under the catalog lock with input
   re-verification. **DV-bearing files compact — LANDED**: the rewrite
   APPLIES each input's live DV (puffin `deletion-vector-v1`, read via
@@ -203,7 +247,7 @@ spec and the implementations together.
   endpoint is metadata-only by design and can't do the S3 footer reads
   this check needs.
 - **Maintenance verify — LANDED**: `POST
-  /v1/catalogs/{c}/maintenance/verify` (gaps.md B3, absorbing B4) — the
+  /v1/catalogs/{c}/maintenance/verify` (schema-gaps review item B3, absorbing B4) — the
   QE suite's global-invariant SQL as a metadata-only, read-only
   endpoint (REPEATABLE READ MVCC snapshot, no catalog lock): row-id
   tiling (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
@@ -213,7 +257,7 @@ spec and the implementations together.
   OpenAPI (501s) + README; not implemented.
 - **DR/export**: `GET /v1/catalogs/{c}/export` specified in the OpenAPI
   (snapshot range + live-file manifest + consumer offsets, consistent
-  at head); 501 stub until built (gaps.md B5).
+  at head); 501 stub until built (schema-gaps review item B5).
 - **Iceberg REST facade + Trino**: design obligations in
   [iceberg-federation.md](iceberg-federation.md) /
   [trino-integration.md](trino-integration.md); v1 schema already

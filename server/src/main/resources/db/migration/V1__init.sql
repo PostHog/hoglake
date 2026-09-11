@@ -149,6 +149,11 @@ CREATE TABLE hog_table_version (
 CREATE UNIQUE INDEX hog_table_version_live_name
     ON hog_table_version (catalog_id, namespace_id, name)
     WHERE end_snapshot IS NULL;
+-- Non-partial: the deferred namespace FK's RI trigger cannot use the
+-- partial live-name index; without this, a namespace or catalog delete
+-- scans every history row per namespace.
+CREATE INDEX hog_table_version_namespace
+    ON hog_table_version (catalog_id, namespace_id);
 CREATE INDEX hog_table_version_live
     ON hog_table_version (catalog_id, table_id) WHERE end_snapshot IS NULL;
 
@@ -178,6 +183,11 @@ CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
 -- Writers stamp parquet field order from ordinals: a duplicate live
 -- ordinal is a silent corruption vector, so the DB refuses it.
+-- IMMEDIATE and write-order-sensitive: a single-statement swap of two
+-- live ordinals violates it mid-update (verified). Every alter op must
+-- end-snapshot old rows before inserting new ones (AlterService does);
+-- a future reorder-columns op must keep that shape or this index must
+-- become a deferrable constraint.
 CREATE UNIQUE INDEX hog_column_live_ordinal
     ON hog_column (catalog_id, table_id, ordinal)
     WHERE end_snapshot IS NULL;
@@ -413,6 +423,9 @@ CREATE TABLE hog_view (
 );
 CREATE UNIQUE INDEX hog_view_live_name
     ON hog_view (catalog_id, namespace_id, name) WHERE end_snapshot IS NULL;
+-- Same RI-trigger rationale as hog_table_version_namespace.
+CREATE INDEX hog_view_namespace
+    ON hog_view (catalog_id, namespace_id);
 
 -- The file-removal queue AND ledger. Physical deletion is decoupled
 -- from metadata deletion, batched, and ALWAYS liveness-checked at drain

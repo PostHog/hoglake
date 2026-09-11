@@ -18,9 +18,9 @@ are the latest `schema_version` for their `table_id`. Most are empty.
 
 **Root cause**:
 `DuckLakeTransactionState::DropEmptySupersededInlinedTables`
-([`src/storage/ducklake_transaction_state.cpp:1381-1441`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction_state.cpp#L1381-L1441)) and the
+([`src/storage/ducklake_transaction_state.cpp:1381-1441`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_transaction_state.cpp#L1381-L1441)) and the
 equivalent in the metadata manager
-([`src/storage/ducklake_metadata_manager.cpp:5074-5124`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L5074-L5124)) both select
+([`src/storage/ducklake_metadata_manager.cpp:5074-5124`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L5074-L5124)) both select
 candidates with:
 
 ```sql
@@ -60,7 +60,7 @@ invalidating the snapshot; each retry re-paid the full load).
 
 **Root cause**:
 `DuckLakeMetadataManager::GetSnapshotAndStatsAndChanges`
-([`src/storage/ducklake_metadata_manager.cpp:3747`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L3747)) UNIONs the
+([`src/storage/ducklake_metadata_manager.cpp:3747`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L3747)) UNIONs the
 latest-snapshot row with the full `ducklake_table_stats ⟕
 ducklake_table_column_stats` join — **no `table_id` filter**. The
 per-table version of the same query exists (`GetGlobalTableStats`,
@@ -87,7 +87,7 @@ observed) while `duckdb_memory()` reports ~0; confirmed OOM loop on a
 catalogs, not the write rate.
 
 **Root cause**: `DuckLakeCatalog::GetSchemaCacheEntry`
-([`src/storage/ducklake_catalog.cpp:220`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_catalog.cpp#L220)) caches one full catalog set
+([`src/storage/ducklake_catalog.cpp:220`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_catalog.cpp#L220)) caches one full catalog set
 per `schema_version` in DuckDB's ObjectCache (8GiB hardcoded cap).
 Eviction is driven by `GetEstimatedCacheMemory()`, which counts **table
 entries, not columns** (`:42-44`) — at 728 tables / 85K columns the
@@ -115,7 +115,7 @@ dropped tables — and defect #2 made every writer pay for them on every
 commit attempt.
 
 **Root cause**: `DROP TABLE` only sets `end_snapshot` on the
-`ducklake_table` row ([`src/storage/ducklake_metadata_manager.cpp:2232`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L2232));
+`ducklake_table` row ([`src/storage/ducklake_metadata_manager.cpp:2232`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L2232));
 stats rows are deleted only by `DeleteSnapshots` (`:4742`), i.e. at
 snapshot-expiry time. Where expiry lags DDL churn, orphans persist
 indefinitely; global stats are unversioned and unreadable for
@@ -146,7 +146,7 @@ shape, most likely from a concurrent multi-minute DDL transaction. An
 InternalException invalidates the whole DuckDB instance.
 
 **Root cause**: `TransformGlobalStatsRow`
-([`src/storage/ducklake_metadata_manager.cpp:862`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L862)) reads `column_id` and
+([`src/storage/ducklake_metadata_manager.cpp:862`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L862)) reads `column_id` and
 the `record_count`/`next_row_id`/`table_size_bytes` trio via `GetValue`
 with no IsNull guard (only the column-stat fields at positions 5+ are
 guarded). A table_stats row with zero column_stats rows LEFT JOINs to
@@ -185,7 +185,7 @@ cascade). Two LEAK classes remained versus the built-in cascade:
 2. **Omitted cascades**: dropped-table cleanup across the ~12 lifecycle
    tables, dropped tables' live-marked data files, unbridged
    schema/view/tag/macro rows (fork cascade at
-   [`src/storage/ducklake_metadata_manager.cpp:4590-4799`](https://github.com/PostHog/hoglake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L4590-L4799)). The port
+   [`src/storage/ducklake_metadata_manager.cpp:4590-4799`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp#L4590-L4799)). The port
    never deletes a dropped table's live-marked files → S3 + catalog
    leak; the 54K-dropped-tables incident shows the class accumulates.
 

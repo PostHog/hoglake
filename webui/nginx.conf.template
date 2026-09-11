@@ -1,8 +1,13 @@
 # Substituted by the nginx image entrypoint (envsubst on
 # /etc/nginx/templates/*.template): ${HOGLAKE_API} is the control-plane
 # base URL.
+# NOTE: static proxy_pass resolves ${HOGLAKE_API}'s hostname ONCE at
+# nginx startup — the upstream name must resolve when the container
+# boots (in k8s the Service DNS record exists as soon as the Service
+# object does; for bare docker runs, create the server container or a
+# network alias first, or nginx exits [emerg] host not found).
 server {
-    listen 80;
+    listen 8080;
     root /usr/share/nginx/html;
     index index.html;
 
@@ -14,7 +19,6 @@ server {
     # Same-origin API paths, mirroring vite.config.ts's dev proxy.
     location /v1/ {
         proxy_pass ${HOGLAKE_API};
-        proxy_set_header Host $host;
         # Snapshot listings and scan plans can be slow on big catalogs;
         # keep the proxy budget above the server's own work, not at
         # nginx's 60s default.

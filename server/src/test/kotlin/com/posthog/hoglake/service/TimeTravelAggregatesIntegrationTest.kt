@@ -32,7 +32,7 @@ class TimeTravelAggregatesIntegrationTest {
 
     @Test
     fun `table aggregates are snapshot scoped`() {
-        catalogs.createCatalog("tta", "s3://tta/")
+        catalogs.createCatalog("tta", "s3://tta/data")
         catalogs.createNamespace("tta", "ns")
         catalogs.createTable("tta", "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
 
@@ -50,8 +50,8 @@ class TimeTravelAggregatesIntegrationTest {
             ),
         )
 
-        val first = append("s3://tta/a.parquet", 10, 1000)
-        val second = append("s3://tta/b.parquet", 5, 500)
+        val first = append("s3://tta/data/a.parquet", 10, 1000)
+        val second = append("s3://tta/data/b.parquet", 5, 500)
 
         val atFirst = catalogs.getTable("tta", "ns", "t", snapshot = first.snapshotId)
         assertThat(atFirst.fileCount).isEqualTo(1)
