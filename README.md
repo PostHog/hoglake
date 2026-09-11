@@ -37,8 +37,8 @@ Implementation lives alongside the docs (`justfile` composes the
 per-component recipes; `just test-all`):
 
 - [server/](server/README.md) — the control plane (Kotlin/Ktor/PG).
-- [server/trino/](server/trino/README.md) — the native read-only Trino
-  connector (interim, until the Iceberg facade lands).
+- [server/trino/](server/trino/README.md) — integration tests for the native
+  read-only connector maintained in [PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake).
 - [pyhoglake/](pyhoglake/README.md) — the Python client (the thin-API
   successor to pyducklake; owns the parquet writer path).
 - [webui/](webui/README.md) — the management console.
