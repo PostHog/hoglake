@@ -1,0 +1,89 @@
+name: Fuzz nightly
+
+# Deep coverage-guided Jazzer soak of the six hermetic fuzz targets
+# (fuzzing.md layer 4). The normal server suite only REPLAYS the
+# committed seed corpus; this run actually fuzzes, and accumulates its
+# generated corpus across nights through the cache so coverage compounds.
+#
+# A crash fails the run and uploads the crashing inputs jazzer-junit
+# wrote back into the seed-corpus resource directories. Promotion rule
+# (fuzzing.md): a real finding becomes a committed corpus entry, a
+# pinned regression test, and a bounds_vectors.json entry when the
+# surface is cross-language.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      fuzz_seconds:
+        description: "Per-target libFuzzer budget in seconds"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-nightly
+  cancel-in-progress: false
+
+jobs:
+  fuzz:
+    if: github.repository == 'PostHog/hoglake'
+    runs-on: ubuntu-latest
+    # Six sequential targets x the default 600s budget, plus build:
+    # ~65 min. Dispatch with a bigger budget needs this raised too.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Cumulative generated corpus: restore the newest previous night,
+      # save under a fresh key (immutable cache entries) so the next
+      # night restores this one via the prefix.
+      - name: Restore accumulated corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: server/.cifuzz-corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
+
+      - name: Fuzz all targets
+        working-directory: server
+        # The dispatch input reaches the shell through env, never by
+        # template interpolation into run: (semgrep run-shell-injection),
+        # and must be a plain integer.
+        env:
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '600' }}
+        run: |
+          case "$FUZZ_SECONDS" in
+            ''|*[!0-9]*) echo "fuzz_seconds must be an integer, got '$FUZZ_SECONDS'" >&2; exit 1 ;;
+          esac
+          ./gradlew --no-daemon fuzz -PfuzzSeconds="$FUZZ_SECONDS"
+
+      # jazzer-junit writes crashing inputs into the committed seed
+      # corpus directories — on a red run, ship exactly those new files
+      # plus the gradle reports for triage.
+      - name: Collect findings
+        if: failure()
+        run: |
+          git status --porcelain server/src/test/resources/com/posthog/hoglake/fuzz \
+            | tee fuzz-findings.txt
+
+      - name: Upload findings
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fuzz-findings-${{ github.run_id }}
+          path: |
+            fuzz-findings.txt
+            server/src/test/resources/com/posthog/hoglake/fuzz/
+            server/build/reports/tests/
+          if-no-files-found: warn
