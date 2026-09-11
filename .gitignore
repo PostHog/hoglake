@@ -1,0 +1,48 @@
+# macOS
+.DS_Store
+
+# Local-only working documents (bug-hunt snapshots, in-flight worklists,
+# personal trackers) — never committed; see AGENT.md doc conventions.
+/plan.md
+/gaps.md
+/bugs.md
+/compaction_bugs.md
+[Mm]onday.md
+[Tt]uesday.md
+[Ww]ednesday.md
+[Tt]hursday.md
+[Ff]riday.md
+[Ss]aturday.md
+[Ss]unday.md
+
+# flox: env definitions (.flox/env*, env.json) are tracked; per-machine
+# state is not. flox writes its own .flox/.gitignore for run/cache/log.
+**/.flox/telemetry_id
+**/.flox/.DS_Store
+
+# Python (pyhoglake, hedgerow, bench)
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+# Bench output (harness journal + any exported results)
+bench-results.jsonl
+perf-results.json
+
+# JVM (server, trino)
+build/
+.gradle/
+.kotlin/
+*.log
+
+# webui
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Editors
+.idea/
+.vscode/
