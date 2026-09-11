@@ -3,11 +3,16 @@ name = "pyhoglake"
 version = "1.0.0"
 description = "Python client for hoglake, the Postgres-native lakehouse-catalog control plane"
 readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27",
     "pyarrow>=17.0",
 ]
+
+[project.urls]
+Repository = "https://github.com/PostHog/hoglake"
+Documentation = "https://github.com/PostHog/hoglake/tree/main/pyhoglake"
 
 [dependency-groups]
 dev = [
