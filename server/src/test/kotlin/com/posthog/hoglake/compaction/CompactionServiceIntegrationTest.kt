@@ -24,6 +24,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.TestImages
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
@@ -79,7 +80,7 @@ class CompactionServiceIntegrationTest {
         const val BUCKET = "hoglake-compaction-test"
 
         val minio: MinIOContainer by lazy {
-            MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z").also { it.start() }
+            TestImages.minio().also { it.start() }
         }
 
         val store: ObjectStore by lazy {

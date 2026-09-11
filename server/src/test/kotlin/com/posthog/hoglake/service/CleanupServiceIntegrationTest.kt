@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.TestImages
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.awaitility.Awaitility.await
@@ -39,7 +40,7 @@ class CleanupServiceIntegrationTest {
         const val BUCKET = "hoglake-cleanup"
 
         val minio: MinIOContainer by lazy {
-            MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z").also { it.start() }
+            TestImages.minio().also { it.start() }
         }
 
         /** Read/put side (bucket bootstrap + object seeding). */

@@ -15,6 +15,7 @@ import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.TestImages
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -597,7 +598,7 @@ class QeConcurrencyTortureTest {
         const val DRAIN_BUCKET = "qe-drain"
 
         val minio: MinIOContainer by lazy {
-            MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z").also { it.start() }
+            TestImages.minio().also { it.start() }
         }
 
         val removals: RemovalStore by lazy {
