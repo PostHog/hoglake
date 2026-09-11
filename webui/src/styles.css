@@ -1,6 +1,10 @@
-/* hoglake console — single dark, dense, legible stylesheet. */
+/* hoglake console — dense, legible, fully tokenized stylesheet.
+   Dark is the default palette; [data-theme="light"] swaps the tokens
+   (set on <html> by lib/theme.ts before first paint). Never hardcode a
+   color outside these two blocks. */
 
 :root {
+  color-scheme: dark;
   --bg: #16181d;
   --bg-raised: #1d2026;
   --bg-hover: #23262d;
@@ -8,10 +12,26 @@
   --text: #d7dae0;
   --text-dim: #8b919c;
   --accent: #6aa1ff;
+  --accent-contrast: #0d1117;
   --ok: #4cc38a;
   --warn: #e5b567;
   --bad: #e5745f;
   --mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --bg-raised: #ffffff;
+  --bg-hover: #eceef2;
+  --border: #d7dbe2;
+  --text: #1c2128;
+  --text-dim: #5b6472;
+  --accent: #2660c4;
+  --accent-contrast: #ffffff;
+  --ok: #1a7f4e;
+  --warn: #8a6d1f;
+  --bad: #c0392b;
 }
 
 * {
@@ -273,6 +293,21 @@ tr.has-deletes {
   white-space: nowrap;
 }
 
+/* Neutral header control — must not pick up the accent `button` look. */
+button.theme-toggle {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 400;
+  border-radius: 4px;
+  padding: 1px 8px;
+  line-height: 1.4;
+}
+button.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+
 .consumer-group {
   margin-bottom: 20px;
 }
@@ -350,7 +385,7 @@ select:focus {
 button {
   background: var(--accent);
   border: 1px solid var(--accent);
-  color: #0d1117;
+  color: var(--accent-contrast);
   font: inherit;
   font-weight: 600;
   border-radius: 4px;

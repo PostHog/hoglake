@@ -1,7 +1,30 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
 import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
+import { applyTheme, initialTheme, persistTheme, type Theme } from "../lib/theme";
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const next: Theme = theme === "dark" ? "light" : "dark";
+  const flip = () => {
+    applyTheme(next);
+    persistTheme(next);
+    setTheme(next);
+  };
+  return (
+    <button
+      type="button"
+      className="theme-toggle"
+      onClick={flip}
+      title={`Switch to ${next} mode`}
+      aria-label={`Switch to ${next} mode`}
+    >
+      {theme === "dark" ? "☀" : "☾"}
+    </button>
+  );
+}
 
 function InstanceName() {
   const { data } = useQuery({
@@ -112,6 +135,7 @@ export function Layout() {
           <a href="/openapi.yaml" target="_blank" rel="noreferrer">
             openapi.yaml
           </a>
+          <ThemeToggle />
           <HealthIndicator />
         </div>
       </header>
