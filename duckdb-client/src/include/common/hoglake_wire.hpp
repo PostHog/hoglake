@@ -167,11 +167,30 @@ struct HoglakeTableAppend {
 	vector<HoglakeFileRegistration> files;
 };
 
-//! CommitRequest (client -> server): appends only for now (deletes in M4).
+//! TableDeletes file entry (client -> server): a puffin DV superseding
+//! the data file's current one (vectors only grow).
+struct HoglakeDeleteFileRegistration {
+	int64_t data_file_id = 0;
+	string path;
+	//! TOTAL deleted positions in the DV (cumulative)
+	int64_t delete_count = 0;
+	int64_t file_size_bytes = 0;
+};
+
+struct HoglakeTableDeletes {
+	string namespace_name;
+	string table_name;
+	string expected_table_uuid;
+	vector<HoglakeDeleteFileRegistration> files;
+};
+
+//! CommitRequest (client -> server). read_snapshot is REQUIRED when
+//! deletes are present (deletes always conflict-check).
 struct HoglakeCommitRequest {
 	//! invalid = blind append (no conflict window)
 	optional_idx read_snapshot;
 	vector<HoglakeTableAppend> appends;
+	vector<HoglakeTableDeletes> deletes;
 	string author;
 	string message;
 };
@@ -195,5 +214,28 @@ struct HoglakeColumnDef {
 	int32_t scale = 0;
 	bool nullable = true;
 };
+
+//! AlterOp (client -> server): one typed schema-evolution op;
+//! discriminated by `op` per the OpenAPI AlterOp schema.
+struct HoglakeAlterOp {
+	//! add_column, drop_column, rename_column, promote_column,
+	//! rename_table, set_partition_spec, set_sort_order
+	string op;
+	//! add_column
+	HoglakeColumnDef column;
+	//! drop_column, promote_column
+	string name;
+	//! rename_column
+	string from;
+	//! rename_column target / promote_column target type
+	string to;
+	//! rename_table
+	string new_name;
+	//! set_partition_spec ([] = unpartitioned)
+	vector<HoglakePartitionField> fields;
+	//! set_sort_order ([] = unsorted)
+	vector<HoglakeSortField> sort_fields;
+};
+
 
 } // namespace duckdb

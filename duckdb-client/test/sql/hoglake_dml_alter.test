@@ -1,0 +1,208 @@
+# name: test/sql/hoglake_dml_alter.test
+# description: M4 against the live dev stack: DELETE/UPDATE via
+#   deletion vectors, ALTER TABLE per the wire's AlterOp vocabulary.
+#   NOTE: RENAME COLUMN with live data requires hydrated stats (the
+#   server refuses on not-yet-hydrated files) — tested on an empty
+#   table because the dev stack's hydrator may lag.
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.dml_t
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.evolve_t
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.evolve_renamed
+
+statement ok
+CREATE TABLE lake.ns1.dml_t (id BIGINT NOT NULL, name VARCHAR, val DOUBLE)
+
+statement ok
+INSERT INTO lake.ns1.dml_t VALUES (1,'a',1.0),(2,'b',2.0),(3,'c',3.0),(4,'d',4.0),(5,'e',5.0)
+
+# ---- DELETE via deletion vectors ----
+
+query I
+DELETE FROM lake.ns1.dml_t WHERE id IN (2, 4)
+----
+2
+
+# row ids of surviving rows are untouched (positional stability)
+query II
+SELECT rowid, id FROM lake.ns1.dml_t ORDER BY id
+----
+0	1
+2	3
+4	5
+
+# a second DELETE grows the same file's vector (merge with the live DV)
+query I
+DELETE FROM lake.ns1.dml_t WHERE id = 5
+----
+1
+
+query I
+SELECT count(*) FROM lake.ns1.dml_t
+----
+2
+
+# deleting nothing registers nothing
+query I
+DELETE FROM lake.ns1.dml_t WHERE id = 999
+----
+0
+
+# ---- UPDATE = delete + insert (updated rows get NEW row ids) ----
+
+query I
+UPDATE lake.ns1.dml_t SET val = val * 10 WHERE id = 3
+----
+1
+
+query III
+SELECT id, name, val FROM lake.ns1.dml_t ORDER BY id
+----
+1	a	1.0
+3	c	30.0
+
+query I
+SELECT rowid > 4 FROM lake.ns1.dml_t WHERE id = 3
+----
+true
+
+# ---- ALTER TABLE ----
+
+statement ok
+CREATE TABLE lake.ns1.evolve_t (id INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO lake.ns1.evolve_t VALUES (1, 'x')
+
+statement ok
+ALTER TABLE lake.ns1.evolve_t ADD COLUMN extra DOUBLE
+
+# old files read the added column as NULL
+statement ok
+INSERT INTO lake.ns1.evolve_t VALUES (2, 'y', 9.5)
+
+query III
+SELECT id, name, extra FROM lake.ns1.evolve_t ORDER BY id
+----
+1	x	NULL
+2	y	9.5
+
+# type promotion (server lattice: int -> long); old files still read
+statement ok
+ALTER TABLE lake.ns1.evolve_t ALTER COLUMN id SET DATA TYPE BIGINT
+
+query II
+SELECT id, id::VARCHAR FROM lake.ns1.evolve_t WHERE id = 1
+----
+1	1
+
+# illegal promotion is refused by the server
+statement error
+ALTER TABLE lake.ns1.evolve_t ALTER COLUMN name SET DATA TYPE INTEGER
+----
+
+statement ok
+ALTER TABLE lake.ns1.evolve_t DROP COLUMN extra
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE lake.ns1.evolve_t)
+----
+id	BIGINT
+name	VARCHAR
+
+statement ok
+ALTER TABLE lake.ns1.evolve_t RENAME TO evolve_renamed
+
+query I
+SELECT count(*) FROM lake.ns1.evolve_renamed
+----
+2
+
+# SET PARTITIONED BY (identity) + partitioned insert through the
+# extension write path
+statement ok
+ALTER TABLE lake.ns1.evolve_renamed SET PARTITIONED BY (name)
+
+statement ok
+INSERT INTO lake.ns1.evolve_renamed VALUES (3, 'z'), (4, 'z'), (5, NULL)
+
+query II
+SELECT name, count(*) FROM lake.ns1.evolve_renamed GROUP BY name ORDER BY name NULLS LAST
+----
+x	1
+y	1
+z	2
+NULL	1
+
+# partition pruning on the extension-written partitioned files
+query I
+SELECT id FROM lake.ns1.evolve_renamed WHERE name = 'z' ORDER BY id
+----
+3
+4
+
+query I
+SELECT id FROM lake.ns1.evolve_renamed WHERE name IS NULL
+----
+5
+
+# DELETE against a partitioned table
+query I
+DELETE FROM lake.ns1.evolve_renamed WHERE name = 'z' AND id = 4
+----
+1
+
+query I
+SELECT count(*) FROM lake.ns1.evolve_renamed
+----
+4
+
+# RENAME COLUMN on a table without live data files (see header note)
+statement ok
+DROP TABLE IF EXISTS lake.ns1.rename_t
+
+statement ok
+CREATE TABLE lake.ns1.rename_t (a INTEGER, b VARCHAR)
+
+statement ok
+ALTER TABLE lake.ns1.rename_t RENAME COLUMN a TO a2
+
+query II
+SELECT column_name, column_type FROM (DESCRIBE lake.ns1.rename_t)
+----
+a2	INTEGER
+b	VARCHAR
+
+# unsupported ALTERs fail loudly
+statement error
+ALTER TABLE lake.ns1.rename_t SET DEFAULT 1 FOR b
+----
+
+statement ok
+DETACH lake

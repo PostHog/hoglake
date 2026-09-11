@@ -49,6 +49,9 @@ private:
 	//! loaded table entries (name -> entry); nullptr value = known-missing
 	case_insensitive_map_t<unique_ptr<CatalogEntry>> tables;
 	bool all_tables_loaded = false;
+	//! superseded entries (ALTER replaces them); kept alive because the
+	//! binder may still hold references for the duration of the statement
+	vector<unique_ptr<CatalogEntry>> retired;
 };
 
 } // namespace duckdb

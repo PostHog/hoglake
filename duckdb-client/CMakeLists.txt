@@ -37,6 +37,7 @@ set(EXTENSION_SOURCES
     src/common/hoglake_types.cpp
     src/rest/hoglake_api_client.cpp
     src/storage/hoglake_catalog.cpp
+    src/storage/hoglake_delete.cpp
     src/storage/hoglake_delete_filter.cpp
     src/storage/hoglake_insert.cpp
     src/storage/hoglake_multi_file_list.cpp
@@ -47,6 +48,7 @@ set(EXTENSION_SOURCES
     src/storage/hoglake_storage.cpp
     src/storage/hoglake_table_entry.cpp
     src/storage/hoglake_transaction.cpp
+    src/storage/hoglake_update.cpp
     src/storage/hoglake_transaction_manager.cpp)
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

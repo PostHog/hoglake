@@ -8,6 +8,10 @@
 #include "storage/hoglake_multi_file_reader.hpp"
 #include "storage/hoglake_scan.hpp"
 #include "storage/hoglake_transaction.hpp"
+#include "duckdb/planner/operator/logical_get.hpp"
+#include "duckdb/planner/operator/logical_projection.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "duckdb/planner/expression/bound_columnref_expression.hpp"
 
 namespace duckdb {
 
@@ -54,6 +58,46 @@ vector<column_t> HoglakeTableEntry::GetRowIdColumns() const {
 	result.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_INDEX);
 	result.push_back(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
 	return result;
+}
+
+void HoglakeTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, LogicalProjection &proj,
+                                              LogicalUpdate &update, ClientContext &context) {
+	// all hoglake updates are deletes + inserts (rewrite semantics);
+	// project every physical column so the rewrite can materialize the
+	// full row (ducklake's approach)
+	update.update_is_del_and_insert = true;
+
+	auto &column_ids = get.GetColumnIds();
+	for (auto &column : columns.Physical()) {
+		auto physical_index = column.Physical();
+		bool found = false;
+		for (auto &col : update.columns) {
+			if (col == physical_index) {
+				found = true;
+				break;
+			}
+		}
+		if (found) {
+			continue;
+		}
+		optional_idx column_id_index;
+		for (idx_t i = 0; i < column_ids.size(); i++) {
+			if (column_ids[i].GetPrimaryIndex() == physical_index.index) {
+				column_id_index = i;
+				break;
+			}
+		}
+		if (!column_id_index.IsValid()) {
+			column_id_index = column_ids.size();
+			get.AddColumnId(physical_index.index);
+		}
+		update.expressions.push_back(make_uniq<BoundColumnRefExpression>(
+		    column.Type(), ColumnBinding(proj.table_index, ProjectionIndex(proj.expressions.size()))));
+		proj.expressions.push_back(make_uniq<BoundColumnRefExpression>(
+		    column.Type(), ColumnBinding(get.table_index, ProjectionIndex(column_id_index.GetIndex()))));
+		get.AddColumnId(physical_index.index);
+		update.columns.push_back(physical_index);
+	}
 }
 
 TableStorageInfo HoglakeTableEntry::GetStorageInfo(ClientContext &context) {

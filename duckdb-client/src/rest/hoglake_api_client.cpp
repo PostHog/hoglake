@@ -639,6 +639,26 @@ HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &req
 			}
 		}
 	}
+	if (!request.deletes.empty()) {
+		auto deletes = yyjson_mut_obj_add_arr(body.doc, root, "deletes");
+		for (auto &table_deletes : request.deletes) {
+			auto deletes_obj = yyjson_mut_arr_add_obj(body.doc, deletes);
+			yyjson_mut_obj_add_strcpy(body.doc, deletes_obj, "namespace", table_deletes.namespace_name.c_str());
+			yyjson_mut_obj_add_strcpy(body.doc, deletes_obj, "table", table_deletes.table_name.c_str());
+			if (!table_deletes.expected_table_uuid.empty()) {
+				yyjson_mut_obj_add_strcpy(body.doc, deletes_obj, "expected_table_uuid",
+				                          table_deletes.expected_table_uuid.c_str());
+			}
+			auto files = yyjson_mut_obj_add_arr(body.doc, deletes_obj, "files");
+			for (auto &file : table_deletes.files) {
+				auto file_obj = yyjson_mut_arr_add_obj(body.doc, files);
+				yyjson_mut_obj_add_int(body.doc, file_obj, "data_file_id", file.data_file_id);
+				yyjson_mut_obj_add_strcpy(body.doc, file_obj, "path", file.path.c_str());
+				yyjson_mut_obj_add_int(body.doc, file_obj, "delete_count", file.delete_count);
+				yyjson_mut_obj_add_int(body.doc, file_obj, "file_size_bytes", file.file_size_bytes);
+			}
+		}
+	}
 	if (!request.author.empty()) {
 		yyjson_mut_obj_add_strcpy(body.doc, root, "author", request.author.c_str());
 	}
@@ -666,6 +686,68 @@ HoglakeCommitOutcome HoglakeApiClient::TryCommit(const HoglakeCommitRequest &req
 		outcome.error = StringUtil::Format("HTTP %d", response.status);
 	}
 	return outcome;
+}
+
+
+HoglakeTableInfo HoglakeApiClient::AlterTable(const string &ns, const string &table,
+                                              const vector<HoglakeAlterOp> &ops) {
+	JsonMutDoc body;
+	auto root = yyjson_mut_obj(body.doc);
+	yyjson_mut_doc_set_root(body.doc, root);
+	auto ops_arr = yyjson_mut_obj_add_arr(body.doc, root, "ops");
+	for (auto &op : ops) {
+		auto op_obj = yyjson_mut_arr_add_obj(body.doc, ops_arr);
+		yyjson_mut_obj_add_strcpy(body.doc, op_obj, "op", op.op.c_str());
+		if (op.op == "add_column") {
+			auto col_obj = yyjson_mut_obj_add_obj(body.doc, op_obj, "column");
+			yyjson_mut_obj_add_strcpy(body.doc, col_obj, "name", op.column.name.c_str());
+			yyjson_mut_obj_add_strcpy(body.doc, col_obj, "type", op.column.type.c_str());
+			yyjson_mut_obj_add_bool(body.doc, col_obj, "nullable", op.column.nullable);
+			if (op.column.type == "decimal") {
+				auto params = yyjson_mut_obj_add_obj(body.doc, col_obj, "type_params");
+				yyjson_mut_obj_add_int(body.doc, params, "precision", op.column.precision);
+				yyjson_mut_obj_add_int(body.doc, params, "scale", op.column.scale);
+			}
+		} else if (op.op == "drop_column" || op.op == "promote_column") {
+			yyjson_mut_obj_add_strcpy(body.doc, op_obj, "name", op.name.c_str());
+			if (op.op == "promote_column") {
+				yyjson_mut_obj_add_strcpy(body.doc, op_obj, "to", op.to.c_str());
+			}
+		} else if (op.op == "rename_column") {
+			yyjson_mut_obj_add_strcpy(body.doc, op_obj, "from", op.from.c_str());
+			yyjson_mut_obj_add_strcpy(body.doc, op_obj, "to", op.to.c_str());
+		} else if (op.op == "rename_table") {
+			yyjson_mut_obj_add_strcpy(body.doc, op_obj, "new_name", op.new_name.c_str());
+		} else if (op.op == "set_partition_spec") {
+			auto fields = yyjson_mut_obj_add_arr(body.doc, op_obj, "fields");
+			for (auto &field : op.fields) {
+				auto field_obj = yyjson_mut_arr_add_obj(body.doc, fields);
+				yyjson_mut_obj_add_int(body.doc, field_obj, "source_field_id", field.source_field_id);
+				yyjson_mut_obj_add_strcpy(body.doc, field_obj, "transform", field.transform.c_str());
+				if (field.transform == "bucket") {
+					yyjson_mut_obj_add_int(body.doc, field_obj, "transform_param", field.transform_param);
+				}
+			}
+		} else if (op.op == "set_sort_order") {
+			auto fields = yyjson_mut_obj_add_arr(body.doc, op_obj, "sort_fields");
+			for (auto &field : op.sort_fields) {
+				auto field_obj = yyjson_mut_arr_add_obj(body.doc, fields);
+				yyjson_mut_obj_add_int(body.doc, field_obj, "source_field_id", field.source_field_id);
+				yyjson_mut_obj_add_strcpy(body.doc, field_obj, "direction", field.direction.c_str());
+				yyjson_mut_obj_add_strcpy(body.doc, field_obj, "null_order", field.null_order.c_str());
+			}
+		} else {
+			throw InternalException("hoglake: unknown alter op %s", op.op);
+		}
+	}
+	auto response = Request(
+	    "POST", CatalogPath("/namespaces/" + EncodeSegment(ns) + "/tables/" + EncodeSegment(table) + "/alter"),
+	    body.Write());
+	if (response.status != 200) {
+		ThrowFor(response, "alter table \"" + ns + "." + table + "\"");
+	}
+	JsonDoc doc(response.body);
+	return ParseTableInfo(ParseObjectResponse(doc, "alter table"));
 }
 
 } // namespace duckdb

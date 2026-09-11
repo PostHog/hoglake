@@ -74,6 +74,27 @@ void HoglakeTransaction::AddAppend(const string &ns, const string &table, const 
 	buffered_appends.push_back(std::move(append));
 }
 
+void HoglakeTransaction::AddDeletes(const string &ns, const string &table, const string &expected_table_uuid,
+                                    vector<HoglakeDeleteFileRegistration> files) {
+	if (files.empty()) {
+		return;
+	}
+	for (auto &deletes : buffered_deletes) {
+		if (deletes.namespace_name == ns && deletes.table_name == table) {
+			for (auto &file : files) {
+				deletes.files.push_back(std::move(file));
+			}
+			return;
+		}
+	}
+	HoglakeTableDeletes deletes;
+	deletes.namespace_name = ns;
+	deletes.table_name = table;
+	deletes.expected_table_uuid = expected_table_uuid;
+	deletes.files = std::move(files);
+	buffered_deletes.push_back(std::move(deletes));
+}
+
 //! The server's commit 409 for a mismatched expected_table_uuid says
 //! this in its message/detail; it distinguishes a recreation refusal
 //! (never retryable) from an ordinary commit conflict (retryable) —
@@ -90,15 +111,24 @@ static T GetSettingOrDefault(ClientContext &context, const char *name, T default
 }
 
 void HoglakeTransaction::Commit(ClientContext &context) {
-	if (buffered_appends.empty()) {
+	if (buffered_appends.empty() && buffered_deletes.empty()) {
 		return;
 	}
 	HoglakeCommitRequest request;
 	request.appends = std::move(buffered_appends);
+	request.deletes = std::move(buffered_deletes);
 	buffered_appends.clear();
-	// blind appends: no read_snapshot (no conflict window; appends only
-	// conflict with DDL on the touched tables, which the server checks
-	// regardless, and the incarnation guard rides expected_table_uuid)
+	buffered_deletes.clear();
+	// append-only commits are blind (no read_snapshot: no conflict
+	// window; the incarnation guard rides expected_table_uuid). Deletes
+	// REQUIRE a read_snapshot (they always conflict-check) — and a
+	// delete conflict is never auto-retried: the superseded deletion
+	// vector must be rebuilt against the new state, so the statement
+	// has to be re-run.
+	bool has_deletes = !request.deletes.empty();
+	if (has_deletes) {
+		request.read_snapshot = GetSnapshot();
+	}
 
 	auto max_retries = GetSettingOrDefault<uint64_t>(context, "hoglake_max_retry_count", 10);
 	auto wait_ms = GetSettingOrDefault<uint64_t>(context, "hoglake_retry_wait_ms", 100);
@@ -120,6 +150,11 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 				// incarnation guard: atomic refusal, never retryable
 				throw TransactionException("%s", message);
 			}
+			if (has_deletes) {
+				throw TransactionException("%s (a conflicting commit superseded this transaction's deletion "
+				                           "vectors; re-run the statement)",
+				                           message);
+			}
 			retryable = true;
 			sleep_ms = static_cast<idx_t>(current_wait);
 			current_wait *= backoff;
@@ -139,9 +174,11 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 }
 
 void HoglakeTransaction::Rollback() {
-	// buffered registrations are dropped; parquet already uploaded for
-	// them is orphaned (cleanup's problem, never the catalog's)
+	// buffered registrations are dropped; parquet/puffin already
+	// uploaded for them is orphaned (cleanup's problem, never the
+	// catalog's)
 	buffered_appends.clear();
+	buffered_deletes.clear();
 }
 
 void HoglakeTransaction::LoadSchemas() {

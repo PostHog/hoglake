@@ -2,8 +2,13 @@
 
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
+#include "duckdb/parser/expression/columnref_expression.hpp"
+#include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/function_expression.hpp"
+#include "duckdb/parser/parsed_data/alter_table_info.hpp"
 #include <algorithm>
 #include "duckdb/parser/constraints/not_null_constraint.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
@@ -212,8 +217,174 @@ void HoglakeSchemaEntry::DropEntry(ClientContext &context, DropInfo &info) {
 	}
 }
 
+//===--------------------------------------------------------------------===//
+// ALTER
+//===--------------------------------------------------------------------===//
+
+static int64_t FindFieldId(const HoglakeTableInfo &wire, const string &column_name) {
+	for (auto &col : wire.columns) {
+		if (StringUtil::CIEquals(col.name, column_name)) {
+			return col.field_id;
+		}
+	}
+	throw BinderException("hoglake: column \"%s\" does not exist in table \"%s\"", column_name, wire.name);
+}
+
+//! Parse a partition-key expression into a wire PartitionField:
+//! a bare column ref = identity; year/month/day/hour(col) and
+//! bucket(col, n) map to the transform vocabulary.
+static HoglakePartitionField ParsePartitionExpression(const HoglakeTableInfo &wire, ParsedExpression &expr) {
+	HoglakePartitionField field;
+	if (expr.GetExpressionClass() == ExpressionClass::COLUMN_REF) {
+		auto &col_ref = expr.Cast<ColumnRefExpression>();
+		field.source_field_id = FindFieldId(wire, col_ref.GetColumnName().GetIdentifierName());
+		field.transform = "identity";
+		return field;
+	}
+	if (expr.GetExpressionClass() == ExpressionClass::FUNCTION) {
+		auto &function = expr.Cast<FunctionExpression>();
+		auto function_name = StringUtil::Lower(function.FunctionName().GetIdentifierName());
+		auto &args = function.GetArguments();
+		if (function_name == "year" || function_name == "month" || function_name == "day" ||
+		    function_name == "hour") {
+			if (args.size() != 1 || args[0].GetExpression().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				throw BinderException("hoglake: %s(...) partition transform takes exactly one column", function_name);
+			}
+			auto &col_ref = args[0].GetExpression().Cast<ColumnRefExpression>();
+			field.source_field_id = FindFieldId(wire, col_ref.GetColumnName().GetIdentifierName());
+			field.transform = function_name;
+			return field;
+		}
+		if (function_name == "bucket") {
+			if (args.size() != 2 || args[0].GetExpression().GetExpressionClass() != ExpressionClass::CONSTANT ||
+			    args[1].GetExpression().GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				throw BinderException("hoglake: bucket partitioning is bucket(<n>, <column>)");
+			}
+			auto &n = args[0].GetExpression().Cast<ConstantExpression>();
+			auto &col_ref = args[1].GetExpression().Cast<ColumnRefExpression>();
+			field.source_field_id = FindFieldId(wire, col_ref.GetColumnName().GetIdentifierName());
+			field.transform = "bucket";
+			field.transform_param =
+			    NumericCast<int32_t>(BigIntValue::Get(n.GetValue().DefaultCastAs(LogicalType::BIGINT)));
+			return field;
+		}
+	}
+	throw BinderException("hoglake: unsupported partition expression \"%s\" (supported: <column>, "
+	                      "year/month/day/hour(<column>), bucket(<n>, <column>))",
+	                      expr.ToString());
+}
+
 void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) {
-	throw NotImplementedException("ALTER is not supported for hoglake yet (lands in M4)");
+	if (info.type != AlterType::ALTER_TABLE) {
+		throw NotImplementedException("hoglake: only ALTER TABLE is supported");
+	}
+	auto &hoglake_transaction = Transaction(transaction);
+	auto &alter_table = info.Cast<AlterTableInfo>();
+	auto table_name = alter_table.GetQualifiedName().Name().GetIdentifierName();
+	auto entry = LookupTable(hoglake_transaction, table_name);
+	if (!entry) {
+		if (info.if_not_found == OnEntryNotFound::RETURN_NULL) {
+			return;
+		}
+		throw CatalogException("hoglake: table \"%s.%s\" does not exist", name.GetIdentifierName(), table_name);
+	}
+	auto &table = entry->Cast<HoglakeTableEntry>();
+	auto &wire = table.GetWireInfo();
+
+	HoglakeAlterOp op;
+	string new_entry_name = table_name;
+	switch (alter_table.alter_table_type) {
+	case AlterTableType::RENAME_TABLE: {
+		auto &rename = alter_table.Cast<RenameTableInfo>();
+		op.op = "rename_table";
+		op.new_name = rename.new_table_name.GetIdentifierName();
+		new_entry_name = op.new_name;
+		break;
+	}
+	case AlterTableType::RENAME_COLUMN: {
+		auto &rename = alter_table.Cast<RenameColumnInfo>();
+		op.op = "rename_column";
+		op.from = rename.old_name.GetIdentifierName();
+		op.to = rename.new_name.GetIdentifierName();
+		break;
+	}
+	case AlterTableType::ADD_COLUMN: {
+		auto &add = alter_table.Cast<AddColumnInfo>();
+		auto &col = add.new_column;
+		if (add.if_column_not_exists && table.ColumnExists(col.Name())) {
+			return;
+		}
+		if (col.HasDefaultValue()) {
+			throw NotImplementedException("hoglake: ADD COLUMN with DEFAULT is not supported (the wire contract "
+			                              "has no column defaults; added columns read as NULL)");
+		}
+		op.op = "add_column";
+		op.column = HoglakeTypes::FromDuckDBType(col.Name().GetIdentifierName(), col.Type(), true);
+		break;
+	}
+	case AlterTableType::REMOVE_COLUMN: {
+		auto &remove = alter_table.Cast<RemoveColumnInfo>();
+		if (remove.if_column_exists && !table.ColumnExists(remove.removed_column)) {
+			return;
+		}
+		op.op = "drop_column";
+		op.name = remove.removed_column.GetIdentifierName();
+		break;
+	}
+	case AlterTableType::ALTER_COLUMN_TYPE: {
+		auto &change = alter_table.Cast<ChangeColumnTypeInfo>();
+		op.op = "promote_column";
+		op.name = change.column_name.GetIdentifierName();
+		// the server's promotion lattice validates the target
+		op.to = HoglakeTypes::FromDuckDBType(op.name, change.target_type, true).type;
+		break;
+	}
+	case AlterTableType::SET_PARTITIONED_BY: {
+		auto &set_partitioned = alter_table.Cast<SetPartitionedByInfo>();
+		op.op = "set_partition_spec";
+		for (auto &expr : set_partitioned.partition_keys) {
+			op.fields.push_back(ParsePartitionExpression(wire, *expr));
+		}
+		break;
+	}
+	case AlterTableType::SET_SORTED_BY: {
+		auto &set_sorted = alter_table.Cast<SetSortedByInfo>();
+		op.op = "set_sort_order";
+		for (auto &order : set_sorted.orders) {
+			if (order.expression->GetExpressionClass() != ExpressionClass::COLUMN_REF) {
+				throw BinderException("hoglake: SET SORTED BY supports plain columns only");
+			}
+			auto &col_ref = order.expression->Cast<ColumnRefExpression>();
+			HoglakeSortField sort_field;
+			sort_field.source_field_id = FindFieldId(wire, col_ref.GetColumnName().GetIdentifierName());
+			sort_field.direction = order.type == OrderType::DESCENDING ? "desc" : "asc";
+			sort_field.null_order = order.null_order == OrderByNullType::NULLS_FIRST ? "nulls_first" : "nulls_last";
+			op.sort_fields.push_back(sort_field);
+		}
+		break;
+	}
+	default:
+		throw NotImplementedException("hoglake: this ALTER TABLE operation is not supported by the wire contract "
+		                              "(supported: RENAME TABLE/COLUMN, ADD/DROP COLUMN, ALTER COLUMN TYPE "
+		                              "promotions, SET PARTITIONED BY, SET SORTED BY)");
+	}
+
+	// eager DDL: one atomic /alter commit (its own server snapshot)
+	auto ns = name.GetIdentifierName();
+	auto altered = hoglake_transaction.Api().AlterTable(ns, table_name, {op});
+
+	// swap the cached entry for the evolved table; the old entry stays
+	// alive (retired) because the statement may still reference it
+	auto existing = tables.find(table_name);
+	if (existing != tables.end()) {
+		retired.push_back(std::move(existing->second));
+		tables.erase(existing);
+	}
+	CacheTable(hoglake_transaction, std::move(altered));
+	if (!StringUtil::CIEquals(new_entry_name, table_name)) {
+		// rename: the response carries the new name; drop the old key
+		tables.erase(table_name);
+	}
 }
 
 //===--------------------------------------------------------------------===//

@@ -38,8 +38,12 @@ public:
 	//! multi-table atomicity comes from the wire contract).
 	void AddAppend(const string &ns, const string &table, const string &expected_table_uuid,
 	               vector<HoglakeFileRegistration> files);
+	//! Buffer superseding deletion vectors (puffin files already
+	//! uploaded); commits with mandatory read_snapshot.
+	void AddDeletes(const string &ns, const string &table, const string &expected_table_uuid,
+	                vector<HoglakeDeleteFileRegistration> files);
 	bool HasBufferedWrites() const {
-		return !buffered_appends.empty();
+		return !buffered_appends.empty() || !buffered_deletes.empty();
 	}
 
 	//! Commit buffered work: the footer-shipping OCC commit with the
@@ -67,6 +71,8 @@ private:
 	case_insensitive_map_t<unique_ptr<HoglakeSchemaEntry>> schemas;
 	//! buffered appends, one entry per (namespace, table)
 	vector<HoglakeTableAppend> buffered_appends;
+	//! buffered deletes, one entry per (namespace, table)
+	vector<HoglakeTableDeletes> buffered_deletes;
 };
 
 } // namespace duckdb

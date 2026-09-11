@@ -111,5 +111,35 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   candidate for M5+)
 - Verified: full suite 143 assertions pass (3 test files) against the
   live dev stack 2026-09-11.
-## M4 — update/delete/alter/drop: NOT STARTED
+## M4 — update/delete/alter/drop: DONE
+- [x] DELETE via deletion vectors: sink groups (filename,
+      file_row_number) per data file, merges with the file's live DV
+      (vectors only grow), writes a superseding puffin container
+      (HoglakePuffin::WritePuffinFile — server-compatible: one
+      uncompressed deletion-vector-v1 blob), buffers
+      DeleteFileRegistrations; commit carries read_snapshot (mandatory
+      with deletes). A delete-commit 409 is NOT auto-retried (the DV
+      must be rebuilt) — the error says re-run. Round-trips the M2 DV
+      read path (surviving rowids stay positionally stable)
+- [x] UPDATE = delete + insert (HoglakeUpdate streams updated values
+      into the insert copy while sinking old row ids into an embedded
+      HoglakeDelete; BindUpdateConstraints sets
+      update_is_del_and_insert and projects all columns). DIVERGENCE:
+      updated rows get NEW row ids — FileRegistration has no
+      explicit_row_ids, so clients cannot preserve row identity
+      (ducklake preserves via _ducklake_internal_row_id; wire finding)
+- [x] ALTER: ADD/DROP COLUMN, RENAME COLUMN/TABLE, ALTER COLUMN TYPE
+      (server promotion lattice), SET PARTITIONED BY (identity +
+      year/month/day/hour + bucket parsed; writes still identity-only),
+      SET SORTED BY (DDL only; sort-on-insert not implemented).
+      Eager one-op /alter commits; altered entries swap in the cache
+      (old entry retired, not freed). SET/DROP NOT NULL, SET DEFAULT,
+      nested-field ops -> NotImplemented (wire gaps)
+- [x] DROP TABLE was M1
+- Environment finding: the dev stack's hydrator is not hydrating ANY
+  deferred-stats files (pyhoglake deferred probe also stays 'pending'
+  forever) — so RENAME COLUMN on tables with live extension-written
+  files 409s (idless_files_present names not-yet-hydrated files).
+  Surfaced cleanly; the sqllogictest renames on an empty table.
+- Verified: full suite 214 assertions pass (4 test files) 2026-09-11.
 ## M5 — time travel + metadata functions + parity checklist: NOT STARTED

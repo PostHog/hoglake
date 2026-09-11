@@ -8,8 +8,14 @@
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/planner/operator/logical_create_table.hpp"
 #include "duckdb/planner/operator/logical_insert.hpp"
+#include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/planner/expression/bound_reference_expression.hpp"
+#include "duckdb/planner/operator/logical_delete.hpp"
+#include "duckdb/planner/operator/logical_update.hpp"
+#include "storage/hoglake_delete.hpp"
 #include "storage/hoglake_insert.hpp"
 #include "storage/hoglake_table_entry.hpp"
+#include "storage/hoglake_update.hpp"
 #include "storage/hoglake_schema_entry.hpp"
 #include "storage/hoglake_transaction.hpp"
 
@@ -129,12 +135,57 @@ PhysicalOperator &HoglakeCatalog::PlanInsert(ClientContext &context, PhysicalPla
 
 PhysicalOperator &HoglakeCatalog::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner, LogicalDelete &op,
                                              PhysicalOperator &plan) {
-	throw NotImplementedException("DELETE is not supported for hoglake yet (deletion vectors land in M4)");
+	if (op.return_chunk) {
+		throw BinderException("RETURNING clause not yet supported for deletion from hoglake tables");
+	}
+	// op.expressions = [rowid, filename, file_index, file_row_number]
+	// (GetRowIdColumns order); the delete sink needs the last three
+	vector<idx_t> row_id_indexes;
+	for (idx_t i = 0; i < 3; i++) {
+		auto &bound_ref = op.expressions[i + 1]->Cast<BoundReferenceExpression>();
+		row_id_indexes.push_back(bound_ref.Index());
+	}
+	return HoglakeDelete::PlanDelete(context, planner, op.table.Cast<HoglakeTableEntry>(), plan,
+	                                 std::move(row_id_indexes), true);
 }
 
 PhysicalOperator &HoglakeCatalog::PlanUpdate(ClientContext &context, PhysicalPlanGenerator &planner, LogicalUpdate &op,
                                              PhysicalOperator &plan) {
-	throw NotImplementedException("UPDATE is not supported for hoglake yet (deletion vectors land in M4)");
+	if (op.return_chunk) {
+		throw BinderException("RETURNING clause not yet supported for updates of hoglake tables");
+	}
+	for (auto &expr : op.expressions) {
+		if (expr->GetExpressionType() == ExpressionType::VALUE_DEFAULT) {
+			throw BinderException("SET DEFAULT is not supported for updates of hoglake tables");
+		}
+	}
+	auto &table = op.table.Cast<HoglakeTableEntry>();
+
+	// embedded delete sink over the last 3 input columns of the delete
+	// chunk the update operator builds
+	vector<idx_t> row_id_indexes {0, 1, 2};
+	auto &delete_op = HoglakeDelete::PlanDelete(context, planner, table, plan, std::move(row_id_indexes), false);
+
+	// update expressions ordered by physical column index
+	vector<unique_ptr<Expression>> expressions;
+	unordered_map<idx_t, idx_t> expression_map;
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		expression_map[op.columns[i].index] = i;
+	}
+	for (idx_t i = 0; i < op.columns.size(); i++) {
+		expressions.push_back(op.expressions[expression_map[i]]->Copy());
+	}
+
+	auto &update_op =
+	    planner.Make<HoglakeUpdate>(table, op.columns, plan, delete_op, expressions).Cast<HoglakeUpdate>();
+	vector<LogicalType> update_output_types;
+	for (auto &expr : update_op.expressions) {
+		update_output_types.push_back(expr->GetReturnType());
+	}
+	update_op.types = std::move(update_output_types);
+
+	// updated rows flow into the ordinary insert path (copy + register)
+	return HoglakeInsert::PlanInsert(context, planner, table, &update_op);
 }
 
 DatabaseSize HoglakeCatalog::GetDatabaseSize(ClientContext &context) {

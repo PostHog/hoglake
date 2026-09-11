@@ -66,6 +66,9 @@ public:
 	unique_ptr<HoglakeTableInfo> TryGetTable(const string &ns, const string &table, const HoglakeTravel &travel);
 	HoglakeTableInfo CreateTable(const string &ns, const string &name, const vector<HoglakeColumnDef> &columns);
 	HoglakeCommitResult DropTable(const string &ns, const string &table);
+	//! One atomic DDL commit applying ops in order; returns the table
+	//! after evolution.
+	HoglakeTableInfo AlterTable(const string &ns, const string &table, const vector<HoglakeAlterOp> &ops);
 
 	// -- views -------------------------------------------------------------
 	vector<HoglakeViewInfo> ListViews(const string &ns);
