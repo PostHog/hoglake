@@ -234,7 +234,13 @@ export function listConsumers(catalog: string): Promise<ConsumerList> {
   return request(buildUrl(`/catalogs/${seg(catalog)}/consumers`));
 }
 
-export function getInstanceInfo(): Promise<{ name?: string }> {
+export interface InstanceInfo {
+  name?: string;
+  total_rows: Int64;
+  total_size_bytes: Int64;
+}
+
+export function getInstanceInfo(): Promise<InstanceInfo> {
   return request(buildUrl("/info"));
 }
 

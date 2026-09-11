@@ -1,6 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
+import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
 
 function InstanceName() {
   const { data } = useQuery({
@@ -11,6 +12,33 @@ function InstanceName() {
   });
   if (!data?.name) return null;
   return <span className="instance-name">{data.name}</span>;
+}
+
+function InstanceTotals() {
+  // Same endpoint as InstanceName under its own key: the name is
+  // fetch-once (staleTime Infinity), the totals refresh. The server
+  // caches them (~60s), so the refetch matches that cadence.
+  const { data } = useQuery({
+    queryKey: ["instance-totals"],
+    queryFn: getInstanceInfo,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
+    retry: false,
+  });
+  if (data?.total_size_bytes === undefined) return null;
+  return (
+    <span
+      className="instance-totals"
+      title={
+        `${data.total_size_bytes} bytes, ${formatCount(data.total_rows)} ` +
+        "rows registered across all live data files (rows are gross of " +
+        "deletion-vector masking; server-cached, ~60s)"
+      }
+    >
+      {formatBytes(data.total_size_bytes)} ·{" "}
+      {formatCompactCount(data.total_rows)} rows
+    </span>
+  );
 }
 
 function HealthIndicator() {
@@ -77,6 +105,7 @@ export function Layout() {
           hoglake
         </Link>
         <InstanceName />
+        <InstanceTotals />
         <Breadcrumbs />
         <div className="topbar-right">
           <Link to="/metrics">metrics</Link>

@@ -32,7 +32,14 @@ fun Application.installApiRoutes(
 ) {
     routing {
         get("/v1/info") {
-            call.respond(InstanceInfoDto(name = instanceName.ifBlank { null }))
+            val totals = catalogs.instanceTotals()
+            call.respond(
+                InstanceInfoDto(
+                    name = instanceName.ifBlank { null },
+                    totalRows = totals.totalRows,
+                    totalSizeBytes = totals.totalSizeBytes,
+                ),
+            )
         }
         route("/v1/catalogs") {
             get {

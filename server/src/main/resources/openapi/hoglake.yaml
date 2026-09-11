@@ -795,7 +795,11 @@ paths:
         Identity of this hoglake instance: the operator-configured
         display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
         shows so deployments are tellable apart. Name omitted when
-        unset.
+        unset. Also carries instance-wide live-data totals for the
+        webui header: sums over live data files (end_snapshot unset)
+        across every catalog. total_rows is gross of deletion-vector
+        masking. The totals are server-cached (about a minute) — they
+        are display numbers, not a consistency primitive.
       responses:
         "200":
           description: Instance info
@@ -803,8 +807,11 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [total_rows, total_size_bytes]
                 properties:
                   name: { type: string }
+                  total_rows: { type: integer, format: int64 }
+                  total_size_bytes: { type: integer, format: int64 }
 
   /catalogs/{catalog}/consumers:
     get:

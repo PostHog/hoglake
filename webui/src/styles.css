@@ -267,6 +267,12 @@ tr.has-deletes {
   white-space: nowrap;
 }
 
+.instance-totals {
+  font-size: 12px;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
 .consumer-group {
   margin-bottom: 20px;
 }
