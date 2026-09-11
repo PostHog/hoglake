@@ -181,7 +181,12 @@ class App private constructor(
                 call.respondText(spec, ContentType.parse("application/yaml"))
             }
         }
-        app.installApiRoutes(catalogService, commitService, cfg.instanceName)
+        app.installApiRoutes(
+            catalogService,
+            commitService,
+            cfg.instanceName,
+            instanceTotals = { catalogMetrics.latestTotals },
+        )
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)

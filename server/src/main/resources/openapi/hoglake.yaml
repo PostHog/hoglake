@@ -795,7 +795,13 @@ paths:
         Identity of this hoglake instance: the operator-configured
         display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
         shows so deployments are tellable apart. Name omitted when
-        unset.
+        unset. Also carries instance-wide live-data totals for the
+        webui header: sums over live data files (end_snapshot unset)
+        across every catalog, refreshed by the server's periodic
+        metrics sampler — display numbers, not a consistency
+        primitive. total_rows is gross of deletion-vector masking.
+        Both fields are omitted in the boot window before the first
+        sample.
       responses:
         "200":
           description: Instance info
@@ -805,6 +811,8 @@ paths:
                 type: object
                 properties:
                   name: { type: string }
+                  total_rows: { type: integer, format: int64 }
+                  total_size_bytes: { type: integer, format: int64 }
 
   /catalogs/{catalog}/consumers:
     get:
@@ -1554,7 +1562,7 @@ components:
 
     PartitionStatsReport:
       type: object
-      required: [partitions, truncated, stale_spec_groups]
+      required: [partitions, truncated, stale_spec_groups, small_file_threshold_bytes]
       properties:
         partitions:
           type: array
@@ -1562,6 +1570,14 @@ components:
         truncated:
           type: boolean
           description: More groups existed than the requested limit.
+        small_file_threshold_bytes:
+          type: integer
+          format: int64
+          description: >
+            The small-file threshold this report was computed with (the
+            compaction target size, HOGLAKE_COMPACTION_TARGET_BYTES;
+            strict less-than) — so displays can say what "small" means
+            in bytes.
         stale_spec_groups:
           type: integer
           format: int64

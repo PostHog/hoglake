@@ -2,6 +2,7 @@ package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.TestImages
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -55,7 +56,7 @@ class HydratorIntegrationTest {
         const val ROW_ID_FIELD_ID = 2147483646
 
         val minio: MinIOContainer by lazy {
-            MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z").also { it.start() }
+            TestImages.minio().also { it.start() }
         }
 
         val store: ObjectStore by lazy {

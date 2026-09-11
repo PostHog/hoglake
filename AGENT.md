@@ -73,7 +73,7 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | `server/**`, codec vectors | test + ktlint and :trino:test as parallel jobs (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job |
+| `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job. No :trino:test job: the connector lives in PostHog/trino and the in-repo harness needs a fork image (HOGLAKE_TRINO_IMAGE) — run it manually per server/trino/README.md |
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest (unit/mocked layer — live integration is local, per the pre-push checklist) |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |

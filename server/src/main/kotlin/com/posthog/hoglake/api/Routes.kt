@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ScanService
 import io.ktor.http.HttpStatusCode
@@ -29,10 +30,22 @@ fun Application.installApiRoutes(
     catalogs: CatalogService,
     commits: CommitService,
     instanceName: String = "",
+    instanceTotals: () -> InstanceTotals? = { null },
 ) {
     routing {
         get("/v1/info") {
-            call.respond(InstanceInfoDto(name = instanceName.ifBlank { null }))
+            // Totals come from the metrics sampler's last pass — never
+            // computed here (a live-manifest sum per request would tax
+            // the commit tail's RDS at fleet scale). Null (fields
+            // omitted) only in the boot window before the first sample.
+            val totals = instanceTotals()
+            call.respond(
+                InstanceInfoDto(
+                    name = instanceName.ifBlank { null },
+                    totalRows = totals?.totalRows,
+                    totalSizeBytes = totals?.totalSizeBytes,
+                ),
+            )
         }
         route("/v1/catalogs") {
             get {

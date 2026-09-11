@@ -219,6 +219,7 @@ export const partitionStatsFixture: PartitionStatsResponse = {
     },
   ],
   truncated: false,
+  small_file_threshold_bytes: "536870912",
 };
 
 export const notFoundError: ApiErrorBody = {

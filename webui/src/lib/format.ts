@@ -29,6 +29,30 @@ export function formatBytes(n: string | number | null | undefined): string {
   return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
 }
 
+/**
+ * Compact count for headline numbers: 4886 -> "4.8K", 324_017_331 ->
+ * "324M". Pure string truncation on the decimal string: no Number
+ * round-trip (lossless above 2^53) and no rounding (which could cross
+ * a tier boundary). The exact value belongs in a `title`, via
+ * formatCount.
+ */
+export function formatCompactCount(n: string | number | null | undefined): string {
+  const s = asDecimalInt(n);
+  if (s === null) return "—";
+  const neg = s.startsWith("-");
+  const digits = neg ? s.slice(1) : s;
+  const tier = Math.floor((digits.length - 1) / 3);
+  if (tier === 0) return neg ? `-${digits}` : digits;
+  const suffixes = ["", "K", "M", "B", "T", "Qa", "Qi"];
+  const suffix = suffixes[Math.min(tier, suffixes.length - 1)];
+  const cut = digits.length - 3 * Math.min(tier, suffixes.length - 1);
+  // Pure string truncation: rounding could cross the tier boundary
+  // ("999950" must stay "999K", never "1000K").
+  const whole = digits.slice(0, cut);
+  const shown = whole.length >= 3 ? whole : `${whole}.${digits[cut]}`;
+  return `${neg ? "-" : ""}${shown}${suffix}`;
+}
+
 export function formatCount(n: string | number | null | undefined): string {
   const s = asDecimalInt(n);
   if (s === null) return "—";

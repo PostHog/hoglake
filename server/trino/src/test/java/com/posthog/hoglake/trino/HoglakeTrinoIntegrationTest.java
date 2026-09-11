@@ -68,7 +68,10 @@ class HoglakeTrinoIntegrationTest
         postgres = new PostgreSQLContainer<>("postgres:16")
                 .withUsername("hoglake")
                 .withPassword("hoglake");
-        minio = new MinIOContainer("minio/minio:RELEASE.2023-09-04T19-57-37Z");
+        // quay.io: Docker Hub stopped serving minio/minio anonymously.
+        minio = new MinIOContainer(
+                DockerImageName.parse("quay.io/minio/minio:RELEASE.2023-09-04T19-57-37Z")
+                        .asCompatibleSubstituteFor("minio/minio"));
         postgres.start();
         minio.start();
 

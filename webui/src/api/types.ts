@@ -200,6 +200,9 @@ export interface PartitionStats {
 export interface PartitionStatsResponse {
   partitions: PartitionStats[];
   truncated: boolean;
+  // The compaction target size the report used as its small-file
+  // threshold (strict <), for saying what "small" means in bytes.
+  small_file_threshold_bytes: Int64;
 }
 
 export interface CommitResult {

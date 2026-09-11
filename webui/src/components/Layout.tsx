@@ -1,6 +1,30 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
+import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
+import { applyTheme, initialTheme, persistTheme, type Theme } from "../lib/theme";
+
+function ThemeToggle() {
+  const [theme, setTheme] = useState<Theme>(initialTheme);
+  const next: Theme = theme === "dark" ? "light" : "dark";
+  const flip = () => {
+    applyTheme(next);
+    persistTheme(next);
+    setTheme(next);
+  };
+  return (
+    <button
+      type="button"
+      className="theme-toggle"
+      onClick={flip}
+      title={`Switch to ${next} mode`}
+      aria-label={`Switch to ${next} mode`}
+    >
+      {theme === "dark" ? "☀" : "☾"}
+    </button>
+  );
+}
 
 function InstanceName() {
   const { data } = useQuery({
@@ -11,6 +35,33 @@ function InstanceName() {
   });
   if (!data?.name) return null;
   return <span className="instance-name">{data.name}</span>;
+}
+
+function InstanceTotals() {
+  // Same endpoint as InstanceName under its own key: the name is
+  // fetch-once (staleTime Infinity), the totals refresh. The server
+  // caches them (~60s), so the refetch matches that cadence.
+  const { data } = useQuery({
+    queryKey: ["instance-totals"],
+    queryFn: getInstanceInfo,
+    refetchInterval: 60_000,
+    refetchIntervalInBackground: false,
+    retry: false,
+  });
+  if (data?.total_size_bytes === undefined) return null;
+  return (
+    <span
+      className="instance-totals"
+      title={
+        `${data.total_size_bytes} bytes, ${formatCount(data.total_rows)} ` +
+        "rows registered across all live data files (rows are gross of " +
+        "deletion-vector masking; refreshed by the server's metrics sampler)"
+      }
+    >
+      {formatBytes(data.total_size_bytes)} ·{" "}
+      {formatCompactCount(data.total_rows)} rows
+    </span>
+  );
 }
 
 function HealthIndicator() {
@@ -77,12 +128,14 @@ export function Layout() {
           hoglake
         </Link>
         <InstanceName />
+        <InstanceTotals />
         <Breadcrumbs />
         <div className="topbar-right">
           <Link to="/metrics">metrics</Link>
           <a href="/openapi.yaml" target="_blank" rel="noreferrer">
             openapi.yaml
           </a>
+          <ThemeToggle />
           <HealthIndicator />
         </div>
       </header>

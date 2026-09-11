@@ -403,8 +403,16 @@ fun ConsumerOffset.toDto() = ConsumerOffsetDto(consumerId, tableUuid, committedS
 
 data class CommitOffsetRequestDto(val snapshotId: Long)
 
-/** GET /v1/info — instance identity for the webui. Name omitted when unset. */
-data class InstanceInfoDto(val name: String?)
+/**
+ * GET /v1/info — instance identity plus live-data totals for the webui
+ * header. Name omitted when unset; totals come from the metrics
+ * sampler's last pass and are omitted in the boot window before it.
+ */
+data class InstanceInfoDto(
+    val name: String?,
+    val totalRows: Long?,
+    val totalSizeBytes: Long?,
+)
 
 /** One row of the catalog-wide consumer listing (GET /consumers). */
 data class ConsumerTableOffsetDto(

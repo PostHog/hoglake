@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { formatBytes, formatCount } from "../src/lib/format";
+import {
+  formatBytes,
+  formatCompactCount,
+  formatCount,
+} from "../src/lib/format";
 import { identifierError } from "../src/lib/names";
 
 describe("formatCount", () => {
@@ -57,5 +61,32 @@ describe("identifierError (server 422 pattern mirror)", () => {
     expect(identifierError("dotted.name")).not.toBeNull();
     expect(identifierError("ns<script>alert(1)</script>")).not.toBeNull();
     expect(identifierError("a".repeat(129))).not.toBeNull(); // too long
+  });
+});
+
+describe("formatCompactCount", () => {
+  it("passes small counts through", () => {
+    expect(formatCompactCount(0)).toBe("0");
+    expect(formatCompactCount("999")).toBe("999");
+    expect(formatCompactCount(-42)).toBe("-42");
+  });
+
+  it("scales by magnitude tier", () => {
+    expect(formatCompactCount(4886)).toBe("4.8K");
+    expect(formatCompactCount("324017331")).toBe("324M");
+    expect(formatCompactCount("8200000000000")).toBe("8.2T");
+    expect(formatCompactCount("-1500000")).toBe("-1.5M");
+  });
+
+  it("truncates (never rounds up across a tier) and stays lossless above 2^53", () => {
+    // 999_950 must not become "1000.0K" or "1.0M" via rounding surprises.
+    expect(formatCompactCount("999950")).toBe("999K");
+    // int64 max: 19 digits, exact leading digits, Qi tier.
+    expect(formatCompactCount("9223372036854775807")).toBe("9.2Qi");
+  });
+
+  it("guards non-integers like the other humanizers", () => {
+    expect(formatCompactCount(undefined)).toBe("—");
+    expect(formatCompactCount("12.5")).toBe("—");
   });
 });
