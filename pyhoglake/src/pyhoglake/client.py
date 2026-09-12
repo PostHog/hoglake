@@ -97,7 +97,7 @@ def _seg(name: object) -> str:
 class S3Config:
     """Object-store connection settings for the parquet write path.
 
-    ``endpoint_override`` may carry the scheme (``http://localhost:19000``);
+    ``endpoint_override`` may carry the scheme (``http://localhost:9000``);
     path-style addressing is used when an endpoint override is set.
     """
 

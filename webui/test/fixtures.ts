@@ -9,6 +9,10 @@ import type {
   Catalog,
   ConsumerOffset,
   DataFile,
+  InstanceMaintenanceStatus,
+  MaintenanceRun,
+  MaintenanceRunPage,
+  MaintenanceStatus,
   Namespace,
   PartitionStatsResponse,
   ScanFile,
@@ -235,4 +239,186 @@ export const conflictError: ApiErrorBody = {
 export const unprocessableError: ApiErrorBody = {
   error: "validation_failed",
   detail: "unknown field ids in column_stats: [99]",
+};
+
+// ---- maintenance -----------------------------------------------------------
+//
+// One run per task flavor, shaped like the ledger rows the runs endpoint
+// returns: loop sweep rows, a manual rehydrate, a failed run (error, null
+// result). run_id strings since run_id is int64 on the wire.
+
+export const maintenanceRunsFixture: MaintenanceRun[] = [
+  {
+    run_id: "104",
+    catalog: "analytics",
+    task: "expiry",
+    trigger: "loop",
+    started_at: "2026-09-11T10:00:00Z",
+    finished_at: "2026-09-11T10:00:00.140Z",
+    status: "ok",
+    result: {
+      snapshots_expired: "12",
+      data_files_queued: "3",
+      delete_files_queued: "0",
+      new_earliest_snapshot_id: "4099",
+      floored_by_consumer: "hedgerow-events",
+    },
+  },
+  {
+    run_id: "103",
+    catalog: "analytics",
+    task: "cleanup",
+    trigger: "loop",
+    started_at: "2026-09-11T09:59:00Z",
+    finished_at: "2026-09-11T09:59:02.300Z",
+    status: "ok",
+    result: { removed: "3", missing: "1", still_referenced: "0" },
+  },
+  {
+    run_id: "102",
+    catalog: "analytics",
+    task: "hydrator",
+    trigger: "loop",
+    started_at: "2026-09-11T09:58:00Z",
+    finished_at: "2026-09-11T09:58:01.000Z",
+    status: "ok",
+    result: { claimed: "2", hydrated: "2", failed: "0", transient: "0" },
+  },
+  {
+    run_id: "101",
+    catalog: "analytics",
+    task: "compaction",
+    trigger: "manual",
+    started_at: "2026-09-11T09:57:00Z",
+    finished_at: "2026-09-11T09:57:05.500Z",
+    status: "ok",
+    result: {
+      groups_compacted: "1",
+      files_in: "6",
+      files_out: "1",
+      bytes_in: "943718400",
+      bytes_out: "940000000",
+      skipped_conflicts: "0",
+      dv_superseded: "0",
+      unconvertible_schema: "0",
+      failed_groups: "0",
+    },
+  },
+  {
+    run_id: "100",
+    catalog: "analytics",
+    task: "verify",
+    trigger: "manual",
+    started_at: "2026-09-11T09:56:00Z",
+    finished_at: "2026-09-11T09:56:01.100Z",
+    status: "ok",
+    result: {
+      catalog: "analytics",
+      status: "pass",
+      checks: [
+        { check: "row_id_tiling", status: "pass", violations: "0", samples: [] },
+        { check: "delete_vectors", status: "pass", violations: "0", samples: [] },
+      ],
+    },
+  },
+  {
+    run_id: "99",
+    catalog: "analytics",
+    task: "expiry",
+    trigger: "loop",
+    started_at: "2026-09-11T09:00:00Z",
+    finished_at: "2026-09-11T09:00:00.050Z",
+    status: "failed",
+    error: "FATAL: connection to server lost",
+    result: null,
+  },
+];
+
+export const maintenanceStatusFixture: MaintenanceStatus = {
+  catalog: "analytics",
+  tasks: [
+    {
+      task: "hydrator",
+      loop_interval_ms: "5000",
+      last_run: maintenanceRunsFixture[2],
+      backlog: { pending_files: "4", failed_files: "1" },
+    },
+    {
+      task: "expiry",
+      loop_interval_ms: "60000",
+      last_run: maintenanceRunsFixture[0],
+      backlog: {
+        snapshot_retention_seconds: "604800",
+        consumer_floor: true,
+        earliest_snapshot_id: "4099",
+        head_snapshot_id: "4211",
+      },
+    },
+    {
+      task: "cleanup",
+      loop_interval_ms: "60000",
+      last_run: maintenanceRunsFixture[1],
+      backlog: { queued_removals: "0" },
+    },
+    {
+      task: "compaction",
+      loop_interval_ms: "0",
+      last_run: maintenanceRunsFixture[3],
+      backlog: { small_files: "42", target_bytes: "536870912" },
+    },
+    {
+      task: "verify",
+      last_run: maintenanceRunsFixture[4],
+      backlog: {},
+    },
+  ],
+};
+
+export const maintenanceRunPageFixture: MaintenanceRunPage = {
+  runs: maintenanceRunsFixture,
+  has_more: false,
+};
+
+/**
+ * The central page's rollup: analytics (with its five tasks) plus a second,
+ * quieter catalog that has never run anything.
+ */
+export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
+  catalogs: [
+    maintenanceStatusFixture,
+    {
+      catalog: "scratch",
+      tasks: [
+        {
+          task: "hydrator",
+          loop_interval_ms: "5000",
+          last_run: null,
+          backlog: { pending_files: "0", failed_files: "0" },
+        },
+        {
+          task: "expiry",
+          loop_interval_ms: "60000",
+          last_run: null,
+          backlog: {
+            consumer_floor: true,
+            earliest_snapshot_id: "0",
+            head_snapshot_id: "12",
+          },
+        },
+        {
+          task: "cleanup",
+          loop_interval_ms: "60000",
+          last_run: null,
+          backlog: { queued_removals: "0" },
+        },
+        {
+          task: "compaction",
+          loop_interval_ms: "0",
+          last_run: null,
+          backlog: { small_files: "0", target_bytes: "536870912" },
+        },
+        { task: "verify", last_run: null, backlog: {} },
+      ],
+    },
+  ],
 };

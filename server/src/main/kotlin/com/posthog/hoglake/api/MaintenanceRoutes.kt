@@ -3,8 +3,11 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.JsonNode
 import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.hydrator.Hydrator
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
+import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.VerifyService
 import io.ktor.http.HttpStatusCode
@@ -37,6 +40,7 @@ fun Application.installMaintenanceRoutes(
     compaction: CompactionService,
     verify: VerifyService,
     hydrator: Hydrator,
+    status: MaintenanceStatusService,
 ) {
     routing {
         route("/v1/catalogs/{catalog}") {
@@ -99,6 +103,21 @@ fun Application.installMaintenanceRoutes(
                     ).toDto(),
                 )
             }
+            // The read side of the run ledger: per-task status (loop
+            // cadence + live backlog + last run) and the paged history.
+            get("/maintenance/status") {
+                call.respond(status.status(call.maintenanceCatalog()).toDto())
+            }
+            get("/maintenance/runs") {
+                call.respond(
+                    status.runs(
+                        call.maintenanceCatalog(),
+                        call.taskQuery(),
+                        call.beforeQuery(),
+                        call.limitQuery(),
+                    ).toDto(),
+                )
+            }
             // DR/export surface (gaps.md B5): specified in
             // openapi/hoglake.yaml, 501 until built — the publications
             // pattern, so clients get the documented contract instead of
@@ -112,6 +131,22 @@ fun Application.installMaintenanceRoutes(
                     ),
                 )
             }
+        }
+        // The instance-wide twins (the central maintenance page): every
+        // catalog's status in one batched read, and the cross-catalog
+        // ledger feed. Same query-parameter conventions as the
+        // per-catalog routes.
+        get("/v1/maintenance/status") {
+            call.respond(status.instanceStatus(call.request.queryParameters["after"], call.limitQuery()).toDto())
+        }
+        get("/v1/maintenance/runs") {
+            call.respond(
+                status.instanceRuns(
+                    call.taskQuery(),
+                    call.beforeQuery(),
+                    call.limitQuery(),
+                ).toDto(),
+            )
         }
     }
 }
@@ -130,3 +165,30 @@ private fun ApplicationCall.batchQuery(): Int? =
         it.toIntOrNull()
             ?: throw BadRequestException("query parameter 'batch' must be an integer, got '$it'")
     }
+
+/** `task` query parameter: an unknown name is a 422 (a value error, not a parse failure). */
+private fun ApplicationCall.taskQuery(): MaintenanceTask? =
+    request.queryParameters["task"]?.let {
+        MaintenanceTask.fromWire(it)
+            ?: throw HoglakeException.Validation(
+                "unknown maintenance task '$it' " +
+                    "(expected one of: ${MaintenanceTask.entries.joinToString(", ") { t -> t.wire }})",
+            )
+    }
+
+/** `before` query parameter: the exclusive run_id cursor for descending pages. */
+private fun ApplicationCall.beforeQuery(): Long? =
+    request.queryParameters["before"]?.let {
+        it.toLongOrNull()
+            ?: throw BadRequestException("query parameter 'before' must be an integer, got '$it'")
+    }
+
+/** `limit` query parameter for the runs page: default 50, service caps at 500. */
+private fun ApplicationCall.limitQuery(): Int =
+    request.queryParameters["limit"]?.let {
+        it.toIntOrNull()
+            ?: throw BadRequestException("query parameter 'limit' must be an integer, got '$it'")
+    } ?: DEFAULT_RUNS_LIMIT
+
+/** Default `?limit` for GET /maintenance/runs (the snapshot-timeline page size precedent). */
+private const val DEFAULT_RUNS_LIMIT = 50

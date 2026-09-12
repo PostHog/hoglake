@@ -462,9 +462,9 @@ def test_partitioned_append_fanout(catalog, ns):
 
 def test_partitioned_compaction_groups_within_partition(catalog, ns):
     """Compaction (metadata-planned server-side: same spec + identical
-    partition_values) must merge only within a partition. 4 small
-    appends x 2 partitions -> 8 files; a compact sweep yields one output
-    per partition, row counts preserved."""
+    partition_values and size tier) must merge only within a partition.
+    Eight uniform appends reach the default T=8 quota; incomplete
+    suffixes and intermediate-tier outputs need not collapse to one file."""
     table = ns.create_table("part_compact", _part_schema())
     fid = {c.name: c.field_id for c in table.columns}
     table.alter(
@@ -478,31 +478,27 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
         ]
     )
     counts = {(7, 1): 3, (8, 1): 3}
-    for _ in range(4):  # server default HOGLAKE_COMPACTION_MIN_INPUT_FILES=4
+    for _ in range(8):  # server default HOGLAKE_COMPACTION_TIER_TARGET=8
         table.append(_part_batch(counts))
-    assert len(table.files()) == 8
+    assert sum(f.record_count for f in table.files()) == 48
 
-    total_groups = 0
     for _ in range(5):
         result = catalog._client._request(
             "POST", catalog._path("/maintenance/compact"), params={"batch": 10}
         )
-        total_groups += result["groups_compacted"]
         if result["groups_compacted"] == 0:
             break
-    if total_groups == 0:
-        pytest.skip("live server's compaction sweep produced no groups")
 
     files = table.files()
     by_values: dict[tuple[str | None, ...], list] = {}
     for f in files:
         by_values.setdefault(f.partition_values, []).append(f)
-    # grouping never crossed a partition boundary: one output per
-    # partition, carrying ONLY that partition's 12 rows
+    # A background sweep may win a race with the manual trigger. Assert
+    # the durable result, including file reduction, rather than skipping.
     assert set(by_values) == {("7", _month_str(1)), ("8", _month_str(1))}
     for group in by_values.values():
-        assert len(group) == 1
-        assert group[0].record_count == 12
+        assert len(group) < 8
+        assert sum(f.record_count for f in group) == 24
 
 
 def test_drop_table(catalog, ns):

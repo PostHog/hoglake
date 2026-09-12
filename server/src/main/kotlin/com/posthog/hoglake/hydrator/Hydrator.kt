@@ -3,10 +3,14 @@ package com.posthog.hoglake.hydrator
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.HydratorSweepResult
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -24,6 +28,7 @@ import java.io.EOFException
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.sql.Types
+import java.time.Instant
 
 /**
  * Async stats hydration for deferred-stats registrations (the
@@ -73,6 +78,9 @@ class Hydrator(
 ) {
     private val log = KotlinLogging.logger {}
     private val json = ObjectMapper()
+
+    /** The run ledger; sweep rows are recorded after the sweep commits, per claimed catalog. */
+    private val runStore = MaintenanceRunStore(jdbi)
 
     internal data class PendingFile(
         val catalogId: Long,
@@ -129,43 +137,97 @@ class Hydrator(
      * processed (transient failures included — they were claimed and
      * attempted). Each file's writes ride a savepoint so one file's DB
      * failure never poisons the sweep transaction for the rest.
+     *
+     * The sweep is instance-wide, so its ledger rows fan out per catalog:
+     * one hog_maintenance_run row per catalog the sweep claimed files for,
+     * recorded AFTER the sweep transaction commits (a no-claim sweep
+     * records nothing — a catalog's waiting work is the stats_state
+     * backlog, not a run).
      */
-    fun runOnce(limit: Int = 100): Int =
-        jdbi.inTransaction<Int, Exception> { h ->
-            val pending = claimPending(h, limit)
-            for (file in pending) {
-                h.savepoint(FILE_SAVEPOINT)
-                try {
-                    hydrate(h, file)
-                } catch (e: TransientFetchException) {
-                    h.rollbackToSavepoint(FILE_SAVEPOINT)
-                    // Transient: the file STAYS pending; the next sweep
-                    // retries it. The counter is the throttle-storm trace.
-                    Metrics.hydratorTransientError()
-                    log.warn(e) {
-                        "transient object-store failure hydrating file ${file.dataFileId} " +
-                            "(${file.path}); leaving pending for the next sweep"
+    fun runOnce(limit: Int = 100): Int {
+        val startedAt = Instant.now()
+        // Per-catalog outcome tallies, accumulated inside the sweep
+        // transaction and recorded after it commits.
+        val tallies = mutableMapOf<Long, MutableList<Long>>()
+        val processed =
+            try {
+                jdbi.inTransaction<Int, Exception> { h ->
+                    val pending = claimPending(h, limit)
+                    for ((catalogId, files) in pending.groupBy { it.catalogId }) {
+                        tallies[catalogId] = mutableListOf(files.size.toLong(), 0, 0, 0)
                     }
-                } catch (e: Exception) {
-                    h.rollbackToSavepoint(FILE_SAVEPOINT)
-                    // Structural: one bad file must not wedge the sweep.
-                    log.error(e) {
-                        "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                    for (file in pending) {
+                        // [claimed, hydrated, failed, transient]
+                        val tally = tallies.getValue(file.catalogId)
+                        h.savepoint(FILE_SAVEPOINT)
+                        try {
+                            if (hydrate(h, file)) tally[1]++ else tally[2]++
+                        } catch (e: TransientFetchException) {
+                            h.rollbackToSavepoint(FILE_SAVEPOINT)
+                            // Transient: the file STAYS pending; the next sweep
+                            // retries it. The counter is the throttle-storm trace.
+                            Metrics.hydratorTransientError()
+                            tally[3]++
+                            log.warn(e) {
+                                "transient object-store failure hydrating file ${file.dataFileId} " +
+                                    "(${file.path}); leaving pending for the next sweep"
+                            }
+                        } catch (e: Exception) {
+                            h.rollbackToSavepoint(FILE_SAVEPOINT)
+                            // Structural: one bad file must not wedge the sweep.
+                            log.error(e) {
+                                "hydration failed for file ${file.dataFileId} (${file.path}); marking failed"
+                            }
+                            markFailed(h, file)
+                            tally[2]++
+                        }
                     }
-                    markFailed(h, file)
+                    pending.size
                 }
+            } catch (e: Throwable) {
+                // The transaction rolled back. Record the sweep failure
+                // for ALL claimed catalogs, never partial success tallies.
+                for (catalogId in tallies.keys) {
+                    runStore.recordSweepById(catalogId, MaintenanceTask.HYDRATOR, startedAt, Instant.now(), null, e)
+                }
+                throw e
             }
-            pending.size
+        val finishedAt = Instant.now()
+        for ((catalogId, tally) in tallies) {
+            runStore.recordSweepById(
+                catalogId,
+                MaintenanceTask.HYDRATOR,
+                startedAt,
+                finishedAt,
+                HydratorSweepResult(
+                    claimed = tally[0],
+                    hydrated = tally[1],
+                    failed = tally[2],
+                    transient = tally[3],
+                ),
+            )
         }
+        return processed
+    }
 
     /**
      * Operator requeue (POST /v1/catalogs/{c}/maintenance/rehydrate):
      * flip the catalog's 'failed' files back to 'pending' — optionally
      * scoped to one table — so the sweep retries them. The recovery path
      * for structural failures whose cause was fixed (object re-uploaded,
-     * registration corrected, cap raised).
+     * registration corrected, cap raised). Recorded in the run ledger as
+     * a manual hydrator run.
      */
     fun rehydrateFailed(
+        catalog: String,
+        namespace: String? = null,
+        table: String? = null,
+    ): RehydrateResult =
+        runStore.recorded(catalog, MaintenanceTask.HYDRATOR, MaintenanceTrigger.MANUAL) {
+            rehydrateFailedAudited(catalog, namespace, table)
+        }
+
+    private fun rehydrateFailedAudited(
         catalog: String,
         namespace: String? = null,
         table: String? = null,
@@ -220,7 +282,7 @@ class Hydrator(
     private fun hydrate(
         h: Handle,
         file: PendingFile,
-    ) {
+    ): Boolean {
         val footer = readFooter(file)
         // The field-id contract check rides the footer we already hold.
         val missingFieldIds = FooterStats.missingFieldIds(footer.fileMetaData.schema)
@@ -232,7 +294,7 @@ class Hydrator(
                     "is ${file.recordCount}; marking failed, writing no stats"
             }
             markFailed(h, file, missingFieldIds)
-            return
+            return false
         }
         // Column binding: id-bearing files map by field id, a stable
         // identity — the LIVE column set is correct at any time. Id-less
@@ -275,6 +337,7 @@ class Hydrator(
             }
         }
         log.debug { "hydrated file ${file.dataFileId} (${file.path}): ${aggs.size} column stats" }
+        return true
     }
 
     private fun upsertStats(

@@ -341,8 +341,8 @@ A table may carry a versioned **sort order** (`hog_sort_spec` /
 writers (the server never verifies file sortedness), binding for
 compaction. **Compaction** (`compaction/CompactionService.kt`,
 `POST /maintenance/compact` + an off-by-default loop) merges small live
-files: candidates share (spec_id, partition_values) and group greedily
-under a byte target — row-id adjacency is NOT required, which is why
+files: candidates share (spec_id, partition_values, size tier) and group
+by byte quota — row-id adjacency is NOT required, which is why
 outputs materialize their row ids as an explicit `_hog_row_id` int64
 column (reserved field id 2147483646, flagged by
 `data_file.explicit_row_ids`) instead of relying on position. That
@@ -356,6 +356,39 @@ travel keeps them; expiry reclaims them later), aggregates stats from
 typed decoded bounds — treating an undecodable bound as absent, never
 wedging on it — and the changefeed excludes compacted outputs so
 consumers never see merged rows re-appear as fresh appends.
+
+`HOGLAKE_COMPACTION_TIER_TARGET` (default **8**, minimum 2) controls
+both geometric tier spacing and maximum fan-in. Starting at
+`HOGLAKE_COMPACTION_TARGET_BYTES` (512 MiB), divide downward by T with
+integer ceiling rounding: …128 KiB → 1 MiB → 8 MiB → 64 MiB → 512 MiB.
+For each partition/spec/tier, consume files in `(row_id_start, file_id)`
+order, stopping each group as soon as its input bytes reach the next
+boundary. Repeat on the remaining files until less than a quota remains.
+The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
+executed attempts per catalog, including failures and skips. There is
+no separate minimum-file-count knob.
+
+Each table's candidate list is fixed before rewriting starts. Promoted
+outputs cannot feed another group in the **same run**. Input bytes are
+only a promotion estimate: encoding, schema changes and DV removal can
+change the output size; the next run classifies its measured size anew.
+Files at or above the final target are excluded; zero-byte inputs cannot
+satisfy a byte quota. Unsorted rewrites stream; sorted rewrites still
+materialize survivors in memory.
+
+Both debt endpoints read persisted asynchronous summaries of files selected
+into complete groups (before the execution budget). A short leftover suffix
+contributes zero debt; raw small-file counts remain visible on the partition
+page. Neither endpoint scans the manifest. `sampled_at` exposes freshness;
+before the first sample, counts are unknown. `MaintenanceSummarySampler`
+checkpoints indexed keyset pages and tier accumulators in Postgres, so a
+restart resumes progress. It scans files at a captured catalog snapshot;
+if expiry overtakes that snapshot it restarts without publishing partial
+counts. Hydration and removal counts are observations over the sampling
+window. Defaults: 10,000 metadata rows per 1s tick, 60s between completed
+refreshes, controlled by `HOGLAKE_MAINTENANCE_SUMMARY_BATCH`,
+`HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS` (0 disables), and
+`HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS`.
 
 Coverage is 100% of live layouts, not just the easy ones:
 
@@ -496,6 +529,25 @@ just compose-up # Postgres 16 + MinIO (ports overridable via HOGLAKE_*_PORT)
 just run        # server on :8080
 just docs       # OpenAPI spec in Swagger UI on :8090 (HOGLAKE_SWAGGER_PORT)
 ```
+
+The compose MinIO needs the server's S3 env pointed at it — the
+defaults are blank/ambient (AWS default chain, for IRSA in deploys), so
+without these the first S3-touching path (hydrator footer reads,
+cleanup deletes, compaction rewrites) dies with the SDK's
+"Unable to load credentials" chain error before any request is made:
+
+```sh
+export HOGLAKE_S3_ENDPOINT=http://localhost:9000   # MinIO from compose-up
+export HOGLAKE_S3_ACCESS_KEY=hoglake               # MINIO_ROOT_USER
+export HOGLAKE_S3_SECRET_KEY=hoglake123            # MINIO_ROOT_PASSWORD
+just run
+```
+
+(`HOGLAKE_S3_PATH_STYLE` already defaults to `true`, which MinIO
+requires.) When the server runs in a container instead, use
+`http://host.docker.internal:9000` — or `http://minio:9000` with the
+container attached to the compose network — as the endpoint.
+
 
 ## Layout
 

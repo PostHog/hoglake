@@ -80,7 +80,7 @@ source:
   consumer_id: hedgerow-events-1    # offset identity in the SOURCE catalog
   start_snapshot: 0                 # used only when no offset exists yet
   s3:                               # object store holding the source parquet
-    endpoint: http://localhost:19000
+    endpoint: http://localhost:9000
     access_key: hoglake
     secret_key: hoglake123
     path_style: true
@@ -270,6 +270,6 @@ flox activate -- uv run pytest -m "not integration" # unit only
 
 Integration tests need a live hoglake server (`HOGLAKE_URL`, default
 `http://localhost:8080`) and MinIO (`HOGLAKE_S3_ENDPOINT`, default
-`http://localhost:19000`, key `hoglake`/`hoglake123`); they create
+`http://localhost:9000`, key `hoglake`/`hoglake123`); they create
 `hedgerow-*`-prefixed catalogs and buckets and skip cleanly when the
 server is unreachable.

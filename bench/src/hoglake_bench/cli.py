@@ -88,7 +88,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     )
     p.add_argument(
         "--s3-endpoint",
-        default=os.environ.get("HOGLAKE_S3_ENDPOINT", "http://localhost:19000"),
+        default=os.environ.get("HOGLAKE_S3_ENDPOINT", "http://localhost:9000"),
     )
     p.add_argument(
         "--s3-access-key",

@@ -102,6 +102,19 @@ object CatalogRepo {
             .map(catalogMapper)
             .list()
 
+    fun page(
+        handle: Handle,
+        after: String?,
+        limit: Int,
+    ): List<CatalogInfo> =
+        handle.createQuery(
+            """
+            SELECT $CATALOG_COLUMNS FROM hog_catalog
+            WHERE (:after::text IS NULL OR name > :after) ORDER BY name LIMIT :limit
+            """,
+        )
+            .bind("after", after).bind("limit", limit).map(catalogMapper).list()
+
     /**
      * Mint the next snapshot id (and schema version) for a DDL/commit
      * tail. Caller must hold the catalog commit lock.

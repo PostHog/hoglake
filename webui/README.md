@@ -3,7 +3,9 @@
 Management console for the hoglake control plane: catalogs, namespaces,
 tables (schema / files / scan with time travel), the snapshot timeline
 (newest-first, paged down from head via the `before` cursor), consumer
-offsets, a per-catalog compaction-debt view, and a server metrics page.
+offsets, a per-catalog compaction-debt view, maintenance views (a
+central catalog × task matrix + per-catalog task pages), and a server
+metrics page.
 Read-heavy by design — v1 exposes create forms for catalogs,
 namespaces, and tables, and deliberately no drop/delete actions.
 
@@ -13,9 +15,21 @@ Notable surfaces beyond the catalog browser:
   Prometheus endpoint rendered visually — stat tiles, per-label bars,
   histogram bucket strips. Manual refresh only, no polling.
 - **Compaction debt** (`/catalogs/:catalog/partitions`): leaf
-  partitions ranked by `debt_score` (= small-file count, the same
-  threshold the compactor plans with), with debt bars, filters, and the
+  partitions ranked by `debt_score` (files selected into complete
+  geometric-tier groups; excludes incomplete suffixes), with small-file
+  share bars, filters, and the
   stale-spec-group count — backed by `GET /stats/partitions`.
+- **Maintenance** (`/maintenance` central + `/catalogs/:catalog/maintenance`
+  per catalog): the central page is a catalog × task matrix (last-run badge
+  plus the one backlog number an operator scans for, linked through to the
+  per-catalog page) over a cross-catalog recent-runs feed; the per-catalog
+  page has per-task panels — loop cadence (or disabled / manual-only), the
+  sampled backlog with freshness timestamps (pending+failed files, removal-queue depth, snapshot floor,
+  small-file debt), and the most recent recorded run — plus the paged run
+  ledger. Backed by `GET /maintenance/status` + `/maintenance/runs` and
+  their per-catalog twins over the `hog_maintenance_run` table every
+  background sweep and manual trigger records into. Read-only: no trigger
+  buttons.
 - **Consumers** (`/catalogs/:catalog/consumers`): every consumer in the
   catalog, grouped, with table names resolved server-side and dropped
   tables badged (offsets outlive drops by design — no more pasting

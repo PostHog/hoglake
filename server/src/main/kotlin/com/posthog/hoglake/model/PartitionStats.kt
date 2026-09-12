@@ -62,4 +62,6 @@ data class PartitionStatsReport(
      * what "small" means in bytes.
      */
     val smallFileThresholdBytes: Long,
+    /** Absent while the first asynchronous summary is warming up. */
+    val sampledAt: java.time.Instant? = null,
 )

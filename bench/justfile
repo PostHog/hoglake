@@ -3,54 +3,73 @@
 _uv := "flox activate -- uv"
 
 # Default recipe: list all available recipes
+[group('development')]
 default:
     @just --list
 
+[group('development')]
 sync:
     {{_uv}} sync
 
-# Fast smoke profile of every scenario (~2-3 min; needs a live server)
+# All scenarios, including metadata-only benchmarks (~2-3 min; live server required)
+[group('suites')]
 quick:
     {{_uv}} run hoglake-bench all --quick
 
-# Full-size runs — the real numbers (tens of minutes)
+# All scenarios at full size, including metadata-only benchmarks (tens of minutes)
+[group('suites')]
 full:
     {{_uv}} run hoglake-bench all --full
 
-# Individual scenarios; extra flags pass through, e.g.
-#   just commit-throughput --preseed-snapshots 0,100000 --ops 500
+# Commit throughput using fabricated registrations; no Parquet objects
+[group('metadata-only')]
 commit-throughput *args:
     {{_uv}} run hoglake-bench commit-throughput {{args}}
 
+# Concurrent commits using fabricated registrations
+[group('metadata-only')]
 commit-contention *args:
     {{_uv}} run hoglake-bench commit-contention {{args}}
 
+# Concurrent deletes using fabricated data-file and deletion-vector paths
+[group('metadata-only')]
 delete-contention *args:
     {{_uv}} run hoglake-bench delete-contention {{args}}
 
+# Changefeed/offset performance over fabricated registrations
+[group('metadata-only')]
 changefeed-scan *args:
     {{_uv}} run hoglake-bench changefeed-scan {{args}}
 
+# Expiry of fabricated registrations plus deletion of real non-Parquet probe objects
+[group('mixed')]
 expiry-throughput *args:
     {{_uv}} run hoglake-bench expiry-throughput {{args}}
 
+# DDL churn with fabricated commit probes
+[group('metadata-only')]
 ddl-churn *args:
     {{_uv}} run hoglake-bench ddl-churn {{args}}
 
+# Real Parquet writes, uploads and catalog registration
+[group('real-data')]
 end-to-end-writer *args:
     {{_uv}} run hoglake-bench end-to-end-writer {{args}}
 
-# Populate a catalog with a realistic fake warehouse, sized in GB, e.g.
-#   just bench seed --gb 2.5 --catalog seed-warehouse
+# Populate a synthetic warehouse with real Parquet objects (e.g. --gb 2.5)
+[group('real-data')]
 seed *args:
     {{_uv}} run hoglake-bench seed {{args}}
 
 # Entire suite; the integration smoke hits HOGLAKE_URL and skips when down
+[group('tests')]
 test:
     {{_uv}} run pytest
 
+[group('tests')]
 unit:
     {{_uv}} run pytest -m "not integration"
 
+[group('tests')]
 integration:
     {{_uv}} run pytest -m integration

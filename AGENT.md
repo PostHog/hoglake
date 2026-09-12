@@ -31,7 +31,13 @@ For the full end-to-end pass (client/hedgerow integration tests against
 a real server): `just server compose-up && just server run` in another
 terminal first — integration tests skip cleanly when no server is up,
 so a green run without one is NOT a full verification. Say which you
-ran.
+ran. The server needs the compose MinIO's credentials in its env
+(`HOGLAKE_S3_ENDPOINT`/`HOGLAKE_S3_ACCESS_KEY`/`HOGLAKE_S3_SECRET_KEY`
+— see server/README.md §Dev environment) or the hydrator/cleanup/
+compaction paths fail the SDK credentials chain. (`just up` / `just
+down` instead brings up/tears down the whole stack in containers —
+server + webui images built from the working tree, webui on :5173 —
+with the S3 env wired by the compose file.)
 
 The server suite includes the **schema equivalence gate**
 (`just server schema-check`): fold(migrations) must equal `schema.sql`.
@@ -57,7 +63,7 @@ React console, Python replication daemon:
 |---|---|---|---|
 | `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG16, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
-| `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
+| `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
@@ -174,7 +180,10 @@ pyproject.
    append counter / row-id allocator anchor — head-scoped by nature).
 8. **Audit/observability never rides a transaction** and never writes
    to any database. Audit emits after commit/rollback; metrics are
-   passive.
+   passive. Maintenance run history and asynchronous summaries are
+   durable operational state; run-history writes are best-effort after
+   task transactions resolve. The removal ledger remains transactionally
+   integrated with commits and cleanup, as invariant 4 requires.
 9. **All SQL is parameterized.** No string-built values, anywhere.
 10. **Rows-then-offset everywhere** (server offset API is monotonic;
     hedgerow commits offsets only after destination durability).
@@ -205,6 +214,24 @@ pyproject.
   its siblings) keeps running; shutdown is structured and bounded
   (cancel + join, 5s hard cap). Tests drive the services'
   `runOnce`/`sampleOnce` entry points directly, not the scheduler.
+  Every maintenance-task run — loop sweep or manual `/maintenance/`
+  trigger — is recorded in `hog_maintenance_run` via
+  `MaintenanceRunStore.recorded` (the per-catalog `runOnce` is the one
+  funnel; the hydrator's instance-wide sweep fans out one row per
+  claimed catalog). Recording is post-run and best-effort (never fails
+  the task); the cleanup sweep purges rows past
+  `HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS` (7d default). Read
+  side: per-catalog `GET .../maintenance/status` + `/runs` and the
+  instance-wide `GET /v1/maintenance/status` + `/runs` twins
+  (MaintenanceStatusService; batched reads independent of catalog count).
+  Dashboard and partition-debt requests read persisted asynchronous
+  summaries, NEVER the manifest. `MaintenanceSummarySampler` checkpoints
+  keyset pages in `(catalog, table, row_id_start, file_id)` order, carrying
+  tier quotas across pages. Default row budget 10,000/tick, interval 1s,
+  refresh delay 60s after a completed scan (`HOGLAKE_MAINTENANCE_SUMMARY_*`).
+  Incomplete generations are never published; old samples remain visible
+  with freshness timestamps. Expiry overtaking a scan restarts it. The
+  central status endpoint pages catalogs (50 default, max 100).
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only
   through the integrating session; agents report needed changes rather
@@ -221,8 +248,15 @@ pyproject.
 ## Known deferrals / open items
 
 - **Compaction (M4) — 100% implemented**: `server/compaction/` —
-  planning is metadata-only (live, same spec + partition values, under
-  target bytes; adjacency NOT required), rewrite via **parquet-java**
+  planning is metadata-only (live, same spec + partition values + size
+  tier; adjacency NOT required). `HOGLAKE_COMPACTION_TIER_TARGET` (T=8,
+  minimum 2) sets both geometric tier spacing and max fan-in. Divide
+  the final target downward by T (ceiling-rounded integer bytes), consume
+  minimal row-id-ordered prefixes reaching each tier's quota, and repeat
+  until the remainder is short. A table's plan is fixed before execution:
+  outputs are never re-compacted within that run. Input bytes estimate
+  promotion; actual output size determines the next-run tier. The existing
+  max-groups-per-run budget still caps executed attempts. Rewrite via **parquet-java**
   (the project's one parquet library — decision 2026-09-05: Hardwood is
   out of main code entirely (the trino test fixtures still use
   hardwood-core to produce id-less parquet — deliberately); parquet-java handles footer reads in the hydrator AND

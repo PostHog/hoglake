@@ -27,6 +27,8 @@ import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
+import com.posthog.hoglake.service.MaintenanceStatusService
+import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
@@ -71,10 +73,19 @@ class App private constructor(
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
     private val partitionStatsService =
-        PartitionStatsService(jdbi, smallFileThresholdBytes = cfg.compactionTargetBytes)
+        PartitionStatsService(
+            jdbi,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            tierTarget = cfg.compactionTierTarget,
+        )
     private val removalStore = RemovalStore(cfg)
     private val cleanupService =
-        CleanupService(jdbi, removalStore, ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds)
+        CleanupService(
+            jdbi,
+            removalStore,
+            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
+            maintenanceLedgerRetentionSeconds = cfg.maintenanceLedgerRetentionSeconds,
+        )
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)
@@ -87,9 +98,29 @@ class App private constructor(
             objectStore,
             CompactionConfig(
                 targetBytes = cfg.compactionTargetBytes,
-                minInputFiles = cfg.compactionMinInputFiles,
+                tierTarget = cfg.compactionTierTarget,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
             ),
+        )
+
+    /** The run ledger's read side: status + history routes (webui maintenance page). */
+    private val maintenanceStatusService =
+        MaintenanceStatusService(
+            jdbi,
+            hydratorIntervalMs = cfg.hydratorIntervalMs,
+            expiryIntervalMs = cfg.expiryIntervalMs,
+            cleanupIntervalMs = cfg.cleanupIntervalMs,
+            compactionIntervalMs = cfg.compactionIntervalMs,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            tierTarget = cfg.compactionTierTarget,
+        )
+
+    private val maintenanceSummarySampler =
+        MaintenanceSummarySampler(
+            jdbi,
+            cfg.compactionTargetBytes,
+            cfg.compactionTierTarget,
+            cfg.maintenanceSummaryRefreshSeconds,
         )
 
     /**
@@ -197,6 +228,7 @@ class App private constructor(
             compactionService,
             verifyService,
             hydrator,
+            maintenanceStatusService,
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPublicationRoutes()
@@ -210,6 +242,9 @@ class App private constructor(
      */
     fun startBackground(): AutoCloseable {
         val loops = BackgroundLoops()
+        loops.register("maintenance_summary", cfg.maintenanceSummaryIntervalMs) {
+            maintenanceSummarySampler.tick(cfg.maintenanceSummaryBatch)
+        }
         loops.register("hydrator", cfg.hydratorIntervalMs) { hydrator.runOnce() }
         loops.register("expiry", cfg.expiryIntervalMs) {
             expiryService.runOnceAllCatalogs(cfg.expiryBatchSize)

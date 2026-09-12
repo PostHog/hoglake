@@ -43,6 +43,10 @@ object Database {
             try {
                 Flyway.configure()
                     .dataSource(ds)
+                    // Concurrent index builds wait for old transactions;
+                    // Flyway must not hold its own transaction-level lock
+                    // open while executing a nontransactional migration.
+                    .configuration(mapOf("flyway.postgresql.transactional.lock" to "false"))
                     .locations("classpath:db/migration")
                     .load()
                     .migrate()

@@ -370,6 +370,72 @@ class HydratorIntegrationTest {
         assertThat(hydrator.runOnce()).isEqualTo(1)
         assertThat(statsState(catalogId, 1)).isEqualTo("failed")
         assertThat(statsRows(catalogId, 1)).isEmpty()
+        val result =
+            jdbi.withHandle<String, Exception> { h ->
+                h.createQuery(
+                    "SELECT result::text FROM hog_maintenance_run WHERE catalog_id = ? ORDER BY run_id DESC LIMIT 1",
+                )
+                    .bind(0, catalogId).mapTo(String::class.java).one()
+            }
+        val node = com.fasterxml.jackson.databind.ObjectMapper().readTree(result)
+        assertThat(node["hydrated"].asLong()).isZero()
+        assertThat(node["failed"].asLong()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a sweep transaction rollback records failure for every claimed catalog`() {
+        val ids = listOf(seedCatalogAndTable(), seedCatalogAndTable())
+        for ((i, id) in ids.withIndex()) {
+            val path = "s3://$BUCKET/rollback-probe-$i.parquet"
+            store.put(path, parquetBytes)
+            seedDataFile(id, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+        }
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                """
+                CREATE FUNCTION reject_hydration_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    IF NEW.path LIKE '%/rollback-probe-%' AND NEW.stats_state = 'provided' THEN
+                        RAISE EXCEPTION 'rollback-probe';
+                    END IF;
+                    RETURN NULL;
+                END $$
+                """,
+            )
+            h.execute(
+                """
+                CREATE CONSTRAINT TRIGGER reject_hydration_commit
+                AFTER UPDATE ON hog_data_file DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION reject_hydration_commit()
+                """,
+            )
+        }
+        try {
+            org.assertj.core.api.Assertions.assertThatThrownBy { hydrator.runOnce() }
+                .rootCause().hasMessageContaining("rollback-probe")
+            for (id in ids) {
+                assertThat(statsState(id, 1)).isEqualTo("pending")
+                val row =
+                    jdbi.withHandle<Pair<String, String>, Exception> { h ->
+                        h.createQuery(
+                            """
+                            SELECT status, error FROM hog_maintenance_run
+                            WHERE catalog_id = ? ORDER BY run_id DESC LIMIT 1
+                            """,
+                        )
+                            .bind(0, id).map { rs, _ -> rs.getString("status") to rs.getString("error") }.one()
+                    }
+                assertThat(row.first).isEqualTo("failed")
+                assertThat(row.second).contains("rollback-probe")
+            }
+        } finally {
+            jdbi.useHandle<Exception> { h ->
+                h.execute("DROP TRIGGER reject_hydration_commit ON hog_data_file")
+                h.execute("DROP FUNCTION reject_hydration_commit()")
+                // Don't leave pending files for other sweep tests in this shared DB.
+                h.execute("UPDATE hog_data_file SET stats_state = 'failed' WHERE path LIKE '%/rollback-probe-%'")
+            }
+        }
     }
 
     @Test

@@ -17,6 +17,18 @@ package com.posthog.hoglake.persistence
 object HogSchemaColumns {
     val TABLES: Map<String, Set<String>> =
         mapOf(
+            // MaintenanceSummarySampler: published samples + durable scan checkpoints.
+            "hog_maintenance_summary" to
+                setOf(
+                    "catalog_id", "generation", "published_generation", "sampled_at",
+                    "sample", "scan_state", "next_batch_at",
+                ),
+            "hog_maintenance_summary_tier" to
+                setOf(
+                    "catalog_id", "generation", "bucket_key", "table_id", "spec_id", "partition_values",
+                    "quota", "remaining", "pending", "selected", "file_count", "small_count",
+                    "total_bytes", "small_bytes", "dv_count",
+                ),
             // CatalogRepo.catalogMapper (the one hog_catalog row mapping;
             // options/expiry/cleanup read through it). Allocator columns are
             // advanced via UPDATE..RETURNING in CatalogRepo.allocate*.
@@ -113,6 +125,13 @@ object HogSchemaColumns {
                 setOf(
                     "removal_id", "catalog_id", "path", "file_kind", "reason", "scheduled_at",
                     "attempts", "last_attempt_at", "drained_at", "drained_outcome",
+                ),
+            // MaintenanceRunStore (insert + last-run/history mappers),
+            // CleanupService (retention purge).
+            "hog_maintenance_run" to
+                setOf(
+                    "run_id", "catalog_id", "task", "run_trigger", "started_at",
+                    "finished_at", "status", "error", "result",
                 ),
         )
 }

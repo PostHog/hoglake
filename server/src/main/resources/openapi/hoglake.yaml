@@ -383,9 +383,18 @@ paths:
       operationId: runCompaction
       summary: >
         Run one compaction sweep now (the background loop calls the same
-        path; batch = groups rewritten this run, default 1 — tiny bites
-        by construction). Merges live small files (same partition spec +
-        values, no live deletion vector) into one file per group whose
+        path; batch bounds group attempts, including failures and skips;
+        default HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN, normally 1).
+        Geometric size tiers divide HOGLAKE_COMPACTION_TARGET_BYTES
+        (512 MiB) repeatedly by HOGLAKE_COMPACTION_TIER_TARGET (T=8,
+        minimum 2). Within each partition/spec/tier, take the shortest
+        row-id-ordered prefix reaching the next byte boundary, at most
+        T files; repeat until the remainder is below quota. Zero-byte
+        files cannot meet a quota; files at/above the final target are
+        excluded. Each table is planned before any of its groups execute,
+        so new outputs never participate in this same run. Input bytes
+        estimate promotion; actual output size determines its next-run
+        tier. DV-bearing inputs are supported. Produces one file per group whose
         rows carry their hoglake row ids in an explicit _hog_row_id
         column (data_file.explicit_row_ids), sorted by the table's live
         sort order when one exists. Inputs are end-snapshotted (time
@@ -486,26 +495,176 @@ paths:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /maintenance/status:
+    get:
+      operationId: getInstanceMaintenanceStatus
+      summary: >
+        Paged catalog maintenance status. Reads persisted asynchronous
+        summaries and bounded latest-run index lookups; never scans the
+        file manifest. Backlogs remain absent until the first complete
+        sample. sampled_at exposes freshness; run history and catalog
+        options/head are current. Summary refresh work is checkpointed
+        in bounded background batches and survives server restarts.
+      parameters:
+        - name: after
+          in: query
+          schema: { type: string }
+          description: Exclusive catalog-name cursor from next_after.
+        - name: limit
+          in: query
+          schema: { type: integer, default: 50, maximum: 100, minimum: 1 }
+      responses:
+        "200":
+          description: One catalog page, including summary freshness.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InstanceMaintenanceStatus" }
+        "422":
+          description: Non-positive limit.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /maintenance/runs:
+    get:
+      operationId: listInstanceMaintenanceRuns
+      summary: >
+        The maintenance run ledger across ALL catalogs, newest first —
+        the ops-feed companion to the per-catalog
+        /catalogs/{c}/maintenance/runs (same cursor and filter
+        conventions; run rows carry their catalog name).
+      parameters:
+        - name: task
+          in: query
+          required: false
+          description: Restrict to one task (422 on an unknown task name).
+          schema: { $ref: "#/components/schemas/MaintenanceTask" }
+        - name: before
+          in: query
+          required: false
+          description: >
+            Exclusive run_id cursor for descending pagination (pass the
+            oldest run_id from the previous page).
+          schema: { type: integer, format: int64 }
+        - name: limit
+          in: query
+          required: false
+          description: Max runs returned (default 50, capped at 500).
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: One page of the instance-wide run ledger.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MaintenanceRunPage" }
+        "422":
+          description: Unknown task name, or limit < 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/maintenance/status:
+    get:
+      operationId: getMaintenanceStatus
+      summary: >
+        Live maintenance status per task: loop cadence, current backlog,
+        and the task's most recent recorded run from hog_maintenance_run
+        (the ledger every background sweep and manual trigger writes).
+        Read-only persisted summaries, with no manifest queries on this
+        request path. Every task is always present. Until sampled_at
+        exists, hydration, cleanup and compaction counts are absent
+        (unknown, not zero). sample_started_at and sampled_at bound the
+        observation window; sampled_snapshot_id identifies the file
+        visibility snapshot. Hydration state and removal-queue counts
+        are observations over that window. Backlog keys are
+        task-specific: hydrator -> pending_files, failed_files (its
+        stats_state backlog); expiry -> snapshot_retention_seconds
+        (absent when expiry is disabled), consumer_floor,
+        earliest_snapshot_id, head_snapshot_id; cleanup ->
+        queued_removals, oldest_queued_age_seconds (absent on an empty
+        queue); compaction -> small_files (ACTIONABLE debt: small files
+        selected into complete geometric-tier prefix groups; incomplete
+        suffixes excluded, before applying the per-run budget), target_bytes;
+        verify -> none (empty object).
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+      responses:
+        "200":
+          description: Per-task maintenance status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MaintenanceStatus" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /catalogs/{catalog}/maintenance/runs:
+    get:
+      operationId: listMaintenanceRuns
+      summary: >
+        The maintenance run ledger, newest first: recorded runs of
+        every task (background-loop sweeps and manual /maintenance/*
+        triggers alike), paged downwards with the `before` cursor (an
+        exclusive run_id bound — the same convention as the snapshot
+        timeline). Hydrator sweeps are recorded per catalog only when
+        the sweep claimed files for that catalog, so a hydrator-quiet
+        catalog has no hydrator rows; its waiting work is the status
+        endpoint's backlog, not a run.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: task
+          in: query
+          required: false
+          description: Restrict to one task (422 on an unknown task name).
+          schema: { $ref: "#/components/schemas/MaintenanceTask" }
+        - name: before
+          in: query
+          required: false
+          description: >
+            Exclusive run_id cursor for descending pagination (pass the
+            oldest run_id from the previous page).
+          schema: { type: integer, format: int64 }
+        - name: limit
+          in: query
+          required: false
+          description: Max runs returned (default 50, capped at 500).
+          schema: { type: integer, default: 50, maximum: 500 }
+      responses:
+        "200":
+          description: One page of the run ledger.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MaintenanceRunPage" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: Unknown task name, or limit < 1
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/stats/partitions:
     get:
       operationId: getPartitionStats
       summary: >
-        Leaf partitions ranked by compaction debt — the operator answer
+        Sampled leaf partitions ranked by compaction debt — the operator answer
         to "how un-compacted is each partition" under the coarse
-        (months x team) partitioning model. Aggregates LIVE
-        (visible-at-head) data files grouped by (table, spec_id,
+        (months x team) partitioning model. Reads the last completed
+        asynchronous summary, not the manifest. Files visible at the
+        sampled snapshot are grouped by (table, spec_id,
         partition value tuple); an unpartitioned table (or the pre-spec
         vintage of a later-partitioned one) is one row with empty
         partition_values and no spec_id, and files written under an
         older spec than the table's current one group under THEIR
         spec_id. "Small" means under the compaction target size
         (HOGLAKE_COMPACTION_TARGET_BYTES, strict less-than — the same
-        threshold the compaction planner applies to candidate inputs),
-        so debt_score (= small_file_count) is exactly the files a sweep
-        would try to merge. Ordered by debt_score desc, ties by
+        threshold the compaction planner applies to candidate inputs).
+        debt_score counts files selected into complete minimal-prefix
+        groups by the geometric tier planner (T from
+        HOGLAKE_COMPACTION_TIER_TARGET, default 8), before the run's
+        group budget. Incomplete suffixes contribute zero debt, while
+        small_file_count still includes them. Ordered by debt_score desc, ties by
         small_file_bytes desc. Read-only metadata aggregation (one
-        REPEATABLE READ MVCC snapshot, no locks) — never blocks
-        writers.
+        REPEATABLE READ snapshot over summary rows). sampled_at is absent
+        and partitions empty during first-sample warmup. Names resolve
+        against the current catalog; dropped tables are omitted.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - name: namespace
@@ -1468,7 +1627,7 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema]
+                 unconvertible_schema, failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -1499,6 +1658,134 @@ components:
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions).
+        failed_groups:
+          type: integer
+          format: int64
+          description: >
+            Groups that FAILED (unreadable input, S3 error, corrupt
+            DV): logged, retried next run. Unlike the skip flavors this
+            is not self-healing signal — a sweep whose groups all fail
+            still reports groups_compacted=0 with failed_groups naming
+            the problem, so a chronically broken compactor can never
+            present as a green no-op.
+
+    MaintenanceTask:
+      type: string
+      enum: [hydrator, expiry, cleanup, compaction, verify]
+      description: The maintenance-task vocabulary of hog_maintenance_run.
+
+    MaintenanceRun:
+      type: object
+      required: [run_id, catalog, task, trigger, started_at, finished_at, status]
+      properties:
+        run_id: { type: integer, format: int64 }
+        catalog:
+          type: string
+          description: The catalog the run acted on (the ledger is per-catalog).
+        task: { $ref: "#/components/schemas/MaintenanceTask" }
+        trigger:
+          type: string
+          enum: [loop, manual]
+          description: >
+            loop = a BackgroundLoops sweep; manual = the /maintenance/*
+            trigger (for task hydrator, manual rows are rehydrate
+            calls).
+        started_at: { type: string, format: date-time }
+        finished_at: { type: string, format: date-time }
+        status:
+          type: string
+          enum: [ok, failed]
+          description: >
+            failed = the run itself threw (recorded with error). Per-FILE
+            hydration failures are not run failures: they surface in the
+            result counts and the status endpoint's failed_files backlog.
+        error:
+          type: string
+          description: Failure detail; present iff status is failed.
+        result:
+          type: object
+          nullable: true
+          description: >
+            The task's result payload — the matching POST response body:
+            ExpiryResult for expiry, CleanupResult for cleanup,
+            CompactionResult for compaction, VerifyReport for verify.
+            Hydrator loop rows carry the sweep's per-catalog counts
+            (claimed, hydrated, failed, transient); manual hydrator rows
+            carry RehydrateResult.
+
+    MaintenanceRunPage:
+      type: object
+      required: [runs, has_more]
+      properties:
+        runs:
+          type: array
+          items: { $ref: "#/components/schemas/MaintenanceRun" }
+        has_more:
+          type: boolean
+          description: More runs exist below this page (page with `before`).
+
+    MaintenanceTaskStatus:
+      type: object
+      required: [task, last_run, backlog]
+      properties:
+        task: { $ref: "#/components/schemas/MaintenanceTask" }
+        loop_interval_ms:
+          type: integer
+          format: int64
+          description: >
+            Background loop cadence (0 = the loop is disabled; manual
+            triggers still work). Absent for verify, which has no loop.
+        last_run:
+          oneOf:
+            - { $ref: "#/components/schemas/MaintenanceRun" }
+            - { type: object, nullable: true, enum: [null] }
+          description: Always included; null when the task has no recorded run.
+        backlog:
+          type: object
+          description: >
+            Task-specific live backlog (never a ledger lookup): hydrator
+            -> pending_files, failed_files; expiry ->
+            snapshot_retention_seconds (absent = expiry disabled),
+            consumer_floor, earliest_snapshot_id, head_snapshot_id;
+            cleanup -> queued_removals, oldest_queued_age_seconds
+            (absent on an empty queue); compaction -> small_files
+            (files selected into complete geometric-tier prefix groups,
+            excluding incomplete suffixes), target_bytes; verify -> none.
+
+    MaintenanceStatus:
+      type: object
+      required: [catalog, tasks]
+      properties:
+        catalog: { type: string }
+        sampled_at:
+          type: string
+          format: date-time
+          description: Completion time of the published backlog sample. Absent during warmup.
+        sample_started_at:
+          type: string
+          format: date-time
+          description: Beginning of the observation window.
+        sampled_snapshot_id:
+          type: integer
+          format: int64
+          description: Catalog snapshot used for sampled file visibility.
+        tasks:
+          type: array
+          description: All five maintenance tasks, always present.
+          items: { $ref: "#/components/schemas/MaintenanceTaskStatus" }
+
+    InstanceMaintenanceStatus:
+      type: object
+      required: [catalogs, has_more]
+      properties:
+        has_more: { type: boolean }
+        next_after:
+          type: string
+          description: Exclusive catalog-name cursor for the next page, present when has_more.
+        catalogs:
+          type: array
+          description: This page's MaintenanceStatus entries, ordered by catalog name.
+          items: { $ref: "#/components/schemas/MaintenanceStatus" }
 
     PartitionValue:
       type: object
@@ -1556,14 +1843,20 @@ components:
           type: integer
           format: int64
           description: >
-            = small_file_count — the files a compaction sweep would try
-            to merge. The ranking key (desc, ties by small_file_bytes
-            desc).
+            Files selected by the geometric tier planner into complete
+            minimal-prefix groups, before applying the per-run budget.
+            Unmergeable suffixes are excluded (including zero-byte files).
+            Uses the same T and final target as compaction. The ranking
+            key (desc, ties by small_file_bytes desc).
 
     PartitionStatsReport:
       type: object
       required: [partitions, truncated, stale_spec_groups, small_file_threshold_bytes]
       properties:
+        sampled_at:
+          type: string
+          format: date-time
+          description: Last completed summary sample. Absent during warmup (partitions is then empty).
         partitions:
           type: array
           items: { $ref: "#/components/schemas/PartitionDebt" }

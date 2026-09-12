@@ -1,5 +1,6 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.compaction.CompactionTiers
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionDebt
 import com.posthog.hoglake.model.PartitionStatsReport
@@ -30,9 +31,12 @@ import java.util.UUID
  *    partition values.
  *  - "Small" = file_size_bytes < [smallFileThresholdBytes], the SAME
  *    strict-less-than CompactionService applies to candidate inputs
- *    (App wires both from Config.compactionTargetBytes) — so
- *    debt_score (= small_file_count) is exactly the files a sweep
- *    would try to merge.
+ *    (App wires both from Config.compactionTargetBytes). debt_score is
+ *    the ACTIONABLE debt under the tiered planner (CompactionTiers):
+ *    count only files selected into complete minimal-prefix groups,
+ *    repeating within each tier. Short remainders keep their raw counts
+ *    in small_file_count but contribute no debt. The execution budget
+ *    limits work per run, not reported backlog.
  *  - dv_count counts live DVs over the group's files (at most one per
  *    file by the unique partial index).
  *  - Ordered by debt_score desc, ties by small_file_bytes desc, then a
@@ -44,9 +48,12 @@ import java.util.UUID
  */
 class PartitionStatsService(
     private val jdbi: Jdbi,
-    /** Compaction target size = the small-file threshold (strict <). */
+    /** Compaction target size = the small-file threshold (strict <); the tier ladder derives from it. */
     private val smallFileThresholdBytes: Long,
+    tierTarget: Int = CompactionTiers.DEFAULT_TIER_TARGET,
 ) {
+    private val tiers = CompactionTiers.of(smallFileThresholdBytes, tierTarget)
+
     fun partitionStats(
         catalog: String,
         namespace: String?,
@@ -75,13 +82,31 @@ class PartitionStatsService(
                     throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
                 }
             }
-            val rows = groupRows(h, cat.catalogId, cat.headSnapshotId, namespace, table, cappedLimit)
+            val published =
+                MaintenanceSummarySampler.read(h, listOf(cat.catalogId))[cat.catalogId]
+                    ?.takeIf {
+                        it.sample.targetBytes == smallFileThresholdBytes && it.sample.tierTarget == tiers.tierTarget
+                    }
+            val rows =
+                if (published == null) {
+                    emptyList()
+                } else {
+                    groupRows(
+                        h,
+                        cat.catalogId,
+                        cat.headSnapshotId,
+                        namespace,
+                        table,
+                        cappedLimit,
+                    )
+                }
             val fieldNames = partitionFieldNames(h, cat.catalogId, rows.map { it.tableId }.distinct())
             PartitionStatsReport(
                 partitions = rows.map { it.toDebt(fieldNames) },
                 truncated = (rows.firstOrNull()?.totalGroups ?: 0L) > cappedLimit,
                 staleSpecGroups = rows.firstOrNull()?.staleSpecGroups ?: 0L,
                 smallFileThresholdBytes = smallFileThresholdBytes,
+                sampledAt = published?.sampledAt,
             )
         }
     }
@@ -100,6 +125,8 @@ class PartitionStatsService(
         val totalBytes: Long,
         val smallFileBytes: Long,
         val dvCount: Long,
+        /** Actionable debt from the tier_groups sub-aggregation (SQL-computed). */
+        val debtScore: Long,
         val totalGroups: Long,
         val staleSpecGroups: Long,
     ) {
@@ -120,7 +147,7 @@ class PartitionStatsService(
                 smallFileBytes = smallFileBytes,
                 avgFileBytes = if (fileCount > 0) totalBytes / fileCount else 0,
                 dvCount = dvCount,
-                debtScore = smallFileCount,
+                debtScore = debtScore,
             )
         }
     }
@@ -145,34 +172,30 @@ class PartitionStatsService(
         val query =
             h.createQuery(
                 """
-                WITH files AS (
-                    SELECT f.table_id, f.spec_id, f.file_size_bytes,
-                           ns.name AS namespace, tv.name AS table_name, t.table_uuid,
-                           (SELECT array_agg(pv.value ORDER BY pv.key_index)
-                            FROM hog_file_partition_value pv
-                            WHERE pv.catalog_id = f.catalog_id
-                              AND pv.data_file_id = f.data_file_id) AS partition_values,
-                           EXISTS (
-                               SELECT 1 FROM hog_delete_file dv
-                               WHERE dv.catalog_id = f.catalog_id
-                                 AND dv.data_file_id = f.data_file_id
-                                 AND dv.begin_snapshot <= :head
-                                 AND (dv.end_snapshot IS NULL OR :head < dv.end_snapshot)
-                           ) AS has_live_dv
-                    FROM hog_data_file f
+                WITH sampled AS (
+                    SELECT p.table_id, p.spec_id, p.partition_values,
+                           sum(p.file_count) AS file_count, sum(p.small_count) AS small_file_count,
+                           sum(p.total_bytes) AS total_bytes, sum(p.small_bytes) AS small_file_bytes,
+                           sum(p.dv_count) AS dv_count, sum(p.selected) AS debt_score
+                    FROM hog_maintenance_summary_tier p
+                    JOIN hog_maintenance_summary s ON s.catalog_id = p.catalog_id
+                      AND s.published_generation = p.generation
+                    WHERE p.catalog_id = :catalogId
+                    GROUP BY p.table_id, p.spec_id, p.partition_values
+                ),
+                groups AS (
+                    SELECT f.*, ns.name AS namespace, tv.name AS table_name, t.table_uuid
+                    FROM sampled f
                     JOIN hog_table t
-                      ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+                      ON t.catalog_id = :catalogId AND t.table_id = f.table_id
                     JOIN hog_table_version tv
-                      ON tv.catalog_id = f.catalog_id AND tv.table_id = f.table_id
+                      ON tv.catalog_id = :catalogId AND tv.table_id = f.table_id
                      AND tv.begin_snapshot <= :head
                      AND (tv.end_snapshot IS NULL OR :head < tv.end_snapshot)
                     JOIN hog_namespace ns
-                      ON ns.catalog_id = f.catalog_id AND ns.namespace_id = tv.namespace_id
-                    WHERE f.catalog_id = :catalogId
-                      AND t.dropped_snapshot IS NULL
+                      ON ns.catalog_id = :catalogId AND ns.namespace_id = tv.namespace_id
+                    WHERE t.dropped_snapshot IS NULL
                       AND NOT ns.dropped
-                      AND f.begin_snapshot <= :head
-                      AND (f.end_snapshot IS NULL OR :head < f.end_snapshot)
                       $namespaceFilter
                       $tableFilter
                 ),
@@ -183,17 +206,6 @@ class PartitionStatsService(
                       AND ps.begin_snapshot <= :head
                       AND (ps.end_snapshot IS NULL OR :head < ps.end_snapshot)
                     GROUP BY ps.table_id
-                ),
-                groups AS (
-                    SELECT namespace, table_name, table_uuid, table_id, spec_id, partition_values,
-                           count(*) AS file_count,
-                           count(*) FILTER (WHERE file_size_bytes < :smallBytes) AS small_file_count,
-                           sum(file_size_bytes) AS total_bytes,
-                           COALESCE(sum(file_size_bytes)
-                                        FILTER (WHERE file_size_bytes < :smallBytes), 0) AS small_file_bytes,
-                           count(*) FILTER (WHERE has_live_dv) AS dv_count
-                    FROM files
-                    GROUP BY namespace, table_name, table_uuid, table_id, spec_id, partition_values
                 )
                 SELECT g.*,
                        count(*) OVER () AS total_groups,
@@ -201,14 +213,13 @@ class PartitionStatsService(
                            OVER () AS stale_spec_groups
                 FROM groups g
                 LEFT JOIN current_spec cs ON cs.table_id = g.table_id
-                ORDER BY small_file_count DESC, small_file_bytes DESC,
+                ORDER BY debt_score DESC, small_file_bytes DESC,
                          namespace, table_name, spec_id NULLS FIRST, partition_values
                 LIMIT :limit
                 """,
             )
                 .bind("catalogId", catalogId)
                 .bind("head", head)
-                .bind("smallBytes", smallFileThresholdBytes)
                 .bind("limit", limit)
         if (namespace != null) query.bind("namespace", namespace)
         if (table != null) query.bind("tableName", table)
@@ -228,6 +239,7 @@ class PartitionStatsService(
                     totalBytes = rs.getLong("total_bytes"),
                     smallFileBytes = rs.getLong("small_file_bytes"),
                     dvCount = rs.getLong("dv_count"),
+                    debtScore = rs.getLong("debt_score"),
                     totalGroups = rs.getLong("total_groups"),
                     staleSpecGroups = rs.getLong("stale_spec_groups"),
                 )

@@ -43,7 +43,7 @@ def seeded(live_server_url):
             access_key=os.environ.get("HOGLAKE_S3_ACCESS_KEY", "hoglake"),
             secret_key=os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123"),
             endpoint_override=os.environ.get(
-                "HOGLAKE_S3_ENDPOINT", "http://localhost:19000"
+                "HOGLAKE_S3_ENDPOINT", "http://localhost:9000"
             ),
             region="us-east-1",
         ),

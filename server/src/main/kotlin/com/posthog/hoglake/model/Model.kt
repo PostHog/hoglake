@@ -421,6 +421,14 @@ data class CompactionResult(
      * schema or the file set changes; skip-with-reason, not a failure.
      */
     val unconvertibleSchema: Long = 0,
+    /**
+     * Groups that FAILED outright (unreadable input, S3 error, corrupt
+     * DV): the group is retried next run, and unlike the skip flavors
+     * this is not self-healing signal — a nonzero count here with a
+     * healthy-looking sweep was the "compactor silently chokes on S3"
+     * failure mode; count it so the run ledger shows it.
+     */
+    val failedGroups: Long = 0,
 )
 
 /**
@@ -453,6 +461,19 @@ data class RehydrateResult(
     val requeued: Long,
 )
 
+/**
+ * One hydrator sweep's outcome for ONE catalog (the ledger row's result
+ * payload): files the sweep claimed, and how the claims resolved.
+ * Transient failures stay 'pending' (retried next sweep); structural
+ * ones are marked 'failed' (the rehydrate endpoint's population).
+ */
+data class HydratorSweepResult(
+    val claimed: Long,
+    val hydrated: Long,
+    val failed: Long,
+    val transient: Long,
+)
+
 /** One cleanup drain's outcome. */
 data class CleanupResult(
     val removed: Long,
@@ -460,6 +481,136 @@ data class CleanupResult(
     /** Entries skipped because the path is still referenced — an
      *  invariant violation worth alerting on, never a deletion. */
     val stillReferenced: Long,
+)
+
+// ---- the maintenance run ledger (hog_maintenance_run) ---------------------
+
+/** The maintenance-task vocabulary (hog_maintenance_run.task's CHECK). */
+enum class MaintenanceTask {
+    HYDRATOR,
+    EXPIRY,
+    CLEANUP,
+    COMPACTION,
+    VERIFY,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        /** Null-tolerant parse (routes turn an unknown name into a 422). */
+        fun fromWire(s: String): MaintenanceTask? = entries.firstOrNull { it.wire == s }
+    }
+}
+
+/** Who drove a recorded run (hog_maintenance_run.run_trigger's CHECK). */
+enum class MaintenanceTrigger {
+    LOOP,
+    MANUAL,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
+}
+
+enum class MaintenanceRunStatus {
+    OK,
+    FAILED,
+    ;
+
+    val wire: String get() = name.lowercase()
+
+    companion object {
+        fun fromWire(s: String) = valueOf(s.uppercase())
+    }
+}
+
+/**
+ * One recorded maintenance run. [resultJson] is the task's result
+ * payload as raw JSON — serialized with the wire's snake_case shape (the
+ * matching POST maintenance-trigger response body) so the ledger reads
+ * exactly like the API; null for failed runs.
+ */
+data class MaintenanceRun(
+    val runId: Long,
+    /** The catalog the run acted on (the ledger is per-catalog). */
+    val catalog: String,
+    val task: MaintenanceTask,
+    val trigger: MaintenanceTrigger,
+    val startedAt: Instant,
+    val finishedAt: Instant,
+    val status: MaintenanceRunStatus,
+    val error: String?,
+    val resultJson: String?,
+)
+
+data class MaintenanceRunPage(
+    val runs: List<MaintenanceRun>,
+    val hasMore: Boolean,
+)
+
+/**
+ * Task-specific live backlog, computed from the catalog at read time —
+ * never derived from the ledger (a run from before boot is history, not
+ * state).
+ */
+sealed interface MaintenanceBacklog {
+    /** stats_state counts: files awaiting hydration, files that failed loudly. */
+    data class HydratorBacklog(
+        val pendingFiles: Long?,
+        val failedFiles: Long?,
+    ) : MaintenanceBacklog
+
+    data class ExpiryBacklog(
+        /** null = snapshot expiry disabled. */
+        val snapshotRetentionSeconds: Long?,
+        val consumerFloor: Boolean,
+        val earliestSnapshotId: Long,
+        val headSnapshotId: Long,
+    ) : MaintenanceBacklog
+
+    data class CleanupBacklog(
+        /** Undrained hog_file_removal entries. */
+        val queuedRemovals: Long?,
+        /** Age of the oldest undrained entry; null on an empty queue. */
+        val oldestQueuedAgeSeconds: Double?,
+    ) : MaintenanceBacklog
+
+    data class CompactionBacklog(
+        /** Live files under the compaction target = the debt a sweep plans against. */
+        val smallFiles: Long?,
+        val targetBytes: Long,
+    ) : MaintenanceBacklog
+
+    data object VerifyBacklog : MaintenanceBacklog
+}
+
+data class MaintenanceTaskStatus(
+    val task: MaintenanceTask,
+    /** Background loop cadence; 0 = disabled; null = the task has no loop (verify). */
+    val loopIntervalMs: Long?,
+    /** The task's most recent recorded run; null = never recorded. */
+    val lastRun: MaintenanceRun?,
+    val backlog: MaintenanceBacklog,
+)
+
+data class MaintenanceStatus(
+    val catalog: String,
+    /** All five tasks, always present. */
+    val tasks: List<MaintenanceTaskStatus>,
+    /** Absent until the first complete async sample; backlogs then remain unknown. */
+    val sampledAt: Instant? = null,
+    val sampleStartedAt: Instant? = null,
+    val sampledSnapshotId: Long? = null,
+)
+
+/** Instance-wide rollup (GET /v1/maintenance/status): every catalog, by name. */
+data class InstanceMaintenanceStatus(
+    val catalogs: List<MaintenanceStatus>,
+    val hasMore: Boolean = false,
+    val nextAfter: String? = null,
 )
 
 /** Changefeed plan for (from, to]: appended files + DVs registered in range. */

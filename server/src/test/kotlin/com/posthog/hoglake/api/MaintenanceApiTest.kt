@@ -10,6 +10,7 @@ import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
+import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.VerifyService
@@ -32,6 +33,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.util.Comparator
 
 /**
  * Wire-level tests for the lifecycle surface: GET/PATCH /options (the
@@ -88,12 +90,20 @@ class MaintenanceApiTest {
                     CompactionService(
                         db.jdbi,
                         compactionStore,
-                        CompactionConfig(targetBytes = 512L * 1024 * 1024, minInputFiles = 4, maxGroupsPerRun = 1),
+                        CompactionConfig(targetBytes = 512L * 1024 * 1024, tierTarget = 8, maxGroupsPerRun = 1),
                     ),
                     VerifyService(db.jdbi),
                     // Rehydrate is metadata-only (a stats_state flip); the
                     // store is never contacted by these tests.
                     Hydrator(db.jdbi, compactionStore),
+                    MaintenanceStatusService(
+                        db.jdbi,
+                        hydratorIntervalMs = 5_000,
+                        expiryIntervalMs = 60_000,
+                        cleanupIntervalMs = 60_000,
+                        compactionIntervalMs = 0,
+                        smallFileThresholdBytes = 512L * 1024 * 1024,
+                    ),
                 )
             }
             block(client)
@@ -454,6 +464,7 @@ class MaintenanceApiTest {
                 "bytes_in",
                 "bytes_out",
                 "skipped_conflicts",
+                "failed_groups",
             )) {
                 assertThat(result[field].asLong()).describedAs(field).isEqualTo(0)
             }
@@ -472,6 +483,172 @@ class MaintenanceApiTest {
                 client.postJson("/v1/catalogs/mnt-nope/maintenance/compact"),
                 HttpStatusCode.NotFound,
                 "not_found",
+            )
+        }
+
+    // ---- maintenance/status + maintenance/runs ------------------------------
+
+    @Test
+    fun `status endpoint reports every task with backlog and last run`() =
+        api { client ->
+            client.createCatalog("mnt-status")
+            // Give expiry a recorded run to report.
+            body(client.postJson("/v1/catalogs/mnt-status/maintenance/expire"))
+
+            val status =
+                body(
+                    client.get("/v1/catalogs/mnt-status/maintenance/status").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            assertThat(status["catalog"].asText()).isEqualTo("mnt-status")
+            val tasks = status["tasks"].associateBy { it["task"].asText() }
+            assertThat(tasks.keys)
+                .containsExactlyInAnyOrder("hydrator", "expiry", "cleanup", "compaction", "verify")
+
+            val expiry = tasks.getValue("expiry")
+            assertThat(expiry["loop_interval_ms"].asLong()).isEqualTo(60_000)
+            // last_run is ALWAYS present (null when none); this catalog ran one.
+            val lastRun = expiry["last_run"]
+            assertThat(lastRun.isNull).isFalse()
+            assertThat(lastRun["trigger"].asText()).isEqualTo("manual")
+            assertThat(lastRun["status"].asText()).isEqualTo("ok")
+            assertThat(lastRun["result"]["snapshots_expired"].asLong()).isEqualTo(0)
+            assertThat(expiry["backlog"]["consumer_floor"].asBoolean()).isTrue()
+
+            // Compaction's loop is disabled (interval 0) in this wiring;
+            // verify is manual-only (no loop_interval_ms key at all).
+            assertThat(tasks.getValue("compaction")["loop_interval_ms"].asLong()).isEqualTo(0)
+            val verify = tasks.getValue("verify")
+            assertThat(verify.has("loop_interval_ms")).isFalse()
+            assertThat(verify["last_run"].isNull).isTrue()
+            // No sampler has run: unknown backlogs must not masquerade as zero.
+            assertThat(tasks.getValue("cleanup")["backlog"].has("queued_removals")).isFalse()
+            assertThat(status.has("sampled_at")).isFalse()
+
+            assertApiError(
+                client.get("/v1/catalogs/mnt-nope/maintenance/status"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    @Test
+    fun `runs endpoint pages newest-first, filters by task, and validates`() =
+        api { client ->
+            client.createCatalog("mnt-runs")
+            client.postJson("/v1/catalogs/mnt-runs/maintenance/expire")
+            client.postJson("/v1/catalogs/mnt-runs/maintenance/expire")
+            client.postJson("/v1/catalogs/mnt-runs/maintenance/verify")
+
+            val all =
+                body(
+                    client.get("/v1/catalogs/mnt-runs/maintenance/runs").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            assertThat(all["runs"].size()).isEqualTo(3)
+            assertThat(all["has_more"].asBoolean()).isFalse()
+            val runIds = all["runs"].map { it["run_id"].asLong() }
+            assertThat(runIds).isSortedAccordingTo(Comparator.reverseOrder())
+            // Every run carries the full wire shape.
+            val run = all["runs"][0]
+            assertThat(run["task"].asText()).isEqualTo("verify")
+            assertThat(run["started_at"].isTextual).isTrue()
+            assertThat(run.has("result")).isTrue()
+
+            val expiryOnly =
+                body(client.get("/v1/catalogs/mnt-runs/maintenance/runs?task=expiry"))
+            assertThat(expiryOnly["runs"].map { it["task"].asText() })
+                .containsExactly("expiry", "expiry")
+
+            // The before cursor pages downward exclusively.
+            val page1 =
+                body(client.get("/v1/catalogs/mnt-runs/maintenance/runs?limit=1"))
+            assertThat(page1["has_more"].asBoolean()).isTrue()
+            val cursor = page1["runs"][0]["run_id"].asLong()
+            val page2 =
+                body(client.get("/v1/catalogs/mnt-runs/maintenance/runs?before=$cursor"))
+            assertThat(page2["runs"].map { it["run_id"].asLong() }.all { it < cursor }).isTrue()
+
+            assertApiError(
+                client.get("/v1/catalogs/mnt-runs/maintenance/runs?task=bogus"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertApiError(
+                client.get("/v1/catalogs/mnt-runs/maintenance/runs?limit=0"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertApiError(
+                client.get("/v1/catalogs/mnt-runs/maintenance/runs?before=later"),
+                HttpStatusCode.BadRequest,
+                "bad_request",
+            )
+            assertApiError(
+                client.get("/v1/catalogs/mnt-nope/maintenance/runs"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    // ---- /v1/maintenance/* (the instance-wide twins) --------------------------
+
+    @Test
+    fun `instance status rolls up every catalog`() =
+        api { client ->
+            client.createCatalog("mnt-inst-a")
+            client.createCatalog("mnt-inst-b")
+            client.postJson("/v1/catalogs/mnt-inst-a/maintenance/expire")
+
+            val status =
+                body(
+                    client.get("/v1/maintenance/status").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            val byName = status["catalogs"].associateBy { it["catalog"].asText() }
+            val a = byName.getValue("mnt-inst-a")
+            assertThat(a["tasks"].map { it["task"].asText() })
+                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "verify")
+            // The one expire run is visible, carrying its catalog name.
+            assertThat(a["tasks"].first { it["task"].asText() == "expiry" }["last_run"]["catalog"].asText())
+                .isEqualTo("mnt-inst-a")
+            val b = byName.getValue("mnt-inst-b")
+            assertThat(b["tasks"].first { it["task"].asText() == "expiry" }["last_run"].isNull).isTrue()
+        }
+
+    @Test
+    fun `instance runs feed spans catalogs and validates like the per-catalog route`() =
+        api { client ->
+            client.createCatalog("mnt-feed-a")
+            client.createCatalog("mnt-feed-b")
+            client.postJson("/v1/catalogs/mnt-feed-a/maintenance/expire")
+            client.postJson("/v1/catalogs/mnt-feed-b/maintenance/expire")
+
+            val page =
+                body(
+                    client.get("/v1/maintenance/runs").also {
+                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
+                    },
+                )
+            val ours =
+                page["runs"].filter {
+                    it["catalog"].asText() in setOf("mnt-feed-a", "mnt-feed-b")
+                }
+            assertThat(ours.map { it["catalog"].asText() }.distinct())
+                .containsExactlyInAnyOrder("mnt-feed-a", "mnt-feed-b")
+
+            assertApiError(
+                client.get("/v1/maintenance/runs?task=bogus"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            assertApiError(
+                client.get("/v1/maintenance/runs?limit=-1"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
             )
         }
 }

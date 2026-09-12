@@ -38,7 +38,7 @@ client = HoglakeClient(
     s3=S3Config(
         access_key="hoglake",
         secret_key="hoglake123",
-        endpoint_override="http://localhost:19000",  # MinIO; omit for AWS
+        endpoint_override="http://localhost:9000",  # MinIO; omit for AWS
         region="us-east-1",
     ),
 )

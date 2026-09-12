@@ -1,9 +1,9 @@
-<?xml version="1.0" encoding="UTF-8"?>
 <!--
   Logging assembly. Two streams to stdout:
-   - CONSOLE: the app's human-readable log, mirroring logback's
-     unconfigured default (BasicConfigurator: root DEBUG, same pattern)
-     so adding this file changes nothing for existing loggers.
+   - CONSOLE: the app's human-readable log. Root at INFO (2026-09-12:
+     DEBUG-by-default made parquet-java log every cell of a compaction
+     rewrite — minutes of log formatting per group); DEBUG stays
+     available per-logger for focused debugging.
    - AUDIT: the first-class audit log (observability/Audit.kt) — one
      JSON line per event via LogstashEncoder on the dedicated
      "hoglake.audit" logger, additivity off so audit events never leak
@@ -28,7 +28,7 @@
         <appender-ref ref="AUDIT"/>
     </logger>
 
-    <root level="DEBUG">
+    <root level="INFO">
         <appender-ref ref="CONSOLE"/>
     </root>
 </configuration>

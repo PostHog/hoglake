@@ -47,12 +47,13 @@ flox activate -- uv run hoglake-bench commit-contention --writers 1,2,4,8,16
 Two options:
 
 1. **Already running** (the usual dev setup): server at
-   `http://localhost:8080`, MinIO at `:19000`
+   `http://localhost:8080`, MinIO at `:9000`
    (`hoglake`/`hoglake123`, path-style). Overridable via `--url`,
    `--s3-endpoint`, … or `HOGLAKE_URL` / `HOGLAKE_S3_*` env vars.
-2. **Bring your own**: in `../server`,
-   `docker compose up -d && flox activate -- gradle run` (Postgres 16 +
-   MinIO + the server; ports overridable via `HOGLAKE_*_PORT`).
+2. **Bring your own**: `just up` at the repo root (Postgres 16 + MinIO
+   + the server + the webui, all containerized), or in `../server`,
+   `docker compose up -d && flox activate -- gradle run` (ports
+   overridable via `HOGLAKE_*_PORT`).
 
 The harness never hammers a dead server: 10 consecutive
 transport/5xx failures abort the run (exit 3) with a clear message.
@@ -89,6 +90,7 @@ console, compaction planning and the changefeed have something with real
 shape to look at.
 
 ```sh
+just bench seed                               # 0.4 GB (default) — dense enough cells to exercise compaction
 just bench seed --gb 2.5                      # or: --catalog my-catalog
 flox activate -- uv run hoglake-bench seed --gb 0.3 --server http://localhost:8080
 ```
