@@ -116,6 +116,19 @@ def _add_common(p: argparse.ArgumentParser) -> None:
         default=3,
         help="unmeasured warmup iterations per loop",
     )
+    p.add_argument(
+        "--pg-dsn",
+        default=os.environ.get(
+            "HOGLAKE_BENCH_PG_DSN",
+            "postgresql://hoglake:hoglake@localhost:5432/hoglake",
+        ),
+        help=(
+            "catalog Postgres DSN, used ONLY to ANALYZE between seeding and "
+            "measurement so scaling flags reflect steady-state plans rather "
+            "than the autoanalyze lag window (env HOGLAKE_BENCH_PG_DSN; "
+            "empty string disables — unsettled runs annotate their flags)"
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:

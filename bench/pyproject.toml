@@ -10,6 +10,8 @@ dependencies = [
     "pyarrow>=17.0",
     "numpy>=1.26",
     "faker>=30.0",
+    # ANALYZE-only stats settling between seed and measure (pg.py).
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]

@@ -545,3 +545,11 @@ CREATE INDEX hog_data_file_maintenance_scan
     ON hog_data_file (catalog_id, table_id, row_id_start, data_file_id);
 CREATE INDEX hog_delete_file_data_lookup
     ON hog_delete_file (catalog_id, data_file_id);
+
+-- Changefeed windows range on begin_snapshot over ALL files (dead ones
+-- included — replay semantics); hog_data_file_live is partial on
+-- liveness and cannot serve them (V3).
+CREATE INDEX hog_data_file_changefeed
+    ON hog_data_file (catalog_id, table_id, begin_snapshot);
+CREATE INDEX hog_delete_file_changefeed
+    ON hog_delete_file (catalog_id, table_id, begin_snapshot);
