@@ -881,7 +881,9 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Validation failure (unknown table, bad stats shape,
-            unknown field ids)
+            unknown field ids, duplicate delete target — a commit carries
+            at most one superseding deletion vector per data file; merge
+            deleted positions client-side and register the union)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
