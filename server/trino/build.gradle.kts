@@ -12,7 +12,7 @@ repositories {
 }
 
 val testcontainersVersion = "1.21.3"
-val ktorVersion = "3.1.3"
+val ktorVersion = "3.2.0"
 
 dependencies {
     testImplementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
