@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 
 from ..context import Bench
+from ..pg import settle_stats
 from ..runner import FailureGuard, InsufficientSamples, run_loop
 from ..stats import Metric, pearson
 from .common import (
@@ -46,6 +47,7 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
     catalog, table = make_bench_table(bench, "cf")
     guard = FailureGuard()
 
+    stats_settled = True
     seeded = 0
     fixed_p50: list[tuple[int, float]] = []  # (catalog snapshots, p50 ms)
     for stage in stages:
@@ -55,6 +57,10 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
             )
         )
         seeded = stage
+        # Settle planner statistics before measuring: a bulk seed sits in
+        # the autoanalyze lag window, where plans reflect stale stats and
+        # the ratio flag measures the staleness, not the access path.
+        stats_settled = settle_stats(args.pg_dsn) and stats_settled
         head = catalog.refresh().head_snapshot_id
         w = min(FIXED_WINDOW, stage)
 
@@ -127,12 +133,21 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
                 "rows_latency_corr": rows_corr,
                 "catalog_latency_corr": catalog_corr,
                 "fixed_window_ratio": catalog_ratio,
+                "stats_settled": stats_settled,
             },
+        )
+    )
+    settle_note = (
+        ""
+        if stats_settled
+        else (
+            " [stats NOT settled: no reachable --pg-dsn, so this ratio may "
+            "reflect planner-stats staleness rather than the access path]"
         )
     )
     report.flag_ratio(
         f"changes() p50 for a fixed {FIXED_WINDOW}-snapshot window from "
-        f"catalog={stages[0]} to catalog={stages[-1]} snapshots",
+        f"catalog={stages[0]} to catalog={stages[-1]} snapshots{settle_note}",
         catalog_ratio,
     )
 
