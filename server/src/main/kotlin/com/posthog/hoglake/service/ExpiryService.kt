@@ -3,10 +3,13 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ExpiryResult
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -60,6 +63,9 @@ import org.jdbi.v3.core.kotlin.withHandleUnchecked
 class ExpiryService(private val jdbi: Jdbi) {
     private val log = KotlinLogging.logger {}
 
+    /** The run ledger; records after the sweep resolves, never inside it. */
+    private val runStore = MaintenanceRunStore(jdbi)
+
     private companion object {
         /**
          * The end-snapshotted-but-never-deleted versioned tables (DDL
@@ -84,8 +90,19 @@ class ExpiryService(private val jdbi: Jdbi) {
      * ZERO-WORK sweep (nothing expired or queued, no consumer floor in
      * play) emits no audit event at all, only an app-log debug line:
      * every-minute background no-ops must not flood the audit stream.
+     * Every run (zero-work included) is recorded in the maintenance run
+     * ledger — the row is the per-catalog loop-liveness signal.
      */
     fun runOnce(
+        catalog: String,
+        batchSize: Int,
+        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+    ): ExpiryResult =
+        runStore.recorded(catalog, MaintenanceTask.EXPIRY, trigger) {
+            runSweep(catalog, batchSize)
+        }
+
+    private fun runSweep(
         catalog: String,
         batchSize: Int,
     ): ExpiryResult {
@@ -327,9 +344,9 @@ class ExpiryService(private val jdbi: Jdbi) {
         val results = mutableListOf<Pair<String, ExpiryResult>>()
         for (name in names) {
             try {
-                results += name to runOnce(name, batchSize)
+                results += name to runOnce(name, batchSize, MaintenanceTrigger.LOOP)
             } catch (e: Exception) {
-                log.error(e) { "expiry sweep failed for catalog '$name'; continuing" }
+                log.error(e) { "expiry sweep failed for catalog '$" }
             }
         }
         return results

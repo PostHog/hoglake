@@ -1,9 +1,12 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.VerifyCheck
 import com.posthog.hoglake.model.VerifyReport
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -47,7 +50,16 @@ import org.jdbi.v3.core.kotlin.inTransactionUnchecked
  * unbounded response.
  */
 class VerifyService(private val jdbi: Jdbi) {
+    /** The run ledger; records after the report resolves, never inside it. */
+    private val runStore = MaintenanceRunStore(jdbi)
+
+    /** Verify is manual-only (no background loop), so every run records trigger 'manual'. */
     fun runOnce(catalog: String): VerifyReport =
+        runStore.recorded(catalog, MaintenanceTask.VERIFY, MaintenanceTrigger.MANUAL) {
+            runChecks(catalog)
+        }
+
+    private fun runChecks(catalog: String): VerifyReport =
         Audit.audited(
             "verify",
             catalog,

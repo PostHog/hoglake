@@ -72,7 +72,10 @@ class CompactionServiceIntegrationTest {
     private val verify = VerifyService(db.jdbi)
     private val counter = AtomicInteger(0)
 
-    private val cfg = CompactionConfig(targetBytes = 512L * 1024 * 1024, minInputFiles = 2, maxGroupsPerRun = 10)
+    // KB-scale ladder for the test fixtures' parquet files (~0.7-1 KiB
+    // each): T=4 includes 512/2048/8192. The 2048 quota needs THREE files
+    // (2 x ~800B < 2048 < 3 x ~800B), so groups still contain all three.
+    private val cfg = CompactionConfig(targetBytes = 8192, tierTarget = 4, maxGroupsPerRun = 10)
     private val svc by lazy { CompactionService(db.jdbi, store, cfg) }
     private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
 
@@ -761,7 +764,7 @@ class CompactionServiceIntegrationTest {
         registerDv(cat, fileIds[0], "s3://$BUCKET/$cat/dv/e0.puffin", listOf(0L, 1L))
         registerDv(cat, fileIds[1], "s3://$BUCKET/$cat/dv/e1.puffin", listOf(0L))
 
-        val result = svc.runOnce(cat, cfg)
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
         assertThat(result.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()
@@ -769,6 +772,137 @@ class CompactionServiceIntegrationTest {
         assertThat(output.rowIdStart).isZero() // min input start: diagnostics only
         assertThat(readRowIds(store.get(output.path))).isEmpty()
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `an unreadable input fails its group in the open - failed_groups counts it, other groups compact`() {
+        // The "silently chokes on S3" regression guard: a group whose
+        // input object is missing (NoSuchKey, hiccup, never uploaded)
+        // must be COUNTED — a sweep whose groups all fail can never
+        // present as a green no-op in the run ledger.
+        val cat = "compact-fail-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        val cols =
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            )
+        catalogs.createTable(cat, "ns", "fine", cols)
+        catalogs.createTable(cat, "ns", "gone", cols)
+
+        fun file(
+            name: String,
+            rows: List<TestRow>,
+            put: Boolean = true,
+        ): FileRegistration {
+            val bytes = parquetBytes(rows)
+            val path = "s3://$BUCKET/$cat/data/$name.parquet"
+            if (put) store.put(path, bytes)
+            return FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
+        }
+
+        commits.commit(
+            cat,
+            CommitRequest(
+                appends =
+                    listOf(
+                        // The healthy group: two real files.
+                        TableAppend(
+                            "ns",
+                            "fine",
+                            listOf(
+                                file("g1", listOf(TestRow(1, "a", 1.0))),
+                                file("g2", listOf(TestRow(2, "b", 2.0))),
+                            ),
+                        ),
+                        // The broken group: one real file + one phantom
+                        // (registered, never uploaded — NoSuchKey at read).
+                        TableAppend(
+                            "ns",
+                            "gone",
+                            listOf(
+                                file("real", listOf(TestRow(3, "c", 3.0))),
+                                file("phantom", listOf(TestRow(4, "d", 4.0)), put = false),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.failedGroups).isEqualTo(1)
+        // The phantom stays live (nothing was end-snapshotted): the
+        // group retries next run.
+        assertThat(catalogs.listFiles(cat, "ns", "gone")).hasSize(2)
+        assertThat(catalogs.listFiles(cat, "ns", "fine")).hasSize(1)
+
+        // And the failure is visible in the ledger row's result payload.
+        val row =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT status, CAST(result AS text) AS result
+                      FROM hog_maintenance_run
+                     WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                       AND task = 'compaction'
+                     ORDER BY run_id DESC
+                     LIMIT 1
+                    """,
+                )
+                    .bind("cat", cat)
+                    .map { rs, _ -> rs.getString("status") to rs.getString("result") }
+                    .one()
+            }
+        assertThat(row.first).isEqualTo("ok")
+        val resultJson = com.fasterxml.jackson.databind.ObjectMapper().readTree(row.second)
+        assertThat(resultJson["failed_groups"].asLong()).isEqualTo(1)
+        assertThat(resultJson["groups_compacted"].asLong()).isEqualTo(1)
+    }
+
+    @Test
+    fun `a no-sort-order group compacts by streaming - row-id order, ids preserved, verify green`() {
+        // The streaming rewrite path (no sort spec -> never materialize
+        // the group on the heap; the 400MB-seed OOM lesson). Content
+        // contract identical to the sorted path.
+        val cat = "compact-stream-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            ),
+        )
+        // Deliberately NO SetSortOrder.
+        val regs =
+            listOf(
+                listOf(TestRow(1, "a", 1.0), TestRow(2, null, null)),
+                listOf(TestRow(3, "c", 3.0), TestRow(4, "d", 4.0)),
+            ).mapIndexed { i, rows ->
+                val bytes = parquetBytes(rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/s$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.failedGroups).isEqualTo(0)
+
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.explicitRowIds).isTrue()
+        assertThat(output.recordCount).isEqualTo(4)
+        // Row-id order, ids 0..3 positional by append order.
+        assertThat(readRowIds(store.get(output.path))).containsExactly(0L, 1L, 2L, 3L)
         assertVerifyPasses(cat)
     }
 
@@ -809,11 +943,28 @@ class CompactionServiceIntegrationTest {
                 ),
             )
         }
-        appendRows("a", (0L..2L).map { TestRow(100 + it, "a$it", it.toDouble()) }) // row ids 0..2
-        appendRows("b", (0L..1L).map { TestRow(200 + it, "b$it", it.toDouble()) }) // row ids 3..4
+
+        // Row sizes are DELIBERATE (incompressible names -> file bytes track
+        // row content): a+b clear the tier-0 floor (16384) of the
+        // target=65536 ladder, their uncompressed output lands in tier 1
+        // (< 32768), and output+c clears the tier-1 floor (32768).
+        fun paddedRows(
+            start: Long,
+            n: Int,
+            pad: Int,
+        ): List<TestRow> =
+            (0 until n).map { i ->
+                val id = start + i
+                // Pseudo-random, deterministic, incompressible.
+                val chars = (0 until pad).map { 'a' + ((id * 31 + it * 17) % 26).toInt() }.joinToString("")
+                TestRow(id, chars, id.toDouble())
+            }
+        appendRows("a", paddedRows(100, 3, 5000)) // row ids 0..2
+        appendRows("b", paddedRows(200, 2, 5000)) // row ids 3..4
+        val ladder = cfg.copy(targetBytes = 65536, tierTarget = 2)
 
         // First compaction: unsorted table -> physical order = row-id order.
-        assertThat(svc.runOnce(cat, cfg).groupsCompacted).isEqualTo(1)
+        assertThat(svc.runOnce(cat, ladder).groupsCompacted).isEqualTo(1)
         val first = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(first.explicitRowIds).isTrue()
         assertThat(readRowIds(store.get(first.path))).containsExactly(0L, 1L, 2L, 3L, 4L)
@@ -821,11 +972,15 @@ class CompactionServiceIntegrationTest {
         // A DV lands on the compacted output: physical positions 0 and 4,
         // i.e. row ids 0 and 4 die. Then more data arrives.
         registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 4L))
-        appendRows("c", (0L..1L).map { TestRow(300 + it, "c$it", it.toDouble()) }) // row ids 5..6
+        // c is a peer of the first output, not a fresh lower-tier file.
+        appendRows("c", paddedRows(300, 2, 10000)) // row ids 5..6
+        val peers = catalogs.listFiles(cat, "ns", "t")
+        assertThat(peers.map { CompactionTiers.of(ladder.targetBytes, ladder.tierTarget).tierOf(it.fileSizeBytes) })
+            .containsOnly(CompactionTiers.of(ladder.targetBytes, ladder.tierTarget).tierOf(first.fileSizeBytes))
 
         // Second compaction: the explicit-id input's DV drops by POSITION,
         // survivors keep the ids their _hog_row_id column carries.
-        val second = svc.runOnce(cat, cfg)
+        val second = svc.runOnce(cat, ladder)
         assertThat(second.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.recordCount).isEqualTo(5)
@@ -836,6 +991,137 @@ class CompactionServiceIntegrationTest {
     }
 
     // ---- heterogeneous schemas ---------------------------------------------
+
+    @Test
+    fun `default T eight rewrites repeated eight-file groups and leaves the seventeenth input`() {
+        val cat = "compact-eight-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val bytes = parquetBytes(listOf(TestRow(1, null, null), TestRow(2, null, null), TestRow(3, null, null)))
+        val regs =
+            (0..16).map { i ->
+                val path = "s3://$BUCKET/$cat/f$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 3, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        // Exact lower-bound inputs need all eight; bytes come from real
+        // parquet, not synthetic size metadata. Both groups must execute.
+        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 8, tierTarget = 8, maxGroupsPerRun = 20)
+        val result = svc.runOnce(cat, policy)
+        assertThat(result.groupsCompacted).isEqualTo(2)
+        assertThat(result.filesIn).isEqualTo(16)
+        assertThat(result.failedGroups).isZero()
+        val live = catalogs.listFiles(cat, "ns", "t")
+        assertThat(live).hasSize(3)
+        assertThat(live.single { !it.explicitRowIds }.path).isEqualTo(regs[16].path)
+        assertThat(live.filter { it.explicitRowIds }.map { it.recordCount }).containsExactly(24L, 24L)
+        val ids =
+            live.flatMap { f ->
+                if (f.explicitRowIds) {
+                    readRowIds(
+                        store.get(f.path),
+                    )
+                } else {
+                    (f.rowIdStart until f.rowIdStart + f.recordCount).toList()
+                }
+            }
+        assertThat(ids.sorted()).containsExactlyElementsOf((0L until 51).toList())
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `newly promoted files wait for the next run even when they could fill the next tier`() {
+        val cat = "compact-no-cascade-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            ),
+        )
+        val random = kotlin.random.Random(84311)
+        var nextId = 0L
+
+        fun input(
+            name: String,
+            count: Int,
+        ): FileRegistration {
+            val rows =
+                List(count) {
+                    val id = nextId++
+                    TestRow(id, String(CharArray(64) { ('a'.code + random.nextInt(26)).toChar() }), random.nextDouble())
+                }
+            val bytes = parquetBytes(rows)
+            val path = "s3://$BUCKET/$cat/$name.parquet"
+            store.put(path, bytes)
+            return FileRegistration(path, count.toLong(), bytes.size.toLong())
+        }
+        val inputs = listOf(input("a", 1000), input("b", 1000), input("peer", 2200))
+        val policy = cfg.copy(targetBytes = 1024 * 1024, tierTarget = 2, maxGroupsPerRun = 20)
+        val tiers = CompactionTiers.of(policy.targetBytes, policy.tierTarget)
+        val low = tiers.tierOf(inputs[0].fileSizeBytes)!!
+        // Pin actual parquet sizes to the intended tiers; no fabricated metadata.
+        assertThat(tiers.tierOf(inputs[1].fileSizeBytes)).isEqualTo(low)
+        assertThat(tiers.tierOf(inputs[2].fileSizeBytes)).isEqualTo(low + 1)
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", inputs))))
+        val before = catalogs.getCatalog(cat).headSnapshotId
+        val first = svc.runOnce(cat, policy)
+        assertThat(first.groupsCompacted).isEqualTo(1)
+        assertThat(first.filesIn).isEqualTo(2)
+        assertThat(first.failedGroups).isZero()
+        val live = catalogs.listFiles(cat, "ns", "t")
+        assertThat(live).hasSize(2)
+        val promoted = live.single { it.explicitRowIds }
+        assertThat(tiers.tierOf(promoted.fileSizeBytes)).isEqualTo(low + 1)
+        // There IS enough to promote again, proving this wasn't just a
+        // sub-quota no-op. It must nevertheless wait for run number two.
+        val next = svc.planTable(cat, "ns", "t", policy)
+        assertThat(next.groups).hasSize(1)
+        assertThat(next.groups.single().files.map { it.dataFileId }).contains(promoted.dataFileId)
+        val second = svc.runOnce(cat, policy)
+        assertThat(second.groupsCompacted).isEqualTo(1)
+        assertThat(second.filesIn).isEqualTo(2)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.recordCount).isEqualTo(4200)
+        assertThat(readRowIds(store.get(output.path))).containsExactlyElementsOf((0L until 4200).toList())
+        assertThat(catalogs.listFiles(cat, "ns", "t", before).map { it.path })
+            .containsExactlyInAnyOrderElementsOf(inputs.map { it.path })
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `multiple groups in one tier execute up to budget including failed attempts`() {
+        val cat = "compact-budget-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val bytes = parquetBytes(listOf(TestRow(1, "x", 1.0)))
+        val regs =
+            (0..5).map { i ->
+                val path = "s3://$BUCKET/$cat/f$i.parquet"
+                if (i != 0) store.put(path, bytes) // first group fails on missing input
+                FileRegistration(path, 1, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        // Choose a quota between one and two actual file sizes, T=2.
+        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 2, tierTarget = 2, maxGroupsPerRun = 2)
+        assertThat(svc.planTable(cat, "ns", "t", policy).groups).hasSize(3)
+        val result = svc.runOnce(cat, policy)
+        assertThat(result.failedGroups).isEqualTo(1)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.filesIn).isEqualTo(2)
+        // Last pair untouched: the failed first group consumed budget.
+        assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+            .contains(regs[0].path, regs[1].path, regs[4].path, regs[5].path)
+        assertVerifyPasses(cat)
+    }
 
     @Test
     fun `a heterogeneous group compacts under the live schema - add null-fills, promote up-casts, drop drops`() {
@@ -923,7 +1209,7 @@ class CompactionServiceIntegrationTest {
             ),
         )
 
-        val result = svc.runOnce(cat, cfg)
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.unconvertibleSchema).isZero()
 
@@ -984,7 +1270,7 @@ class CompactionServiceIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         val headBefore = catalogs.getCatalog(cat).headSnapshotId
 
-        val result = svc.runOnce(cat, cfg)
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
         assertThat(result.groupsCompacted).isZero()
         assertThat(result.unconvertibleSchema).isEqualTo(1)
         assertThat(result.skippedConflicts).isZero()
@@ -1066,7 +1352,7 @@ class CompactionServiceIntegrationTest {
                 FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
-        val result = svc.runOnce(cat, cfg)
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
         assertThat(result.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()

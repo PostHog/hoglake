@@ -4,10 +4,13 @@ import com.posthog.hoglake.Config
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -149,13 +152,20 @@ class CleanupService(
     private val store: RemovalStore,
     private val subBatchSize: Int = SUB_BATCH,
     private val ledgerRetentionSeconds: Long = LEDGER_RETENTION_SECONDS,
+    private val maintenanceLedgerRetentionSeconds: Long = MAINTENANCE_LEDGER_RETENTION_SECONDS,
 ) {
     private val log = KotlinLogging.logger {}
+
+    /** The maintenance run ledger; also the owner of its retention purge. */
+    private val runStore = MaintenanceRunStore(jdbi)
 
     init {
         require(subBatchSize > 0) { "subBatchSize must be positive (got $subBatchSize)" }
         require(ledgerRetentionSeconds > 0) {
             "ledgerRetentionSeconds must be positive (got $ledgerRetentionSeconds)"
+        }
+        require(maintenanceLedgerRetentionSeconds > 0) {
+            "maintenanceLedgerRetentionSeconds must be positive (got $maintenanceLedgerRetentionSeconds)"
         }
     }
 
@@ -174,6 +184,15 @@ class CleanupService(
      * audit stream.
      */
     fun runOnce(
+        catalog: String,
+        batchSize: Int,
+        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+    ): CleanupResult =
+        runStore.recorded(catalog, MaintenanceTask.CLEANUP, trigger) {
+            runDrain(catalog, batchSize)
+        }
+
+    private fun runDrain(
         catalog: String,
         batchSize: Int,
     ): CleanupResult {
@@ -335,7 +354,27 @@ class CleanupService(
             }
         }
         purgeDrainedLedger(catalog, catalogId)
+        purgeMaintenanceLedger(catalog, catalogId)
         return CleanupResult(removed, missing, stillReferenced)
+    }
+
+    /**
+     * Maintenance-ledger retention (the hog_maintenance_run twin of
+     * [purgeDrainedLedger]): run rows older than
+     * [maintenanceLedgerRetentionSeconds] are hard-deleted so the ledger
+     * stays a bounded recent history, not an accumulation.
+     */
+    private fun purgeMaintenanceLedger(
+        catalog: String,
+        catalogId: Long,
+    ) {
+        val purged =
+            jdbi.withHandleUnchecked { h ->
+                runStore.purge(h, catalogId, maintenanceLedgerRetentionSeconds)
+            }
+        if (purged > 0) {
+            log.debug { "cleanup: purged $purged maintenance run rows for catalog '$catalog'" }
+        }
     }
 
     /**
@@ -401,7 +440,7 @@ class CleanupService(
         val results = mutableListOf<Pair<String, CleanupResult>>()
         for (name in names) {
             try {
-                results += name to runOnce(name, batchSize)
+                results += name to runOnce(name, batchSize, MaintenanceTrigger.LOOP)
             } catch (e: Exception) {
                 log.error(e) { "cleanup drain failed for catalog '$name'; continuing" }
             }
@@ -423,5 +462,8 @@ class CleanupService(
 
         /** Default drained-ledger retention: 30 days (HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS). */
         const val LEDGER_RETENTION_SECONDS = 30L * 24 * 60 * 60
+
+        /** Default run-ledger retention: 7 days (HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS). */
+        const val MAINTENANCE_LEDGER_RETENTION_SECONDS = 7L * 24 * 60 * 60
     }
 }

@@ -5,7 +5,7 @@ import { listPartitionStats } from "../api/client";
 import type { PartitionStats } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
-import { formatBytes, formatCount } from "../lib/format";
+import { formatBytes, formatCount, formatTime } from "../lib/format";
 
 const LIMIT = 50;
 
@@ -128,6 +128,8 @@ export function PartitionsPage() {
         limit: LIMIT,
       }),
     enabled: Boolean(catalog),
+    refetchInterval: 5_000,
+    refetchIntervalInBackground: false,
   });
   if (!catalog) return null;
 
@@ -193,6 +195,11 @@ export function PartitionsPage() {
         </div>
       </form>
       {query.isError && <ErrorBox error={query.error} />}
+      {query.data && (
+        <p className="subtle">
+          {query.data.sampled_at ? `Sampled ${formatTime(query.data.sampled_at)}` : "Partition summary warming up — no completed sample yet."}
+        </p>
+      )}
       {!query.isError && (
         <>
           {query.data?.truncated && (
@@ -231,7 +238,7 @@ export function PartitionsPage() {
                   sortKey="debt"
                   sort={sort}
                   onSort={onSort}
-                  tooltip="The share of this partition's files that are small: small files / files. A full bar means every file is a merge candidate."
+                  tooltip="The share of this partition's files below the final target. Small files can still be below their tier's merge quota; the score counts only complete groups."
                 />
                 <SortableTh
                   label="total size"
@@ -261,7 +268,7 @@ export function PartitionsPage() {
                   sort={sort}
                   onSort={onSort}
                   numeric
-                  tooltip="score = the small-file count: exactly the files one compaction sweep would try to merge. The server orders by score, ties broken by small-file bytes."
+                  tooltip="Files selected into complete geometric-tier compaction groups, before the per-run budget. Each group takes the fewest files reaching the next byte boundary (up to T=8 by default). Short remainders do not count. Ordered by score, ties by small-file bytes."
                 />
               </tr>
             </thead>
@@ -272,7 +279,9 @@ export function PartitionsPage() {
                 {partitions.length === 0 && (
                   <tr>
                     <td colSpan={9} className="empty">
-                      No partitions match — nothing owes compaction debt here.
+                      {query.data?.sampled_at
+                        ? "No partitions match — nothing owes compaction debt here."
+                        : "Partition summary is being prepared."}
                     </td>
                   </tr>
                 )}

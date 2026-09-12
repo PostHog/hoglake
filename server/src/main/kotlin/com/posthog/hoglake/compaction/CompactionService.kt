@@ -7,11 +7,14 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
@@ -32,13 +35,20 @@ import kotlin.io.path.fileSize
 
 /** Per-run compaction knobs (Config's HOGLAKE_COMPACTION_* env surface). */
 data class CompactionConfig(
-    /** Output target size; also the "small file" input threshold. */
+    /** Output target size; the tier ladder (CompactionTiers) derives from it. */
     val targetBytes: Long,
-    /** Smallest group worth rewriting. */
-    val minInputFiles: Int,
+    /**
+     * Geometric tier ratio AND maximum fan-in. Consume minimal prefixes
+     * reaching each tier's quota, repeating until the remainder is short.
+     */
+    val tierTarget: Int,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
-)
+) {
+    init {
+        CompactionTiers.of(targetBytes, tierTarget)
+    }
+}
 
 /** A candidate's live deletion vector, captured at planning time. */
 data class LiveDv(
@@ -87,13 +97,22 @@ data class CompactionPlan(
  * predecessor never survived in production; README.md §4's
  * commit-storm history is the design constraint here).
  *
- * PLANNING is metadata-only, per table: candidates are LIVE data files
- * under the target size — DV-bearing ones included, each carrying its
- * live DV's identity ([LiveDv]) so execution can apply it and commit
- * can detect supersession — bucketed by (spec_id, identical
- * partition_values), ordered by row_id_start, then grouped greedily
- * into runs whose summed bytes stay <= target and whose file count
- * reaches min_input_files. UNLIKE the predecessor's
+ * PLANNING is metadata-only, per table, and TIERED (the DuckLake
+ * tiered-merge recommendation; CompactionTiers): candidates are LIVE
+ * data files below the target size — DV-bearing ones included, each
+ * carrying its live DV's identity ([LiveDv]) so execution can apply it
+ * and commit can detect supersession — bucketed by (spec_id, identical
+ * partition_values, size TIER), ordered by row_id_start. A bucket's
+ * tier is eligible only when its aggregate bytes reach the next tier's
+ * floor (otherwise the merge could not produce a next-tier file —
+ * skipped until more appends arrive), and the group takes the MINIMAL
+ * row-id-ordered prefix reaching that floor, capped at
+ * compaction_tier_target (default 8, also the tier ratio). Repeat on
+ * the remaining candidates until below quota. Promotion is estimated
+ * from input bytes; encoding and DV removal can change output size.
+ * A run plans each table before executing any of its groups, so
+ * a file compacted this run is never a candidate for
+ * the next tier up in the SAME run. UNLIKE the predecessor's
  * merge_adjacent_files, row-id ADJACENCY IS NOT REQUIRED — which is
  * exactly why outputs must materialize ids explicitly (ParquetRewriter).
  *
@@ -162,6 +181,9 @@ class CompactionService(
 ) {
     private val log = KotlinLogging.logger {}
 
+    /** The run ledger; records after the sweep resolves, never inside it. */
+    private val runStore = MaintenanceRunStore(jdbi)
+
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
         val catalogId: Long,
@@ -199,7 +221,19 @@ class CompactionService(
         namespace: String,
         table: String,
         cfg: CompactionConfig = defaults,
-    ): CompactionPlan = jdbi.withHandleUnchecked { h -> planWithContext(h, catalog, namespace, table, cfg).plan }
+    ): CompactionPlan = planSnapshot(catalog, namespace, table, cfg).plan
+
+    /** Schema, head and input files must come from the SAME MVCC view. */
+    private fun planSnapshot(
+        catalog: String,
+        namespace: String,
+        table: String,
+        cfg: CompactionConfig,
+    ): PlanWithContext =
+        jdbi.inTransactionUnchecked { h ->
+            h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            planWithContext(h, catalog, namespace, table, cfg)
+        }
 
     private fun planWithContext(
         h: Handle,
@@ -293,26 +327,18 @@ class CompactionService(
                 }
                 .list()
 
-        val out = mutableListOf<CompactionGroup>()
+        val tiers = CompactionTiers.of(cfg.targetBytes, cfg.tierTarget)
+        val out = mutableListOf<Pair<Int, CompactionGroup>>()
         for ((bucket, bucketRows) in rows.groupBy { it.bucket }) {
-            var run = mutableListOf<CompactionCandidate>()
-            var runBytes = 0L
-
-            fun close() {
-                if (run.size >= cfg.minInputFiles) {
-                    out += CompactionGroup(run, bucket.specId, bucket.values)
-                }
-                run = mutableListOf()
-                runBytes = 0
+            for (take in tiers.groups(bucketRows.map { it.candidate }) { it.fileSizeBytes }) {
+                val tier = tiers.tierOf(take.first().fileSizeBytes)!!
+                out += tier to CompactionGroup(take, bucket.specId, bucket.values)
             }
-            for (row in bucketRows) {
-                if (run.isNotEmpty() && runBytes + row.candidate.fileSizeBytes > cfg.targetBytes) close()
-                run += row.candidate
-                runBytes += row.candidate.fileSizeBytes
-            }
-            close()
         }
+        // Most-fragmented tier first, then row-id order within the tier.
         return out
+            .sortedWith(compareBy({ it.first }, { it.second.files.first().rowIdStart }))
+            .map { it.second }
     }
 
     // ---- one run ---------------------------------------------------------
@@ -321,16 +347,28 @@ class CompactionService(
     fun runOnce(
         catalog: String,
         batchOverride: Int? = null,
-    ): CompactionResult = runOnce(catalog, defaults.copy(maxGroupsPerRun = batchOverride ?: defaults.maxGroupsPerRun))
+        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+    ): CompactionResult =
+        runOnce(catalog, defaults.copy(maxGroupsPerRun = batchOverride ?: defaults.maxGroupsPerRun), trigger)
 
     /**
      * One compaction sweep over [catalog]: plan tables in name order and
      * rewrite at most cfg.maxGroupsPerRun groups (every skip flavor
      * consumes budget too — a skipped group already spent the IO).
      * Metrics and the audit event are emitted here, after all group
-     * transactions resolved.
+     * transactions resolved; every run is recorded in the maintenance
+     * run ledger.
      */
     fun runOnce(
+        catalog: String,
+        cfg: CompactionConfig,
+        trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+    ): CompactionResult =
+        runStore.recorded(catalog, MaintenanceTask.COMPACTION, trigger) {
+            runSweep(catalog, cfg)
+        }
+
+    private fun runSweep(
         catalog: String,
         cfg: CompactionConfig,
     ): CompactionResult =
@@ -341,7 +379,8 @@ class CompactionService(
             detail = { r ->
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
-                    "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema}"
+                    "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
+                    "failed_groups=${r.failedGroups}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -367,12 +406,12 @@ class CompactionService(
         var skipped = 0L
         var dvSuperseded = 0L
         var unconvertible = 0L
+        var failed = 0L
 
-        fun budgetSpent() = groupsCompacted + skipped + dvSuperseded + unconvertible >= cfg.maxGroupsPerRun
+        fun budgetSpent() = groupsCompacted + skipped + dvSuperseded + unconvertible + failed >= cfg.maxGroupsPerRun
         outer@ for ((namespace, table) in tables) {
             if (budgetSpent()) break
-            val (ctx, plan) =
-                jdbi.withHandleUnchecked { h -> planWithContext(h, catalog, namespace, table, cfg) }
+            val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
             for (group in plan.groups) {
                 if (budgetSpent()) break@outer
                 try {
@@ -397,7 +436,10 @@ class CompactionService(
                     unconvertible++
                 } catch (e: Exception) {
                     // One bad group (unreadable input, corrupt DV, S3
-                    // hiccup) never wedges the sweep.
+                    // hiccup) never wedges the sweep — but it IS counted:
+                    // an uncounted swallow is a silently-dead compactor
+                    // with a green run ledger (the NoSuchBucket incident).
+                    failed++
                     log.error(e) {
                         "compaction group of ${group.files.size} files failed for " +
                             "$catalog/$namespace.$table; continuing"
@@ -414,6 +456,7 @@ class CompactionService(
             skippedConflicts = skipped,
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertible,
+            failedGroups = failed,
         )
     }
 
@@ -457,10 +500,7 @@ class CompactionService(
         table: String,
         group: CompactionGroup,
     ): GroupOutcome {
-        val ctx =
-            jdbi.withHandleUnchecked { h ->
-                planWithContext(h, catalog, namespace, table, defaults).ctx
-            }
+        val ctx = planSnapshot(catalog, namespace, table, defaults).ctx
         return compactGroup(ctx, group)
     }
 
@@ -935,7 +975,7 @@ class CompactionService(
         val results = mutableListOf<Pair<String, CompactionResult>>()
         for (name in names) {
             try {
-                results += name to runOnce(name, cfg)
+                results += name to runOnce(name, cfg, MaintenanceTrigger.LOOP)
             } catch (e: Exception) {
                 log.error(e) { "compaction sweep failed for catalog '$name'; continuing" }
             }

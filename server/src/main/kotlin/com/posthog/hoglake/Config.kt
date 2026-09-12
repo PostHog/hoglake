@@ -43,6 +43,14 @@ data class Config(
      */
     val removalLedgerRetentionSeconds: Long =
         env("HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS", "${30L * 24 * 60 * 60}").toLong(),
+    /**
+     * How long hog_maintenance_run rows (the maintenance run ledger)
+     * are kept before the cleanup sweep purges them. Default 7 days:
+     * at the default loop intervals the ledger sees ~2-3 rows per minute
+     * per catalog.
+     */
+    val maintenanceLedgerRetentionSeconds: Long =
+        env("HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS", "${7L * 24 * 60 * 60}").toLong(),
     /** Catalog-health gauge sample interval; <= 0 disables the sampler loop. */
     val metricsIntervalMs: Long = env("HOGLAKE_METRICS_INTERVAL_MS", "15000").toLong(),
     /**
@@ -58,12 +66,20 @@ data class Config(
      * construction: tiny bites (see the batch knobs), never a storm.
      */
     val compactionIntervalMs: Long = env("HOGLAKE_COMPACTION_INTERVAL_MS", "0").toLong(),
-    /** Compaction output target size; also the "small file" threshold for inputs. */
+    /** Final compaction size; intermediate tiers divide this repeatedly by the tier target. */
     val compactionTargetBytes: Long = env("HOGLAKE_COMPACTION_TARGET_BYTES", "${512L * 1024 * 1024}").toLong(),
-    /** Minimum input files before a group is worth rewriting. */
-    val compactionMinInputFiles: Int = env("HOGLAKE_COMPACTION_MIN_INPUT_FILES", "4").toInt(),
+    /**
+     * Geometric tier ratio and maximum fan-in, >= 2. Default 8 gives
+     * ...128 KiB -> 1 MiB -> 8 MiB -> 64 MiB -> 512 MiB. Merge only
+     * the minimal prefix reaching a quota, then repeat on the remainder.
+     */
+    val compactionTierTarget: Int = env("HOGLAKE_COMPACTION_TIER_TARGET", "8").toInt(),
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
+    /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
+    val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
+    val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
+    val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
     companion object {
         private fun env(

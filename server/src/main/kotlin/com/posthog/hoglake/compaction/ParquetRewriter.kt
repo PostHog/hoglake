@@ -9,6 +9,7 @@ import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.ParquetFileWriter
+import org.apache.parquet.hadoop.ParquetWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.ColumnIOFactory
@@ -114,59 +115,98 @@ object ParquetRewriter {
         val outputSchema = outputSchema(liveColumns)
         val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
         val rowIdIndex = outputSchema.fieldCount - 1
-
         val factory = SimpleGroupFactory(outputSchema)
+
+        if (sortFields.isEmpty()) {
+            // No sort order: STREAM — write each survivor as it is read,
+            // never materializing the group. Materialize-then-write put
+            // the whole group's Group objects on the heap and OOM'd the
+            // server on a 400 MB catalog; heap must stay flat in group
+            // size (parquet-java's own row-group buffering bounds it).
+            var written = 0L
+            var minRowId: Long? = null
+            newWriter(outputSchema, output).use { writer ->
+                for (input in inputs) {
+                    forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory) { group, rowId ->
+                        writer.write(group)
+                        written++
+                        minRowId = minOf(minRowId ?: rowId, rowId)
+                    }
+                }
+            }
+            return RewriteResult(written, minRowId)
+        }
+
+        // Sorted: survivors must be materialized to sort. Sorting is safe
+        // ONLY because ids are explicit; sortedWith is stable, so ties
+        // keep row-id order. (Heap grows with group size here — sorted
+        // tables opt into that via their sort spec; the group's byte
+        // budget is the planner's targetBytes.)
         val rows = ArrayList<Row>()
         var minRowId: Long? = null
         for (input in inputs) {
-            val schema = readSchema(input.localPath)
-            // A previously-compacted input carries its ids in its own
-            // row-id column; positional ids would be wrong for it.
-            val srcRowIdIndex =
-                schema.fields.indexOfFirst { it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
-            val plan = columnPlan(schema, liveColumns, input.localPath)
-            var applied = 0L
-            readRows(input.localPath, schema) { src, ordinal ->
-                if (input.deletes?.contains(ordinal) == true) {
-                    applied++
-                    return@readRows
-                }
-                val dst = factory.newGroup()
-                for ((outIdx, step) in plan.withIndex()) {
-                    if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
-                        copyValue(src, step, dst, outIdx, dataFields[outIdx].asPrimitiveType())
-                    }
-                }
-                val rowId =
-                    if (srcRowIdIndex != null) {
-                        src.getLong(srcRowIdIndex, 0)
-                    } else {
-                        input.rowIdStart + ordinal
-                    }
-                dst.add(rowIdIndex, rowId)
-                rows.add(Row(dst, rowId))
+            forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory) { group, rowId ->
+                rows.add(Row(group, rowId))
                 minRowId = minOf(minRowId ?: rowId, rowId)
             }
-            val expected = input.deletes?.cardinality ?: 0L
-            check(applied == expected) {
-                "deletion vector for ${input.localPath} claims $expected positions but only " +
-                    "$applied fell inside the file — refusing a lossy compaction"
-            }
         }
+        val ordered = rows.sortedWith(comparator(outputSchema, sortFields))
+        newWriter(outputSchema, output).use { writer -> for (row in ordered) writer.write(row.group) }
+        return RewriteResult(ordered.size.toLong(), minRowId)
+    }
 
-        // Sorting is safe ONLY because ids are explicit (above); sortedWith
-        // is stable, so ties keep row-id order.
-        val ordered =
-            if (sortFields.isEmpty()) rows else rows.sortedWith(comparator(outputSchema, sortFields))
+    /** The per-input pipeline: apply the DV, map to the live schema, stamp the row id, emit. */
+    private fun forEachSurvivor(
+        input: Input,
+        liveColumns: List<Column>,
+        dataFields: List<Type>,
+        rowIdIndex: Int,
+        factory: SimpleGroupFactory,
+        emit: (Group, Long) -> Unit,
+    ) {
+        val schema = readSchema(input.localPath)
+        // A previously-compacted input carries its ids in its own
+        // row-id column; positional ids would be wrong for it.
+        val srcRowIdIndex =
+            schema.fields.indexOfFirst { it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
+        val plan = columnPlan(schema, liveColumns, input.localPath)
+        var applied = 0L
+        readRows(input.localPath, schema) { src, ordinal ->
+            if (input.deletes?.contains(ordinal) == true) {
+                applied++
+                return@readRows
+            }
+            val dst = factory.newGroup()
+            for ((outIdx, step) in plan.withIndex()) {
+                if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
+                    copyValue(src, step, dst, outIdx, dataFields[outIdx].asPrimitiveType())
+                }
+            }
+            val rowId =
+                if (srcRowIdIndex != null) {
+                    src.getLong(srcRowIdIndex, 0)
+                } else {
+                    input.rowIdStart + ordinal
+                }
+            dst.add(rowIdIndex, rowId)
+            emit(dst, rowId)
+        }
+        val expected = input.deletes?.cardinality ?: 0L
+        check(applied == expected) {
+            "deletion vector for ${input.localPath} claims $expected positions but only " +
+                "$applied fell inside the file — refusing a lossy compaction"
+        }
+    }
 
+    private fun newWriter(
+        outputSchema: MessageType,
+        output: Path,
+    ): ParquetWriter<Group> =
         ExampleParquetWriter.builder(LocalOutputFile(output))
             .withType(outputSchema)
             .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
             .withWriteMode(ParquetFileWriter.Mode.OVERWRITE)
             .build()
-            .use { writer -> for (row in ordered) writer.write(row.group) }
-        return RewriteResult(ordered.size.toLong(), minRowId)
-    }
 
     // ---- schema ----------------------------------------------------------
 

@@ -237,7 +237,8 @@ class TestSeedCli:
     def test_defaults_parse(self):
         args = build_parser().parse_args(["seed"])
         assert args.scenario == "seed"
-        assert args.gb == 1.0
+        assert args.gb == 0.4
+        assert args.file_mb == 20.0
         assert args.catalog.startswith("seed-")
         assert args.url.startswith("http")
 

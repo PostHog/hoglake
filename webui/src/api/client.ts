@@ -9,7 +9,11 @@ import type {
   CreateCatalogRequest,
   CreateTableRequest,
   DataFile,
+  InstanceMaintenanceStatus,
   Int64,
+  MaintenanceRunPage,
+  MaintenanceStatus,
+  MaintenanceTask,
   Namespace,
   PartitionStatsResponse,
   ScanFile,
@@ -214,6 +218,47 @@ export function listPartitionStats(
     buildUrl(`/catalogs/${seg(catalog)}/stats/partitions`, {
       namespace: opts?.namespace || undefined,
       table: opts?.table || undefined,
+      limit: opts?.limit,
+    }),
+  );
+}
+
+// -- maintenance --------------------------------------------------------------
+
+export function getMaintenanceStatus(
+  catalog: string,
+): Promise<MaintenanceStatus> {
+  return request(buildUrl(`/catalogs/${seg(catalog)}/maintenance/status`));
+}
+
+export function listMaintenanceRuns(
+  catalog: string,
+  opts?: { task?: MaintenanceTask; before?: Int64; limit?: number },
+): Promise<MaintenanceRunPage> {
+  return request(
+    buildUrl(`/catalogs/${seg(catalog)}/maintenance/runs`, {
+      task: opts?.task,
+      before: opts?.before,
+      limit: opts?.limit,
+    }),
+  );
+}
+
+// -- maintenance (instance-wide) ----------------------------------------------
+
+export function getInstanceMaintenanceStatus(opts?: { after?: string }): Promise<InstanceMaintenanceStatus> {
+  return request(buildUrl("/maintenance/status", { after: opts?.after }));
+}
+
+export function listInstanceMaintenanceRuns(opts?: {
+  task?: MaintenanceTask;
+  before?: Int64;
+  limit?: number;
+}): Promise<MaintenanceRunPage> {
+  return request(
+    buildUrl("/maintenance/runs", {
+      task: opts?.task,
+      before: opts?.before,
       limit: opts?.limit,
     }),
   );

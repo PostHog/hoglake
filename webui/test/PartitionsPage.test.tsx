@@ -112,7 +112,7 @@ describe("PartitionsPage", () => {
   it("shows an empty state when nothing owes debt", async () => {
     mockFetch((url) =>
       url === baseUrl
-        ? jsonResponse({ partitions: [], truncated: false })
+        ? jsonResponse({ partitions: [], truncated: false, sampled_at: "2026-09-12T04:00:00Z" })
         : undefined,
     );
     renderApp("/catalogs/analytics/partitions");

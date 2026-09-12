@@ -1,6 +1,11 @@
 # Local dev stack. Tests use Testcontainers and do NOT need this;
 # this is for running the server against live deps:
 #   docker compose up -d && flox activate -- gradle run
+#
+# The `full` profile (just up / just down at the repo root) adds the
+# containerized server and webui to these deps — the whole console in
+# docker, images built from the working tree. State persists across
+# up/down cycles in named volumes (wipe with: just down-volumes).
 services:
   postgres:
     image: postgres:16
@@ -10,6 +15,8 @@ services:
       POSTGRES_PASSWORD: hoglake
     ports:
       - "${HOGLAKE_PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hoglake"]
       interval: 2s
@@ -26,8 +33,64 @@ services:
     ports:
       - "${HOGLAKE_MINIO_PORT:-9000}:9000"
       - "${HOGLAKE_MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
     healthcheck:
       test: ["CMD", "mc", "ready", "local"]
       interval: 2s
       timeout: 2s
       retries: 15
+
+  # The control plane, containerized (image built from THIS tree by
+  # `just up`). S3 env wires the compose MinIO explicitly — the defaults
+  # are blank/ambient (the AWS chain, for deploys) and fail the SDK
+  # credentials chain against MinIO.
+  server:
+    profiles: ["full"]
+    build: .
+    image: hoglake-server:dev
+    environment:
+      HOGLAKE_INSTANCE_NAME: dev-compose
+      HOGLAKE_JDBC_URL: jdbc:postgresql://postgres:5432/hoglake
+      HOGLAKE_DB_USER: hoglake
+      HOGLAKE_DB_PASSWORD: hoglake
+      HOGLAKE_S3_ENDPOINT: http://minio:9000
+      HOGLAKE_S3_ACCESS_KEY: hoglake
+      HOGLAKE_S3_SECRET_KEY: hoglake123
+      # The compaction loop is ON in this stack (60s, tiny bites: one
+      # group per catalog per sweep). Override from the shell, e.g.
+      # HOGLAKE_COMPACTION_INTERVAL_MS=0 just up to disable.
+      HOGLAKE_COMPACTION_INTERVAL_MS: ${HOGLAKE_COMPACTION_INTERVAL_MS:-60000}
+      HOGLAKE_COMPACTION_TIER_TARGET: ${HOGLAKE_COMPACTION_TIER_TARGET:-8}
+      HOGLAKE_COMPACTION_TARGET_BYTES: ${HOGLAKE_COMPACTION_TARGET_BYTES:-536870912}
+      HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN: ${HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN:-1}
+      HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS: ${HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS:-1000}
+      HOGLAKE_MAINTENANCE_SUMMARY_BATCH: ${HOGLAKE_MAINTENANCE_SUMMARY_BATCH:-10000}
+      HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS: ${HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS:-60}
+    ports:
+      - "${HOGLAKE_SERVER_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  # The console (static build + nginx proxying /v1 etc. to the server).
+  # depends_on started, not healthy: nginx's envsubst resolves the
+  # upstream name at boot, which compose DNS answers once the container
+  # exists; the webui's health dot shows server readiness after that.
+  webui:
+    profiles: ["full"]
+    build: ../webui
+    image: hoglake-webui:dev
+    environment:
+      HOGLAKE_API: http://server:8080
+    ports:
+      - "${HOGLAKE_WEBUI_PORT:-5173}:8080"
+    depends_on:
+      server:
+        condition: service_started
+
+volumes:
+  pgdata:
+  minio-data:

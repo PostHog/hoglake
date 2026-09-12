@@ -198,6 +198,7 @@ export interface PartitionStats {
 }
 
 export interface PartitionStatsResponse {
+  sampled_at?: string;
   partitions: PartitionStats[];
   truncated: boolean;
   // The compaction target size the report used as its small-file
@@ -208,4 +209,158 @@ export interface PartitionStatsResponse {
 export interface CommitResult {
   snapshot_id: Int64;
   schema_version?: Int64;
+}
+
+// ---- maintenance (GET /maintenance/status + /maintenance/runs) ------------
+//
+// The run ledger mirrors hog_maintenance_run: `result` is the matching POST
+// response body (wire snake_case), typed per task below. A failed run has
+// `result: null` and carries `error` instead.
+
+export type MaintenanceTask =
+  | "hydrator"
+  | "expiry"
+  | "cleanup"
+  | "compaction"
+  | "verify";
+
+export type MaintenanceTrigger = "loop" | "manual";
+
+export type MaintenanceRunState = "ok" | "failed";
+
+/** Hydrator loop rows: the sweep's per-catalog claim outcomes. */
+export interface HydratorSweepResult {
+  claimed: Int64;
+  hydrated: Int64;
+  failed: Int64;
+  transient: Int64;
+}
+
+/** Manual hydrator rows are rehydrate calls. */
+export interface RehydrateResult {
+  requeued: Int64;
+}
+
+export interface ExpiryResult {
+  snapshots_expired: Int64;
+  data_files_queued: Int64;
+  delete_files_queued: Int64;
+  new_earliest_snapshot_id: Int64;
+  floored_by_consumer?: string;
+}
+
+export interface CleanupResult {
+  removed: Int64;
+  missing: Int64;
+  still_referenced: Int64;
+}
+
+export interface CompactionResult {
+  groups_compacted: Int64;
+  files_in: Int64;
+  files_out: Int64;
+  bytes_in: Int64;
+  bytes_out: Int64;
+  skipped_conflicts: Int64;
+  dv_superseded: Int64;
+  unconvertible_schema: Int64;
+  /** Groups that failed outright (logged, retried next run) — red-flag counter. */
+  failed_groups: Int64;
+}
+
+export interface VerifyCheck {
+  check: string;
+  status: "pass" | "fail";
+  violations: Int64;
+  samples: string[];
+}
+
+export interface VerifyReport {
+  catalog: string;
+  status: "pass" | "fail";
+  checks: VerifyCheck[];
+}
+
+interface MaintenanceRunBase {
+  run_id: Int64;
+  /** The catalog the run acted on (the ledger is per-catalog). */
+  catalog: string;
+  trigger: MaintenanceTrigger;
+  started_at: string;
+  finished_at: string;
+  status: MaintenanceRunState;
+  /** Present iff status is "failed". */
+  error?: string;
+}
+
+export type MaintenanceRun =
+  | (MaintenanceRunBase & {
+      task: "hydrator";
+      result: HydratorSweepResult | RehydrateResult | null;
+    })
+  | (MaintenanceRunBase & { task: "expiry"; result: ExpiryResult | null })
+  | (MaintenanceRunBase & { task: "cleanup"; result: CleanupResult | null })
+  | (MaintenanceRunBase & { task: "compaction"; result: CompactionResult | null })
+  | (MaintenanceRunBase & { task: "verify"; result: VerifyReport | null });
+
+export interface HydratorBacklog {
+  pending_files?: Int64;
+  failed_files?: Int64;
+}
+
+export interface ExpiryBacklog {
+  /** Absent when snapshot expiry is disabled. */
+  snapshot_retention_seconds?: Int64;
+  consumer_floor: boolean;
+  earliest_snapshot_id: Int64;
+  head_snapshot_id: Int64;
+}
+
+export interface CleanupBacklog {
+  /** Undrained removal-queue entries. */
+  queued_removals?: Int64;
+  /** Absent on an empty queue. */
+  oldest_queued_age_seconds?: number;
+}
+
+export interface CompactionBacklog {
+  /** Live files under the target size — the debt a sweep plans against. */
+  small_files?: Int64;
+  target_bytes: Int64;
+}
+
+export type VerifyBacklog = Record<string, never>;
+
+interface MaintenanceTaskStatusBase {
+  /** 0 = loop disabled; absent = the task has no loop (verify). */
+  loop_interval_ms?: Int64;
+  /** Always present; null = no recorded run yet. */
+  last_run: MaintenanceRun | null;
+}
+
+export type MaintenanceTaskStatus =
+  | (MaintenanceTaskStatusBase & { task: "hydrator"; backlog: HydratorBacklog })
+  | (MaintenanceTaskStatusBase & { task: "expiry"; backlog: ExpiryBacklog })
+  | (MaintenanceTaskStatusBase & { task: "cleanup"; backlog: CleanupBacklog })
+  | (MaintenanceTaskStatusBase & { task: "compaction"; backlog: CompactionBacklog })
+  | (MaintenanceTaskStatusBase & { task: "verify"; backlog: VerifyBacklog });
+
+export interface MaintenanceStatus {
+  catalog: string;
+  tasks: MaintenanceTaskStatus[];
+  sampled_at?: string;
+  sample_started_at?: string;
+  sampled_snapshot_id?: Int64;
+}
+
+/** GET /v1/maintenance/status: every catalog's MaintenanceStatus, by name. */
+export interface InstanceMaintenanceStatus {
+  catalogs: MaintenanceStatus[];
+  has_more?: boolean;
+  next_after?: string;
+}
+
+export interface MaintenanceRunPage {
+  runs: MaintenanceRun[];
+  has_more: boolean;
 }

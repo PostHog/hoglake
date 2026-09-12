@@ -131,6 +131,7 @@ export function Layout() {
         <InstanceTotals />
         <Breadcrumbs />
         <div className="topbar-right">
+          <Link to="/maintenance">maintenance</Link>
           <Link to="/metrics">metrics</Link>
           <a href="/openapi.yaml" target="_blank" rel="noreferrer">
             openapi.yaml

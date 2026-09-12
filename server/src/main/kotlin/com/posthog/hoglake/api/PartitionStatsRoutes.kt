@@ -77,6 +77,7 @@ data class PartitionStatsReportDto(
     val truncated: Boolean,
     val staleSpecGroups: Long,
     val smallFileThresholdBytes: Long,
+    val sampledAt: java.time.Instant?,
 )
 
 fun PartitionValue.toDto() = PartitionValueDto(field = field, value = value)
@@ -103,4 +104,5 @@ fun PartitionStatsReport.toDto() =
         truncated = truncated,
         staleSpecGroups = staleSpecGroups,
         smallFileThresholdBytes = smallFileThresholdBytes,
+        sampledAt = sampledAt,
     )

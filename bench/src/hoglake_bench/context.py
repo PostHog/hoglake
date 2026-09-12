@@ -14,7 +14,7 @@ from pyhoglake import Catalog, HoglakeClient, S3Config
 @dataclass
 class BenchConfig:
     url: str = "http://localhost:8080"
-    s3_endpoint: str = "http://localhost:19000"
+    s3_endpoint: str = "http://localhost:9000"
     s3_access_key: str = "hoglake"
     s3_secret_key: str = "hoglake123"
     s3_region: str = "us-east-1"

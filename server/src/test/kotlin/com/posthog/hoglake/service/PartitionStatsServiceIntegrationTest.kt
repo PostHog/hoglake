@@ -38,8 +38,22 @@ class PartitionStatsServiceIntegrationTest {
     private val alter = AlterService(db.jdbi)
     private val counter = AtomicInteger(0)
 
-    /** Strict less-than 1000 = "small", mirroring the compaction planner. */
-    private val svc = PartitionStatsService(db.jdbi, smallFileThresholdBytes = 1000)
+    /** T=4, target=1000: quotas 1/4/16/63/250/1000. */
+    private val stats = PartitionStatsService(db.jdbi, smallFileThresholdBytes = 1000, tierTarget = 4)
+    private val svc =
+        object {
+            fun partitionStats(
+                catalog: String,
+                namespace: String?,
+                table: String?,
+                limit: Int,
+            ): com.posthog.hoglake.model.PartitionStatsReport {
+                db.jdbi.useHandleUnchecked { it.execute("UPDATE hog_maintenance_summary SET next_batch_at = now()") }
+                val sampler = MaintenanceSummarySampler(db.jdbi, 1000, 4, 3600)
+                while (sampler.runOnce()) { /* materialize a complete sample before testing report semantics */ }
+                return stats.partitionStats(catalog, namespace, table, limit)
+            }
+        }
 
     @AfterAll
     fun tearDown() = db.close()
@@ -128,7 +142,7 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(p1.specId).isEqualTo(1)
         assertThat(p1.fileCount).isEqualTo(4)
         assertThat(p1.smallFileCount).isEqualTo(4)
-        assertThat(p1.debtScore).isEqualTo(4)
+        assertThat(p1.debtScore).isEqualTo(3) // shortest prefix reaches 250; the fourth is a remainder
         assertThat(p1.totalBytes).isEqualTo(400)
         assertThat(p1.smallFileBytes).isEqualTo(400)
         assertThat(p1.avgFileBytes).isEqualTo(100)
@@ -142,7 +156,9 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(p2.partitionValues).containsExactly(PartitionValue("team", "p2"))
         assertThat(p2.fileCount).isEqualTo(2)
         assertThat(p2.smallFileCount).isEqualTo(1)
-        assertThat(p2.debtScore).isEqualTo(1)
+        // One small file cannot fill its tier quota: raw count visible,
+        // actionable debt zero.
+        assertThat(p2.debtScore).isEqualTo(0)
         assertThat(p2.totalBytes).isEqualTo(1600)
         assertThat(p2.smallFileBytes).isEqualTo(100)
         assertThat(p2.avgFileBytes).isEqualTo(800)
@@ -154,45 +170,57 @@ class PartitionStatsServiceIntegrationTest {
     @Test
     fun `worst-case seeded ordering is debt desc with small-byte tiebreak`() {
         val cat = fixture()
-        // Pre-spec vintage: debt 2, small bytes 1200.
+        // Pre-spec vintage: 2 x 600B tier-2 files, sum 1200 >= floor 1000 -> debt 2.
         append(cat, "t", file("u1", 600), file("u2", 600))
         partitionByTeam(cat)
         append(
             cat,
             "t",
-            // a: debt 3, small bytes 900.
+            // a: 3 x 300B, sum 900 < quota 1000 -> debt 0.
             file("a1", 300, values = listOf("a")),
             file("a2", 300, values = listOf("a")),
             file("a3", 300, values = listOf("a")),
-            // b: debt 3, small bytes 300 — loses the tie to a.
+            // b: 3 x 100B, sum 300 >= quota 250 -> debt 3.
             file("b1", 100, values = listOf("b")),
             file("b2", 100, values = listOf("b")),
             file("b3", 100, values = listOf("b")),
-            // c: debt 4 — the winner.
+            // c: 4 x 50B, two pairs reaching quota 63 -> debt 4.
             file("c1", 50, values = listOf("c")),
             file("c2", 50, values = listOf("c")),
             file("c3", 50, values = listOf("c")),
             file("c4", 50, values = listOf("c")),
-            // d: debt 2, small bytes 800 — loses the tie to the vintage's 1200.
+            // d: 2 x 400B, sum 800 < quota 1000 -> debt 0.
             file("d1", 400, values = listOf("d")),
             file("d2", 400, values = listOf("d")),
             file("dbig", 2000, values = listOf("d")),
-            // e: no debt at all, still listed.
+            // e: no small files at all, still listed.
             file("ebig", 5000, values = listOf("e")),
         )
 
         val report = svc.partitionStats(cat, null, null, 50)
         assertThat(report.partitions.map { it.partitionValues.map(PartitionValue::value) })
-            .containsExactly(
-                listOf("c"),
-                listOf("a"),
-                listOf("b"),
-                emptyList(),
-                listOf("d"),
-                listOf("e"),
-            )
-        assertThat(report.partitions.map { it.debtScore }).containsExactly(4L, 3L, 3L, 2L, 2L, 0L)
-        assertThat(report.partitions).allSatisfy { assertThat(it.debtScore).isEqualTo(it.smallFileCount) }
+            .containsExactly(listOf("c"), listOf("b"), emptyList(), listOf("a"), listOf("d"), listOf("e"))
+        assertThat(report.partitions.map { it.debtScore }).containsExactly(4L, 3L, 2L, 0L, 0L, 0L)
+        // c's pairs clear 63; a/d are in [250,1000), short of 1000.
+        val c = report.partitions[0]
+        assertThat(c.smallFileCount).isEqualTo(4)
+        assertThat(c.debtScore).isEqualTo(4)
+    }
+
+    @Test
+    fun `tier floor is inclusive - a bucket summing to exactly the floor is debt`() {
+        val cat = fixture()
+        partitionByTeam(cat)
+        // x: 100 + 150 = exactly the tier-0 floor (250): mergeable.
+        append(cat, "t", file("x1", 100, values = listOf("x")), file("x2", 150, values = listOf("x")))
+        // y: 100 + 140 = 240 < 250: one byte short is no group.
+        append(cat, "t", file("y1", 100, values = listOf("y")), file("y2", 140, values = listOf("y")))
+
+        val by =
+            svc.partitionStats(cat, null, null, 50).partitions
+                .associateBy { it.partitionValues.single().value }
+        assertThat(by["x"]!!.debtScore).isEqualTo(2)
+        assertThat(by["y"]!!.debtScore).isEqualTo(0)
     }
 
     // ---- partition field naming ------------------------------------------------
@@ -362,7 +390,9 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(entry.fileCount).isEqualTo(3)
         assertThat(entry.smallFileCount).isEqualTo(1)
         assertThat(entry.smallFileBytes).isEqualTo(999)
-        assertThat(entry.debtScore).isEqualTo(1)
+        // One sub-threshold bucket: raw small count 1, but no group can
+        // form (min 2), so actionable debt is 0.
+        assertThat(entry.debtScore).isEqualTo(0)
         assertThat(entry.totalBytes).isEqualTo(3000)
         assertThat(entry.avgFileBytes).isEqualTo(1000)
     }

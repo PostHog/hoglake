@@ -45,10 +45,17 @@ DEFAULT_SEED = 4740871
 DEFAULT_CATALOG = "seed-warehouse"
 
 #: Facts/events aim for files in this band — many mid-sized files, not a
-#: few giants, so compaction planning has something real to rank.
+#: few giants, so compaction planning has something real to rank. The
+#: default sits at the floor to produce small-file populations across
+#: the team×month grid. Compaction eligibility is byte-triggered within
+#: geometric size tiers, not a minimum file count.
 MIN_FILE_MB = 20.0
 MAX_FILE_MB = 80.0
-DEFAULT_FILE_MB = 32.0
+DEFAULT_FILE_MB = 20.0
+
+#: Default volume: 0.4 GB, a small interactive seed. Repeated seeds append
+#: more files into the same cells, filling their compaction byte quotas.
+DEFAULT_GB = 0.4
 
 #: Rows used to calibrate bytes-per-row locally (no catalog writes).
 PROBE_ROWS = 20_000
@@ -567,9 +574,9 @@ def add_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--gb",
         type=_gb,
-        default=1.0,
+        default=DEFAULT_GB,
         help="total volume to write, in GB (fractional ok; rounded to the "
-        f"nearest 100 MB; minimum {MIN_GB:g})",
+        f"nearest 100 MB; minimum {MIN_GB:g}; default {DEFAULT_GB:g})",
     )
     p.add_argument(
         "--catalog",

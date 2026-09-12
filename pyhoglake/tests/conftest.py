@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
     pass
 
 HOGLAKE_URL = os.environ.get("HOGLAKE_URL", "http://localhost:8080")
-S3_ENDPOINT = os.environ.get("HOGLAKE_S3_ENDPOINT", "http://localhost:19000")
+S3_ENDPOINT = os.environ.get("HOGLAKE_S3_ENDPOINT", "http://localhost:9000")
 S3_ACCESS_KEY = os.environ.get("HOGLAKE_S3_ACCESS_KEY", "hoglake")
 S3_SECRET_KEY = os.environ.get("HOGLAKE_S3_SECRET_KEY", "hoglake123")
 

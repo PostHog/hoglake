@@ -308,6 +308,59 @@ tr.has-deletes {
   border-color: var(--warn);
 }
 
+/* -- maintenance page ----------------------------------------------------- */
+
+.task-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+  gap: 16px;
+  margin-bottom: 20px;
+}
+.task-panel h3 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  text-transform: capitalize;
+}
+.task-panel .stats-header {
+  margin-bottom: 8px;
+}
+.last-run {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+.run-error {
+  color: var(--bad);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 60ch;
+  display: inline-block;
+  vertical-align: bottom;
+}
+.backlog-bad {
+  color: var(--bad);
+}
+
+/* Central maintenance matrix: one row per catalog, one cell per task. */
+.task-matrix .task-cell {
+  white-space: nowrap;
+}
+.task-cell-link {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  text-decoration: none;
+  color: inherit;
+}
+.task-cell-link:hover .subtle,
+.task-cell-link:hover .backlog-bad {
+  text-decoration: underline;
+}
+
 .instance-name {
   padding: 1px 8px;
   border: 1px solid var(--accent, var(--border));
@@ -688,6 +741,16 @@ button.ghost:hover:not(:disabled) {
   border-radius: 6px;
   background: rgba(229, 181, 103, 0.08);
   color: var(--warn);
+}
+
+/* The maintenance-ledger-unavailable notice (older server build). */
+.notice-banner {
+  padding: 8px 12px;
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-raised);
+  color: var(--text-dim);
 }
 .debt-cell {
   min-width: 120px;

@@ -64,7 +64,17 @@ class PartitionStatsApiTest {
 
     private fun api(block: suspend ApplicationTestBuilder.(HttpClient) -> Unit) =
         testApplication {
-            application { app.module(this) }
+            application {
+                val sampler =
+                    com.posthog.hoglake.service.MaintenanceSummarySampler(
+                        db.jdbi,
+                        512L * 1024 * 1024,
+                        8,
+                        3600,
+                    )
+                while (sampler.runOnce()) { /* publish before exercising the report */ }
+                app.module(this)
+            }
             block(client)
         }
 
@@ -107,13 +117,17 @@ class PartitionStatsApiTest {
                             "analytics",
                             "events",
                             listOf(
-                                // team 42: debt 2 (one big, two small).
+                                // team 42: four 40 MiB files reach the
+                                // default 64 MiB quota twice (debt 4).
                                 f("t42-big", bigBytes, listOf("42")),
                                 f("t42-s1", smallBytes, listOf("42")),
                                 f("t42-s2", smallBytes, listOf("42")),
-                                // team 7: debt 1.
+                                f("t42-s3", smallBytes, listOf("42")),
+                                f("t42-s4", smallBytes, listOf("42")),
+                                // team 7: one small file — raw count 1,
+                                // actionable debt 0 (sub-threshold).
                                 f("t7-s1", smallBytes, listOf("7")),
-                                // null team: debt 1, fewer small bytes than team 7.
+                                // null team: same, fewer small bytes than team 7.
                                 f("tnull-s1", 2_097_152, listOf(null)),
                             ),
                         ),
@@ -139,6 +153,7 @@ class PartitionStatsApiTest {
                         "truncated",
                         "stale_spec_groups",
                         "small_file_threshold_bytes",
+                        "sampled_at",
                     ),
                 )
             assertThat(node["truncated"].isBoolean).isTrue()
@@ -153,9 +168,12 @@ class PartitionStatsApiTest {
             assertThat(partitions.isArray).isTrue()
             assertThat(partitions).hasSize(4)
 
-            // Ordering: debt desc, ties by small_file_bytes desc.
+            // Ordering: debt desc, ties by small_file_bytes desc. Only
+            // team 42 has two complete pairs: the rest pin 0.
             val first = partitions[0]
-            assertThat(first["debt_score"].asLong()).isEqualTo(2)
+            assertThat(first["debt_score"].asLong()).isEqualTo(4)
+            assertThat(partitions[1]["debt_score"].asLong()).isEqualTo(0)
+            assertThat(partitions[1]["small_file_count"].asLong()).isEqualTo(1)
             assertThat(partitions[1]["partition_values"][0]["value"].asText()).isEqualTo("7")
             assertThat(partitions[2]["partition_values"][0]["value"].isNull).isTrue()
             assertThat(partitions[3]["table"].asText()).isEqualTo("raw")
@@ -201,12 +219,12 @@ class PartitionStatsApiTest {
                 assertThat(first[field].isIntegralNumber).describedAs(field).isTrue()
                 assertThat(first[field].isTextual).describedAs(field).isFalse()
             }
-            assertThat(first["file_count"].asLong()).isEqualTo(3)
-            assertThat(first["small_file_count"].asLong()).isEqualTo(2)
-            assertThat(first["total_bytes"].asLong()).isEqualTo(bigBytes + 2 * smallBytes)
-            assertThat(first["small_file_bytes"].asLong()).isEqualTo(2 * smallBytes)
+            assertThat(first["file_count"].asLong()).isEqualTo(5)
+            assertThat(first["small_file_count"].asLong()).isEqualTo(4)
+            assertThat(first["total_bytes"].asLong()).isEqualTo(bigBytes + 4 * smallBytes)
+            assertThat(first["small_file_bytes"].asLong()).isEqualTo(4 * smallBytes)
             assertThat(first["avg_file_bytes"].asLong())
-                .isEqualTo((bigBytes + 2 * smallBytes) / 3)
+                .isEqualTo((bigBytes + 4 * smallBytes) / 5)
             assertThat(first["dv_count"].asLong()).isEqualTo(0)
 
             // Unpartitioned entry: empty partition_values, spec_id omitted.

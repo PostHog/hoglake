@@ -243,6 +243,12 @@ export function CatalogPage() {
         >
           Compaction debt
         </Link>
+        <Link
+          className="side-link"
+          to={`/catalogs/${encodeURIComponent(catalog)}/maintenance`}
+        >
+          Maintenance
+        </Link>
       </div>
       <CatalogHeader catalog={catalog} />
       <div className="two-col">
