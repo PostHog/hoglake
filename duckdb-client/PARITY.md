@@ -17,7 +17,7 @@ client work not yet done.
 | Secrets (`TYPE ducklake`) | TODO | endpoint+token secret type; low-cost once auth exists |
 | Multi-catalog attach | DONE | independent catalogs per ATTACH |
 | `DETACH` / re-attach | DONE | |
-| Identifier case semantics | DONE | DuckDB CI identifiers over the case-sensitive server: listing-based resolution for tables and columns, case-preserving creates, CI duplicate conflicts on CREATE and on ALTER targets (add/rename column, rename table; self case-change legal), ambiguity errors for case-colliding server-side tables, columns, and namespaces with listings surviving — fixture-created colliding pairs exercised (`hoglake_case.test`) |
+| Identifier case semantics | DONE | DuckDB CI identifiers over the case-sensitive server: listing-based resolution for tables and columns, case-preserving creates, CI duplicate conflicts on CREATE and on ALTER targets (add/rename column, rename table; self case-change legal), ambiguity errors for case-colliding server-side tables, columns, and namespaces with listings surviving. Fixture-created colliding TABLE and NAMESPACE pairs (`hoglake_case.test`) AND a colliding-COLUMN table (`hoglake_wire_hardening.test`: targeted error, order-independent, listings survive) |
 | `metadata_*` options, `busy_timeout`, `automatic_migration`, `ducklake_version`, `override_data_path` | N/A | no client-visible metadata backend |
 | `encrypted`, `data_inlining_row_limit` | N/A | encryption/inlining dropped by hoglake's design |
 
@@ -49,6 +49,8 @@ client work not yet done.
 | Partitioned INSERT | PARTIAL | identity transforms only; identity wire encodings for boolean/int/long/string/date/timestamp are byte-verified against pyhoglake's wire_string cross-client (verify_partition_wire.py, incl. fractional-second timestamps); float/double/decimal/uuid/binary identity partitions and bucket/year/month/day/hour transforms throw NotImplemented (transforms + murmur3 port is the follow-up) |
 | `DELETE` | DONE | puffin DV merge + superseding registration; multi-statement transactions merge per data_file_id (one live DV per file per commit) AND same-transaction scans mask buffered deletes (read-your-own-deletes — no resurrect/double corruption; `hoglake_txn.test`); conflict = re-run (no blind retry) |
 | `UPDATE` | DONE | delete + insert; **updated rows get NEW row ids** (wire gap: FileRegistration cannot register explicit-row-id files) |
+| Wire/user-input hardening | DONE | no wire- or user-supplied value can reach an InternalException (= DuckDB instance invalidation): parse-time range validation for every numeric wire field, decimal params validated with the table named, typed errors for negative SNAPSHOT_VERSION / AT VERSION / batch / bucket counts, unrepresentable tables skipped from listings with remembered targeted errors (`hoglake_wire_hardening.test`) |
+| DML after own INSERT/UPDATE | DONE (refused) | DELETE/UPDATE on a table this transaction already appended rows to is refused (uncommitted inserts are invisible to scans; a partial-overlap predicate would commit sequentially-wrong data with a plausible count — R3-6). DELETE-then-DELETE/UPDATE stay legal (`hoglake_txn.test`) |
 | DDL vs buffered writes (both orders) | DONE | eager DDL on a table with uncommitted writes is refused, and the mirror order too: DELETE/UPDATE after an ALTER of the same table (or with buffered appends to an altered table) is refused before it can self-conflict at commit; ALTER-then-INSERT commits (blind); created/altered tables read at the post-DDL snapshot (`hoglake_txn.test`, DESIGN.md "Transactions and eager DDL") |
 | `MERGE INTO` | TODO | lowers to the same primitives; not wired |
 | `INSERT ... RETURNING` / `ON CONFLICT` | TODO | refused with clear errors |
@@ -63,7 +65,7 @@ client work not yet done.
 |---|---|---|
 | SELECT / parquet scan | DONE | parquet_scan clone + hoglake MultiFileReader; field-id mapping, by-name fallback for id-less files |
 | Deletion-vector application | DONE | puffin deletion-vector-v1 reader (roaring) |
-| `rowid` virtual column | PARTIAL | positional path tested (stable across DVs); the explicit `_hog_row_id` (2147483646) branch is implemented but UNTESTED — no compaction output exists on the dev stack (hydrator gap) |
+| `rowid` virtual column | DONE | positional path tested (stable across DVs) AND the explicit `_hog_row_id` (2147483646) branch tested against a real fixture-forced server compaction output (`hoglake_compacted_read.test`: one merged file, row ids preserved 0..4) |
 | `filename` / `file_row_number` / `snapshot_id` virtual columns | DONE | snapshot_id = file begin_snapshot |
 | Partition pruning | DONE | identity transforms, filter constant-folded per partition value; binary partition wire values base64-decoded (pyhoglake encoding; tested on a fixture-written binary partition); non-live-spec files never pruned |
 | File-level min/max (zone-map) pruning | WIRE GAP | `/scan` carries no column bounds |
@@ -88,7 +90,7 @@ client work not yet done.
 
 | Capability | Status | Notes |
 |---|---|---|
-| `merge_adjacent_files` | PARTIAL (server-side passthrough) | `hoglake_compact(cat, batch)` — POST /maintenance/compact. Wire round trip + result shape tested; the dev stack's hydrator gap leaves every candidate pending, so a compaction that actually rewrites files (and the explicit `_hog_row_id` read path it would produce) is UNTESTED |
+| `merge_adjacent_files` | DONE (server-side passthrough) | `hoglake_compact(cat, batch)` — POST /maintenance/compact; refused on read-only attaches. Real compaction exercised: the fixture force-compacts `points` via this endpoint and the suite reads the output (`hoglake_compacted_read.test`) |
 | `expire_snapshots` | PARTIAL (server-side passthrough) | `hoglake_expire(cat, batch)`; shape-tested only (no retention configured on the dev catalog, so nothing ever expires in tests) |
 | `cleanup_old_files` | DONE (server-side) | `hoglake_cleanup(cat, batch)` — liveness-checked server-side; shape-tested |
 | verify (no ducklake analogue) | DONE | `hoglake_verify(cat)` |

@@ -222,6 +222,68 @@ def main() -> None:
                 pass
         print(f"fixture ready: {CATALOG} namespaces ambigns + AmbigNs (CI-colliding pair)")
 
+        # ---- poison tables (round-3 hardening): metadata OTHER clients
+        # can legally register but DuckDB cannot represent. Listings
+        # must skip them with targeted errors; the instance must NEVER
+        # be invalidated. Created via raw REST because pyhoglake/pyarrow
+        # refuse some of these shapes.
+        import httpx
+
+        def rest(method, path, **kw):
+            r = httpx.request(method, HOGLAKE_URL.rstrip("/") + "/v1" + path, **kw)
+            if r.status_code not in (200, 201, 404, 409):
+                raise RuntimeError(f"{method} {path}: {r.status_code} {r.text[:200]}")
+            return r
+
+        # decimal precision far beyond DuckDB's 38
+        rest("DELETE", f"/catalogs/{CATALOG}/namespaces/ns1/tables/bad_dec100")
+        rest("POST", f"/catalogs/{CATALOG}/namespaces/ns1/tables", json={
+            "name": "bad_dec100",
+            "columns": [{"name": "d", "type": "decimal", "type_params": {"precision": 100, "scale": 2}}],
+        })
+        # decimal with no type_params at all
+        rest("DELETE", f"/catalogs/{CATALOG}/namespaces/ns1/tables/bad_dec_nop")
+        rest("POST", f"/catalogs/{CATALOG}/namespaces/ns1/tables", json={
+            "name": "bad_dec_nop",
+            "columns": [{"name": "d", "type": "decimal"}],
+        })
+        # case-colliding COLUMN names (server dedupe is exact-match)
+        rest("DELETE", f"/catalogs/{CATALOG}/namespaces/ns1/tables/bad_cols")
+        rest("POST", f"/catalogs/{CATALOG}/namespaces/ns1/tables", json={
+            "name": "bad_cols",
+            "columns": [{"name": "team", "type": "string"}, {"name": "Team", "type": "int"}],
+        })
+        print(f"fixture ready: {CATALOG}/ns1 poison tables bad_dec100, bad_dec_nop, bad_cols")
+
+        # ---- duplicate-path registration (in duckext-sqltest, where
+        # the DML tests run): one physical parquet registered as TWO
+        # live logical files — legal on the wire (writer retries).
+        SQLTEST = "duckext-sqltest"
+        r = rest("GET", f"/catalogs/{SQLTEST}")
+        if r.status_code == 404:
+            rest("POST", "/catalogs", json={"name": SQLTEST, "data_path": "s3://duckext-itest/sqltest/"})
+            rest("POST", f"/catalogs/{SQLTEST}/namespaces", json={"name": "ns1"})
+        sq = client.catalog(SQLTEST)
+        try:
+            sq_ns = sq.create_namespace("ns1")
+        except AlreadyExistsError:
+            sq_ns = sq.namespace("ns1")
+        try:
+            sq_ns.table("dup_path").drop()
+        except NotFoundError:
+            pass
+        dup = sq_ns.create_table("dup_path", pa.schema([pa.field("a", pa.int64())]))
+        dup.append(pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
+        f = dup.files()[0]
+        rest("POST", f"/catalogs/{SQLTEST}/commit", json={
+            "appends": [{
+                "namespace": "ns1", "table": "dup_path",
+                "files": [{"path": f.path, "record_count": f.record_count,
+                            "file_size_bytes": f.file_size_bytes}],
+            }],
+        })
+        print(f"fixture ready: {SQLTEST}/ns1.dup_path (one path, two live registrations)")
+
         # time-travel env for the sqllogictests: genuinely historical
         # snapshot ids and a timestamp BETWEEN the two points batches
         # (proves timestamp resolution picks the earlier snapshot).
@@ -247,6 +309,32 @@ def main() -> None:
             f"export DUCKEXT_POINTS_T1_PLUS2='{t1_plus2}'",
             f"export DUCKEXT_EVO_SNAP_V1={e1.snapshot_id}",
         ]
+        # force-compact points so the suite can deterministically read a
+        # compaction output (explicit _hog_row_id file). Needs the
+        # stack's hydrator (stats must be provided before files become
+        # compaction candidates); on timeout the flag is left unset and
+        # the gated test file skips.
+        import time as _time
+
+        def points_files():
+            return rest("GET", f"/catalogs/{CATALOG}/namespaces/ns1/tables/points/scan").json()
+
+        compacted = False
+        deadline = _time.time() + 90
+        while _time.time() < deadline:
+            files = points_files()
+            if len(files) == 1 and files[0]["data_file"].get("explicit_row_ids"):
+                compacted = True
+                break
+            if all(f["data_file"]["stats_state"] == "provided" for f in files):
+                rest("POST", f"/catalogs/{CATALOG}/maintenance/compact?batch=10")
+            _time.sleep(2)
+        if compacted:
+            env_lines.append("export DUCKEXT_POINTS_COMPACTED=1")
+            print("points compacted (explicit _hog_row_id file); gated test enabled")
+        else:
+            print("WARNING: points did not compact within 90s (hydrator down?); compacted-read test will skip")
+
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live-env.sh")
         with open(env_path, "w") as f:
             f.write("\n".join(env_lines) + "\n")

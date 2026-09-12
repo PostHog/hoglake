@@ -75,9 +75,16 @@ SinkFinalizeType HoglakeDelete::Finalize(Pipeline &pipeline, Event &event, Clien
 	// resolve data files (ids + live DVs) at the entry's read travel —
 	// the same plan the scan that produced these row ids used
 	auto scan_files = transaction.Api().PlanScan(ns, table_name, table.GetReadTravel());
-	map<string, const HoglakeScanFile *> by_path;
+	// the catalog LEGALLY holds multiple live logical files registered
+	// for one physical path (writer retries; the server's commit path
+	// admits duplicates by design). The scan's filename column cannot
+	// distinguish them, and the positions are physical ordinals of the
+	// shared bytes — so the superseding DV must be registered for EVERY
+	// live data_file_id of the path, or the duplicate logical file's
+	// rows silently survive the DELETE.
+	map<string, vector<const HoglakeScanFile *>> by_path;
 	for (auto &file : scan_files) {
-		by_path.emplace(file.data_file.path, &file);
+		by_path[file.data_file.path].push_back(&file);
 	}
 
 	auto &fs = FileSystem::GetFileSystem(context);
@@ -95,42 +102,48 @@ SinkFinalizeType HoglakeDelete::Finalize(Pipeline &pipeline, Event &event, Clien
 			                           "snapshot (concurrent compaction or drop?) — re-run the DELETE",
 			                           data_file_path);
 		}
-		auto &scan_file = *file_entry->second;
+		for (auto scan_file_ptr : file_entry->second) {
+			auto &scan_file = *scan_file_ptr;
 
-		// vectors only grow: the superseding DV = (server-live DV) ∪
-		// (positions already buffered by EARLIER statements of this
-		// transaction) ∪ (this statement's new positions) — one commit
-		// must carry exactly one DV per data file, containing everything
-		set<idx_t> positions = entry.second;
-		if (scan_file.has_delete_file) {
-			auto existing = HoglakePuffin::ReadDeletionVector(context, scan_file.delete_file.path);
-			positions.insert(existing.begin(), existing.end());
+			// vectors only grow: the superseding DV = (this logical
+			// file's server-live DV) ∪ (positions already buffered by
+			// EARLIER statements of this transaction for it) ∪ (this
+			// statement's new positions) — one commit must carry
+			// exactly one DV per data_file_id, containing everything
+			set<idx_t> positions = entry.second;
+			if (scan_file.has_delete_file) {
+				auto existing = HoglakePuffin::ReadDeletionVector(context, scan_file.delete_file.path);
+				positions.insert(existing.begin(), existing.end());
+			}
+			auto buffered =
+			    transaction.GetBufferedDeletePositions(ns, table_name, scan_file.data_file.data_file_id);
+			positions.insert(buffered.begin(), buffered.end());
+			auto record_count = NumericCast<idx_t>(scan_file.data_file.record_count);
+			if (!positions.empty() && *positions.rbegin() >= record_count) {
+				throw InternalException(
+				    "hoglake: deleted position %llu out of range for data file \"%s\" (%llu rows)",
+				    *positions.rbegin(), data_file_path, record_count);
+			}
+
+			auto puffin = HoglakePuffin::WritePuffinFile(positions, data_file_path);
+			auto dv_path = data_path + "data/" + ns + "/" + table_name + "/hoglake-dv-" +
+			               UUID::ToString(UUID::GenerateRandomUUID()) + ".puffin";
+			auto handle =
+			    fs.OpenFile(dv_path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW);
+			handle->Write(puffin.data(), puffin.size());
+			handle->Close();
+
+			HoglakeDeleteFileRegistration registration;
+			registration.data_file_id = scan_file.data_file.data_file_id;
+			registration.path = dv_path;
+			registration.delete_count = NumericCast<int64_t>(positions.size());
+			registration.file_size_bytes = NumericCast<int64_t>(puffin.size());
+			// client-side: lets the NEXT statement in this transaction
+			// merge and supersede this registration (AddDeletes
+			// replaces by data_file_id)
+			registration.positions = std::move(positions);
+			registrations.push_back(std::move(registration));
 		}
-		auto buffered = transaction.GetBufferedDeletePositions(ns, table_name, scan_file.data_file.data_file_id);
-		positions.insert(buffered.begin(), buffered.end());
-		auto record_count = NumericCast<idx_t>(scan_file.data_file.record_count);
-		if (!positions.empty() && *positions.rbegin() >= record_count) {
-			throw InternalException("hoglake: deleted position %llu out of range for data file \"%s\" (%llu rows)",
-			                        *positions.rbegin(), data_file_path, record_count);
-		}
-
-		auto puffin = HoglakePuffin::WritePuffinFile(positions, data_file_path);
-		auto dv_path = data_path + "data/" + ns + "/" + table_name + "/hoglake-dv-" +
-		               UUID::ToString(UUID::GenerateRandomUUID()) + ".puffin";
-		auto handle = fs.OpenFile(dv_path, FileOpenFlags::FILE_FLAGS_WRITE | FileOpenFlags::FILE_FLAGS_FILE_CREATE_NEW);
-		handle->Write(puffin.data(), puffin.size());
-		handle->Close();
-
-		HoglakeDeleteFileRegistration registration;
-		registration.data_file_id = scan_file.data_file.data_file_id;
-		registration.path = dv_path;
-		registration.delete_count = NumericCast<int64_t>(positions.size());
-		registration.file_size_bytes = NumericCast<int64_t>(puffin.size());
-		// client-side: lets the NEXT statement in this transaction merge
-		// and supersede this registration (AddDeletes replaces by
-		// data_file_id)
-		registration.positions = std::move(positions);
-		registrations.push_back(std::move(registration));
 	}
 	transaction.AddDeletes(ns, table_name, table.GetTableUUID(), std::move(registrations));
 	return SinkFinalizeType::READY;

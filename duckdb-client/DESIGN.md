@@ -150,18 +150,22 @@ puffin file, and the registration REPLACES the earlier buffered one.
 The server's one-live-DV-per-data-file invariant therefore holds for
 any multi-statement DML transaction (`hoglake_txn.test`).
 
-**Read-your-own-DELETES (and only deletes).** Every same-transaction
-scan merges the transaction's buffered delete positions into its
-delete mask (AT-clause reads stay historical), so a later statement
-never re-reads a row this transaction already deleted — without this,
-DELETE-then-UPDATE resurrected the deleted row and UPDATE-then-UPDATE
-doubled the table, silently, at commit. Uncommitted INSERTS remain
-invisible: a second unpredicated UPDATE in one transaction therefore
-reports 0 rows (the first UPDATE's rewrites are unreadable inserts,
-its sources are masked deletes) and the +N of the second UPDATE is not
-applied — visible in the statement's row count, tested in
-`hoglake_txn.test`, and the honest consequence of buffering inserts
-while masking deletes.
+**Read-your-own-DELETES; refuse-after-own-INSERTS.** Every
+same-transaction scan merges the transaction's buffered delete
+positions into its delete mask (AT-clause reads stay historical), so
+a later statement never re-reads a row this transaction already
+deleted — without this, DELETE-then-UPDATE resurrected the deleted
+row and UPDATE-then-UPDATE doubled the table, silently, at commit.
+Uncommitted INSERTS (from INSERT or an earlier UPDATE's rewrites)
+remain invisible — and because a later predicate could then silently
+miss rewritten rows while reporting a plausible nonzero count
+(partial predicate overlap commits sequentially-wrong data), any
+DELETE/UPDATE on a table this transaction already inserted or updated
+rows into is REFUSED with a clear error. DELETE-then-DELETE and
+DELETE-then-UPDATE stay legal (deletes are masked); everything after
+an append-producing statement on the same table requires COMMIT
+first. Tested in `hoglake_txn.test` (both corruption shapes refused,
+the legal orders verified).
 
 ## Transactions and eager DDL
 
@@ -206,10 +210,11 @@ on COMMIT (the CTAS child plan is cast to the wire types first —
 TINYINT/SMALLINT widen to the wire "int"; feeding narrower vectors
 into the copy corrupts data silently).
 
-Read-your-own-writes is NOT provided: uncommitted inserts/deletes are
-invisible to the transaction's own scans (a created-in-txn table reads
-as empty until COMMIT). DELETE therefore cannot target rows inserted
-in the same transaction.
+Uncommitted INSERTS are invisible to the transaction's own scans (a
+created-in-txn table reads as empty until COMMIT); buffered DELETES
+ARE masked (see "Read-your-own-DELETES" above), and DML that would
+trip over the insert invisibility is refused rather than allowed to
+commit wrong data.
 
 ## Identifier case
 
@@ -434,14 +439,20 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    own DDL commit's snapshot and papers over it with a racy
    GET /catalogs — return CommitResult-style snapshot info on
    create/alter for a deterministic post-DDL read pin.
-9. No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
+9. The server does NOT enforce the `_hog` reserved column prefix
+   (name validation is pattern-only), despite both clients' comments
+   assuming it — a non-hoglake client can commit a user `_hog_row_id`
+   column that collides with compaction's reserved carrier and breaks
+   name-based readers. The extension and pyhoglake enforce it
+   client-side; the server should too.
+10. No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
    attach can never produce a client-side snapshot id (reads stay
    consistent because the server re-resolves the same timestamp to the
    same snapshot; `hoglake_current_snapshot` errors instead of lying).
    Returning the resolved snapshot id on time-travel responses (or a
    resolve endpoint) would close this.
-10. Environment (not wire): the local dev stack's hydrator hydrates
-   nothing — every deferred-stats file stays `pending` forever
-   (pyhoglake deferred appends included). Blocks rename-column on
-   tables with live client-written files and starves compaction of
-   candidates. Worth a look at the dev-server S3 config.
+11. Environment note (historical): earlier rounds found the dev
+   stack's hydrator hydrating nothing (files stuck `pending`,
+   compaction starved). As of 2026-09-12 the stack hydrates and
+   compacts again; the fixture force-compacts `points` and the
+   suite reads real compaction output (explicit `_hog_row_id`).

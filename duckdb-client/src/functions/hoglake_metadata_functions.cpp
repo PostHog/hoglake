@@ -9,6 +9,7 @@
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/exception/catalog_exception.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "storage/hoglake_catalog.hpp"
@@ -168,7 +169,17 @@ static unique_ptr<GlobalTableFunctionState> TableInfoInit(ClientContext &context
 	auto result = make_uniq<HoglakeTableInfoState>();
 	for (auto &ns : catalog.Api().ListNamespaces()) {
 		for (auto &summary : catalog.Api().ListTables(ns)) {
-			auto table = catalog.Api().TryGetTable(ns, summary.name, transaction.Travel());
+			unique_ptr<HoglakeTableInfo> table;
+			try {
+				table = catalog.Api().TryGetTable(ns, summary.name, transaction.Travel());
+			} catch (CatalogException &) {
+				// unrepresentable wire metadata (e.g. out-of-range
+				// decimal params): skip the table, never break the
+				// whole listing
+				continue;
+			} catch (InvalidInputException &) {
+				continue;
+			}
 			if (!table) {
 				continue;
 			}
@@ -274,7 +285,13 @@ static unique_ptr<FunctionData> MaintenanceBind(ClientContext &context, TableFun
 	auto result = make_uniq<HoglakeMaintenanceData>(catalog, verb);
 	auto entry = input.named_parameters.find("batch");
 	if (entry != input.named_parameters.end() && !entry->second.IsNull()) {
-		result->batch = NumericCast<idx_t>(BigIntValue::Get(entry->second.DefaultCastAs(LogicalType::BIGINT)));
+		auto batch = BigIntValue::Get(entry->second.DefaultCastAs(LogicalType::BIGINT));
+		if (batch < 1 || batch > 2147483647) {
+			// typed error: NumericCast on a negative would throw an
+			// instance-invalidating InternalException
+			throw BinderException("hoglake %s: batch must be in [1, 2^31), got %lld", verb, batch);
+		}
+		result->batch = NumericCast<idx_t>(batch);
 	}
 	names = StringsToIdentifiers({"result"});
 	return_types = {LogicalType::JSON()};

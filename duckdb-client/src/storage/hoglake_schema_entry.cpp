@@ -3,6 +3,7 @@
 #include "duckdb/catalog/entry_lookup_info.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/error_data.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/unordered_set.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
@@ -145,17 +146,32 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::LookupTableInternal(HoglakeTransa
 	if (existing != tables.end()) {
 		return existing->second.get();
 	}
+	auto unrepresentable = unrepresentable_tables.find(resolved);
+	if (unrepresentable != unrepresentable_tables.end()) {
+		// a listing skipped this table with a targeted error; the
+		// direct lookup must surface THAT error (never "does not
+		// exist", and DROP IF EXISTS must not silently no-op)
+		throw CatalogException("%s", unrepresentable->second);
+	}
 	if (all_tables_loaded) {
 		// listed at head but not visible at the pinned travel
 		return nullptr;
 	}
 	auto ns = name.GetIdentifierName();
 	auto travel = transaction.Travel();
-	auto table_info = transaction.Api().TryGetTable(ns, resolved, travel);
-	if (!table_info) {
-		return nullptr;
+	try {
+		auto table_info = transaction.Api().TryGetTable(ns, resolved, travel);
+		if (!table_info) {
+			return nullptr;
+		}
+		return &CacheTableInternal(transaction, std::move(*table_info), travel, false);
+	} catch (CatalogException &ex) {
+		unrepresentable_tables[resolved] = ErrorData(ex).RawMessage();
+		throw;
+	} catch (InvalidInputException &ex) {
+		unrepresentable_tables[resolved] = ErrorData(ex).RawMessage();
+		throw;
 	}
-	return &CacheTableInternal(transaction, std::move(*table_info), travel, false);
 }
 
 void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) {
@@ -175,17 +191,24 @@ void HoglakeSchemaEntry::LoadAllTablesInternal(HoglakeTransaction &transaction) 
 		if (tables.find(exact) != tables.end()) {
 			continue;
 		}
-		auto table_info = transaction.Api().TryGetTable(ns, exact, travel);
-		if (!table_info) {
-			// listed at head but missing at the pinned travel
-			continue;
-		}
+		// the try covers BOTH the fetch (parse-time wire validation,
+		// e.g. out-of-range decimal params, throws there) and entry
+		// construction (case-colliding columns): an unrepresentable
+		// table must never break the LISTING. Remember the targeted
+		// error so a DIRECT lookup after this listing rethrows it
+		// instead of reporting "does not exist".
 		try {
+			auto table_info = transaction.Api().TryGetTable(ns, exact, travel);
+			if (!table_info) {
+				// listed at head but missing at the pinned travel
+				continue;
+			}
 			CacheTableInternal(transaction, std::move(*table_info), travel, false);
-		} catch (CatalogException &) {
-			// unrepresentable table (e.g. case-colliding columns):
-			// direct lookup surfaces the targeted error; the LISTING
-			// must not break for every other table
+		} catch (CatalogException &ex) {
+			unrepresentable_tables[exact] = ErrorData(ex).RawMessage();
+			continue;
+		} catch (InvalidInputException &ex) {
+			unrepresentable_tables[exact] = ErrorData(ex).RawMessage();
 			continue;
 		}
 	}
@@ -467,8 +490,11 @@ static HoglakePartitionField ParsePartitionExpression(const HoglakeTableInfo &wi
 			auto &col_ref = args[1].GetExpression().Cast<ColumnRefExpression>();
 			field.source_field_id = FindFieldId(wire, col_ref.GetColumnName().GetIdentifierName());
 			field.transform = "bucket";
-			field.transform_param =
-			    NumericCast<int32_t>(BigIntValue::Get(n.GetValue().DefaultCastAs(LogicalType::BIGINT)));
+			auto bucket_count = BigIntValue::Get(n.GetValue().DefaultCastAs(LogicalType::BIGINT));
+			if (bucket_count < 1 || bucket_count > 2147483647) {
+				throw BinderException("hoglake: bucket count must be in [1, 2^31), got %lld", bucket_count);
+			}
+			field.transform_param = NumericCast<int32_t>(bucket_count);
 			return field;
 		}
 	}
@@ -542,6 +568,13 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		op.op = "rename_column";
 		op.from = ResolveWireColumn(wire, rename.old_name.GetIdentifierName()).name;
 		op.to = rename.new_name.GetIdentifierName();
+		if (StringUtil::StartsWith(StringUtil::Lower(op.to), RESERVED_COLUMN_PREFIX)) {
+			// see ADD COLUMN: the client is the reservation's
+			// enforcement point
+			throw InvalidInputException("hoglake: column name \"%s\" uses the reserved \"%s\" prefix "
+			                            "(hoglake internal columns, e.g. _hog_row_id)",
+			                            op.to, RESERVED_COLUMN_PREFIX);
+		}
 		// CI-conflict check on the target (server checks exact-case
 		// only; a committed collision makes the table unrepresentable
 		// in DuckDB). Renaming a column onto its own name with a case
@@ -560,6 +593,16 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		auto &col = add.new_column;
 		if (add.if_column_not_exists && table.ColumnExists(col.Name())) {
 			return;
+		}
+		// reserved-prefix check: the server does NOT enforce the _hog
+		// reservation (its name validation is pattern-only), so the
+		// client is the enforcement point — a committed _hog_row_id
+		// user column collides with compaction's reserved row-id
+		// carrier and breaks name-based readers fleet-wide
+		if (StringUtil::StartsWith(StringUtil::Lower(col.Name().GetIdentifierName()), RESERVED_COLUMN_PREFIX)) {
+			throw InvalidInputException("hoglake: column name \"%s\" uses the reserved \"%s\" prefix "
+			                            "(hoglake internal columns, e.g. _hog_row_id)",
+			                            col.Name().GetIdentifierName(), RESERVED_COLUMN_PREFIX);
 		}
 		// CI-conflict check BEFORE the eager server commit (the server
 		// checks exact-case only; a committed CI collision poisons the

@@ -77,15 +77,23 @@ HoglakeTravel HoglakeTransaction::TravelFor(optional_ptr<BoundAtClause> at_claus
 	}
 	auto unit = StringUtil::Lower(at_clause->Unit().GetIdentifierName());
 	if (unit == "version") {
-		auto version = at_clause->GetValue().DefaultCastAs(LogicalType::BIGINT);
-		return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(BigIntValue::Get(version)));
+		auto version = BigIntValue::Get(at_clause->GetValue().DefaultCastAs(LogicalType::BIGINT));
+		if (version < 0) {
+			throw BinderException("hoglake: AT (VERSION => %lld): snapshot versions are non-negative", version);
+		}
+		return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(version));
 	}
 	if (unit == "timestamp") {
 		// server wants an ISO-8601 instant WITH offset; parse with
-		// INSTANT semantics (TIMESTAMP_TZ) so explicit offsets convert
-		// instead of being dropped, then send the canonical UTC form
+		// INSTANT semantics through the session's TIMESTAMPTZ cast so
+		// explicit offsets convert (never dropped) and naive inputs
+		// mean what they mean everywhere else in the session
+		auto context_ptr = context.lock();
+		if (!context_ptr) {
+			throw InternalException("hoglake: transaction context expired while resolving AT (TIMESTAMP)");
+		}
 		HoglakeTravel travel;
-		travel.at_timestamp = HoglakeTypes::CanonicalInstant(at_clause->GetValue());
+		travel.at_timestamp = HoglakeTypes::CanonicalInstant(*context_ptr, at_clause->GetValue());
 		return travel;
 	}
 	throw BinderException("hoglake: unsupported AT unit \"%s\" (VERSION or TIMESTAMP)", unit);
@@ -210,6 +218,23 @@ bool HoglakeTransaction::IsAlteredTable(const string &ns, const string &table) {
 void HoglakeTransaction::RequireDMLAllowed(const string &ns, const string &table, bool is_delete) {
 	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
 	if (is_delete) {
+		// uncommitted INSERTS (from INSERT or an earlier UPDATE's
+		// rewrites) are invisible to this transaction's scans, so a
+		// predicate-bearing DELETE/UPDATE over a table with buffered
+		// appends can silently miss rows it should affect (partial
+		// predicate overlap reports a plausible nonzero count while
+		// committing sequentially-wrong data). Wrong data beats no
+		// data: refuse loudly.
+		for (auto &append : buffered_appends) {
+			if (StringUtil::CIEquals(append.namespace_name, ns) && StringUtil::CIEquals(append.table_name, table)) {
+				throw TransactionException(
+				    "hoglake: cannot DELETE/UPDATE table \"%s.%s\": this transaction already inserted or "
+				    "updated rows in it, and uncommitted inserts are invisible to the transaction's own scans — "
+				    "the statement could silently miss them. COMMIT or ROLLBACK first (see DESIGN.md, "
+				    "\"Transactions and snapshot pinning\")",
+				    ns, table);
+			}
+		}
 		if (altered_tables.find(ns + "." + table) != altered_tables.end()) {
 			throw TransactionException(
 			    "hoglake: cannot DELETE/UPDATE table \"%s.%s\": this transaction already ran DDL on it, and a "

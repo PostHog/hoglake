@@ -44,16 +44,25 @@ def main() -> int:
             table = ns.table(tname)
             files = table.files()
             seen: dict[str, int] = {}
+            compacted = False
             for f in files:
                 assert f.partition_values is not None, f"{tname}: unpartitioned file {f.path}"
+                if getattr(f, "explicit_row_ids", False):
+                    compacted = True
                 key = f.partition_values[0]
                 seen[key] = seen.get(key, 0) + 1
-            # both clients wrote every value => every expected string
-            # has >= 2 files, and NO unexpected string exists (a
-            # divergent encoding would show up as an extra group)
+            # both clients wrote every value => NO unexpected string
+            # exists (a divergent encoding would show up as an extra
+            # group) and every expected string is present. The >=2-files
+            # check additionally proves both clients landed in ONE
+            # group, but only while the background compactor has not
+            # merged them (compaction outputs carry explicit_row_ids and
+            # collapse each group to one file — which is itself proof
+            # the strings were byte-identical, since compaction groups
+            # by exact spec+value equality).
             extra = set(seen) - expected_strings
             missing = expected_strings - set(seen)
-            single = {k: v for k, v in seen.items() if v < 2}
+            single = {} if compacted else {k: v for k, v in seen.items() if v < 2}
             if extra or missing or single:
                 failures += 1
                 print(f"FAIL {tname}:")

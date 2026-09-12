@@ -11,7 +11,8 @@
 
 namespace duckdb {
 
-static void HandleHoglakeOption(HoglakeOptions &options, const string &option, const Value &value) {
+static void HandleHoglakeOption(ClientContext &context, HoglakeOptions &options, const string &option,
+                                const Value &value) {
 	auto lcase = StringUtil::Lower(option);
 	if (lcase == "endpoint") {
 		options.endpoint = value.ToString();
@@ -23,7 +24,13 @@ static void HandleHoglakeOption(HoglakeOptions &options, const string &option, c
 		if (!options.snapshot_time.empty()) {
 			throw InvalidInputException("Cannot specify both SNAPSHOT_VERSION and SNAPSHOT_TIME");
 		}
-		options.snapshot_version = NumericCast<idx_t>(BigIntValue::Get(value.DefaultCastAs(LogicalType::BIGINT)));
+		auto version = BigIntValue::Get(value.DefaultCastAs(LogicalType::BIGINT));
+		if (version < 0) {
+			// a plain typed error: an InternalException here (the old
+			// NumericCast) would invalidate the ENTIRE DuckDB instance
+			throw InvalidInputException("SNAPSHOT_VERSION must be non-negative, got %lld", version);
+		}
+		options.snapshot_version = NumericCast<idx_t>(version);
 	} else if (lcase == "snapshot_time") {
 		if (options.snapshot_version.IsValid()) {
 			throw InvalidInputException("Cannot specify both SNAPSHOT_VERSION and SNAPSHOT_TIME");
@@ -32,7 +39,7 @@ static void HandleHoglakeOption(HoglakeOptions &options, const string &option, c
 		// accepts, with INSTANT semantics (explicit offsets convert to
 		// UTC instead of being dropped; naive timestamps follow the
 		// session TimeZone — UTC by default)
-		options.snapshot_time = HoglakeTypes::CanonicalInstant(value);
+		options.snapshot_time = HoglakeTypes::CanonicalInstant(context, value);
 	} else {
 		throw NotImplementedException("Unsupported option %s for hoglake", option);
 	}
@@ -59,7 +66,7 @@ static unique_ptr<Catalog> HoglakeAttach(optional_ptr<StorageExtensionInfo> stor
 	HoglakeOptions options;
 	ParseAttachPath(options, info.path);
 	for (auto &entry : attach_options.options) {
-		HandleHoglakeOption(options, entry.first, entry.second);
+		HandleHoglakeOption(context, options, entry.first, entry.second);
 	}
 	if (options.endpoint.empty()) {
 		Value endpoint_setting;
@@ -76,6 +83,17 @@ static unique_ptr<Catalog> HoglakeAttach(optional_ptr<StorageExtensionInfo> stor
 		throw InvalidInputException("hoglake: no catalog name in attach path");
 	}
 	options.access_mode = attach_options.access_mode;
+	if (options.create_if_not_exists &&
+	    (attach_options.access_mode == AccessMode::READ_ONLY || options.snapshot_version.IsValid() ||
+	     !options.snapshot_time.empty())) {
+		// CREATE_IF_NOT_EXISTS is a control-plane mutation (POST
+		// /catalogs): a read-only or snapshot-pinned attach must never
+		// perform it (and pinning into a would-be-new catalog is
+		// meaningless anyway)
+		throw InvalidInputException(
+		    "hoglake: CREATE_IF_NOT_EXISTS cannot be combined with READ_ONLY or SNAPSHOT_VERSION/SNAPSHOT_TIME: "
+		    "creating the catalog is a server-side mutation");
+	}
 	if (options.snapshot_version.IsValid() || !options.snapshot_time.empty()) {
 		if (attach_options.access_mode == AccessMode::READ_WRITE) {
 			throw InvalidInputException("SNAPSHOT_VERSION / SNAPSHOT_TIME can only be used in read-only mode");

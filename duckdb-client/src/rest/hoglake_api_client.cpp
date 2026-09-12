@@ -69,6 +69,27 @@ string GetString(yyjson_val *obj, const char *key, const string &default_value =
 	return string(yyjson_get_str(val), yyjson_get_len(val));
 }
 
+//! Wire integers that feed NumericCast / narrow struct fields MUST be
+//! range-checked at parse time: an out-of-range value would otherwise
+//! throw InternalException downstream, which DuckDB escalates to
+//! whole-instance invalidation. Malformed wire data must be a clean,
+//! catchable IOException instead.
+int64_t GetBoundedInt(yyjson_val *obj, const char *key, int64_t min_value, int64_t max_value,
+                      int64_t default_value = 0) {
+	auto val = yyjson_obj_get(obj, key);
+	if (!val || yyjson_is_null(val)) {
+		return default_value;
+	}
+	if (!yyjson_is_int(val) && !yyjson_is_uint(val)) {
+		throw IOException("hoglake: expected integer for field \"%s\" in server response", key);
+	}
+	auto result = yyjson_get_sint(val);
+	if (result < min_value || result > max_value) {
+		throw IOException("hoglake: field \"%s\" in server response is out of range (%lld)", key, result);
+	}
+	return result;
+}
+
 int64_t GetInt(yyjson_val *obj, const char *key, int64_t default_value = 0) {
 	auto val = yyjson_obj_get(obj, key);
 	if (!val || yyjson_is_null(val)) {
@@ -92,8 +113,8 @@ HoglakeCatalogInfo ParseCatalogInfo(yyjson_val *obj) {
 	HoglakeCatalogInfo info;
 	info.name = GetString(obj, "name");
 	info.data_path = GetString(obj, "data_path");
-	info.head_snapshot_id = GetInt(obj, "head_snapshot_id");
-	info.schema_version = GetInt(obj, "schema_version");
+	info.head_snapshot_id = GetBoundedInt(obj, "head_snapshot_id", 0, 9223372036854775807LL);
+	info.schema_version = GetBoundedInt(obj, "schema_version", 0, 9223372036854775807LL);
 	info.earliest_snapshot_time = GetString(obj, "earliest_snapshot_time");
 	return info;
 }
@@ -103,12 +124,14 @@ HoglakeColumn ParseColumn(yyjson_val *obj) {
 	col.name = GetString(obj, "name");
 	col.type = GetString(obj, "type");
 	col.nullable = GetBool(obj, "nullable", true);
-	col.field_id = GetInt(obj, "field_id");
-	col.ordinal = NumericCast<int32_t>(GetInt(obj, "ordinal"));
+	// field ids are parquet field ids: [0, 2^31) (2147483646 is the
+	// reserved _hog_row_id id)
+	col.field_id = GetBoundedInt(obj, "field_id", 0, 2147483647);
+	col.ordinal = NumericCast<int32_t>(GetBoundedInt(obj, "ordinal", 0, 2147483647));
 	auto params = yyjson_obj_get(obj, "type_params");
 	if (params && yyjson_is_obj(params)) {
-		col.precision = NumericCast<int32_t>(GetInt(params, "precision"));
-		col.scale = NumericCast<int32_t>(GetInt(params, "scale"));
+		col.precision = NumericCast<int32_t>(GetBoundedInt(params, "precision", 0, 2147483647));
+		col.scale = NumericCast<int32_t>(GetBoundedInt(params, "scale", 0, 2147483647));
 	}
 	return col;
 }
@@ -123,7 +146,7 @@ HoglakePartitionSpec ParsePartitionSpec(yyjson_val *obj) {
 		HoglakePartitionField pf;
 		pf.source_field_id = GetInt(field, "source_field_id");
 		pf.transform = GetString(field, "transform");
-		pf.transform_param = NumericCast<int32_t>(GetInt(field, "transform_param"));
+		pf.transform_param = NumericCast<int32_t>(GetBoundedInt(field, "transform_param", 0, 2147483647));
 		spec.fields.push_back(std::move(pf));
 	}
 	return spec;
@@ -157,7 +180,22 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 	size_t idx, max;
 	yyjson_val *col;
 	yyjson_arr_foreach(columns, idx, max, col) {
-		info.columns.push_back(ParseColumn(col));
+		auto parsed = ParseColumn(col);
+		// belt-and-braces (the type mapper validates again): reject
+		// out-of-range decimal params HERE with a message naming the
+		// table — a bad value from the wire must be a targeted,
+		// catchable error, never an instance-invalidating
+		// InternalException from LogicalType::DECIMAL
+		if (parsed.type == "decimal" &&
+		    (parsed.precision < 1 || parsed.precision > 38 || parsed.scale < 0 ||
+		     parsed.scale > parsed.precision)) {
+			throw CatalogException(
+			    "hoglake: table \"%s\" column \"%s\" has decimal type_params outside DuckDB's range "
+			    "(precision %d, scale %d; DuckDB requires 1 <= precision <= 38, 0 <= scale <= precision). "
+			    "Repair the table via another client",
+			    info.name, parsed.name, parsed.precision, parsed.scale);
+		}
+		info.columns.push_back(std::move(parsed));
 	}
 	auto spec = yyjson_obj_get(obj, "partition_spec");
 	if (spec && yyjson_is_obj(spec)) {
@@ -191,18 +229,26 @@ HoglakeCommitResult ParseCommitResult(yyjson_val *obj) {
 
 HoglakeDataFile ParseDataFile(yyjson_val *obj) {
 	HoglakeDataFile file;
-	file.data_file_id = GetInt(obj, "data_file_id");
+	static constexpr int64_t MAX_I64 = 9223372036854775807LL;
+	file.data_file_id = GetBoundedInt(obj, "data_file_id", 0, MAX_I64);
 	file.path = GetString(obj, "path");
 	file.file_format = GetString(obj, "file_format");
-	file.record_count = GetInt(obj, "record_count");
-	file.file_size_bytes = GetInt(obj, "file_size_bytes");
-	file.footer_size = GetInt(obj, "footer_size");
-	file.row_id_start = GetInt(obj, "row_id_start");
+	file.record_count = GetBoundedInt(obj, "record_count", 0, MAX_I64);
+	file.file_size_bytes = GetBoundedInt(obj, "file_size_bytes", 0, MAX_I64);
+	file.footer_size = GetBoundedInt(obj, "footer_size", 0, MAX_I64);
+	file.row_id_start = GetBoundedInt(obj, "row_id_start", 0, MAX_I64);
 	file.stats_state = GetString(obj, "stats_state");
-	file.begin_snapshot = GetInt(obj, "begin_snapshot");
+	file.begin_snapshot = GetBoundedInt(obj, "begin_snapshot", 0, MAX_I64);
 	auto spec_id = yyjson_obj_get(obj, "spec_id");
 	if (spec_id && !yyjson_is_null(spec_id)) {
-		file.spec_id = NumericCast<idx_t>(yyjson_get_sint(spec_id));
+		auto raw_spec = yyjson_get_sint(spec_id);
+		if (!yyjson_is_int(spec_id) && !yyjson_is_uint(spec_id)) {
+			throw IOException("hoglake: malformed spec_id in server response");
+		}
+		if (raw_spec < 0) {
+			throw IOException("hoglake: negative spec_id in server response");
+		}
+		file.spec_id = NumericCast<idx_t>(raw_spec);
 	}
 	auto values = yyjson_obj_get(obj, "partition_values");
 	if (values && yyjson_is_arr(values)) {
@@ -226,13 +272,14 @@ HoglakeDataFile ParseDataFile(yyjson_val *obj) {
 
 HoglakeDeleteFile ParseDeleteFile(yyjson_val *obj) {
 	HoglakeDeleteFile file;
-	file.delete_file_id = GetInt(obj, "delete_file_id");
-	file.data_file_id = GetInt(obj, "data_file_id");
+	static constexpr int64_t MAX_I64 = 9223372036854775807LL;
+	file.delete_file_id = GetBoundedInt(obj, "delete_file_id", 0, MAX_I64);
+	file.data_file_id = GetBoundedInt(obj, "data_file_id", 0, MAX_I64);
 	file.path = GetString(obj, "path");
 	file.file_format = GetString(obj, "file_format");
-	file.delete_count = GetInt(obj, "delete_count");
-	file.file_size_bytes = GetInt(obj, "file_size_bytes");
-	file.begin_snapshot = GetInt(obj, "begin_snapshot");
+	file.delete_count = GetBoundedInt(obj, "delete_count", 0, MAX_I64);
+	file.file_size_bytes = GetBoundedInt(obj, "file_size_bytes", 0, MAX_I64);
+	file.begin_snapshot = GetBoundedInt(obj, "begin_snapshot", 0, MAX_I64);
 	return file;
 }
 
@@ -774,7 +821,7 @@ HoglakeApiClient::SnapshotPage HoglakeApiClient::ListSnapshots(idx_t after, idx_
 	yyjson_val *snap;
 	yyjson_arr_foreach(snapshots, idx, max, snap) {
 		HoglakeSnapshotInfo info;
-		info.snapshot_id = GetInt(snap, "snapshot_id");
+		info.snapshot_id = GetBoundedInt(snap, "snapshot_id", 0, 9223372036854775807LL);
 		info.snapshot_time = GetString(snap, "snapshot_time");
 		info.schema_version = GetInt(snap, "schema_version");
 		info.author = GetString(snap, "author");

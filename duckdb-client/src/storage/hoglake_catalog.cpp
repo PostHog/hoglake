@@ -44,6 +44,12 @@ void HoglakeCatalog::Initialize(bool load_builtin) {
 			throw InvalidInputException(
 			    "hoglake: CREATE_IF_NOT_EXISTS requires DATA_PATH (an s3:// URI the catalog owns)");
 		}
+		if (GetAttached().IsReadOnly()) {
+			// defense in depth (the attach option combination is already
+			// refused): a read-only attach must never POST /catalogs
+			throw InvalidInputException(
+			    "hoglake: refusing to create catalog \"%s\" from a read-only attach", options.catalog_name);
+		}
 		auto created = api_client->CreateCatalog(options.data_path);
 		data_path = created.data_path;
 		return;

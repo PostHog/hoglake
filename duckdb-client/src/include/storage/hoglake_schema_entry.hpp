@@ -84,6 +84,11 @@ private:
 	//! name(s) sharing that CI key
 	case_insensitive_map_t<vector<string>> table_names;
 	bool table_names_loaded = false;
+	//! tables a listing (or lookup) skipped as unrepresentable in
+	//! DuckDB (case-colliding columns, out-of-range wire metadata):
+	//! exact server name -> the targeted error, rethrown on direct
+	//! lookup so existence is never misreported as "does not exist"
+	case_insensitive_map_t<string> unrepresentable_tables;
 	//! tables dropped by THIS transaction (eager server drop): the pin
 	//! predates the drop, so server reads would resurrect them —
 	//! filtered out of every lookup/listing (exact server names)

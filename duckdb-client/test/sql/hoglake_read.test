@@ -15,6 +15,17 @@ require-env HOGLAKE_URL
 # host:port of the dev MinIO, e.g. localhost:9000
 require-env DUCKEXT_S3_ENDPOINT
 
+# fixture-exported time-travel snapshot ids (test/fixtures/live-env.sh)
+require-env DUCKEXT_POINTS_SNAP_V1
+
+require-env DUCKEXT_POINTS_SNAP_V2
+
+require-env DUCKEXT_POINTS_T1
+
+require-env DUCKEXT_POINTS_T1_PLUS2
+
+require-env DUCKEXT_EVO_SNAP_V1
+
 statement ok
 CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
     ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
@@ -47,21 +58,26 @@ SELECT rowid, id FROM lake.ns1.points ORDER BY rowid
 3	4
 4	5
 
-# two files (one per append batch)
+# LAYOUT assertions are pinned AT the second batch's snapshot: the dev
+# stack's background compactor may merge the two files at HEAD any
+# time after the fixture ran (time travel keeps the historical layout,
+# and compaction outputs never change VALUES — value assertions above
+# stay on head)
 query I
-SELECT count(DISTINCT filename) FROM lake.ns1.points
+SELECT count(DISTINCT filename) FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V2})
 ----
 2
 
 # two snapshots wrote the data
 query I
-SELECT count(DISTINCT snapshot_id) FROM lake.ns1.points
+SELECT count(DISTINCT snapshot_id) FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V2})
 ----
 2
 
 # batch alignment: the second batch's rows carry the newer snapshot
 query II
-SELECT id, snapshot_id = (SELECT max(snapshot_id) FROM lake.ns1.points) FROM lake.ns1.points ORDER BY id
+SELECT id, snapshot_id = (SELECT max(snapshot_id) FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V2}))
+    FROM lake.ns1.points AT (VERSION => {DUCKEXT_POINTS_SNAP_V2}) ORDER BY id
 ----
 1	false
 2	false
@@ -142,16 +158,6 @@ DETACH lake
 # DUCKEXT_POINTS_SNAP_V1 = the first batch's commit, V2 = the second's;
 # head has 5 rows, V1 has 3 — a head-reading AT implementation FAILS
 # these) ----
-
-require-env DUCKEXT_POINTS_SNAP_V1
-
-require-env DUCKEXT_POINTS_SNAP_V2
-
-require-env DUCKEXT_POINTS_T1
-
-require-env DUCKEXT_POINTS_T1_PLUS2
-
-require-env DUCKEXT_EVO_SNAP_V1
 
 statement ok
 ATTACH 'hoglake:duckext-read' AS lake (ENDPOINT '{HOGLAKE_URL}')

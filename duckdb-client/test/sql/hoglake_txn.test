@@ -205,10 +205,12 @@ SELECT a FROM lake.ns1.ryo_txn_a ORDER BY a
 11
 12
 
-# (b) two unpredicated UPDATEs: no doubling. The second UPDATE reports
-# 0 rows — the first UPDATE's rewritten rows are uncommitted INSERTS,
-# which this transaction's scans do not see (documented divergence;
-# DESIGN.md "Transactions and snapshot pinning")
+# (b) any DELETE/UPDATE after this transaction inserted or updated
+# rows in the same table is REFUSED: uncommitted inserts are invisible
+# to the transaction's own scans, so a later predicate could silently
+# miss rewritten rows (partial overlap would even report a plausible
+# nonzero count). Round 3 replaced the earlier 0-rows quirk with this
+# loud refusal — wrong data beats no data.
 statement ok
 BEGIN
 
@@ -217,20 +219,54 @@ UPDATE lake.ns1.ryo_txn_b SET a = a + 10
 ----
 3
 
-query I
+statement error
 UPDATE lake.ns1.ryo_txn_b SET a = a + 100
 ----
-0
+<REGEX>:.*uncommitted inserts are invisible.*
 
 statement ok
-COMMIT
+ROLLBACK
+
+# the partial-overlap corruption shape (R3-6: UPDATE a=1 -> 3, then
+# DELETE a=3 committed {2,3} instead of the sequential {2}) is the
+# same refusal
+statement ok
+BEGIN
+
+query I
+UPDATE lake.ns1.ryo_txn_b SET a = 3 WHERE a = 1
+----
+1
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_b WHERE a = 3
+----
+<REGEX>:.*uncommitted inserts are invisible.*
+
+statement ok
+ROLLBACK
+
+# INSERT-then-DELETE on one table is the same hazard class
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (50)
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_b WHERE a = 50
+----
+<REGEX>:.*uncommitted inserts are invisible.*
+
+statement ok
+ROLLBACK
 
 query I
 SELECT a FROM lake.ns1.ryo_txn_b ORDER BY a
 ----
-11
-12
-13
+1
+2
+3
 
 # ---- DML after eager DDL on the same table: a commit carrying
 # deletes would 409 against the transaction's own ALTER — refused
@@ -287,6 +323,73 @@ DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
 
 statement ok
 ROLLBACK
+
+# rule (c): INSERT into an ALTERed table while buffered deletes exist
+# — the commit would carry deletes and conflict-check the altered
+# table via its append
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+1
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b ADD COLUMN c2 INTEGER
+
+statement error
+INSERT INTO lake.ns1.ryo_txn_b VALUES (7, 7)
+----
+<REGEX>:.*ran DDL on it and also holds buffered deletes.*
+
+statement ok
+ROLLBACK
+
+# ---- combined delete-mask branch: a file with BOTH a committed
+# server-live DV and same-transaction buffered deletes; a merge
+# regression (overwrite instead of union) would resurrect the
+# committed-deleted row through the UPDATE ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_dv
+
+statement ok
+CREATE TABLE lake.ns1.ryo_dv (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_dv VALUES (1), (2), (3), (4), (5)
+
+# committed DV on the file
+query I
+DELETE FROM lake.ns1.ryo_dv WHERE a = 1
+----
+1
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_dv WHERE a = 2
+----
+1
+
+# the UPDATE's scan must apply committed DV ∪ buffered positions:
+# neither 1 nor 2 may be resurrected
+query I
+UPDATE lake.ns1.ryo_dv SET a = a + 10
+----
+3
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.ryo_dv ORDER BY a
+----
+13
+14
+15
 
 statement ok
 DETACH lake

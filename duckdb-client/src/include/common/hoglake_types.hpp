@@ -9,6 +9,10 @@
 #include "common/hoglake_wire.hpp"
 
 namespace duckdb {
+class ClientContext;
+}
+
+namespace duckdb {
 
 struct HoglakeTypes {
 	//! Wire column -> DuckDB type. Throws on unknown type strings.
@@ -25,10 +29,13 @@ struct HoglakeTypes {
 	//! Canonical wire date string (date.isoformat(): YYYY-MM-DD).
 	static string CanonicalDate(date_t date);
 	//! Canonical ISO-8601 UTC instant ("...Z") from ANY timestamp-ish
-	//! Value, parsed with INSTANT semantics via TIMESTAMP_TZ: explicit
-	//! numeric offsets are honored (never dropped), naive inputs follow
-	//! the session TimeZone (UTC unless ICU changes it).
-	static string CanonicalInstant(const Value &value);
+	//! Value, parsed with INSTANT semantics through the SESSION's
+	//! TIMESTAMPTZ cast (context-aware, so ICU's session-TimeZone cast
+	//! applies when loaded): explicit numeric offsets are honored
+	//! (never dropped); naive inputs mean exactly what the same
+	//! literal's ::TIMESTAMPTZ cast means in this session — the
+	//! session TimeZone under ICU, UTC in ICU-less builds.
+	static string CanonicalInstant(ClientContext &context, const Value &value);
 };
 
 } // namespace duckdb

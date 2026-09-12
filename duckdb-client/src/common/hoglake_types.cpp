@@ -5,6 +5,7 @@
 #include "duckdb/common/types/date.hpp"
 #include "duckdb/common/types/time.hpp"
 #include "duckdb/common/types/timestamp.hpp"
+#include "duckdb/main/client_context.hpp"
 
 namespace duckdb {
 
@@ -50,6 +51,16 @@ LogicalType HoglakeTypes::ToDuckDBType(const HoglakeColumn &column) {
 		if (column.precision <= 0) {
 			throw InvalidInputException("hoglake decimal column \"%s\" is missing precision/scale type_params",
 			                            column.name);
+		}
+		// validate BEFORE constructing: out-of-range values would make
+		// NumericCast / LogicalType::DECIMAL throw InternalException,
+		// which DuckDB escalates to whole-instance invalidation. Wire
+		// data must only ever produce catchable errors.
+		if (column.precision > 38 || column.scale < 0 || column.scale > column.precision) {
+			throw InvalidInputException(
+			    "hoglake decimal column \"%s\" has type_params outside DuckDB's range (precision %d, scale %d; "
+			    "DuckDB requires 1 <= precision <= 38, 0 <= scale <= precision)",
+			    column.name, column.precision, column.scale);
 		}
 		return LogicalType::DECIMAL(NumericCast<uint8_t>(column.precision), NumericCast<uint8_t>(column.scale));
 	}
@@ -126,12 +137,20 @@ string HoglakeTypes::CanonicalTimestamp(timestamp_t timestamp) {
 	return result;
 }
 
-string HoglakeTypes::CanonicalInstant(const Value &value) {
+string HoglakeTypes::CanonicalInstant(ClientContext &context, const Value &value) {
 	// TIMESTAMP_TZ parsing has instant semantics: '...+02:00' converts
 	// to the UTC instant instead of silently dropping the offset (which
 	// a naive-TIMESTAMP cast does). The stored representation IS micros
 	// since epoch UTC.
-	auto tz_value = value.DefaultCastAs(LogicalType::TIMESTAMP_TZ);
+	//
+	// The cast MUST run through the client context (never
+	// Value::DefaultCastAs, whose bare CastFunctionSet ignores
+	// DBConfig): with ICU loaded, the session-TimeZone-aware
+	// VARCHAR/TIMESTAMP -> TIMESTAMPTZ cast lives in DBConfig's set,
+	// so a naive input means exactly what the same literal means in
+	// any query-level cast of the session. Without ICU (this repo's
+	// test build), the engine's default cast treats naive as UTC.
+	auto tz_value = value.CastAs(context, LogicalType::TIMESTAMP_TZ);
 	auto micros = TimestampTZValue::Get(tz_value);
 	return CanonicalTimestamp(timestamp_t(micros.value)) + "Z";
 }

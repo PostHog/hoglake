@@ -201,3 +201,24 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
 - Verified 2026-09-11: ./test/run-live-tests.sh fully green — 9
   sqllogictest files / 515 assertions + 4 cross-client partition
   groups byte-shared.
+
+## Review round 3 — all 13 confirmed + 1 unverified finding fixed: DONE
+- Theme: InternalException = instance death. Full 45-site NumericCast/
+  LogicalType sweep dispatched (parse-time wire bounds via
+  GetBoundedInt, decimal params validated naming the table, typed
+  errors for every user-supplied number); listing containment widened
+  (both throw layers, table_info too) with remembered
+  unrepresentable-table errors (order-independent lookups, loud DROP
+  IF EXISTS); session-TimeZone semantics actually implemented
+  (context-bearing TIMESTAMPTZ cast); partial-overlap DML silent
+  wrongness closed by refusing DELETE/UPDATE after own inserts;
+  reserved _hog enforced on ALTER targets; create-catalog refused on
+  read-only/pinned attaches; duplicate-path DELETE registers the DV
+  for every live data_file_id (unverified finding confirmed+fixed).
+  Dispositions + R2 corrections: REVIEW-FINDINGS-R3.md / -R2.md.
+- Environment: the dev stack's hydrator/compactor revived — fixture
+  force-compacts points and hoglake_compacted_read.test now reads a
+  REAL compaction output (explicit _hog_row_id, row ids preserved);
+  compaction-fragile layout asserts pinned via time travel.
+- Verified 2026-09-12: ./test/run-live-tests.sh fully green — 11
+  sqllogictest files / 592 assertions + cross-client wire check.
