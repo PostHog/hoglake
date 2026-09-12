@@ -1,15 +1,34 @@
 # Substituted by the nginx image entrypoint (envsubst on
 # /etc/nginx/templates/*.template): ${HOGLAKE_API} is the control-plane
-# base URL.
-# NOTE: static proxy_pass resolves ${HOGLAKE_API}'s hostname ONCE at
-# nginx startup — the upstream name must resolve when the container
-# boots (in k8s the Service DNS record exists as soon as the Service
-# object does; for bare docker runs, create the server container or a
-# network alias first, or nginx exits [emerg] host not found).
+# base URL, ${HOGLAKE_DNS_RESOLVER} the nameserver used for RUNTIME
+# upstream resolution (derived from /etc/resolv.conf by
+# 10-resolver.envsh; 127.0.0.11 fallback for bare docker).
+#
+# proxy_pass uses a VARIABLE on purpose: a literal upstream is resolved
+# once at nginx startup, so the container crash-loops until the server's
+# DNS record exists (the gigahog first-sync finding, hoglake#4). With a
+# variable, nginx resolves per-request through `resolver` and the
+# console boots regardless of ordering; /v1 requests fail with 502
+# until the server appears, then heal without a restart.
+#
+# NOTE: nginx's resolver ignores /etc/resolv.conf search domains, so
+# ${HOGLAKE_API} must use a fully qualified hostname (or an IP) — in
+# k8s, the Service's full form
+# (e.g. http://gigahog-server.gigahog.svc.cluster.local:8080).
 server {
     listen 8080;
     root /usr/share/nginx/html;
     index index.html;
+
+    resolver ${HOGLAKE_DNS_RESOLVER} valid=30s;
+
+    # Probe endpoint: static 200, independent of the SPA fallback and
+    # of the API proxy — "nginx is up", nothing more. Kubernetes
+    # liveness/readiness for the console point here.
+    location = /health {
+        default_type text/plain;
+        return 200 "ok\n";
+    }
 
     # SPA routes: anything that is not a file falls back to index.html.
     location / {
@@ -17,20 +36,24 @@ server {
     }
 
     # Same-origin API paths, mirroring vite.config.ts's dev proxy.
+    # With a variable proxy_pass and no URI part, nginx forwards the
+    # original request URI unchanged — identical routing to the old
+    # literal form.
+    set $hoglake_api ${HOGLAKE_API};
     location /v1/ {
-        proxy_pass ${HOGLAKE_API};
+        proxy_pass $hoglake_api;
         # Snapshot listings and scan plans can be slow on big catalogs;
         # keep the proxy budget above the server's own work, not at
         # nginx's 60s default.
         proxy_read_timeout 120s;
     }
     location = /healthz {
-        proxy_pass ${HOGLAKE_API};
+        proxy_pass $hoglake_api;
     }
     location = /metrics {
-        proxy_pass ${HOGLAKE_API};
+        proxy_pass $hoglake_api;
     }
     location = /openapi.yaml {
-        proxy_pass ${HOGLAKE_API};
+        proxy_pass $hoglake_api;
     }
 }
