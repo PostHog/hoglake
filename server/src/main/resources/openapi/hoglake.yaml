@@ -16,6 +16,50 @@ info:
 servers:
   - url: /v1
 paths:
+  # ---- operational endpoints (served at the ROOT, not under /v1) ----
+  # Probe guidance: liveness -> /livez (process-only; a database outage
+  # must NOT restart pods), readiness -> /healthz (catalog reachability;
+  # an unready pod leaves the Service). The webui serves its own static
+  # /health for its probes and proxies /healthz, /metrics and
+  # /openapi.yaml through to the server.
+  /livez:
+    servers: [{ url: / }]
+    get:
+      operationId: livez
+      summary: >
+        Process liveness only — never touches the database. Use as the
+        Kubernetes liveness probe; using /healthz for liveness restarts
+        every pod during a database outage.
+      responses:
+        "200":
+          description: The process is up.
+          content:
+            text/plain:
+              schema: { type: string, example: ok }
+  /healthz:
+    servers: [{ url: / }]
+    get:
+      operationId: healthz
+      summary: >
+        Readiness — the catalog database must answer (SELECT 1 through
+        the pool, fail-fast on a dead pool). Use as the Kubernetes
+        readiness probe.
+      responses:
+        "200":
+          description: The catalog is reachable.
+        "503":
+          description: The catalog is unreachable or the pool is dead.
+  /metrics:
+    servers: [{ url: / }]
+    get:
+      operationId: metrics
+      summary: Prometheus text exposition (scrape endpoint).
+      responses:
+        "200":
+          description: Prometheus 0.0.4 text format.
+          content:
+            text/plain: {}
+
   /catalogs:
     get:
       operationId: listCatalogs

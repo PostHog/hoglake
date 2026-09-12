@@ -55,14 +55,22 @@ jobs:
           # nginx a resolvable alias so the smoke tests OUR config, not
           # DNS.
           docker network create smoke-net
-          docker run -d --name fake-api --network smoke-net --network-alias hoglake-server alpine sleep 300
+          # No upstream on purpose: runtime DNS resolution means the
+          # console must boot and probe green with the server absent
+          # (the gigahog first-sync ordering finding, hoglake#4).
           docker run -d --name smoke --network smoke-net -p 8081:8080 hoglake-webui:ci
           for _ in $(seq 1 15); do
-            if curl -fsS -m 2 http://localhost:8081/ >/dev/null; then ok=1; break; fi
+            if curl -fsS -m 2 http://localhost:8081/health >/dev/null; then ok=1; break; fi
             sleep 1
           done
           docker logs smoke | tail -5
           [ "${ok:-}" = "1" ]
+          # SPA still serves, and a proxied path fails soft (502/504
+          # from nginx), never a container crash.
+          curl -fsS -m 2 http://localhost:8081/ >/dev/null
+          code=$(curl -s -o /dev/null -m 5 -w "%{http_code}" http://localhost:8081/healthz)
+          echo "proxied /healthz without upstream -> $code"
+          case "$code" in 502|504) : ;; *) echo "expected 502/504"; exit 1 ;; esac
 
   deploy:
     # GATED ON CI — see server.yml's deploy job for the decision note.

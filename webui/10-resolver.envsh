@@ -1,0 +1,10 @@
+# Sourced by the nginx image entrypoint BEFORE template envsubst
+# (docker-entrypoint.sh sources *.envsh in /docker-entrypoint.d).
+# Derive the runtime DNS resolver for nginx's `resolver` directive from
+# the container's own resolv.conf (kube-dns in k8s, 127.0.0.11 in
+# docker); an explicit HOGLAKE_DNS_RESOLVER env wins.
+if [ -z "${HOGLAKE_DNS_RESOLVER:-}" ]; then
+  HOGLAKE_DNS_RESOLVER="$(awk '/^nameserver/ { print $2; exit }' /etc/resolv.conf 2>/dev/null)"
+  HOGLAKE_DNS_RESOLVER="${HOGLAKE_DNS_RESOLVER:-127.0.0.11}"
+  export HOGLAKE_DNS_RESOLVER
+fi

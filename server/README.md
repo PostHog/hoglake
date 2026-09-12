@@ -512,6 +512,25 @@ as a first-class consumer offset (so the retention floor protects
 unpublished ranges automatically). Fully specified in the OpenAPI
 (endpoints return 501) so clients can build against the shape.
 
+## Operational endpoints and probe contracts
+
+Served at the root (not under `/v1`), documented in
+`openapi/hoglake.yaml`:
+
+| Endpoint | What | Kubernetes probe |
+|---|---|---|
+| `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
+| `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` through the pool, fail-fast on a dead pool; the zombie-server incident is why) | **readiness** (an unready pod leaves the Service) |
+| `GET /metrics` | Prometheus text exposition | scrape target, never a probe |
+
+The webui container serves its own static `GET /health` (nginx `return
+200`, independent of the SPA fallback and the API proxy) as its probe
+target, and proxies `/healthz`, `/metrics` and `/openapi.yaml` through
+to the server. Its upstream is resolved at request time (nginx
+`resolver` + variable `proxy_pass`), so the console boots and probes
+green whether or not the server exists yet; proxied paths return
+502 until it does, then heal without a restart.
+
 ## Dev environment
 
 Toolchain via [flox](https://flox.dev) (JDK 21); Gradle via the
