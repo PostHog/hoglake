@@ -257,4 +257,54 @@ class ScanAndDeleteApiTest {
                 "bad_request",
             )
         }
+
+    /**
+     * Wire pin for issue #12's scenario: two delete-file registrations
+     * for one data file in a single commit. validateRequest has always
+     * refused this (the one-live-DV batch in applyDeletes is never
+     * reached) — this pins the 422 CONTRACT at the HTTP layer so the
+     * guard can never silently regress into the unique-index 500 the
+     * issue feared.
+     */
+    @Test
+    fun `commit with two deletion vectors for one data file is a 422 naming the file`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "dvdup", "data_path": "s3://hog/dvdup"}""")
+            client.postJson("/v1/catalogs/dvdup/namespaces", """{"name": "ns"}""")
+            client.postJson(
+                "/v1/catalogs/dvdup/namespaces/ns/tables",
+                """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+            client.postJson(
+                "/v1/catalogs/dvdup/commit",
+                """
+            {"appends": [{"namespace": "ns", "table": "t", "files": [
+               {"path": "s3://hog/dvdup/f1.parquet", "record_count": 3, "file_size_bytes": 100}]}]}
+            """,
+            )
+
+            val head = body(client.get("/v1/catalogs/dvdup"))["head_snapshot_id"].asLong()
+            val dup =
+                client.postJson(
+                    "/v1/catalogs/dvdup/commit",
+                    """
+            {"read_snapshot": $head, "deletes": [{"namespace": "ns", "table": "t", "files": [
+               {"data_file_id": 1, "path": "s3://hog/dvdup/dv-a.puffin",
+                "delete_count": 1, "file_size_bytes": 64},
+               {"data_file_id": 1, "path": "s3://hog/dvdup/dv-b.puffin",
+                "delete_count": 2, "file_size_bytes": 64}]}]}
+            """,
+                )
+            assertThat(dup.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            val err = body(dup)
+            assertThat(err["error"].asText()).isEqualTo("validation")
+            assertThat(err["detail"].asText())
+                .contains("duplicate delete target data_file_id 1")
+
+            // Nothing committed: the head did not advance and no DV exists.
+            assertThat(body(client.get("/v1/catalogs/dvdup"))["head_snapshot_id"].asLong())
+                .isEqualTo(head)
+            val scan = body(client.get("/v1/catalogs/dvdup/namespaces/ns/tables/t/scan"))
+            assertThat(scan[0].has("delete_file")).isFalse()
+        }
 }
