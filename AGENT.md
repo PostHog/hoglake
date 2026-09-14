@@ -76,6 +76,7 @@ path-scoped per component, posthog-monorepo style:
 | `server.yml` | `server/**`, codec vectors | test + ktlint and :trino:test as parallel jobs (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job |
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest (unit/mocked layer — live integration is local, per the pre-push checklist) |
+| `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow or `pyhoglake/pyproject.toml` | ruff, pytest matrix (3.11–3.13), build, wheel smoke test; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
 
