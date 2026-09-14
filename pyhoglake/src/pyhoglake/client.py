@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import struct
 import uuid as _uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Self
@@ -42,6 +42,7 @@ from .models import (
     ConsumerOffset,
     DataFile,
     ExpiryResult,
+    PartitionSpec,
     ScanFile,
     Snapshot,
     TableInfo,
@@ -711,8 +712,9 @@ class Table:
         target_schema = columns_to_arrow_schema(info.columns)
         data = _align_table(data, target_schema)
 
-        partitioned = info.partition_spec is not None and info.partition_spec.fields
-        if partitioned:
+        groups: Sequence[tuple[tuple[str | None, ...] | None, pa.Table]]
+        spec = info.partition_spec
+        if spec is not None and spec.fields:
             if data.num_rows == 0:
                 raise ValidationError(
                     f"cannot append 0 rows to partitioned table "
@@ -720,7 +722,7 @@ class Table:
                     "derivable and a commit registers at least one file",
                     status_code=None,
                 )
-            groups = _partition_groups(data, info)
+            groups = _partition_groups(data, info, spec)
         else:
             groups = [(None, data)]
 
@@ -864,7 +866,7 @@ def _write_one_file(
 
 
 def _partition_groups(
-    data: pa.Table, info: TableInfo
+    data: pa.Table, info: TableInfo, spec: PartitionSpec
 ) -> list[tuple[tuple[str | None, ...], pa.Table]]:
     """Split an aligned batch by partition tuple under the table's live
     spec: one (wire-string tuple, sub-table) per distinct tuple, ordered
@@ -876,7 +878,6 @@ def _partition_groups(
     a null source value yields a null partition value forming its own
     group, per Iceberg.
     """
-    spec = info.partition_spec
     by_field_id = {c.field_id: c for c in info.columns}
     key_names = [f"__hog_pk_{i}" for i in range(len(spec.fields))]
     key_arrays: list[pa.Array] = []

@@ -32,6 +32,7 @@ dev = [
     # Pinned: an unpinned ruff resolves a different rule set per machine
     # (and silently ignored the per-file-ignores below).
     "ruff==0.16.6",
+    "mypy==2.3.1",
 ]
 
 [build-system]
@@ -53,6 +54,15 @@ only-include = ["src", "tests"]
     "DTZ001",  # tests exercise naive datetimes on purpose
     "BLE001",  # conftest server-probe catch is deliberate
 ]
+
+[tool.mypy]
+files = ["src"]
+python_version = "3.11"
+
+[[tool.mypy.overrides]]
+# pyarrow ships no type information.
+module = ["pyarrow", "pyarrow.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 markers = [

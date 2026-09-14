@@ -11,7 +11,7 @@ the pre-split commits).
 
 ```bash
 cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
-just lint-all        # ktlint + ruff (check & format) across both Python trees
+just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
 just pyhoglake test  # pyhoglake suite
 just webui test      # vitest (no server needed)
 just hedgerow test   # unit; integration needs a live server
@@ -81,8 +81,8 @@ path-scoped per component, posthog-monorepo style:
 |---|---|---|
 | `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job. No :trino:test job: the connector lives in PostHog/trino and the in-repo harness needs a fork image (HOGLAKE_TRINO_IMAGE) — run it manually per server/trino/README.md |
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest (unit/mocked layer — live integration is local, per the pre-push checklist) |
-| `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow or `pyhoglake/pyproject.toml` | ruff, pytest matrix (3.11–3.13), build, wheel smoke test; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
+| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. All unit/mocked layer — live integration is local, per the pre-push checklist |
+| `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
 
@@ -128,7 +128,8 @@ hedgerow pyproject.toml, spec `info.version`), tag it (`vX.Y.Z`;
 commit restores the next `-dev`. The `:checkOpenapiVersion` gradle task
 (in CI) keeps the spec's `info.version` locked to the server version;
 the pyhoglake publish workflow refuses a tag that mismatches its
-pyproject.
+pyproject. The Python packages' `__version__` attributes read the
+installed metadata, so they are not version strings to bump.
 
 ## Invariants (violating any of these is a bug, full stop)
 

@@ -8,9 +8,8 @@ name: Publish pyhoglake
 # publisher pins this repo, this workflow file, and the `pypi` environment.
 # GitHub side: the `pypi` environment only deploys from pyhoglake-v* tags.
 #
-# Pull requests that touch this workflow or the packaging config, and manual
-# runs from a branch, do a dry run: lint, test, build, and smoke test, no
-# publish.
+# Pull requests that touch this workflow, and manual runs from a branch, run
+# the checks without publishing.
 
 on:
   push:
@@ -19,7 +18,6 @@ on:
   pull_request:
     paths:
       - ".github/workflows/publish-pyhoglake.yml"
-      - "pyhoglake/pyproject.toml"
   workflow_dispatch:
 
 permissions:
@@ -31,101 +29,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: pyhoglake
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - run: uv sync --locked
-
-      - name: Ruff
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
-
-  test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.11", "3.12", "3.13"]
-    env:
-      UV_PYTHON: ${{ matrix.python-version }}
-    defaults:
-      run:
-        working-directory: pyhoglake
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - run: uv sync --locked
-
-      # Integration tests skip without a live server; this is the
-      # unit/mocked layer (same split as ci-python.yml).
-      - name: Tests
-        run: uv run pytest -q
-
-  build:
-    name: Build sdist and wheel
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    defaults:
-      run:
-        working-directory: pyhoglake
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
-
-      - name: Tag must match the package version
-        if: github.ref_type == 'tag'
-        run: |
-          version=$(uv version --short)
-          if [ "$GITHUB_REF_NAME" != "pyhoglake-v$version" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject version $version"
-            exit 1
-          fi
-
-      - name: Build sdist and wheel
-        run: uv build
-
-      # A clean env with only the wheel installed catches files missing from
-      # the package. The version check fails if __version__ drifts from
-      # pyproject.toml again.
-      - name: Smoke test the wheel
-        run: |
-          expected=$(uv version --short)
-          installed=$(uv run --isolated --no-project --with ./dist/pyhoglake-*.whl python -c "import pyhoglake; print(pyhoglake.__version__)")
-          if [ "$installed" != "$expected" ]; then
-            echo "::error::Installed wheel reports version $installed, expected $expected"
-            exit 1
-          fi
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: pyhoglake-dist
-          path: pyhoglake/dist/
-          if-no-files-found: error
+  pyhoglake:
+    uses: ./.github/workflows/pyhoglake-checks.yml
 
   publish:
     name: Publish to PyPI
-    needs: [lint, test, build]
+    needs: [pyhoglake]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10

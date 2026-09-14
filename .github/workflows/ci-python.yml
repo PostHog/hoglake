@@ -10,6 +10,7 @@ on:
       # The OpenAPI spec is the wire contract the clients conform to.
       - "server/src/main/resources/openapi/hoglake.yaml"
       - ".github/workflows/ci-python.yml"
+      - ".github/workflows/pyhoglake-checks.yml"
   pull_request:
     branches: [main]
     paths:
@@ -18,6 +19,7 @@ on:
       - "bench/**"
       - "server/src/main/resources/openapi/hoglake.yaml"
       - ".github/workflows/ci-python.yml"
+      - ".github/workflows/pyhoglake-checks.yml"
 
 permissions:
   contents: read
@@ -27,6 +29,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pyhoglake:
+    uses: ./.github/workflows/pyhoglake-checks.yml
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -34,8 +39,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - component: pyhoglake
-            lint: "true"
           - component: hedgerow
             lint: "true"
           # bench passes `ruff check` but carries a formatting backlog;
@@ -47,11 +50,13 @@ jobs:
       run:
         working-directory: ${{ matrix.component }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6.8.0
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
-      - run: uv sync
+      - run: uv sync --locked
 
       - name: Lint (ruff, pinned in dev deps)
         if: matrix.lint == 'true'

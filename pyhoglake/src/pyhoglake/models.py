@@ -13,9 +13,7 @@ from .errors import MalformedResponseError
 T = TypeVar("T")
 
 
-def _parse_dt(value: str | None) -> datetime | None:
-    if value is None:
-        return None
+def _parse_dt(value: str) -> datetime:
     # Python >= 3.11 fromisoformat accepts 'Z' and fractional offsets.
     return datetime.fromisoformat(value)
 
