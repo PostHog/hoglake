@@ -64,16 +64,29 @@ string GetString(yyjson_val *obj, const char *key, const string &default_value =
 		return default_value;
 	}
 	if (!yyjson_is_str(val)) {
-		throw IOException("hoglake: expected string for field \"%s\" in server response", key);
+		throw InvalidInputException("hoglake: expected string for field \"%s\" in server response", key);
 	}
 	return string(yyjson_get_str(val), yyjson_get_len(val));
 }
 
+//! EXCEPTION TAXONOMY for wire input (load-bearing for the catalog
+//! containment boundaries in hoglake_schema_entry / metadata
+//! functions, which catch CatalogException + InvalidInputException):
+//!   - IOException            = transport/protocol failure (network,
+//!     non-JSON body, wrong top-level shape). PROPAGATES: a down or
+//!     broken server must fail the statement, never fake an empty or
+//!     partial catalog.
+//!   - InvalidInputException  = malformed wire DATA in an otherwise
+//!     well-formed response (out-of-range or wrong-typed field
+//!     values). CONTAINABLE: one bad object must not take down
+//!     listings.
+//!   - CatalogException       = wire-data error scoped to a named
+//!     catalog object (preferred where the object is known, e.g.
+//!     decimal params naming the table). CONTAINABLE.
 //! Wire integers that feed NumericCast / narrow struct fields MUST be
 //! range-checked at parse time: an out-of-range value would otherwise
 //! throw InternalException downstream, which DuckDB escalates to
-//! whole-instance invalidation. Malformed wire data must be a clean,
-//! catchable IOException instead.
+//! whole-instance invalidation.
 int64_t GetBoundedInt(yyjson_val *obj, const char *key, int64_t min_value, int64_t max_value,
                       int64_t default_value = 0) {
 	auto val = yyjson_obj_get(obj, key);
@@ -81,11 +94,12 @@ int64_t GetBoundedInt(yyjson_val *obj, const char *key, int64_t min_value, int64
 		return default_value;
 	}
 	if (!yyjson_is_int(val) && !yyjson_is_uint(val)) {
-		throw IOException("hoglake: expected integer for field \"%s\" in server response", key);
+		throw InvalidInputException("hoglake: expected integer for field \"%s\" in server response", key);
 	}
 	auto result = yyjson_get_sint(val);
 	if (result < min_value || result > max_value) {
-		throw IOException("hoglake: field \"%s\" in server response is out of range (%lld)", key, result);
+		throw InvalidInputException("hoglake: field \"%s\" in server response is out of range (%lld)", key,
+		                            result);
 	}
 	return result;
 }
@@ -96,7 +110,7 @@ int64_t GetInt(yyjson_val *obj, const char *key, int64_t default_value = 0) {
 		return default_value;
 	}
 	if (!yyjson_is_int(val) && !yyjson_is_uint(val)) {
-		throw IOException("hoglake: expected integer for field \"%s\" in server response", key);
+		throw InvalidInputException("hoglake: expected integer for field \"%s\" in server response", key);
 	}
 	return yyjson_get_sint(val);
 }
@@ -173,9 +187,11 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 	info.name = GetString(obj, "name");
 	info.namespace_name = GetString(obj, "namespace");
 	info.table_uuid = GetString(obj, "table_uuid");
-	info.record_count = GetInt(obj, "record_count");
-	info.file_count = GetInt(obj, "file_count");
-	info.file_size_bytes = GetInt(obj, "file_size_bytes");
+	// Table-schema numerics were the one struct the R3 sweep missed:
+	// record_count feeds NumericCast in GetStorageInfo
+	info.record_count = GetBoundedInt(obj, "record_count", 0, 9223372036854775807LL);
+	info.file_count = GetBoundedInt(obj, "file_count", 0, 9223372036854775807LL);
+	info.file_size_bytes = GetBoundedInt(obj, "file_size_bytes", 0, 9223372036854775807LL);
 	auto columns = yyjson_obj_get(obj, "columns");
 	size_t idx, max;
 	yyjson_val *col;
@@ -222,8 +238,8 @@ HoglakeViewInfo ParseViewInfo(yyjson_val *obj) {
 
 HoglakeCommitResult ParseCommitResult(yyjson_val *obj) {
 	HoglakeCommitResult result;
-	result.snapshot_id = GetInt(obj, "snapshot_id");
-	result.schema_version = GetInt(obj, "schema_version");
+	result.snapshot_id = GetBoundedInt(obj, "snapshot_id", 0, 9223372036854775807LL);
+	result.schema_version = GetBoundedInt(obj, "schema_version", 0, 9223372036854775807LL);
 	return result;
 }
 
@@ -243,10 +259,10 @@ HoglakeDataFile ParseDataFile(yyjson_val *obj) {
 	if (spec_id && !yyjson_is_null(spec_id)) {
 		auto raw_spec = yyjson_get_sint(spec_id);
 		if (!yyjson_is_int(spec_id) && !yyjson_is_uint(spec_id)) {
-			throw IOException("hoglake: malformed spec_id in server response");
+			throw InvalidInputException("hoglake: malformed spec_id in server response");
 		}
 		if (raw_spec < 0) {
-			throw IOException("hoglake: negative spec_id in server response");
+			throw InvalidInputException("hoglake: negative spec_id in server response");
 		}
 		file.spec_id = NumericCast<idx_t>(raw_spec);
 	}
@@ -261,8 +277,9 @@ HoglakeDataFile ParseDataFile(yyjson_val *obj) {
 				file.partition_values.push_back(Value(string(yyjson_get_str(val), yyjson_get_len(val))));
 			} else {
 				// never construct string(nullptr, n) from a non-string
-				// element: fail like every other field in this parser
-				throw IOException("hoglake: malformed partition_values in server response (non-string element)");
+				// element: wire DATA error, containable per the taxonomy
+				throw InvalidInputException(
+				    "hoglake: malformed partition_values in server response (non-string element)");
 			}
 		}
 	}

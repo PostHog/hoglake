@@ -105,10 +105,14 @@ static void SnapshotsExecute(ClientContext &context, TableFunctionInput &data, D
 		}
 		auto &snap = state.buffered[state.buffer_offset++];
 		output.SetValue(0, count, Value::BIGINT(snap.snapshot_id));
-		output.SetValue(1, count,
-		                snap.snapshot_time.empty()
-		                    ? Value(LogicalType::TIMESTAMP_TZ)
-		                    : Value(snap.snapshot_time).DefaultCastAs(LogicalType::TIMESTAMP_TZ));
+		Value snapshot_time(LogicalType::TIMESTAMP_TZ);
+		if (!snap.snapshot_time.empty()) {
+			// wire string: a malformed value must yield NULL for the
+			// row, never break the whole listing
+			Value raw(snap.snapshot_time);
+			raw.DefaultTryCastAs(LogicalType::TIMESTAMP_TZ, snapshot_time, nullptr);
+		}
+		output.SetValue(1, count, snapshot_time);
 		output.SetValue(2, count, Value::BIGINT(snap.schema_version));
 		output.SetValue(3, count, snap.author.empty() ? Value(LogicalType::VARCHAR) : Value(snap.author));
 		output.SetValue(4, count, snap.message.empty() ? Value(LogicalType::VARCHAR) : Value(snap.message));
@@ -203,7 +207,12 @@ static void TableInfoExecute(ClientContext &context, TableFunctionInput &data, D
 		auto &row = state.rows[state.offset++];
 		output.SetValue(0, count, Value(row.namespace_name));
 		output.SetValue(1, count, Value(row.table_name));
-		output.SetValue(2, count, Value(row.table_uuid).DefaultCastAs(LogicalType::UUID));
+		Value uuid_value(LogicalType::UUID);
+		// wire string: malformed uuid -> NULL row value, never a listing
+		// failure
+		Value raw_uuid(row.table_uuid);
+		raw_uuid.DefaultTryCastAs(LogicalType::UUID, uuid_value, nullptr);
+		output.SetValue(2, count, uuid_value);
 		output.SetValue(3, count, Value::BIGINT(row.record_count));
 		output.SetValue(4, count, Value::BIGINT(row.file_count));
 		output.SetValue(5, count, Value::BIGINT(row.file_size_bytes));

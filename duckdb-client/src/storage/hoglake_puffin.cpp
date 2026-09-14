@@ -193,6 +193,12 @@ vector<data_t> HoglakePuffin::EncodeBlob(const set<idx_t> &positions) {
 		entry.second.runOptimize();
 		vector_size += sizeof(int32_t) + entry.second.getSizeInBytes(true);
 	}
+	if (vector_size + 4 > 4294967295ULL) {
+		// blob length prefix is uint32 by spec; positions can include
+		// object-store-supplied DV contents, so refuse typed rather
+		// than let NumericCast invalidate the instance
+		throw InvalidInputException("hoglake: deletion vector too large to serialize (%llu bytes)", vector_size);
+	}
 	idx_t total_size = sizeof(uint32_t) + 4 + vector_size + sizeof(uint32_t);
 
 	vector<data_t> blob(total_size);

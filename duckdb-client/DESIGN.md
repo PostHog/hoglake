@@ -289,7 +289,19 @@ key_index). Paths: `<data_path>data/<namespace>/<table>/<uuid>.parquet`
 segment hygiene. `expected_table_uuid` rides every append (the
 incarnation guard) with the uuid the table entry was bound at.
 
-DELETE (M4): scan produces (file, position) sets; per touched data file
+DELETE (M4): scan produces (file, position) sets, attributed to the
+exact LOGICAL registration via the rowid base (rowid −
+file_row_number == the registration's row_id_start): the catalog
+legally holds several live registrations of one physical path (writer
+retries), and a rowid/snapshot-scoped predicate must grow only the
+matching copy's DV. Ambiguous shapes (explicit-row-id duplicates,
+shared row_id_start) refuse typed. Out-of-range positions — an
+under-declared duplicate registration or another client's committed
+DV holding positions ≥ record_count (the server validates neither) —
+are the OTHER party's corruption: the statement refuses with a typed
+error naming file, position, and registration; never an
+instance-invalidating InternalException, never a silent clamp.
+Otherwise: scan produces (file, position) sets; per touched data file
 the transaction merges positions into that file's existing DV (vectors
 only grow — superseding DV must contain the old one), writes a new
 puffin file, buffers a `DeleteFileRegistration`

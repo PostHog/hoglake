@@ -24,8 +24,11 @@
 namespace duckdb {
 
 //! Column names with this prefix are reserved for hoglake internals
-//! (_hog_row_id is compaction's row-id carrier); the server 422s them.
-//! Fast-fail client-side with a better message.
+//! (_hog_row_id is compaction's row-id carrier). The server does NOT
+//! enforce the reservation (its name validation is pattern-only —
+//! DESIGN.md server finding 9), so THIS CLIENT IS THE ENFORCEMENT
+//! POINT: weakening these checks commits user _hog columns into the
+//! shared catalog and breaks name-based readers fleet-wide.
 static constexpr const char *RESERVED_COLUMN_PREFIX = "_hog";
 
 HoglakeSchemaEntry::HoglakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, HoglakeTransaction &transaction)

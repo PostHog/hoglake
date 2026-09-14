@@ -1,9 +1,13 @@
 //===----------------------------------------------------------------------===//
 // HoglakeDelete: DELETE via deletion vectors. The child scan emits the
-// row-id columns (filename, file_index, file_row_number); the sink
-// groups deleted positions per data file, merges them into the file's
-// existing live DV (vectors only grow), writes a superseding puffin
-// file, and buffers the DeleteFileRegistration on the transaction.
+// row-id columns; the sink groups deleted positions per LOGICAL data
+// file — keyed by (filename, rowid - file_row_number), because the
+// catalog legally holds multiple live registrations of one physical
+// path (writer retries) and only the rowid base distinguishes them —
+// merges each group into that registration's existing live DV
+// (vectors only grow), writes a superseding puffin file per
+// data_file_id, and buffers the DeleteFileRegistrations on the
+// transaction.
 //===----------------------------------------------------------------------===//
 
 #pragma once
@@ -19,8 +23,15 @@ class PhysicalPlanGenerator;
 
 class HoglakeDeleteGlobalState : public GlobalSinkState {
 public:
-	//! data file path -> deleted positions (0-based physical ordinals)
-	map<string, set<idx_t>> new_deletes;
+	//! (data file path, rowid base = rowid - file_row_number) ->
+	//! deleted positions (0-based physical ordinals). The base is the
+	//! registration's row_id_start for positional files, letting
+	//! Finalize attribute positions to the RIGHT logical copy of a
+	//! duplicate-registered path; explicit-row-id files produce
+	//! non-constant bases, which Finalize tolerates for
+	//! single-registration paths (all groups union) and refuses,
+	//! typed, for duplicate-registered ones.
+	map<string, map<int64_t, set<idx_t>>> new_deletes;
 	idx_t deleted_count = 0;
 };
 
@@ -30,7 +41,7 @@ public:
 	              vector<idx_t> row_id_indexes);
 
 	HoglakeTableEntry &table;
-	//! indexes of (filename, file_index, file_row_number) in the input
+	//! indexes of (rowid, filename, file_row_number) in the input
 	vector<idx_t> row_id_indexes;
 
 public:

@@ -33,8 +33,13 @@ string HoglakeDelete::GetName() const {
 SinkResultType HoglakeDelete::Sink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) const {
 	auto &gstate = input.global_state.Cast<HoglakeDeleteGlobalState>();
 
-	auto &file_name_vector = chunk.data[row_id_indexes[0]];
+	auto &rowid_vector = chunk.data[row_id_indexes[0]];
+	auto &file_name_vector = chunk.data[row_id_indexes[1]];
 	auto &file_row_number_vector = chunk.data[row_id_indexes[2]];
+
+	UnifiedVectorFormat rowid_data;
+	rowid_vector.ToUnifiedFormat(rowid_data);
+	auto rowids = UnifiedVectorFormat::GetData<int64_t>(rowid_data);
 
 	UnifiedVectorFormat file_name_data;
 	file_name_vector.ToUnifiedFormat(file_name_data);
@@ -45,13 +50,22 @@ SinkResultType HoglakeDelete::Sink(ExecutionContext &context, DataChunk &chunk, 
 	auto row_numbers = UnifiedVectorFormat::GetData<int64_t>(row_number_data);
 
 	for (idx_t i = 0; i < chunk.size(); i++) {
+		auto rid_idx = rowid_data.sel->get_index(i);
 		auto name_idx = file_name_data.sel->get_index(i);
 		auto row_idx = row_number_data.sel->get_index(i);
-		if (!file_name_data.validity.RowIsValid(name_idx) || !row_number_data.validity.RowIsValid(row_idx)) {
+		if (!rowid_data.validity.RowIsValid(rid_idx) || !file_name_data.validity.RowIsValid(name_idx) ||
+		    !row_number_data.validity.RowIsValid(row_idx)) {
 			throw InternalException("hoglake: NULL row-id column in DELETE input");
 		}
-		auto inserted =
-		    gstate.new_deletes[file_names[name_idx].GetString()].insert(NumericCast<idx_t>(row_numbers[row_idx]));
+		auto row_number = row_numbers[row_idx];
+		if (row_number < 0) {
+			throw InternalException("hoglake: negative file_row_number in DELETE input");
+		}
+		// the rowid base distinguishes duplicate registrations of one
+		// physical path (positional files: base == row_id_start)
+		auto base = rowids[rid_idx] - row_number;
+		auto inserted = gstate.new_deletes[file_names[name_idx].GetString()][base].insert(
+		    NumericCast<idx_t>(row_number));
 		if (inserted.second) {
 			gstate.deleted_count++;
 		}
@@ -96,33 +110,101 @@ SinkFinalizeType HoglakeDelete::Finalize(Pipeline &pipeline, Event &event, Clien
 	vector<HoglakeDeleteFileRegistration> registrations;
 	for (auto &entry : gstate.new_deletes) {
 		auto &data_file_path = entry.first;
+		auto &base_groups = entry.second;
 		auto file_entry = by_path.find(data_file_path);
 		if (file_entry == by_path.end()) {
 			throw TransactionException("hoglake: DELETE targets data file \"%s\" which is not live at the pinned "
 			                           "snapshot (concurrent compaction or drop?) — re-run the DELETE",
 			                           data_file_path);
 		}
-		for (auto scan_file_ptr : file_entry->second) {
+		auto &copies = file_entry->second;
+
+		// attribute each (rowid base -> positions) group to the RIGHT
+		// live registration of the path:
+		//  - one registration: every group belongs to it (explicit-
+		//    row-id files produce varying bases; harmless here)
+		//  - several registrations (writer-retry duplicates): only
+		//    positional files carry a meaningful base (== their
+		//    row_id_start); attribute exactly, refuse anything
+		//    ambiguous with a typed error — deleting a position from a
+		//    copy whose rows did NOT match the predicate would commit
+		//    removal of unmatched rows
+		map<int64_t, set<idx_t>> per_file_positions; // data_file_id -> new positions
+		if (copies.size() == 1) {
+			auto &only = per_file_positions[copies[0]->data_file.data_file_id];
+			for (auto &group : base_groups) {
+				only.insert(group.second.begin(), group.second.end());
+			}
+		} else {
+			map<int64_t, int64_t> by_start; // row_id_start -> data_file_id
+			for (auto copy : copies) {
+				auto &data_file = copy->data_file;
+				if (data_file.explicit_row_ids) {
+					throw InvalidInputException(
+					    "hoglake: data file \"%s\" of table \"%s.%s\" has multiple live registrations and at "
+					    "least one carries explicit row ids — positions cannot be attributed to a specific "
+					    "registration. Repair the duplicate registration via another client",
+					    data_file_path, ns, table_name);
+				}
+				if (!by_start.emplace(data_file.row_id_start, data_file.data_file_id).second) {
+					throw InvalidInputException(
+					    "hoglake: data file \"%s\" of table \"%s.%s\" has multiple live registrations sharing "
+					    "row_id_start %lld — positions cannot be attributed unambiguously. Repair the duplicate "
+					    "registration via another client",
+					    data_file_path, ns, table_name, data_file.row_id_start);
+				}
+			}
+			for (auto &group : base_groups) {
+				auto match = by_start.find(group.first);
+				if (match == by_start.end()) {
+					throw TransactionException(
+					    "hoglake: DELETE positions for data file \"%s\" resolve to rowid base %lld, which matches "
+					    "no live registration at the pinned snapshot — re-run the DELETE",
+					    data_file_path, group.first);
+				}
+				per_file_positions[match->second].insert(group.second.begin(), group.second.end());
+			}
+		}
+
+		for (auto scan_file_ptr : copies) {
 			auto &scan_file = *scan_file_ptr;
+			auto data_file_id = scan_file.data_file.data_file_id;
+			auto attributed = per_file_positions.find(data_file_id);
+			if (attributed == per_file_positions.end()) {
+				// no matched rows in this logical copy: its DV must not
+				// grow (sequential semantics for rowid/snapshot-scoped
+				// predicates over duplicate registrations)
+				continue;
+			}
 
 			// vectors only grow: the superseding DV = (this logical
 			// file's server-live DV) ∪ (positions already buffered by
 			// EARLIER statements of this transaction for it) ∪ (this
-			// statement's new positions) — one commit must carry
+			// statement's attributed positions) — one commit carries
 			// exactly one DV per data_file_id, containing everything
-			set<idx_t> positions = entry.second;
+			set<idx_t> positions = std::move(attributed->second);
 			if (scan_file.has_delete_file) {
 				auto existing = HoglakePuffin::ReadDeletionVector(context, scan_file.delete_file.path);
 				positions.insert(existing.begin(), existing.end());
 			}
-			auto buffered =
-			    transaction.GetBufferedDeletePositions(ns, table_name, scan_file.data_file.data_file_id);
+			auto buffered = transaction.GetBufferedDeletePositions(ns, table_name, data_file_id);
 			positions.insert(buffered.begin(), buffered.end());
-			auto record_count = NumericCast<idx_t>(scan_file.data_file.record_count);
-			if (!positions.empty() && *positions.rbegin() >= record_count) {
-				throw InternalException(
-				    "hoglake: deleted position %llu out of range for data file \"%s\" (%llu rows)",
-				    *positions.rbegin(), data_file_path, record_count);
+			// out-of-range positions mean the CATALOG's metadata is
+			// inconsistent (a duplicate registration declaring fewer
+			// rows than the physical parquet holds, or another client's
+			// committed DV holding positions beyond record_count — the
+			// server validates neither). That is the other party's
+			// corruption: refuse this statement with a TYPED error
+			// naming the file and position, never an instance-
+			// invalidating InternalException, and never silently clamp
+			// (DESIGN.md, "Write path")
+			auto record_count = scan_file.data_file.record_count;
+			if (!positions.empty() && NumericCast<int64_t>(*positions.rbegin()) >= record_count) {
+				throw InvalidInputException(
+				    "hoglake: deleted position %llu is out of range for data file \"%s\" of table \"%s.%s\" "
+				    "(registration data_file_id %lld declares %lld rows). The registration or its committed "
+				    "deletion vector is inconsistent with the physical file — repair it via another client",
+				    *positions.rbegin(), data_file_path, ns, table_name, data_file_id, record_count);
 			}
 
 			auto puffin = HoglakePuffin::WritePuffinFile(positions, data_file_path);
@@ -134,7 +216,7 @@ SinkFinalizeType HoglakeDelete::Finalize(Pipeline &pipeline, Event &event, Clien
 			handle->Close();
 
 			HoglakeDeleteFileRegistration registration;
-			registration.data_file_id = scan_file.data_file.data_file_id;
+			registration.data_file_id = data_file_id;
 			registration.path = dv_path;
 			registration.delete_count = NumericCast<int64_t>(positions.size());
 			registration.file_size_bytes = NumericCast<int64_t>(puffin.size());

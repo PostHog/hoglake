@@ -253,7 +253,15 @@ def main() -> None:
             "name": "bad_cols",
             "columns": [{"name": "team", "type": "string"}, {"name": "Team", "type": "int"}],
         })
-        print(f"fixture ready: {CATALOG}/ns1 poison tables bad_dec100, bad_dec_nop, bad_cols")
+        # decimal params OUTSIDE the parse bound range (negative): this
+        # throws from the parse layer, not the named-table belt — the
+        # containment must hold for it too (R4-5/R4-9)
+        rest("DELETE", f"/catalogs/{CATALOG}/namespaces/ns1/tables/bad_dec_neg")
+        rest("POST", f"/catalogs/{CATALOG}/namespaces/ns1/tables", json={
+            "name": "bad_dec_neg",
+            "columns": [{"name": "d", "type": "decimal", "type_params": {"precision": -1, "scale": 0}}],
+        })
+        print(f"fixture ready: {CATALOG}/ns1 poison tables bad_dec100, bad_dec_nop, bad_dec_neg, bad_cols")
 
         # ---- duplicate-path registration (in duckext-sqltest, where
         # the DML tests run): one physical parquet registered as TWO
@@ -283,6 +291,58 @@ def main() -> None:
             }],
         })
         print(f"fixture ready: {SQLTEST}/ns1.dup_path (one path, two live registrations)")
+
+        # duplicate registration with an INCONSISTENT record_count (the
+        # server validates only >= 0, never against the parquet): DML
+        # touching the physical rows beyond the under-declared count
+        # must refuse with a typed error, never invalidate the
+        # instance (R4-1)
+        try:
+            sq_ns.table("dup_incon").drop()
+        except NotFoundError:
+            pass
+        dupi = sq_ns.create_table("dup_incon", pa.schema([pa.field("a", pa.int64())]))
+        dupi.append(pa.table({"a": pa.array([1, 2, 3], pa.int64())}))
+        fi = dupi.files()[0]
+        rest("POST", f"/catalogs/{SQLTEST}/commit", json={
+            "appends": [{
+                "namespace": "ns1", "table": "dup_incon",
+                "files": [{"path": fi.path, "record_count": 2,
+                            "file_size_bytes": fi.file_size_bytes}],
+            }],
+        })
+        print(f"fixture ready: {SQLTEST}/ns1.dup_incon (duplicate registration declaring 2 of 3 rows)")
+
+        # sorted table for the DISCRIMINATING compacted-rowid test
+        # (R4-10): compaction sorts the merge by the live sort order, so
+        # the compacted file's _hog_row_id column is PERMUTED relative
+        # to physical position — a positional-fallback regression reads
+        # different rowids
+        try:
+            ns.table("points_sorted").drop()
+        except NotFoundError:
+            pass
+        srt = ns.create_table(
+            "points_sorted",
+            pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("v", pa.int64())]),
+        )
+        v_field = next(c for c in srt.columns if c.name == "v")
+        rest("POST", f"/catalogs/{CATALOG}/namespaces/ns1/tables/points_sorted/alter", json={
+            "ops": [{"op": "set_sort_order",
+                      "sort_fields": [{"source_field_id": v_field.field_id,
+                                        "direction": "asc", "null_order": "nulls_last"}]}],
+        })
+        # 8 single-row batches (8 files: the tiered planner promotes a
+        # group only when its aggregate reaches the next tier floor —
+        # tier ratio 8 — and caps groups at 8 inputs) with a DESCENDING
+        # sort key, so the sorted merge fully REVERSES row order:
+        # explicit _hog_row_id = [7,6,...,0] by physical position,
+        # maximally discriminating against positional fallback
+        srt_schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("v", pa.int64())])
+        for i in range(8):
+            srt.append(pa.table({"id": pa.array([i + 1], pa.int64()),
+                                 "v": pa.array([80 - 10 * i], pa.int64())}, schema=srt_schema))
+        print(f"fixture ready: {CATALOG}/ns1.points_sorted (8 unsorted batches, sort order v asc)")
 
         # time-travel env for the sqllogictests: genuinely historical
         # snapshot ids and a timestamp BETWEEN the two points batches
@@ -316,24 +376,44 @@ def main() -> None:
         # the gated test file skips.
         import time as _time
 
-        def points_files():
-            return rest("GET", f"/catalogs/{CATALOG}/namespaces/ns1/tables/points/scan").json()
+        def table_files(tname):
+            return rest("GET", f"/catalogs/{CATALOG}/namespaces/ns1/tables/{tname}/scan").json()
 
-        compacted = False
-        deadline = _time.time() + 90
-        while _time.time() < deadline:
-            files = points_files()
-            if len(files) == 1 and files[0]["data_file"].get("explicit_row_ids"):
-                compacted = True
+        def is_compacted(tname, files):
+            if tname == "points_sorted":
+                # the tiered planner may stall above one file; ANY
+                # explicit (sorted-merge) output already carries the
+                # position-permuted _hog_row_id the discriminating test
+                # needs
+                return any(f["data_file"].get("explicit_row_ids") for f in files)
+            return len(files) == 1 and files[0]["data_file"].get("explicit_row_ids")
+
+        compact_targets = ["points", "points_sorted"]
+        compacted = {t: False for t in compact_targets}
+        deadline = _time.time() + 120
+        while _time.time() < deadline and not all(compacted.values()):
+            pending = False
+            for t in compact_targets:
+                files = table_files(t)
+                if is_compacted(t, files):
+                    compacted[t] = True
+                elif not all(f["data_file"]["stats_state"] == "provided" for f in files):
+                    pending = True
+            if all(compacted.values()):
                 break
-            if all(f["data_file"]["stats_state"] == "provided" for f in files):
+            if not pending:
                 rest("POST", f"/catalogs/{CATALOG}/maintenance/compact?batch=10")
             _time.sleep(2)
-        if compacted:
+        if compacted["points"]:
             env_lines.append("export DUCKEXT_POINTS_COMPACTED=1")
             print("points compacted (explicit _hog_row_id file); gated test enabled")
         else:
-            print("WARNING: points did not compact within 90s (hydrator down?); compacted-read test will skip")
+            print("WARNING: points did not compact within 120s (hydrator down?); compacted-read test will skip")
+        if compacted["points_sorted"]:
+            env_lines.append("export DUCKEXT_SORTED_COMPACTED=1")
+            print("points_sorted compacted (sorted merge => permuted _hog_row_id); discriminating test enabled")
+        else:
+            print("WARNING: points_sorted did not compact within 120s; discriminating rowid test will skip")
 
         env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "live-env.sh")
         with open(env_path, "w") as f:

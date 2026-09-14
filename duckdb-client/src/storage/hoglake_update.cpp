@@ -77,7 +77,9 @@ unique_ptr<OperatorState> HoglakeUpdate::GetOperatorState(ExecutionContext &cont
 	}
 	result->update_expression_chunk.Initialize(context.client, expression_types);
 
+	// [rowid, filename, file_index, file_row_number]
 	vector<LogicalType> delete_types;
+	delete_types.emplace_back(LogicalType::BIGINT);
 	delete_types.emplace_back(LogicalType::VARCHAR);
 	delete_types.emplace_back(LogicalType::UBIGINT);
 	delete_types.emplace_back(LogicalType::BIGINT);
@@ -125,8 +127,11 @@ OperatorResultType HoglakeUpdate::Execute(ExecutionContext &context, DataChunk &
 
 	// old row ids -> the embedded delete sink
 	auto &delete_chunk = lstate.delete_chunk;
+	// rowid rides first (the delete sink derives each row's
+	// registration base from rowid - file_row_number)
+	delete_chunk.data[0].Reference(input.data[row_id_index]);
 	for (idx_t i = 0; i < DELETION_INFO_SIZE; i++) {
-		delete_chunk.data[i].Reference(input.data[delete_idx_start + i]);
+		delete_chunk.data[1 + i].Reference(input.data[delete_idx_start + i]);
 	}
 	delete_chunk.SetCardinality(input.size());
 

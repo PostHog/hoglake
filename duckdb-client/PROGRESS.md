@@ -222,3 +222,20 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   compaction-fragile layout asserts pinned via time travel.
 - Verified 2026-09-12: ./test/run-live-tests.sh fully green — 11
   sqllogictest files / 592 assertions + cross-client wire check.
+
+## Review round 4 — all 11 confirmed findings fixed: DONE
+- Corrected sweep rule (engine-internal only if BOTH sides engine-
+  derived) re-run: typed refusals for out-of-range external DV/
+  registration data in the delete sink (refuse loudly, never clamp),
+  Table-schema parse bounds (the omitted struct), puffin encode size
+  guard. Exception taxonomy unified (transport IOException propagates;
+  wire-data InvalidInput/CatalogException containable) so the
+  containment pair covers every data-shaped throw. Per-copy DV
+  attribution via rowid base for duplicate-path registrations (rowid
+  predicates grow only the matching copy; ambiguous shapes refuse
+  typed); server duplicate-target 422 verified compatible (one
+  registration per data_file_id). Discriminating explicit-rowid test
+  via sort-permuted compaction (points_sorted); stale _hog header
+  comment fixed. Dispositions: REVIEW-FINDINGS-R4.md.
+- Verified 2026-09-14: ./test/run-live-tests.sh fully green — 11
+  sqllogictest files / 630 assertions + cross-client wire check.

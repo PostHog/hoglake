@@ -177,10 +177,12 @@ PhysicalOperator &HoglakeCatalog::PlanDelete(ClientContext &context, PhysicalPla
 		throw BinderException("RETURNING clause not yet supported for deletion from hoglake tables");
 	}
 	// op.expressions = [rowid, filename, file_index, file_row_number]
-	// (GetRowIdColumns order); the delete sink needs the last three
+	// (GetRowIdColumns order); the delete sink needs rowid + filename +
+	// file_row_number (the rowid base attributes positions to the right
+	// logical registration of a duplicate-registered path)
 	vector<idx_t> row_id_indexes;
-	for (idx_t i = 0; i < 3; i++) {
-		auto &bound_ref = op.expressions[i + 1]->Cast<BoundReferenceExpression>();
+	for (auto expr_idx : {0, 1, 3}) {
+		auto &bound_ref = op.expressions[expr_idx]->Cast<BoundReferenceExpression>();
 		row_id_indexes.push_back(bound_ref.Index());
 	}
 	return HoglakeDelete::PlanDelete(context, planner, op.table.Cast<HoglakeTableEntry>(), plan,
@@ -199,9 +201,9 @@ PhysicalOperator &HoglakeCatalog::PlanUpdate(ClientContext &context, PhysicalPla
 	}
 	auto &table = op.table.Cast<HoglakeTableEntry>();
 
-	// embedded delete sink over the last 3 input columns of the delete
-	// chunk the update operator builds
-	vector<idx_t> row_id_indexes {0, 1, 2};
+	// embedded delete sink over the delete chunk the update operator
+	// builds: [rowid, filename, file_index, file_row_number]
+	vector<idx_t> row_id_indexes {0, 1, 3};
 	auto &delete_op = HoglakeDelete::PlanDelete(context, planner, table, plan, std::move(row_id_indexes), false);
 
 	// update expressions ordered by physical column index
