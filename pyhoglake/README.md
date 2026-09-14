@@ -1,6 +1,6 @@
 # pyhoglake
 
-Python client for [hoglake](../README.md), the Postgres-native
+Python client for [hoglake](https://github.com/PostHog/hoglake#readme), the Postgres-native
 lakehouse-catalog control plane. A **thin API wrapper**: no embedded
 engine, no SQL, no direct catalog-database access — ever. The client
 writes parquet to object storage itself and registers it with the
@@ -9,8 +9,7 @@ control plane via footer-shipping commits.
 ## Install
 
 ```sh
-# from this directory
-uv add pyhoglake            # or: pip install .
+pip install pyhoglake       # or: uv add pyhoglake
 ```
 
 Dependencies: `httpx`, `pyarrow`. Development uses the flox env in this
