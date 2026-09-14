@@ -128,7 +128,8 @@ hedgerow pyproject.toml, spec `info.version`), tag it (`vX.Y.Z`;
 commit restores the next `-dev`. The `:checkOpenapiVersion` gradle task
 (in CI) keeps the spec's `info.version` locked to the server version;
 the pyhoglake publish workflow refuses a tag that mismatches its
-pyproject.
+pyproject. The Python packages' `__version__` attributes read the
+installed metadata, so they are not version strings to bump.
 
 ## Invariants (violating any of these is a bug, full stop)
 

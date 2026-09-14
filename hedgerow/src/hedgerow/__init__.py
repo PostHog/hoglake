@@ -5,6 +5,8 @@ one destination table, append-only, at-least-once. The lessons-learned
 list lives in :mod:`hedgerow.daemon` and README.md.
 """
 
+import importlib.metadata
+
 from .config import (
     ConfigError,
     DestinationConfig,
@@ -30,7 +32,8 @@ from .halts import (
 from .projection import ProjectionPlan, validate_projection
 from .window import Window, plan_window
 
-__version__ = "0.1.0"
+# Read from the installed metadata so it cannot drift from pyproject.toml.
+__version__ = importlib.metadata.version("hedgerow")
 
 __all__ = [
     "ConfigError",
