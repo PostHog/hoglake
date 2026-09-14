@@ -1,15 +1,11 @@
 name: pyhoglake checks
 
-# Lint, type check, tests, build, and wheel smoke test for pyhoglake. One
-# definition for both callers: ci-python.yml runs it on every pyhoglake
-# change, and publish-pyhoglake.yml runs it before a PyPI upload.
+# Lint, type check, tests, build, and wheel smoke test for pyhoglake. CI and
+# the publish workflow both call it, so a PyPI upload is gated by the same
+# checks as every pull request.
 
 on:
   workflow_call:
-    outputs:
-      version:
-        description: The pyhoglake version in pyproject.toml
-        value: ${{ jobs.build.outputs.version }}
 
 permissions:
   contents: read
@@ -61,9 +57,7 @@ jobs:
 
       - run: uv sync --locked
 
-      # Integration tests skip without a live server; this is the
-      # unit/mocked layer. The live layer runs locally, per the AGENT.md
-      # pre-push checklist.
+      # Integration tests skip without a live server (unit/mocked layer).
       - name: Tests
         run: uv run pytest -q
 
@@ -71,8 +65,6 @@ jobs:
     name: Build sdist and wheel
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      version: ${{ steps.version.outputs.version }}
     defaults:
       run:
         working-directory: pyhoglake
@@ -83,9 +75,14 @@ jobs:
 
       - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
 
-      - name: Read the package version
-        id: version
-        run: echo "version=$(uv version --short)" >> "$GITHUB_OUTPUT"
+      - name: Tag must match the package version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(uv version --short)
+          if [ "$GITHUB_REF_NAME" != "pyhoglake-v$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject version $version"
+            exit 1
+          fi
 
       - name: Build sdist and wheel
         run: uv build
@@ -94,12 +91,11 @@ jobs:
       # the package. The version check fails if __version__ drifts from
       # pyproject.toml again.
       - name: Smoke test the wheel
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
+          expected=$(uv version --short)
           installed=$(uv run --isolated --no-project --with ./dist/pyhoglake-*.whl python -c "import pyhoglake; print(pyhoglake.__version__)")
-          if [ "$installed" != "$VERSION" ]; then
-            echo "::error::Installed wheel reports version $installed, expected $VERSION"
+          if [ "$installed" != "$expected" ]; then
+            echo "::error::Installed wheel reports version $installed, expected $expected"
             exit 1
           fi
 

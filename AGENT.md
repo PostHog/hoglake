@@ -86,6 +86,9 @@ path-scoped per component, posthog-monorepo style:
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
 
+Actions are pinned by commit SHA. Dependabot (`.github/dependabot.yml`)
+opens one grouped PR a week to update them.
+
 CD is the charts state-file mechanism (same as duckgres, millpond,
 viaduck): a push to main touching `server/**` or `webui/**` runs the
 `deploy` job of `server.yml` / `webui.yml`, which builds a

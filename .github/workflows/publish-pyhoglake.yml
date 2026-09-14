@@ -8,9 +8,8 @@ name: Publish pyhoglake
 # publisher pins this repo, this workflow file, and the `pypi` environment.
 # GitHub side: the `pypi` environment only deploys from pyhoglake-v* tags.
 #
-# The checks live in pyhoglake-checks.yml, which ci-python.yml also runs on
-# every pyhoglake change. Pull requests that touch this workflow, and manual
-# runs from a branch, run the checks without publishing.
+# Pull requests that touch this workflow, and manual runs from a branch, run
+# the checks without publishing.
 
 on:
   push:
@@ -30,13 +29,12 @@ concurrency:
   cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  checks:
-    name: pyhoglake
+  pyhoglake:
     uses: ./.github/workflows/pyhoglake-checks.yml
 
   publish:
     name: Publish to PyPI
-    needs: [checks]
+    needs: [pyhoglake]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -47,15 +45,6 @@ jobs:
       id-token: write # PyPI trusted publishing and the GitHub attestation
       attestations: write # stores the GitHub attestation
     steps:
-      - name: Tag must match the package version
-        env:
-          VERSION: ${{ needs.checks.outputs.version }}
-        run: |
-          if [ "$GITHUB_REF_NAME" != "pyhoglake-v$VERSION" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME does not match pyproject version $VERSION"
-            exit 1
-          fi
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: pyhoglake-dist
