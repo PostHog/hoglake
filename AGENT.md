@@ -11,7 +11,7 @@ the pre-split commits).
 
 ```bash
 cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
-just lint-all        # ktlint + ruff (check & format) across both Python trees
+just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
 just pyhoglake test  # pyhoglake suite
 just webui test      # vitest (no server needed)
 just hedgerow test   # unit; integration needs a live server

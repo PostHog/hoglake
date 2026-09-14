@@ -123,7 +123,7 @@ class Snapshot:
             d,
             lambda d: cls(
                 snapshot_id=d["snapshot_id"],
-                snapshot_time=_parse_dt(d["snapshot_time"]),
+                snapshot_time=datetime.fromisoformat(d["snapshot_time"]),
                 schema_version=d["schema_version"],
                 author=d.get("author"),
                 message=d.get("message"),
