@@ -13,9 +13,7 @@ from .errors import MalformedResponseError
 T = TypeVar("T")
 
 
-def _parse_dt(value: str | None) -> datetime | None:
-    if value is None:
-        return None
+def _parse_dt(value: str) -> datetime:
     # Python >= 3.11 fromisoformat accepts 'Z' and fractional offsets.
     return datetime.fromisoformat(value)
 
@@ -123,7 +121,7 @@ class Snapshot:
             d,
             lambda d: cls(
                 snapshot_id=d["snapshot_id"],
-                snapshot_time=datetime.fromisoformat(d["snapshot_time"]),
+                snapshot_time=_parse_dt(d["snapshot_time"]),
                 schema_version=d["schema_version"],
                 author=d.get("author"),
                 message=d.get("message"),
