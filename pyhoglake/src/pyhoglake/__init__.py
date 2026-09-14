@@ -1,5 +1,7 @@
 """pyhoglake — Python client for the hoglake control plane."""
 
+import importlib.metadata
+
 from . import ops, transforms
 from .bounds import decode_bound, encode_bound
 from .client import (
@@ -49,7 +51,8 @@ from .models import (
 from .ops import AlterOp
 from .types import arrow_type_to_coltype, coltype_to_arrow
 
-__version__ = "0.1.0"
+# Read from the installed metadata so it cannot drift from pyproject.toml.
+__version__ = importlib.metadata.version("pyhoglake")
 
 __all__ = [
     "UNGUARDED",
