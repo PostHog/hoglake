@@ -1,0 +1,395 @@
+# name: test/sql/hoglake_txn.test
+# description: transaction semantics — multi-statement DML over shared
+#   files commits as ONE deletion vector per data file; eager DDL vs
+#   buffered writes is refused with a clear error; a table created in a
+#   transaction is readable in the same transaction (post-DDL read
+#   travel).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.txn_t
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.txn_created
+
+statement ok
+CREATE TABLE lake.ns1.txn_t (a BIGINT)
+
+# one file holds all five rows
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (1), (2), (3), (4), (5)
+
+# ---- multi-statement DML on the SAME parquet file in one transaction:
+# before the DV-merge fix this commit was permanently uncommittable
+# (two live-DV registrations for one data_file_id) ----
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 1
+----
+1
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 2
+----
+1
+
+query I
+UPDATE lake.ns1.txn_t SET a = 30 WHERE a = 3
+----
+1
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.txn_t ORDER BY a
+----
+4
+5
+30
+
+# ---- eager DDL over buffered writes for the same table is refused
+# (would otherwise abort at COMMIT after the DDL already persisted) ----
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (100)
+
+statement error
+DROP TABLE lake.ns1.txn_t
+----
+<REGEX>:.*uncommitted writes.*
+
+statement ok
+ROLLBACK
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 4
+----
+1
+
+statement error
+ALTER TABLE lake.ns1.txn_t ADD COLUMN c INTEGER
+----
+<REGEX>:.*uncommitted writes.*
+
+statement ok
+ROLLBACK
+
+# the rollback discarded the buffered delete
+query I
+SELECT count(*) FROM lake.ns1.txn_t
+----
+3
+
+# DDL on a DIFFERENT table than the buffered writes is allowed
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_t VALUES (200)
+
+statement ok
+CREATE TABLE lake.ns1.txn_created (x BIGINT)
+
+# a table created in this transaction is readable in the same
+# transaction (its entry reads at the post-create snapshot, not the
+# pre-create pin): 0 rows, not a 404
+query I
+SELECT count(*) FROM lake.ns1.txn_created
+----
+0
+
+statement ok
+COMMIT
+
+query I
+SELECT count(*) FROM lake.ns1.txn_t WHERE a = 200
+----
+1
+
+# ---- rollback of pure DML discards everything buffered ----
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.txn_created VALUES (1)
+
+query I
+DELETE FROM lake.ns1.txn_t WHERE a = 200
+----
+1
+
+statement ok
+ROLLBACK
+
+query II
+SELECT (SELECT count(*) FROM lake.ns1.txn_created), (SELECT count(*) FROM lake.ns1.txn_t WHERE a = 200)
+----
+0	1
+
+# ---- read-your-own-DELETES: later statements in a transaction must
+# not re-read rows the transaction already deleted (pre-fix, (a)
+# resurrected the deleted row and (b) doubled the table — both
+# committed silently wrong data) ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_txn_a
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_txn_b
+
+statement ok
+CREATE TABLE lake.ns1.ryo_txn_a (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_a VALUES (1), (2), (3)
+
+statement ok
+CREATE TABLE lake.ns1.ryo_txn_b (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (1), (2), (3)
+
+# (a) DELETE then unpredicated UPDATE: the deleted row must NOT be
+# resurrected
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 3
+----
+1
+
+query I
+UPDATE lake.ns1.ryo_txn_a SET a = a + 10
+----
+2
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.ryo_txn_a ORDER BY a
+----
+11
+12
+
+# (b) any DELETE/UPDATE after this transaction inserted or updated
+# rows in the same table is REFUSED: uncommitted inserts are invisible
+# to the transaction's own scans, so a later predicate could silently
+# miss rewritten rows (partial overlap would even report a plausible
+# nonzero count). Round 3 replaced the earlier 0-rows quirk with this
+# loud refusal — wrong data beats no data.
+statement ok
+BEGIN
+
+query I
+UPDATE lake.ns1.ryo_txn_b SET a = a + 10
+----
+3
+
+statement error
+UPDATE lake.ns1.ryo_txn_b SET a = a + 100
+----
+<REGEX>:.*uncommitted inserts are invisible.*
+
+statement ok
+ROLLBACK
+
+# the partial-overlap corruption shape (R3-6: UPDATE a=1 -> 3, then
+# DELETE a=3 committed {2,3} instead of the sequential {2}) is the
+# same refusal
+statement ok
+BEGIN
+
+query I
+UPDATE lake.ns1.ryo_txn_b SET a = 3 WHERE a = 1
+----
+1
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_b WHERE a = 3
+----
+<REGEX>:.*uncommitted inserts are invisible.*
+
+statement ok
+ROLLBACK
+
+# INSERT-then-DELETE on one table is the same hazard class
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (50)
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_b WHERE a = 50
+----
+<REGEX>:.*uncommitted inserts are invisible.*
+
+statement ok
+ROLLBACK
+
+query I
+SELECT a FROM lake.ns1.ryo_txn_b ORDER BY a
+----
+1
+2
+3
+
+# ---- DML after eager DDL on the same table: a commit carrying
+# deletes would 409 against the transaction's own ALTER — refused
+# loudly instead (mirror order of the DDL-after-writes rule) ----
+
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_a ADD COLUMN c INTEGER
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+<REGEX>:.*already ran DDL on it.*
+
+statement ok
+ROLLBACK
+
+# ALTER then INSERT (no deletes anywhere) commits fine: append-only
+# commits are blind and never conflict-checked
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b ADD COLUMN c INTEGER
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (99, 7)
+
+statement ok
+COMMIT
+
+query II
+SELECT a, c FROM lake.ns1.ryo_txn_b WHERE a = 99
+----
+99	7
+
+# ALTER x + INSERT x + DELETE y: the delete would drag the altered
+# table into the conflict check — refused
+statement ok
+BEGIN
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b DROP COLUMN c
+
+statement ok
+INSERT INTO lake.ns1.ryo_txn_b VALUES (100)
+
+statement error
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+<REGEX>:.*inserted into table.*after running DDL.*
+
+statement ok
+ROLLBACK
+
+# rule (c): INSERT into an ALTERed table while buffered deletes exist
+# — the commit would carry deletes and conflict-check the altered
+# table via its append
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
+----
+1
+
+statement ok
+ALTER TABLE lake.ns1.ryo_txn_b ADD COLUMN c2 INTEGER
+
+statement error
+INSERT INTO lake.ns1.ryo_txn_b VALUES (7, 7)
+----
+<REGEX>:.*ran DDL on it and also holds buffered deletes.*
+
+statement ok
+ROLLBACK
+
+# ---- combined delete-mask branch: a file with BOTH a committed
+# server-live DV and same-transaction buffered deletes; a merge
+# regression (overwrite instead of union) would resurrect the
+# committed-deleted row through the UPDATE ----
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.ryo_dv
+
+statement ok
+CREATE TABLE lake.ns1.ryo_dv (a BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.ryo_dv VALUES (1), (2), (3), (4), (5)
+
+# committed DV on the file
+query I
+DELETE FROM lake.ns1.ryo_dv WHERE a = 1
+----
+1
+
+statement ok
+BEGIN
+
+query I
+DELETE FROM lake.ns1.ryo_dv WHERE a = 2
+----
+1
+
+# the UPDATE's scan must apply committed DV ∪ buffered positions:
+# neither 1 nor 2 may be resurrected
+query I
+UPDATE lake.ns1.ryo_dv SET a = a + 10
+----
+3
+
+statement ok
+COMMIT
+
+query I
+SELECT a FROM lake.ns1.ryo_dv ORDER BY a
+----
+13
+14
+15
+
+statement ok
+DETACH lake

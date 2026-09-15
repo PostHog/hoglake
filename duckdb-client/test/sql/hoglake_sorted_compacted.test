@@ -1,0 +1,57 @@
+# name: test/sql/hoglake_sorted_compacted.test
+# description: the DISCRIMINATING explicit-row-id test, in its OWN file
+#   because its fixture gate (DUCKEXT_SORTED_COMPACTED) is conditional
+#   on the dev stack compacting: `require-env` is a WHOLE-FILE skip
+#   disposition wherever it appears, so a conditional gate sharing a
+#   file with unconditional coverage silently disables that coverage
+#   too (finding R7-1). One conditional gate, one file.
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+require-env DUCKEXT_SORTED_COMPACTED
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+# ---- DISCRIMINATING explicit-row-id test: points_sorted was appended
+# with a DESCENDING sort key in single-row batches and compacted under
+# an ASCENDING sort order, so the sorted merge REVERSES row order —
+# inside the compacted file, _hog_row_id is permuted against physical
+# position. A positional-fallback regression (rowid = row_id_start +
+# file_row_number) would pair rowid 0 with the HIGHEST id; the correct
+# explicit read pairs rowid i with id i+1. (The plain points assertion
+# above cannot catch that regression: its merge is order-preserving
+# and zero-based, so both arithmetics coincide.) ----
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakesrt (ENDPOINT '{HOGLAKE_URL}')
+
+query I
+SELECT count(*) > 0 FROM (SELECT * FROM lakesrt.ns1.points_sorted)
+----
+true
+
+query III
+SELECT rowid, id, v FROM lakesrt.ns1.points_sorted ORDER BY rowid
+----
+0	1	80
+1	2	70
+2	3	60
+3	4	50
+4	5	40
+5	6	30
+6	7	20
+7	8	10
+
+statement ok
+DETACH lakesrt

@@ -1,0 +1,169 @@
+# name: test/sql/hoglake_types.test
+# description: type-diverse write-then-read coverage: every hoglake
+#   wire type round-trips through the extension's write path, plus
+#   typed identity partitions (int/date/timestamp/boolean) whose wire
+#   strings must match pyhoglake's (verify_partition_wire.py checks the
+#   cross-client grouping after this test ran).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.all_types
+
+statement ok
+CREATE TABLE lake.ns1.all_types (
+    b BOOLEAN,
+    i INTEGER,
+    l BIGINT,
+    f FLOAT,
+    d DOUBLE,
+    dec DECIMAL(12, 3),
+    dt DATE,
+    tm TIME,
+    ts TIMESTAMP,
+    tstz TIMESTAMPTZ,
+    s VARCHAR NOT NULL,
+    u UUID,
+    bin BLOB
+)
+
+# 9007199254740993 = 2^53 + 1 (not representable in a double)
+statement ok
+INSERT INTO lake.ns1.all_types VALUES
+    (true, 2147483647, 9007199254740993, 1.5, -2.25, 123456789.125,
+     DATE '2026-02-28', TIME '23:59:59.123456', TIMESTAMP '2026-01-02 03:04:05.900000',
+     TIMESTAMPTZ '2026-01-02 03:04:05.9+00', 'ünïcödé 🦔 string', UUID 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11',
+     '\xDE\xAD\xBE\xEF'::BLOB),
+    (false, -2147483648, -9007199254740993, NULL, NULL, -0.001,
+     DATE '1969-12-31', TIME '00:00:00', TIMESTAMP '1969-12-31 23:59:59',
+     NULL, '', NULL, ''::BLOB),
+    (NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'nulls', NULL, NULL)
+
+query IIII
+SELECT b, i, l, f FROM lake.ns1.all_types ORDER BY rowid
+----
+true	2147483647	9007199254740993	1.5
+false	-2147483648	-9007199254740993	NULL
+NULL	NULL	NULL	NULL
+
+query IIII
+SELECT d, dec, dt, tm FROM lake.ns1.all_types ORDER BY rowid
+----
+-2.25	123456789.125	2026-02-28	23:59:59.123456
+NULL	-0.001	1969-12-31	00:00:00
+NULL	NULL	NULL	NULL
+
+query III
+SELECT ts, s, u FROM lake.ns1.all_types ORDER BY rowid
+----
+2026-01-02 03:04:05.9	ünïcödé 🦔 string	a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11
+1969-12-31 23:59:59	(empty)	NULL
+NULL	nulls	NULL
+
+query II
+SELECT tstz = TIMESTAMPTZ '2026-01-02 03:04:05.9+00', bin FROM lake.ns1.all_types ORDER BY rowid
+----
+true	\xDE\xAD\xBE\xEF
+NULL	(empty)
+NULL	NULL
+
+# exact int64 above 2^53 survives (no double round trip anywhere)
+query I
+SELECT l - 9007199254740992 FROM lake.ns1.all_types WHERE l > 0
+----
+1
+
+# NOT NULL enforcement on a VARCHAR column
+statement error
+INSERT INTO lake.ns1.all_types (s) VALUES (NULL)
+----
+<REGEX>:.*NOT NULL constraint failed.*
+
+# ---- typed identity partitions: insert the SAME logical key values
+# pyhoglake's fixture wrote; verify_partition_wire.py then asserts both
+# clients landed in identical partition string groups ----
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lakef (ENDPOINT '{HOGLAKE_URL}')
+
+statement ok
+INSERT INTO lakef.ns1.xclient_int VALUES (7, 'duck'), (42, 'duck')
+
+statement ok
+INSERT INTO lakef.ns1.xclient_date VALUES (DATE '2026-03-01', 'duck'), (DATE '2026-03-02', 'duck')
+
+statement ok
+INSERT INTO lakef.ns1.xclient_ts VALUES
+    (TIMESTAMP '2026-01-02 03:04:05.900000', 'duck'),
+    (TIMESTAMP '2026-01-02 03:04:05', 'duck')
+
+statement ok
+INSERT INTO lakef.ns1.xclient_bool VALUES (true, 'duck'), (false, 'duck')
+
+# both clients' rows are visible per key (partition filters correct
+# across mixed-writer files). count(DISTINCT src) is rerun-stable:
+# repeated suite runs append more 'duck' rows but never change it.
+query I
+SELECT count(DISTINCT src) FROM lakef.ns1.xclient_int WHERE k = 7
+----
+2
+
+query I
+SELECT count(DISTINCT src) FROM lakef.ns1.xclient_ts WHERE k = TIMESTAMP '2026-01-02 03:04:05.900000'
+----
+2
+
+query I
+SELECT count(DISTINCT src) FROM lakef.ns1.xclient_date WHERE k = DATE '2026-03-02'
+----
+2
+
+query I
+SELECT count(DISTINCT src) FROM lakef.ns1.xclient_bool WHERE k = false
+----
+2
+
+# ---- binary identity partitions (pyhoglake-written; the wire value is
+# BASE64): pruning must decode, not cast the base64 text into the BLOB,
+# or these filters silently return zero rows ----
+
+query I
+SELECT n FROM lakef.ns1.part_bin WHERE k = '\x68\x65\x6C\x6C\x6F'::BLOB
+----
+1
+
+query I
+SELECT n FROM lakef.ns1.part_bin WHERE k = '\x00\x01'::BLOB
+----
+2
+
+query I
+SELECT count(*) FROM lakef.ns1.part_bin WHERE k IS NOT NULL
+----
+2
+
+statement ok
+DETACH lakef

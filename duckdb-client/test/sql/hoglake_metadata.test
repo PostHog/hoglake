@@ -1,0 +1,182 @@
+# name: test/sql/hoglake_metadata.test
+# description: M5 against the live dev stack: time travel
+#   (AT VERSION/TIMESTAMP, attach-level pins), metadata functions,
+#   maintenance passthroughs.
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require json
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.tt
+
+statement ok
+CREATE TABLE lake.ns1.tt (id BIGINT)
+
+statement ok
+INSERT INTO lake.ns1.tt VALUES (1), (2)
+
+statement ok
+INSERT INTO lake.ns1.tt VALUES (3)
+
+# ---- time travel ----
+
+# a future timestamp resolves to head (per the wire contract)
+query I
+SELECT count(*) FROM lake.ns1.tt AT (TIMESTAMP => TIMESTAMP '2100-01-01')
+----
+3
+
+# the snapshot before the last insert has 2 rows: derive it via the
+# snapshot_id virtual column (deterministic across reruns)
+query I
+SELECT count(*) FROM lake.ns1.tt WHERE snapshot_id < (SELECT max(snapshot_id) FROM lake.ns1.tt)
+----
+2
+
+# out-of-range version errors cleanly
+statement error
+SELECT count(*) FROM lake.ns1.tt AT (VERSION => 99999999)
+----
+<REGEX>:.*out of range.*
+
+# a timestamp before the catalog existed errors (below the floor)
+statement error
+SELECT count(*) FROM lake.ns1.tt AT (TIMESTAMP => TIMESTAMP '2000-01-01')
+----
+
+# ---- metadata functions ----
+
+query I
+SELECT count(*) > 0 FROM hoglake_snapshots('lake')
+----
+true
+
+# pagination: a 2-per-page walk returns exactly the same set as one
+# big page (this catalog has far more than 2 snapshots, so the walk
+# crosses many page boundaries)
+query I
+SELECT (SELECT count(*) FROM hoglake_snapshots('lake', page_size => 2)) =
+       (SELECT count(*) FROM hoglake_snapshots('lake'))
+----
+true
+
+query I
+SELECT count(*) = count(DISTINCT snapshot_id) FROM hoglake_snapshots('lake', page_size => 2)
+----
+true
+
+# the newest snapshot records the insert into tt as a TYPED change:
+# kind table_inserted_into, with a real object id
+query II
+SELECT changes[1].kind, changes[1].object_id > 0 FROM hoglake_snapshots('lake') ORDER BY snapshot_id DESC LIMIT 1
+----
+table_inserted_into	true
+
+query I
+SELECT (SELECT id FROM hoglake_current_snapshot('lake')) = (SELECT max(snapshot_id) FROM hoglake_snapshots('lake'))
+----
+true
+
+query III
+SELECT namespace, table_name, record_count FROM hoglake_table_info('lake') WHERE table_name = 'tt'
+----
+ns1	tt	3
+
+# ---- maintenance passthroughs (server-side; results are JSON).
+# NOTE: these assert the wire round trip and result SHAPE; this dev
+# catalog has no retention configured and no hydrated stats, so expiry
+# expires nothing and compaction finds no groups — the numbers are
+# asserted as present-and-zero, not as real maintenance effects. ----
+
+# smoke-only: EXPLAIN exercises the bind path of a maintenance
+# function. HONESTY NOTE: on this dev stack a stray bind-time POST
+# /maintenance/expire would be a silent no-op (no retention
+# configured), so this statement CANNOT detect a
+# mutation-at-bind regression — the guarantee lives in the code
+# (MaintenanceInit) and the read-only refusal test below.
+statement ok
+EXPLAIN SELECT * FROM hoglake_expire('lake')
+
+
+query II
+SELECT result ->> '$.snapshots_expired' IS NOT NULL, result ->> '$.new_earliest_snapshot_id' IS NOT NULL
+    FROM hoglake_expire('lake')
+----
+true	true
+
+query III
+SELECT result ->> '$.groups_compacted' IS NOT NULL, result ->> '$.files_in' IS NOT NULL,
+       result ->> '$.skipped_conflicts' IS NOT NULL
+    FROM hoglake_compact('lake')
+----
+true	true	true
+
+query III
+SELECT result ->> '$.removed' IS NOT NULL, result ->> '$.missing' IS NOT NULL,
+       result ->> '$.still_referenced' IS NOT NULL
+    FROM hoglake_cleanup('lake', batch => 100)
+----
+true	true	true
+
+query I
+SELECT result ->> '$.status' FROM hoglake_verify('lake')
+----
+pass
+
+# unknown catalogs error cleanly
+statement error
+SELECT * FROM hoglake_snapshots('not_attached')
+----
+
+statement ok
+DETACH lake
+
+# a read-only attach refuses mutating maintenance outright (and a
+# SNAPSHOT pin forces read-only, so pinned readers are covered too);
+# hoglake_verify stays allowed (read-only server op)
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake_ro (ENDPOINT '{HOGLAKE_URL}', READ_ONLY)
+
+statement error
+SELECT * FROM hoglake_expire('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+statement error
+SELECT * FROM hoglake_compact('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+statement error
+SELECT * FROM hoglake_cleanup('lake_ro')
+----
+<REGEX>:.*maintenance.*read-only.*
+
+query I
+SELECT result ->> '$.status' FROM hoglake_verify('lake_ro')
+----
+pass
+
+statement ok
+DETACH lake_ro

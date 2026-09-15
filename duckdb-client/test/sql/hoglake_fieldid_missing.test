@@ -1,0 +1,64 @@
+# name: test/sql/hoglake_fieldid_missing.test
+# description: the flag-true/column-missing direction of the
+#   reserved-field-id contract: a registration WITH explicit row ids
+#   whose parquet lacks field id 2147483646 must refuse TYPED, not
+#   reach DuckDB's FieldIdMapper::GetDefault (InternalException ->
+#   whole-instance invalidation). Its own file because its fixture gate
+#   is conditional on the dev stack compacting, and `require-env` skips
+#   the WHOLE file wherever it appears — sharing a file with
+#   unconditional coverage would silently disable that too (R7-1).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+require-env DUCKEXT_FID_MISSING
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lakefm (ENDPOINT '{HOGLAKE_URL}')
+
+# ---- the COMPLEMENTARY direction: a registration WITH explicit row
+# ids whose parquet lacks the reserved field id (fixture byte-patches a
+# real compaction output's footer so the id is no longer 2147483646,
+# keeping file and footer sizes identical). Pre-fix this reached
+# DuckDB's FieldIdMapper::GetDefault -> InternalException -> whole
+# instance invalidated; it must refuse typed like its mirror. ----
+
+query I
+SELECT count(*) FROM lakefm.ns1.fid_missing
+----
+8
+
+statement error
+SELECT rowid FROM lakefm.ns1.fid_missing
+----
+<REGEX>:.*registered WITH explicit row ids but its parquet has no column.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+statement error
+DELETE FROM lakefm.ns1.fid_missing WHERE id = 1
+----
+<REGEX>:.*registered WITH explicit row ids but its parquet has no column.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+statement ok
+DETACH lakefm

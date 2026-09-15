@@ -1,0 +1,55 @@
+# name: test/sql/hoglake_concurrency.test
+# description: regression coverage for the round-1 catalog-cache race
+#   (UAF): SHOW ALL TABLES (and the duckdb_tables/duckdb_views/
+#   duckdb_columns union under it) runs parallel pipeline inits that
+#   all race into LoadAllTables/CacheTable. Pre-fix this failed 4-5 of
+#   6 runs at default threads with a garbage entry.type read from a
+#   freed HoglakeTableEntry; the loop makes a lock regression loud.
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+# parallel pipeline inits need threads; be explicit so the repro does
+# not depend on the runner's core count
+statement ok
+SET threads TO 8
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lake (ENDPOINT '{HOGLAKE_URL}')
+
+# each iteration detaches/re-attaches so every round starts with COLD
+# per-transaction caches — the race lives in concurrent cache fills
+loop i 0 8
+
+statement ok
+DETACH lake
+
+statement ok
+ATTACH 'hoglake:duckext-read' AS lake (ENDPOINT '{HOGLAKE_URL}')
+
+statement ok
+SHOW ALL TABLES
+
+query I
+SELECT count(*) > 0 FROM duckdb_tables() t
+    JOIN duckdb_columns() c USING (database_name, schema_name, table_name)
+    WHERE t.database_name = 'lake'
+----
+true
+
+endloop
+
+statement ok
+DETACH lake

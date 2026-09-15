@@ -1,0 +1,146 @@
+# name: test/sql/hoglake_write.test
+# description: M3 write path against the live dev stack: INSERT as
+#   parquet write + footer-shipping commit; transactional
+#   multi-statement commits; CTAS. Self-contained (eager DDL creates
+#   the fixture tables).
+# group: [hoglake]
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env HOGLAKE_URL
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+    ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
+
+statement ok
+ATTACH 'hoglake:duckext-sqltest' AS lake
+    (ENDPOINT '{HOGLAKE_URL}', CREATE_IF_NOT_EXISTS true, DATA_PATH 's3://duckext-itest/sqltest/')
+
+statement ok
+CREATE SCHEMA IF NOT EXISTS lake.ns1
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.w_test
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.w_other
+
+statement ok
+DROP TABLE IF EXISTS lake.ns1.w_ctas
+
+statement ok
+CREATE TABLE lake.ns1.w_test (id BIGINT NOT NULL, name VARCHAR, val DOUBLE)
+
+statement ok
+INSERT INTO lake.ns1.w_test VALUES (1, 'a', 1.5), (2, 'b', NULL), (3, NULL, -2.0)
+
+query I
+SELECT count(*) FROM lake.ns1.w_test
+----
+3
+
+query IIII
+SELECT rowid, id, name, val FROM lake.ns1.w_test ORDER BY rowid
+----
+0	1	a	1.5
+1	2	b	NULL
+2	3	NULL	-2.0
+
+# NOT NULL is enforced client-side from the written null counts;
+# a refused insert registers nothing
+statement error
+INSERT INTO lake.ns1.w_test VALUES (NULL, 'x', 0.0)
+----
+<REGEX>:.*NOT NULL constraint failed.*
+
+query I
+SELECT count(*) FROM lake.ns1.w_test
+----
+3
+
+# multi-statement transaction: one commit, one snapshot, atomic across
+# tables
+statement ok
+CREATE TABLE lake.ns1.w_other (id BIGINT)
+
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.w_test VALUES (4, 'd', 4.0)
+
+statement ok
+INSERT INTO lake.ns1.w_other VALUES (100)
+
+statement ok
+COMMIT
+
+query II
+SELECT (SELECT count(*) FROM lake.ns1.w_test), (SELECT count(*) FROM lake.ns1.w_other)
+----
+4	1
+
+query I
+SELECT (SELECT max(snapshot_id) FROM lake.ns1.w_test) = (SELECT max(snapshot_id) FROM lake.ns1.w_other)
+----
+true
+
+# rollback discards buffered registrations (uploaded parquet is
+# orphaned; cleanup's problem, never the catalog's)
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO lake.ns1.w_other VALUES (200)
+
+statement ok
+ROLLBACK
+
+query I
+SELECT count(*) FROM lake.ns1.w_other
+----
+1
+
+# CREATE TABLE AS (eager create + buffered insert)
+statement ok
+CREATE TABLE lake.ns1.w_ctas AS SELECT id, name FROM lake.ns1.w_test WHERE id <= 2
+
+query II
+SELECT id, name FROM lake.ns1.w_ctas ORDER BY id
+----
+1	a
+2	b
+
+# appending across multiple statements accumulates snapshots
+query I
+SELECT count(DISTINCT snapshot_id) FROM lake.ns1.w_test
+----
+2
+
+# CTAS from types NARROWER than their wire mapping (TINYINT/SMALLINT ->
+# wire "int" -> INTEGER) must cast before the parquet copy — without
+# the cast projection these read back as garbage (int8/int16 buffers
+# consumed at int32 width)
+statement ok
+DROP TABLE IF EXISTS lake.ns1.w_narrow
+
+statement ok
+CREATE TABLE lake.ns1.w_narrow AS SELECT (t+1)::TINYINT AS a, (t*10+7)::SMALLINT AS b FROM range(4) tbl(t)
+
+query II
+SELECT a, b FROM lake.ns1.w_narrow ORDER BY a
+----
+1	7
+2	17
+3	27
+4	37
+
+statement ok
+DETACH lake
