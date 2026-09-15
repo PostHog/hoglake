@@ -1,0 +1,4 @@
+# .kt is source: diff it as text even when a test embeds control bytes
+# in a string literal (a NUL in the blob otherwise makes git call the
+# whole file binary, and the change lands in review with no diff).
+*.kt diff
