@@ -443,11 +443,25 @@ class IcebergSingleValueTest {
                 .isEqualTo(document.toByteArray(Charsets.UTF_8))
             assertThat(IcebergSingleValue.decode(ColType.JSON, document.toByteArray(Charsets.UTF_8)))
                 .isEqualTo(document)
-            // Above the BMP, UTF-16 unit order (String.compareTo) disagrees
-            // with code-point order; json must use the same unsigned byte
-            // compare string does.
+            // Above the BMP, UTF-16 unit order (String.compareTo)
+            // disagrees with code-point order: U+1F600's lead surrogate
+            // 0xD83D sorts BELOW 0xFFFD as UTF-16 units, while its UTF-8
+            // bytes F0 9F 98 80 sort ABOVE EF BF BD.
             val astral = "😀"
             val bmp = "�"
+            // Absolute, not relative. Asserting only that JSON agrees with
+            // STRING passes when BOTH are wrong — a comparator switched to
+            // String.compareTo flips the pair on both types at once.
+            assertThat(IcebergSingleValue.compareValues(ColType.JSON, astral, bmp))
+                .describedAs("json orders the astral codepoint above U+FFFD, as UTF-8 bytes")
+                .isGreaterThan(0)
+            assertThat(IcebergSingleValue.compareValues(ColType.STRING, astral, bmp))
+                .describedAs("string does the same")
+                .isGreaterThan(0)
+            // The counterexample, stated so the anchors above cannot be
+            // mistaken for a tautology: Java's own String order says the
+            // opposite.
+            assertThat(astral.compareTo(bmp)).isLessThan(0)
             assertThat(IcebergSingleValue.compareValues(ColType.JSON, astral, bmp))
                 .isEqualTo(IcebergSingleValue.compareValues(ColType.STRING, astral, bmp))
         }

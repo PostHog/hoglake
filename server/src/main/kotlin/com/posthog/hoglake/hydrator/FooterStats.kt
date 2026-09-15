@@ -1,6 +1,7 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.statistics.Statistics
@@ -47,15 +48,6 @@ object FooterStats {
 
     /** 2^64, for reading an unsigned int64 out of its signed bit pattern. */
     private val TWO_POW_64: BigInteger = BigInteger.ONE.shiftLeft(64)
-
-    /**
-     * The only catalog types that may read a parquet INT(32, unsigned)
-     * leaf: both zero-extend it into an 8-byte bound, so the magnitude
-     * survives and the unsigned ordering parquet used still holds.
-     * uint32 is the declared pairing; long is where it lands after the
-     * legal uint8/uint16/uint32 -> long promotions.
-     */
-    private val UNSIGNED_INT32_READERS = setOf(ColType.UINT32, ColType.LONG)
 
     data class ColumnAgg(
         val fieldId: Long,
@@ -232,19 +224,33 @@ object FooterStats {
     ): Any? {
         val physical = leaf.primitive.primitiveTypeName
 
-        // A full-width unsigned INT annotation is not decoration. It
-        // changes BOTH what the bits mean (a magnitude, not a signed
-        // value) and the order parquet used to compute this chunk's
-        // min/max. Only the catalog types that actually zero-extend may
-        // read one; every other pairing reads the magnitude signed AND
-        // inherits an ordering it disagrees with, which is how a bound
-        // pair comes back with lower > upper — the shape a pruner reads
-        // as "no rows here", silently dropping the file from scans.
-        // Narrower unsigned widths (8/16) are exempt because their
-        // values are positive in an int32 either way, so both readings
-        // and both orderings agree.
-        if (isUnsignedInt(leaf, 32) && col.type !in UNSIGNED_INT32_READERS) return null
-        if (isUnsignedInt(leaf, 64) && col.type != ColType.UINT64) return null
+        // An unsigned INT annotation is not decoration. It says the bits
+        // are a magnitude rather than a signed value, AND that parquet
+        // ordered this chunk's min/max unsigned. A catalog type may read
+        // one only if its own domain CONTAINS [0, 2^width): otherwise the
+        // top of the file's range does not fit the bound, and the
+        // orderings disagree — which is how a bound pair comes back with
+        // lower > upper, the shape a pruner reads as "no rows here",
+        // silently dropping the file from every scan.
+        //
+        // The rule is per-width rather than per-type, because the same
+        // annotation is fine or fatal depending on both: int16 reads
+        // INT(8, unsigned) happily (255 fits) and must refuse
+        // INT(16, unsigned) (65535 does not), and int8 refuses even the
+        // 8-bit one.
+        val unsignedWidth = unsignedIntWidth(leaf)
+        if (unsignedWidth != null && unsignedWidth > col.type.maxUnsignedParquetWidth) {
+            // Loud, like the decimal-scale mismatch below: a fleet-wide
+            // loss of bounds on a whole column type is a pruning
+            // regression, and silence would make it invisible until
+            // someone noticed scans got slower.
+            log.warn {
+                "column ${col.name} is '${col.type.wire}' but the parquet leaf is " +
+                    "INT($unsignedWidth, unsigned), whose values do not all fit that type; " +
+                    "skipping bounds (counts are unaffected)"
+            }
+            return null
+        }
 
         return when (col.type) {
             ColType.BOOLEAN ->
@@ -442,6 +448,12 @@ object FooterStats {
     private fun isUnsignedInt(leaf: Leaf): Boolean =
         (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
             ?.isSigned == false
+
+    /** The leaf's unsigned INT width, or null when it is not unsigned-annotated. */
+    private fun unsignedIntWidth(leaf: Leaf): Int? =
+        (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+            ?.takeIf { !it.isSigned }
+            ?.bitWidth
 
     /** True when the leaf carries parquet INT(width, isSigned = false). */
     private fun isUnsignedInt(

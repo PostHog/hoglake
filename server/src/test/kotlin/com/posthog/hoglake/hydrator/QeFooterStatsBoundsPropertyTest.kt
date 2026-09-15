@@ -4,11 +4,6 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.IcebergType
 import com.posthog.hoglake.model.icebergType
 import com.posthog.hoglake.stats.IcebergSingleValue
-import io.kotest.property.Arb
-import io.kotest.property.arbitrary.int
-import io.kotest.property.arbitrary.long
-import io.kotest.property.checkAll
-import kotlinx.coroutines.runBlocking
 import org.apache.parquet.column.Encoding
 import org.apache.parquet.column.statistics.Statistics
 import org.apache.parquet.hadoop.metadata.BlockMetaData
@@ -26,42 +21,72 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import kotlin.random.Random
 
 /**
- * Property assault on FooterStats' decode matrix: every catalog type
- * crossed with every physical/logical shape a writer might hand us.
+ * Assault on FooterStats' decode matrix: every catalog type crossed with
+ * every physical/logical shape a writer might hand us.
  *
- * Two invariants, and the SECOND one is the reason this class exists:
+ * The matrix is ENUMERATED, not sampled. It is ~500 cells and each one
+ * costs a handful of pure function calls, so a random walk over it buys
+ * nothing and costs coverage: at the default property-test budget a
+ * typical run left dozens of cells untouched, which made a reintroduced
+ * sign-extension bug a coin flip rather than a failure. Every cell now
+ * runs, with a seed derived from the cell's own identity, so a failure
+ * reproduces exactly from its name alone.
+ *
+ * Three claims, per cell:
  *
  *  1. A produced bound is encoded at the MAPPED Iceberg type's width
  *     (ColType.icebergType, iceberg-federation.md §2) — a 4-byte bound
  *     under a long column is the stale-width poison that wedges
  *     compaction's bound-merge.
  *  2. lower <= upper, compared under the catalog type.
+ *  3. The cells in [mustProduce] produce a bound at all.
  *
- * Invariant 2 catches an entire bug CLASS generically rather than one
+ * Claim 2 catches an entire bug CLASS generically rather than one
  * instance of it. The unsigned-int32-under-a-long-column defect
  * (0xFFFFFFFF sign-extending to -1) produced exactly an inverted range,
  * and an inverted range is worse than a wrong one: a pruner reads it as
- * "no rows here" and drops the file from every scan while all the
- * counts still look healthy. Any future decode arm that reinterprets
- * bits without honouring the annotation that ordered them will land
- * here the same way.
+ * "no rows here" and drops the file from every scan while all the counts
+ * still look healthy. Any future decode arm that reinterprets bits
+ * without honouring the annotation that ordered them lands here the same
+ * way — but only if the offending bits are actually generated, so every
+ * fixed-width shape hard-codes its high-bit-set patterns (0xFFFFFFFF for
+ * a 32-bit leaf, Long.MIN_VALUE's pattern for a 64-bit one) instead of
+ * hoping a sampler stumbles onto them. Those patterns are ~2^-31 of the
+ * domain; they are 100% of the bugs.
  *
- * The generated min/max pair is always ordered in the LEAF's own
+ * Claim 3 is what stops the whole thing from passing vacuously. "Bounds
+ * NULL, never guessed" is the standing contract, so a refusal is always
+ * a *safe* answer — which means a decode arm could go dark and claims 1
+ * and 2 would still be perfectly satisfied by the resulting silence.
+ * [mustProduce] names the pairings a writer in the wild actually emits,
+ * and refusing one of those is a pruning regression, not caution.
+ *
+ * Generated (min, max) pairs are always ordered in the LEAF'S OWN
  * parquet sort order, because that is what a real writer's footer
  * contains — an unsigned annotation means parquet ordered the chunk
  * unsigned, and reading those bytes signed is precisely the mistake.
- * (Bounds are allowed to come back NULL for any shape: "NULL, never
- * guessed" is the standing contract, so refusing is always correct.)
  */
 class QeFooterStatsBoundsPropertyTest {
+    private companion object {
+        /** Extra generated pairs per cell, on top of the pinned boundary ones. */
+        const val RANDOM_PAIRS_PER_CELL = 4
+    }
+
     /** One physical/logical leaf shape, with the ordering parquet gives it. */
     private class Shape(
         val name: String,
         val leaf: PrimitiveType,
-        /** A sorted (min, max) pair of raw statistics bytes in this leaf's order. */
-        val sortedPair: (Arb.Companion, kotlin.random.Random) -> Pair<ByteArray, ByteArray>,
+        /**
+         * Pairs every cell of this shape's column gets, pinned in source:
+         * the domain edges and the bit patterns that expose reinterpretation
+         * bugs. Ordered in the leaf's own parquet sort order.
+         */
+        val boundary: List<Pair<ByteArray, ByteArray>>,
+        /** One more same-ordering pair, from the cell's pinned Random. */
+        val random: (Random) -> Pair<ByteArray, ByteArray>,
     )
 
     private fun leafOf(
@@ -79,90 +104,135 @@ class QeFooterStatsBoundsPropertyTest {
 
     private fun le(v: Long): ByteArray = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putLong(v).array()
 
-    /** Two ints ordered by [cmp], as 4-byte LE stat bytes. */
-    private fun intPair(
-        rnd: kotlin.random.Random,
-        bound: Int,
-        cmp: Comparator<Int>,
-    ): Pair<ByteArray, ByteArray> {
-        val a = rnd.nextInt(0, bound)
-        val b = rnd.nextInt(0, bound)
-        val (lo, hi) = if (cmp.compare(a, b) <= 0) a to b else b to a
-        return le(lo) to le(hi)
-    }
+    /** Big-endian, the byte order parquet uses for BINARY-backed decimals. */
+    private fun be(v: Long): ByteArray = ByteBuffer.allocate(8).putLong(v).array()
 
-    private fun longPair(
-        rnd: kotlin.random.Random,
-        cmp: Comparator<Long>,
-    ): Pair<ByteArray, ByteArray> {
-        val a = rnd.nextLong()
-        val b = rnd.nextLong()
-        val (lo, hi) = if (cmp.compare(a, b) <= 0) a to b else b to a
-        return le(lo) to le(hi)
-    }
+    private fun intPairs(vararg pairs: Pair<Int, Int>): List<Pair<ByteArray, ByteArray>> =
+        pairs.map { le(it.first) to le(it.second) }
+
+    private fun longPairs(vararg pairs: Pair<Long, Long>): List<Pair<ByteArray, ByteArray>> =
+        pairs.map { le(it.first) to le(it.second) }
+
+    private fun bytePairs(vararg pairs: Pair<ByteArray, ByteArray>): List<Pair<ByteArray, ByteArray>> = pairs.toList()
+
+    private fun bytes(vararg v: Int): ByteArray = ByteArray(v.size) { v[it].toByte() }
+
+    private fun filled(
+        size: Int,
+        v: Int,
+    ): ByteArray = ByteArray(size) { v.toByte() }
+
+    /** Signed-int32 leaves, annotated and bare; parquet orders them signed. */
+    private val signedInt32Shapes =
+        listOf(
+            "int32" to null,
+            "int32/int8s" to LogicalTypeAnnotation.intType(8, true),
+            "int32/int16s" to LogicalTypeAnnotation.intType(16, true),
+            "int32/int32s" to LogicalTypeAnnotation.intType(32, true),
+        )
+
+    /** BYTE_ARRAY leaves; parquet orders all three unsigned lexicographic. */
+    private val byteArrayShapes =
+        listOf(
+            "binary" to null,
+            "binary/string" to LogicalTypeAnnotation.stringType(),
+            "binary/json" to LogicalTypeAnnotation.jsonType(),
+        )
 
     private val shapes: List<Shape> by lazy {
         buildList {
-            // Signed int32, annotated and bare. Parquet orders these signed.
-            val signedInt32 =
-                listOf(
-                    "int32" to null,
-                    "int32/int8s" to LogicalTypeAnnotation.intType(8, true),
-                    "int32/int16s" to LogicalTypeAnnotation.intType(16, true),
-                    "int32/int32s" to LogicalTypeAnnotation.intType(32, true),
-                )
-            for ((label, ann) in signedInt32) {
+            for ((label, ann) in signedInt32Shapes) {
                 add(
-                    Shape(label, leafOf(PrimitiveTypeName.INT32, ann)) { _, rnd ->
-                        // Full signed domain, shifted so negatives appear.
-                        val cmp = Comparator<Int> { x, y -> x.compareTo(y) }
-                        val (a, b) = intPair(rnd, Int.MAX_VALUE, cmp)
-                        val sa = ByteBuffer.wrap(a).order(ByteOrder.LITTLE_ENDIAN).int - 1_000_000
-                        val sb = ByteBuffer.wrap(b).order(ByteOrder.LITTLE_ENDIAN).int - 1_000_000
-                        le(minOf(sa, sb)) to le(maxOf(sa, sb))
+                    Shape(
+                        label,
+                        leafOf(PrimitiveTypeName.INT32, ann),
+                        // Both int32 extremes and the all-ones pattern, which is
+                        // -1 signed: an arm that reads these bits unsigned puts
+                        // the max below the min.
+                        intPairs(
+                            Int.MIN_VALUE to Int.MAX_VALUE,
+                            -1 to 0,
+                            Int.MIN_VALUE to Int.MIN_VALUE,
+                            Int.MAX_VALUE to Int.MAX_VALUE,
+                        ),
+                    ) { rnd ->
+                        val a = rnd.nextInt()
+                        val b = rnd.nextInt()
+                        le(minOf(a, b)) to le(maxOf(a, b))
                     },
                 )
             }
             // UNSIGNED int32 at each width. Parquet orders these UNSIGNED,
-            // which is the whole point: the raw bits of the max can have
-            // the high bit set.
+            // which is the whole point: the raw bits of the max can have the
+            // high bit set while still being the larger value.
             for (width in listOf(8, 16, 32)) {
+                val span = if (width == 32) 0xFFFFFFFFL else (1L shl width) - 1
+                val top = span.toInt()
+                val mid = (span / 2 + 1).toInt()
                 add(
                     Shape(
                         "int32/uint$width",
                         leafOf(PrimitiveTypeName.INT32, LogicalTypeAnnotation.intType(width, false)),
-                    ) { _, rnd ->
-                        val span = if (width == 32) 0xFFFFFFFFL else (1L shl width) - 1
-                        val a = (rnd.nextDouble() * span).toLong()
-                        val b = (rnd.nextDouble() * span).toLong()
+                        // (0, top) is the pair that kills a sign-extending
+                        // reader at width 32: signed it reads (0, -1), which is
+                        // the inverted range a pruner obeys. (mid, top) stays
+                        // ordered under both readings, so it is the control.
+                        intPairs(0 to top, mid to top, top to top, 0 to 0),
+                    ) { rnd ->
+                        val a = rnd.nextLong(0, span + 1)
+                        val b = rnd.nextLong(0, span + 1)
                         le(minOf(a, b).toInt()) to le(maxOf(a, b).toInt())
                     },
                 )
             }
             add(
-                Shape("int64", leafOf(PrimitiveTypeName.INT64)) { _, rnd ->
-                    longPair(rnd) { x, y -> x.compareTo(y) }
+                Shape(
+                    "int64",
+                    leafOf(PrimitiveTypeName.INT64),
+                    longPairs(
+                        Long.MIN_VALUE to Long.MAX_VALUE,
+                        -1L to 0L,
+                        Long.MIN_VALUE to Long.MIN_VALUE,
+                        Long.MAX_VALUE to Long.MAX_VALUE,
+                    ),
+                ) { rnd ->
+                    val a = rnd.nextLong()
+                    val b = rnd.nextLong()
+                    le(minOf(a, b)) to le(maxOf(a, b))
                 },
             )
             add(
                 Shape(
                     "int64/uint64",
                     leafOf(PrimitiveTypeName.INT64, LogicalTypeAnnotation.intType(64, false)),
-                ) { _, rnd ->
-                    longPair(rnd) { x, y -> java.lang.Long.compareUnsigned(x, y) }
+                    // (MAX, MIN) is unsigned-ordered (2^63-1 < 2^63) and
+                    // signed-INVERTED, so it is the 64-bit twin of the uint32
+                    // trap; (0, -1) spans the whole unsigned domain.
+                    longPairs(
+                        0L to -1L,
+                        Long.MAX_VALUE to Long.MIN_VALUE,
+                        Long.MIN_VALUE to -1L,
+                        -1L to -1L,
+                    ),
+                ) { rnd ->
+                    val a = rnd.nextLong()
+                    val b = rnd.nextLong()
+                    if (java.lang.Long.compareUnsigned(a, b) <= 0) le(a) to le(b) else le(b) to le(a)
                 },
             )
             for (unit in LogicalTypeAnnotation.TimeUnit.entries) {
+                // A millis leaf's int64 extremes are NOT reachable bounds: the
+                // read scales them to micros, which overflows, and the contract
+                // says a null bound rather than a wrapped one. Cap them so the
+                // edge still exercises the arm instead of only its overflow
+                // guard (that guard has its own coverage in the unit tests).
+                val edge = if (unit == LogicalTypeAnnotation.TimeUnit.MILLIS) Long.MAX_VALUE / 1_000 else Long.MAX_VALUE
                 add(
                     Shape(
                         "int64/ts-$unit",
-                        leafOf(
-                            PrimitiveTypeName.INT64,
-                            LogicalTypeAnnotation.timestampType(false, unit),
-                        ),
-                    ) { _, rnd ->
-                        // Bounded so unit conversion cannot overflow into the
-                        // null-bound path on every single sample.
+                        leafOf(PrimitiveTypeName.INT64, LogicalTypeAnnotation.timestampType(false, unit)),
+                        longPairs(-edge to edge, -1L to 0L, -edge to -edge, edge to edge),
+                    ) { rnd ->
                         val a = rnd.nextLong(-1_000_000_000_000L, 1_000_000_000_000L)
                         val b = rnd.nextLong(-1_000_000_000_000L, 1_000_000_000_000L)
                         le(minOf(a, b)) to le(maxOf(a, b))
@@ -176,45 +246,79 @@ class QeFooterStatsBoundsPropertyTest {
                         PrimitiveTypeName.INT64,
                         LogicalTypeAnnotation.timeType(false, LogicalTypeAnnotation.TimeUnit.MICROS),
                     ),
-                ) { _, rnd ->
+                    // Micros are the stored unit, so no scaling can overflow and
+                    // the int64 extremes are legitimate bound bits here.
+                    longPairs(
+                        Long.MIN_VALUE to Long.MAX_VALUE,
+                        -1L to 0L,
+                        0L to 86_399_999_999L,
+                    ),
+                ) { rnd ->
                     val a = rnd.nextLong(0, 86_400_000_000L)
                     val b = rnd.nextLong(0, 86_400_000_000L)
                     le(minOf(a, b)) to le(maxOf(a, b))
                 },
             )
             add(
-                Shape("int32/date", leafOf(PrimitiveTypeName.INT32, LogicalTypeAnnotation.dateType())) { _, rnd ->
+                Shape(
+                    "int32/date",
+                    leafOf(PrimitiveTypeName.INT32, LogicalTypeAnnotation.dateType()),
+                    intPairs(Int.MIN_VALUE to Int.MAX_VALUE, -1 to 0, 0 to 0),
+                ) { rnd ->
                     val a = rnd.nextInt(-50_000, 50_000)
                     val b = rnd.nextInt(-50_000, 50_000)
                     le(minOf(a, b)) to le(maxOf(a, b))
                 },
             )
             add(
-                Shape("float", leafOf(PrimitiveTypeName.FLOAT)) { _, rnd ->
-                    val a = rnd.nextFloat() * 1000f
-                    val b = rnd.nextFloat() * 1000f
-                    le(java.lang.Float.floatToRawIntBits(minOf(a, b))) to
-                        le(java.lang.Float.floatToRawIntBits(maxOf(a, b)))
+                Shape(
+                    "float",
+                    leafOf(PrimitiveTypeName.FLOAT),
+                    // Negative floats have the sign bit set, so the all-negative
+                    // pair is this shape's high-bit case; -0.0/0.0 pins the one
+                    // place IEEE order and bit order disagree. No NaN: FooterStats
+                    // refuses NaN bounds by contract, and this shape's cells are
+                    // must-produce.
+                    listOf(
+                        le((-Float.MAX_VALUE).toRawBits()) to le(Float.MAX_VALUE.toRawBits()),
+                        le((-1000f).toRawBits()) to le((-0.5f).toRawBits()),
+                        le((-0.0f).toRawBits()) to le(0.0f.toRawBits()),
+                    ),
+                ) { rnd ->
+                    val a = (rnd.nextFloat() - 0.5f) * 1000f
+                    val b = (rnd.nextFloat() - 0.5f) * 1000f
+                    le(minOf(a, b).toRawBits()) to le(maxOf(a, b).toRawBits())
                 },
             )
             add(
-                Shape("double", leafOf(PrimitiveTypeName.DOUBLE)) { _, rnd ->
-                    val a = rnd.nextDouble() * 1000.0
-                    val b = rnd.nextDouble() * 1000.0
-                    le(java.lang.Double.doubleToRawLongBits(minOf(a, b))) to
-                        le(java.lang.Double.doubleToRawLongBits(maxOf(a, b)))
+                Shape(
+                    "double",
+                    leafOf(PrimitiveTypeName.DOUBLE),
+                    listOf(
+                        le((-Double.MAX_VALUE).toRawBits()) to le(Double.MAX_VALUE.toRawBits()),
+                        le((-1000.0).toRawBits()) to le((-0.5).toRawBits()),
+                        le((-0.0).toRawBits()) to le(0.0.toRawBits()),
+                    ),
+                ) { rnd ->
+                    val a = (rnd.nextDouble() - 0.5) * 1000.0
+                    val b = (rnd.nextDouble() - 0.5) * 1000.0
+                    le(minOf(a, b).toRawBits()) to le(maxOf(a, b).toRawBits())
                 },
             )
-            // BYTE_ARRAY flavours: parquet orders these unsigned lexicographic.
-            val byteArrays =
-                listOf(
-                    "binary" to null,
-                    "binary/string" to LogicalTypeAnnotation.stringType(),
-                    "binary/json" to LogicalTypeAnnotation.jsonType(),
-                )
-            for ((label, ann) in byteArrays) {
+            for ((label, ann) in byteArrayShapes) {
                 add(
-                    Shape(label, leafOf(PrimitiveTypeName.BINARY, ann)) { _, rnd ->
+                    Shape(
+                        label,
+                        leafOf(PrimitiveTypeName.BINARY, ann),
+                        // 0x7F/0x80 is the byte-array analogue of the integer
+                        // sign trap: ordered unsigned, inverted signed.
+                        bytePairs(
+                            bytes(0x00) to bytes(0xFF),
+                            bytes(0x7F) to bytes(0x80),
+                            filled(4, 0x00) to filled(4, 0xFF),
+                            filled(4, 0xFF) to filled(4, 0xFF),
+                        ),
+                    ) { rnd ->
                         val a = ByteArray(rnd.nextInt(1, 8)) { rnd.nextInt(256).toByte() }
                         val b = ByteArray(rnd.nextInt(1, 8)) { rnd.nextInt(256).toByte() }
                         if (java.util.Arrays.compareUnsigned(a, b) <= 0) a to b else b to a
@@ -225,19 +329,17 @@ class QeFooterStatsBoundsPropertyTest {
                 Shape(
                     "binary/decimal",
                     leafOf(PrimitiveTypeName.BINARY, LogicalTypeAnnotation.decimalType(0, 20)),
-                ) { _, rnd ->
-                    // Non-negative, fixed 8-byte big-endian: with the high
-                    // bit clear and both operands the same length, numeric
-                    // order and unsigned byte order coincide. That keeps the
-                    // pair correctly ordered under BOTH readings, so a
-                    // decimal-annotated leaf read as a string/binary column
-                    // (a type mismatch, but one the matrix generates) does
-                    // not fail the invariant for a reason that is really an
-                    // ordering disagreement rather than a decode bug.
+                    // The one shape that deliberately keeps the high bit CLEAR.
+                    // A BINARY decimal reads as a signed two's-complement
+                    // BigInteger but as unsigned bytes under a string/binary
+                    // column, and the matrix generates both: with the high bit
+                    // clear and equal lengths the two orderings coincide, so an
+                    // inversion here means a decode bug rather than a
+                    // disagreement about what the bytes are.
+                    bytePairs(be(0L) to be(Long.MAX_VALUE), be(0L) to be(0L), be(Long.MAX_VALUE) to be(Long.MAX_VALUE)),
+                ) { rnd ->
                     val a = rnd.nextLong(0, Long.MAX_VALUE)
                     val b = rnd.nextLong(0, Long.MAX_VALUE)
-
-                    fun be(v: Long) = ByteBuffer.allocate(8).putLong(v).array()
                     be(minOf(a, b)) to be(maxOf(a, b))
                 },
             )
@@ -245,17 +347,92 @@ class QeFooterStatsBoundsPropertyTest {
                 Shape(
                     "fixed16/uuid",
                     leafOf(PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY, LogicalTypeAnnotation.uuidType(), 16),
-                ) { _, rnd ->
+                    bytePairs(
+                        filled(16, 0x00) to filled(16, 0xFF),
+                        bytes(0x7F) + filled(15, 0xFF) to bytes(0x80) + filled(15, 0x00),
+                        filled(16, 0xFF) to filled(16, 0xFF),
+                    ),
+                ) { rnd ->
                     val a = ByteArray(16) { rnd.nextInt(256).toByte() }
                     val b = ByteArray(16) { rnd.nextInt(256).toByte() }
                     if (java.util.Arrays.compareUnsigned(a, b) <= 0) a to b else b to a
                 },
             )
             add(
-                Shape("boolean", leafOf(PrimitiveTypeName.BOOLEAN)) { _, _ ->
-                    byteArrayOf(0) to byteArrayOf(1)
-                },
+                Shape(
+                    "boolean",
+                    leafOf(PrimitiveTypeName.BOOLEAN),
+                    bytePairs(bytes(0) to bytes(1), bytes(0) to bytes(0), bytes(1) to bytes(1)),
+                ) { _ -> bytes(0) to bytes(1) },
             )
+        }
+    }
+
+    /**
+     * The (catalog type, shape) cells that MUST come back with a bound.
+     *
+     * Everything here is a pairing a real writer emits — pyarrow, DuckDB,
+     * or hoglake's own writer — so a NULL bound is lost pruning on live
+     * data, not the decode path being careful. The set is deliberately
+     * narrower than "every cell that happens to work today": it names the
+     * arms whose loss would be a regression, and leaves the incidental
+     * pairings (a date leaf under an int column, say) to claims 1 and 2.
+     */
+    private val mustProduce: Set<Pair<ColType, String>> by lazy {
+        buildSet {
+            // The five types that ride parquet INT32 with either no
+            // annotation or a signed one.
+            val int32Types = listOf(ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT)
+            for ((label, _) in signedInt32Shapes) {
+                for (t in int32Types) {
+                    add(t to label)
+                }
+            }
+            // Small unsigned widths: signed and unsigned parquet order agree
+            // below 2^16, which is what lets these types read them at all.
+            add(ColType.UINT8 to "int32/uint8")
+            add(ColType.UINT16 to "int32/uint8")
+            add(ColType.UINT16 to "int32/uint16")
+            add(ColType.INT to "int32/uint8")
+            add(ColType.INT to "int32/uint16")
+            // uint32's two physical spellings: hoglake writes INT64,
+            // pyarrow/DuckDB write INT32 + INT(32, unsigned).
+            add(ColType.UINT32 to "int32/uint32")
+            add(ColType.UINT32 to "int64")
+            // long: the plain signed case, plus the zero-extension case that
+            // keeps working after a uint8/16/32 -> long ALTER (the stats bytes
+            // of already-written files are never rewritten).
+            add(ColType.LONG to "int64")
+            for (w in listOf(8, 16, 32)) {
+                add(ColType.LONG to "int32/uint$w")
+            }
+            add(ColType.UINT64 to "int64/uint64")
+            // Each timestamp type against the unit its own files carry.
+            // timestamp_s has no parquet unit of its own: pyarrow coerces
+            // timestamp[s] to TIMESTAMP(MILLIS) on write.
+            add(ColType.TIMESTAMP_S to "int64/ts-MILLIS")
+            add(ColType.TIMESTAMP_MS to "int64/ts-MILLIS")
+            add(ColType.TIMESTAMP to "int64/ts-MICROS")
+            add(ColType.TIMESTAMPTZ to "int64/ts-MICROS")
+            add(ColType.TIMESTAMP_NS to "int64/ts-NANOS")
+            add(ColType.TIME to "int64/time-us")
+            add(ColType.DATE to "int32/date")
+            add(ColType.FLOAT to "float")
+            add(ColType.DOUBLE to "double")
+            // float under a double column: the legal FLOAT -> DOUBLE promotion
+            // leaves 4-byte stats bytes behind a double column forever.
+            add(ColType.DOUBLE to "float")
+            for ((label, _) in byteArrayShapes) {
+                add(ColType.STRING to label)
+                add(ColType.JSON to label)
+                add(ColType.BINARY to label)
+            }
+            // binary accepts FIXED_LEN too, so a uuid-shaped file under a
+            // binary column still bounds.
+            add(ColType.BINARY to "fixed16/uuid")
+            add(ColType.UUID_T to "fixed16/uuid")
+            add(ColType.DECIMAL to "binary/decimal")
+            add(ColType.BOOLEAN to "boolean")
         }
     }
 
@@ -309,99 +486,127 @@ class QeFooterStatsBoundsPropertyTest {
         )
     }
 
+    private fun columnOf(type: ColType): CatalogColumn =
+        CatalogColumn(
+            fieldId = 1,
+            name = "v",
+            type = type,
+            // Must equal the decimal shape's annotated scale — decimalType(0, 20)
+            // is decimal(precision 20, scale 0). A mismatch is not a failure, it
+            // is a silent skip, so getting this wrong switches the entire decimal
+            // arm off while the test still passes.
+            decimalScale = 0,
+        )
+
     @Test
-    fun `a produced bound is mapped-type-wide and never inverted`() =
-        runBlocking<Unit> {
-            val failures = mutableListOf<String>()
-            var produced = 0
-            var refused = 0
+    fun `every catalog type x leaf shape cell is mapped-type-wide and never inverted`() {
+        val failures = mutableListOf<String>()
+        var cells = 0
+        var produced = 0
+        var refused = 0
 
-            checkAll(
-                Arb.int(0, ColType.entries.size - 1),
-                Arb.int(0, shapes.size - 1),
-                Arb.long(),
-            ) { typeIdx, shapeIdx, seed ->
-                val type = ColType.entries[typeIdx]
-                val shape = shapes[shapeIdx]
-                val rnd = kotlin.random.Random(seed)
-                val (min, max) = shape.sortedPair(Arb, rnd)
+        for (type in ColType.entries) {
+            for (shape in shapes) {
+                cells++
+                // Pinned to the cell's identity, not to a run: a failure names
+                // the cell, and rerunning that cell replays the same bytes.
+                val rnd = Random("${type.wire}/${shape.name}".hashCode().toLong())
+                val pairs = shape.boundary + List(RANDOM_PAIRS_PER_CELL) { shape.random(rnd) }
+                val required = (type to shape.name) in mustProduce
 
-                val agg =
-                    FooterStats.aggregate(
-                        footerFor(shape, min, max),
-                        listOf(
-                            CatalogColumn(
-                                fieldId = 1,
-                                name = "v",
-                                type = type,
-                                // Matches the decimal shape's annotation so the
-                                // decimal arm is exercised rather than always
-                                // skipped on a scale mismatch.
-                                decimalScale = 20,
-                            ),
-                        ),
-                        "s3://qe/f.parquet",
-                    ).singleOrNull() ?: return@checkAll
-
-                val lower = agg.lowerBound
-                val upper = agg.upperBound
-                if (lower == null || upper == null) {
-                    // Refusing is always a correct answer.
-                    refused++
-                    return@checkAll
-                }
-                produced++
-
-                val want = expectedWidth(type)
-                if (want != null && (lower.size != want || upper.size != want)) {
-                    failures +=
-                        "${type.wire} on ${shape.name}: bound widths ${lower.size}/${upper.size}, " +
-                        "expected $want for mapped ${type.icebergType.wire}"
-                    return@checkAll
-                }
-
-                // String/json/binary/uuid bounds are compared as STORED
-                // BYTES, unsigned — that is what Iceberg does, and it also
-                // sidesteps a decode artifact: invalid UTF-8 decodes to
-                // U+FFFD replacements, so comparing the decoded Strings
-                // would report an inversion that the stored bytes do not
-                // have. Everything else compares as its decoded value,
-                // since signed little-endian ints do not sort bytewise.
-                val byteOrdered =
-                    type.icebergType in
-                        setOf(IcebergType.STRING, IcebergType.BINARY, IcebergType.UUID)
-                val inverted =
-                    if (byteOrdered) {
-                        java.util.Arrays.compareUnsigned(lower, upper) > 0
-                    } else {
-                        val lo =
-                            try {
-                                IcebergSingleValue.decode(type, lower)
-                            } catch (e: IllegalArgumentException) {
-                                failures +=
-                                    "${type.wire} on ${shape.name}: stored bound will not decode: ${e.message}"
-                                return@checkAll
-                            }
-                        val hi = IcebergSingleValue.decode(type, upper)
-                        // NaN is unordered; FooterStats already refuses NaN
-                        // bounds, so anything reaching here must compare.
-                        IcebergSingleValue.compareValues(type, lo, hi) > 0
+                for ((min, max) in pairs) {
+                    val agg =
+                        FooterStats.aggregate(
+                            footerFor(shape, min, max),
+                            listOf(columnOf(type)),
+                            "s3://qe/f.parquet",
+                        ).singleOrNull()
+                    if (agg == null) {
+                        // Counts are unconditional: dropping the whole stats row
+                        // loses null_count too, not just the bounds.
+                        failures += "${type.wire} on ${shape.name}: no stats row at all"
+                        continue
                     }
-                if (inverted) {
-                    failures +=
-                        "${type.wire} on ${shape.name}: INVERTED range " +
-                        "lower=${lower.toHex()} upper=${upper.toHex()} " +
-                        "(raw min=${min.toHex()} max=${max.toHex()})"
+
+                    val lower = agg.lowerBound
+                    val upper = agg.upperBound
+                    if (lower == null || upper == null) {
+                        refused++
+                        if (required) {
+                            failures +=
+                                "${type.wire} on ${shape.name}: NULL bound for a pairing writers " +
+                                "emit (raw min=${min.toHex()} max=${max.toHex()})"
+                        }
+                        continue
+                    }
+                    produced++
+                    failures += violations(type, shape, min, max, lower, upper)
                 }
             }
-
-            assertThat(failures).describedAs("decode-matrix violations").isEmpty()
-            // Guard against the property passing vacuously: the matrix must
-            // actually be producing bounds, not refusing everything.
-            assertThat(produced)
-                .describedAs("samples that produced a bound (refused %d)", refused)
-                .isGreaterThan(100)
         }
+
+        assertThat(failures).describedAs("decode-matrix violations").isEmpty()
+        assertThat(cells)
+            .describedAs("the full matrix ran, not a sample of it")
+            .isEqualTo(ColType.entries.size * shapes.size)
+        // Backstop for claim 3: even if mustProduce were gutted, a matrix that
+        // stopped decoding wholesale would show up here. Most of the matrix is
+        // genuinely mismatched (a boolean leaf under a uuid column, say), so the
+        // floor sits below the ~710 the current arms produce, not near the total.
+        assertThat(produced)
+            .describedAs("cell values that produced a bound (refused %d)", refused)
+            .isGreaterThan(600)
+    }
+
+    /** Claims 1 and 2 for one produced bound pair. */
+    private fun violations(
+        type: ColType,
+        shape: Shape,
+        min: ByteArray,
+        max: ByteArray,
+        lower: ByteArray,
+        upper: ByteArray,
+    ): List<String> {
+        val want = expectedWidth(type)
+        if (want != null && (lower.size != want || upper.size != want)) {
+            return listOf(
+                "${type.wire} on ${shape.name}: bound widths ${lower.size}/${upper.size}, " +
+                    "expected $want for mapped ${type.icebergType.wire}",
+            )
+        }
+
+        // String/json/binary/uuid bounds are compared as STORED BYTES,
+        // unsigned — that is what Iceberg does, and it also sidesteps a decode
+        // artifact: invalid UTF-8 decodes to U+FFFD replacements, so comparing
+        // the decoded Strings would report an inversion that the stored bytes
+        // do not have. Everything else compares as its decoded value, since
+        // signed little-endian ints do not sort bytewise.
+        val byteOrdered =
+            type.icebergType in setOf(IcebergType.STRING, IcebergType.BINARY, IcebergType.UUID)
+        val inverted =
+            if (byteOrdered) {
+                java.util.Arrays.compareUnsigned(lower, upper) > 0
+            } else {
+                val lo =
+                    try {
+                        IcebergSingleValue.decode(type, lower)
+                    } catch (e: IllegalArgumentException) {
+                        return listOf("${type.wire} on ${shape.name}: stored bound will not decode: ${e.message}")
+                    }
+                val hi = IcebergSingleValue.decode(type, upper)
+                // NaN is unordered; FooterStats already refuses NaN bounds, so
+                // anything reaching here must compare.
+                IcebergSingleValue.compareValues(type, lo, hi) > 0
+            }
+        if (inverted) {
+            return listOf(
+                "${type.wire} on ${shape.name}: INVERTED range " +
+                    "lower=${lower.toHex()} upper=${upper.toHex()} " +
+                    "(raw min=${min.toHex()} max=${max.toHex()})",
+            )
+        }
+        return emptyList()
+    }
 
     private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 }
