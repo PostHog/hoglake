@@ -75,7 +75,7 @@ Targets (one class, one `@FuzzTest` each):
 |---|---|---|
 | `IcebergSingleValueDecodeFuzzTest` | `IcebergSingleValue.decode` (arbitrary bytes × every ColType) | only `IllegalArgumentException` refusals; `encode(decode(x)) == x` for canonical encodings |
 | `IcebergSingleValueCompareFuzzTest` | `encode`/`compareValues` over generated typed values | round-trip; comparator sign-antisymmetry, reflexivity, transitivity, equals-consistency |
-| `ParquetFooterFuzzTest` | the hydrator's `ParquetFileReader.open(...).footer` path + `FooterStats` | typed/structural refusals only (parquet's own frames), `FooterStats.*` total over parsed footers; 1 MiB input cap |
+| `ParquetFooterFuzzTest` | the hydrator's footer parse (`FooterParse.parse`) + `FooterStats` | `IOException` refusals only — `FooterParse` translates every other escape from parquet-java into `FooterParseException`, so the contract needs no stack inspection; `FooterStats.*` total over parsed footers; 1 MiB input cap |
 | `PuffinDeletionVectorFuzzTest` | `PuffinDeletionVector.read` (highest value: fresh code on writer-supplied bytes) | loud typed refusals (IAE/ISE/IOException), deterministic decode, no silent mis-decode |
 | `IdentifiersFuzzTest` | `Identifiers.validate` + the RequestId header shape | only `HoglakeException.Validation`; decisions stable and equal to a character-walk reference of the documented policy |
 | `WireDtoParseFuzzTest` | `toModel()` on a successfully-parsed `CommitRequestDto` / polymorphic `AlterOp` | only the exceptions ErrorMapping turns into 4xx (`JacksonException`, `BadRequestException`, `HoglakeException`) |
@@ -113,6 +113,14 @@ Crashing inputs found while fuzzing are written back into the same
 directories by jazzer-junit (instant regression tests); the growing
 generated corpus lands in `server/.cifuzz-corpus/` (transient, never
 committed).
+
+Run the targets with `-XX:-OmitStackTraceInFastThrow` (wired into both
+the `test` and `fuzz*` tasks). Fuzzing makes an exception site hot, and
+HotSpot then throws a preallocated instance with no stack trace and no
+message: the finding becomes undiagnosable, and any assertion that reads
+`e.stackTrace` silently stops matching. Issue #15 was filed against the
+wrong class for exactly that reason, and the erased stack was hiding two
+further defects behind the first one.
 
 Promotion rule (unchanged): a fuzzer-found nasty value becomes a
 committed corpus entry here, a pinned regression test, and — when the

@@ -14,7 +14,6 @@ import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import io.github.oshai.kotlinlogging.KotlinLogging
-import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.SeekableInputStream
@@ -535,7 +534,14 @@ class Hydrator(
             it is NoSuchKeyException || (it is S3Exception && it.statusCode() == 404)
         }
 
-    private fun parseFooter(input: InputFile): ParquetMetadata = ParquetFileReader.open(input).use { it.footer }
+    /**
+     * [FooterParse] rather than ParquetFileReader directly: it translates
+     * everything parquet-java lets escape that is not an IOException into
+     * a typed refusal, so a corrupt footer reaches the sweep's structural
+     * branch as a refusal and not as a bare NPE (three fuzzer-found
+     * escapes so far; see FooterParse's note).
+     */
+    private fun parseFooter(input: InputFile): ParquetMetadata = FooterParse.parse(input)
 
     /**
      * A parquet-java [InputFile] over one cached byte region of the

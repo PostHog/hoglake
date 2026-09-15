@@ -109,7 +109,10 @@ tasks.test {
     }
     // jazzer-junit self-attaches its instrumentation agent for the corpus
     // replay of the fuzz targets; JDK 21 warns on dynamic attach otherwise.
-    jvmArgs("-XX:+EnableDynamicAgentLoading")
+    // -XX:-OmitStackTraceInFastThrow: see the fuzz tasks below — a hot
+    // NPE otherwise arrives with no stack and no message, which makes a
+    // failure report useless and any frame-based assertion unreliable.
+    jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
     testLogging {
         events("failed", "skipped")
         showStackTraces = true
@@ -157,7 +160,13 @@ val fuzzTasks =
             // (arg 0 is argv0 and skipped by jazzer-junit.)
             systemProperty("jazzer.internal.arg.0", "jazzer")
             systemProperty("jazzer.internal.arg.1", "-max_total_time=$fuzzSeconds")
-            jvmArgs("-XX:+EnableDynamicAgentLoading")
+            // -XX:-OmitStackTraceInFastThrow is load-bearing here. Fuzzing
+            // makes an exception site hot, and HotSpot then throws a
+            // preallocated instance with NO stack trace and NO message.
+            // A finding reported that way cannot be diagnosed at all (#15
+            // was misfiled against the wrong class for exactly this
+            // reason) and any stack-frame check silently stops matching.
+            jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
             outputs.upToDateWhen { false }
             testLogging {
                 events("passed", "failed")
