@@ -188,6 +188,18 @@ def test_binary_raw():
     assert decode_bound("binary", b"\x00\x01\xff") == b"\x00\x01\xff"
 
 
+@pytest.mark.parametrize("col_type", ["uuid", "binary"])
+@pytest.mark.parametrize("value", [4_300_000_000, 16, 0, True])
+def test_int_bounds_for_bytes_types_raise_without_allocating(col_type, value):
+    # bytes(int) allocates that many zero bytes: a numeric stat under a
+    # mismatched catalog type must raise ValueError (which the stats path
+    # degrades to a null bound), never attempt the allocation. CI caught
+    # this as a MemoryError in its memory-capped runner; dev machines
+    # absorb the 4GB of lazy zero pages and hide it.
+    with pytest.raises(ValueError):
+        encode_bound(col_type, value)
+
+
 @pytest.mark.parametrize(
     "unscaled,expected",
     [

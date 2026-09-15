@@ -162,11 +162,17 @@ def encode_bound(
             return value.bytes
         if isinstance(value, str):
             return _uuid.UUID(value).bytes
+        # bytes(int) ALLOCATES that many zero bytes — a numeric stat from a
+        # mismatched footer must fail here, not as an OOM (bool is an int).
+        if isinstance(value, int):
+            raise ValueError(f"uuid bound must be 16 bytes, got int {value!r}")
         b = bytes(value)
         if len(b) != 16:
             raise ValueError(f"uuid bound must be 16 bytes, got {len(b)}")
         return b
     if col_type == "binary":
+        if isinstance(value, int):
+            raise ValueError(f"binary bound must be bytes-like, got int {value!r}")
         return bytes(value)
     if col_type == "decimal":
         scale = int((type_params or {}).get("scale", 0))
