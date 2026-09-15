@@ -433,8 +433,9 @@ object ParquetRewriter {
             ColType.LONG ->
                 when {
                     srcName == PrimitiveType.PrimitiveTypeName.INT64 -> CopyMode.IDENTITY
-                    // uint8/uint16/uint32 -> long: zero-extend. Sign-extending
-                    // an unsigned int32 above 2^31 silently negates it.
+                    // A foreign writer's unsigned int32 under a `long`
+                    // column: zero-extend. Sign-extending an unsigned
+                    // int32 above 2^31 silently negates it.
                     srcName == PrimitiveType.PrimitiveTypeName.INT32 && isUnsigned(src) ->
                         CopyMode.UINT32_TO_LONG
                     srcName == PrimitiveType.PrimitiveTypeName.INT32 -> CopyMode.INT_TO_LONG
@@ -460,8 +461,9 @@ object ParquetRewriter {
                     refuse()
                 }
             }
-            // timestamp_s and timestamp_ms are both physically MILLIS, so
-            // the timestamp_s -> timestamp_ms promotion is a no-op here.
+            // timestamp_s and timestamp_ms are both physically MILLIS —
+            // parquet has no seconds unit — so one arm serves both. They
+            // are distinct catalog types, not promotable to each other.
             ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS -> {
                 val unit = timestampUnit(src)
                 if (srcName == PrimitiveType.PrimitiveTypeName.INT64 &&

@@ -260,9 +260,29 @@ def test_transform_type_gates_are_exactly_these_sets():
 # cross-language parity: _BUCKETABLE == AlterService.BUCKETABLE_TYPES
 # ---------------------------------------------------------------------------
 
-_SERVER_KOTLIN = Path(__file__).resolve().parents[2] / "server/src/main/kotlin"
-_MODEL_KT = _SERVER_KOTLIN / "com/posthog/hoglake/model/Model.kt"
-_ALTER_KT = _SERVER_KOTLIN / "com/posthog/hoglake/service/AlterService.kt"
+_KOTLIN_REL = Path("server/src/main/kotlin")
+_MODEL_REL = _KOTLIN_REL / "com/posthog/hoglake/model/Model.kt"
+_ALTER_REL = _KOTLIN_REL / "com/posthog/hoglake/service/AlterService.kt"
+
+
+def _server_file(relative: Path) -> Path:
+    """Locate a server source file by walking up from this test.
+
+    Resolved by SEARCH rather than a fixed parents[n] hop, and FAILING
+    rather than skipping when it is missing: a skip reads as green, so a
+    moved directory would silently retire the only check that the server
+    and client bucket sets agree.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / relative
+        if candidate.exists():
+            return candidate
+    raise AssertionError(
+        f"cannot find {relative} above {here}. This test compares the client's "
+        f"bucket set against the server's; if the trees really are separate now, "
+        f"delete it deliberately rather than letting it skip."
+    )
 
 
 def _kotlin_bucketable() -> frozenset[str]:
@@ -274,9 +294,11 @@ def _kotlin_bucketable() -> frozenset[str]:
     as wrong partition values in production.
     """
     enum_body = re.search(
-        r"enum class ColType \{(.*?)\n\s*;", _MODEL_KT.read_text(), re.DOTALL
+        r"enum class ColType \{(.*?)\n\s*;",
+        _server_file(_MODEL_REL).read_text(),
+        re.DOTALL,
     )
-    assert enum_body, f"ColType enum not found in {_MODEL_KT}"
+    assert enum_body, f"ColType enum not found in {_MODEL_REL}"
     entries = re.findall(
         r"^\s+([A-Z][A-Z0-9_]*),\s*$", enum_body.group(1), re.MULTILINE
     )
@@ -285,10 +307,10 @@ def _kotlin_bucketable() -> frozenset[str]:
     excluded_src = re.search(
         r"val BUCKETABLE_TYPES\s*=\s*ColType\.entries\.toSet\(\)\s*-\s*setOf\("
         r"(?P<body>[^)]*)\)",
-        _ALTER_KT.read_text(),
+        _server_file(_ALTER_REL).read_text(),
         re.DOTALL,
     )
-    assert excluded_src, f"BUCKETABLE_TYPES not found in {_ALTER_KT}"
+    assert excluded_src, f"BUCKETABLE_TYPES not found in {_ALTER_REL}"
     excluded = re.findall(r"ColType\.([A-Z0-9_]+)", excluded_src.group("body"))
     assert excluded, "parsed an EMPTY exclusion set — the regex has rotted"
 
@@ -299,10 +321,6 @@ def _kotlin_bucketable() -> frozenset[str]:
     return frozenset(map(wire, entries)) - frozenset(map(wire, excluded))
 
 
-@pytest.mark.skipif(
-    not _MODEL_KT.exists() or not _ALTER_KT.exists(),
-    reason="server tree not present (pyhoglake checked out standalone)",
-)
 def test_bucketable_matches_the_server_gate():
     """The server accepts a bucket partition spec; the CLIENT computes the
     values. If the sets diverge, one side silently produces or admits

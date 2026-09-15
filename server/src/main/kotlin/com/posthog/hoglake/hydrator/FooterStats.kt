@@ -292,10 +292,12 @@ object FooterStats {
                 } else {
                     null
                 }
-            // The read-path twin of ParquetRewriter's UINT32_TO_LONG. The
-            // uint8/uint16/uint32 -> long promotions are legal and do NOT
-            // rewrite stats bytes, so unsigned-annotated files keep
-            // arriving here under a long column long after the ALTER.
+            // The read-path twin of ParquetRewriter's UINT32_TO_LONG.
+            // No PROMOTION produces this pairing (DuckLake has no
+            // unsigned -> signed rung), but a foreign writer does: arrow
+            // and DuckDB both emit unsigned 32-bit data as INT32 +
+            // INT(32, unsigned), and a client is free to declare that
+            // column `long`, whose domain contains every uint32 value.
             // Sign-extending one turns 0xFFFFFFFF into -1, putting the
             // upper bound BELOW the lower and making every pruner drop the
             // file. Zero-extend at any width instead; the annotation is

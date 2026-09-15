@@ -27,8 +27,10 @@ import kotlin.random.Random
  * Assault on FooterStats' decode matrix: every catalog type crossed with
  * every physical/logical shape a writer might hand us.
  *
- * The matrix is ENUMERATED, not sampled. It is ~500 cells and each one
- * costs a handful of pure function calls, so a random walk over it buys
+ * The matrix is ENUMERATED, not sampled: every catalog type against
+ * every leaf shape, asserted against the full cross product rather than
+ * a counted total. Each cell costs a handful of pure function calls, so
+ * a random walk over it buys
  * nothing and costs coverage: at the default property-test budget a
  * typical run left dozens of cells untouched, which made a reintroduced
  * sign-extension bug a coin flip rather than a failure. Every cell now
@@ -43,6 +45,7 @@ import kotlin.random.Random
  *     compaction's bound-merge.
  *  2. lower <= upper, compared under the catalog type.
  *  3. The cells in [mustProduce] produce a bound at all.
+ *  4. The cells in [mustRefuse] produce NO bound at all.
  *
  * Claim 2 catches an entire bug CLASS generically rather than one
  * instance of it. The unsigned-int32-under-a-long-column defect
@@ -63,6 +66,16 @@ import kotlin.random.Random
  * and 2 would still be perfectly satisfied by the resulting silence.
  * [mustProduce] names the pairings a writer in the wild actually emits,
  * and refusing one of those is a pruning regression, not caution.
+ *
+ * Claim 4 is claim 3's mirror, and it exists because claims 1-3 are all
+ * satisfied by a gate that is too PERMISSIVE as long as the values it
+ * lets through happen to be small. The per-width unsigned rule is
+ * exactly such a gate: widening it back to "only full-width unsigned is
+ * refused" keeps every other assertion green, because an INT(16,
+ * unsigned) leaf under an int8 column still decodes to a positive int
+ * that fits four bytes and still sorts the right way round — it is just
+ * 65535 written as an int8 bound. [mustRefuse] names the cells where a
+ * bound must not appear at all.
  *
  * Generated (min, max) pairs are always ordered in the LEAF'S OWN
  * parquet sort order, because that is what a real writer's footer
@@ -399,9 +412,10 @@ class QeFooterStatsBoundsPropertyTest {
             // pyarrow/DuckDB write INT32 + INT(32, unsigned).
             add(ColType.UINT32 to "int32/uint32")
             add(ColType.UINT32 to "int64")
-            // long: the plain signed case, plus the zero-extension case that
-            // keeps working after a uint8/16/32 -> long ALTER (the stats bytes
-            // of already-written files are never rewritten).
+            // long: the plain signed case, plus the zero-extension cases
+            // a foreign writer produces — arrow and DuckDB emit unsigned
+            // data as INT32 + INT(w, unsigned), and long's domain holds
+            // all of them up to 32 bits.
             add(ColType.LONG to "int64")
             for (w in listOf(8, 16, 32)) {
                 add(ColType.LONG to "int32/uint$w")
@@ -433,6 +447,38 @@ class QeFooterStatsBoundsPropertyTest {
             add(ColType.UUID_T to "fixed16/uuid")
             add(ColType.DECIMAL to "binary/decimal")
             add(ColType.BOOLEAN to "boolean")
+        }
+    }
+
+    /**
+     * Cells that must yield NO bound: an unsigned leaf whose domain
+     * [0, 2^w) does not fit the catalog type's own
+     * (ColType.maxUnsignedParquetWidth).
+     *
+     * Every entry here is a NARROW width, on purpose. A rule that only
+     * refuses full-width unsigned annotations passes claims 1-3 — the
+     * values still fit four bytes and still sort correctly — while
+     * quietly storing 65535 as an int8 column's upper bound. These are
+     * the cells that tell the two rules apart.
+     */
+    private val mustRefuse: Set<Pair<ColType, String>> by lazy {
+        buildSet {
+            // int8 holds 127: no unsigned width fits, not even 8.
+            add(ColType.INT8 to "int32/uint8")
+            add(ColType.INT8 to "int32/uint16")
+            // int16 holds 32767: takes INT(8,u), not INT(16,u).
+            add(ColType.INT16 to "int32/uint16")
+            // uint8 holds 255.
+            add(ColType.UINT8 to "int32/uint16")
+            // uint16 holds 65535.
+            add(ColType.UINT16 to "int32/uint32")
+            // int and date are int32-domain: 16 bits fit, 32 do not.
+            add(ColType.INT to "int32/uint32")
+            add(ColType.DATE to "int32/uint32")
+            // 64-bit unsigned belongs to uint64 alone.
+            add(ColType.LONG to "int64/uint64")
+            add(ColType.UINT32 to "int64/uint64")
+            add(ColType.TIMESTAMP to "int64/uint64")
         }
     }
 
@@ -501,18 +547,19 @@ class QeFooterStatsBoundsPropertyTest {
     @Test
     fun `every catalog type x leaf shape cell is mapped-type-wide and never inverted`() {
         val failures = mutableListOf<String>()
-        var cells = 0
+        val visited = mutableSetOf<Pair<ColType, String>>()
         var produced = 0
         var refused = 0
 
         for (type in ColType.entries) {
             for (shape in shapes) {
-                cells++
+                visited += type to shape.name
                 // Pinned to the cell's identity, not to a run: a failure names
                 // the cell, and rerunning that cell replays the same bytes.
                 val rnd = Random("${type.wire}/${shape.name}".hashCode().toLong())
                 val pairs = shape.boundary + List(RANDOM_PAIRS_PER_CELL) { shape.random(rnd) }
                 val required = (type to shape.name) in mustProduce
+                val forbidden = (type to shape.name) in mustRefuse
 
                 for ((min, max) in pairs) {
                     val agg =
@@ -540,15 +587,29 @@ class QeFooterStatsBoundsPropertyTest {
                         continue
                     }
                     produced++
+                    if (forbidden) {
+                        failures +=
+                            "${type.wire} on ${shape.name}: produced a bound from an unsigned leaf " +
+                            "wider than its domain (raw min=${min.toHex()} max=${max.toHex()}, " +
+                            "lower=${lower.toHex()} upper=${upper.toHex()})"
+                        continue
+                    }
                     failures += violations(type, shape, min, max, lower, upper)
                 }
             }
         }
 
         assertThat(failures).describedAs("decode-matrix violations").isEmpty()
-        assertThat(cells)
+        // The SET of cells actually visited, compared against the full
+        // cross product. A counter incremented inside the loop only ever
+        // proves the loop ran as many times as it ran.
+        assertThat(visited)
             .describedAs("the full matrix ran, not a sample of it")
-            .isEqualTo(ColType.entries.size * shapes.size)
+            .isEqualTo(
+                ColType.entries.flatMap { t -> shapes.map { t to it.name } }.toSet(),
+            )
+        assertThat(mustRefuse).describedAs("claim 4 is not vacuous").isNotEmpty()
+        assertThat(mustProduce).describedAs("claim 3 is not vacuous").isNotEmpty()
         // Backstop for claim 3: even if mustProduce were gutted, a matrix that
         // stopped decoding wholesale would show up here. Most of the matrix is
         // genuinely mismatched (a boolean leaf under a uuid column, say), so the

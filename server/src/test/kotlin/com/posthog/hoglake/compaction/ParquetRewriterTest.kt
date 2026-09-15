@@ -664,6 +664,79 @@ class ParquetRewriterTest {
     }
 
     @Test
+    fun `an unsigned source wider than the live type is refused, per width`() {
+        // The rewriter's domain gate, which had no coverage at all:
+        // deleting it left every other test green, because every OTHER
+        // test pairs an unsigned source with a type that can hold it.
+        //
+        // Each row is (live type, source annotation width): an unsigned
+        // leaf of width w is convertible only under a type whose domain
+        // contains [0, 2^w). Without the gate these copy through IDENTITY
+        // and get re-stamped with the LIVE column's annotation —
+        // compaction laundering a file the hydrator refuses to read, and
+        // turning "no bounds" into "wrong bounds".
+        val refused =
+            listOf(
+                // int8 holds 127; it cannot take any unsigned width.
+                Triple(ColType.INT8, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.INT8, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.INT8, 8, PrimitiveTypeName.INT32),
+                // int16 takes INT(8,u) but not INT(16,u).
+                Triple(ColType.INT16, 16, PrimitiveTypeName.INT32),
+                // int and date are int32-domain: 16 bits yes, 32 no.
+                Triple(ColType.INT, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.DATE, 32, PrimitiveTypeName.INT32),
+                // uint16 holds 65535; INT(32,u) overflows it.
+                Triple(ColType.UINT16, 32, PrimitiveTypeName.INT32),
+                // 64-bit unsigned belongs to uint64 alone.
+                Triple(ColType.LONG, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.TIME, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.TIMESTAMP, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.UINT32, 64, PrimitiveTypeName.INT64),
+            )
+        for ((live, width, physical) in refused) {
+            val input = oneColumn(physical, LogicalTypeAnnotation.intType(width, false))
+            val rows =
+                if (physical == PrimitiveTypeName.INT32) {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1) })
+                } else {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1L) })
+                }
+            assertThatThrownBy { rewriteOne("refuse-${live.wire}-u$width", input, live, rows) }
+                .describedAs("%s must refuse an INT(%d, unsigned) source", live.wire, width)
+                .isInstanceOf(UnconvertibleSchemaException::class.java)
+                .hasMessageContaining("cannot be produced")
+        }
+    }
+
+    @Test
+    fun `an unsigned source the live type CAN hold still converts`() {
+        // The control: the gate must bite on width, not on the mere
+        // presence of an unsigned annotation.
+        val allowed =
+            listOf(
+                Triple(ColType.INT16, 8, PrimitiveTypeName.INT32),
+                Triple(ColType.INT, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT8, 8, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT16, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT32, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.LONG, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT64, 64, PrimitiveTypeName.INT64),
+            )
+        for ((live, width, physical) in allowed) {
+            val input = oneColumn(physical, LogicalTypeAnnotation.intType(width, false))
+            val rows =
+                if (physical == PrimitiveTypeName.INT32) {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1) })
+                } else {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1L) })
+                }
+            val (_, out) = rewriteOne("allow-${live.wire}-u$width", input, live, rows)
+            assertThat(out).describedAs("%s accepts INT(%d, unsigned)", live.wire, width).hasSize(1)
+        }
+    }
+
+    @Test
     fun `json rewrites as BYTE_ARRAY with the JSON annotation, bytes untouched`() {
         val input = oneColumn(PrimitiveTypeName.BINARY, LogicalTypeAnnotation.jsonType())
         val document = """{ "b":1,  "a":[2] }"""

@@ -307,12 +307,17 @@ class AlterService(private val jdbi: Jdbi) {
      *
      * Which promotions need this falls out of the facade mapping rather
      * than a list: bounds are stored in the MAPPED Iceberg type's
-     * encoding, so a promotion re-encodes iff the mapped type changes.
-     * That makes the whole int8/int16/uint8/uint16 ladder free (they all
-     * map to Iceberg int, 4 bytes), uint32 -> long free (both map to
-     * long, 8 bytes), and timestamp_s -> timestamp_ms -> timestamp free
-     * (all three map to Iceberg timestamp and store micros). Only the
-     * int-mapped -> long-mapped and float -> double widenings move bytes.
+     * encoding, so a promotion re-encodes iff the mapped type changes
+     * ([boundReencodeFor]). Over the matrix as it actually stands:
+     *
+     *  - FREE, both sides map to Iceberg int: int8 -> int16, int8 -> int,
+     *    int16 -> int, uint8 -> uint16.
+     *  - WIDENS 4 bytes to 8, int -> long: int8/int16/int -> long, and
+     *    uint8/uint16 -> uint32 — note that last pair, where neither type
+     *    name says "long" and a rule written over names would miss it.
+     *  - WIDENS 4 to 8, float -> double: float -> double.
+     *
+     * Nothing else is promotable, so nothing else can reach here.
      */
     private fun reencodeStatsOnPromote(
         h: Handle,

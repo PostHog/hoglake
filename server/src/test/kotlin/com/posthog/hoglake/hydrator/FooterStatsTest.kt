@@ -593,13 +593,13 @@ class FooterStatsTest {
 
     @Test
     fun `an unsigned int32 under a catalog long zero-extends at every width`() {
-        // The promotion uint8/uint16/uint32 -> long is legal and leaves the
-        // stats bytes alone (same mapped Iceberg type at 4 bytes for the
-        // small widths, already 8 for uint32), so files written BEFORE the
-        // promotion keep arriving at the hydrator afterwards under the new
-        // catalog type. Sign-extending them is the ParquetRewriter hazard in
-        // its read-path twin: 0xFFFFFFFF becomes -1, the upper bound lands
-        // BELOW the lower one, and a pruner silently drops the whole file.
+        // A `long` column's domain contains every unsigned value up to
+        // 32 bits, and arrow and DuckDB both emit unsigned data as INT32
+        // + INT(w, unsigned), so a client declaring the column `long`
+        // produces exactly this pairing with no ALTER involved.
+        // Sign-extending it is the ParquetRewriter hazard in its
+        // read-path twin: 0xFFFFFFFF becomes -1, the upper bound lands
+        // BELOW the lower one, and a pruner silently drops the file.
         val widths = listOf(8 to 255, 16 to 65_535, 32 to -1)
         for ((width, maxBits) in widths) {
             val a =
@@ -671,6 +671,70 @@ class FooterStatsTest {
         val out = agg(m, CatalogColumn(1, "a", ColType.DATE, null))
         assertThat(out[1L]!!.lowerBound).isNull()
         assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `a NARROW unsigned annotation is refused by types too small to hold it`() {
+        // The per-width half of the rule, which a full-width-only gate
+        // gets wrong while looking fine: INT(16, unsigned) holding 65535
+        // decodes to a positive int, fits four bytes, and sorts the right
+        // way round — it is simply not an int8 bound. Every row here is a
+        // narrow width, because the wide ones cannot tell the two rules
+        // apart.
+        val cases =
+            listOf(
+                // (catalog type, annotation width, the value that overflows it)
+                Triple(ColType.INT8, 8, 255),
+                Triple(ColType.INT8, 16, 65_535),
+                Triple(ColType.INT16, 16, 65_535),
+                Triple(ColType.UINT8, 16, 65_535),
+            )
+        for ((type, width, max) in cases) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(max)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.valueCount)
+                .describedAs("%s keeps its counts", type.wire)
+                .isEqualTo(10)
+            assertThat(out[1L]!!.lowerBound)
+                .describedAs("%s must not bound an INT(%d, unsigned) leaf", type.wire, width)
+                .isNull()
+            assertThat(out[1L]!!.upperBound).describedAs("%s upper", type.wire).isNull()
+        }
+    }
+
+    @Test
+    fun `a narrow unsigned annotation IS read by types that contain it`() {
+        // The control for the rule's other side: int16 holds 255, int
+        // holds 65535, and refusing those would lose bounds on files
+        // nothing is wrong with.
+        val cases =
+            listOf(
+                Triple(ColType.INT16, 8, 255),
+                Triple(ColType.INT, 8, 255),
+                Triple(ColType.INT, 16, 65_535),
+                Triple(ColType.UINT8, 8, 255),
+                Triple(ColType.UINT16, 16, 65_535),
+            )
+        for ((type, width, max) in cases) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(max)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.lowerBound)
+                .describedAs("%s reads an INT(%d, unsigned) leaf", type.wire, width)
+                .isEqualTo(le(0))
+            assertThat(out[1L]!!.upperBound).describedAs("%s upper", type.wire).isEqualTo(le(max))
+        }
     }
 
     @Test

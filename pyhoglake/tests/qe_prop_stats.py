@@ -258,6 +258,28 @@ _FOREIGN_FOOTERS = {
     "boolean": (pa.bool_(), [False, True]),
 }
 
+#: (footer, catalog type) cells where the two genuinely AGREE, so a bound
+#: must actually come out. Without these the test above is satisfied by a
+#: codec that returned None for everything — "did not raise" is a very
+#: low bar, and nulling every bound in the lake clears it.
+_MUST_PRODUCE = {
+    ("int64", "long"),
+    ("double", "double"),
+    ("double", "float"),
+    ("string", "string"),
+    ("string", "json"),
+    ("binary", "binary"),
+    ("boolean", "boolean"),
+    ("timestamp_us", "timestamp"),
+    # timestamptz is absent from COLUMN_KINDS, so there is no cell to
+    # claim — caught by the seen == _MUST_PRODUCE check, which is what it
+    # is for.
+    # A millis footer scales UP to nanos exactly; a nanos footer is read
+    # raw. Both are the paths a timestamp_ns column actually takes.
+    ("timestamp_ms", "timestamp_ns"),
+    ("timestamp_ns", "timestamp_ns"),
+}
+
 
 def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
     """EVERY catalog type over EVERY foreign footer shape degrades to
@@ -270,8 +292,11 @@ def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
     neither was reachable from the paths anyone had thought to test.
     A foreign footer is an INPUT, not a given — the writer does not get
     to fail a commit because someone else's file had a statistic it
-    could not read.
+    could not read. The cells in _MUST_PRODUCE pin the other side: where
+    footer and catalog type agree, a bound has to come out, so a codec
+    that degraded EVERYTHING to null cannot pass.
     """
+    seen: set[tuple[str, str]] = set()
     for footer, (arrow_type, values) in sorted(_FOREIGN_FOOTERS.items()):
         table = pa.table({"c": pa.array(values, arrow_type)})
         meta = _write_meta(table, 1)  # one row group per value
@@ -282,6 +307,13 @@ def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
             assert len(stats) == 1, (kind, footer)
             assert stats[0].value_count == len(values), (kind, footer)
             assert stats[0].null_count == 0, (kind, footer)
+            if (footer, kind) in _MUST_PRODUCE:
+                assert stats[0].lower_bound is not None, (kind, footer)
+                assert stats[0].upper_bound is not None, (kind, footer)
+                seen.add((footer, kind))
+    # Every declared cell was actually reachable: a typo in _MUST_PRODUCE
+    # would otherwise make it a set of assertions nobody runs.
+    assert seen == _MUST_PRODUCE, _MUST_PRODUCE - seen
 
 
 # -- NaN policy (targeted; property above excludes NaN by construction) ----
