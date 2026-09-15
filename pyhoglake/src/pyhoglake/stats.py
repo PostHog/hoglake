@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import struct
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from .bounds import encode_bound
@@ -27,11 +28,7 @@ _FLOAT_TYPES = frozenset({"float", "double"})
 # microsecond resolution, so `st.min` RAISES ValueError for any value
 # that is not a whole microsecond ("not safely convertible to
 # microseconds") and quietly drops the sub-micro digits of the ones it
-# does render. min_raw/max_raw hand back the stored int64 — nanos, which
-# is exactly the unit encode_bound("timestamp_ns", int) wants. This relies
-# on the writer contract that a timestamp_ns column is written as
-# parquet Timestamp(NANOS) (types.coltype_to_arrow), which holds for
-# every footer pyhoglake produces.
+# does render. min_raw/max_raw hand back the stored int64.
 #
 # Every other new type needs no special case: pyarrow reports int8/
 # int16/uint8/uint16/uint32/uint64 statistics as plain Python ints
@@ -39,6 +36,36 @@ _FLOAT_TYPES = frozenset({"float", "double"})
 # timestamp_ms as datetimes that encode_bound converts to micros, and
 # json as bytes, which the string branch passes through verbatim.
 _RAW_STAT_TYPES = frozenset({"timestamp_ns"})
+
+# THE TRAP those raw ints come with: min_raw is the stored int64 in the
+# FILE's unit, not necessarily nanos. pyhoglake's own writer emits
+# Timestamp(NANOS) for a timestamp_ns column (types.coltype_to_arrow,
+# and pyarrow 25 keeps ns at parquet version 2.6 with no
+# coerce_timestamps), so today every footer this function sees is
+# already nanos — but the stats path is also handed footers written by
+# other clients, and a MILLIS-annotated one would be off by 10^6 with
+# no symptom other than wrong pruning. So the unit is read from the
+# footer and scaled, exactly as the Kotlin hydrator's
+# decodeTimestampNanos does; scaling up is always exact.
+_NANOS_PER_UNIT = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
+
+
+def _nanos_scale(metadata: pq.FileMetaData, name: str) -> int | None:
+    """Nanos-per-tick for the footer field ``name``, or None when it is
+    not a timestamp we can read.
+
+    The unit comes from the footer's own arrow schema rather than the
+    catalog type: the catalog says what the column was DECLARED as, the
+    file says what its int64s MEAN, and only the second one can be
+    trusted to interpret raw statistics.
+    """
+    try:
+        field = metadata.schema.to_arrow_schema().field(name)
+    except (KeyError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        return None
+    if not pa.types.is_timestamp(field.type):
+        return None
+    return _NANOS_PER_UNIT.get(field.type.unit)
 
 
 def _float_total_order_key(v: float) -> int:
@@ -86,7 +113,16 @@ def extract_column_stats(
         have_min_max = True
         mins: list = []
         maxs: list = []
-        raw_stats = col.type in _RAW_STAT_TYPES
+        # Raw int64 stats are only interpretable once their unit is
+        # known. A footer field that is not a timestamp, or whose unit we
+        # cannot read, leaves the bounds NULL rather than guessing nanos
+        # — and reading st.min instead is not an option, since that is
+        # the call that raises on sub-microsecond values.
+        raw_scale = (
+            _nanos_scale(metadata, name) if col.type in _RAW_STAT_TYPES else None
+        )
+        if col.type in _RAW_STAT_TYPES and raw_scale is None:
+            have_min_max = False
 
         for r in range(metadata.num_row_groups):
             rg = metadata.row_group(r)
@@ -99,9 +135,16 @@ def extract_column_stats(
                 have_min_max = False
                 continue
             null_count += st.null_count
+            if not have_min_max:
+                continue  # bounds already written off; never touch st.min
             if st.has_min_max and rg.num_rows > st.null_count:
-                mins.append(st.min_raw if raw_stats else st.min)
-                maxs.append(st.max_raw if raw_stats else st.max)
+                if raw_scale is not None:
+                    # Scaling up to nanos is exact for every unit.
+                    mins.append(st.min_raw * raw_scale)
+                    maxs.append(st.max_raw * raw_scale)
+                else:
+                    mins.append(st.min)
+                    maxs.append(st.max)
             elif rg.num_rows > st.null_count:
                 have_min_max = False
             # an all-null row group legitimately has no min/max; skip it

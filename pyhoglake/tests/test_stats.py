@@ -205,6 +205,43 @@ def test_timestamp_nanos_bounds_come_from_raw_statistics():
     assert decode_bound("timestamp_ns", s.upper_bound) == max(nanos)
 
 
+@pytest.mark.parametrize(
+    ("unit", "nanos_per_tick"),
+    [("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000)],
+)
+def test_timestamp_nanos_scales_a_foreign_unit_footer(unit, nanos_per_tick):
+    """min_raw is the stored int64 in the FILE's unit, not necessarily
+    nanos. pyhoglake's own writer emits NANOS, but a foreign client's
+    file under a timestamp_ns column would otherwise be read 10^6 (or
+    10^3) too small with no symptom but wrong pruning."""
+    columns = (Column(name="x", type="timestamp_ns", field_id=1, ordinal=0),)
+    ticks = [-3, 5]
+    meta = _write(
+        pa.table({"x": pa.array(ticks, pa.timestamp(unit))}), row_group_size=2
+    )
+    (s,) = extract_column_stats(meta, columns)
+    # Scaling up is exact, so the bound is the TRUE nanosecond instant
+    # whatever the file's unit turned out to be. The "s" case is the
+    # sharp one: parquet has no seconds unit, so pyarrow rewrote those
+    # ticks as millis, and only reading the footer's own unit (rather
+    # than the declared one) still lands on the right instant.
+    assert s.lower_bound == struct.pack("<q", min(ticks) * nanos_per_tick)
+    assert s.upper_bound == struct.pack("<q", max(ticks) * nanos_per_tick)
+
+
+def test_timestamp_nanos_on_a_non_timestamp_footer_drops_bounds():
+    """A footer field that is not a timestamp gives no unit to scale by,
+    so the raw int64s mean nothing. Bounds go NULL rather than being
+    read as nanos — and st.min is never touched, since on a genuine ns
+    column that is the call that raises."""
+    columns = (Column(name="x", type="timestamp_ns", field_id=1, ordinal=0),)
+    meta = _write(pa.table({"x": pa.array([1, 2], pa.int64())}), row_group_size=2)
+    (s,) = extract_column_stats(meta, columns)
+    assert s.value_count == 2  # the honest counts survive
+    assert s.lower_bound is None
+    assert s.upper_bound is None
+
+
 def test_json_bounds_are_the_document_bytes():
     """Parquet reports a JSON column's stats as bytes; encode_bound's
     string branch passes them through untouched."""
