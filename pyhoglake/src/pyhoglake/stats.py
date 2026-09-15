@@ -20,6 +20,26 @@ from .models import Column, ColumnStats
 # bounds must use total-order semantics (see _float_total_order_key).
 _FLOAT_TYPES = frozenset({"float", "double"})
 
+# Column types read from Statistics.min_raw/max_raw instead of min/max.
+#
+# timestamp_ns is the only one, and it is not an optimization: pyarrow
+# renders a timestamp[ns] statistic as a datetime, which tops out at
+# microsecond resolution, so `st.min` RAISES ValueError for any value
+# that is not a whole microsecond ("not safely convertible to
+# microseconds") and quietly drops the sub-micro digits of the ones it
+# does render. min_raw/max_raw hand back the stored int64 — nanos, which
+# is exactly the unit encode_bound("timestamp_ns", int) wants. This relies
+# on the writer contract that a timestamp_ns column is written as
+# parquet Timestamp(NANOS) (types.coltype_to_arrow), which holds for
+# every footer pyhoglake produces.
+#
+# Every other new type needs no special case: pyarrow reports int8/
+# int16/uint8/uint16/uint32/uint64 statistics as plain Python ints
+# (uint64 non-negative, up to 2^64-1, NOT sign-wrapped), timestamp_s and
+# timestamp_ms as datetimes that encode_bound converts to micros, and
+# json as bytes, which the string branch passes through verbatim.
+_RAW_STAT_TYPES = frozenset({"timestamp_ns"})
+
 
 def _float_total_order_key(v: float) -> int:
     """IEEE-754 total-order sort key: the semantics of Kotlin/Java's
@@ -66,6 +86,7 @@ def extract_column_stats(
         have_min_max = True
         mins: list = []
         maxs: list = []
+        raw_stats = col.type in _RAW_STAT_TYPES
 
         for r in range(metadata.num_row_groups):
             rg = metadata.row_group(r)
@@ -79,8 +100,8 @@ def extract_column_stats(
                 continue
             null_count += st.null_count
             if st.has_min_max and rg.num_rows > st.null_count:
-                mins.append(st.min)
-                maxs.append(st.max)
+                mins.append(st.min_raw if raw_stats else st.min)
+                maxs.append(st.max_raw if raw_stats else st.max)
             elif rg.num_rows > st.null_count:
                 have_min_max = False
             # an all-null row group legitimately has no min/max; skip it

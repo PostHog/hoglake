@@ -21,6 +21,12 @@ Pinned policies (verified here):
   row group has no min/max -> bounds omitted entirely (never a
   truncated — i.e. WRONG — upper bound).
 * A file column absent from the catalog schema is skipped.
+* timestamp_ns bounds come from Statistics.min_raw/max_raw, not
+  min/max: pyarrow renders a timestamp[ns] statistic as a datetime and
+  RAISES ValueError for any value that is not a whole microsecond. The
+  raw int64 is nanos, which is the stored unit encode_bound wants.
+* uint64 footer stats are non-negative Python ints up to 2^64-1 (never
+  sign-wrapped), so no masking is needed on the hand-off.
 """
 
 import io
@@ -72,6 +78,34 @@ COLUMN_KINDS = {
         st.integers(-(10**18) + 1, 10**18 - 1).map(lambda n: Decimal(n).scaleb(-3)),
     ),
     "uuid": (None, st.binary(min_size=16, max_size=16)),
+    "int8": (None, st.integers(-(2**7), 2**7 - 1)),
+    "int16": (None, st.integers(-(2**15), 2**15 - 1)),
+    "uint8": (None, st.integers(0, 2**8 - 1)),
+    "uint16": (None, st.integers(0, 2**16 - 1)),
+    # uint32 writes as parquet INT64 (the writer contract), so its stats
+    # come back as plain ints across the whole unsigned domain
+    "uint32": (None, st.integers(0, 2**32 - 1)),
+    # the footer reports a UINT64 column's min/max as a non-negative
+    # Python int all the way to 2^64-1 — never sign-wrapped (verified)
+    "uint64": (None, st.integers(0, 2**64 - 1)),
+    # seconds/millis columns: pyarrow reports these as datetimes, which
+    # encode_bound converts to the stored micros
+    "timestamp_s": (
+        None,
+        st.datetimes(datetime(1700, 1, 1), datetime(2400, 1, 1)).map(
+            lambda d: d.replace(microsecond=0)
+        ),
+    ),
+    "timestamp_ms": (
+        None,
+        st.datetimes(datetime(1700, 1, 1), datetime(2400, 1, 1)).map(
+            lambda d: d.replace(microsecond=(d.microsecond // 1000) * 1000)
+        ),
+    ),
+    # nanos: ground truth is the raw int, because arrow will not render
+    # a sub-microsecond timestamp[ns] as a datetime at all
+    "timestamp_ns": (None, st.integers(-(2**62), 2**62)),
+    "json": (None, st.text(max_size=40)),
 }
 
 
@@ -167,6 +201,36 @@ def test_extracted_stats_match_ground_truth(case):
         else:
             assert got_lo == lo
             assert got_hi == hi
+
+
+@STATS_SETTINGS
+@given(st.data())
+def test_every_column_kind_is_exercised_at_least_once(data):
+    """The property above samples 4 kinds out of 21 per example, so a new
+    type could ride along untested. This one walks the whole table."""
+    for kind, (params, value_st) in sorted(COLUMN_KINDS.items()):
+        col = Column(
+            name="c",
+            type=kind,
+            field_id=1,
+            ordinal=0,
+            nullable=True,
+            type_params=params,
+        )
+        vals = data.draw(
+            st.lists(st.one_of(st.none(), value_st), min_size=1, max_size=6)
+        )
+        schema = columns_to_arrow_schema((col,))
+        table = pa.table({"c": pa.array(vals, schema.field("c").type)}, schema=schema)
+        (s,) = extract_column_stats(_write_meta(table, 2), (col,))
+        assert s.value_count == len(vals)
+        assert s.null_count == sum(1 for v in vals if v is None)
+        lo, hi = _ground_truth_minmax(kind, vals)
+        if lo is None:
+            assert s.lower_bound is None and s.upper_bound is None
+            continue
+        assert _normalize(kind, decode_bound(kind, s.lower_bound, params)) == lo
+        assert _normalize(kind, decode_bound(kind, s.upper_bound, params)) == hi
 
 
 # -- NaN policy (targeted; property above excludes NaN by construction) ----

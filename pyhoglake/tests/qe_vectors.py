@@ -42,6 +42,36 @@ _EPOCH_DATE = date(1970, 1, 1)
 _EPOCH_NAIVE = datetime(1970, 1, 1)
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
+#: hoglake's closed column-type vocabulary, in spec enum order. The file
+#: must document a convention for every one of these AND carry vectors
+#: for every one: a type with no vector is a type whose two codecs have
+#: never been compared.
+ALL_COLTYPES = {
+    "boolean",
+    "int8",
+    "int16",
+    "int",
+    "long",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "float",
+    "double",
+    "decimal",
+    "date",
+    "time",
+    "timestamp_s",
+    "timestamp_ms",
+    "timestamp",
+    "timestamp_ns",
+    "timestamptz",
+    "string",
+    "json",
+    "uuid",
+    "binary",
+}
+
 
 def _parse_value(vec):
     """value string -> the Python value fed to encode_bound (per the
@@ -49,7 +79,25 @@ def _parse_value(vec):
     t, v = vec["type"], vec["value"]
     if t == "boolean":
         return {"true": True, "false": False}[v]
-    if t in ("int", "long", "date", "time", "timestamp", "timestamptz"):
+    if t in (
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "date",
+        "time",
+        # micros for these three, nanos for timestamp_ns: the STORED unit
+        # in both cases, which is what the codec takes an int to mean
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp",
+        "timestamp_ns",
+        "timestamptz",
+    ):
         return int(v)  # integer-domain conventions; codec accepts ints
     if t in ("float", "double"):
         if v == "NaN":
@@ -62,7 +110,7 @@ def _parse_value(vec):
         if v == "-Infinity":
             return -math.inf
         return float(v)
-    if t == "string":
+    if t in ("string", "json"):
         return v
     if t == "uuid":
         return _uuid.UUID(v)
@@ -78,7 +126,19 @@ def _decoded_matches(vec, decoded):
     t, v = vec["type"], vec["value"]
     if t == "boolean":
         return decoded is ({"true": True, "false": False}[v])
-    if t in ("int", "long"):
+    if t in (
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        # nanos as a plain int: decode_bound deliberately does NOT build a
+        # datetime, which would round the sub-microsecond digits away
+        "timestamp_ns",
+    ):
         return decoded == int(v)
     if t in ("float", "double"):
         fmt = "<f" if t == "float" else "<d"
@@ -93,11 +153,13 @@ def _decoded_matches(vec, decoded):
             micros % 60_000_000 // 1_000_000,
             micros % 1_000_000,
         )
-    if t == "timestamp":
+    if t in ("timestamp", "timestamp_s", "timestamp_ms"):
+        # all three decode to the same naive datetime: micros is the
+        # stored unit for every hoglake type mapped to Iceberg timestamp
         return decoded == _EPOCH_NAIVE + timedelta(microseconds=int(v))
     if t == "timestamptz":
         return decoded == _EPOCH_UTC + timedelta(microseconds=int(v))
-    if t == "string":
+    if t in ("string", "json"):
         return decoded == v
     if t == "uuid":
         return decoded == _uuid.UUID(v)
@@ -121,21 +183,7 @@ def _vector_id(vec):
 def test_vector_file_header_contract():
     assert DOC["format"] == "hoglake-bounds-vectors"
     assert DOC["version"] == 1
-    assert set(DOC["value_conventions"]) >= {
-        "boolean",
-        "int",
-        "long",
-        "float",
-        "double",
-        "date",
-        "time",
-        "timestamp",
-        "timestamptz",
-        "string",
-        "uuid",
-        "binary",
-        "decimal",
-    }
+    assert set(DOC["value_conventions"]) >= ALL_COLTYPES
     assert len(VECTORS) >= 40
     for vec in VECTORS:
         assert set(vec) >= {"type", "type_params", "value", "hex", "note"}
@@ -169,33 +217,37 @@ def test_python_codec_matches_vector(vec):
 
 def test_all_coltypes_are_covered():
     covered = {v["type"] for v in VECTORS}
-    assert covered == {
-        "boolean",
-        "int",
-        "long",
-        "float",
-        "double",
-        "date",
-        "time",
-        "timestamp",
-        "timestamptz",
-        "string",
-        "uuid",
-        "binary",
-        "decimal",
-    }
+    assert covered == ALL_COLTYPES
+
+
+def test_every_new_type_is_verified_both_ways():
+    """No new type may hide behind `encode_only`: that escape hatch
+    exists solely for the two precision-38 decimal vectors whose Python
+    DECODE is knowingly lossy."""
+    encode_only = {v["type"] for v in VECTORS if v.get("verify") == "encode_only"}
+    assert encode_only == {"decimal"}
 
 
 def test_fixed_width_vectors_have_fixed_width_hex():
+    # uint64 and json are absent on purpose: uint64's minimal
+    # two's-complement form is 1-9 bytes wide, json's is the document.
     widths = {
         "boolean": 1,
+        "int8": 4,
+        "int16": 4,
         "int": 4,
+        "uint8": 4,
+        "uint16": 4,
+        "uint32": 8,
         "long": 8,
         "float": 4,
         "double": 8,
         "date": 4,
         "time": 8,
+        "timestamp_s": 8,
+        "timestamp_ms": 8,
         "timestamp": 8,
+        "timestamp_ns": 8,
         "timestamptz": 8,
         "uuid": 16,
     }

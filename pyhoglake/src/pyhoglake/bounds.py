@@ -1,20 +1,51 @@
 """Iceberg single-value binary serialization for column-stat bounds.
 
+A bound is encoded in the serialization of the column type's MAPPED
+ICEBERG type, never of the hoglake type name — that is what keeps
+manifest generation for the Iceberg facade a mechanical copy, and it is
+why several hoglake types share one encoding here.
+
 Encodings (little-endian unless stated):
 
     boolean      1 byte, 0x00 / 0x01
-    int          4-byte LE signed
-    long         8-byte LE signed
+    int8         4-byte LE signed  \\
+    int16        4-byte LE signed   |  all map to Iceberg int; the small
+    uint8        4-byte LE signed   |  widths fit int32 exactly, signed
+    uint16       4-byte LE signed   |  or not
+    int          4-byte LE signed  /
+    uint32       8-byte LE signed  \\  map to Iceberg long (32 unsigned
+    long         8-byte LE signed  /   bits do not fit a signed int32)
+    uint64       minimal two's-complement big-endian value of the mapped
+                 decimal(20,0) — 9 bytes with a 0x00 sign byte above 2^63
     float        4-byte LE IEEE-754
     double       8-byte LE IEEE-754
     date         days since 1970-01-01, 4-byte LE signed
     time         microseconds since midnight, 8-byte LE signed
-    timestamp    microseconds since epoch, 8-byte LE signed
+    timestamp_s  MICROseconds since epoch, 8-byte LE signed  \\  all map to
+    timestamp_ms MICROseconds since epoch, 8-byte LE signed   |  Iceberg
+    timestamp    MICROseconds since epoch, 8-byte LE signed  /   timestamp
+    timestamp_ns NANOseconds since epoch, 8-byte LE signed (Iceberg V3
+                 timestamp_ns — the one temporal type not stored in micros)
     timestamptz  microseconds since epoch UTC, 8-byte LE signed
     string       UTF-8 bytes
+    json         UTF-8 bytes (maps to Iceberg string; the document text
+                 verbatim, never re-canonicalized)
     uuid         16 bytes, big-endian
     binary       raw bytes
     decimal      minimal two's-complement big-endian unscaled value
+
+The declared precision of timestamp_s/timestamp_ms is catalog metadata,
+not a bound unit: their bounds are micros because Iceberg ``timestamp``
+single values are micros.
+
+Domain enforcement is deliberately NOT here. The codec is total in both
+directions (``encode_bound(t, decode_bound(t, b)) == b`` for every
+well-formed ``b``), so a uint8 bound holding 300 encodes and decodes
+without complaint. Keeping values inside their type's domain is the
+writer's job; range checks here would make ``decode_bound``
+un-invertible for hostile footers, which is the failure mode this design
+refuses. The Kotlin ``IcebergSingleValue`` makes the same choice, byte
+for byte.
 """
 
 from __future__ import annotations
@@ -67,16 +98,35 @@ def _micros_since_epoch(value: Any) -> int:
     raise TypeError(f"cannot encode {type(value).__name__} as timestamp micros")
 
 
+def _nanos_since_epoch(value: Any) -> int:
+    """Nanos for a ``timestamp_ns`` bound, whose STORED unit is nanos.
+
+    An int is therefore already the answer. A ``datetime`` tops out at
+    microsecond resolution, so it can only ever contribute whole micros
+    — scaling it is exact, not a widening guess.
+    """
+    if isinstance(value, int):
+        return value
+    return _micros_since_epoch(value) * 1000
+
+
 def encode_bound(
     col_type: str, value: Any, type_params: dict[str, Any] | None = None
 ) -> bytes:
     """Encode a single value in Iceberg single-value binary for ``col_type``."""
     if col_type == "boolean":
         return b"\x01" if value else b"\x00"
-    if col_type == "int":
+    # Iceberg int: one 4-byte encoding for five hoglake types.
+    if col_type in ("int", "int8", "int16", "uint8", "uint16"):
         return struct.pack("<i", int(value))
-    if col_type == "long":
+    # Iceberg long: uint32 joins it because 32 unsigned bits overflow int32.
+    if col_type in ("long", "uint32"):
         return struct.pack("<q", int(value))
+    # Iceberg decimal(20,0): the unsigned value as a minimal big-endian
+    # two's-complement integer, so [2^63, 2^64) grows a 0x00 sign byte
+    # instead of wrapping negative.
+    if col_type == "uint64":
+        return _minimal_twos_complement(int(value))
     if col_type == "float":
         return struct.pack("<f", float(value))
     if col_type == "double":
@@ -95,9 +145,15 @@ def encode_bound(
         else:
             micros = int(value)
         return struct.pack("<q", micros)
-    if col_type in ("timestamp", "timestamptz"):
+    # A passed int is always the STORED unit, so the seconds and millis
+    # variants share this arm: micros. Their declared precision is
+    # catalog metadata; Iceberg timestamp single values are micros.
+    if col_type in ("timestamp", "timestamptz", "timestamp_s", "timestamp_ms"):
         return struct.pack("<q", _micros_since_epoch(value))
-    if col_type == "string":
+    if col_type == "timestamp_ns":
+        return struct.pack("<q", _nanos_since_epoch(value))
+    # json maps to Iceberg string: the same bytes, no canonicalization.
+    if col_type in ("string", "json"):
         if isinstance(value, bytes):
             return value
         return str(value).encode("utf-8")
@@ -124,10 +180,15 @@ def decode_bound(
     """Inverse of :func:`encode_bound` (returns naive-Python values)."""
     if col_type == "boolean":
         return data != b"\x00"
-    if col_type == "int":
+    if col_type in ("int", "int8", "int16", "uint8", "uint16"):
         return struct.unpack("<i", data)[0]
-    if col_type == "long":
+    if col_type in ("long", "uint32"):
         return struct.unpack("<q", data)[0]
+    if col_type == "uint64":
+        # Shares decimal's encoding at scale 0, so the unscaled integer
+        # IS the value; signed=True because 0x00-prefixed nine-byte
+        # forms above 2^63 must not be read as negative.
+        return int.from_bytes(data, "big", signed=True)
     if col_type == "float":
         return struct.unpack("<f", data)[0]
     if col_type == "double":
@@ -144,13 +205,19 @@ def decode_bound(
             micros % 60_000_000 // 1_000_000,
             micros % 1_000_000,
         )
-    if col_type in ("timestamp", "timestamptz"):
+    if col_type in ("timestamp", "timestamptz", "timestamp_s", "timestamp_ms"):
         from datetime import timedelta
 
         micros = struct.unpack("<q", data)[0]
         base = _EPOCH_UTC if col_type == "timestamptz" else _EPOCH_NAIVE
         return base + timedelta(microseconds=micros)
-    if col_type == "string":
+    if col_type == "timestamp_ns":
+        # Nanos as a plain int, NOT a datetime: datetime tops out at
+        # microsecond resolution, so building one would round away the
+        # sub-micro digits and break encode(decode(b)) == b. A caller
+        # that wants a datetime divides by 1000 and owns the loss.
+        return struct.unpack("<q", data)[0]
+    if col_type in ("string", "json"):
         return data.decode("utf-8")
     if col_type == "uuid":
         return _uuid.UUID(bytes=data)
