@@ -6,6 +6,7 @@ import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import java.io.EOFException
+import java.io.IOException
 import java.nio.ByteBuffer
 
 /**
@@ -29,14 +30,20 @@ class FooterParseTest {
         ) { "fuzz corpus entry $name is missing" }.use { it.readBytes() }
 
     @Test
-    fun `thrift readBinary NPE becomes a typed refusal`() {
-        // crash-3668a338… (nightly fuzz run 34670455393, #15): shaded
-        // thrift's TCompactProtocol.readBinary wraps a null buffer while
-        // skipping an unknown binary field.
+    fun `the thrift readBinary input is refused, however parquet-java chooses to`() {
+        // crash-3668a338… (nightly fuzz run 34670455393, #15). Under
+        // parquet-hadoop 1.17.1 shaded thrift's TCompactProtocol.readBinary
+        // wrapped a null buffer and this arrived as an NPE for FooterParse
+        // to translate; 1.18.1 hits thrift's message-size limit first and
+        // refuses it as an IOException itself.
+        //
+        // So the assertion is the CONTRACT, not the shape: this input is
+        // refused with an IOException and nothing else. Pinning the NPE
+        // made the test fail on an upstream FIX, which is the wrong thing
+        // to be told — the fuzz target already reports any escape that is
+        // not an IOException, so shape changes need no test edit.
         assertThatThrownBy { FooterParse.parse(Bytes(corpus(THRIFT_NPE_INPUT))) }
-            .isInstanceOf(FooterParseException::class.java)
-            .hasCauseInstanceOf(NullPointerException::class.java)
-            .hasMessageContaining("corrupt parquet footer")
+            .isInstanceOf(IOException::class.java)
     }
 
     @Test

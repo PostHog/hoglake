@@ -1,14 +1,11 @@
 package com.posthog.hoglake.persistence
 
-import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.PropertyNamingStrategies
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.posthog.hoglake.model.MaintenanceRun
 import com.posthog.hoglake.model.MaintenanceRunStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.wireObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -308,15 +305,17 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
 
         /**
          * Result payloads serialize exactly like the wire: snake_case,
-         * ISO-8601 times, absent-when-null — the app-wide Jackson config
-         * mirrored (ApiTest DTOs and this ledger read identically).
+         * ISO-8601 times, absent-when-null — so an operator reading this
+         * ledger in psql sees what the API would have shown.
+         *
+         * The app-wide config itself, not a copy of it. The copy this
+         * replaces asserted the same thing in a comment while having
+         * quietly lost WRITE_DATES_AS_TIMESTAMPS=false, so a temporal
+         * field would have been written as a numeric epoch under a
+         * comment promising ISO-8601. No result payload carries one
+         * today, which is the only reason that never showed up.
          */
-        private val RESULT_JSON: ObjectMapper =
-            ObjectMapper()
-                .registerKotlinModule()
-                .registerModule(JavaTimeModule())
-                .setPropertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
-                .setSerializationInclusion(JsonInclude.Include.NON_NULL)
+        private val RESULT_JSON: ObjectMapper = wireObjectMapper()
 
         private fun errorText(e: Throwable): String {
             val cause = generateSequence(e) { it.cause }.take(16).last()
