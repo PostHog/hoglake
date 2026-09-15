@@ -2,13 +2,11 @@ package com.posthog.hoglake.fuzz
 
 import com.code_intelligence.jazzer.junit.FuzzTest
 import com.fasterxml.jackson.core.JacksonException
-import com.fasterxml.jackson.databind.PropertyNamingStrategies
-import com.fasterxml.jackson.databind.json.JsonMapper
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
-import com.fasterxml.jackson.module.kotlin.kotlinModule
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
+import com.posthog.hoglake.api.wireObjectMapper
 import com.posthog.hoglake.model.HoglakeException
 import io.ktor.server.plugins.BadRequestException
 
@@ -16,8 +14,8 @@ import io.ktor.server.plugins.BadRequestException
  * Fuzz target (fuzzing.md layer 4, target f): the wire parse path for the
  * two most structured request bodies — CommitRequestDto and the
  * polymorphic AlterTableRequestDto (`op`-discriminated) — over arbitrary
- * bytes, through a Jackson mapper configured exactly like App.module's
- * ContentNegotiation (kotlin module, JavaTimeModule, SNAKE_CASE).
+ * bytes, through the production wire mapper itself (api/WireJson.kt),
+ * shared with App.module rather than reconstructed here.
  *
  * The two phases have different contracts, and conflating them produces
  * false findings:
@@ -79,12 +77,11 @@ class WireDtoParseFuzzTest {
     private companion object {
         const val MAX_INPUT_BYTES = 1 shl 20
 
-        /** Mirror of App.module's ContentNegotiation jackson block (request side). */
-        val mapper: JsonMapper =
-            JsonMapper.builder()
-                .addModule(kotlinModule())
-                .addModule(JavaTimeModule())
-                .propertyNamingStrategy(PropertyNamingStrategies.SNAKE_CASE)
-                .build()
+        /**
+         * The PRODUCTION wire mapper, not a copy of it (api/WireJson.kt):
+         * a hand-rolled twin here would let this target pass while the
+         * real mapper behaves differently.
+         */
+        val mapper: ObjectMapper = wireObjectMapper()
     }
 }

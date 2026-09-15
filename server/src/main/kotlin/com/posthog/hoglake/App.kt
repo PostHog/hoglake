@@ -1,10 +1,6 @@
 package com.posthog.hoglake
 
-import com.fasterxml.jackson.annotation.JsonInclude
-import com.fasterxml.jackson.databind.PropertyNamingStrategies
-import com.fasterxml.jackson.databind.SerializationFeature
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.posthog.hoglake.api.configureHoglakeWire
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping
@@ -155,15 +151,9 @@ class App private constructor(
 
     fun module(app: Application) {
         app.install(ContentNegotiation) {
-            jackson {
-                // The wire is snake_case with ISO-8601 date-times and
-                // base64 byte fields, per openapi/hoglake.yaml.
-                registerKotlinModule()
-                registerModule(JavaTimeModule())
-                propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
-                disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-                setSerializationInclusion(JsonInclude.Include.NON_NULL)
-            }
+            // One definition, shared with the tests that pin this
+            // behaviour (api/WireJson.kt).
+            jackson { configureHoglakeWire() }
         }
         app.install(RequestId)
         app.install(CallLogging) {
