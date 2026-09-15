@@ -27,6 +27,15 @@ The server builds through the **checked-in Gradle wrapper**
 system-installed gradle. The `just server ...` recipes route through it
 too, so `just test-all` (server + pyhoglake) stays equivalent.
 
+The DuckDB extension is built and tested separately (it is not in
+`just`): `cd duckdb-client && ./test/run-live-tests.sh`, which needs
+the dev stack and a pyhoglake checkout for its fixtures. Its
+sqllogictests SKIP without `HOGLAKE_URL`, so a green `make test`
+without a server up verifies nothing — see
+[duckdb-client/README.md](duckdb-client/README.md) for the build flags
+(omitting `BUILD_EXTENSION_TEST_DEPS=full` makes vcpkg delete
+curl/openssl/zlib from the build tree).
+
 For the full end-to-end pass (client/hedgerow integration tests against
 a real server): `just server compose-up && just server run` in another
 terminal first — integration tests skip cleanly when no server is up,
@@ -65,6 +74,7 @@ React console, Python replication daemon:
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
+| `duckdb-client/` | DuckDB extension: ATTACH over REST, scan (partition pruning + deletion vectors), INSERT/UPDATE/DELETE via footer-shipping commits, DDL, time travel, metadata/maintenance functions | C++ / DuckDB (pinned) / cpp-httplib + yyjson (both duckdb-vendored) / roaring via vcpkg | sqllogictests against the live dev stack + cross-client wire vectors |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
 — it is the single source of truth for wire shapes; server routes,
@@ -149,7 +159,14 @@ installed metadata, so they are not version strings to bump.
    `row_id_start` is only min(input ids), not positional. Sorting on
    rewrite is safe *only* because of this; positional reassignment of
    merged rows is the predecessor's rowid-remap bug and must never
-   return.
+   return. The flag — never a file's own field ids — decides which
+   source a reader uses, and a reader must refuse a file that
+   disagrees with its registration in EITHER direction, because the
+   server cannot detect the disagreement (registration never opens the
+   parquet; `/verify` is metadata-only). Both refusals are implemented
+   and tested in `duckdb-client/`; the server does not yet enforce the
+   reserved `_hog` prefix that protects the carrier (finding 9 in
+   duckdb-client/DESIGN.md).
 3. **One live deletion vector per data file** (unique partial index);
    supersessions only grow (`delete_count` monotone); a DV newer than
    your `read_snapshot` is a 409, never a lost update.
@@ -306,6 +323,18 @@ installed metadata, so they are not version strings to bump.
   tiling (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
   orphaned live rows on dropped tables, still-referenced removal-queue
   entries, true snapshot density, next_row_id consistency.
+- **DuckDB client (`duckdb-client/`)**: complete through time travel
+  and maintenance functions, verified against the live dev stack, but
+  NOT yet in CI and not yet released — no path-scoped workflow, and its
+  `duckdb` / `extension-ci-tools` trees are gitignored pinned clones
+  rather than submodules (the repo root was out of the branch's write
+  scope; they become submodules on extraction to a standalone
+  community-extension repo). Its DESIGN.md ends with 11 numbered
+  **findings for the server** — wire gaps (no namespace drop, no
+  `explicit_row_ids` on `FileRegistration`, no snapshot id on
+  create/alter responses, head-only listings, no timestamp→snapshot
+  resolution) that each cap a parity item. No server changes were made
+  for them.
 - **CDC publications to Kafka (the WAL tap)**: fully specified in the
   OpenAPI (501s) + README; not implemented.
 - **DR/export**: `GET /v1/catalogs/{c}/export` specified in the OpenAPI
@@ -351,6 +380,9 @@ architecture answers) · [ducklake-api-map.md](ducklake-api-map.md) /
 [fuzzing.md](fuzzing.md) · [source-inventory.md](source-inventory.md).
 
 **Per-component** — [server](server/README.md) ·
+[duckdb-client](duckdb-client/README.md)
+([design](duckdb-client/DESIGN.md) ·
+[parity](duckdb-client/PARITY.md)) ·
 [trino connector](server/trino/README.md) ·
 [pyhoglake](pyhoglake/README.md) · [webui](webui/README.md) ·
 [hedgerow](hedgerow/README.md) · [bench](bench/README.md).

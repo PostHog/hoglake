@@ -1,5 +1,11 @@
 # A DuckDB Read Extension for Hoglake (2026-09-05)
 
+> **Built, and gone further than this sketch.** The extension lives in
+> [duckdb-client/](duckdb-client/README.md) and does writes too;
+> [duckdb-client/DESIGN.md](duckdb-client/DESIGN.md) is the as-built
+> design and supersedes this document where they differ. Kept for the
+> reasoning that led here.
+
 Design sketch. DuckDB returns as **a client, never the engine the
 catalog lives inside** (README non-goal preserved). The extension talks
 REST to the control plane and reads parquet from object storage itself;

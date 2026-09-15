@@ -29,9 +29,12 @@ control plane. Companion docs in this directory:
 - [split-validation-commit.md](split-validation-commit.md) — a designed
   (unscheduled) refinement moving validation in front of the
   serialization point, should one catalog ever outgrow the commit tail.
-- [duckdb-read-extension.md](duckdb-read-extension.md) — a sketch for
-  DuckDB's return as a client, never as the engine the catalog lives
-  inside.
+- [duckdb-read-extension.md](duckdb-read-extension.md) — the original
+  sketch for DuckDB's return as a client, never as the engine the
+  catalog lives inside. Built out (reads AND writes) in
+  [duckdb-client/](duckdb-client/README.md); its design doc
+  ([duckdb-client/DESIGN.md](duckdb-client/DESIGN.md)) supersedes the
+  sketch.
 
 Implementation lives alongside the docs (`justfile` composes the
 per-component recipes; `just test-all`):
@@ -44,6 +47,10 @@ per-component recipes; `just test-all`):
 - [webui/](webui/README.md) — the management console.
 - [hedgerow/](hedgerow/README.md) — the hoglake-native replication
   daemon (viaduck's successor; append-only, single-destination v1).
+- [duckdb-client/](duckdb-client/README.md) — the DuckDB extension:
+  DuckDB as a REST client of the catalog (read, write, DML, DDL, time
+  travel), the DuckLake extension's shape with its metadata layer
+  replaced by hoglake's wire contract.
 - [bench/](bench/README.md) — the stress/benchmark harness behind the
   measured numbers below.
 
@@ -69,7 +76,10 @@ kept intact, with three structural changes:
    catalog lives inside.
 
 Non-goals: DuckLake compatibility (wire, SQL, or metadata), multi-RDBMS
-backends, keeping the DuckDB extension alive.
+backends, keeping the DuckDB *extension* alive — hoglake's own DuckDB
+client ([duckdb-client/](duckdb-client/README.md)) is a fresh client of
+the service, not a continuation of it, and nothing in the required path
+depends on it.
 
 ## Hoglake vs. DuckLake at a glance
 

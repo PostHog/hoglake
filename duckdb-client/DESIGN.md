@@ -430,7 +430,9 @@ loops.
 
 ## Milestone status
 
-Tracked in [PROGRESS.md](PROGRESS.md).
+Tracked in [PROGRESS.md](PROGRESS.md); [README.md](README.md) is the
+component's front door (what it is, how to build it, how to run the
+live suite).
 
 ## Parity status
 
