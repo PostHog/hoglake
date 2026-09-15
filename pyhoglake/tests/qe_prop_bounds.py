@@ -293,11 +293,17 @@ def test_timestamp_micros_passthrough_encoding(micros):
     assert encode_bound("timestamptz", micros) == struct.pack("<q", micros)
 
 
-def test_timestamp_decode_2_pow_62_overflows():
-    # Pinned: encode accepts any int64 micros; decode of instants beyond
-    # datetime.max raises OverflowError.
-    with pytest.raises(OverflowError):
-        decode_bound("timestamp", struct.pack("<q", 2**62))
+def test_timestamp_decode_past_datetime_max_returns_raw_micros():
+    # Pinned: encode accepts any int64 micros, and decode of an instant
+    # beyond datetime.max falls back to the raw micros rather than
+    # raising. Python's calendar stops at year 9999 (~2.5e17 micros)
+    # while the bound domain is the whole int64 (~9.2e18) — refusing
+    # there would make the top of our own domain undecodable in one
+    # language only, since Kotlin decodes it to a plain Long.
+    raw = struct.pack("<q", 2**62)
+    assert decode_bound("timestamp", raw) == 2**62
+    # And the round trip still closes, which is the property that matters.
+    assert encode_bound("timestamp", decode_bound("timestamp", raw)) == raw
 
 
 @given(

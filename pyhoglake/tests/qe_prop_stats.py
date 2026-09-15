@@ -27,6 +27,11 @@ Pinned policies (verified here):
   raw int64 is nanos, which is the stored unit encode_bound wants.
 * uint64 footer stats are non-negative Python ints up to 2^64-1 (never
   sign-wrapped), so no masking is needed on the hand-off.
+* A statistic the bound path cannot read or represent yields NULL
+  BOUNDS, never an exception out of the commit — the file's physical
+  type and unit are foreign inputs, not givens. Asserted over the full
+  catalog-type x footer-shape cross product, which is how the last two
+  escaping paths were found.
 """
 
 import io
@@ -231,6 +236,52 @@ def test_every_column_kind_is_exercised_at_least_once(data):
             continue
         assert _normalize(kind, decode_bound(kind, s.lower_bound, params)) == lo
         assert _normalize(kind, decode_bound(kind, s.upper_bound, params)) == hi
+
+
+# -- foreign footers: a mismatched catalog type must degrade, not raise ----
+#
+# Everything above writes the arrow type the catalog column implies. The
+# stats path is also handed footers OTHER writers produced, where the
+# physical type and unit are inputs rather than givens; the whole cross
+# product is walked here because the failure mode is an exception out of
+# an otherwise-valid append, and each type pairing reaches the bound code
+# by a different route.
+
+_FOREIGN_FOOTERS = {
+    "int64": (pa.int64(), [0, 2**40]),  # wider than a 4-byte Iceberg int
+    "timestamp_us": (pa.timestamp("us"), [0, 253_402_214_400_000_000]),  # year 9999
+    "timestamp_ms": (pa.timestamp("ms"), [-(2**40), 2**40]),
+    "timestamp_ns": (pa.timestamp("ns"), [1, 1_000_000_001]),  # sub-micro: st.min dies
+    "string": (pa.string(), ["a", "z"]),
+    "double": (pa.float64(), [1.5, 2.5]),
+    "binary": (pa.binary(), [b"\x00", b"\xff"]),
+    "boolean": (pa.bool_(), [False, True]),
+}
+
+
+def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
+    """EVERY catalog type over EVERY foreign footer shape degrades to
+    absent bounds rather than raising.
+
+    The cross product is the point: the two gaps this originally found
+    (float/double's total-order min/max running outside the guard, and
+    decimal's InvalidOperation being an ArithmeticError rather than a
+    ValueError) were each reachable only from one cell of it, and
+    neither was reachable from the paths anyone had thought to test.
+    A foreign footer is an INPUT, not a given — the writer does not get
+    to fail a commit because someone else's file had a statistic it
+    could not read.
+    """
+    for footer, (arrow_type, values) in sorted(_FOREIGN_FOOTERS.items()):
+        table = pa.table({"c": pa.array(values, arrow_type)})
+        meta = _write_meta(table, 1)  # one row group per value
+        for kind, (params, _) in sorted(COLUMN_KINDS.items()):
+            col = Column(name="c", type=kind, field_id=1, ordinal=0, type_params=params)
+            stats = extract_column_stats(meta, (col,))
+            # counts never depend on whether a bound could be read
+            assert len(stats) == 1, (kind, footer)
+            assert stats[0].value_count == len(values), (kind, footer)
+            assert stats[0].null_count == 0, (kind, footer)
 
 
 # -- NaN policy (targeted; property above excludes NaN by construction) ----

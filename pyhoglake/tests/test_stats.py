@@ -4,6 +4,7 @@ import io
 import struct
 from datetime import date, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -11,7 +12,7 @@ import pytest
 
 from pyhoglake import decode_bound, encode_bound
 from pyhoglake.models import Column
-from pyhoglake.stats import extract_column_stats
+from pyhoglake.stats import _nanos_scale, extract_column_stats
 from pyhoglake.types import columns_to_arrow_schema
 
 COLUMNS = (
@@ -207,7 +208,13 @@ def test_timestamp_nanos_bounds_come_from_raw_statistics():
 
 @pytest.mark.parametrize(
     ("unit", "nanos_per_tick"),
-    [("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000)],
+    # MILLIS/MICROS/NANOS is the WHOLE of parquet's TimeUnit logical
+    # type, so these three are every unit a footer can actually report.
+    # An "s" row used to sit here and never reached _nanos_scale's
+    # seconds branch (pyarrow rewrites timestamp[s] as TIMESTAMP(MILLIS),
+    # and the ms scale happens to land on the same nanos) — it is now the
+    # dedicated test below, and the branch itself is unit-tested directly.
+    [("ms", 1_000_000), ("us", 1_000), ("ns", 1)],
 )
 def test_timestamp_nanos_scales_a_foreign_unit_footer(unit, nanos_per_tick):
     """min_raw is the stored int64 in the FILE's unit, not necessarily
@@ -219,14 +226,80 @@ def test_timestamp_nanos_scales_a_foreign_unit_footer(unit, nanos_per_tick):
     meta = _write(
         pa.table({"x": pa.array(ticks, pa.timestamp(unit))}), row_group_size=2
     )
+    # Assert WHICH scale fired, not just the answer: without this, a unit
+    # parquet silently rewrote would let the case pass on a coincidence.
+    assert meta.schema.to_arrow_schema().field("x").type.unit == unit
+    assert _nanos_scale(meta, "x") == nanos_per_tick
     (s,) = extract_column_stats(meta, columns)
     # Scaling up is exact, so the bound is the TRUE nanosecond instant
-    # whatever the file's unit turned out to be. The "s" case is the
-    # sharp one: parquet has no seconds unit, so pyarrow rewrote those
-    # ticks as millis, and only reading the footer's own unit (rather
-    # than the declared one) still lands on the right instant.
+    # whatever the file's unit turned out to be.
     assert s.lower_bound == struct.pack("<q", min(ticks) * nanos_per_tick)
     assert s.upper_bound == struct.pack("<q", max(ticks) * nanos_per_tick)
+
+
+def test_timestamp_seconds_input_arrives_as_a_millis_footer():
+    """Parquet has no seconds TimeUnit: pyarrow rewrites a timestamp[s]
+    column as TIMESTAMP(MILLIS) and multiplies the ticks by 1000. Reading
+    the FOOTER's unit rather than the declared one is what still lands on
+    the true instant — believing "seconds" and scaling by 10^9 would be
+    10^3 too high."""
+    ticks = [-3, 5]
+    meta = _write(pa.table({"x": pa.array(ticks, pa.timestamp("s"))}), row_group_size=2)
+    assert meta.schema.to_arrow_schema().field("x").type.unit == "ms"
+    assert meta.row_group(0).column(0).statistics.min_raw == -3000  # rescaled ticks
+    assert _nanos_scale(meta, "x") == 1_000_000  # the millis branch, never seconds
+    columns = (Column(name="x", type="timestamp_ns", field_id=1, ordinal=0),)
+    (s,) = extract_column_stats(meta, columns)
+    assert s.lower_bound == struct.pack("<q", -3 * 10**9)
+    assert s.upper_bound == struct.pack("<q", 5 * 10**9)
+
+
+def _footer_with_arrow_schema(schema):
+    """Stand-in for the two attributes _nanos_scale reaches through.
+
+    Handmade because the cases below cannot be written as parquet: a
+    seconds unit has no TimeUnit to encode, and a to_arrow_schema() that
+    raises needs a parquet type pyarrow has no arrow mapping for.
+    """
+    return SimpleNamespace(schema=SimpleNamespace(to_arrow_schema=lambda: schema))
+
+
+@pytest.mark.parametrize(
+    ("unit", "expected"),
+    [("s", 1_000_000_000), ("ms", 1_000_000), ("us", 1_000), ("ns", 1)],
+)
+def test_nanos_scale_unit_table(unit, expected):
+    """_NANOS_PER_UNIT is keyed on ARROW units, which include "s" even
+    though parquet cannot encode one. The row stays (a future reader that
+    builds its schema from somewhere other than the parquet types would
+    reach it) and is pinned here, since no footer test can be."""
+    assert (
+        _nanos_scale(
+            _footer_with_arrow_schema(pa.schema([("x", pa.timestamp(unit))])), "x"
+        )
+        == expected
+    )
+
+
+def test_nanos_scale_none_for_a_non_timestamp_field():
+    schema = pa.schema([("x", pa.int64())])
+    assert _nanos_scale(_footer_with_arrow_schema(schema), "x") is None
+
+
+def test_nanos_scale_none_when_the_field_is_absent():
+    schema = pa.schema([("other", pa.timestamp("ns"))])
+    assert _nanos_scale(_footer_with_arrow_schema(schema), "x") is None
+
+
+def test_nanos_scale_none_when_the_arrow_schema_cannot_be_built():
+    """A parquet type with no arrow mapping makes to_arrow_schema() raise.
+    No schema means no unit, which means no bound — never a guess."""
+
+    def boom():
+        raise pa.ArrowNotImplementedError("no arrow type for this parquet type")
+
+    meta = SimpleNamespace(schema=SimpleNamespace(to_arrow_schema=boom))
+    assert _nanos_scale(meta, "x") is None
 
 
 def test_timestamp_nanos_on_a_non_timestamp_footer_drops_bounds():
@@ -238,6 +311,24 @@ def test_timestamp_nanos_on_a_non_timestamp_footer_drops_bounds():
     meta = _write(pa.table({"x": pa.array([1, 2], pa.int64())}), row_group_size=2)
     (s,) = extract_column_stats(meta, columns)
     assert s.value_count == 2  # the honest counts survive
+    assert s.lower_bound is None
+    assert s.upper_bound is None
+
+
+def test_nested_leaf_path_absent_from_the_arrow_schema_drops_bounds():
+    """The field-absent branch of _nanos_scale, reached by a REAL footer:
+    a nested group writes leaf path "a.b" while the arrow schema carries
+    a single struct field "a", so looking "a.b" up raises KeyError. Nested
+    schemas are outside the supported type set, but a foreign file with
+    one must degrade, not guess that the raw int64s are nanos."""
+    columns = (Column(name="a.b", type="timestamp_ns", field_id=1, ordinal=0),)
+    inner = pa.struct([pa.field("b", pa.timestamp("us"))])
+    meta = _write(pa.table({"a": pa.array([{"b": -3}, {"b": 5}], inner)}), 2)
+    assert meta.row_group(0).column(0).path_in_schema == "a.b"
+    assert meta.schema.to_arrow_schema().names == ["a"]
+    (s,) = extract_column_stats(meta, columns)
+    assert s.value_count == 2
+    assert s.null_count == 0
     assert s.lower_bound is None
     assert s.upper_bound is None
 
@@ -263,6 +354,76 @@ def test_uint32_column_written_as_uint32_still_reads():
     (s,) = extract_column_stats(meta, columns)
     assert s.lower_bound == encode_bound("uint32", 0)
     assert s.upper_bound == encode_bound("uint32", 2**32 - 1)
+
+
+# -- unreadable bounds degrade to NULL, never out of the commit --------------
+#
+# The writer path is handed footers other clients wrote, so the file's
+# physical type and unit are INPUTS, not givens. Each case below mismatches
+# one against the catalog column and used to escape extract_column_stats as
+# a raw struct.error / ValueError, failing an append whose data is fine.
+# The Kotlin hydrator holds the same contract ("overflow must degrade to a
+# null bound, never escape and fail the file"); the writer must not be the
+# stricter of the two.
+
+
+def _foreign_stats(col_type, values, arrow_type, row_group_size=1, type_params=None):
+    """Stats for a catalog column deliberately mismatched against the
+    arrow type the footer was written with."""
+    columns = (
+        Column(name="x", type=col_type, field_id=1, ordinal=0, type_params=type_params),
+    )
+    meta = _write(pa.table({"x": pa.array(values, arrow_type)}), row_group_size)
+    (s,) = extract_column_stats(meta, columns)
+    return s
+
+
+# micros for 9999-12-31T00:00:00, the usual year-9999 sentinel: 2.53e17
+# ticks, which is 2.53e20 nanos — 27x past int64's ceiling.
+_YEAR_9999_MICROS = 253_402_214_400_000_000
+
+
+def test_nanos_scale_overflow_degrades_to_null_bounds():
+    """A catalog timestamp_ns column over a MICROS footer: scaling up is
+    exact but not REPRESENTABLE for a far-future sentinel. One row group
+    scales cleanly and the next overflows, which also pins that a
+    half-read column ships NO bound rather than the half it managed."""
+    s = _foreign_stats("timestamp_ns", [0, None, _YEAR_9999_MICROS], pa.timestamp("us"))
+    assert s.value_count == 3
+    assert s.null_count == 1
+    assert s.lower_bound is None
+    assert s.upper_bound is None
+
+
+@pytest.mark.parametrize("col_type", ["int", "uint8"])
+def test_footer_value_wider_than_the_catalog_type_degrades(col_type):
+    """A foreign INT64 statistic under a catalog column whose Iceberg
+    bound is 4 bytes. encode_bound is right to refuse — a wrapped bound
+    would prune away files that do match — but the refusal belongs to the
+    bound, not to the commit."""
+    with pytest.raises(struct.error):
+        encode_bound(col_type, 2**40)  # pinned: the hazard being absorbed
+    s = _foreign_stats(col_type, [0, None, 2**40], pa.int64())
+    assert s.value_count == 3
+    assert s.null_count == 1
+    assert s.lower_bound is None
+    assert s.upper_bound is None
+
+
+def test_nanos_footer_under_a_micros_catalog_type_degrades():
+    """A catalog `timestamp` (micros) column over a foreign NANOS footer.
+    timestamp is not in _RAW_STAT_TYPES, so the bound comes from st.min —
+    and pyarrow refuses to render a sub-microsecond timestamp[ns]
+    statistic as a datetime at all."""
+    nanos = [1, None, 1_000_000_001]
+    meta = _write(pa.table({"x": pa.array(nanos, pa.timestamp("ns"))}), 1)
+    with pytest.raises(ValueError, match="not safely convertible"):
+        _ = meta.row_group(0).column(0).statistics.min  # the hazard, pinned
+    s = _foreign_stats("timestamp", nanos, pa.timestamp("ns"))
+    assert s.value_count == 3
+    assert s.null_count == 1
+    assert s.lower_bound is None
+    assert s.upper_bound is None
 
 
 # -- signed-zero bound determinism (bugs.md #20) -----------------------------

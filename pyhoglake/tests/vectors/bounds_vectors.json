@@ -27,7 +27,6 @@
     "uuid": "canonical 8-4-4-4-12 lowercase form",
     "binary": "standard base64 of the raw bytes"
   },
-  "generated_by": "pyhoglake 1.1.0.dev0 bounds codec via tests/qe_vectors.py conventions",
   "vectors": [
     {
       "type": "boolean",
@@ -785,16 +784,16 @@
     {
       "type": "timestamp_s",
       "type_params": null,
-      "value": "9223372036854",
-      "hex": "f65ad07b63080000",
-      "note": "the largest whole second that still fits int64 micros"
+      "value": "9223372036854000000",
+      "hex": "8029f4ffffffff7f",
+      "note": "second 9223372036854 expressed in micros: the largest whole second inside the int64 micros domain (int64 max is 807 micros later). encode_only: pyhoglake decode_bound materializes a datetime, whose year-9999 ceiling (~2.5e17 micros) this is 36x past"
     },
     {
       "type": "timestamp_ms",
       "type_params": null,
-      "value": "9223372036854775",
-      "hex": "f753e3a59bc42000",
-      "note": "the largest whole milli that still fits int64 micros"
+      "value": "9223372036854775000",
+      "hex": "d8fcffffffffff7f",
+      "note": "milli 9223372036854775 expressed in micros: the largest whole milli inside the int64 micros domain (int64 max is 807 micros later). encode_only: same datetime-range overflow in pyhoglake decode_bound"
     },
     {
       "type": "timestamp_ns",

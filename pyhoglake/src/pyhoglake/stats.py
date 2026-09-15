@@ -50,6 +50,31 @@ _RAW_STAT_TYPES = frozenset({"timestamp_ns"})
 _NANOS_PER_UNIT = {"s": 1_000_000_000, "ms": 1_000_000, "us": 1_000, "ns": 1}
 
 
+#: Everything the bound-reading path may raise on a footer it cannot
+#: honestly turn into a bound. pyarrow raises ValueError for an
+#: unrenderable temporal statistic, struct raises struct.error when a
+#: value will not fit its format, a type mismatch surfaces as TypeError,
+#: and the decimal path raises InvalidOperation (an ArithmeticError, NOT
+#: a ValueError) when Decimal(str(v)) cannot parse a non-numeric
+#: statistic. All of them mean the same thing here: no bound.
+_BOUND_ERRORS = (ValueError, OverflowError, TypeError, ArithmeticError, struct.error)
+
+_INT64_MIN = -(2**63)
+_INT64_MAX = 2**63 - 1
+
+
+def _int64_or_raise(v: int) -> int:
+    """``v`` if it fits a signed 64-bit bound, else raise.
+
+    Python ints are unbounded, so an out-of-range scaled timestamp would
+    otherwise sail on and blow up inside ``struct.pack`` much later, where
+    the cause is no longer obvious.
+    """
+    if not _INT64_MIN <= v <= _INT64_MAX:
+        raise OverflowError(f"bound {v} does not fit int64")
+    return v
+
+
 def _nanos_scale(metadata: pq.FileMetaData, name: str) -> int | None:
     """Nanos-per-tick for the footer field ``name``, or None when it is
     not a timestamp we can read.
@@ -138,13 +163,32 @@ def extract_column_stats(
             if not have_min_max:
                 continue  # bounds already written off; never touch st.min
             if st.has_min_max and rg.num_rows > st.null_count:
-                if raw_scale is not None:
-                    # Scaling up to nanos is exact for every unit.
-                    mins.append(st.min_raw * raw_scale)
-                    maxs.append(st.max_raw * raw_scale)
-                else:
-                    mins.append(st.min)
-                    maxs.append(st.max)
+                try:
+                    if raw_scale is not None:
+                        # Scaling up to nanos is exact for every unit, but
+                        # not necessarily REPRESENTABLE: a MICROS footer
+                        # holding a year-9999 sentinel is ~2.5e20 nanos,
+                        # well past int64.
+                        lo_v = _int64_or_raise(st.min_raw * raw_scale)
+                        hi_v = _int64_or_raise(st.max_raw * raw_scale)
+                        mins.append(lo_v)
+                        maxs.append(hi_v)
+                    else:
+                        # st.min itself raises for a NANOS footer (pyarrow
+                        # will not render sub-microsecond instants as
+                        # datetimes), which a catalog `timestamp` column
+                        # over a foreign ns file reaches.
+                        mins.append(st.min)
+                        maxs.append(st.max)
+                except _BOUND_ERRORS:
+                    # A bound we cannot read or represent is an ABSENT
+                    # bound, never a failed commit. The Kotlin hydrator
+                    # holds the same contract ("overflow must degrade to a
+                    # null bound, never escape and fail the file") and the
+                    # writer path must not be the stricter of the two: a
+                    # single unreadable statistic would otherwise abort an
+                    # append whose data is perfectly fine.
+                    have_min_max = False
             elif rg.num_rows > st.null_count:
                 have_min_max = False
             # an all-null row group legitimately has no min/max; skip it
@@ -156,14 +200,26 @@ def extract_column_stats(
 
         lower = upper = None
         if have_min_max and mins:
-            if col.type in _FLOAT_TYPES:
-                lo = min(mins, key=_float_total_order_key)
-                hi = max(maxs, key=_float_total_order_key)
-            else:
-                lo = min(mins)
-                hi = max(maxs)
-            lower = encode_bound(col.type, lo, col.type_params)
-            upper = encode_bound(col.type, hi, col.type_params)
+            # The SELECTION is inside the guard too, not just the encode:
+            # _float_total_order_key packs its argument as a double, so a
+            # non-float statistic under a catalog float/double column
+            # (a foreign timestamp or string footer) raised before
+            # encode_bound was ever reached.
+            try:
+                if col.type in _FLOAT_TYPES:
+                    lo = min(mins, key=_float_total_order_key)
+                    hi = max(maxs, key=_float_total_order_key)
+                else:
+                    lo = min(mins)
+                    hi = max(maxs)
+                lower = encode_bound(col.type, lo, col.type_params)
+                upper = encode_bound(col.type, hi, col.type_params)
+            except _BOUND_ERRORS:
+                # The footer's value does not fit — or does not mean —
+                # what the catalog type needs: a foreign INT64 statistic
+                # under a catalog `int`, a string under a `decimal`. Same
+                # rule throughout: absent, not fatal.
+                lower = upper = None
 
         out.append(
             ColumnStats(

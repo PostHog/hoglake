@@ -22,8 +22,12 @@ Spec exactly:
   slices them, but two documents equal as JSON (key order, whitespace,
   number spelling) have different bytes, so either transform would
   scatter equal values across partitions and prune away files that do
-  match. The server's gate says the same thing
-  (``AlterService.BUCKETABLE_TYPES`` excludes boolean/float/double/json).
+  match.
+- ``uint32``/``uint64``/``timestamp_s``/``timestamp_ms``/``timestamp_ns``
+  take identity and truncate but NOT bucket — see ``_BUCKETABLE`` for the
+  hash-domain reason. The server's gate is identical
+  (``AlterService.BUCKETABLE_TYPES``); the two sets are pinned equal by a
+  test that parses the Kotlin.
 - ``timestamp_ns`` partition values are NANOS as a decimal string, not
   an isoformat timestamp: a Python datetime cannot carry nanoseconds,
   and arrow will not even render a sub-microsecond ``timestamp[ns]`` as
@@ -64,8 +68,27 @@ _EPOCH_DATE = date(1970, 1, 1)
 _MICROS_PER_HOUR = 3_600_000_000
 _MICROS_PER_DAY = 86_400_000_000
 
-#: Column types bucket() accepts (Iceberg spec: no boolean/float/double).
-#: json is excluded too — see the note above _TRUNCATABLE.
+#: Column types bucket() accepts. Three exclusion reasons:
+#:
+#:  - boolean/float/double: outside the Iceberg spec's Appendix-B hash
+#:    domain outright.
+#:  - json: see the note above _TRUNCATABLE.
+#:  - uint32/uint64/timestamp_s/timestamp_ms/timestamp_ns: the
+#:    hash-domain mismatch. Appendix B hashes the MAPPED Iceberg type's
+#:    representation — timestamps as micros, uint64-as-decimal(20,0) as
+#:    minimal two's-complement bytes, uint32-as-long as the
+#:    zero-extended value — and hoglake has neither a cross-language
+#:    contract for hashing on the mapped value nor cross-language bucket
+#:    vectors proving both sides agree on it. A bucket value nobody has
+#:    verified prunes silently and wrongly, so until those exist these
+#:    five are identity/truncate only (they stay in _TRUNCATABLE; only
+#:    bucket is withdrawn). Re-admitting them is a deliberate future
+#:    change with those vectors attached, not a default.
+#:
+#: Must equal AlterService.BUCKETABLE_TYPES exactly — the server accepts
+#: the spec, but the client is what computes the values, so a divergence
+#: means an accepted spec the writer cannot honour. Pinned by a test that
+#: parses the Kotlin.
 _BUCKETABLE = frozenset(
     {
         "int8",
@@ -74,14 +97,9 @@ _BUCKETABLE = frozenset(
         "long",
         "uint8",
         "uint16",
-        "uint32",
-        "uint64",
         "date",
         "time",
-        "timestamp_s",
-        "timestamp_ms",
         "timestamp",
-        "timestamp_ns",
         "timestamptz",
         "string",
         "uuid",
@@ -95,7 +113,7 @@ _BUCKETABLE = frozenset(
 #: transform would scatter equal values across partitions and prune away
 #: files that do match. Identity is the only honest transform for json —
 #: the same gate the server enforces (AlterService.BUCKETABLE_TYPES
-#: excludes boolean/float/double/json).
+#: excludes json alongside boolean/float/double).
 _TRUNCATABLE = frozenset(
     {
         "int8",
@@ -193,32 +211,24 @@ def bucket_encode(
     """Iceberg Appendix-B hash input encoding for ``value``.
 
     Diverges from the bounds codec (:mod:`pyhoglake.bounds`) where the
-    spec says so: every integer width and ``date`` hash as 8-byte LE
-    **longs** (``hashInt(v) = hashLong(long(v))``), not the 4-byte forms
-    the bounds codec stores for ``int``/``int8``/``int16``/``uint8``/
-    ``uint16``/``date``, and not the minimal big-endian form it stores
-    for ``uint64``. ``decimal``/``uuid``/``string``/``binary`` reuse the
-    bounds encodings, which already match the spec.
+    spec says so: every bucketable integer width and ``date`` hash as
+    8-byte LE **longs** (``hashInt(v) = hashLong(long(v))``), not the
+    4-byte forms the bounds codec stores for ``int``/``int8``/``int16``/
+    ``uint8``/``uint16``/``date``. ``decimal``/``uuid``/``string``/
+    ``binary`` reuse the bounds encodings, which already match the spec.
+
+    The types _BUCKETABLE withholds fall through to the ValidationError:
+    an encoding nobody has verified cross-language is worse than a
+    refusal, because its partition values look fine and prune wrong.
     """
-    if col_type in ("int", "long", "int8", "int16", "uint8", "uint16", "uint32"):
+    if col_type in ("int", "long", "int8", "int16", "uint8", "uint16"):
         return struct.pack("<q", int(value))
-    if col_type == "uint64":
-        # Same 8-byte LE long form, but [2^63, 2^64) does not fit a
-        # SIGNED long: take the two's-complement 64 bits directly.
-        # Byte-identical to struct.pack("<q", v) for every value that
-        # does fit, so the two halves of the domain hash consistently.
-        return (int(value) & 0xFFFFFFFFFFFFFFFF).to_bytes(8, "little")
     if col_type == "date":
         return struct.pack("<q", _days_since_epoch(value))
     if col_type == "time":
         return struct.pack("<q", _time_micros(value))
-    # The seconds/millis widths hash their MICROS, like their bounds:
-    # one stored unit per mapped Iceberg type, or equal instants written
-    # at different declared precisions would land in different buckets.
-    if col_type in ("timestamp", "timestamptz", "timestamp_s", "timestamp_ms"):
+    if col_type in ("timestamp", "timestamptz"):
         return struct.pack("<q", _micros_since_epoch(value))
-    if col_type == "timestamp_ns":
-        return struct.pack("<q", _nanos_since_epoch(value))
     if col_type == "string":
         if isinstance(value, bytes):
             return value
@@ -479,8 +489,8 @@ def transform_strings(
         # Arrow REFUSES to render a sub-microsecond timestamp[ns] as a
         # datetime (to_pylist raises ValueError), and micro-aligned ones
         # it renders lossily. Cast to raw int64 nanos so the per-value
-        # Python path below sees the codec's own carrier: encode_bound,
-        # bucket_encode and wire_string all take an int as nanos.
+        # Python path below sees the codec's own carrier: encode_bound
+        # and wire_string both take an int as nanos.
         arr = pc.cast(arr, pa.int64())
 
     def one(value: Any) -> str | None:

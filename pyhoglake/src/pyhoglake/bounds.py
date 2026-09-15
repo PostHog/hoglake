@@ -210,7 +210,18 @@ def decode_bound(
 
         micros = struct.unpack("<q", data)[0]
         base = _EPOCH_UTC if col_type == "timestamptz" else _EPOCH_NAIVE
-        return base + timedelta(microseconds=micros)
+        try:
+            return base + timedelta(microseconds=micros)
+        except OverflowError:
+            # Python's datetime stops at year 9999 (~2.5e17 micros) while
+            # the bound's domain is the whole int64 (~9.2e18) — a factor of
+            # 36. Those bounds are legal, encodable, and the Kotlin codec
+            # decodes them to a plain Long, so refusing here would make the
+            # top of our own domain undecodable in one language only.
+            # Fall back to raw micros, exactly as timestamp_ns does for the
+            # same reason; encode_bound accepts ints, so the round-trip
+            # still closes.
+            return micros
     if col_type == "timestamp_ns":
         # Nanos as a plain int, NOT a datetime: datetime tops out at
         # microsecond resolution, so building one would round away the

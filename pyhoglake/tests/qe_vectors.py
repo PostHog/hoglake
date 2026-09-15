@@ -9,13 +9,21 @@ header's value_conventions, then assert encode(value) == unhex(hex)
 and — unless verify == "encode_only" — decode(unhex(hex)) == value and
 re-encode(decode(...)) == unhex(hex).
 
-The two decimal "encode_only" vectors document the pyhoglake
-decode_bound context-precision bug (see qe_prop_bounds.py); the JVM
-side has no such context and SHOULD run them as full round-trips.
+Every "encode_only" vector documents a PYTHON decode_bound defect, not
+a codec disagreement: the precision-38 decimals hit its decimal-context
+rounding (see qe_prop_bounds.py), the two top-of-int64 timestamps hit
+datetime's year-9999 ceiling. The JVM decoder shares neither limit
+(BigInteger, Long) and SHOULD run all of them as full round-trips —
+QeBoundsDecodeVectorsTest does, which is why the marker is read
+per-type there rather than as a blanket skip.
 
-Regeneration (only when the codec intentionally changes): the vectors
-were produced by feeding these exact values through
-pyhoglake.bounds.encode_bound — see the file's generated_by key.
+Regeneration (only when the codec intentionally changes): feed the
+exact value through pyhoglake.bounds.encode_bound and paste .hex() —
+never hand-compute a byte. The file carried a "generated_by" provenance
+string until it was dropped: nothing could falsify it, because every
+run re-derives all 107 encodings from the INSTALLED codec anyway, and
+pinning it to a version number would only have added a seventh string
+to the release bump for a claim no regeneration backed.
 """
 
 import base64
@@ -153,12 +161,18 @@ def _decoded_matches(vec, decoded):
             micros % 60_000_000 // 1_000_000,
             micros % 1_000_000,
         )
-    if t in ("timestamp", "timestamp_s", "timestamp_ms"):
-        # all three decode to the same naive datetime: micros is the
-        # stored unit for every hoglake type mapped to Iceberg timestamp
-        return decoded == _EPOCH_NAIVE + timedelta(microseconds=int(v))
-    if t == "timestamptz":
-        return decoded == _EPOCH_UTC + timedelta(microseconds=int(v))
+    if t in ("timestamp", "timestamp_s", "timestamp_ms", "timestamptz"):
+        # All four decode to the same calendar object — micros is the
+        # stored unit for every hoglake type mapped to Iceberg timestamp —
+        # EXCEPT past year 9999, where datetime cannot go and the codec
+        # falls back to raw micros (the same answer timestamp_ns always
+        # gives). Accept whichever the value's magnitude implies.
+        micros = int(v)
+        base = _EPOCH_UTC if t == "timestamptz" else _EPOCH_NAIVE
+        try:
+            return decoded == base + timedelta(microseconds=micros)
+        except OverflowError:
+            return decoded == micros
     if t in ("string", "json"):
         return decoded == v
     if t == "uuid":
@@ -184,7 +198,10 @@ def test_vector_file_header_contract():
     assert DOC["format"] == "hoglake-bounds-vectors"
     assert DOC["version"] == 1
     assert set(DOC["value_conventions"]) >= ALL_COLTYPES
-    assert len(VECTORS) >= 40
+    # Exact, not >=: a vector deleted by a bad merge is otherwise a silent
+    # loss of coverage. Bump deliberately when adding vectors, and keep
+    # BoundsVectorFile.EXPECTED_COUNT on the Kotlin side in step.
+    assert len(VECTORS) == 107
     for vec in VECTORS:
         assert set(vec) >= {"type", "type_params", "value", "hex", "note"}
         # hex must be lowercase and byte-aligned
@@ -221,9 +238,20 @@ def test_all_coltypes_are_covered():
 
 
 def test_every_new_type_is_verified_both_ways():
-    """No new type may hide behind `encode_only`: that escape hatch
-    exists solely for the two precision-38 decimal vectors whose Python
-    DECODE is knowingly lossy."""
+    """No new type may hide behind `encode_only`. The only remaining
+    member is a PYTHON decode defect the vector pins rather than papers
+    over, and the JVM does not share it (BigInteger has no ambient
+    precision), so the Kotlin decode test runs it as a full round-trip:
+
+      decimal -- decode_bound rounds >28-digit unscaled values through
+                 the ambient decimal context
+
+    The two timestamp boundary vectors used to be here too: correcting
+    them to true micros (~9.2e18) walked straight past datetime's year
+    9999 ceiling (~2.5e17). That was a real codec gap, not a vector
+    problem, and decode_bound now falls back to raw micros there — so
+    they are two-way again.
+    """
     encode_only = {v["type"] for v in VECTORS if v.get("verify") == "encode_only"}
     assert encode_only == {"decimal"}
 
