@@ -630,6 +630,50 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `an unsigned int64 under any catalog type but uint64 drops bounds`() {
+        // Found by QeFooterStatsBoundsPropertyTest's lower <= upper
+        // invariant. Parquet ordered this chunk UNSIGNED, so a long
+        // column reading the same bits signed inherits an ordering it
+        // disagrees with — and the values above 2^63 are not longs at
+        // all. uint64 is the one reader that zero-extends into a
+        // decimal(20,0) bound, so it is the one reader allowed.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.intType(64, false),
+            )
+        // Unsigned-ordered min/max whose signed reading inverts.
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1L), le(-1L)))))
+        for (type in listOf(ColType.LONG, ColType.TIMESTAMP, ColType.TIMESTAMPTZ, ColType.DECIMAL)) {
+            val out = agg(m, CatalogColumn(1, "a", type, 0))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isNull()
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isNull()
+        }
+        // The allowed reader still gets its bounds, right way up.
+        val ok = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        assertThat(ok[1L]!!.lowerBound).isEqualTo(java.math.BigInteger.ONE.toByteArray())
+        assertThat(ok[1L]!!.upperBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+    }
+
+    @Test
+    fun `an unsigned int32 under a date column drops bounds`() {
+        // Same find, same shape: date maps to Iceberg int and reads the
+        // int32 signed, so an unsigned-ordered chunk inverts under it.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1), le(-1)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.DATE, null))
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
     fun `an unsigned int32 under an int-mapped catalog type drops bounds`() {
         // No legal promotion produces this pairing (nothing promotes INTO
         // int from uint32), so it can only arrive from a foreign writer

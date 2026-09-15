@@ -48,6 +48,15 @@ object FooterStats {
     /** 2^64, for reading an unsigned int64 out of its signed bit pattern. */
     private val TWO_POW_64: BigInteger = BigInteger.ONE.shiftLeft(64)
 
+    /**
+     * The only catalog types that may read a parquet INT(32, unsigned)
+     * leaf: both zero-extend it into an 8-byte bound, so the magnitude
+     * survives and the unsigned ordering parquet used still holds.
+     * uint32 is the declared pairing; long is where it lands after the
+     * legal uint8/uint16/uint32 -> long promotions.
+     */
+    private val UNSIGNED_INT32_READERS = setOf(ColType.UINT32, ColType.LONG)
+
     data class ColumnAgg(
         val fieldId: Long,
         val valueCount: Long,
@@ -222,6 +231,21 @@ object FooterStats {
         upper: Boolean,
     ): Any? {
         val physical = leaf.primitive.primitiveTypeName
+
+        // A full-width unsigned INT annotation is not decoration. It
+        // changes BOTH what the bits mean (a magnitude, not a signed
+        // value) and the order parquet used to compute this chunk's
+        // min/max. Only the catalog types that actually zero-extend may
+        // read one; every other pairing reads the magnitude signed AND
+        // inherits an ordering it disagrees with, which is how a bound
+        // pair comes back with lower > upper — the shape a pruner reads
+        // as "no rows here", silently dropping the file from scans.
+        // Narrower unsigned widths (8/16) are exempt because their
+        // values are positive in an int32 either way, so both readings
+        // and both orderings agree.
+        if (isUnsignedInt(leaf, 32) && col.type !in UNSIGNED_INT32_READERS) return null
+        if (isUnsignedInt(leaf, 64) && col.type != ColType.UINT64) return null
+
         return when (col.type) {
             ColType.BOOLEAN ->
                 if (physical == PrimitiveType.PrimitiveTypeName.BOOLEAN && raw.size == 1) {
@@ -234,19 +258,10 @@ object FooterStats {
             // int32 already holds the true value, and for widths <= 16 the
             // signed and unsigned parquet sort orders agree, so the
             // footer's min/max are trustworthy either way. All four map to
-            // Iceberg int, hence the 4-byte bound.
-            //
-            // The exception is a full-width UNSIGNED int32, which no legal
-            // promotion produces here (nothing promotes into int from
-            // uint32) and which cannot be honest: its values need 33 bits,
-            // and parquet ordered the chunk unsigned, so a signed read can
-            // come back with lower > upper.
+            // Iceberg int, hence the 4-byte bound. (A full-width unsigned
+            // int32 never reaches here — the guard above sent it away.)
             ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
-                if (physical == PrimitiveType.PrimitiveTypeName.INT32 && !isUnsignedInt(leaf, 32)) {
-                    readIntLE(raw)
-                } else {
-                    null
-                }
+                if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
             // uint32 maps to Iceberg long. hoglake's own writers emit INT64
             // (see iceberg-federation.md §2), but pyarrow/DuckDB emit
             // INT32 + INT(32, unsigned) natively, so both are read. The
