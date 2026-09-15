@@ -68,21 +68,28 @@ UNGUARDED = object()
 _RECREATED_MARKER = "the table was recreated"
 
 # COLUMN names starting with this prefix are reserved for hoglake internals
-# (``_hog_row_id`` is compaction's row-id carrier); the server 422s them at
-# create/add/rename. Namespace/table/view names are NOT affected.
+# (``_hog_row_id`` is compaction's row-id carrier). The SERVER DOES NOT
+# enforce this: its column-name check is the identifier pattern only
+# (Identifiers.validate), which a leading underscore satisfies, so a
+# `_hog_row_id` column is accepted at create/add/rename. This client-side
+# check is the only barrier on the pyhoglake path (hoglake#36).
+# Namespace/table/view names are NOT affected.
 _RESERVED_COLUMN_PREFIX = "_hog"
 
 
 def _check_reserved_columns(schema: pa.Schema) -> None:
     """Fast-fail schema field names using the reserved ``_hog`` column
-    prefix BEFORE any request or parquet upload (the server would 422 the
-    create, and an append would waste the S3 write)."""
+    prefix BEFORE any request or parquet upload. The server accepts such
+    names (see [_RESERVED_COLUMN_PREFIX]), so this is enforcement, not an
+    optimisation: without it the column lands in the catalog and collides
+    with compaction's row-id carrier."""
     reserved = [n for n in schema.names if n.startswith(_RESERVED_COLUMN_PREFIX)]
     if reserved:
         raise ValidationError(
             f"column names {reserved} use the reserved "
             f"'{_RESERVED_COLUMN_PREFIX}' prefix (hoglake internal columns, "
-            "e.g. _hog_row_id); the server refuses these with 422",
+            "e.g. _hog_row_id), which collides with compaction's row-id "
+            "carrier; rename them",
             status_code=None,
         )
 
