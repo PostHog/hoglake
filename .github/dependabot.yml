@@ -1,0 +1,48 @@
+# Version updates, not just security alerts. The original dependency
+# set was written from an agent's memory rather than a registry lookup
+# and arrived up to 17 months stale at the initial commit (parquet
+# 1.15.2, Apr 2025, at a Sep 2026 bootstrap); security scanning never
+# noticed because staleness without a CVE is invisible to it. These
+# schedules make staleness produce PRs instead of silence.
+#
+# Minor and patch updates arrive grouped per ecosystem (one PR a week,
+# low noise); majors stay individual so breaking changes are reviewed
+# on their own.
+version: 2
+updates:
+  - package-ecosystem: gradle
+    directories:
+      - /server
+      - /server/trino
+    schedule:
+      interval: weekly
+    groups:
+      gradle-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /webui
+    schedule:
+      interval: weekly
+    groups:
+      npm-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: uv
+    directories:
+      - /pyhoglake
+      - /hedgerow
+      - /bench
+    schedule:
+      interval: weekly
+    groups:
+      python-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions-minor-patch:
+        update-types: [minor, patch]

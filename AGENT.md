@@ -209,6 +209,15 @@ installed metadata, so they are not version strings to bump.
 
 ## Working conventions
 
+- **Dependency versions are looked up, never recalled.** When adding or
+  pinning a dependency, verify the latest stable version against its
+  registry (Maven Central, npm, PyPI) at that moment — a version
+  written from memory is stale by your knowledge horizon, silently
+  (the original dependency set arrived up to 17 months old this way,
+  and security scanning never notices staleness without a CVE).
+  Dependabot version updates (.github/dependabot.yml) backstop this
+  weekly; grouped minor/patch PRs get a normal review, majors get
+  their own.
 - **Migrations**: plain SQL in `server/src/main/resources/db/migration/`.
   **The chain is append-only as of v1.0.0** (2026-09-11, the Gigahog
   deploy): `V1__init.sql` is FROZEN — never edit it; schema changes are
