@@ -624,32 +624,21 @@ class ParquetRewriterTest {
     }
 
     @Test
-    fun `a millis file promoted into a micros timestamp column scales exactly`() {
-        // Without this, promoting timestamp_ms -> timestamp would leave
-        // every pre-promotion file permanently unconvertible.
-        val input =
-            oneColumn(
-                PrimitiveTypeName.INT64,
-                LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
-            )
-        val (prim, rows) =
-            rewriteOne("ms-to-us", input, ColType.TIMESTAMP, listOf({ g -> g.add("v", -1_500L) }))
-        assertThat(prim.logicalTypeAnnotation)
-            .isEqualTo(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MICROS))
-        assertThat(rows.single().getLong(0, 0)).isEqualTo(-1_500_000L)
-    }
-
-    @Test
-    fun `a millis value that cannot fit micros refuses rather than wrapping`() {
+    fun `a millis file under a micros timestamp column is refused, not silently scaled`() {
+        // There is no legal path to this pairing: PROMOTIONS follows
+        // DuckLake's documented table, which has no timestamp rungs, so a
+        // millis file can only sit under a micros column if a writer
+        // disagreed with its own DDL. Refusing keeps compaction from
+        // inventing a unit conversion nobody asked for.
         val input =
             oneColumn(
                 PrimitiveTypeName.INT64,
                 LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
             )
         assertThatThrownBy {
-            rewriteOne("ms-overflow", input, ColType.TIMESTAMP, listOf({ g -> g.add("v", Long.MAX_VALUE) }))
+            rewriteOne("ms-under-us", input, ColType.TIMESTAMP, listOf({ g -> g.add("v", 1L) }))
         }.isInstanceOf(UnconvertibleSchemaException::class.java)
-            .hasMessageContaining("does not fit int64 micros")
+            .hasMessageContaining("cannot be produced")
     }
 
     @Test

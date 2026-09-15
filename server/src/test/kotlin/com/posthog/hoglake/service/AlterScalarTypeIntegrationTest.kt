@@ -52,29 +52,62 @@ class AlterScalarTypeIntegrationTest {
     // ---- the promotion ladders --------------------------------------------
 
     @Test
-    fun `the signed and unsigned integer ladders walk end to end`() {
+    fun `the signed and unsigned ladders walk to their own ends`() {
         val (cat, ns, _) =
             fixture(
                 ColumnDef("a", ColType.INT8),
                 ColumnDef("b", ColType.UINT8),
             )
+        // Signed: int8 -> int16 -> int -> long.
         alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("a", ColType.INT16)))
         alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("a", ColType.INT)))
         alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("a", ColType.LONG)))
+        // Unsigned: uint8 -> uint16 -> uint32, and STOPS there. DuckLake
+        // offers uint32 -> uint64, but uint64 maps to decimal(20,0) and
+        // long -> decimal is not an Iceberg evolution.
         alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.UINT16)))
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.LONG)))
+        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.UINT32)))
         val live = catalogs.getTable(cat, ns, "t").columns.associate { it.def.name to it.def.type }
         assertThat(live["a"]).isEqualTo(ColType.LONG)
-        assertThat(live["b"]).isEqualTo(ColType.LONG)
+        assertThat(live["b"]).isEqualTo(ColType.UINT32)
     }
 
     @Test
-    fun `the timestamp precision ladder walks seconds to millis to micros`() {
-        val (cat, ns, _) = fixture(ColumnDef("ts", ColType.TIMESTAMP_S))
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("ts", ColType.TIMESTAMP_MS)))
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("ts", ColType.TIMESTAMP)))
+    fun `uint8 reaches uint32 in one step as well as two`() {
+        val (cat, ns, _) = fixture(ColumnDef("b", ColType.UINT8))
+        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.UINT32)))
         assertThat(catalogs.getTable(cat, ns, "t").columns.single().def.type)
-            .isEqualTo(ColType.TIMESTAMP)
+            .isEqualTo(ColType.UINT32)
+    }
+
+    @Test
+    fun `promotions outside DuckLake's table are refused even when value-preserving`() {
+        val (cat, ns, _) =
+            fixture(
+                ColumnDef("u8", ColType.UINT8),
+                ColumnDef("u32", ColType.UINT32),
+                ColumnDef("ts", ColType.TIMESTAMP_S),
+            )
+        // uint8 -> int loses nothing (255 fits int32), but DuckLake has no
+        // unsigned -> signed rung at all, and a hoglake catalog must not
+        // accept DDL a DuckLake client would reject.
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("u8", ColType.INT)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("'uint8'")
+            .hasMessageContaining("'int'")
+        // The timestamp precision ladder is pure metadata and still not
+        // something DuckLake offers.
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("ts", ColType.TIMESTAMP_MS)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("'timestamp_s'")
+        // And uint32 -> long, which used to be allowed here on a
+        // same-mapped-type argument DuckLake's table does not share.
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("u32", ColType.LONG)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("'uint32'")
     }
 
     @Test
@@ -125,6 +158,10 @@ class AlterScalarTypeIntegrationTest {
 
     @Test
     fun `a promotion out of the int mapping widens the bounds, unsigned values included`() {
+        // uint16 -> uint32 is int -> long in Iceberg terms, so the 4-byte
+        // bound must become 8 bytes even though neither type name says
+        // "long". Keying the re-encode on the MAPPED type is what gets
+        // this right without a special case.
         val (cat, ns, catalogId) = fixture(ColumnDef("b", ColType.UINT16))
         val field = fieldId(cat, "b")
         seedBounds(
@@ -135,29 +172,11 @@ class AlterScalarTypeIntegrationTest {
             IcebergSingleValue.encodeInt(65_535),
         )
 
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.LONG)))
+        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("b", ColType.UINT32)))
 
         val (lower, upper) = readBounds(catalogId, field)
         assertThat(lower).isEqualTo(IcebergSingleValue.encodeLong(0L))
         assertThat(upper).isEqualTo(IcebergSingleValue.encodeLong(65_535L))
-    }
-
-    @Test
-    fun `the timestamp precision ladder leaves micros bounds untouched`() {
-        // All three map to Iceberg timestamp and all three STORE micros,
-        // so the declared precision change is metadata only.
-        val (cat, ns, catalogId) = fixture(ColumnDef("ts", ColType.TIMESTAMP_S))
-        val field = fieldId(cat, "ts")
-        val lo = IcebergSingleValue.encodeTimestampMicros(-1_500_000L)
-        val hi = IcebergSingleValue.encodeTimestampMicros(2_000_000L)
-        seedBounds(catalogId, cat, field, lo, hi)
-
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("ts", ColType.TIMESTAMP_MS)))
-        alter.alterTable(cat, ns, "t", listOf(AlterOp.PromoteColumn("ts", ColType.TIMESTAMP)))
-
-        val (lower, upper) = readBounds(catalogId, field)
-        assertThat(lower).isEqualTo(lo)
-        assertThat(upper).isEqualTo(hi)
     }
 
     // ---- partition-transform type gates ------------------------------------
@@ -198,12 +217,8 @@ class AlterScalarTypeIntegrationTest {
     }
 
     @Test
-    fun `bucket accepts every new type except json`() {
-        for (type in listOf(
-            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16,
-            ColType.UINT32, ColType.UINT64,
-            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP_NS,
-        )) {
+    fun `bucket accepts the new small integer widths`() {
+        for (type in listOf(ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16)) {
             val (cat, ns, _) = fixture(ColumnDef("v", type))
             val field = fieldId(cat, "v")
             val info =
@@ -220,7 +235,7 @@ class AlterScalarTypeIntegrationTest {
     }
 
     @Test
-    fun `bucket is refused on json and on the Iceberg-unbucketable types`() {
+    fun `bucket is refused outside the Iceberg hash domain`() {
         // json: two documents equal as JSON hash differently, so bucketing
         // would scatter equal values and prune wrong. boolean/float/double:
         // the Iceberg spec excludes them outright.
@@ -238,6 +253,63 @@ class AlterScalarTypeIntegrationTest {
                 .isInstanceOf(HoglakeException.Validation::class.java)
                 .hasMessageContaining("'${type.wire}'")
                 .hasMessageContaining("bucket")
+                .hasMessageContaining("excludes it from the bucket hash domain")
+        }
+    }
+
+    @Test
+    fun `bucket is refused on the mapped-hash types, naming that as the reason`() {
+        // uint32, uint64 and the three timestamp precisions are excluded
+        // for a DIFFERENT reason from json's, and the message has to say
+        // which: Iceberg hashes the MAPPED type's representation, hoglake
+        // has no cross-language contract for that hash, and the server
+        // never computes bucket values itself — it only stores the
+        // strings clients send. A generic "not bucketable" would send a
+        // caller hunting for a syntax error.
+        val expected =
+            mapOf(
+                ColType.UINT32 to "long",
+                ColType.UINT64 to "decimal",
+                ColType.TIMESTAMP_S to "timestamp",
+                ColType.TIMESTAMP_MS to "timestamp",
+                ColType.TIMESTAMP_NS to "timestamp_ns",
+            )
+        for ((type, mapped) in expected) {
+            val (cat, ns, _) = fixture(ColumnDef("v", type))
+            val field = fieldId(cat, "v")
+            assertThatThrownBy {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(field, Transform.BUCKET, 8)))),
+                )
+            }.describedAs(type.wire)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("'${type.wire}'")
+                .hasMessageContaining("MAPPED type")
+                .hasMessageContaining("'$mapped'")
+                .hasMessageContaining("cross-language contract")
+        }
+    }
+
+    @Test
+    fun `the mapped-hash types still take identity and the temporal transforms`() {
+        // Withdrawing bucket must not withdraw everything: these columns
+        // stay partitionable, just not by hash.
+        for (type in listOf(ColType.UINT32, ColType.UINT64, ColType.TIMESTAMP_NS)) {
+            val (cat, ns, _) = fixture(ColumnDef("v", type))
+            val field = fieldId(cat, "v")
+            val info =
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(field, Transform.IDENTITY)))),
+                )
+            assertThat(info.partitionSpec!!.fields.single().transform)
+                .describedAs(type.wire)
+                .isEqualTo(Transform.IDENTITY)
         }
     }
 

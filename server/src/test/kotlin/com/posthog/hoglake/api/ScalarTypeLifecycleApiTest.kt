@@ -185,9 +185,7 @@ class ScalarTypeLifecycleApiTest {
                     "a" to "int",
                     "a" to "long",
                     "b" to "uint16",
-                    "u" to "long",
-                    "ts" to "timestamp_ms",
-                    "ts" to "timestamp",
+                    "b" to "uint32",
                 )
             for ((column, target) in rungs) {
                 val response =
@@ -202,9 +200,21 @@ class ScalarTypeLifecycleApiTest {
                     .describedAs("alter response echoes %s as %s", column, target)
                     .isEqualTo(target)
             }
+            // u and ts never move: DuckLake's table has no uint32 -> long
+            // rung and no timestamp rungs at all, so these are 422 and the
+            // columns keep the types they were declared with.
+            for ((column, target) in listOf("u" to "long", "ts" to "timestamp_ms")) {
+                assertThat(
+                    client.postJson(
+                        "$tablesUrl/ladders/alter",
+                        """{"ops": [{"op": "promote_column", "name": "$column", "to": "$target"}]}""",
+                    ).status,
+                ).describedAs("promote %s to %s", column, target)
+                    .isEqualTo(HttpStatusCode.UnprocessableEntity)
+            }
             val table = body(client.get("$tablesUrl/ladders"))
             assertThat(listOf("a", "b", "u", "ts").map { typeOf(table, it) })
-                .isEqualTo(listOf("long", "uint16", "long", "timestamp"))
+                .isEqualTo(listOf("long", "uint32", "uint32", "timestamp_s"))
         }
 
     @Test

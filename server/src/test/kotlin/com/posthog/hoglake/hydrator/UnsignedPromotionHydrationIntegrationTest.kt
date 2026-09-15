@@ -1,13 +1,11 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.commit.CommitService
-import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
-import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
@@ -34,19 +32,24 @@ import java.nio.file.Files
  * end through the real services rather than asserted on a hand-built
  * footer.
  *
- * The scenario is ordinary, which is the point. A client writes a uint32
- * column the way pyarrow and DuckDB natively do — parquet INT32 with
- * INT(32, unsigned) — and registers it with DEFERRED stats, so the
- * hydrator (not the writer) produces the bounds. Later the column is
- * promoted uint32 -> long, which is legal, and whose stats re-encode
- * correctly does nothing because uint32 and long share a mapped Iceberg
- * type. Files registered after that point hydrate under a LONG column
- * while still carrying the unsigned annotation.
+ * The scenario is ordinary, which is the point. A client declares a
+ * column as `long` and writes it the way pyarrow and DuckDB natively
+ * write unsigned 32-bit data — parquet INT32 with INT(32, unsigned) —
+ * then registers with DEFERRED stats, so the HYDRATOR, not the writer,
+ * produces the bounds. Nothing here is a type error: a long column's
+ * domain contains every uint32 value, and the file is exactly what a
+ * foreign writer emits.
  *
  * Read with a sign extension, the file's max of 4294967295 became -1:
  * an upper bound BELOW the lower bound, which every range pruner reads
  * as "no rows can match" — the file silently disappears from scans while
  * every count and status field still looks healthy.
+ *
+ * (This used to arrive via a uint32 -> long PROMOTION. That rung left
+ * the matrix when PROMOTIONS was pinned to DuckLake's documented set,
+ * but the defect never depended on it: the hazard is a foreign file's
+ * annotation, and declaring the column long up front reaches it just as
+ * directly.)
  */
 @Tag("integration")
 class UnsignedPromotionHydrationIntegrationTest {
@@ -55,7 +58,6 @@ class UnsignedPromotionHydrationIntegrationTest {
 
     private val catalogs by lazy { CatalogService(jdbi) }
     private val commits by lazy { CommitService(jdbi) }
-    private val alter by lazy { AlterService(jdbi) }
     private val hydrator by lazy { Hydrator(jdbi, store) }
 
     @AfterEach
@@ -116,19 +118,12 @@ class UnsignedPromotionHydrationIntegrationTest {
     }
 
     @Test
-    fun `a foreign unsigned int32 file hydrates correctly after uint32 is promoted to long`() {
-        val cat = "unsigned-promo"
+    fun `a foreign unsigned int32 file hydrates correctly under a long column`() {
+        val cat = "unsigned-long"
         catalogs.createCatalog(cat, "s3://$BUCKET/")
         catalogs.createNamespace(cat, "ns")
-        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("v", ColType.UINT32)))
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("v", ColType.LONG)))
         val fieldId = catalogs.getTable(cat, "ns", "t").columns.single().fieldId
-
-        // The promotion comes FIRST, so the file below is registered and
-        // hydrated entirely under the long column — the state a lake ends
-        // up in permanently, not a transient window.
-        alter.alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("v", ColType.LONG)))
-        assertThat(catalogs.getTable(cat, "ns", "t").columns.single().def.type)
-            .isEqualTo(ColType.LONG)
 
         val bytes = unsignedInt32Parquet(Math.toIntExact(fieldId))
         val path = "s3://$BUCKET/t/unsigned.parquet"
@@ -178,10 +173,13 @@ class UnsignedPromotionHydrationIntegrationTest {
     }
 
     @Test
-    fun `the same file hydrated under the unpromoted uint32 column agrees`() {
-        // The control: promotion must not change the bounds at all, which
-        // is the premise that lets the stats re-encode skip this pairing.
-        val cat = "unsigned-no-promo"
+    fun `the same file under a uint32 column produces byte-identical bounds`() {
+        // The control. uint32 and long share a mapped Iceberg type, so
+        // the DECLARED type must not change a single byte of the stored
+        // bound — if it did, the two columns would prune differently over
+        // identical data, and the "bounds are the mapped type's encoding"
+        // invariant would be false.
+        val cat = "unsigned-uint32"
         catalogs.createCatalog(cat, "s3://$BUCKET/")
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("v", ColType.UINT32)))
@@ -217,12 +215,9 @@ class UnsignedPromotionHydrationIntegrationTest {
         assertThat(IcebergSingleValue.decode(ColType.UINT32, lower!!)).isEqualTo(MIN_UNSIGNED)
         assertThat(IcebergSingleValue.decode(ColType.UINT32, upper!!)).isEqualTo(MAX_UNSIGNED)
 
-        // Byte-identical to the promoted case: uint32 and long share a
-        // mapped Iceberg type, so the stored bytes cannot differ.
-        alter.alterTable(cat, "ns", "t", listOf(AlterOp.PromoteColumn("v", ColType.LONG)))
-        val (lowerAfter, upperAfter) = boundsOf(cat, fieldId)
-        assertThat(lowerAfter).isEqualTo(lower)
-        assertThat(upperAfter).isEqualTo(upper)
+        // The same bytes the long column stored for the same file.
+        assertThat(lower).isEqualTo(IcebergSingleValue.encode(ColType.LONG, MIN_UNSIGNED))
+        assertThat(upper).isEqualTo(IcebergSingleValue.encode(ColType.LONG, MAX_UNSIGNED))
     }
 
     /** The one live stats row's bounds, straight from the hydrator's output. */

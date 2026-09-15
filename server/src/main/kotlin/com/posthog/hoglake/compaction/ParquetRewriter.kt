@@ -4,6 +4,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
@@ -100,15 +101,19 @@ object ParquetRewriter {
      * How one matched input column lands in the output.
      *
      * [UINT32_TO_LONG] exists because unsigned parquet int32s must NOT
-     * sign-extend: a uint32 above 2^31 would become negative, and the
-     * uint8/uint16/uint32 -> long promotions all produce exactly this
-     * pairing. [MILLIS_TO_MICROS] is the timestamp_s/timestamp_ms ->
-     * timestamp promotion's companion — an exact x1000 widening, refused
-     * on int64 overflow rather than wrapped, without which promoting a
-     * millis column would leave every pre-promotion file permanently
-     * unconvertible.
+     * sign-extend: a uint32 above 2^31 would become negative, and a
+     * foreign writer's unsigned int32 file under a `long` column is
+     * exactly that pairing.
+     *
+     * There is deliberately no millis -> micros mode. It existed to
+     * serve a timestamp_ms -> timestamp promotion, and that promotion
+     * left the matrix once PROMOTIONS was pinned to DuckLake's
+     * documented set (which has no timestamp rungs at all). With no
+     * legal path producing a millis file under a micros column, the only
+     * way to reach one is a writer disagreeing with its own DDL, and
+     * refusing that is the rewriter's job.
      */
-    private enum class CopyMode { IDENTITY, INT_TO_LONG, UINT32_TO_LONG, FLOAT_TO_DOUBLE, MILLIS_TO_MICROS }
+    private enum class CopyMode { IDENTITY, INT_TO_LONG, UINT32_TO_LONG, FLOAT_TO_DOUBLE }
 
     /**
      * Merge [inputs] (caller orders them by rowIdStart) into [output]
@@ -388,6 +393,18 @@ object ParquetRewriter {
                 "column '${column.def.name}' (live type ${live.wire}) cannot be produced from " +
                     "$srcName${src.logicalTypeAnnotation?.let { " ($it)" } ?: ""} in $inputPath",
             )
+
+        // The same domain rule the hydrator's footer decode applies
+        // (ColType.maxUnsignedParquetWidth). Without it the two surfaces
+        // DISAGREED: an INT(32, unsigned) file under an int8 column was
+        // refused by the hydrator and copied through by the rewriter,
+        // which then re-stamped it with the live column's INT(8, signed)
+        // annotation — compaction laundering an annotation the hydrator
+        // had rejected, and turning a file with no bounds into a file
+        // with wrong ones. Both surfaces now refuse.
+        val unsignedWidth = unsignedWidthOf(src)
+        if (unsignedWidth != null && unsignedWidth > live.maxUnsignedParquetWidth) refuse()
+
         return when (live) {
             ColType.BOOLEAN ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BOOLEAN) CopyMode.IDENTITY else refuse()
@@ -457,13 +474,12 @@ object ParquetRewriter {
             }
             ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> {
                 val unit = timestampUnit(src)
-                when {
-                    srcName != PrimitiveType.PrimitiveTypeName.INT64 -> refuse()
-                    unit == null || unit == LogicalTypeAnnotation.TimeUnit.MICROS -> CopyMode.IDENTITY
-                    // The timestamp_s/timestamp_ms -> timestamp promotion's
-                    // file-side companion: exact x1000, refused on overflow.
-                    unit == LogicalTypeAnnotation.TimeUnit.MILLIS -> CopyMode.MILLIS_TO_MICROS
-                    else -> refuse()
+                if (srcName == PrimitiveType.PrimitiveTypeName.INT64 &&
+                    (unit == null || unit == LogicalTypeAnnotation.TimeUnit.MICROS)
+                ) {
+                    CopyMode.IDENTITY
+                } else {
+                    refuse()
                 }
             }
             ColType.TIMESTAMP_NS -> {
@@ -506,8 +522,13 @@ object ParquetRewriter {
         }
     }
 
-    private fun isUnsigned(src: PrimitiveType): Boolean =
-        (src.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)?.isSigned == false
+    private fun isUnsigned(src: PrimitiveType): Boolean = unsignedWidthOf(src) != null
+
+    /** The source's unsigned INT width, or null when it is not unsigned-annotated. */
+    private fun unsignedWidthOf(src: PrimitiveType): Int? =
+        (src.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+            ?.takeIf { !it.isSigned }
+            ?.bitWidth
 
     private fun timestampUnit(src: PrimitiveType): LogicalTypeAnnotation.TimeUnit? =
         (src.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)?.unit
@@ -548,22 +569,6 @@ object ParquetRewriter {
             CopyMode.UINT32_TO_LONG ->
                 dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong() and 0xFFFFFFFFL)
             CopyMode.FLOAT_TO_DOUBLE -> dst.add(dstIdx, src.getFloat(srcIdx, 0).toDouble())
-            CopyMode.MILLIS_TO_MICROS -> {
-                val millis = src.getLong(srcIdx, 0)
-                val micros =
-                    try {
-                        Math.multiplyExact(millis, 1_000L)
-                    } catch (_: ArithmeticException) {
-                        // Loud, not wrapped: a millis timestamp this far out
-                        // has no micros representation, and a wrapped value
-                        // would be silently wrong data in the output file.
-                        throw UnconvertibleSchemaException(
-                            "timestamp value $millis ms does not fit int64 micros; " +
-                                "cannot rewrite it under the promoted timestamp column",
-                        )
-                    }
-                dst.add(dstIdx, micros)
-            }
             CopyMode.IDENTITY ->
                 when (primitive.primitiveTypeName) {
                     PrimitiveType.PrimitiveTypeName.BOOLEAN -> dst.add(dstIdx, src.getBoolean(srcIdx, 0))

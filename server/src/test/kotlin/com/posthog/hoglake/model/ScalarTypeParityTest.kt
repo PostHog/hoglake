@@ -139,54 +139,125 @@ class ScalarTypeParityTest {
 
     @Nested
     inner class Promotions {
+        /**
+         * DuckLake's documented promotion table, transcribed from
+         * https://ducklake.select/docs/stable/duckdb/usage/schema_evolution
+         * ("Only type promotions are supported. Type promotions must be
+         * lossless"), in hoglake wire names: DuckLake's int32/int64 are
+         * our int/long, its float32/float64 our float/double.
+         *
+         * Stated here as a LITERAL, independently of the production
+         * table, so the test can compute the intersection itself rather
+         * than restate the answer. Update it only against the docs.
+         */
+        private val duckLake: Map<ColType, Set<ColType>> =
+            mapOf(
+                ColType.INT8 to setOf(ColType.INT16, ColType.INT, ColType.LONG),
+                ColType.INT16 to setOf(ColType.INT, ColType.LONG),
+                ColType.INT to setOf(ColType.LONG),
+                ColType.UINT8 to setOf(ColType.UINT16, ColType.UINT32, ColType.UINT64),
+                ColType.UINT16 to setOf(ColType.UINT32, ColType.UINT64),
+                ColType.UINT32 to setOf(ColType.UINT64),
+                ColType.FLOAT to setOf(ColType.DOUBLE),
+            )
+
+        /**
+         * Iceberg schema-evolution legality of the induced facade change,
+         * as a predicate over [icebergType] rather than a list: same
+         * mapped type, or one of Iceberg's own widenings. (Decimal
+         * precision widening is legal too, but no hoglake promotion
+         * produces it — precision is a type_param, not a type.)
+         */
+        private fun icebergLegal(
+            from: ColType,
+            to: ColType,
+        ): Boolean {
+            val a = from.icebergType
+            val b = to.icebergType
+            return a == b ||
+                (a == IcebergType.INT && b == IcebergType.LONG) ||
+                (a == IcebergType.FLOAT && b == IcebergType.DOUBLE)
+        }
+
         @Test
-        fun `the allowed matrix is exactly this`() {
-            val expected =
-                mapOf(
-                    ColType.INT8 to setOf(ColType.INT16, ColType.INT, ColType.LONG),
-                    ColType.INT16 to setOf(ColType.INT, ColType.LONG),
-                    ColType.INT to setOf(ColType.LONG),
-                    ColType.UINT8 to setOf(ColType.UINT16, ColType.INT, ColType.LONG),
-                    ColType.UINT16 to setOf(ColType.INT, ColType.LONG),
-                    ColType.UINT32 to setOf(ColType.LONG),
-                    ColType.FLOAT to setOf(ColType.DOUBLE),
-                    ColType.TIMESTAMP_S to setOf(ColType.TIMESTAMP_MS, ColType.TIMESTAMP),
-                    ColType.TIMESTAMP_MS to setOf(ColType.TIMESTAMP),
-                )
+        fun `PROMOTIONS is exactly DuckLake's table intersected with Iceberg legality`() {
+            // The whole matrix, derived from the two sources above rather
+            // than copied from the implementation — so a hand-edited entry
+            // (in either direction) fails instead of being restated.
             for (from in ColType.entries) {
-                val allowed = ColType.entries.filter { from.canPromoteTo(it) }.toSet()
-                assertThat(allowed)
-                    .describedAs("promotions from %s", from.wire)
-                    .isEqualTo(expected[from] ?: emptySet<ColType>())
+                val expected =
+                    (duckLake[from] ?: emptySet())
+                        .filter { icebergLegal(from, it) }
+                        .toSet()
+                val actual = ColType.entries.filter { from.canPromoteTo(it) }.toSet()
+                assertThat(actual)
+                    .describedAs(
+                        "promotions from %s: DuckLake offers %s, Iceberg legality keeps %s",
+                        from.wire,
+                        (duckLake[from] ?: emptySet()).map { it.wire }.sorted(),
+                        expected.map { it.wire }.sorted(),
+                    )
+                    .isEqualTo(expected)
             }
         }
 
         @Test
-        fun `every allowed promotion is a legal Iceberg schema evolution`() {
-            // THE rule. Iceberg permits: same type, int -> long,
-            // float -> double, and decimal precision widening (which no
-            // hoglake promotion produces, since decimal precision is a
-            // type_param rather than a type). Anything else would make the
-            // lake unreadable through the facade the moment it is applied.
-            for (from in ColType.entries) {
-                for (to in ColType.entries.filter { from.canPromoteTo(it) }) {
-                    val a = from.icebergType
-                    val b = to.icebergType
-                    val legal =
-                        a == b ||
-                            (a == IcebergType.INT && b == IcebergType.LONG) ||
-                            (a == IcebergType.FLOAT && b == IcebergType.DOUBLE)
-                    assertThat(legal)
-                        .describedAs(
-                            "%s -> %s induces the Iceberg evolution %s -> %s, which is not legal",
-                            from.wire,
-                            to.wire,
-                            a.wire,
-                            b.wire,
-                        )
-                        .isTrue()
+        fun `each half of the intersection actually excludes something`() {
+            // Guards the test above from passing because one of its two
+            // filters is a no-op. If either list ever stops biting, the
+            // "intersection" claim is decoration.
+            val duckLakeRejects =
+                ColType.entries.flatMap { from ->
+                    ColType.entries.filter { to ->
+                        from != to && icebergLegal(from, to) && to !in (duckLake[from] ?: emptySet())
+                    }.map { from to it }
                 }
-            }
+            assertThat(duckLakeRejects)
+                .describedAs("Iceberg-legal pairs DuckLake does not offer")
+                .isNotEmpty()
+
+            val icebergRejects =
+                duckLake.entries.flatMap { (from, tos) ->
+                    tos.filter { !icebergLegal(from, it) }.map { from to it }
+                }
+            assertThat(icebergRejects.map { "${it.first.wire}->${it.second.wire}" })
+                .describedAs("DuckLake promotions Iceberg legality removes")
+                .containsExactlyInAnyOrder("uint8->uint64", "uint16->uint64", "uint32->uint64")
+        }
+
+        @Test
+        fun `the named consequences of the intersection`() {
+            // Spelled out because each one surprised somebody.
+
+            // ADDED by following DuckLake: uint8/uint16 reach uint32,
+            // which is int -> long in Iceberg terms.
+            assertThat(ColType.UINT8.canPromoteTo(ColType.UINT32)).isTrue()
+            assertThat(ColType.UINT16.canPromoteTo(ColType.UINT32)).isTrue()
+
+            // REMOVED by following DuckLake, despite being value-preserving:
+            // DuckLake offers no unsigned -> signed rung at all, and no
+            // timestamp rungs at all. Accepting these would mean a hoglake
+            // catalog takes DDL a DuckLake client rejects.
+            assertThat(ColType.UINT8.canPromoteTo(ColType.INT)).isFalse()
+            assertThat(ColType.UINT16.canPromoteTo(ColType.LONG)).isFalse()
+            assertThat(ColType.UINT32.canPromoteTo(ColType.LONG)).isFalse()
+            assertThat(ColType.TIMESTAMP_S.canPromoteTo(ColType.TIMESTAMP_MS)).isFalse()
+            assertThat(ColType.TIMESTAMP_MS.canPromoteTo(ColType.TIMESTAMP)).isFalse()
+
+            // REMOVED by Iceberg legality, despite DuckLake offering them:
+            // uint64 maps to decimal(20,0), and int/long -> decimal is not
+            // an Iceberg evolution.
+            assertThat(ColType.UINT8.canPromoteTo(ColType.UINT64)).isFalse()
+            assertThat(ColType.UINT16.canPromoteTo(ColType.UINT64)).isFalse()
+            assertThat(ColType.UINT32.canPromoteTo(ColType.UINT64)).isFalse()
+
+            // Never offered by either: json/string share a mapped type but
+            // not a validity claim, and timestamp_ns is its own Iceberg type.
+            assertThat(ColType.JSON.canPromoteTo(ColType.STRING)).isFalse()
+            assertThat(ColType.STRING.canPromoteTo(ColType.JSON)).isFalse()
+            assertThat(ColType.TIMESTAMP.canPromoteTo(ColType.TIMESTAMP_NS)).isFalse()
+            // uint64 is terminal.
+            assertThat(ColType.entries.none { ColType.UINT64.canPromoteTo(it) }).isTrue()
         }
 
         @Test
@@ -203,26 +274,6 @@ class ScalarTypeParityTest {
                     }
                 }
             }
-        }
-
-        @Test
-        fun `the deliberate refusals stay refused`() {
-            // uint32 -> uint64 would be long -> decimal(20,0) in Iceberg:
-            // DuckLake allows the widening, hoglake cannot.
-            assertThat(ColType.UINT32.canPromoteTo(ColType.UINT64)).isFalse()
-            // timestamp -> timestamp_ns changes the mapped type AND the
-            // stored bound unit under every existing stats row.
-            assertThat(ColType.TIMESTAMP.canPromoteTo(ColType.TIMESTAMP_NS)).isFalse()
-            assertThat(ColType.TIMESTAMP_MS.canPromoteTo(ColType.TIMESTAMP_NS)).isFalse()
-            assertThat(ColType.TIMESTAMP_S.canPromoteTo(ColType.TIMESTAMP_NS)).isFalse()
-            // json and string share a mapped type but not a claim.
-            assertThat(ColType.JSON.canPromoteTo(ColType.STRING)).isFalse()
-            assertThat(ColType.STRING.canPromoteTo(ColType.JSON)).isFalse()
-            // uint64 is terminal: nothing in the vocabulary contains it.
-            assertThat(ColType.entries.none { ColType.UINT64.canPromoteTo(it) }).isTrue()
-            // Signed sources never reach the unsigned types (int8 holds -128).
-            assertThat(ColType.INT8.canPromoteTo(ColType.UINT16)).isFalse()
-            assertThat(ColType.INT.canPromoteTo(ColType.UINT64)).isFalse()
         }
     }
 

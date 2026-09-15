@@ -118,39 +118,88 @@ metadata. Recorded here rather than solved: the facade does not exist
 yet, and `uint64` columns are rare enough that pinning the honest
 mapping now beats inventing a physical format no writer emits.
 
-### 2.5 Promotions are constrained twice
+### 2.5 Promotions are an intersection, not a judgement call
 
-A promotion is legal iff it is DuckLake-legal **and** the induced
-Iceberg schema evolution is legal (same mapped type, or Iceberg's own
-int→long / float→double / decimal-precision widenings). Two places
-where the second half makes hoglake stricter than DuckLake:
+A promotion is offered iff it appears in **both**:
 
-- `uint32 → uint64` is refused: long → decimal(20,0) is not an Iceberg
-  evolution, so the promotion would make the table unservable.
-- `timestamp → timestamp_ns` is refused: the mapped type changes, and
-  the stored bound unit would change from micros to nanos underneath
-  every existing stats row.
+1. **DuckLake's documented promotion table**
+   ([schema evolution](https://ducklake.select/docs/stable/duckdb/usage/schema_evolution)
+   — "Only type promotions are supported. Type promotions must be
+   lossless"): `int8 → int16/int32/int64`, `int16 → int32/int64`,
+   `int32 → int64`, `uint8 → uint16/uint32/uint64`,
+   `uint16 → uint32/uint64`, `uint32 → uint64`, `float32 → float64`.
+2. **Iceberg schema-evolution legality** of the induced facade change:
+   same mapped type, or `int → long`, `float → double`, decimal
+   precision widening.
+
+The result:
+
+| from | to |
+|---|---|
+| `int8` | `int16`, `int`, `long` |
+| `int16` | `int`, `long` |
+| `int` | `long` |
+| `uint8` | `uint16`, `uint32` |
+| `uint16` | `uint32` |
+| `float` | `double` |
+
+Being an intersection cuts both ways, and both directions have bitten:
+
+- **Value-preserving is not sufficient.** `uint8 → int`,
+  `uint16 → long` and the whole
+  `timestamp_s → timestamp_ms → timestamp` ladder are lossless — the
+  timestamp one is pure metadata, since all three store micros bounds —
+  but DuckLake offers none of them. A hoglake catalog that accepts DDL
+  a DuckLake client rejects is a catalog the two disagree about, so
+  they are refused.
+- **DuckLake-legal is not sufficient either.** Every `→ uint64` rung is
+  in DuckLake's table, but `uint64` maps to `decimal(20,0)`, and
+  `int → decimal` / `long → decimal` are not Iceberg evolutions. Taking
+  them would silently make the lake unservable through the facade.
+
+Because bounds are keyed to the *mapped* type (§2.1), a promotion needs
+its stats re-encoded only when that mapped type changes. The
+`int8 → int16 → int` steps and `uint8 → uint16` are metadata-only;
+`* → long` and `uint8/uint16 → uint32` widen 4-byte bounds to 8.
 
 `json` and `string` share a mapped type but neither promotes to the
-other — json carries a validity claim string does not.
-
-Because bounds are keyed to the *mapped* type, a promotion only needs
-its stats re-encoded when the mapped type changes. The whole
-int8→int16→int ladder, `uint32 → long`, and
-`timestamp_s → timestamp_ms → timestamp` are all metadata-only.
+other — json carries a validity claim string does not — and nothing
+promotes into `timestamp_ns`, which is its own Iceberg type with its
+own bound unit.
 
 ### 2.6 Partition transforms over the new types
 
 `year`/`month`/`day`/`hour` accept every timestamp precision (the
 transforms are epoch-relative integers; declared precision does not
-change them). `bucket(n)` accepts everything except the Iceberg-excluded
-`boolean`/`float`/`double` — **and except `json`**. That last one is a
-deliberate choice, not an oversight: bucketing hashes bytes, and two
-documents that are equal as JSON (key order, whitespace, number
-spelling) have different bytes, so a json bucket spec would scatter
-equal values across partitions and prune wrong. `json` supports
-`identity` only, which is at least honestly opaque byte equality. The
-same reasoning would exclude `truncate` when the server grows it.
+change them).
+
+`bucket(n)` is the narrow one, and it has **three** exclusion reasons:
+
+- `boolean`/`float`/`double` — outside the Iceberg spec's Appendix-B
+  hash domain outright.
+- `json` — bucketing hashes BYTES, and two documents equal as JSON (key
+  order, whitespace, number spelling) have different bytes, so a json
+  bucket spec would scatter equal values across partitions and prune
+  wrong. The same reasoning excludes `truncate` when the server grows
+  it.
+- `uint32`, `uint64`, `timestamp_s`, `timestamp_ms`, `timestamp_ns` —
+  the **hash-domain mismatch**. Appendix B hashes the *mapped* type's
+  representation: timestamps as micros, `uint64`-as-`decimal(20,0)` as
+  minimal two's-complement bytes, `uint32`-as-`long` as the
+  zero-extended value. The server never computes a bucket value — it
+  stores the partition strings clients send — so accepting a bucket
+  spec on these would be accepting values nobody has verified. They are
+  identity/truncate-only until there is a client contract for hashing
+  on the mapped value AND cross-language bucket vectors proving both
+  sides agree. Re-admitting them is a deliberate change with those
+  vectors attached, not a default.
+
+The server's `AlterService.BUCKETABLE_TYPES` and pyhoglake's
+`_BUCKETABLE` must stay exactly equal (there is a test): the client is
+where bucket values are actually computed, so a divergence would mean
+the server accepting a spec the writer cannot honour. The 422 for the
+five hash-domain types names that reason specifically rather than
+saying "not bucketable", because the two are different problems.
 
 ### 2.7 Permanently refused names
 
