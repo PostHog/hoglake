@@ -520,4 +520,201 @@ class FooterStatsTest {
         assertThat(out).containsOnlyKeys(1L)
         assertThat(out[1L]!!.upperBound).isEqualTo(le(2L))
     }
+
+    // ---- the DuckLake scalar-parity types ----------------------------------
+    //
+    // Bounds are always the MAPPED Iceberg type's encoding, so the
+    // assertions below are really assertions about iceberg-federation.md
+    // §2's table: 4-byte ints for everything int-mapped, 8-byte longs for
+    // uint32, decimal bytes for uint64, micros for the timestamp
+    // precisions and nanos for timestamp_ns.
+
+    @Test
+    fun `small int widths ride int32 and keep the 4-byte int bound`() {
+        val widths =
+            listOf(
+                Triple(ColType.INT8, 8, true),
+                Triple(ColType.INT16, 16, true),
+                Triple(ColType.UINT8, 8, false),
+                Triple(ColType.UINT16, 16, false),
+            )
+        for ((type, width, signed) in widths) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, signed),
+                )
+            val lo = if (signed) -5 else 0
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(lo), le(9)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isEqualTo(le(lo))
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isEqualTo(le(9))
+        }
+    }
+
+    @Test
+    fun `uint32 from the hoglake-written int64 form is a plain long bound`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0L), le(4_294_967_295L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(0L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(4_294_967_295L))
+    }
+
+    @Test
+    fun `uint32 from an arrow-written unsigned int32 zero-extends past 2 to the 31`() {
+        // The bug this pins: sign-extending 0xFFFFFFFF gives -1, which is
+        // not a uint32 bound and inverts the range.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(-1)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(0L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(4_294_967_295L))
+    }
+
+    @Test
+    fun `uint32 from an int32 WITHOUT the unsigned annotation drops bounds`() {
+        // Without the annotation parquet computed min/max in SIGNED order,
+        // so reinterpreting them as unsigned would invert the range. Null,
+        // never guessed.
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT32)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(7)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.valueCount).isEqualTo(10)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `uint64 bounds are the decimal encoding of the unsigned value`() {
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.intType(64, false),
+            )
+        // max is the bit pattern of 2^64-1; min is 2^63 (Long.MIN_VALUE's bits).
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(Long.MIN_VALUE), le(-1L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        // 2^63 and 2^64-1 both need the leading 0x00 sign byte.
+        assertThat(out[1L]!!.lowerBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(63).toByteArray())
+        assertThat(out[1L]!!.upperBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+    }
+
+    @Test
+    fun `uint64 without the unsigned annotation drops bounds`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1L), le(2L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        assertThat(out[1L]!!.lowerBound).isNull()
+    }
+
+    @Test
+    fun `timestamp_s files are physically millis and still bound in micros`() {
+        // Parquet has no seconds unit, so this IS the shape a timestamp_s
+        // column's files have (pyarrow coerces timestamp[s] to MILLIS).
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(-1_000L), le(2_000L)))))
+        for (type in listOf(ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS)) {
+            val out = agg(m, CatalogColumn(1, "ts", type, null))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isEqualTo(le(-1_000_000L))
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isEqualTo(le(2_000_000L))
+        }
+    }
+
+    @Test
+    fun `timestamp_ns bounds are nanos, not micros`() {
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(-1_500L), le(2_500L)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+        // Verbatim: no flooring, no ceiling, no unit change.
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(-1_500L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(2_500L))
+    }
+
+    @Test
+    fun `timestamp_ns scales a millis or micros file UP exactly`() {
+        val scales =
+            listOf(
+                LogicalTypeAnnotation.TimeUnit.MILLIS to 1_000_000L,
+                LogicalTypeAnnotation.TimeUnit.MICROS to 1_000L,
+            )
+        for ((unit, factor) in scales) {
+            val ts =
+                leaf(
+                    "ts",
+                    PrimitiveType.PrimitiveTypeName.INT64,
+                    logical = LogicalTypeAnnotation.timestampType(false, unit),
+                )
+            val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(3L), le(4L)))))
+            val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+            assertThat(out[1L]!!.lowerBound).describedAs("$unit").isEqualTo(le(3L * factor))
+        }
+    }
+
+    @Test
+    fun `timestamp_ns scaling overflow drops bounds, never throws`() {
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(1L), le(Long.MAX_VALUE)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+        assertThat(out).containsOnlyKeys(1L)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `json bounds are the document bytes, compared unsigned like string`() {
+        val j =
+            leaf(
+                "j",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.jsonType(),
+            )
+        val m =
+            meta(
+                schema(j),
+                20,
+                listOf(chunk(j, 10, stats(j, "{\"a\":1}".toByteArray(), "{\"µ\":2}".toByteArray()))),
+                listOf(chunk(j, 10, stats(j, "{\"b\":1}".toByteArray(), "{\"c\":2}".toByteArray()))),
+            )
+        val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo("{\"a\":1}".toByteArray())
+        // 'µ' is 0xC2 0xB5 in UTF-8 — above 'c' only under an UNSIGNED
+        // byte compare, which is the one that matches Iceberg's ordering.
+        assertThat(out[1L]!!.upperBound).isEqualTo("{\"µ\":2}".toByteArray())
+    }
+
+    @Test
+    fun `json also reads a plain BYTE_ARRAY with no JSON annotation`() {
+        // The annotation changes neither the bytes nor their sort order,
+        // so requiring it would only lose bounds on files from writers
+        // that do not stamp it.
+        val j = leaf("j", PrimitiveType.PrimitiveTypeName.BINARY)
+        val m = meta(schema(j), 10, listOf(chunk(j, 10, stats(j, "[]".toByteArray(), "{}".toByteArray()))))
+        val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo("[]".toByteArray())
+    }
 }

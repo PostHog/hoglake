@@ -310,22 +310,146 @@ class IcebergSingleValueTest {
             val samples =
                 mapOf<ColType, Any>(
                     ColType.BOOLEAN to true,
+                    ColType.INT8 to 1,
+                    ColType.INT16 to 1,
                     ColType.INT to 1,
                     ColType.LONG to 1L,
+                    ColType.UINT8 to 1,
+                    ColType.UINT16 to 1,
+                    ColType.UINT32 to 1L,
+                    ColType.UINT64 to BigInteger.ONE,
                     ColType.FLOAT to 1f,
                     ColType.DOUBLE to 1.0,
                     ColType.DECIMAL to BigDecimal.ONE,
                     ColType.DATE to LocalDate.EPOCH,
                     ColType.TIME to LocalTime.NOON,
+                    ColType.TIMESTAMP_S to 1L,
+                    ColType.TIMESTAMP_MS to 1L,
                     ColType.TIMESTAMP to LocalDateTime.of(2020, 1, 1, 0, 0),
+                    ColType.TIMESTAMP_NS to 1L,
                     ColType.TIMESTAMPTZ to Instant.EPOCH,
                     ColType.STRING to "s",
+                    ColType.JSON to "{}",
                     ColType.UUID_T to UUID.randomUUID(),
                     ColType.BINARY to byteArrayOf(1),
                 )
+            // Exhaustive by assertion, not by hope: a new ColType with no
+            // sample here fails LOUDLY instead of going untested.
+            assertThat(samples.keys).containsExactlyInAnyOrderElementsOf(ColType.entries)
             for ((type, value) in samples) {
-                assertThat(IcebergSingleValue.encode(type, value)).isNotNull()
+                assertThat(IcebergSingleValue.encode(type, value))
+                    .describedAs(type.wire)
+                    .isNotNull()
             }
+        }
+    }
+
+    // ---- the DuckLake scalar-parity types ---------------------------------
+
+    @Nested
+    inner class ScalarParityTypes {
+        @Test
+        fun `every int-mapped type shares the 4-byte int encoding`() {
+            for (type in listOf(ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16)) {
+                assertThat(IcebergSingleValue.encode(type, -7))
+                    .describedAs(type.wire)
+                    .isEqualTo(IcebergSingleValue.encode(ColType.INT, -7))
+                assertThat(IcebergSingleValue.decode(type, IcebergSingleValue.encode(type, -7)))
+                    .describedAs(type.wire)
+                    .isEqualTo(-7)
+            }
+        }
+
+        @Test
+        fun `uint32 uses the 8-byte long encoding, not int`() {
+            // The facade maps uint32 to Iceberg long, so its bound is 8
+            // bytes. Getting this wrong makes every uint32 bound
+            // undecodable under the live type.
+            val enc = IcebergSingleValue.encode(ColType.UINT32, 4_294_967_295L)
+            assertThat(enc).hasSize(8)
+            assertThat(enc).isEqualTo(IcebergSingleValue.encodeLong(4_294_967_295L))
+            assertThat(IcebergSingleValue.decode(ColType.UINT32, enc)).isEqualTo(4_294_967_295L)
+        }
+
+        @Test
+        fun `uint64 encodes as the decimal unscaled value, growing a sign byte above 2 to the 63`() {
+            val big = BigInteger.ONE.shiftLeft(63) // 9223372036854775808
+            val enc = IcebergSingleValue.encode(ColType.UINT64, big)
+            // Minimal two's-complement of a positive value with the high
+            // bit set needs the leading 0x00.
+            assertThat(enc).hasSize(9)
+            assertThat(enc[0]).isEqualTo(0.toByte())
+            assertThat(IcebergSingleValue.decode(ColType.UINT64, enc)).isEqualTo(big)
+
+            val max = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)
+            assertThat(IcebergSingleValue.decode(ColType.UINT64, IcebergSingleValue.encode(ColType.UINT64, max)))
+                .isEqualTo(max)
+        }
+
+        @Test
+        fun `uint64 refuses a Long, whose sign would be a guess`() {
+            assertThatThrownBy { IcebergSingleValue.encode(ColType.UINT64, -1L) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+        }
+
+        @Test
+        fun `timestamp_s and timestamp_ms store micros, exactly like timestamp`() {
+            for (type in listOf(ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS)) {
+                assertThat(IcebergSingleValue.encode(type, -1_500_000L))
+                    .describedAs(type.wire)
+                    .isEqualTo(IcebergSingleValue.encode(ColType.TIMESTAMP, -1_500_000L))
+            }
+        }
+
+        @Test
+        fun `the declared-unit helpers convert to micros and refuse overflow`() {
+            assertThat(IcebergSingleValue.encodeTimestampSeconds(-2L))
+                .isEqualTo(IcebergSingleValue.encodeLong(-2_000_000L))
+            assertThat(IcebergSingleValue.encodeTimestampMillis(-2L))
+                .isEqualTo(IcebergSingleValue.encodeLong(-2_000L))
+            assertThatThrownBy { IcebergSingleValue.encodeTimestampSeconds(Long.MAX_VALUE) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("timestamp_s")
+            assertThatThrownBy { IcebergSingleValue.encodeTimestampMillis(Long.MAX_VALUE) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("timestamp_ms")
+        }
+
+        @Test
+        fun `timestamp_ns stores nanos - the one temporal type that is not micros`() {
+            val nanos = 1_510_871_468_123_456_789L
+            assertThat(IcebergSingleValue.encode(ColType.TIMESTAMP_NS, nanos))
+                .isEqualTo(IcebergSingleValue.encodeLong(nanos))
+            assertThat(IcebergSingleValue.decode(ColType.TIMESTAMP_NS, IcebergSingleValue.encodeLong(nanos)))
+                .isEqualTo(nanos)
+        }
+
+        @Test
+        fun `a timestamp_ns LocalDateTime converts to nanos and refuses overflow`() {
+            assertThat(IcebergSingleValue.encode(ColType.TIMESTAMP_NS, LocalDateTime.of(1970, 1, 1, 0, 0)))
+                .isEqualTo(IcebergSingleValue.encodeLong(0L))
+            // Year 2600 is ~2e19 nanos: past int64. Nanosecond timestamps
+            // only span 1677..2262, and the codec must say so rather than wrap.
+            assertThatThrownBy {
+                IcebergSingleValue.encode(ColType.TIMESTAMP_NS, LocalDateTime.of(2600, 1, 1, 0, 0))
+            }.isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("timestamp_ns")
+        }
+
+        @Test
+        fun `json encodes as UTF-8 bytes and compares as unsigned bytes like string`() {
+            val document = """{"µ":1}"""
+            assertThat(IcebergSingleValue.encode(ColType.JSON, document))
+                .isEqualTo(document.toByteArray(Charsets.UTF_8))
+            assertThat(IcebergSingleValue.decode(ColType.JSON, document.toByteArray(Charsets.UTF_8)))
+                .isEqualTo(document)
+            // Above the BMP, UTF-16 unit order (String.compareTo) disagrees
+            // with code-point order; json must use the same unsigned byte
+            // compare string does.
+            val astral = "😀"
+            val bmp = "�"
+            assertThat(IcebergSingleValue.compareValues(ColType.JSON, astral, bmp))
+                .isEqualTo(IcebergSingleValue.compareValues(ColType.STRING, astral, bmp))
         }
     }
 }
