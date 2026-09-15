@@ -447,6 +447,29 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
 
 ## Findings for the server (no server changes made)
 
+### Ticket split for umbrella wire-gap issue
+
+Split the umbrella into these individual server tickets:
+
+- [ ] **Add `snapshot=` to listing endpoints (`/namespaces`, `/tables`)**
+  so a snapshot-pinned transaction can list catalog objects at the same
+  pinned snapshot as its reads (fixes listing phantoms/misses under
+  concurrent DDL).
+- [ ] **Add per-column min/max bounds to `/scan` `ScanFile`** so clients
+  can zone-map prune files during planning. (Adjacent to #9, which is
+  about bounds display rather than scan planning.)
+- [ ] **Allow client-supplied `explicit_row_ids` in file registration**
+  so client UPDATE flows (delete+insert) can preserve row-id lineage.
+- [ ] **Add update-image semantics to changefeed** so update consumers
+  get linkage between delete/insert pairs (pre/post image semantics).
+- [ ] **Add namespace drop endpoint (`DELETE /namespaces/{ns}`)** so
+  `DROP SCHEMA` is representable on the wire.
+- [ ] **Add table/column comments on the wire** (storage + read/write
+  contract) so `COMMENT ON` is representable.
+- [ ] **Document non-transactional DDL as an explicit wire contract**
+  (each DDL commits its own snapshot) and keep client-side coherence
+  rules where atomic DDL+DML is required.
+
 1. `/scan` (`ScanFile`) carries no per-file column bounds → no
    file-level zone-map pruning for external engines. Suggest optional
    bounds in `ScanFile` or a server-side filter param.
