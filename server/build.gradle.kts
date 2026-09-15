@@ -13,7 +13,7 @@ repositories {
 
 val ktorVersion = "3.5.2"
 val jdbiVersion = "3.54.0"
-val flywayVersion = "11.8.2"
+val flywayVersion = "13.5.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
 val awsSdkVersion = "2.54.13"
