@@ -12,16 +12,16 @@ repositories {
 }
 
 val ktorVersion = "3.2.0"
-val jdbiVersion = "3.45.4"
-val flywayVersion = "10.21.0"
+val jdbiVersion = "3.49.3"
+val flywayVersion = "11.8.2"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.3"
-val awsSdkVersion = "2.29.29"
+val awsSdkVersion = "2.46.7"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
     // kotlinx-coroutines line ktor already carries transitively.
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
 
     // HTTP server
     implementation("io.ktor:ktor-server-core:$ktorVersion")
@@ -35,7 +35,7 @@ dependencies {
 
     // Persistence
     implementation("org.postgresql:postgresql:42.7.7")
-    implementation("com.zaxxer:HikariCP:6.2.1")
+    implementation("com.zaxxer:HikariCP:6.3.0")
     implementation("org.jdbi:jdbi3-core:$jdbiVersion")
     implementation("org.jdbi:jdbi3-kotlin:$jdbiVersion")
     implementation("org.jdbi:jdbi3-postgres:$jdbiVersion")
@@ -52,8 +52,8 @@ dependencies {
     // dependency-free jar; the wider Hadoop dependency tree must not leak
     // into the codebase.
     implementation("org.apache.parquet:parquet-hadoop:1.17.1")
-    implementation("org.apache.hadoop:hadoop-client-api:3.4.1")
-    runtimeOnly("org.apache.hadoop:hadoop-client-runtime:3.4.1")
+    implementation("org.apache.hadoop:hadoop-client-api:3.5.0")
+    runtimeOnly("org.apache.hadoop:hadoop-client-runtime:3.5.0")
 
     // Deletion vectors: hoglake DVs are Iceberg v3 puffin `deletion-vector-v1`
     // blobs — a portable 64-bit roaring bitmap of deleted row positions.
@@ -64,23 +64,23 @@ dependencies {
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.5.18")
-    implementation("io.github.oshai:kotlin-logging-jvm:7.0.3")
-    implementation("net.logstash.logback:logstash-logback-encoder:8.0")
+    implementation("io.github.oshai:kotlin-logging-jvm:7.0.7")
+    implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:1.15.0")
 
     // Tests
     testImplementation(kotlin("test"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.assertj:assertj-core:3.27.3")
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
     testImplementation("org.testcontainers:postgresql:$testcontainersVersion")
     testImplementation("org.testcontainers:minio:$testcontainersVersion")
     testImplementation("org.testcontainers:junit-jupiter:$testcontainersVersion")
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
-    testImplementation("org.awaitility:awaitility:4.2.2")
+    testImplementation("org.awaitility:awaitility:4.3.0")
     testImplementation("io.kotest:kotest-property:5.9.1")
 
     // Coverage-guided fuzzing (fuzzing.md layer 4): jazzer-junit @FuzzTest
