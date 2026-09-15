@@ -407,7 +407,7 @@ HoglakeApiClient::Response HoglakeApiClient::Request(const string &method, const
 	return response;
 }
 
-void HoglakeApiClient::ThrowFor(const Response &response, const string &what) {
+void HoglakeApiClient::ThrowFor(const Response &response, const string &what, bool travel_scoped) {
 	string error = StringUtil::Format("HTTP %d", response.status);
 	string detail;
 	{
@@ -422,12 +422,24 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what) {
 		}
 	}
 	auto message = StringUtil::Format("hoglake: %s failed: %s%s%s", what, error, detail.empty() ? "" : " — ", detail);
-	// request-scoped 422s (the snapshot/travel selector itself is
-	// unserviceable) apply to every object, so they must propagate like
-	// the 410 below rather than being contained per table
+	// REQUEST-SCOPED refusals apply to every object of the catalog and
+	// must propagate past the per-table containment boundaries (a
+	// contained one makes a listing report an EMPTY schema — the
+	// taxonomy's cardinal rule at the top of this file).
+	//
+	// Classification is by OUR OWN request shape: `travel_scoped` is
+	// true iff this request carried a snapshot/at_timestamp selector,
+	// which is knowable without reading the server's prose. A 422 on
+	// such a request is unserviceable for every table, whatever the
+	// responder worded (or whether it sent a JSON body at all), so a
+	// proxy 422 or a future rewording cannot silently fall back to the
+	// contained branch. The substring match survives only as a
+	// secondary net for a NON-travel request whose body still names the
+	// selector.
 	auto lower_error = StringUtil::Lower(error + " " + detail);
 	if (response.status == 422 &&
-	    (StringUtil::Contains(lower_error, "snapshot") || StringUtil::Contains(lower_error, "at_timestamp"))) {
+	    (travel_scoped || StringUtil::Contains(lower_error, "snapshot") ||
+	     StringUtil::Contains(lower_error, "at_timestamp"))) {
 		throw TransactionException("%s (the requested snapshot/timestamp cannot be served)", message);
 	}
 	switch (response.status) {
@@ -556,7 +568,7 @@ unique_ptr<HoglakeTableInfo> HoglakeApiClient::TryGetTable(const string &ns, con
 		return nullptr;
 	}
 	if (response.status != 200) {
-		ThrowFor(response, "GET table \"" + ns + "." + table + "\"");
+		ThrowFor(response, "GET table \"" + ns + "." + table + "\"", !travel.IsHead());
 	}
 	JsonDoc doc(response.body);
 	return make_uniq<HoglakeTableInfo>(ParseTableInfo(ParseObjectResponse(doc, "GET table")));
@@ -655,7 +667,7 @@ vector<HoglakeScanFile> HoglakeApiClient::PlanScan(const string &ns, const strin
 	            TravelQuery(travel);
 	auto response = Request("GET", path, string());
 	if (response.status != 200) {
-		ThrowFor(response, "plan scan of \"" + ns + "." + table + "\"");
+		ThrowFor(response, "plan scan of \"" + ns + "." + table + "\"", !travel.IsHead());
 	}
 	JsonDoc doc(response.body);
 	auto root = ParseArrayResponse(doc, "plan scan");

@@ -159,7 +159,21 @@ MultiFileReaderVirtualColumnBinding HoglakeMultiFileReader::GetVirtualColumnExpr
 		    explicit_entry != options.end() && BooleanValue::Get(explicit_entry->second);
 		bool has_reserved_column = TryFindColumnByFieldId(local_columns, HOG_ROW_ID_FIELD_ID);
 		if (explicit_row_ids) {
-			// symmetric with the flag-true/column-missing refusal below
+			if (!has_reserved_column) {
+				// EXPLICIT refusal, never a fall-through: `row_id_column`
+				// carries no default_expression, so handing it to the
+				// mapper for a file without field id 2147483646 reaches
+				// FieldIdMapper::GetDefault -> InternalException ->
+				// whole-instance invalidation. (A file with NO field ids
+				// at all falls back to BY_NAME and fails typed on its
+				// own; the fatal case is precisely the field-id-bearing
+				// one, i.e. what compaction outputs are.)
+				throw InvalidInputException(
+				    "hoglake: data file \"%s\" is registered WITH explicit row ids but its parquet has no column "
+				    "carrying the reserved field id %d (_hog_row_id) - the file does not match its registration and "
+				    "its row ids cannot be read. Repair the file or its registration via another client",
+				    reader_data.file_to_be_opened.path, HOG_ROW_ID_FIELD_ID);
+			}
 			return MultiFileReaderVirtualColumnBinding(*row_id_column);
 		}
 		if (has_reserved_column) {

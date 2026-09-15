@@ -119,7 +119,12 @@ private:
 
 	Response Request(const string &method, const string &path, const string &json_body);
 	//! Throws the mapped duckdb exception for a non-2xx response.
-	[[noreturn]] void ThrowFor(const Response &response, const string &what);
+	//! travel_scoped: this request carried a snapshot/at_timestamp
+	//! selector, so a refusal of that selector applies to EVERY object
+	//! of the catalog (request-scoped) and must propagate past the
+	//! per-table containment boundaries. Classified from OUR OWN
+	//! request shape, never from the server's prose.
+	[[noreturn]] void ThrowFor(const Response &response, const string &what, bool travel_scoped = false);
 	string CatalogPath(const string &suffix) const;
 	static string TravelQuery(const HoglakeTravel &travel);
 

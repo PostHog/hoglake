@@ -252,3 +252,15 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   REVIEW-FINDINGS-R5.md.
 - Verified 2026-09-14: ./test/run-live-tests.sh green — 11 files /
   638 assertions + cross-client wire check.
+
+## Review round 6 — all 4 findings fixed (incl. one regression of mine): DONE
+- R6-1: the wave-5 rowid fix had deleted the only guard for the
+  flag-true/column-missing direction (fall-through to the missing
+  row_id_start option); restored as an EXPLICIT typed refusal before
+  the physical binding. R6-2: fixture `fid_missing` byte-patches a real
+  compaction output's footer (reserved field id -> 2147483645, sizes
+  unchanged) so both directions of the contract are tested. R6-3: 422
+  request-scope classification now uses our own request shape
+  (travel_scoped) instead of matching the server's prose. R6-4:
+  DESIGN.md §5 de-duplicated and made true. R5 disposition corrected in
+  place. Dispositions: REVIEW-FINDINGS-R6.md.

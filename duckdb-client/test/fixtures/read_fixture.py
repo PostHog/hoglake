@@ -75,6 +75,7 @@ def main() -> None:
         region="us-east-1",
         allow_bucket_creation=True,
     )
+    env_lines: list[str] = []
     with HoglakeClient(HOGLAKE_URL, s3=s3) as client:
         fs = s3.filesystem()
         fs.create_dir(BUCKET)
@@ -321,6 +322,7 @@ def main() -> None:
         # refuse the file rather than read its contents as row ids. The
         # column also holds a NULL, the R5-1 trigger.
         import io as _io
+        import time as _time
         import uuid as _uuid
         import pyarrow.parquet as _pq
 
@@ -357,6 +359,78 @@ def main() -> None:
             }],
         })
         print(f"fixture ready: {SQLTEST}/ns1.bad_fieldid (reserved field id on a positional file)")
+
+        # ---- flag-true / column-missing (R6-2): the complementary
+        # direction of the reserved-field-id contract. Only compaction
+        # sets explicit_row_ids, so the fixture lets the server compact
+        # a table and then replaces the OUTPUT OBJECT in the bucket
+        # with a parquet that carries field ids but no _hog_row_id —
+        # what an object-store-level corruption or a compaction bug
+        # looks like. Gated: exports DUCKEXT_FID_MISSING only if the
+        # swap succeeded.
+        try:
+            sq_ns.table("fid_missing").drop()
+        except NotFoundError:
+            pass
+        fm_schema = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+        fm = sq_ns.create_table("fid_missing", fm_schema)
+        for i in range(8):
+            fm.append(pa.table({"id": pa.array([i + 1], pa.int64())}, schema=fm_schema))
+        fm_deadline = _time.time() + 120
+        fm_out = None
+        while _time.time() < fm_deadline:
+            files = rest("GET", f"/catalogs/{SQLTEST}/namespaces/ns1/tables/fid_missing/scan").json()
+            explicit = [f["data_file"] for f in files if f["data_file"].get("explicit_row_ids")]
+            if explicit:
+                fm_out = explicit[0]
+                break
+            if all(f["data_file"]["stats_state"] == "provided" for f in files):
+                rest("POST", f"/catalogs/{SQLTEST}/maintenance/compact?batch=10")
+            _time.sleep(2)
+        if fm_out is None:
+            print("WARNING: fid_missing did not compact; flag-true/column-missing test will skip")
+        else:
+            # Byte-patch the compaction output's FOOTER so the reserved
+            # field id 2147483646 becomes 2147483645: thrift compact
+            # encodes both as 5-byte zigzag varints, so file size and
+            # footer size are unchanged (the reader validates both
+            # against the registration) while no column carries the
+            # reserved id any more — exactly flag-true/column-missing.
+            swap_key = fm_out["path"][len("s3://"):]
+            fs_handle = s3.filesystem()
+            with fs_handle.open_input_stream(swap_key) as src:
+                original = src.read()
+            footer_len = int.from_bytes(original[-8:-4], "little")
+            footer_start = len(original) - footer_len - 8
+            reserved = (2147483646 << 1).to_bytes(5, "little")  # placeholder, replaced below
+
+            def zigzag_varint(value: int) -> bytes:
+                zz = (value << 1) ^ (value >> 31)
+                out = bytearray()
+                while True:
+                    byte = zz & 0x7F
+                    zz >>= 7
+                    if zz:
+                        out.append(byte | 0x80)
+                    else:
+                        out.append(byte)
+                        break
+                return bytes(out)
+
+            reserved = zigzag_varint(2147483646)
+            replacement = zigzag_varint(2147483645)
+            footer = original[footer_start:]
+            if len(reserved) != len(replacement) or reserved not in footer:
+                print("WARNING: could not patch the reserved field id in the compaction footer; "
+                      "flag-true/column-missing test will skip")
+            else:
+                patched = original[:footer_start] + footer.replace(reserved, replacement, 1)
+                assert len(patched) == len(original)
+                with fs_handle.open_output_stream(swap_key) as out:
+                    out.write(patched)
+                env_lines.append("export DUCKEXT_FID_MISSING=1")
+                print(f"fixture ready: {SQLTEST}/ns1.fid_missing "
+                      f"(explicit_row_ids output whose parquet lacks the reserved field id)")
 
         # sorted table for the DISCRIMINATING compacted-rowid test
         # (R4-10): compaction sorts the merge by the live sort order, so
@@ -407,7 +481,7 @@ def main() -> None:
         # the same instant as T1 expressed at +02:00 (offset handling:
         # a client that drops the offset reads head instead of batch1)
         t1_plus2 = (t1 + timedelta(hours=2)).strftime("%Y-%m-%d %H:%M:%S.%f") + "+02:00"
-        env_lines = [
+        env_lines += [
             f"export DUCKEXT_POINTS_SNAP_V1={r1.snapshot_id}",
             f"export DUCKEXT_POINTS_SNAP_V2={r2.snapshot_id}",
             f"export DUCKEXT_POINTS_T1='{t1_natural}'",
@@ -419,8 +493,6 @@ def main() -> None:
         # stack's hydrator (stats must be provided before files become
         # compaction candidates); on timeout the flag is left unset and
         # the gated test file skips.
-        import time as _time
-
         def table_files(tname):
             return rest("GET", f"/catalogs/{CATALOG}/namespaces/ns1/tables/{tname}/scan").json()
 

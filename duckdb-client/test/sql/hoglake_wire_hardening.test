@@ -21,6 +21,11 @@ require-env HOGLAKE_URL
 
 require-env DUCKEXT_S3_ENDPOINT
 
+# the flag-true/column-missing fixture (a byte-patched compaction
+# output) is gated: the fixture exports this only when the dev stack
+# actually compacted the table
+require-env DUCKEXT_FID_MISSING
+
 statement ok
 CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
     ENDPOINT '{DUCKEXT_S3_ENDPOINT}', URL_STYLE 'path', USE_SSL false)
@@ -266,6 +271,38 @@ statement error
 DELETE FROM lakes.ns1.bad_fieldid WHERE a = 2
 ----
 <REGEX>:.*reserved parquet field id.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+# ---- the COMPLEMENTARY direction: a registration WITH explicit row
+# ids whose parquet lacks the reserved field id (fixture byte-patches a
+# real compaction output's footer so the id is no longer 2147483646,
+# keeping file and footer sizes identical). Pre-fix this reached
+# DuckDB's FieldIdMapper::GetDefault -> InternalException -> whole
+# instance invalidated; it must refuse typed like its mirror. ----
+
+query I
+SELECT count(*) FROM lakes.ns1.fid_missing
+----
+8
+
+statement error
+SELECT rowid FROM lakes.ns1.fid_missing
+----
+<REGEX>:.*registered WITH explicit row ids but its parquet has no column.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+statement error
+DELETE FROM lakes.ns1.fid_missing WHERE id = 1
+----
+<REGEX>:.*registered WITH explicit row ids but its parquet has no column.*
 
 query I
 SELECT 'alive'
