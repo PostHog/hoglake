@@ -361,6 +361,13 @@ tr.has-deletes {
   text-decoration: underline;
 }
 
+.server-version {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+
 .instance-name {
   padding: 1px 8px;
   border: 1px solid var(--accent, var(--border));

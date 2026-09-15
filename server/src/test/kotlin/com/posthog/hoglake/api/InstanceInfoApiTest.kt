@@ -3,6 +3,7 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
+import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.ColType
@@ -26,11 +27,12 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 
 /**
- * Wire-level pinning for GET /v1/info totals — the webui header builds
- * against exactly this shape. Semantics pinned: totals come from the
- * metrics sampler's last pass (never computed per request), the fields
- * are ABSENT before the first sample, they sum live data files only,
- * and a dropped table's files leave the totals on the next sample.
+ * Wire-level pinning for GET /v1/info — the webui header builds against
+ * exactly this shape. Semantics pinned: totals come from the metrics
+ * sampler's last pass (never computed per request), the fields are
+ * ABSENT before the first sample, they sum live data files only, and a
+ * dropped table's files leave the totals on the next sample. The version
+ * is pinned as ALWAYS present, sampler or no sampler.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -102,6 +104,18 @@ class InstanceInfoApiTest {
             assertThat(root["total_rows"].isIntegralNumber).isTrue()
             assertThat(root["total_rows"].asLong()).isEqualTo(15)
             assertThat(root["total_size_bytes"].asLong()).isEqualTo(1_050_624)
+        }
+
+    @Test
+    fun `version is present from boot, before any sample`() =
+        api { client ->
+            // Unlike the totals, the version does not depend on the
+            // sampler: an operator asking "what is running?" during a boot
+            // stall is exactly when the answer matters most.
+            val root = body(client.get("/v1/info"))
+            assertThat(root.has("version")).isTrue()
+            assertThat(root["version"].asText()).isEqualTo(BuildInfo.version)
+            assertThat(root["version"].asText()).isNotBlank()
         }
 
     @Test

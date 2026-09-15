@@ -202,6 +202,31 @@ tasks.register<JavaExec>("generateFuzzSeeds") {
 }
 
 // The OpenAPI spec's info.version must match the server version. The
+// The running version, readable at runtime. A generated resource rather
+// than the jar manifest: the manifest is absent when the server runs from
+// classes (Gradle run, every test), so a manifest read would answer
+// "unknown" in exactly the environments where a version banner is most
+// likely to be wrong. project.version is the single source (build.gradle
+// -> here -> GET /v1/info -> webui badge), so there is nothing to keep in
+// sync by hand.
+val generateVersionResource =
+    tasks.register("generateVersionResource") {
+        description = "Write the project version into a resource the server reads at runtime"
+        val outputDir = layout.buildDirectory.dir("generated/version")
+        val projectVersion = version.toString()
+        inputs.property("version", projectVersion)
+        outputs.dir(outputDir)
+        doLast {
+            val file = outputDir.get().file("com/posthog/hoglake/version.properties").asFile
+            file.parentFile.mkdirs()
+            file.writeText("version=$projectVersion\n")
+        }
+    }
+
+sourceSets.main {
+    output.dir(mapOf("builtBy" to generateVersionResource), layout.buildDirectory.dir("generated/version"))
+}
+
 // v1.0.0 tag shipped a spec that still said 0.1.0 because nothing
 // enforced the pairing; this check makes the drift a build failure.
 tasks.register("checkOpenapiVersion") {
