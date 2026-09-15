@@ -45,6 +45,9 @@ data class CatalogColumn(
 object FooterStats {
     private val log = KotlinLogging.logger {}
 
+    /** 2^64, for reading an unsigned int64 out of its signed bit pattern. */
+    private val TWO_POW_64: BigInteger = BigInteger.ONE.shiftLeft(64)
+
     data class ColumnAgg(
         val fieldId: Long,
         val valueCount: Long,
@@ -411,8 +414,6 @@ object FooterStats {
         } else {
             BigInteger.valueOf(bits).add(TWO_POW_64)
         }
-
-    private val TWO_POW_64: BigInteger = BigInteger.ONE.shiftLeft(64)
 
     private fun decodeDecimal(
         col: CatalogColumn,
