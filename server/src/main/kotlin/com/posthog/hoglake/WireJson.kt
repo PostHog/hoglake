@@ -1,4 +1,4 @@
-package com.posthog.hoglake.api
+package com.posthog.hoglake
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.ObjectMapper
@@ -12,10 +12,16 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
  * The one wire JSON configuration: snake_case with ISO-8601 date-times
  * and base64 byte fields, per openapi/hoglake.yaml.
  *
- * Defined once because it was defined three times — App.module plus two
- * tests, each claiming in a comment to mirror it "exactly". A fuzz target
- * that configures its own mapper is only fuzzing production while those
- * comments stay true, and nothing made them stay true.
+ * Defined once because it was defined five times — App.module, three
+ * tests, and the maintenance-run ledger, each claiming in a comment to
+ * mirror the others "exactly". None of those comments was enforced and
+ * two had already drifted: a fuzz target that configures its own mapper
+ * only fuzzes production while its comment stays true, and the ledger's
+ * copy had lost the ISO-8601 date setting it claimed to have.
+ *
+ * It lives at the top level rather than in `api` because it is not only
+ * the API's: the maintenance ledger stores wire-shaped payloads on
+ * purpose, and persistence must not have to import from `api` to say so.
  *
  * [KotlinFeature.StrictNullChecks] is the load-bearing one. Kotlin's
  * non-null ELEMENT types (`List<AlterOpDto>`) are erased at the Jackson

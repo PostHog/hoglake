@@ -6,8 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
-import com.posthog.hoglake.api.wireObjectMapper
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
 
 /**

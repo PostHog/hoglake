@@ -1,6 +1,5 @@
 package com.posthog.hoglake
 
-import com.posthog.hoglake.api.configureHoglakeWire
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
 import com.posthog.hoglake.api.installErrorMapping

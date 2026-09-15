@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.AlterService
