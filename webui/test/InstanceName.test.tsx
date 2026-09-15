@@ -36,3 +36,39 @@ describe("topbar instance name", () => {
     expect(document.querySelector(".instance-name")).toBeNull();
   });
 });
+
+describe("topbar server version", () => {
+  it("shows the running server version beside the brand", async () => {
+    mockFetch((url) => {
+      if (url === "/v1/info")
+        return jsonResponse({ name: "GigaHog", version: "1.0.1-dev" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    expect(await screen.findByText("v1.0.1-dev")).toBeInTheDocument();
+  });
+
+  it("shows the server's own answer when it does not know its version", async () => {
+    // BuildInfo reports "unknown" rather than omitting the field; the
+    // badge must not silently hide that.
+    mockFetch((url) => {
+      if (url === "/v1/info") return jsonResponse({ version: "unknown" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    expect(await screen.findByText("vunknown")).toBeInTheDocument();
+  });
+
+  it("renders no version badge against a server that predates the field", async () => {
+    mockFetch((url) => {
+      if (url === "/v1/info") return jsonResponse({ name: "GigaHog" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    expect(await screen.findByText("GigaHog")).toBeInTheDocument();
+    expect(document.querySelector(".server-version")).toBeNull();
+  });
+});
