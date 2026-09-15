@@ -96,8 +96,19 @@ object ParquetRewriter {
 
     private class Row(val group: Group, val rowId: Long)
 
-    /** How one matched input column lands in the output. */
-    private enum class CopyMode { IDENTITY, INT_TO_LONG, FLOAT_TO_DOUBLE }
+    /**
+     * How one matched input column lands in the output.
+     *
+     * [UINT32_TO_LONG] exists because unsigned parquet int32s must NOT
+     * sign-extend: a uint32 above 2^31 would become negative, and the
+     * uint8/uint16/uint32 -> long promotions all produce exactly this
+     * pairing. [MILLIS_TO_MICROS] is the timestamp_s/timestamp_ms ->
+     * timestamp promotion's companion — an exact x1000 widening, refused
+     * on int64 overflow rather than wrapped, without which promoting a
+     * millis column would leave every pre-promotion file permanently
+     * unconvertible.
+     */
+    private enum class CopyMode { IDENTITY, INT_TO_LONG, UINT32_TO_LONG, FLOAT_TO_DOUBLE, MILLIS_TO_MICROS }
 
     /**
      * Merge [inputs] (caller orders them by rowIdStart) into [output]
@@ -235,8 +246,25 @@ object ParquetRewriter {
         return when (column.def.type) {
             ColType.BOOLEAN ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
+            ColType.INT8 -> intColumn(id, name, 8, signed = true)
+            ColType.INT16 -> intColumn(id, name, 16, signed = true)
+            ColType.UINT8 -> intColumn(id, name, 8, signed = false)
+            ColType.UINT16 -> intColumn(id, name, 16, signed = false)
             ColType.INT ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT32).id(id).named(name)
+            // uint32 is written as a plain INT64, NOT as the INT32 +
+            // INT(32, unsigned) pyarrow and DuckDB emit natively: it maps
+            // to Iceberg long, and an Iceberg reader takes an INT32 column
+            // as SIGNED, so values above 2^31 would read back negative
+            // through the facade. Reads still accept both forms; rewriting
+            // converges files on the facade-readable one.
+            ColType.UINT32 ->
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
+            // uint64 keeps its native physical form. Its facade mapping is
+            // decimal(20,0), which parquet cannot express as an INT64, so
+            // uint64 is the one type whose FILES are not facade-readable in
+            // place even though its BOUNDS already are (iceberg-federation.md §2).
+            ColType.UINT64 -> intColumn(id, name, 64, signed = false)
             ColType.LONG ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
             ColType.FLOAT ->
@@ -254,9 +282,21 @@ object ParquetRewriter {
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timeType(false, LogicalTypeAnnotation.TimeUnit.MICROS))
                     .id(id).named(name)
+            // Parquet has no seconds timestamp unit, so timestamp_s files
+            // are physically MILLIS (pyarrow 25 coerces timestamp[s] on
+            // write; verified) and rewrite to MILLIS unchanged. The
+            // declared precision lives in the catalog, never in the file.
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS ->
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                    .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS))
+                    .id(id).named(name)
             ColType.TIMESTAMP ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MICROS))
+                    .id(id).named(name)
+            ColType.TIMESTAMP_NS ->
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                    .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS))
                     .id(id).named(name)
             ColType.TIMESTAMPTZ ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
@@ -265,6 +305,12 @@ object ParquetRewriter {
             ColType.STRING ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
                     .`as`(LogicalTypeAnnotation.stringType()).id(id).named(name)
+            // json maps to Iceberg string; the JSON annotation is the only
+            // thing that distinguishes it physically, and the bytes are
+            // copied verbatim — compaction never reformats a document.
+            ColType.JSON ->
+                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                    .`as`(LogicalTypeAnnotation.jsonType()).id(id).named(name)
             ColType.UUID_T ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY).length(16)
                     .`as`(LogicalTypeAnnotation.uuidType()).id(id).named(name)
@@ -272,6 +318,19 @@ object ParquetRewriter {
                 Types.optional(PrimitiveType.PrimitiveTypeName.BINARY).id(id).named(name)
         }
     }
+
+    /** An INT32/INT64 column carrying parquet's INT(width, signed) annotation. */
+    private fun intColumn(
+        id: Int,
+        name: String,
+        width: Int,
+        signed: Boolean,
+    ): Type =
+        Types.optional(
+            if (width == 64) PrimitiveType.PrimitiveTypeName.INT64 else PrimitiveType.PrimitiveTypeName.INT32,
+        )
+            .`as`(LogicalTypeAnnotation.intType(width, signed))
+            .id(id).named(name)
 
     private fun decimalScale(column: Column): Int? = (column.def.typeParams?.get("scale") as? Number)?.toInt()
 
@@ -332,12 +391,36 @@ object ParquetRewriter {
         return when (live) {
             ColType.BOOLEAN ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BOOLEAN) CopyMode.IDENTITY else refuse()
-            ColType.INT ->
+            // Every width <= 16 (signed or not) rides parquet INT32 and
+            // holds its true value there, so the int8/int16/uint8/uint16
+            // promotion ladder is a physical no-op: copy the int32.
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.INT32) CopyMode.IDENTITY else refuse()
+            // uint32 reads back from either physical form (see
+            // parquetTypeFor) and always writes INT64. A plain signed
+            // INT32 is refused: nothing legal produces one for a uint32
+            // column, and reading it would be a guess about the sign.
+            ColType.UINT32 ->
+                when {
+                    srcName == PrimitiveType.PrimitiveTypeName.INT64 -> CopyMode.IDENTITY
+                    srcName == PrimitiveType.PrimitiveTypeName.INT32 && isUnsigned(src) ->
+                        CopyMode.UINT32_TO_LONG
+                    else -> refuse()
+                }
+            ColType.UINT64 ->
+                if (srcName == PrimitiveType.PrimitiveTypeName.INT64 && isUnsigned(src)) {
+                    CopyMode.IDENTITY
+                } else {
+                    refuse()
+                }
             ColType.LONG ->
-                when (srcName) {
-                    PrimitiveType.PrimitiveTypeName.INT64 -> CopyMode.IDENTITY
-                    PrimitiveType.PrimitiveTypeName.INT32 -> CopyMode.INT_TO_LONG
+                when {
+                    srcName == PrimitiveType.PrimitiveTypeName.INT64 -> CopyMode.IDENTITY
+                    // uint8/uint16/uint32 -> long: zero-extend. Sign-extending
+                    // an unsigned int32 above 2^31 silently negates it.
+                    srcName == PrimitiveType.PrimitiveTypeName.INT32 && isUnsigned(src) ->
+                        CopyMode.UINT32_TO_LONG
+                    srcName == PrimitiveType.PrimitiveTypeName.INT32 -> CopyMode.INT_TO_LONG
                     else -> refuse()
                 }
             ColType.FLOAT ->
@@ -360,18 +443,43 @@ object ParquetRewriter {
                     refuse()
                 }
             }
-            ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> {
-                val unit =
-                    (src.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)?.unit
+            // timestamp_s and timestamp_ms are both physically MILLIS, so
+            // the timestamp_s -> timestamp_ms promotion is a no-op here.
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS -> {
+                val unit = timestampUnit(src)
                 if (srcName == PrimitiveType.PrimitiveTypeName.INT64 &&
-                    (unit == null || unit == LogicalTypeAnnotation.TimeUnit.MICROS)
+                    (unit == null || unit == LogicalTypeAnnotation.TimeUnit.MILLIS)
                 ) {
                     CopyMode.IDENTITY
                 } else {
                     refuse()
                 }
             }
-            ColType.STRING ->
+            ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> {
+                val unit = timestampUnit(src)
+                when {
+                    srcName != PrimitiveType.PrimitiveTypeName.INT64 -> refuse()
+                    unit == null || unit == LogicalTypeAnnotation.TimeUnit.MICROS -> CopyMode.IDENTITY
+                    // The timestamp_s/timestamp_ms -> timestamp promotion's
+                    // file-side companion: exact x1000, refused on overflow.
+                    unit == LogicalTypeAnnotation.TimeUnit.MILLIS -> CopyMode.MILLIS_TO_MICROS
+                    else -> refuse()
+                }
+            }
+            ColType.TIMESTAMP_NS -> {
+                // Nothing promotes INTO timestamp_ns, so a nanos input is
+                // the only shape that can legally exist here.
+                if (srcName == PrimitiveType.PrimitiveTypeName.INT64 &&
+                    timestampUnit(src) == LogicalTypeAnnotation.TimeUnit.NANOS
+                ) {
+                    CopyMode.IDENTITY
+                } else {
+                    refuse()
+                }
+            }
+            // json and string are both BYTE_ARRAY; the bytes pass through
+            // untouched either way.
+            ColType.STRING, ColType.JSON ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BINARY) CopyMode.IDENTITY else refuse()
             ColType.BINARY ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BINARY) CopyMode.IDENTITY else refuse()
@@ -397,6 +505,12 @@ object ParquetRewriter {
             }
         }
     }
+
+    private fun isUnsigned(src: PrimitiveType): Boolean =
+        (src.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)?.isSigned == false
+
+    private fun timestampUnit(src: PrimitiveType): LogicalTypeAnnotation.TimeUnit? =
+        (src.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)?.unit
 
     // ---- row IO ----------------------------------------------------------
 
@@ -429,7 +543,27 @@ object ParquetRewriter {
         val srcIdx = step.srcIndex
         when (step.mode) {
             CopyMode.INT_TO_LONG -> dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong())
+            // Zero-extend, never sign-extend: this mode exists precisely
+            // for the int32 bit patterns whose unsigned reading is > 2^31.
+            CopyMode.UINT32_TO_LONG ->
+                dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong() and 0xFFFFFFFFL)
             CopyMode.FLOAT_TO_DOUBLE -> dst.add(dstIdx, src.getFloat(srcIdx, 0).toDouble())
+            CopyMode.MILLIS_TO_MICROS -> {
+                val millis = src.getLong(srcIdx, 0)
+                val micros =
+                    try {
+                        Math.multiplyExact(millis, 1_000L)
+                    } catch (_: ArithmeticException) {
+                        // Loud, not wrapped: a millis timestamp this far out
+                        // has no micros representation, and a wrapped value
+                        // would be silently wrong data in the output file.
+                        throw UnconvertibleSchemaException(
+                            "timestamp value $millis ms does not fit int64 micros; " +
+                                "cannot rewrite it under the promoted timestamp column",
+                        )
+                    }
+                dst.add(dstIdx, micros)
+            }
             CopyMode.IDENTITY ->
                 when (primitive.primitiveTypeName) {
                     PrimitiveType.PrimitiveTypeName.BOOLEAN -> dst.add(dstIdx, src.getBoolean(srcIdx, 0))
@@ -485,7 +619,10 @@ object ParquetRewriter {
      * compares as the signed two's-complement BigInteger (an unsigned
      * byte compare mis-sorts negatives); other binary/fixed (string,
      * uuid, raw bytes) compare unsigned lexicographic, which for UTF-8
-     * strings is code-point order. Float/Double order NaN greatest
+     * strings is code-point order. Integers annotated INT(w, unsigned)
+     * compare UNSIGNED — a signed compare puts every uint64 above 2^63
+     * (and every uint32 above 2^31) below zero, which is the same class
+     * of bug as the decimal case. Float/Double order NaN greatest
      * (Kotlin's natural compareTo).
      */
     private fun compareNonNull(
@@ -498,9 +635,17 @@ object ParquetRewriter {
             PrimitiveType.PrimitiveTypeName.BOOLEAN ->
                 a.getBoolean(idx, 0).compareTo(b.getBoolean(idx, 0))
             PrimitiveType.PrimitiveTypeName.INT32 ->
-                a.getInteger(idx, 0).compareTo(b.getInteger(idx, 0))
+                if (isUnsigned(primitive)) {
+                    Integer.compareUnsigned(a.getInteger(idx, 0), b.getInteger(idx, 0))
+                } else {
+                    a.getInteger(idx, 0).compareTo(b.getInteger(idx, 0))
+                }
             PrimitiveType.PrimitiveTypeName.INT64 ->
-                a.getLong(idx, 0).compareTo(b.getLong(idx, 0))
+                if (isUnsigned(primitive)) {
+                    java.lang.Long.compareUnsigned(a.getLong(idx, 0), b.getLong(idx, 0))
+                } else {
+                    a.getLong(idx, 0).compareTo(b.getLong(idx, 0))
+                }
             PrimitiveType.PrimitiveTypeName.FLOAT ->
                 a.getFloat(idx, 0).compareTo(b.getFloat(idx, 0))
             PrimitiveType.PrimitiveTypeName.DOUBLE ->

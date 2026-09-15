@@ -88,8 +88,18 @@ class QeBoundsVectorsTest {
     ): Any =
         when (type) {
             ColType.BOOLEAN -> value.toBooleanStrict()
-            ColType.INT, ColType.DATE -> value.toInt()
-            ColType.LONG, ColType.TIME, ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> value.toLong()
+            // Everything that maps to Iceberg int carries a decimal int32
+            // string; everything that maps to long (or to Iceberg
+            // timestamp/timestamp_ns) carries a decimal int64 string in
+            // the STORED unit — micros for timestamp_s/timestamp_ms,
+            // nanos for timestamp_ns.
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16,
+            ColType.INT, ColType.DATE,
+            -> value.toInt()
+            ColType.UINT32, ColType.LONG, ColType.TIME,
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP,
+            ColType.TIMESTAMP_NS, ColType.TIMESTAMPTZ,
+            -> value.toLong()
             ColType.FLOAT ->
                 when (value) {
                     // NaN: the hex is authoritative for the payload; reconstruct
@@ -112,10 +122,12 @@ class QeBoundsVectorsTest {
                     "-Infinity" -> Double.NEGATIVE_INFINITY
                     else -> value.toDouble()
                 }
-            ColType.STRING -> value
+            ColType.STRING, ColType.JSON -> value
             ColType.UUID_T -> UUID.fromString(value)
             ColType.BINARY -> Base64.getDecoder().decode(value)
-            ColType.DECIMAL -> BigInteger(value)
+            // uint64 shares decimal's carrier: the unsigned value as a
+            // BigInteger, which is also its unscaled decimal(20,0) value.
+            ColType.UINT64, ColType.DECIMAL -> BigInteger(value)
         }
 
     // ---- hex helpers -----------------------------------------------------

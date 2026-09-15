@@ -126,12 +126,8 @@ data class AlterOpDto(
         field: String,
     ): T = value ?: throw BadRequestException("op '$op' requires field '$field'")
 
-    private fun parseColType(s: String): ColType =
-        try {
-            ColType.fromWire(s)
-        } catch (_: IllegalArgumentException) {
-            throw HoglakeException.Validation("unknown column type '$s'")
-        }
+    /** Refused type names keep their named reason; see ColType.parseWire. */
+    private fun parseColType(s: String): ColType = ColType.parseWire(s) { "unknown column type '$s'" }
 }
 
 data class AlterTableRequestDto(val ops: List<AlterOpDto> = emptyList())

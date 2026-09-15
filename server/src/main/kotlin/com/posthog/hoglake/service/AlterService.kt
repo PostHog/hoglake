@@ -5,11 +5,13 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.IcebergType
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.canPromoteTo
+import com.posthog.hoglake.model.icebergType
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.FileRepo
@@ -301,6 +303,15 @@ class AlterService(private val jdbi: Jdbi) {
      * catalog lock — promote is rare DDL. Rows hydrated concurrently under
      * the old type can still slip in AFTER this (hydrator race);
      * compaction's bound-merge skips undecodable widths as the backstop.
+     *
+     * Which promotions need this falls out of the facade mapping rather
+     * than a list: bounds are stored in the MAPPED Iceberg type's
+     * encoding, so a promotion re-encodes iff the mapped type changes.
+     * That makes the whole int8/int16/uint8/uint16 ladder free (they all
+     * map to Iceberg int, 4 bytes), uint32 -> long free (both map to
+     * long, 8 bytes), and timestamp_s -> timestamp_ms -> timestamp free
+     * (all three map to Iceberg timestamp and store micros). Only the
+     * int-mapped -> long-mapped and float -> double widenings move bytes.
      */
     private fun reencodeStatsOnPromote(
         h: Handle,
@@ -312,8 +323,11 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val widen: (ByteArray) -> ByteArray =
             when {
-                from == ColType.INT && to == ColType.LONG -> ::widenIntToLong
-                from == ColType.FLOAT && to == ColType.DOUBLE -> ::widenFloatToDouble
+                from.icebergType == to.icebergType -> return
+                from.icebergType == IcebergType.INT && to.icebergType == IcebergType.LONG ->
+                    ::widenIntToLong
+                from.icebergType == IcebergType.FLOAT && to.icebergType == IcebergType.DOUBLE ->
+                    ::widenFloatToDouble
                 else -> return
             }
 
@@ -407,12 +421,20 @@ class AlterService(private val jdbi: Jdbi) {
                         "partition source field_id ${f.sourceFieldId} is not a live column",
                     )
             when (f.transform) {
-                Transform.BUCKET ->
+                Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
                         throw HoglakeException.Validation(
                             "bucket transform requires transform_param >= 1",
                         )
                     }
+                    if (col.def.type !in BUCKETABLE_TYPES) {
+                        throw HoglakeException.Validation(
+                            "bucket transform cannot be applied to column '${col.def.name}' of type " +
+                                "'${col.def.type.wire}' (Iceberg spec: bucketable types are " +
+                                "${BUCKETABLE_TYPES.map { it.wire }.sorted()})",
+                        )
+                    }
+                }
                 else ->
                     if (f.transformParam != null) {
                         throw HoglakeException.Validation(
@@ -422,8 +444,8 @@ class AlterService(private val jdbi: Jdbi) {
             }
             if (f.transform in TEMPORAL_TRANSFORMS && col.def.type !in TEMPORAL_TYPES) {
                 throw HoglakeException.Validation(
-                    "transform '${f.transform.wire}' requires a date/timestamp/timestamptz " +
-                        "column; '${col.def.name}' is '${col.def.type.wire}'",
+                    "transform '${f.transform.wire}' requires a date or timestamp column; " +
+                        "'${col.def.name}' is '${col.def.type.wire}'",
                 )
             }
         }
@@ -708,7 +730,41 @@ class AlterService(private val jdbi: Jdbi) {
     private companion object {
         val TEMPORAL_TRANSFORMS =
             setOf(Transform.YEAR, Transform.MONTH, Transform.DAY, Transform.HOUR)
+
+        /**
+         * Sources year/month/day/hour accept. Every timestamp precision
+         * qualifies: the transforms are epoch-relative integers, which
+         * the declared precision does not change. `hour` on a `date`
+         * column is accepted here for continuity with the pre-parity
+         * behaviour, even though Iceberg does not define it — tightening
+         * that is a separate, breaking change, not a type-parity one.
+         */
         val TEMPORAL_TYPES =
-            setOf(ColType.DATE, ColType.TIMESTAMP, ColType.TIMESTAMPTZ)
+            setOf(
+                ColType.DATE,
+                ColType.TIMESTAMP_S,
+                ColType.TIMESTAMP_MS,
+                ColType.TIMESTAMP,
+                ColType.TIMESTAMP_NS,
+                ColType.TIMESTAMPTZ,
+            )
+
+        /**
+         * Sources bucket(n) accepts, per the Iceberg spec's Appendix-B
+         * hash domain: everything except boolean, float, double — and
+         * except json.
+         *
+         * json is DELIBERATELY excluded even though it maps to Iceberg
+         * string. Bucketing hashes bytes, and two JSON documents that
+         * are equal as JSON (key order, whitespace, number spelling)
+         * hash differently, so a json bucket spec would scatter equal
+         * values across partitions and prune wrong. json therefore
+         * supports IDENTITY only: opaque byte equality, which at least
+         * says what it does. (Same reasoning would exclude truncate,
+         * which the server's Transform vocabulary does not yet have.)
+         */
+        val BUCKETABLE_TYPES =
+            ColType.entries.toSet() -
+                setOf(ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE, ColType.JSON)
     }
 }

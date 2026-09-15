@@ -71,9 +71,13 @@ class QeBoundsDecodeVectorsTest {
     ): Boolean =
         when (type) {
             ColType.BOOLEAN -> decoded == value.toBooleanStrict()
-            ColType.INT, ColType.DATE -> decoded == value.toInt()
-            ColType.LONG, ColType.TIME, ColType.TIMESTAMP, ColType.TIMESTAMPTZ ->
-                decoded == value.toLong()
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16,
+            ColType.INT, ColType.DATE,
+            -> decoded == value.toInt()
+            ColType.UINT32, ColType.LONG, ColType.TIME,
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP,
+            ColType.TIMESTAMP_NS, ColType.TIMESTAMPTZ,
+            -> decoded == value.toLong()
             ColType.FLOAT ->
                 when (value) {
                     // NaN payloads: the hex bits are authoritative.
@@ -89,10 +93,10 @@ class QeBoundsDecodeVectorsTest {
                     "-Infinity" -> decoded == Double.NEGATIVE_INFINITY
                     else -> decoded == value.toDouble()
                 }
-            ColType.STRING -> decoded == value
+            ColType.STRING, ColType.JSON -> decoded == value
             ColType.UUID_T -> decoded == UUID.fromString(value)
             ColType.BINARY -> (decoded as ByteArray).contentEquals(Base64.getDecoder().decode(value))
-            ColType.DECIMAL -> decoded == BigInteger(value)
+            ColType.UINT64, ColType.DECIMAL -> decoded == BigInteger(value)
         }
 
     private fun decodeHex(hex: String): ByteArray =

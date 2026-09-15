@@ -31,18 +31,32 @@ export interface Namespace {
   name: string;
 }
 
+// The server's closed column-type vocabulary, in the spec's enum order
+// (ColumnDef.type in openapi/hoglake.yaml). Types the server refuses
+// permanently — int128, uint128, timetz, interval, geometry — are absent
+// on purpose: the console must not offer what the API always rejects.
 export const COLUMN_TYPES = [
   "boolean",
+  "int8",
+  "int16",
   "int",
   "long",
+  "uint8",
+  "uint16",
+  "uint32",
+  "uint64",
   "float",
   "double",
   "decimal",
   "date",
   "time",
+  "timestamp_s",
+  "timestamp_ms",
   "timestamp",
+  "timestamp_ns",
   "timestamptz",
   "string",
+  "json",
   "uuid",
   "binary",
 ] as const;

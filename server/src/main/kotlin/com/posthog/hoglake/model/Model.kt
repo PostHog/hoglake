@@ -8,9 +8,129 @@ import java.util.UUID
  * the API layer serializes; they mirror the OpenAPI schemas
  * (src/main/resources/openapi/hoglake.yaml) and the tables in
  * db/migration/V1__init.sql.
+ *
+ * [ColType] below is the closed flat column-type vocabulary. Every
+ * member has a defined Iceberg facade mapping ([ColType.icebergType],
+ * iceberg-federation.md §2) — that is the membership rule, not a
+ * nice-to-have: a type whose facade story is undefined may not be used
+ * in a hoglake table. Extending the set is a migration (the
+ * hog_column.col_type CHECK) plus an §2 table row, never an ad-hoc enum
+ * entry. Type names DuckLake has and hoglake permanently refuses live
+ * in [ColType.REFUSALS], each with the reason, because "we will never
+ * support this, and here is why" is a different answer from "typo".
  */
-
 enum class ColType {
+    BOOLEAN,
+    INT8,
+    INT16,
+    INT,
+    LONG,
+    UINT8,
+    UINT16,
+    UINT32,
+    UINT64,
+    FLOAT,
+    DOUBLE,
+    DECIMAL,
+    DATE,
+    TIME,
+    TIMESTAMP_S,
+    TIMESTAMP_MS,
+    TIMESTAMP,
+    TIMESTAMP_NS,
+    TIMESTAMPTZ,
+    STRING,
+    JSON,
+    UUID_T,
+    BINARY,
+    ;
+
+    /** Wire/DB name (lowercase; UUID_T stored as "uuid"). */
+    val wire: String get() = if (this == UUID_T) "uuid" else name.lowercase()
+
+    companion object {
+        /** The DuckLake geometry family — one refusal reason, many names. */
+        private val GEOMETRY_TYPES =
+            listOf(
+                "point",
+                "linestring",
+                "polygon",
+                "multipoint",
+                "multilinestring",
+                "multipolygon",
+                "linestring_z",
+                "geometrycollection",
+            )
+
+        /**
+         * DuckLake type names hoglake refuses PERMANENTLY, mapped to the
+         * 422 detail that names the type and the reason. These are not
+         * "not yet": each is unmappable to Iceberg, so no facade story
+         * exists to write (iceberg-federation.md §2).
+         */
+        val REFUSALS: Map<String, String> =
+            buildMap {
+                for (t in listOf("int128", "uint128")) {
+                    put(
+                        t,
+                        "type '$t' needs 39 decimal digits, which exceeds Iceberg's widest exact " +
+                            "numeric type decimal(38), and is not supported",
+                    )
+                }
+                for (t in listOf("timetz", "interval")) {
+                    put(t, "type '$t' has no Iceberg mapping and is not supported")
+                }
+                for (t in GEOMETRY_TYPES) {
+                    put(
+                        t,
+                        "type '$t' is a DuckLake geometry type; geometry is out of scope for " +
+                            "hoglake and is not supported",
+                    )
+                }
+            }
+
+        /**
+         * Strict parse: throws [IllegalArgumentException] on anything
+         * outside the vocabulary. The persistence layer's reader (the
+         * DB CHECK already narrowed the input) and internal callers use
+         * this; request surfaces use [parseWire] so a refused name gets
+         * its named reason instead of "unknown type".
+         */
+        fun fromWire(s: String): ColType = if (s == "uuid") UUID_T else valueOf(s.uppercase())
+
+        /**
+         * Wire parse for request surfaces. A name in [REFUSALS] fails
+         * with that entry's reason; anything else unknown fails with
+         * [unknown]'s message. Both are 422 Validation — the difference
+         * is whether the caller should fix a typo or stop trying.
+         */
+        fun parseWire(
+            s: String,
+            unknown: () -> String,
+        ): ColType {
+            REFUSALS[s]?.let { throw HoglakeException.Validation(it) }
+            return try {
+                fromWire(s)
+            } catch (_: IllegalArgumentException) {
+                throw HoglakeException.Validation(unknown())
+            }
+        }
+    }
+}
+
+/**
+ * The Iceberg type a [ColType] presents as through the read-only facade
+ * (iceberg-federation.md §2). Two invariants ride on this mapping:
+ *
+ *  1. `hog_file_column_stats.lower_bound`/`upper_bound` hold the Iceberg
+ *     single-value serialization of the MAPPED type, so manifest
+ *     generation is a mechanical copy. timestamp_s/timestamp_ms bounds
+ *     are therefore microseconds, like plain timestamp.
+ *  2. A type promotion is legal only when the induced Iceberg schema
+ *     evolution is legal — same mapped type, or one of Iceberg's own
+ *     widenings (int->long, float->double, decimal precision).
+ */
+enum class IcebergType {
     BOOLEAN,
     INT,
     LONG,
@@ -20,19 +140,42 @@ enum class ColType {
     DATE,
     TIME,
     TIMESTAMP,
+
+    /** Iceberg V3 `timestamp_ns`; its single-value encoding is nanos, not micros. */
+    TIMESTAMP_NS,
     TIMESTAMPTZ,
     STRING,
-    UUID_T,
+    UUID,
     BINARY,
     ;
 
-    /** Wire/DB name (lowercase; UUID_T stored as "uuid"). */
-    val wire: String get() = if (this == UUID_T) "uuid" else name.lowercase()
-
-    companion object {
-        fun fromWire(s: String): ColType = if (s == "uuid") UUID_T else valueOf(s.uppercase())
-    }
+    val wire: String get() = name.lowercase()
 }
+
+/** This type's Iceberg facade mapping — see [IcebergType]. */
+val ColType.icebergType: IcebergType
+    get() =
+        when (this) {
+            ColType.BOOLEAN -> IcebergType.BOOLEAN
+            // int8/int16 and the small unsigned widths all fit int32 exactly.
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT -> IcebergType.INT
+            // uint32 needs 33 bits to stay value-preserving, so it maps to long.
+            ColType.UINT32, ColType.LONG -> IcebergType.LONG
+            // uint64 has no signed 64-bit home: decimal(20,0) is the narrowest
+            // Iceberg type that holds [0, 2^64).
+            ColType.UINT64 -> IcebergType.DECIMAL
+            ColType.FLOAT -> IcebergType.FLOAT
+            ColType.DOUBLE -> IcebergType.DOUBLE
+            ColType.DECIMAL -> IcebergType.DECIMAL
+            ColType.DATE -> IcebergType.DATE
+            ColType.TIME -> IcebergType.TIME
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP -> IcebergType.TIMESTAMP
+            ColType.TIMESTAMP_NS -> IcebergType.TIMESTAMP_NS
+            ColType.TIMESTAMPTZ -> IcebergType.TIMESTAMPTZ
+            ColType.STRING, ColType.JSON -> IcebergType.STRING
+            ColType.UUID_T -> IcebergType.UUID
+            ColType.BINARY -> IcebergType.BINARY
+        }
 
 enum class StatsState {
     PROVIDED,
@@ -138,13 +281,52 @@ data class SortSpec(
     val fields: List<SortFieldDef>,
 )
 
-/** Widening promotions the ALTER path permits (Iceberg-compatible set). */
-fun ColType.canPromoteTo(target: ColType): Boolean =
-    when (this) {
-        ColType.INT -> target == ColType.LONG
-        ColType.FLOAT -> target == ColType.DOUBLE
-        else -> false
-    }
+/**
+ * Widening promotions the ALTER path permits. A promotion is legal iff
+ * it is BOTH value-preserving in DuckLake terms AND a legal Iceberg
+ * schema evolution of the facade mapping: the target's [icebergType]
+ * either equals the source's, or is one of Iceberg's own widenings
+ * (int->long, float->double, decimal precision). `IcebergLegalPromotionsTest`
+ * pins that rule against this table.
+ *
+ * Two places where the Iceberg-legality half makes hoglake STRICTER
+ * than DuckLake, both deliberate (iceberg-federation.md §2):
+ *
+ *  - `uint32 -> uint64` is refused. DuckLake widens it happily, but the
+ *    facade would go long -> decimal(20,0), which Iceberg does not
+ *    allow — the lake would become unservable by the promotion.
+ *  - `timestamp -> timestamp_ns` is refused for the same shape:
+ *    timestamp -> timestamp_ns is not an Iceberg evolution, and the
+ *    stored bound unit would change from micros to nanos underneath
+ *    every existing stats row.
+ *
+ * `json` and `string` share a mapped type but are NOT interchangeable
+ * here: json carries a validity claim string does not, so neither
+ * direction is offered.
+ */
+private val PROMOTIONS: Map<ColType, Set<ColType>> =
+    mapOf(
+        // Signed integer ladder; every step keeps the value and lands on
+        // int or long.
+        ColType.INT8 to setOf(ColType.INT16, ColType.INT, ColType.LONG),
+        ColType.INT16 to setOf(ColType.INT, ColType.LONG),
+        ColType.INT to setOf(ColType.LONG),
+        // Unsigned widths widen among themselves and into the signed
+        // types that strictly contain them (uint8 <= 255, uint16 <= 65535).
+        ColType.UINT8 to setOf(ColType.UINT16, ColType.INT, ColType.LONG),
+        ColType.UINT16 to setOf(ColType.INT, ColType.LONG),
+        // uint32 already maps to long, so long is a same-mapped-type move.
+        ColType.UINT32 to setOf(ColType.LONG),
+        ColType.FLOAT to setOf(ColType.DOUBLE),
+        // Timestamp precision widening: all three map to Iceberg
+        // timestamp and all three store micros bounds, so these are
+        // metadata-only moves. timestamp_ns is NOT in the ladder.
+        ColType.TIMESTAMP_S to setOf(ColType.TIMESTAMP_MS, ColType.TIMESTAMP),
+        ColType.TIMESTAMP_MS to setOf(ColType.TIMESTAMP),
+    )
+
+/** Widening promotions the ALTER path permits — see [PROMOTIONS]. */
+fun ColType.canPromoteTo(target: ColType): Boolean = PROMOTIONS[this]?.contains(target) == true
 
 /** One typed ALTER TABLE operation. */
 sealed class AlterOp {
