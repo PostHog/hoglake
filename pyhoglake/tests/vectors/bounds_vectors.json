@@ -27,7 +27,7 @@
     "uuid": "canonical 8-4-4-4-12 lowercase form",
     "binary": "standard base64 of the raw bytes"
   },
-  "generated_by": "pyhoglake 0.1.0 bounds codec via tests/qe_vectors.py conventions",
+  "generated_by": "pyhoglake 1.1.0.dev0 bounds codec via tests/qe_vectors.py conventions",
   "vectors": [
     {
       "type": "boolean",
