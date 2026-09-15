@@ -51,7 +51,7 @@ dependencies {
     // writer both live on it. hadoop-client-api is the shaded,
     // dependency-free jar; the wider Hadoop dependency tree must not leak
     // into the codebase.
-    implementation("org.apache.parquet:parquet-hadoop:1.15.2")
+    implementation("org.apache.parquet:parquet-hadoop:1.17.1")
     implementation("org.apache.hadoop:hadoop-client-api:3.4.1")
     runtimeOnly("org.apache.hadoop:hadoop-client-runtime:3.4.1")
 
