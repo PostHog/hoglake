@@ -281,6 +281,10 @@ export function listConsumers(catalog: string): Promise<ConsumerList> {
 
 export interface InstanceInfo {
   name?: string;
+  // The running server's version. Optional here, not in the spec: a
+  // server older than the field is exactly the case the badge exists to
+  // make visible, so the type has to admit it.
+  version?: string;
   // Absent in the boot window before the server's first metrics sample.
   total_rows?: Int64;
   total_size_bytes?: Int64;

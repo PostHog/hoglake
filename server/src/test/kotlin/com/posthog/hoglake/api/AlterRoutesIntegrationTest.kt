@@ -1,12 +1,8 @@
 package com.posthog.hoglake.api
 
-import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.databind.PropertyNamingStrategies
-import com.fasterxml.jackson.databind.SerializationFeature
-import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import com.posthog.hoglake.configureHoglakeWire
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.AlterService
@@ -55,16 +51,9 @@ class AlterRoutesIntegrationTest {
     private fun api(block: suspend ApplicationTestBuilder.(HttpClient) -> Unit) =
         testApplication {
             application {
-                // Exactly App.module's serialization + error stack.
-                this.install(ContentNegotiation) {
-                    jackson {
-                        registerKotlinModule()
-                        registerModule(JavaTimeModule())
-                        propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
-                        disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
-                        setSerializationInclusion(JsonInclude.Include.NON_NULL)
-                    }
-                }
+                // App.module's serialization + error stack, by sharing
+                // its definition rather than restating it (api/WireJson.kt).
+                this.install(ContentNegotiation) { jackson { configureHoglakeWire() } }
                 this.install(StatusPages) { installErrorMapping() }
                 installAlterRoutes(alter)
             }

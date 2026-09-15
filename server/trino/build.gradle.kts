@@ -35,7 +35,7 @@ dependencies {
     testImplementation("org.testcontainers:minio:$testcontainersVersion")
     testImplementation("org.testcontainers:trino:$testcontainersVersion")
     // The JDBC client is independent of the server SPI and remains Java 21 compatible.
-    testImplementation("io.trino:trino-jdbc:446")
+    testImplementation("io.trino:trino-jdbc:483")
     // Real parquet files for the end-to-end read test (same writer the
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
