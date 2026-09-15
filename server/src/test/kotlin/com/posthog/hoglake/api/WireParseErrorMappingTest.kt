@@ -54,6 +54,10 @@ class WireParseErrorMappingTest {
                         call.receive<CommitRequestDto>().toModel()
                         call.respond(HttpStatusCode.OK)
                     }
+                    post("/parse/create") {
+                        call.receive<CreateTableRequestDto>().columns.forEach { it.toModel() }
+                        call.respond(HttpStatusCode.OK)
+                    }
                     post("/parse/alter") {
                         call.receive<AlterTableRequestDto>().ops.forEach { it.toModel() }
                         call.respond(HttpStatusCode.OK)
@@ -114,9 +118,25 @@ class WireParseErrorMappingTest {
             for (body in bodies) {
                 assertBadRequest(client.postBytes("/parse/alter", body.toByteArray()))
             }
-            for (body in listOf("""{"appends":[null]}""", """{"deletes":[null]}""")) {
+            val commitBodies =
+                listOf(
+                    """{"appends":[null]}""",
+                    """{"deletes":[null]}""",
+                    // Nested one level down, and reported by review as
+                    // missing from the first pass of this test.
+                    """{"appends":[{"namespace":"n","table":"t","files":[null]}]}""",
+                    """{"deletes":[{"namespace":"n","table":"t","files":[null]}]}""",
+                    """{"appends":[{"namespace":"n","table":"t","files":[{"path":"s3://b/f",""" +
+                        """"record_count":1,"file_size_bytes":1,"column_stats":[null]}]}]}""",
+                )
+            for (body in commitBodies) {
                 assertBadRequest(client.postBytes("/parse/commit", body.toByteArray()))
             }
+            // A third endpoint: create-table carries the same shape, so
+            // the blast radius was never just alter + commit.
+            assertBadRequest(
+                client.postBytes("/parse/create", """{"name":"t","columns":[null]}""".toByteArray()),
+            )
         }
 
     @Test

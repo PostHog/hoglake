@@ -22,14 +22,24 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
  * boundary by default, so a JSON `null` inside such a list binds happily
  * and only fails later, when the mapping code dereferences it — a bare
  * NullPointerException from the route handler, which ErrorMapping does
- * not map, i.e. a 500 on a malformed request. Five request lists had that
- * hole (`ops`, `fields`, `sort_fields`, `appends`, `deletes`).
+ * not map, i.e. a 500 on a malformed request.
+ *
+ * The rule, not the list, is the thing to remember: EVERY request
+ * collection with a non-null element type that is mapped after binding
+ * had this shape. At the time of the fix that was nine, across three
+ * endpoints — `ops`, `fields`, `sort_fields` (alter); `appends`,
+ * `deletes`, and the nested `files` of each (commit); `column_stats`
+ * (nested in a file registration); and `columns` (create table). They
+ * are listed to show the spread, not as an inventory to maintain: the
+ * setting is global, so a tenth added tomorrow is covered the day it is
+ * added, and nothing here needs updating.
  *
  * With the feature on, Jackson refuses the null during binding with an
  * InvalidNullException naming the property, inside ContentNegotiation,
  * so the wire answer is a 400 with a usable message. Element types that
- * are DECLARED nullable — `partition_values: List<String?>`, where a null
- * partition value is a real value — are unaffected.
+ * are DECLARED nullable are unaffected — `partition_values:
+ * List<String?>`, where a null partition value is a real value, and
+ * `type_params: Map<String, Any?>`.
  */
 fun ObjectMapper.configureHoglakeWire(): ObjectMapper =
     apply {
