@@ -120,7 +120,10 @@ class ScalarTypeLifecycleApiTest {
     @Test
     fun `inline base64 bounds for the new types survive a commit byte for byte`() =
         api { client ->
-            val types = listOf("uint32", "uint64", "timestamp_s", "timestamp_ns", "json")
+            // All ten, not a sample: the base64 wire and the bytea column
+            // are shared, but the ENCODINGS differ per mapped type, and a
+            // width mistake only shows on the type that has it.
+            val types = newScalars
             val created = client.postJson(tablesUrl, createBody("stats", types))
             assertThat(created.status).isEqualTo(HttpStatusCode.Created)
             val fieldIds = body(created)["columns"].associate { it["name"].asText() to it["field_id"].asLong() }
@@ -161,6 +164,40 @@ class ScalarTypeLifecycleApiTest {
                 assertThat(stored[fieldId]?.first).describedAs("%s lower bound", type).isEqualTo(lower)
                 assertThat(stored[fieldId]?.second).describedAs("%s upper bound", type).isEqualTo(upper)
             }
+        }
+
+    // ---- ALTER: adding the new scalars to an existing table ----------------
+
+    @Test
+    fun `add_column accepts every new scalar on a live table`() =
+        api { client ->
+            // Only the REFUSAL path was exercised over the wire, which
+            // cannot distinguish "the parser rejects bad names" from "the
+            // parser rejects everything unfamiliar".
+            client.postJson(tablesUrl, """{"name": "grow", "columns": [{"name": "id", "type": "long"}]}""")
+            for (type in newScalars) {
+                val response =
+                    client.postJson(
+                        "$tablesUrl/grow/alter",
+                        """{"ops": [{"op": "add_column",
+                            "column": {"name": "c_$type", "type": "$type", "nullable": true}}]}""",
+                    )
+                assertThat(response.status).describedAs("add_column %s", type).isEqualTo(HttpStatusCode.OK)
+                assertThat(typeOf(body(response), "c_$type"))
+                    .describedAs("alter response echoes %s", type)
+                    .isEqualTo(type)
+            }
+            // All ten landed, in the order they were added, alongside the
+            // original column.
+            val table = body(client.get("$tablesUrl/grow"))
+            assertThat(table["columns"].map { it["name"].asText() })
+                .isEqualTo(listOf("id") + newScalars.map { "c_$it" })
+            assertThat(newScalars.map { typeOf(table, "c_$it") }).isEqualTo(newScalars)
+            // Field ids keep ascending across the ten ALTERs — each is its
+            // own DDL commit, so a reused id would be a cross-snapshot bug.
+            val ids = table["columns"].map { it["field_id"].asLong() }
+            assertThat(ids).isSorted()
+            assertThat(ids.toSet()).hasSize(ids.size)
         }
 
     // ---- ALTER: the legal ladders and the illegal steps --------------------
@@ -268,6 +305,17 @@ class ScalarTypeLifecycleApiTest {
      */
     private val edgeBounds: Map<String, Pair<ByteArray, ByteArray>> =
         mapOf(
+            // The int-mapped widths: 4-byte bounds at each domain edge.
+            "int8" to (IcebergSingleValue.encodeInt(-128) to IcebergSingleValue.encodeInt(127)),
+            "int16" to (IcebergSingleValue.encodeInt(-32_768) to IcebergSingleValue.encodeInt(32_767)),
+            "uint8" to (IcebergSingleValue.encodeInt(0) to IcebergSingleValue.encodeInt(255)),
+            "uint16" to (IcebergSingleValue.encodeInt(0) to IcebergSingleValue.encodeInt(65_535)),
+            // Declared in millis, stored in micros.
+            "timestamp_ms" to
+                (
+                    IcebergSingleValue.encodeTimestampMillis(-62_135_596_800_000L) to
+                        IcebergSingleValue.encodeTimestampMillis(253_402_300_799_000L)
+                ),
             // uint32 maps to Iceberg long: 8 bytes even at 0.
             "uint32" to (IcebergSingleValue.encodeLong(0L) to IcebergSingleValue.encodeLong(4_294_967_295L)),
             // uint64 maps to decimal(20,0): big-endian, variable length,

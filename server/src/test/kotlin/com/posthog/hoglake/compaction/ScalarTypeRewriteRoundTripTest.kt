@@ -58,6 +58,75 @@ class ScalarTypeRewriteRoundTripTest {
         tmp.toFile().deleteRecursively()
     }
 
+    // ---- the five that round-trip without changing shape ----------------
+
+    @Test
+    fun `the small integer widths keep both their bounds and their annotation`() {
+        // int8/int16/uint8/uint16 all ride INT32 and all map to Iceberg
+        // int, so compaction should be a pure copy: same 4-byte bound,
+        // same INT(width, signed) annotation, twice over. Covered
+        // explicitly because "nothing happens" is exactly the claim a
+        // rewrite is most likely to break quietly.
+        val widths =
+            listOf(
+                Triple(ColType.INT8, 8, true),
+                Triple(ColType.INT16, 16, true),
+                Triple(ColType.UINT8, 8, false),
+                Triple(ColType.UINT16, 16, false),
+            )
+        for ((type, width, signed) in widths) {
+            val annotation = LogicalTypeAnnotation.intType(width, signed)
+            val input = oneColumn(PrimitiveTypeName.INT32, annotation)
+            // The domain edges for this width, in the leaf's own order.
+            val lo = if (signed) -(1 shl (width - 1)) else 0
+            val hi = if (signed) (1 shl (width - 1)) - 1 else (1 shl width) - 1
+            val rows =
+                listOf<(Group) -> Unit>(
+                    { g -> g.add("v", lo) },
+                    { g -> g.add("v", 0) },
+                    { g -> g.add("v", hi) },
+                )
+            val trip = roundTrip("i$width-$signed", input, type, rows)
+            assertThat(trip.lower).describedAs(type.wire).isEqualTo(IcebergSingleValue.encodeInt(lo))
+            assertThat(trip.upper).describedAs(type.wire).isEqualTo(IcebergSingleValue.encodeInt(hi))
+            for (out in listOf(trip.first, trip.second)) {
+                assertThat(physical(out).primitiveTypeName)
+                    .describedAs("%s stays INT32", type.wire)
+                    .isEqualTo(PrimitiveTypeName.INT32)
+                assertThat(physical(out).logicalTypeAnnotation)
+                    .describedAs("%s keeps its INT(%d, %s) annotation", type.wire, width, signed)
+                    .isEqualTo(annotation)
+            }
+        }
+    }
+
+    @Test
+    fun `timestamp_ms bounds stay micros while its files stay millis`() {
+        // The same declared-unit/stored-unit split as timestamp_s, and it
+        // needs its own case: the two share a physical form but are
+        // different catalog types, so a rewrite could plausibly get one
+        // right and the other wrong.
+        val input =
+            oneColumn(
+                PrimitiveTypeName.INT64,
+                LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val rows =
+            listOf<(Group) -> Unit>(
+                { g -> g.add("v", -1_500L) },
+                { g -> g.add("v", 0L) },
+                { g -> g.add("v", 1_788_609_600_123L) },
+            )
+        val trip = roundTrip("ts-ms", input, ColType.TIMESTAMP_MS, rows)
+        assertThat(trip.lower).isEqualTo(IcebergSingleValue.encodeTimestampMicros(-1_500_000L))
+        assertThat(trip.upper).isEqualTo(IcebergSingleValue.encodeTimestampMicros(1_788_609_600_123_000L))
+        for (out in listOf(trip.first, trip.second)) {
+            assertThat(
+                (physical(out).logicalTypeAnnotation as LogicalTypeAnnotation.TimestampLogicalTypeAnnotation).unit,
+            ).describedAs("output file stays MILLIS").isEqualTo(LogicalTypeAnnotation.TimeUnit.MILLIS)
+        }
+    }
+
     // ---- uint32 --------------------------------------------------------
 
     @Test

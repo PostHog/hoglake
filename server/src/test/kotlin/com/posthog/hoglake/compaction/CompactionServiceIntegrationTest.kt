@@ -596,6 +596,118 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a mixed-width bound pair from a promotion race merges to null, not to garbage`() {
+        // The race AlterService documents: the promote-time re-encode
+        // rewrites existing 4-byte bounds to 8, but a hydrator already
+        // in flight under the OLD type can land another 4-byte row
+        // AFTER it. The merge then sees one bound of each width for the
+        // same column, and decoding a 4-byte payload as the live 8-byte
+        // type is not a near miss — it is an exception, which used to
+        // wedge the group on every sweep until its inputs expired.
+        //
+        // Exercised on a NEW type so the backstop is known to cover the
+        // parity set too: uint8 -> uint32 is int -> long in Iceberg
+        // terms, so it is a width-changing promotion exactly like
+        // int -> long, just with neither name saying "long".
+        val fx = fixture(dvOnMiddle = false)
+        val added =
+            alter.alterTable(
+                fx.cat,
+                "ns",
+                "t",
+                listOf(AlterOp.AddColumn(ColumnDef("small", ColType.UINT8))),
+            )
+        val field = added.columns.single { it.def.name == "small" }.fieldId
+
+        // Pre-promotion bounds on every input, in the 4-byte int encoding.
+        db.jdbi.useHandleUnchecked { h ->
+            for (fileId in fx.fileIds) {
+                h.execute(
+                    """
+                    INSERT INTO hog_file_column_stats
+                        (catalog_id, data_file_id, field_id, value_count, null_count,
+                         lower_bound, upper_bound)
+                    VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
+                    """,
+                    fx.cat,
+                    fileId,
+                    field,
+                    IcebergSingleValue.encodeInt(1),
+                    IcebergSingleValue.encodeInt(200),
+                )
+            }
+        }
+
+        alter.alterTable(
+            fx.cat,
+            "ns",
+            "t",
+            listOf(AlterOp.PromoteColumn("small", ColType.UINT32)),
+        )
+
+        // The promote widened all of them; now simulate the racing
+        // hydrator by putting ONE back to the pre-promotion width.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                UPDATE hog_file_column_stats SET lower_bound = ?, upper_bound = ?
+                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)
+                  AND data_file_id = ? AND field_id = ?
+                """,
+                IcebergSingleValue.encodeInt(1),
+                IcebergSingleValue.encodeInt(200),
+                fx.cat,
+                fx.fileIds[0],
+                field,
+            )
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).describedAs("the sweep is not wedged").isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val merged =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = :field
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .map { rs, _ -> rs.getBytes("lower_bound") to rs.getBytes("upper_bound") }
+                    .one()
+            }
+        // Honest absence, not a bound merged from a payload that was
+        // reinterpreted at the wrong width.
+        assertThat(merged.first).describedAs("mixed-width merge yields no lower bound").isNull()
+        assertThat(merged.second).describedAs("mixed-width merge yields no upper bound").isNull()
+
+        // The columns that were consistent still merged normally — one
+        // poisoned field must not null the whole file's stats.
+        val others =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                      AND s.field_id <> :field AND s.lower_bound IS NOT NULL
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .mapTo(Long::class.java)
+                    .one()
+            }
+        assertThat(others).describedAs("unaffected columns keep their merged bounds").isGreaterThan(0)
+    }
+
+    @Test
     fun `bound-merge is unsigned for uint64 and byte-ordered for json`() {
         // The two new types whose merge is NOT its natural JVM ordering.
         // uint64 decodes to a BigInteger, so the winner must be picked by

@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import org.assertj.core.api.Assertions.assertThat
-import org.junit.jupiter.api.Assumptions.assumeTrue
 import org.junit.jupiter.api.Test
 import java.math.BigInteger
 import java.nio.ByteBuffer
@@ -34,20 +33,14 @@ import java.util.UUID
  *  - string: the string itself; uuid: canonical form; binary: base64
  *  - decimal: UNSCALED integer as decimal string
  *
- * If the vector file is absent (the Python side not yet landed), the
- * test SKIPS with a clear message rather than failing.
+ * A missing vector file FAILS this test. It used to skip, which made a
+ * broken path indistinguishable from a passing cross-language gate —
+ * the one failure mode this whole layer exists to rule out.
  */
 class QeBoundsVectorsTest {
-    private val vectorFile: Path =
-        Path.of("..", "pyhoglake", "tests", "vectors", "bounds_vectors.json").normalize()
-
     @Test
     fun `kotlin encoder matches every python-generated vector`() {
-        assumeTrue(
-            Files.exists(vectorFile),
-            "SKIPPED: cross-language vector file not present yet at $vectorFile " +
-                "(the pyhoglake side generates it; re-run once it lands)",
-        )
+        val vectorFile = BoundsVectorFile.resolve()
         val root = ObjectMapper().readTree(Files.readString(vectorFile))
         val vectors: JsonNode =
             when {
@@ -55,7 +48,9 @@ class QeBoundsVectorsTest {
                 root.has("vectors") && root["vectors"].isArray -> root["vectors"]
                 else -> error("unrecognized vector file shape: expected array or {vectors: [...]}")
             }
-        assertThat(vectors.size()).describedAs("vector count").isGreaterThan(0)
+        assertThat(vectors.size())
+            .describedAs("vector count (pinned in both languages; see BoundsVectorFile.EXPECTED_COUNT)")
+            .isEqualTo(BoundsVectorFile.EXPECTED_COUNT)
 
         val failures = mutableListOf<String>()
         var checked = 0
@@ -140,4 +135,42 @@ class QeBoundsVectorsTest {
     }
 
     private fun hexOf(bytes: ByteArray): String = bytes.joinToString("") { "%02x".format(it) }
+}
+
+/**
+ * Locating the shared vector file, for both cross-language test classes.
+ *
+ * The plain relative path only works when the JVM's working directory is
+ * `server/`, which is a gradle detail no test should depend on: when it
+ * moves, the file "does not exist" and — before this — the gate quietly
+ * stopped running. So resolution falls back to walking up from user.dir,
+ * and exhausting both strategies is a failure naming every path tried.
+ */
+internal object BoundsVectorFile {
+    /**
+     * Pinned exactly so a vector lost to a bad merge fails instead of
+     * shrinking coverage in silence. Update DELIBERATELY when vectors are
+     * added, together with the identical pin in pyhoglake/tests/qe_vectors.py.
+     */
+    const val EXPECTED_COUNT = 107
+
+    private const val REPO_RELATIVE = "pyhoglake/tests/vectors/bounds_vectors.json"
+
+    fun resolve(): Path {
+        val fromCwd = Path.of("..").resolve(REPO_RELATIVE).normalize()
+        if (Files.exists(fromCwd)) return fromCwd
+
+        val tried = mutableListOf("cwd-relative: ${fromCwd.toAbsolutePath()}")
+        var dir: Path? = Path.of(System.getProperty("user.dir")).toAbsolutePath()
+        while (dir != null) {
+            val candidate = dir.resolve(REPO_RELATIVE)
+            if (Files.exists(candidate)) return candidate
+            tried += "walk-up: $candidate"
+            dir = dir.parent
+        }
+        throw AssertionError(
+            "cross-language bounds vector file not found — the Python/Kotlin codec parity gate " +
+                "cannot run. Tried:\n" + tried.joinToString("\n") { "  $it" },
+        )
+    }
 }
