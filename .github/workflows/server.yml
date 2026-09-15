@@ -46,10 +46,57 @@ jobs:
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
 
-  # The trino-test job is gone: the connector moved to PostHog/trino
-  # (repo PR #1) and :trino:test now refuses to run without a fork
-  # image (HOGLAKE_TRINO_IMAGE). The harness runs manually against a
-  # fork build — see server/trino/README.md.
+  trino-test:
+    # The connector lives in PostHog/trino (repo PR #1); this runs the
+    # in-repo integration harness against the fork's PUBLIC server
+    # image (ghcr.io/posthog/trino, mirrored by its publish workflow on
+    # every master push). The image is arm64-only, hence the ARM
+    # runner. Deliberately NOT in deploy's `needs` and not a required
+    # check: a broken fork build or a flaky ~1GB pull must never wedge
+    # hoglake CD (that failure mode killed the original job).
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    concurrency:
+      group: server-trino-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Image selection: the HOGLAKE_TRINO_IMAGE repo variable pins an
+      # exact ref when set; otherwise resolve the newest ordered
+      # release tag (r<position>-<sha6>, lexicographically sortable by
+      # construction) from the public ghcr mirror — anonymous, no
+      # cross-repo auth, and new fork releases are picked up with zero
+      # changes here.
+      - name: Resolve Trino image
+        id: image
+        env:
+          PINNED: ${{ vars.HOGLAKE_TRINO_IMAGE }}
+        run: |
+          if [ -n "$PINNED" ]; then
+            echo "ref=$PINNED" >> "$GITHUB_OUTPUT"
+            echo "Using pinned image: $PINNED"
+            exit 0
+          fi
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:posthog/trino:pull" | jq -r .token)
+          tag=$(curl -fsS -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/posthog/trino/tags/list?n=1000" \
+            | jq -r '.tags[]' | grep -E '^r[0-9]{12}-[0-9a-f]{6}$' | sort | tail -1)
+          [ -n "$tag" ] || { echo "::error::No ordered release tag found on ghcr.io/posthog/trino"; exit 1; }
+          echo "ref=ghcr.io/posthog/trino:$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest fork release: $tag"
+
+      - name: Trino connector integration tests
+        working-directory: server
+        env:
+          HOGLAKE_TRINO_IMAGE: ${{ steps.image.outputs.ref }}
+        run: ./gradlew --no-daemon :trino:test
 
   image:
     # The deployable image must assemble and BOOT from every PR —

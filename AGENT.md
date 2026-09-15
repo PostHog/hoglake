@@ -89,7 +89,7 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, and the gated `deploy` job. No :trino:test job: the connector lives in PostHog/trino and the in-repo harness needs a fork image (HOGLAKE_TRINO_IMAGE) — run it manually per server/trino/README.md |
+| `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. All unit/mocked layer — live integration is local, per the pre-push checklist |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
