@@ -103,12 +103,18 @@ enum class ColType {
          * with that entry's reason; anything else unknown fails with
          * [unknown]'s message. Both are 422 Validation — the difference
          * is whether the caller should fix a typo or stop trying.
+         *
+         * The refusal lookup lowercases first because [fromWire] is
+         * case-insensitive (it uppercases before `valueOf`). Without
+         * that, "INT" was accepted while "INT128" fell through to the
+         * generic unknown-type message — the one answer the refusals
+         * exist to prevent.
          */
         fun parseWire(
             s: String,
             unknown: () -> String,
         ): ColType {
-            REFUSALS[s]?.let { throw HoglakeException.Validation(it) }
+            REFUSALS[s.lowercase()]?.let { throw HoglakeException.Validation(it) }
             return try {
                 fromWire(s)
             } catch (_: IllegalArgumentException) {

@@ -262,6 +262,34 @@ class ScalarTypeParityTest {
                 })
         }
 
+        @ParameterizedTest(name = "{0}")
+        @MethodSource("com.posthog.hoglake.model.ScalarTypeParityTest#refusedNames")
+        fun `a refused name is refused in any case, like every other type name`(name: String) {
+            // fromWire uppercases before valueOf, so "INT" and "Int" are
+            // accepted types. A refusal lookup that only matched lowercase
+            // therefore answered "unknown column type 'INT128'" — sending
+            // the caller hunting for a spelling of a type that will never
+            // exist, which is exactly what REFUSALS is for.
+            for (spelling in listOf(name.uppercase(), name.replaceFirstChar { it.uppercase() })) {
+                assertThatThrownBy { ColType.parseWire(spelling) { "unknown column type '$spelling'" } }
+                    .describedAs("parseWire(%s)", spelling)
+                    .isInstanceOf(HoglakeException.Validation::class.java)
+                    .satisfies({ e ->
+                        assertThat(e.message).doesNotContain("unknown column type")
+                        assertThat(e.message).contains("is not supported")
+                    })
+            }
+        }
+
+        @Test
+        fun `case-insensitivity is inherited from fromWire, not invented here`() {
+            // The premise the test above rests on: if this ever stops
+            // holding, the refusal lowercasing becomes dead weight rather
+            // than a fix, and someone should notice.
+            assertThat(ColType.fromWire("INT")).isEqualTo(ColType.INT)
+            assertThat(ColType.fromWire("TimeStamp_Ns")).isEqualTo(ColType.TIMESTAMP_NS)
+        }
+
         @Test
         fun `a genuinely unknown name still gets the unknown-type message`() {
             assertThatThrownBy { ColType.parseWire("int7") { "unknown column type 'int7'" } }
