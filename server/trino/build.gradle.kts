@@ -16,7 +16,7 @@ val ktorVersion = "3.5.2"
 
 dependencies {
     testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.2")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.assertj:assertj-core:3.27.7")
     // Integration tests: the hoglake server runs in-process from the
