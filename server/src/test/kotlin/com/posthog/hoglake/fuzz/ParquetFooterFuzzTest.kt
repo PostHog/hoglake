@@ -2,9 +2,9 @@ package com.posthog.hoglake.fuzz
 
 import com.code_intelligence.jazzer.junit.FuzzTest
 import com.posthog.hoglake.hydrator.CatalogColumn
+import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
-import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.SeekableInputStream
@@ -18,22 +18,24 @@ import java.nio.ByteOrder
  * the hydrator runs on writer-supplied bytes, plus [FooterStats] over
  * whatever parses.
  *
- * The harness mirrors Hydrator.parseFooter exactly:
- * `ParquetFileReader.open(input).use { it.footer }` over an in-memory
- * [InputFile]. Input shape: bytes starting with "PAR1" are treated as a
+ * The harness mirrors Hydrator.parseFooter exactly: [FooterParse.parse]
+ * over an in-memory [InputFile] — the same wrapper production uses, so
+ * the contract below is tested where it is enforced. Input shape: bytes starting with "PAR1" are treated as a
  * whole parquet file; anything else is wrapped as the thrift footer of a
  * synthetic file (PAR1 + data + LE len + PAR1) so the fuzzer spends its
  * time inside the thrift decode, not hunting for magic bytes.
  *
  * Contract under test:
- *  - the footer parse fails typed/structurally — IOException (including
- *    parquet's ParquetDecodingException-wrapped thrift failures) or a
- *    refusal RuntimeException raised from parquet's own frames
- *    (parquet-java deliberately uses bare RuntimeException for "is not a
- *    Parquet file" / "corrupted file") — never NPE/ClassCastException,
- *    never a crash outside parquet frames, never a hang, never unbounded
- *    allocation (input capped at 1 MiB; thrift's own limits govern the
- *    rest);
+ *  - the footer parse fails as an IOException and nothing else.
+ *    [FooterParse] collapses parquet-java's three refusal styles (typed
+ *    IOException, deliberate bare RuntimeException, and the accidental
+ *    runtime exceptions it lets escape from unguarded optional thrift
+ *    fields) into that one category, so this assertion needs no stack
+ *    inspection and no per-class carve-out — which is the point: the
+ *    previous frame-matching version silently stopped matching once
+ *    HotSpot began fast-throwing the hot NPE with an empty stack (#15).
+ *    Never a hang, never unbounded allocation (input capped at 1 MiB;
+ *    thrift's own limits govern the rest);
  *  - when the footer DOES parse, FooterStats.missingFieldIds /
  *    usesFieldIds / aggregate are total: they never throw, whatever the
  *    schema shape (that is the hydrator's "bounds NULL, never guessed"
@@ -48,7 +50,7 @@ class ParquetFooterFuzzTest {
 
         val footer: ParquetMetadata =
             try {
-                ParquetFileReader.open(BytesInputFile(file)).use { it.footer }
+                FooterParse.parse(BytesInputFile(file))
             } catch (e: Exception) {
                 checkAllowedParseFailure(e)
                 return
@@ -62,35 +64,11 @@ class ParquetFooterFuzzTest {
     }
 
     private fun checkAllowedParseFailure(e: Exception) {
-        // KNOWN UPSTREAM WART (fuzzer-found 2026-09-06, pinned corpus entry
-        // thrift_readbinary_npe): shaded thrift's TCompactProtocol.readBinary
-        // NPEs (ByteBuffer.wrap(null)) while SKIPPING an unknown binary field
-        // with a hostile length in a corrupt footer. parquet-java internal;
-        // the hydrator contains it (Hydrator.kt catch(Exception) -> 'failed'),
-        // but it is a bare NPE where a decoding refusal belongs. Carved out
-        // by exact signature so any OTHER NPE stays a finding.
-        if (e is NullPointerException &&
-            e.stackTrace.any { it.className.startsWith("shaded.parquet.org.apache.thrift.protocol") }
-        ) {
-            return
-        }
-        // NPE/CCE are never a deliberate refusal, wherever they come from.
-        if (e is NullPointerException || e is ClassCastException) {
+        // One rule, no exceptions to it: the parse refuses with an
+        // IOException. Anything else escaping FooterParse is a hole in the
+        // translation, which is exactly what this target exists to find.
+        if (e !is IOException) {
             throw IllegalStateException("footer parse escaped with ${e.javaClass.name}: ${e.message}", e)
-        }
-        val parquetFrame =
-            e.stackTrace.firstOrNull()?.className.orEmpty().let {
-                it.startsWith("org.apache.parquet") || it.startsWith("shaded.parquet")
-            }
-        val allowed =
-            e is IOException ||
-                // parquet-java refuses structurally-broken files with typed
-                // subclasses AND bare RuntimeException ("is not a Parquet
-                // file", "corrupted file: the footer index..."); a refusal
-                // raised from a parquet frame is a refusal.
-                (e is RuntimeException && (parquetFrame || e.javaClass.name.startsWith("org.apache.parquet")))
-        if (!allowed) {
-            throw IllegalStateException("footer parse escaped with untyped ${e.javaClass.name}: ${e.message}", e)
         }
     }
 

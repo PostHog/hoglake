@@ -1000,13 +1000,15 @@ paths:
         Identity of this hoglake instance: the operator-configured
         display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
         shows so deployments are tellable apart. Name omitted when
-        unset. Also carries instance-wide live-data totals for the
-        webui header: sums over live data files (end_snapshot unset)
-        across every catalog, refreshed by the server's periodic
-        metrics sampler — display numbers, not a consistency
-        primitive. total_rows is gross of deletion-vector masking.
-        Both fields are omitted in the boot window before the first
-        sample.
+        unset. Carries the running server's version, which the webui
+        shows beside the brand so the deployed build is readable
+        without shelling in. Also carries instance-wide live-data
+        totals for the webui header: sums over live data files
+        (end_snapshot unset) across every catalog, refreshed by the
+        server's periodic metrics sampler — display numbers, not a
+        consistency primitive. total_rows is gross of deletion-vector
+        masking. Both totals are omitted in the boot window before the
+        first sample.
       responses:
         "200":
           description: Instance info
@@ -1014,8 +1016,15 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [version]
                 properties:
                   name: { type: string }
+                  version:
+                    type: string
+                    description: >
+                      The running server's version, as built (e.g.
+                      1.0.1-dev). Always present: "unknown" when the
+                      binary carries no version resource, never omitted.
                   total_rows: { type: integer, format: int64 }
                   total_size_bytes: { type: integer, format: int64 }
 

@@ -37,6 +37,26 @@ function InstanceName() {
   return <span className="instance-name">{data.name}</span>;
 }
 
+function ServerVersion() {
+  // Shares the fetch-once key with InstanceName: both read identity that
+  // cannot change without the server restarting, which drops the query.
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  if (!data?.version) return null;
+  return (
+    <span
+      className="server-version"
+      title={`Running hoglake server version ${data.version} (GET /v1/info)`}
+    >
+      v{data.version}
+    </span>
+  );
+}
+
 function InstanceTotals() {
   // Same endpoint as InstanceName under its own key: the name is
   // fetch-once (staleTime Infinity), the totals refresh. The server
@@ -127,6 +147,7 @@ export function Layout() {
         <Link to="/" className="brand">
           hoglake
         </Link>
+        <ServerVersion />
         <InstanceName />
         <InstanceTotals />
         <Breadcrumbs />

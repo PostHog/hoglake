@@ -405,9 +405,13 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * GET /v1/info — instance identity plus live-data totals for the webui
  * header. Name omitted when unset; totals come from the metrics
  * sampler's last pass and are omitted in the boot window before it.
+ * Version is the running server's own, always present (BuildInfo falls
+ * back to "unknown" rather than omitting it — "which version is this?"
+ * having no answer is itself the answer an operator needs).
  */
 data class InstanceInfoDto(
     val name: String?,
+    val version: String,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
 )
