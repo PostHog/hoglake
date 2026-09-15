@@ -238,6 +238,45 @@ SELECT 'alive'
 ----
 alive
 
+# ---- reserved parquet field id on a POSITIONAL registration: the
+# CATALOG's explicit_row_ids flag decides the rowid source, never the
+# file's own field ids. Reading the physical column here would report
+# file contents (10, NULL, 30) as row ids instead of 0,1,2. Plain
+# column reads still work; anything needing rowid refuses typed and
+# the instance survives. ----
+
+query I
+SELECT a FROM lakes.ns1.bad_fieldid ORDER BY a
+----
+1
+2
+3
+
+statement error
+SELECT rowid FROM lakes.ns1.bad_fieldid
+----
+<REGEX>:.*reserved parquet field id.*WITHOUT explicit row ids.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+statement error
+DELETE FROM lakes.ns1.bad_fieldid WHERE a = 2
+----
+<REGEX>:.*reserved parquet field id.*
+
+query I
+SELECT 'alive'
+----
+alive
+
+query I
+SELECT 'alive'
+----
+alive
+
 # nothing committed: both physical copies of a=3 still read
 query I
 SELECT count(*) FROM lakes.ns1.dup_incon WHERE a = 3

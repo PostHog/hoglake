@@ -239,3 +239,16 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   comment fixed. Dispositions: REVIEW-FINDINGS-R4.md.
 - Verified 2026-09-14: ./test/run-live-tests.sh fully green — 11
   sqllogictest files / 630 assertions + cross-client wire check.
+
+## Review round 5 — all 4 confirmed findings fixed: DONE
+- R5-2 root fixed: the catalog's explicit_row_ids flag (not the file's
+  field ids) selects the rowid source; both mismatch directions refuse
+  typed; DESIGN.md §5 corrected to match. R5-1 symptom: delete-sink
+  validity-mask guards typed (sweep rule widened a third time to cover
+  validity masks on external vectors; no other throwing sites exist).
+  R5-3: request-scoped refusals (410, snapshot-scoped 422) now
+  propagate instead of being contained, so listings never report an
+  empty schema. R5-4: DV read allocation capped. Dispositions:
+  REVIEW-FINDINGS-R5.md.
+- Verified 2026-09-14: ./test/run-live-tests.sh green — 11 files /
+  638 assertions + cross-client wire check.

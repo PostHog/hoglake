@@ -144,16 +144,36 @@ MultiFileReaderVirtualColumnBinding HoglakeMultiFileReader::GetVirtualColumnExpr
     ClientContext &context, MultiFileReaderData &reader_data, const vector<MultiFileColumnDefinition> &local_columns,
     const idx_t column_id, const LogicalType &type, MultiFileLocalIndex local_idx) {
 	if (column_id == COLUMN_IDENTIFIER_ROW_ID) {
-		// stable hoglake row id: the physical _hog_row_id column when the
-		// file carries one (compaction outputs), else
-		// row_id_start + file_row_number
-		if (TryFindColumnByFieldId(local_columns, HOG_ROW_ID_FIELD_ID)) {
-			return MultiFileReaderVirtualColumnBinding(*row_id_column);
-		}
+		// stable hoglake row id. THE CATALOG decides the source, never
+		// the file's own field ids: explicit_row_ids files (compaction
+		// outputs) carry the physical _hog_row_id column; positional
+		// files are row_id_start + file_row_number. Reading the
+		// physical column off a positional file would silently report
+		// file contents as row ids.
 		if (!reader_data.file_to_be_opened.extended_info) {
 			throw InternalException("hoglake: extended file info missing for row id column");
 		}
 		auto &options = reader_data.file_to_be_opened.extended_info->options;
+		auto explicit_entry = options.find("explicit_row_ids");
+		bool explicit_row_ids =
+		    explicit_entry != options.end() && BooleanValue::Get(explicit_entry->second);
+		bool has_reserved_column = TryFindColumnByFieldId(local_columns, HOG_ROW_ID_FIELD_ID);
+		if (explicit_row_ids) {
+			// symmetric with the flag-true/column-missing refusal below
+			return MultiFileReaderVirtualColumnBinding(*row_id_column);
+		}
+		if (has_reserved_column) {
+			// the reserved parquet field id is never allocatable to a
+			// real column (AGENT.md invariant 2). The server cannot
+			// detect this (it never opens registered parquet and
+			// /verify excludes the field-id contract), so the client is
+			// the enforcement point: refuse the file, typed.
+			throw InvalidInputException(
+			    "hoglake: data file \"%s\" carries the reserved parquet field id %d (_hog_row_id) but the catalog "
+			    "registered it WITHOUT explicit row ids - the file violates the reserved-field-id invariant and its "
+			    "row ids cannot be trusted. Repair the registration via another client",
+			    reader_data.file_to_be_opened.path, HOG_ROW_ID_FIELD_ID);
+		}
 		auto entry = options.find("row_id_start");
 		if (entry == options.end()) {
 			throw InvalidInputException("hoglake: file \"%s\" has no row_id_start and no _hog_row_id column - "

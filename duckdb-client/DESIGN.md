@@ -266,7 +266,17 @@ conflict checks, and the fixture-created ambiguous pairs.
 5. **Virtual columns**: `rowid` = `row_id_start + ordinal` for
    positional files; for `explicit_row_ids` files (compaction outputs)
    it reads the physical `_hog_row_id` column (reserved parquet field
-   id 2147483646). `filename` and `snapshot_id` (file's
+   id 2147483646). The CATALOG's flag decides — never the file's own
+   field ids: a positional registration whose parquet nonetheless
+   carries the reserved field id violates the reserved-id invariant
+   (AGENT.md invariant 2) and is refused typed when its rowid is
+   needed, because the server cannot detect it (registration never
+   opens the parquet; /verify excludes the field-id contract). The
+   complementary direction — flag set, column absent — is refused the
+   same way. `filename` and `snapshot_id` (file's `begin_snapshot`)
+   as in DuckLake. `_hog_row_id` is projected out of ordinary
+   `SELECT *`.
+ `filename` and `snapshot_id` (file's
    `begin_snapshot`) as in DuckLake. `_hog_row_id` is projected out of
    ordinary `SELECT *`.
 

@@ -422,6 +422,14 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what) {
 		}
 	}
 	auto message = StringUtil::Format("hoglake: %s failed: %s%s%s", what, error, detail.empty() ? "" : " — ", detail);
+	// request-scoped 422s (the snapshot/travel selector itself is
+	// unserviceable) apply to every object, so they must propagate like
+	// the 410 below rather than being contained per table
+	auto lower_error = StringUtil::Lower(error + " " + detail);
+	if (response.status == 422 &&
+	    (StringUtil::Contains(lower_error, "snapshot") || StringUtil::Contains(lower_error, "at_timestamp"))) {
+		throw TransactionException("%s (the requested snapshot/timestamp cannot be served)", message);
+	}
 	switch (response.status) {
 	case 400:
 	case 422:
@@ -431,7 +439,15 @@ void HoglakeApiClient::ThrowFor(const Response &response, const string &what) {
 	case 409:
 		throw TransactionException("%s", message);
 	case 410:
-		throw InvalidInputException("%s (this history is below the catalog's expiry floor)", message);
+		// REQUEST-SCOPED by construction: the requested snapshot/
+		// timestamp is below the expiry floor, so it applies to every
+		// object of the catalog. TransactionException is outside the
+		// catalog containment set on purpose — containing it would make
+		// a listing report an EMPTY schema instead of failing (the
+		// taxonomy's cardinal rule at the top of this file).
+		throw TransactionException("%s (this history is below the catalog's expiry floor; the transaction's pinned "
+		                           "snapshot can no longer be read — start a new transaction)",
+		                           message);
 	case 503:
 		throw IOException("%s (retryable commit backpressure)", message);
 	default:

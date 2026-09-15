@@ -279,6 +279,18 @@ vector<idx_t> HoglakePuffin::ReadDeletionVector(ClientContext &context, const st
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto file_handle = fs.OpenFile(path, FileOpenFlags::FILE_FLAGS_READ);
 	auto file_size = NumericCast<idx_t>(file_handle->GetFileSize());
+	// bound the allocation BEFORE reading: the object is written by
+	// other clients and its size is never validated server-side (the
+	// registration's file_size_bytes is never compared against the
+	// object). A puffin DV is a roaring bitmap plus a small footer;
+	// anything past this cap is not a DV we should page into memory.
+	static constexpr idx_t MAX_DELETION_VECTOR_BYTES = 256ULL * 1024 * 1024;
+	if (file_size > MAX_DELETION_VECTOR_BYTES) {
+		throw InvalidInputException(
+		    "hoglake: deletion vector file \"%s\" is %llu bytes, beyond the %llu-byte limit this client will read - "
+		    "repair the registration via another client",
+		    path, file_size, MAX_DELETION_VECTOR_BYTES);
+	}
 	auto buffer = make_unsafe_uniq_array<data_t>(file_size);
 	file_handle->Read(buffer.get(), file_size);
 	auto data = buffer.get();

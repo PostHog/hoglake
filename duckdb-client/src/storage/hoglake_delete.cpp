@@ -53,13 +53,28 @@ SinkResultType HoglakeDelete::Sink(ExecutionContext &context, DataChunk &chunk, 
 		auto rid_idx = rowid_data.sel->get_index(i);
 		auto name_idx = file_name_data.sel->get_index(i);
 		auto row_idx = row_number_data.sel->get_index(i);
+		// VALIDITY MASKS on wire/object-store-derived vectors are
+		// external input too (a registered parquet can hold a NULL in
+		// the column the rowid comes from): refuse typed, naming the
+		// table, never an instance-invalidating InternalException
 		if (!rowid_data.validity.RowIsValid(rid_idx) || !file_name_data.validity.RowIsValid(name_idx) ||
 		    !row_number_data.validity.RowIsValid(row_idx)) {
-			throw InternalException("hoglake: NULL row-id column in DELETE input");
+			auto file_name = file_name_data.validity.RowIsValid(name_idx)
+			                     ? file_names[name_idx].GetString()
+			                     : string("<unknown>");
+			throw InvalidInputException(
+			    "hoglake: DELETE/UPDATE on table \"%s.%s\" read a NULL row id from data file \"%s\" - the file's "
+			    "row ids are not usable (a registered parquet holding NULLs in the reserved _hog_row_id column, or "
+			    "a registration inconsistent with the file). Repair it via another client",
+			    table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name, file_name);
 		}
 		auto row_number = row_numbers[row_idx];
 		if (row_number < 0) {
-			throw InternalException("hoglake: negative file_row_number in DELETE input");
+			throw InvalidInputException(
+			    "hoglake: DELETE/UPDATE on table \"%s.%s\" read a negative row position (%lld) from data file "
+			    "\"%s\" - repair the file or its registration via another client",
+			    table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name, row_number,
+			    file_names[name_idx].GetString());
 		}
 		// the rowid base distinguishes duplicate registrations of one
 		// physical path (positional files: base == row_id_start)

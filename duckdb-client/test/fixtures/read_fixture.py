@@ -313,6 +313,51 @@ def main() -> None:
         })
         print(f"fixture ready: {SQLTEST}/ns1.dup_incon (duplicate registration declaring 2 of 3 rows)")
 
+        # ---- reserved-field-id poison (R5-2): an ordinary in-contract
+        # registration whose parquet carries the RESERVED field id
+        # 2147483646 on a normal column. The server never opens
+        # registered parquet (and /verify excludes the field-id
+        # contract), so explicit_row_ids stays false — the client must
+        # refuse the file rather than read its contents as row ids. The
+        # column also holds a NULL, the R5-1 trigger.
+        import io as _io
+        import uuid as _uuid
+        import pyarrow.parquet as _pq
+
+        try:
+            sq_ns.table("bad_fieldid").drop()
+        except NotFoundError:
+            pass
+        fid_tbl = sq_ns.create_table(
+            "bad_fieldid",
+            pa.schema([pa.field("a", pa.int64()), pa.field("junk", pa.int64())]),
+        )
+        fid_cols = {c.name: c for c in fid_tbl.columns}
+        poison_schema = pa.schema([
+            pa.field("a", pa.int64(),
+                     metadata={b"PARQUET:field_id": str(fid_cols["a"].field_id).encode()}),
+            # the reserved id, on an ordinary column
+            pa.field("junk", pa.int64(), metadata={b"PARQUET:field_id": b"2147483646"}),
+        ])
+        sink = _io.BytesIO()
+        _pq.write_table(
+            pa.table({"a": pa.array([1, 2, 3], pa.int64()),
+                      "junk": pa.array([10, None, 30], pa.int64())}, schema=poison_schema),
+            sink,
+        )
+        raw = sink.getvalue()
+        key = f"duckext-itest/sqltest/data/ns1/bad_fieldid/{_uuid.uuid4()}.parquet"
+        with s3.filesystem().open_output_stream(key) as out:
+            out.write(raw)
+        rest("POST", f"/catalogs/{SQLTEST}/commit", json={
+            "appends": [{
+                "namespace": "ns1", "table": "bad_fieldid",
+                "files": [{"path": f"s3://{key}", "record_count": 3,
+                            "file_size_bytes": len(raw)}],
+            }],
+        })
+        print(f"fixture ready: {SQLTEST}/ns1.bad_fieldid (reserved field id on a positional file)")
+
         # sorted table for the DISCRIMINATING compacted-rowid test
         # (R4-10): compaction sorts the merge by the live sort order, so
         # the compacted file's _hog_row_id column is PERMUTED relative

@@ -250,8 +250,11 @@ OpenFileInfo HoglakeMultiFileList::GetFile(idx_t i) const {
 	if (file.footer_size > 0) {
 		extended_info->options["footer_size"] = Value::UBIGINT(NumericCast<idx_t>(file.footer_size));
 	}
-	// for explicit-row-id files row_id_start has no positional meaning;
-	// the reader takes ids from the _hog_row_id column instead
+	// THE WIRE decides the rowid source, never the file's own field ids:
+	// for explicit-row-id files row_id_start has no positional meaning
+	// and the reader takes ids from the physical _hog_row_id column;
+	// for positional files the reserved field id must not appear at all
+	extended_info->options["explicit_row_ids"] = Value::BOOLEAN(file.explicit_row_ids);
 	if (!file.explicit_row_ids) {
 		extended_info->options["row_id_start"] = Value::UBIGINT(NumericCast<idx_t>(file.row_id_start));
 	}
