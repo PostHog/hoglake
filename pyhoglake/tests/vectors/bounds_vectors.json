@@ -725,6 +725,90 @@
       "value": "AAH/",
       "hex": "0001ff",
       "note": "base64 of 00 01 ff"
+    },
+    {
+      "type": "uint32",
+      "type_params": null,
+      "value": "2147483647",
+      "hex": "ffffff7f00000000",
+      "note": "int32 max: the last value a signed and an unsigned reading agree on"
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "127",
+      "hex": "7f",
+      "note": "1-byte minimal two's-complement, high bit clear"
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "128",
+      "hex": "0080",
+      "note": "1 -> 2 byte transition: 0x80 needs a leading 0x00 sign byte"
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "255",
+      "hex": "00ff",
+      "note": "2 bytes, both significant"
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "9223372036854775807",
+      "hex": "7fffffffffffffff",
+      "note": "int64 max: 8 bytes, the last value before the 9-byte sign-byte form"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"e\":\"\ud83e\udd94\"}",
+      "hex": "7b2265223a22f09fa694227d",
+      "note": "astral-plane codepoint: UTF-8 bytes order it above the BMP, UTF-16 units do not"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"a\":\"\u65e5\u672c\u8a9e\"}",
+      "hex": "7b2261223a22e697a5e69cace8aa9e227d",
+      "note": "3-byte UTF-8 sequences"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"a\":\"x\u0000y\"}",
+      "hex": "7b2261223a22780079227d",
+      "note": "embedded NUL inside a JSON string value"
+    },
+    {
+      "type": "timestamp_s",
+      "type_params": null,
+      "value": "9223372036854",
+      "hex": "f65ad07b63080000",
+      "note": "the largest whole second that still fits int64 micros"
+    },
+    {
+      "type": "timestamp_ms",
+      "type_params": null,
+      "value": "9223372036854775",
+      "hex": "f753e3a59bc42000",
+      "note": "the largest whole milli that still fits int64 micros"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "9223372036854775807",
+      "hex": "ffffffffffffff7f",
+      "note": "int64 max nanos"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "-9223372036854775808",
+      "hex": "0000000000000080",
+      "note": "int64 min nanos"
     }
   ]
 }
