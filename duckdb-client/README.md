@@ -72,6 +72,13 @@ own community-extension repo.
 ./test/run-live-tests.sh        # fixtures -> sqllogictests -> cross-client wire check
 ```
 
+It fails — loudly, non-zero — if a fixture gate the suite needs was not
+exported, if the runner skipped any file, if fewer test files ran than
+exist, or if the assertion count fell below its floor. `require-env` is
+a WHOLE-FILE skip in sqllogictest, so an ungated-looking green run
+could otherwise be a run that silently dropped a file (R7-1); each
+conditional fixture gate accordingly owns its own `.test` file.
+
 Needs the dev stack (`just server compose-up && just server run`) plus
 a pyhoglake checkout (`PYHOGLAKE_DIR`, default `~/src/hoglake/pyhoglake`)
 for the fixtures. `make test` alone runs the sqllogictests, which
@@ -79,7 +86,9 @@ for the fixtures. `make test` alone runs the sqllogictests, which
 server up is not a verification of anything. Say which you ran.
 
 The suite creates disposable `duckext-*` catalogs in a `duckext-itest`
-bucket. Three things it deliberately proves rather than assumes: row
+bucket, and its files are idempotent: repeat runs without re-running
+the fixture assert the same counts. Three things it deliberately proves
+rather than assumes: row
 ids survive a real server compaction (the fixture force-compacts and
 the test reads the `_hog_row_id` carrier), extension-written and
 pyhoglake-written partition values land in byte-identical partition

@@ -264,3 +264,19 @@ Working tree: git worktree `~/src/hoglake-duckdb-client`, branch
   (travel_scoped) instead of matching the server's prose. R6-4:
   DESIGN.md §5 de-duplicated and made true. R5 disposition corrected in
   place. Dispositions: REVIEW-FINDINGS-R6.md.
+
+## Review round 7 — no code defects; test-harness integrity fixed: DONE
+- First clean code round. R7-1 (mine, wave 6): `require-env` is a
+  WHOLE-FILE skip, so the conditional fid_missing gate silently
+  disabled all of hoglake_wire_hardening.test — while make test and
+  run-live-tests.sh still exited 0. Each conditional gate now owns its
+  file (hoglake_fieldid_missing.test, hoglake_sorted_compacted.test),
+  and run-live-tests.sh asserts the gates are exported, that no file
+  was skipped, that every .test file ran, and an assertion floor —
+  green now means green, and says what ran. R7-2: the dup_path
+  rerun-stability claim made true (assert the key both DELETEs leave
+  alone); verified by three fixture-less repeat runs. Wave 6's 643 was
+  genuine (gate was set; delta matches). Dispositions:
+  REVIEW-FINDINGS-R7.md.
+- Verified 2026-09-14: ./test/run-live-tests.sh green — 13 files /
+  645 assertions / 0 skipped + cross-client wire check.

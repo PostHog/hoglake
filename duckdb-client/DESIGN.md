@@ -406,7 +406,12 @@ loops.
 1. **sqllogictests** (`test/sql/`): the primary suite, run via
    `make test` — or `test/run-live-tests.sh`, which chains fixtures,
    the suite (with the fixture-exported time-travel snapshot ids in
-   the environment), and the cross-client wire check. Integration tests `require-env HOGLAKE_URL` (+ MinIO
+   the environment), and the cross-client wire check. `require-env` is
+   a WHOLE-FILE skip disposition wherever it appears, and the runner
+   exits 0 on a skip, so: every conditional fixture gate owns its own
+   file, and `run-live-tests.sh` fails when a gate is unexported, when
+   any file was skipped, when fewer files ran than exist, or below an
+   assertion floor — a green run states what it ran. Integration tests `require-env HOGLAKE_URL` (+ MinIO
    creds env) and run against the live dev stack
    (`http://localhost:8080` + MinIO `http://localhost:19000`,
    creds hoglake/hoglake123 — pyhoglake's conventions); they
