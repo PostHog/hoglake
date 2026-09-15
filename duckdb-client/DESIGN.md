@@ -435,9 +435,10 @@ loops.
 
 ## Milestone status
 
-Tracked in [PROGRESS.md](PROGRESS.md); [README.md](README.md) is the
-component's front door (what it is, how to build it, how to run the
-live suite).
+M0–M5 all landed; the milestone log itself is a local-only working
+document (repo convention for in-flight worklists), as are the
+review-round findings files. [README.md](README.md) is the component's
+front door (what it is, how to build it, how to run the live suite).
 
 ## Parity status
 

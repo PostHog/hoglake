@@ -34,8 +34,11 @@ than faked.
 |---|---|
 | [DESIGN.md](DESIGN.md) | architecture, module map, wire-client decision, transaction/pinning model, read/write paths, test strategy, and the numbered **findings for the server** |
 | [PARITY.md](PARITY.md) | every DuckLake SQL-surface capability with DONE / PARTIAL / WIRE GAP / N-A / TODO |
-| [PROGRESS.md](PROGRESS.md) | milestone log (M0–M5) and the adversarial-review rounds |
-| `REVIEW-FINDINGS*.md` | the review rounds themselves: each finding, its verifier, and its fix disposition |
+
+The milestone log and the seven rounds of adversarial-review findings
+(each finding, its verifier, its fix disposition) are working documents
+and stay local-only, per the repo convention — the PR body carries the
+summary.
 
 Divergences from DuckLake are deliberate and documented (in DESIGN.md
 and PARITY.md), never silent: DDL is eager (own server snapshot, so

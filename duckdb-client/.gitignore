@@ -8,3 +8,10 @@
 .DS_Store
 /.cache/
 test/fixtures/live-env.sh
+
+# Working documents, per the repo convention that in-flight worklists
+# and bug-hunt writeups stay local-only (AGENT.md "Doc index"): the
+# milestone log and the adversarial-review rounds. Their conclusions
+# live in DESIGN.md/PARITY.md/README.md and in PR bodies.
+/PROGRESS.md
+/REVIEW-FINDINGS*.md
