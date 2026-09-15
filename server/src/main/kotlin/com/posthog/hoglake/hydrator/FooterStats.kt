@@ -230,13 +230,23 @@ object FooterStats {
                     null
                 }
             // int8/int16/uint8/uint16 all ride parquet INT32 (with an
-            // INT(width, signed) annotation writers add and we ignore): the
-            // physical int32 already holds the true value in every case,
-            // and for widths <= 16 the signed and unsigned parquet sort
-            // orders agree, so the footer's min/max are trustworthy either
-            // way. All four map to Iceberg int, hence the 4-byte bound.
+            // INT(width, signed) annotation writers add): the physical
+            // int32 already holds the true value, and for widths <= 16 the
+            // signed and unsigned parquet sort orders agree, so the
+            // footer's min/max are trustworthy either way. All four map to
+            // Iceberg int, hence the 4-byte bound.
+            //
+            // The exception is a full-width UNSIGNED int32, which no legal
+            // promotion produces here (nothing promotes into int from
+            // uint32) and which cannot be honest: its values need 33 bits,
+            // and parquet ordered the chunk unsigned, so a signed read can
+            // come back with lower > upper.
             ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
-                if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
+                if (physical == PrimitiveType.PrimitiveTypeName.INT32 && !isUnsignedInt(leaf, 32)) {
+                    readIntLE(raw)
+                } else {
+                    null
+                }
             // uint32 maps to Iceberg long. hoglake's own writers emit INT64
             // (see iceberg-federation.md §2), but pyarrow/DuckDB emit
             // INT32 + INT(32, unsigned) natively, so both are read. The
@@ -261,10 +271,22 @@ object FooterStats {
                 } else {
                     null
                 }
+            // The read-path twin of ParquetRewriter's UINT32_TO_LONG. The
+            // uint8/uint16/uint32 -> long promotions are legal and do NOT
+            // rewrite stats bytes, so unsigned-annotated files keep
+            // arriving here under a long column long after the ALTER.
+            // Sign-extending one turns 0xFFFFFFFF into -1, putting the
+            // upper bound BELOW the lower and making every pruner drop the
+            // file. Zero-extend at any width instead; the annotation is
+            // also what tells us parquet ordered the chunk unsigned, so
+            // the bounds are the unsigned min/max we want.
             ColType.LONG ->
                 when (physical) {
                     PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)
-                    PrimitiveType.PrimitiveTypeName.INT32 -> readIntLE(raw)?.toLong()
+                    PrimitiveType.PrimitiveTypeName.INT32 ->
+                        readIntLE(raw)?.let { bits ->
+                            if (isUnsignedInt(leaf)) bits.toLong() and 0xFFFFFFFFL else bits.toLong()
+                        }
                     else -> null
                 }
             ColType.FLOAT ->
@@ -395,6 +417,16 @@ object FooterStats {
             null
         }
     }
+
+    /**
+     * True when the leaf carries parquet INT(*, isSigned = false) at ANY
+     * width. Two things follow from an unsigned annotation and both
+     * matter: the physical bits are a magnitude rather than a signed
+     * value, and parquet computed the chunk's min/max in UNSIGNED order.
+     */
+    private fun isUnsignedInt(leaf: Leaf): Boolean =
+        (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+            ?.isSigned == false
 
     /** True when the leaf carries parquet INT(width, isSigned = false). */
     private fun isUnsignedInt(

@@ -592,6 +592,66 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `an unsigned int32 under a catalog long zero-extends at every width`() {
+        // The promotion uint8/uint16/uint32 -> long is legal and leaves the
+        // stats bytes alone (same mapped Iceberg type at 4 bytes for the
+        // small widths, already 8 for uint32), so files written BEFORE the
+        // promotion keep arriving at the hydrator afterwards under the new
+        // catalog type. Sign-extending them is the ParquetRewriter hazard in
+        // its read-path twin: 0xFFFFFFFF becomes -1, the upper bound lands
+        // BELOW the lower one, and a pruner silently drops the whole file.
+        val widths = listOf(8 to 255, 16 to 65_535, 32 to -1)
+        for ((width, maxBits) in widths) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(maxBits)))))
+            val out = agg(m, CatalogColumn(1, "a", ColType.LONG, null))
+            val expectedMax = maxBits.toLong() and 0xFFFFFFFFL
+            assertThat(out[1L]!!.lowerBound).describedAs("uint%d lower", width).isEqualTo(le(0L))
+            assertThat(out[1L]!!.upperBound)
+                .describedAs("uint%d upper (must zero-extend, not sign-extend)", width)
+                .isEqualTo(le(expectedMax))
+        }
+    }
+
+    @Test
+    fun `a signed int32 under a catalog long still sign-extends`() {
+        // The control: the pre-existing int -> long promotion must keep
+        // meaning what it meant.
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT32)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(-7), le(9)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.LONG, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(-7L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(9L))
+    }
+
+    @Test
+    fun `an unsigned int32 under an int-mapped catalog type drops bounds`() {
+        // No legal promotion produces this pairing (nothing promotes INTO
+        // int from uint32), so it can only arrive from a foreign writer
+        // disagreeing with the declared type. The values do not fit a
+        // 4-byte signed Iceberg int bound and parquet ordered the chunk's
+        // min/max unsigned, so there is nothing honest to store.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(-1)))))
+        for (type in listOf(ColType.INT, ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16)) {
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.valueCount).describedAs(type.wire).isEqualTo(10)
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isNull()
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isNull()
+        }
+    }
+
+    @Test
     fun `uint64 bounds are the decimal encoding of the unsigned value`() {
         val a =
             leaf(
