@@ -1,0 +1,239 @@
+package com.posthog.hoglake.service
+
+import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.testing.PgTestSupport
+import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.awaitility.Awaitility.await
+import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.Tag
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.TestInstance
+import java.time.Duration
+import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+
+@Tag("integration")
+@TestInstance(TestInstance.Lifecycle.PER_CLASS)
+class TableCreationIntegrationTest {
+    private val db = PgTestSupport.freshDatabase()
+    private val catalogs = CatalogService(db.jdbi)
+    private val creations = TableCreationService(db.jdbi, catalogs, CommitService(db.jdbi))
+    private val definition = TableCreationDefinition("test", "target", listOf(ColumnDef("id", ColType.LONG)))
+
+    @AfterAll
+    fun close() = db.close()
+
+    private fun catalog(): String {
+        val name = "creation-" + UUID.randomUUID().toString().replace("-", "")
+        catalogs.createCatalog(name, "s3://bucket/$name")
+        catalogs.createNamespace(name, "test")
+        return name
+    }
+
+    private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
+
+    @Test
+    fun `prepare is invisible and retries publish exactly once`() {
+        val catalog = catalog()
+        val head = catalogs.getCatalog(catalog)
+        val id = UUID.randomUUID()
+        val prepared = creations.prepare(catalog, id, definition)
+        assertThat(creations.prepare(catalog, id, definition)).isEqualTo(prepared)
+        assertThat(prepared.columns.map { it.fieldId }).containsExactly(1L)
+        assertThat(catalogs.getCatalog(catalog)).isEqualTo(head)
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        val committed = creations.publish(catalog, id, listOf(file(prepared)))
+        assertThat(committed.state).isEqualTo("committed")
+        assertThat(committed.snapshotId).isEqualTo(head.headSnapshotId + 1)
+        assertThat(committed.schemaVersion).isEqualTo(head.schemaVersion + 1)
+        val table = catalogs.getTable(catalog, "test", "target")
+        assertThat(table.tableUuid).isEqualTo(prepared.tableUuid)
+        assertThat(table.recordCount).isEqualTo(7)
+        assertThat(table.fileCount).isEqualTo(1)
+        assertThat(table.fileSizeBytes).isEqualTo(100)
+        assertThat(creations.publish(catalog, id, listOf(file(prepared)))).isEqualTo(committed)
+        assertThat(creations.abort(catalog, id)).isEqualTo(committed)
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(committed.snapshotId)
+        assertThatThrownBy {
+            creations.publish(catalog, id, emptyList())
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            creations.prepare(catalog, id, definition.copy(name = "different"))
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        catalogs.dropTable(catalog, "test", "target")
+        val replacement = catalogs.createTable(catalog, "test", "target", definition.columns)
+        assertThat(creations.publish(catalog, id, listOf(file(prepared)))).isEqualTo(committed)
+        assertThat(catalogs.getTable(catalog, "test", "target").tableUuid).isEqualTo(replacement.tableUuid)
+    }
+
+    @Test
+    fun `invalid registration rolls back table snapshot and receipt`() {
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val head = catalogs.getCatalog(catalog)
+        // Negative count is checked by shared registration code, after table rows are written.
+        assertThatThrownBy {
+            creations.publish(
+                catalog,
+                operation.operationId,
+                listOf(file(operation).copy(recordCount = -1)),
+            )
+        }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        assertThat(catalogs.getCatalog(catalog)).isEqualTo(head)
+        assertThat(creations.status(catalog, operation.operationId).state).isEqualTo("prepared")
+        assertThat(creations.publish(catalog, operation.operationId, emptyList()).state).isEqualTo("committed")
+        assertThat(catalogs.getTable(catalog, "test", "target").fileCount).isZero()
+    }
+
+    @Test
+    fun `same target has one winner and permanent rejection`() {
+        val catalog = catalog()
+        val first = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val second = creations.prepare(catalog, UUID.randomUUID(), definition)
+        Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+            val gate = CountDownLatch(1)
+            val futures =
+                listOf(first, second).map { operation ->
+                    executor.submit<TableCreation> {
+                        gate.await()
+                        creations.publish(catalog, operation.operationId, emptyList())
+                    }
+                }
+            gate.countDown()
+            val results = futures.map { it.get(10, TimeUnit.SECONDS) }
+            assertThat(results.map { it.state }).containsExactlyInAnyOrder("committed", "rejected")
+            val rejected = results.single { it.state == "rejected" }
+            catalogs.dropTable(catalog, "test", "target")
+            assertThat(creations.publish(catalog, rejected.operationId, emptyList())).isEqualTo(rejected)
+            assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        }
+    }
+
+    @Test
+    fun `concurrent duplicate commit produces one snapshot`() {
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+            val gate = CountDownLatch(1)
+            val results =
+                (1..8).map {
+                    executor.submit<TableCreation> {
+                        gate.await()
+                        creations.publish(catalog, operation.operationId, listOf(file(operation)))
+                    }
+                }
+            gate.countDown()
+            assertThat(results.map { it.get(10, TimeUnit.SECONDS) }.distinct()).hasSize(1)
+        }
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head + 1)
+        assertThat(catalogs.getTable(catalog, "test", "target").recordCount).isEqualTo(7)
+    }
+
+    @Test
+    fun `abort races publication without deleting a committed table`() {
+        repeat(10) {
+            val catalog = catalog()
+            val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+            Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+                val gate = CountDownLatch(1)
+                val publish =
+                    executor.submit<TableCreation> {
+                        gate.await()
+                        creations.publish(catalog, operation.operationId, emptyList())
+                    }
+                val abort =
+                    executor.submit<TableCreation> {
+                        gate.await()
+                        creations.abort(catalog, operation.operationId)
+                    }
+                gate.countDown()
+                assertThat(publish.get(10, TimeUnit.SECONDS).state).isEqualTo(abort.get(10, TimeUnit.SECONDS).state)
+                val state = creations.status(catalog, operation.operationId).state
+                assertThat(state).isIn("committed", "aborted")
+                assertThat(catalogs.listTables(catalog, "test").size).isEqualTo(if (state == "committed") 1 else 0)
+            }
+        }
+    }
+
+    @Test
+    fun `expiry fences late publication and namespace identity is pinned`() {
+        val catalog = catalog()
+        val expired = creations.prepare(catalog, UUID.randomUUID(), definition)
+        db.jdbi.useHandle<Exception> { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table_creation SET expires_at = clock_timestamp() - interval '1 second'
+                WHERE operation_id = :id
+                """,
+            )
+                .bind("id", expired.operationId).execute()
+        }
+        assertThat(creations.publish(catalog, expired.operationId, emptyList()).state).isEqualTo("aborted")
+        val pending = creations.prepare(catalog, UUID.randomUUID(), definition)
+        db.jdbi.useHandle<Exception> { h ->
+            h.createUpdate("UPDATE hog_namespace SET name = 'old' WHERE catalog_id = :catalog")
+                .bind("catalog", catalogs.getCatalog(catalog).catalogId).execute()
+        }
+        catalogs.createNamespace(catalog, "test")
+        assertThat(creations.publish(catalog, pending.operationId, emptyList()).reason).isEqualTo("namespace_changed")
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+    }
+
+    @Test
+    fun `readers cannot observe creation before publication transaction commits`() {
+        val catalog = catalog()
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        db.jdbi.useHandle<Exception> { h ->
+            h.execute(
+                """
+                CREATE FUNCTION block_creation_receipt() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                  IF NEW.state = 'committed' THEN PERFORM pg_advisory_xact_lock(836251); END IF;
+                  RETURN NEW;
+                END $$;
+                CREATE TRIGGER block_receipt BEFORE UPDATE ON hog_table_creation
+                FOR EACH ROW EXECUTE FUNCTION block_creation_receipt();
+            """,
+            )
+            h.begin()
+            h.execute("SELECT pg_advisory_xact_lock(836251)")
+            Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+                val publish =
+                    executor.submit<TableCreation> {
+                        creations.publish(catalog, prepared.operationId, listOf(file(prepared)))
+                    }
+                try {
+                    await().atMost(Duration.ofSeconds(10)).until {
+                        db.jdbi.withHandle<Boolean, Exception> { check ->
+                            check.createQuery(
+                                """
+                                SELECT EXISTS(SELECT 1 FROM pg_locks
+                                WHERE locktype = 'advisory' AND objid = 836251 AND NOT granted)
+                                """,
+                            )
+                                .mapTo(Boolean::class.java).one()
+                        }
+                    }
+                    assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+                    assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+                } finally {
+                    h.commit()
+                }
+                assertThat(publish.get(10, TimeUnit.SECONDS).state).isEqualTo("committed")
+            }
+            h.execute("DROP TRIGGER block_receipt ON hog_table_creation; DROP FUNCTION block_creation_receipt()")
+        }
+        assertThat(catalogs.getTable(catalog, "test", "target").recordCount).isEqualTo(7)
+    }
+}

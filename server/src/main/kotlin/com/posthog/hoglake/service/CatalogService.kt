@@ -29,6 +29,7 @@ import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Instant
+import java.util.UUID
 
 /**
  * Catalog DDL + read paths. Every DDL operation is one transaction that
@@ -177,55 +178,72 @@ class CatalogService(private val jdbi: Jdbi) {
             "$namespace.$name",
             detail = { "columns=${columns.size}" },
         ) {
-            Identifiers.validate("table", name)
-            if (columns.isEmpty()) {
-                throw HoglakeException.Validation("table '$name' must have at least one column")
-            }
-            columns.forEach { Identifiers.validate("column", it.name) }
-            val dupes = columns.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
-            if (dupes.isNotEmpty()) {
-                throw HoglakeException.Validation("duplicate column names: ${dupes.sorted()}")
-            }
-            jdbi.inTransactionUnchecked { h ->
-                val cat = requireCatalog(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId)
-                val ns = requireNamespace(h, cat, namespace)
-                if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name) != null) {
-                    throw HoglakeException.AlreadyExists(
-                        "table '$name' already exists in namespace '$namespace'",
-                    )
-                }
-                val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
-                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
-                val tableId = CatalogRepo.allocateTableId(h, cat.catalogId)
-                SnapshotRepo.insertChange(
-                    h,
-                    cat.catalogId,
-                    alloc.snapshotId,
-                    ChangeKind.TABLE_CREATED,
-                    tableId,
-                )
-                val tableUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId)
-                val firstFieldId = TableRepo.allocateFieldIds(h, cat.catalogId, tableId, columns.size)
-                val cols =
-                    columns.mapIndexed { i, def ->
-                        Column(fieldId = firstFieldId + i, ordinal = i, def = def)
-                    }
-                TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
-                TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
-                TableRepo.insertStatsRow(h, cat.catalogId, tableId)
-                TableInfo(
-                    tableId = tableId,
-                    tableUuid = tableUuid,
-                    namespace = ns.name,
-                    name = name,
-                    columns = cols,
-                    recordCount = 0,
-                    fileCount = 0,
-                    fileSizeBytes = 0,
-                )
-            }
+            jdbi.inTransactionUnchecked { h -> createTable(h, catalog, namespace, name, columns) }
         }
+
+    /** Caller may compose creation with file registration in the same transaction. */
+    internal fun createTable(
+        h: Handle,
+        catalog: String,
+        namespace: String,
+        name: String,
+        columns: List<ColumnDef>,
+        tableUuid: UUID = UUID.randomUUID(),
+    ): TableInfo {
+        validateTableDefinition(name, columns)
+        val cat = requireCatalog(h, catalog)
+        Locks.acquireCatalogCommitLock(h, cat.catalogId)
+        val ns = requireNamespace(h, cat, namespace)
+        if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name) != null) {
+            throw HoglakeException.AlreadyExists(
+                "table '$name' already exists in namespace '$namespace'",
+            )
+        }
+        val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
+        SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+        val tableId = CatalogRepo.allocateTableId(h, cat.catalogId)
+        SnapshotRepo.insertChange(
+            h,
+            cat.catalogId,
+            alloc.snapshotId,
+            ChangeKind.TABLE_CREATED,
+            tableId,
+        )
+        val createdUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid)
+        val firstFieldId = TableRepo.allocateFieldIds(h, cat.catalogId, tableId, columns.size)
+        val cols =
+            columns.mapIndexed { i, def ->
+                Column(fieldId = firstFieldId + i, ordinal = i, def = def)
+            }
+        TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
+        TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
+        TableRepo.insertStatsRow(h, cat.catalogId, tableId)
+        return TableInfo(
+            tableId = tableId,
+            tableUuid = createdUuid,
+            namespace = ns.name,
+            name = name,
+            columns = cols,
+            recordCount = 0,
+            fileCount = 0,
+            fileSizeBytes = 0,
+        )
+    }
+
+    internal fun validateTableDefinition(
+        name: String,
+        columns: List<ColumnDef>,
+    ) {
+        Identifiers.validate("table", name)
+        if (columns.isEmpty()) {
+            throw HoglakeException.Validation("table '$name' must have at least one column")
+        }
+        columns.forEach { Identifiers.validate("column", it.name) }
+        val dupes = columns.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+        if (dupes.isNotEmpty()) {
+            throw HoglakeException.Validation("duplicate column names: ${dupes.sorted()}")
+        }
+    }
 
     fun dropTable(
         catalog: String,

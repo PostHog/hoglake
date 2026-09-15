@@ -1,0 +1,277 @@
+package com.posthog.hoglake.service
+
+import com.fasterxml.jackson.databind.SerializationFeature
+import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.NamespaceRepo
+import com.posthog.hoglake.persistence.TableRepo
+import org.jdbi.v3.core.Handle
+import org.jdbi.v3.core.Jdbi
+import org.jdbi.v3.core.kotlin.inTransactionUnchecked
+import java.time.Instant
+import java.util.UUID
+
+data class TableCreationDefinition(val namespace: String, val name: String, val columns: List<ColumnDef>)
+
+data class TableCreation(
+    val operationId: UUID,
+    val tableUuid: UUID,
+    val definition: TableCreationDefinition,
+    val columns: List<Column>,
+    val writePath: String,
+    val state: String,
+    val expiresAt: Instant,
+    val snapshotId: Long?,
+    val schemaVersion: Long?,
+    val reason: String?,
+)
+
+/**
+ * Unpublished definitions plus permanent publication receipts. Every state transition takes
+ * the catalog lock, including abort/expiry. A prepared status is never a cleanup permit:
+ * only a terminal rejected/aborted receipt fences an in-flight publication.
+ */
+class TableCreationService(
+    private val jdbi: Jdbi,
+    private val catalogs: CatalogService,
+    private val commits: CommitService,
+) {
+    private val mapper =
+        jacksonObjectMapper().findAndRegisterModules().enable(
+            SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS,
+        )
+
+    fun prepare(
+        catalog: String,
+        operationId: UUID,
+        definition: TableCreationDefinition,
+    ): TableCreation =
+        jdbi.inTransactionUnchecked { h ->
+            val cat = CatalogRepo.require(h, catalog)
+            Locks.acquireCatalogCommitLock(h, cat.catalogId)
+            val encoded = mapper.writeValueAsString(definition)
+            if (exists(h, cat.catalogId, operationId)) {
+                requireSame(h, cat.catalogId, operationId, "definition", encoded)
+                return@inTransactionUnchecked load(h, cat.catalogId, operationId)
+            }
+            catalogs.validateTableDefinition(definition.name, definition.columns)
+            Identifiers.validate("namespace", definition.namespace)
+            if (definition.columns.size > 10000) throw HoglakeException.Validation("too many columns")
+            val ns =
+                NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
+                    ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
+            // Prefix includes a server-generated identity: even a future catalog recreation
+            // and reused client operation id cannot reuse old object paths.
+            val uuid = UUID.randomUUID()
+            h.createUpdate(
+                """
+                INSERT INTO hog_table_creation (catalog_id, operation_id, namespace_id, definition, table_uuid, write_path)
+                VALUES (:catalog, :operation, :namespace, CAST(:definition AS jsonb), :uuid, :path)
+                """,
+            ).bind("catalog", cat.catalogId).bind("operation", operationId)
+                .bind("namespace", ns.namespaceId).bind("definition", encoded).bind("uuid", uuid)
+                .bind("path", cat.dataPath.trimEnd('/') + "/data/$uuid/").execute()
+            load(h, cat.catalogId, operationId)
+        }
+
+    fun status(
+        catalog: String,
+        operationId: UUID,
+    ): TableCreation =
+        jdbi.inTransactionUnchecked { h ->
+            val cat = CatalogRepo.require(h, catalog)
+            Locks.acquireCatalogCommitLock(h, cat.catalogId)
+            load(h, cat.catalogId, operationId)
+        }
+
+    fun abort(
+        catalog: String,
+        operationId: UUID,
+    ): TableCreation =
+        jdbi.inTransactionUnchecked { h ->
+            val cat = CatalogRepo.require(h, catalog)
+            Locks.acquireCatalogCommitLock(h, cat.catalogId)
+            val operation = load(h, cat.catalogId, operationId)
+            if (operation.state == "prepared") transition(h, cat.catalogId, operationId, "aborted", "client_abort")
+            load(h, cat.catalogId, operationId)
+        }
+
+    fun publish(
+        catalog: String,
+        operationId: UUID,
+        files: List<FileRegistration>,
+    ): TableCreation =
+        jdbi.inTransactionUnchecked { h ->
+            val cat = CatalogRepo.require(h, catalog)
+            Locks.acquireCatalogCommitLock(h, cat.catalogId)
+            val operation = load(h, cat.catalogId, operationId)
+            val encoded = mapper.writeValueAsString(files)
+            if (operation.state == "committed" || operation.state == "rejected") {
+                requireSame(h, cat.catalogId, operationId, "files", encoded)
+                return@inTransactionUnchecked operation
+            }
+            if (operation.state == "aborted") return@inTransactionUnchecked operation
+            if (files.size > 10000) throw HoglakeException.Validation("too many files")
+            if (files.map { it.path }.toSet().size != files.size) {
+                throw HoglakeException.Validation(
+                    "duplicate file paths",
+                )
+            }
+            files.forEach {
+                if (!it.path.startsWith(
+                        operation.writePath,
+                    )
+                ) {
+                    throw HoglakeException.Validation("file outside operation write_path")
+                }
+                if (it.footerSize == null || it.footerSize < 0 || it.footerSize > it.fileSizeBytes - 8) {
+                    throw HoglakeException.Validation("invalid footer_size")
+                }
+            }
+            h.createUpdate(
+                """
+                UPDATE hog_table_creation SET files = CAST(:files AS jsonb) WHERE catalog_id = :catalog AND
+                operation_id = :operation
+                """,
+            )
+                .bind("files", encoded).bind("catalog", cat.catalogId).bind("operation", operationId).execute()
+            val definition = operation.definition
+            val ns = NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
+            val originalNamespace =
+                h.createQuery(
+                    """
+                    SELECT namespace_id FROM hog_table_creation
+                    WHERE catalog_id = :catalog AND operation_id = :operation
+                    """,
+                )
+                    .bind("catalog", cat.catalogId).bind("operation", operationId).mapTo(Long::class.java).one()
+            if (ns == null || ns.namespaceId != originalNamespace) {
+                transition(h, cat.catalogId, operationId, "rejected", "namespace_changed")
+            } else if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, definition.name) != null) {
+                transition(h, cat.catalogId, operationId, "rejected", "target_exists")
+            } else {
+                val table =
+                    catalogs.createTable(
+                        h,
+                        catalog,
+                        definition.namespace,
+                        definition.name,
+                        definition.columns,
+                        operation.tableUuid,
+                    )
+                check(table.columns == operation.columns)
+                val published = CatalogRepo.require(h, catalog)
+                commits.registerInitialFiles(
+                    h,
+                    cat.catalogId,
+                    cat.dataPath,
+                    definition.namespace,
+                    definition.name,
+                    table.tableId,
+                    published.headSnapshotId,
+                    files,
+                )
+                h.createUpdate(
+                    """
+                    UPDATE hog_table_creation SET state = 'committed', snapshot_id = :snapshot, schema_version = :version
+                    WHERE catalog_id = :catalog AND operation_id = :operation
+                    """,
+                ).bind("snapshot", published.headSnapshotId).bind("version", published.schemaVersion)
+                    .bind("catalog", cat.catalogId).bind("operation", operationId).execute()
+            }
+            load(h, cat.catalogId, operationId)
+        }
+
+    private fun exists(
+        h: Handle,
+        catalog: Long,
+        operation: UUID,
+    ): Boolean =
+        h.createQuery(
+            """
+            SELECT count(*) FROM hog_table_creation
+            WHERE catalog_id = :catalog AND operation_id = :operation
+            """,
+        )
+            .bind("catalog", catalog).bind("operation", operation).mapTo(Int::class.java).one() == 1
+
+    private fun requireSame(
+        h: Handle,
+        catalog: Long,
+        operation: UUID,
+        column: String,
+        encoded: String,
+    ) {
+        check(column == "definition" || column == "files")
+        val same =
+            h.createQuery(
+                """
+                SELECT $column = CAST(:encoded AS jsonb) FROM hog_table_creation WHERE catalog_id = :catalog AND
+                operation_id = :operation
+                """,
+            )
+                .bind(
+                    "encoded",
+                    encoded,
+                ).bind("catalog", catalog).bind("operation", operation).mapTo(Boolean::class.java).one()
+        if (!same) throw HoglakeException.CommitConflict("operation id reused with a different $column")
+    }
+
+    private fun transition(
+        h: Handle,
+        catalog: Long,
+        operation: UUID,
+        state: String,
+        reason: String,
+    ) {
+        h.createUpdate(
+            """
+            UPDATE hog_table_creation SET state = :state, reason = :reason WHERE catalog_id = :catalog AND
+            operation_id = :operation AND state = 'prepared'
+            """,
+        )
+            .bind("state", state).bind("reason", reason).bind("catalog", catalog).bind("operation", operation).execute()
+    }
+
+    private fun load(
+        h: Handle,
+        catalog: Long,
+        operation: UUID,
+    ): TableCreation {
+        // Lazy expiry is sufficient to fence late publication; no object deletion is performed.
+        h.createUpdate(
+            """
+            UPDATE hog_table_creation SET state = 'aborted', reason = 'expired' WHERE catalog_id = :catalog AND
+            operation_id = :operation AND state = 'prepared' AND expires_at <= clock_timestamp()
+            """,
+        )
+            .bind("catalog", catalog).bind("operation", operation).execute()
+        return h.createQuery(
+            "SELECT * FROM hog_table_creation WHERE catalog_id = :catalog AND operation_id = :operation",
+        )
+            .bind("catalog", catalog).bind("operation", operation)
+            .map { rs, _ ->
+                val definition = mapper.readValue<TableCreationDefinition>(rs.getString("definition"))
+                TableCreation(
+                    operation, rs.getObject("table_uuid", UUID::class.java), definition,
+                    definition.columns.mapIndexed { i, def -> Column(i.toLong() + 1, i, def) },
+                    rs.getString(
+                        "write_path",
+                    ),
+                    rs.getString(
+                        "state",
+                    ),
+                    rs.getObject("expires_at", java.time.OffsetDateTime::class.java).toInstant(),
+                    rs.getObject("snapshot_id")?.let { (it as Number).toLong() },
+                    rs.getObject("schema_version")?.let { (it as Number).toLong() }, rs.getString("reason"),
+                )
+            }.findOne().orElseThrow { HoglakeException.NotFound("table creation operation '$operation'") }
+    }
+}

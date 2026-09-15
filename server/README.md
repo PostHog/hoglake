@@ -591,3 +591,37 @@ JUnit 5 + AssertJ; property tests via kotest-property (strategy:
 (`docker-java.properties` in test resources pins the Docker API version
 for recent daemons). The schema-equivalence test and an OCC concurrency
 torture suite run with everything else in `just test`.
+
+
+## Atomic CREATE / CTAS
+
+Catalog responses advertise `atomic-table-creation-v1`. Prepare a definition with
+`PUT /v1/catalogs/{catalog}/table-creations/{operation-uuid}`, write Parquet using
+the returned field IDs and `write_path`, then POST the ordered file registrations
+to that operation's `/commit`. Preparation creates no visible table or snapshot
+and does not reserve the target name. Publication installs the definition, files,
+and receipt in one database transaction and one snapshot. Empty registrations
+create an empty table. INSERT continues to use the existing append API.
+
+Repeat preparation with the same definition, or publication with the identical
+ordered file list, to recover lost responses. Different payloads under the same
+operation ID conflict. GET the operation to inspect its durable state. A committed
+receipt remains valid even after subsequent table deletion or replacement.
+POST `/abort` to atomically fence publication; if publication already won, abort
+returns `committed` and never deletes the table. HTTP 200 reports operation state,
+including `rejected` and `aborted`; clients must inspect the response state.
+
+Prepared operations expire after 24 hours, checked under the publication lock on
+status, abort, preparation retry, or publication. Terminal receipts are retained
+for the lifetime of the catalog in this version. No automatic object deletion is added: failed or
+aborted writes can leave objects. A `prepared` status or an unavailable receipt is
+not permission to delete data. Only terminal aborted/rejected operations are
+eligible for operator cleanup, after their writers have stopped. Never remove
+files from committed operations based on operation age; normal catalog retention
+owns their lifecycle. There is no automatic fallback to staging-table rename.
+
+The API supports unpartitioned creation, at most 10000 columns and 10000 files per
+operation, and validates registration metadata using the existing append checks.
+It does not open Parquet objects at publication time. Field IDs are table-local,
+start at one, and are installed with the prepared UUID at publication. Expanding
+receipt retention, automated orphan cleanup, or idempotent INSERT is separate work.
