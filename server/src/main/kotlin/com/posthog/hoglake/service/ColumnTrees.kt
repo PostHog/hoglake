@@ -100,7 +100,12 @@ object ColumnTrees {
         // and hands it back on every read. Symmetric with the
         // children-on-a-scalar refusal above: each type takes exactly the
         // one it has a meaning for.
-        if (def.typeParams != null && def.typeParams.isNotEmpty()) {
+        // PRESENT, not non-empty — the same criterion the scalar
+        // children check uses above. `"type_params": {}` on a container
+        // is still a caller claiming this column has parameters, and
+        // normalising it to "omitted" answered 201 to a request this
+        // message promises a 422 for.
+        if (def.typeParams != null) {
             throw HoglakeException.Validation(
                 "column '$qualified' is '${def.type.wire}', a nested container, and cannot have " +
                     "type_params: a container's shape is its children, not its parameters",

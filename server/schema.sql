@@ -200,7 +200,15 @@ CREATE TABLE hog_column (
     -- are impossible by construction (ids are allocated strictly
     -- increasing, parents before children).
     CONSTRAINT hog_column_parent_not_self
-        CHECK (parent_field_id IS NULL OR parent_field_id <> field_id)
+        CHECK (parent_field_id IS NULL OR parent_field_id <> field_id),
+    -- Ids are allocated depth-first, parents before children, so a
+    -- parent's id is always BELOW its children's. That ordering is what
+    -- makes deeper cycles impossible by construction; as a row-local
+    -- CHECK it costs nothing and it subsumes the self-reference above,
+    -- which keeps its own name because its message is the one a
+    -- confused client needs.
+    CONSTRAINT hog_column_parent_precedes_child
+        CHECK (parent_field_id IS NULL OR parent_field_id < field_id)
 );
 CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;

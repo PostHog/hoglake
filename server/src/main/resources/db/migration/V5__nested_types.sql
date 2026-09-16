@@ -61,7 +61,17 @@ SET lock_timeout = '5s';
 -- expected. Check first and say so.
 DO $$
 DECLARE
-    found_def text;
+    found_def   text;
+    found_types text[];
+    -- V4's vocabulary, in V4's order. The order is load-bearing: the
+    -- schema-equivalence gate compares the normalized constraint text,
+    -- so a catalog whose CHECK lists the same 23 names in a different
+    -- order is NOT the state this migration appends to.
+    expected_types CONSTANT text[] := ARRAY[
+        'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
+        'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
+        'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
+        'timestamptz', 'string', 'json', 'uuid', 'binary'];
 BEGIN
     SELECT pg_get_constraintdef(oid) INTO found_def
     FROM pg_constraint
@@ -79,10 +89,28 @@ BEGIN
             'V5 found hog_column_col_type_check but it does not constrain col_type (%). '
             'Refusing to replace a constraint this migration does not recognise.', found_def;
     END IF;
-    IF found_def NOT LIKE '%timestamp_ns%' THEN
+
+    -- The DEFINITION, not a substring of it. V5 DROPs this constraint
+    -- and recreates it, so one that merely MENTIONS a V4 type while
+    -- permitting a different vocabulary — a hand-patched catalog that
+    -- allows 'variant', say — would be discarded silently, which is the
+    -- divergence this guard claims to catch.
+    --
+    -- Compared as the extracted MEMBER LIST rather than as one exact
+    -- string: pg_get_constraintdef renders `IN (...)` as
+    -- `= ANY (ARRAY['boolean'::text, ...])`, and the casts and spacing
+    -- in that rendering are Postgres's business and have changed
+    -- before. The vocabulary and its order are the guarantee V4 made;
+    -- pin those and nothing else.
+    SELECT array_agg(m[1] ORDER BY ord) INTO found_types
+    FROM regexp_matches(found_def, '''([a-z0-9_]+)''', 'g') WITH ORDINALITY AS t(m, ord);
+
+    IF found_types IS DISTINCT FROM expected_types THEN
         RAISE EXCEPTION
-            'V5 found hog_column_col_type_check without V4''s scalar types (%). This catalog '
-            'is at a pre-V4 vocabulary; run the chain in order.', found_def;
+            'V5 expected hog_column_col_type_check to permit exactly V4''s vocabulary, in V4''s '
+            'order. Expected: %. Found: % (from %). V5 replaces this constraint and will not '
+            'silently discard a vocabulary it does not recognise; reconcile with V4 before '
+            're-running.', expected_types, found_types, found_def;
     END IF;
 END
 $$;
@@ -146,6 +174,15 @@ ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check CHECK (col_type 
 -- children) and are not worth a recursive CHECK.
 ALTER TABLE hog_column ADD CONSTRAINT hog_column_parent_not_self
     CHECK (parent_field_id IS NULL OR parent_field_id <> field_id);
+-- Ids are allocated depth-first, parents before children, so a parent's
+-- id is always BELOW its children's. That ordering is what makes
+-- "deeper cycles are impossible by construction" true, and until now it
+-- was only a comment. As a row-local CHECK it costs nothing, it
+-- subsumes the self-reference above (kept separately because its
+-- message is the one a confused client needs), and it makes a cycle
+-- unrepresentable rather than merely unlikely.
+ALTER TABLE hog_column ADD CONSTRAINT hog_column_parent_precedes_child
+    CHECK (parent_field_id IS NULL OR parent_field_id < field_id);
 
 DROP INDEX hog_column_live_ordinal;
 CREATE UNIQUE INDEX hog_column_live_ordinal

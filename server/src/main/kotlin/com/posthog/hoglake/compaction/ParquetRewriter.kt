@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.SortDirection
@@ -484,7 +485,37 @@ object ParquetRewriter {
         schema: MessageType,
         liveColumns: List<Column>,
         inputPath: Path,
-    ): List<Step?> = planChildren(schema.fields, liveColumns, inputPath)
+    ): List<Step?> {
+        // DUPLICATE IDS, before any binding. planChildren elects the
+        // FIRST field with a matching id, so a file declaring one id
+        // twice would have had the rewrite source live data from
+        // whichever came first — and then end-snapshot the input, making
+        // the guess permanent. There is no correct resolution, so the
+        // group skips with unconvertible_schema instead.
+        val duplicates = duplicateFieldIds(schema.fields)
+        if (duplicates.isNotEmpty()) {
+            throw UnconvertibleSchemaException(
+                "$inputPath declares field id(s) ${duplicates.sorted()} more than once; field ids " +
+                    "are the binding contract and a duplicate has no correct resolution",
+            )
+        }
+        return planChildren(schema.fields, liveColumns, inputPath)
+    }
+
+    /** Field ids [fields] declares more than once, at any depth. */
+    private fun duplicateFieldIds(fields: List<Type>): Set<Int> {
+        val seen = HashSet<Int>()
+        val dupes = HashSet<Int>()
+
+        fun walk(level: List<Type>) {
+            for (field in level) {
+                field.id?.intValue()?.let { if (!seen.add(it)) dupes.add(it) }
+                if (!field.isPrimitive) walk(field.asGroupType().fields)
+            }
+        }
+        walk(fields)
+        return dupes
+    }
 
     /** [columnPlan]'s recursion: one step per live column among [srcFields]. */
     private fun planChildren(
@@ -501,6 +532,45 @@ object ParquetRewriter {
                     ?: return@map null
             planNode(srcFields[srcIndex], srcIndex, column, inputPath)
         }
+
+    /**
+     * The step for one SYNTHETIC child — a list's element, a map's key
+     * or value — at [position] inside the repetition layer.
+     *
+     * Bound by ID when the file declares one, by POSITION when it does
+     * not, and never by NAME. The parquet spec says the synthetic names
+     * are insignificant (this object's own `repeatedEntryGroup` says so
+     * about the layer above), writers use `item`, `bag`, `entries` — but
+     * [planChildren]'s id-less fallback matches on the LIVE column's
+     * name, which for a list element is always `element`. So an id-less
+     * element named `item` was refused here while the reader bound it
+     * positionally and produced stats: the two surfaces disagreeing
+     * about the same file, which is the drift the shared
+     * `maxUnsignedParquetWidth` exists to prevent.
+     *
+     * The positional fallback is the same exemption `missingFieldIds`
+     * grants the repetition layer, and safe for the same reason: such a
+     * file is already flagged, so renames on its table are blocked and
+     * position cannot drift out from under it.
+     */
+    private fun planSynthetic(
+        srcFields: List<Type>,
+        position: Int,
+        column: Column,
+        inputPath: Path,
+    ): Step? {
+        val byId = srcFields.indexOfFirst { it.id?.intValue()?.toLong() == column.fieldId }
+        val srcIndex =
+            when {
+                byId >= 0 -> byId
+                // Only fall back when the candidate declares no id at
+                // all: a child naming a DIFFERENT id is a mismatch, not
+                // an unnamed one.
+                position < srcFields.size && srcFields[position].id == null -> position
+                else -> return null
+            }
+        return planNode(srcFields[srcIndex], srcIndex, column, inputPath)
+    }
 
     /**
      * The step producing [column] from the input field [src].
@@ -524,6 +594,7 @@ object ParquetRewriter {
      * evolvable columns (add_column with a `parent`), so one the input
      * predates is the same situation one level down.
      */
+
     private fun planNode(
         src: Type,
         srcIndex: Int,
@@ -535,6 +606,22 @@ object ParquetRewriter {
                 "column '${column.def.name}' (live type ${column.def.type.wire}) cannot be " +
                     "produced from $inputPath: $detail",
             )
+
+        // REPETITION, before anything else. Every catalog type reachable
+        // here holds AT MOST ONE value per row: a scalar, a struct, or a
+        // container whose repetition lives in its own synthetic layer
+        // (which planNode is never handed — it descends THROUGH it). A
+        // REPEATED node says "many per row", and the copy below reads
+        // repetition 0 and only repetition 0. Measured before this
+        // guard: a 2-repetition struct rewrote to its first repetition
+        // alone, half the values gone, rowsWritten still equal to the
+        // record count so nothing looked wrong — and the inputs were
+        // then end-snapshotted and expired.
+        if (src.isRepetition(Type.Repetition.REPEATED)) {
+            refuseShape(
+                "the input field is REPEATED, but '${column.def.type.wire}' holds one value per row",
+            )
+        }
 
         if (!column.def.type.isNested) {
             if (!src.isPrimitive) refuseShape("the input field is a group, not a primitive leaf")
@@ -556,8 +643,14 @@ object ParquetRewriter {
                 // rows of empty structs, and the commit would
                 // end-snapshot the input that held the real values —
                 // F1's shape through a different door. Refuse instead.
+                // CONTAINER annotations only, matching the reader
+                // (FooterStats.isContainerAnnotation). Refusing ANY
+                // annotation made a struct-shaped group carrying a stray
+                // unrelated one (ENUM, say) permanently uncompactable,
+                // and the reader stopped bounding it too — a table that
+                // worked before this phase would have quietly stopped.
                 val annotation = group.logicalTypeAnnotation
-                if (annotation != null) {
+                if (FooterStats.isContainerAnnotation(annotation)) {
                     refuseShape(
                         "the input field is a '$annotation' group, not a struct; a container " +
                             "wearing a struct's field id is a type mismatch, not a schema evolution",
@@ -572,8 +665,16 @@ object ParquetRewriter {
                 if (entry.fieldCount != 1) {
                     refuseShape("the input list's repeated group has ${entry.fieldCount} fields, not 1")
                 }
+                // The CATALOG's arity too: a container row with the wrong
+                // child count is a corrupt catalog, and `single()` threw
+                // a raw NoSuchElementException out of the sweep.
+                if (column.children.size != 1) {
+                    refuseShape(
+                        "the live list column has ${column.children.size} children, not 1 (its element)",
+                    )
+                }
                 val element =
-                    planChildren(entry.fields, listOf(column.children.single()), inputPath).single()
+                    planSynthetic(entry.fields, 0, column.children[0], inputPath)
                         ?: refuseShape("the input list's element does not match the live element field id")
                 Step.ListStep(srcIndex, element)
             }
@@ -592,10 +693,17 @@ object ParquetRewriter {
                 if (!entry.getType(0).isRepetition(Type.Repetition.REQUIRED)) {
                     refuseShape("the input map's key is not REQUIRED; Iceberg map keys are non-nullable")
                 }
-                val planned = planChildren(entry.fields, column.children, inputPath)
-                val key = planned[0] ?: refuseShape("the input map's key does not match the live key field id")
+                if (column.children.size != 2) {
+                    refuseShape(
+                        "the live map column has ${column.children.size} children, not 2 (key, value)",
+                    )
+                }
+                val key =
+                    planSynthetic(entry.fields, 0, column.children[0], inputPath)
+                        ?: refuseShape("the input map's key does not match the live key field id")
                 val value =
-                    planned[1] ?: refuseShape("the input map's value does not match the live value field id")
+                    planSynthetic(entry.fields, 1, column.children[1], inputPath)
+                        ?: refuseShape("the input map's value does not match the live value field id")
                 Step.MapStep(srcIndex, key, value)
             }
             else -> error("unreachable: ${column.def.type} is not a container")

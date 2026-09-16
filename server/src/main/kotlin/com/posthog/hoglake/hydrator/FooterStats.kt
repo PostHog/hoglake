@@ -155,13 +155,7 @@ object FooterStats {
      * child is the element itself).
      */
     private fun syntheticRepetitionLayer(group: GroupType): GroupType? {
-        val annotation = group.logicalTypeAnnotation
-        if (annotation !is LogicalTypeAnnotation.ListLogicalTypeAnnotation &&
-            annotation !is LogicalTypeAnnotation.MapLogicalTypeAnnotation &&
-            annotation !is LogicalTypeAnnotation.MapKeyValueTypeAnnotation
-        ) {
-            return null
-        }
+        if (!isContainerAnnotation(group.logicalTypeAnnotation)) return null
         val only = group.fields.singleOrNull() ?: return null
         if (only.isPrimitive || !only.isRepetition(Type.Repetition.REPEATED)) return null
         return only.asGroupType()
@@ -198,6 +192,24 @@ object FooterStats {
                 "parquet schema of $filePath carries no field ids; " +
                     "falling back to column-name matching"
             }
+        }
+
+        // DUPLICATE IDS, before any binding. Every lookup below picks
+        // the FIRST field with a matching id, so a file carrying one id
+        // on two fields would have had whichever came first silently
+        // elected — measured: bounds from `first` recorded for a column
+        // the file also declares as `second`. There is no rule that says
+        // which is right, so there is no binding to make: the whole
+        // file's stats are refused, loudly, and the file keeps whatever
+        // it already had rather than gaining something invented.
+        val duplicates = duplicateFieldIds(schema)
+        if (duplicates.isNotEmpty()) {
+            log.warn {
+                "parquet schema of $filePath declares field id(s) ${duplicates.sorted()} more than " +
+                    "once; field ids are the binding contract and a duplicate has no correct " +
+                    "resolution, so no stats are produced for this file"
+            }
+            return emptyList()
         }
 
         val matched = LinkedHashMap<Long, Pair<CatalogColumn, Leaf>>()
@@ -253,6 +265,24 @@ object FooterStats {
             }
         }
 
+        // REPETITION, before anything else. Every catalog type reachable
+        // here holds AT MOST ONE value per row: a scalar, a struct, or a
+        // container whose repetition lives in its own synthetic layer
+        // (which matchInto is never handed — it descends THROUGH it).
+        // A REPEATED node binding to any of them is a file saying "many
+        // per row" where the catalog says "one", and the two read paths
+        // answer that differently and both wrongly: this one counts
+        // every repetition as a value, and the rewriter copies only
+        // repetition 0 and drops the rest — measured, a 2-repetition
+        // struct lost half its values with rowsWritten still matching
+        // the record count, and the inputs then expired.
+        if (field.isRepetition(Type.Repetition.REPEATED)) {
+            shapeMismatch(
+                "is REPEATED, but '${col.type.wire}' holds one value per row",
+            )
+            return
+        }
+
         if (!col.type.isNested) {
             if (!field.isPrimitive) {
                 shapeMismatch("is a group, not a primitive leaf")
@@ -275,7 +305,16 @@ object FooterStats {
                 // subtree goes quiet — safe, but silent, and the two
                 // surfaces would disagree about a file the rewriter
                 // refuses outright.
-                if (group.logicalTypeAnnotation != null) {
+                // CONTAINER annotations only. Rejecting ANY annotation
+                // took bounds away from a struct-shaped group carrying a
+                // stray unrelated one (ENUM, say) that used to produce
+                // them perfectly well — and since the rewriter refused
+                // the same file, such a table became permanently
+                // uncompactable. A LIST/MAP annotation means the file
+                // says "container" where the catalog says "struct"; any
+                // other annotation on a plain group says nothing about
+                // its shape, so bind by shape.
+                if (isContainerAnnotation(group.logicalTypeAnnotation)) {
                     shapeMismatch(
                         "is a '${group.logicalTypeAnnotation}' group, not a struct",
                     )
@@ -313,6 +352,17 @@ object FooterStats {
                     shapeMismatch("has a repeated group with ${entry.fieldCount} fields, not 1 (element)")
                     return
                 }
+                // The CATALOG's arity, not just the file's. A container
+                // row with the wrong child count is a corrupt or
+                // hand-edited catalog, and indexing into it threw
+                // IndexOutOfBounds straight out of the hydrator sweep.
+                // Degrade like every other disagreement.
+                if (col.children.size != 1) {
+                    shapeMismatch(
+                        "is a list whose CATALOG row has ${col.children.size} children, not 1",
+                    )
+                    return
+                }
                 val child = col.children.single()
                 if (!childBinds(child, element, useFieldIds)) {
                     shapeMismatch(
@@ -334,6 +384,12 @@ object FooterStats {
                 val entry = repeated.asGroupType()
                 if (entry.fieldCount != 2) {
                     shapeMismatch("has a key_value group with ${entry.fieldCount} fields, not 2 (key, value)")
+                    return
+                }
+                if (col.children.size != 2) {
+                    shapeMismatch(
+                        "is a map whose CATALOG row has ${col.children.size} children, not 2",
+                    )
                     return
                 }
                 // The rewriter refuses an OPTIONAL key (the output key is
@@ -390,6 +446,19 @@ object FooterStats {
         val id = field.id ?: return true
         return id.intValue().toLong() == col.fieldId
     }
+
+    /**
+     * Whether [annotation] declares a parquet CONTAINER — the three that
+     * mean "this group is a list or a map", as opposed to the many that
+     * decorate a value (STRING, ENUM, DECIMAL...). One definition, two
+     * callers: the field-id exemption and the struct shape check have to
+     * mean the same thing by "container" or a file can be a container to
+     * one and a struct to the other.
+     */
+    fun isContainerAnnotation(annotation: LogicalTypeAnnotation?): Boolean =
+        annotation is LogicalTypeAnnotation.ListLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.MapLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.MapKeyValueTypeAnnotation
 
     /**
      * The parquet field for [col] among [fields]: by field id when the
@@ -815,6 +884,24 @@ object FooterStats {
 
     private fun readLongLE(raw: ByteArray): Long? =
         if (raw.size == 8) ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).long else null
+
+    /**
+     * Field ids the schema declares more than once, over EVERY node
+     * (leaves and container wrappers alike — both bind).
+     */
+    private fun duplicateFieldIds(schema: MessageType): Set<Int> {
+        val seen = HashSet<Int>()
+        val dupes = HashSet<Int>()
+
+        fun walk(fields: List<Type>) {
+            for (field in fields) {
+                field.id?.intValue()?.let { if (!seen.add(it)) dupes.add(it) }
+                if (!field.isPrimitive) walk(field.asGroupType().fields)
+            }
+        }
+        walk(schema.fields)
+        return dupes
+    }
 
     /** Every primitive leaf of the schema, at any depth, with its full chunk path. */
     private fun allLeaves(schema: MessageType): List<Leaf> =

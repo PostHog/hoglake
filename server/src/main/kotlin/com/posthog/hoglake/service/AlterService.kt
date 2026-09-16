@@ -730,8 +730,23 @@ class AlterService(private val jdbi: Jdbi) {
                 parent = container
                 siblings = container.children
             }
+            // singleOrNull, not find: the DDL path refuses duplicate
+            // sibling names, but the DATABASE only enforces unique
+            // (parent, ordinal) — not (parent, name). A catalog that
+            // acquired two siblings called the same thing (a hand-edited
+            // row, a restored dump) would otherwise have alter ops act on
+            // whichever came first, silently, forever. Belt and
+            // suspenders, and loud.
+            val candidates = siblings.filter { it.def.name == segment }
+            if (candidates.size > 1) {
+                throw HoglakeException.Validation(
+                    "column path '$path' is ambiguous: ${candidates.size} live columns are named " +
+                        "'$segment' here (field ids ${candidates.map { it.fieldId }.sorted()}); " +
+                        "the catalog is inconsistent and this ALTER will not guess",
+                )
+            }
             current =
-                siblings.find { it.def.name == segment }
+                candidates.singleOrNull()
                     ?: throw HoglakeException.Validation(
                         if (i == 0) {
                             "column '$path' does not exist"

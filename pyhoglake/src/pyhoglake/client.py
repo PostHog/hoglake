@@ -78,13 +78,48 @@ _RECREATED_MARKER = "the table was recreated"
 _RESERVED_COLUMN_PREFIX = "_hog"
 
 
+def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
+    """Dotted paths of every field — at ANY nesting level — whose name
+    uses the reserved prefix.
+
+    Recursive because the reserved name is reserved everywhere: a
+    ``_hog_row_id`` field inside a struct reaches parquet exactly like a
+    top-level one, and compaction writes its own ``_hog_row_id`` at the
+    top level of the OUTPUT, so a nested collision is a name clash in
+    waiting rather than a present one. Refusing both is cheaper than
+    explaining the difference.
+    """
+    out: list[str] = []
+    for f in fields:  # type: ignore[attr-defined]
+        path = f"{prefix}.{f.name}" if prefix else f.name
+        if f.name.startswith(_RESERVED_COLUMN_PREFIX):
+            out.append(path)
+        t = f.type
+        if pa.types.is_struct(t):
+            out += _reserved_field_paths(
+                [t.field(i) for i in range(t.num_fields)], path
+            )
+        elif pa.types.is_map(t):
+            out += _reserved_field_paths([t.key_field, t.item_field], path)
+        elif (
+            pa.types.is_list(t)
+            or pa.types.is_large_list(t)
+            or pa.types.is_fixed_size_list(t)
+        ):
+            out += _reserved_field_paths([t.value_field], path)
+    return out
+
+
 def _check_reserved_columns(schema: pa.Schema) -> None:
     """Fast-fail schema field names using the reserved ``_hog`` column
     prefix BEFORE any request or parquet upload. The server accepts such
     names (see [_RESERVED_COLUMN_PREFIX]), so this is enforcement, not an
     optimisation: without it the column lands in the catalog and collides
-    with compaction's row-id carrier."""
-    reserved = [n for n in schema.names if n.startswith(_RESERVED_COLUMN_PREFIX)]
+    with compaction's row-id carrier.
+
+    Checked at every nesting level — the server's gap (hoglake#36) is at
+    every level too."""
+    reserved = _reserved_field_paths(list(schema))
     if reserved:
         raise ValidationError(
             f"column names {reserved} use the reserved "
@@ -807,9 +842,54 @@ class Table:
         return info
 
 
+def _nested_field_mismatch(
+    have: pa.DataType, want: pa.DataType, path: str
+) -> tuple[list[str], list[str]]:
+    """(missing, extra) dotted paths comparing a caller's nested type
+    against the catalog's, recursively."""
+    missing: list[str] = []
+    extra: list[str] = []
+    if pa.types.is_struct(want) and pa.types.is_struct(have):
+        want_names = [want.field(i).name for i in range(want.num_fields)]
+        have_names = [have.field(i).name for i in range(have.num_fields)]
+        missing += [f"{path}.{n}" for n in want_names if n not in have_names]
+        extra += [f"{path}.{n}" for n in have_names if n not in want_names]
+        for name in want_names:
+            if name in have_names:
+                m, e = _nested_field_mismatch(
+                    have.field(name).type, want.field(name).type, f"{path}.{name}"
+                )
+                missing += m
+                extra += e
+    elif pa.types.is_map(want) and pa.types.is_map(have):
+        for label, h, w in (
+            ("key", have.key_field.type, want.key_field.type),
+            ("value", have.item_field.type, want.item_field.type),
+        ):
+            m, e = _nested_field_mismatch(h, w, f"{path}.{label}")
+            missing += m
+            extra += e
+    elif pa.types.is_list(want) and pa.types.is_list(have):
+        m, e = _nested_field_mismatch(
+            have.value_field.type, want.value_field.type, f"{path}.element"
+        )
+        missing += m
+        extra += e
+    return missing, extra
+
+
 def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
     """Reorder ``data`` to the catalog column order and cast to the target
-    schema (which carries the field-id metadata)."""
+    schema (which carries the field-id metadata).
+
+    The name comparison is RECURSIVE. At top level a missing or unknown
+    column has always been a refusal; below it, ``cast`` quietly
+    null-filled what the caller had not supplied and dropped what the
+    catalog did not know — so a typo'd struct field appended as an
+    all-NULL column whose own stats said ``null_count == record_count``,
+    and the only evidence was that the data was not there. The same
+    mistake deserves the same answer at every level.
+    """
     have = set(data.schema.names)
     want = list(target.names)
     missing = [n for n in want if n not in have]
@@ -821,6 +901,24 @@ def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
     if extra:
         raise ValidationError(
             f"data has columns not in the table schema: {extra}",
+            status_code=None,
+        )
+    nested_missing: list[str] = []
+    nested_extra: list[str] = []
+    for name in want:
+        m, e = _nested_field_mismatch(
+            data.schema.field(name).type, target.field(name).type, name
+        )
+        nested_missing += m
+        nested_extra += e
+    if nested_missing:
+        raise ValidationError(
+            f"data is missing nested table fields: {nested_missing}",
+            status_code=None,
+        )
+    if nested_extra:
+        raise ValidationError(
+            f"data has nested fields not in the table schema: {nested_extra}",
             status_code=None,
         )
     data = data.select(want)

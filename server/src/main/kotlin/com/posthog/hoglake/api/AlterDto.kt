@@ -111,8 +111,19 @@ data class AlterOpDto(
     val fields: List<AlterPartitionFieldDto>? = null,
     val sortFields: List<AlterSortFieldDto>? = null,
 ) {
-    fun toModel(): AlterOp =
-        when (op) {
+    fun toModel(): AlterOp {
+        // `parent` belongs to add_column alone. Silently ignoring it on
+        // the others reads as "supported, and it did nothing" — a caller
+        // who writes `{"op":"drop_column","parent":"addr","name":"zip"}`
+        // meaning `addr.zip` gets a 200 and the WRONG column dropped.
+        // The other ops address by dotted path; say so.
+        if (parent != null && op != "add_column") {
+            throw HoglakeException.Validation(
+                "op '$op' does not take 'parent' (only add_column does); address a nested column " +
+                    "by its dotted path instead, e.g. \"addr.zip\"",
+            )
+        }
+        return when (op) {
             "add_column" -> AlterOp.AddColumn(required(column, "column").toModel(), parent)
             "drop_column" -> AlterOp.DropColumn(required(name, "name"))
             "rename_column" -> AlterOp.RenameColumn(required(from, "from"), required(to, "to"))
@@ -125,6 +136,7 @@ data class AlterOpDto(
                 AlterOp.SetSortOrder(required(sortFields, "sort_fields").map { it.toModel() })
             else -> throw BadRequestException("unknown alter op '$op'")
         }
+    }
 
     private fun <T : Any> required(
         value: T?,
