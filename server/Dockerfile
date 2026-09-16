@@ -24,7 +24,13 @@ COPY trino/build.gradle.kts trino/build.gradle.kts
 RUN ./gradlew --no-daemon dependencies --configuration runtimeClasspath -x :trino:dependencies || true
 
 COPY src/ src/
-RUN ./gradlew --no-daemon :installDist -x test -x ktlintCheck
+# Build identity for GET /v1/info. Declared HERE, after the dependency
+# priming above, so a stamp that changes every build cannot invalidate
+# the dependency layer. Empty by default and left empty by local and PR
+# builds on purpose: only the CD image build stamps one, so a stamp in
+# the webui always means "this came off the pipeline".
+ARG HOGLAKE_BUILD_STAMP=""
+RUN ./gradlew --no-daemon :installDist -x test -x ktlintCheck -PbuildStamp="$HOGLAKE_BUILD_STAMP"
 
 FROM eclipse-temurin:21-jre-noble
 # Non-root: the server needs no filesystem beyond /tmp (parquet footer

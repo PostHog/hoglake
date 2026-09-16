@@ -61,6 +61,31 @@ describe("topbar server version", () => {
     expect(await screen.findByText("vunknown")).toBeInTheDocument();
   });
 
+  it("shows the build stamp beside the version when the image was stamped", async () => {
+    mockFetch((url) => {
+      if (url === "/v1/info")
+        return jsonResponse({ version: "1.0.1-dev", build: "20260915T2104Z" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    expect(await screen.findByText("+20260915T2104Z")).toBeInTheDocument();
+    expect(screen.getByText("v1.0.1-dev")).toBeInTheDocument();
+  });
+
+  it("shows a bare version for a locally built server", async () => {
+    // No stamp is the ordinary local build, not a fault: the badge must
+    // read as a plain version rather than showing an empty suffix.
+    mockFetch((url) => {
+      if (url === "/v1/info") return jsonResponse({ version: "1.0.1-dev" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    expect(await screen.findByText("v1.0.1-dev")).toBeInTheDocument();
+    expect(document.querySelector(".server-build")).toBeNull();
+  });
+
   it("renders no version badge against a server that predates the field", async () => {
     mockFetch((url) => {
       if (url === "/v1/info") return jsonResponse({ name: "GigaHog" });

@@ -368,6 +368,13 @@ tr.has-deletes {
   white-space: nowrap;
 }
 
+/* Dimmer than the version it follows: the build stamp is long, and the
+   version is what the eye should land on first. */
+.server-build {
+  margin-left: 1px;
+  opacity: 0.65;
+}
+
 .instance-name {
   padding: 1px 8px;
   border: 1px solid var(--accent, var(--border));

@@ -17,6 +17,42 @@ import org.junit.jupiter.api.Test
  */
 class BuildInfoTest {
     @Test
+    fun `an unstamped build reports no build stamp`() {
+        // The default, and the one that must not regress into a sentinel:
+        // an ordinary gradle build passes no -PbuildStamp, and absent has
+        // to stay absent so the webui shows a bare version rather than
+        // something that reads like a broken deploy.
+        assertThat(BuildInfo.buildStamp).isNull()
+    }
+
+    @Test
+    fun `a supplied stamp is accepted as-is`() {
+        assertThat(BuildInfo.sanitizeStamp("20260915T2104Z")).isEqualTo("20260915T2104Z")
+        assertThat(BuildInfo.sanitizeStamp("1.2.3-rc4+g0ab1cd")).isEqualTo("1.2.3-rc4+g0ab1cd")
+    }
+
+    @Test
+    fun `blank and missing are no stamp, not a fault`() {
+        assertThat(BuildInfo.sanitizeStamp(null)).isNull()
+        assertThat(BuildInfo.sanitizeStamp("")).isNull()
+        assertThat(BuildInfo.sanitizeStamp("   ")).isNull()
+    }
+
+    @Test
+    fun `a malformed stamp costs the badge, not the endpoint`() {
+        // It arrives through a Docker build arg and lands in every
+        // /v1/info response, so a pipeline that sets it wrong must not be
+        // able to put an unbounded or control-laden blob on a hot path.
+        assertThat(BuildInfo.sanitizeStamp("a".repeat(65))).isNull()
+        assertThat(BuildInfo.sanitizeStamp("has space")).isNull()
+        assertThat(BuildInfo.sanitizeStamp("new\nline")).isNull()
+        assertThat(BuildInfo.sanitizeStamp("<script>alert(1)</script>")).isNull()
+        assertThat(BuildInfo.sanitizeStamp("-leading-punctuation")).isNull()
+        // The boundary itself is legal: 64 characters exactly.
+        assertThat(BuildInfo.sanitizeStamp("b".repeat(64))).isEqualTo("b".repeat(64))
+    }
+
+    @Test
     fun `the running version comes from the generated resource`() {
         assertThat(BuildInfo.version)
             .isNotBlank()

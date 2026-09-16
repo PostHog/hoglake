@@ -285,6 +285,10 @@ export interface InstanceInfo {
   // server older than the field is exactly the case the badge exists to
   // make visible, so the type has to admit it.
   version?: string;
+  // Packaging stamp (e.g. 20260915T2104Z). Absent on any build nobody
+  // stamped — every local build, every PR image — which is normal and
+  // renders as no suffix, not as an error.
+  build?: string;
   // Absent in the boot window before the server's first metrics sample.
   total_rows?: Int64;
   total_size_bytes?: Int64;
