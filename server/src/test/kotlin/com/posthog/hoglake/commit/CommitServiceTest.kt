@@ -100,6 +100,57 @@ class CommitServiceTest {
             Fixture(catalogId, namespaceId, tables)
         }
 
+    @Test
+    fun `publication receipt survives retry and rejects changed payload`() {
+        seed()
+        val request =
+            CommitRequest(
+                idempotencyKey = java.util.UUID.randomUUID(),
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/once.parquet", 7)))),
+            )
+        val first = service.commit("cat", request)
+        assertThat(service.commit("cat", request)).isEqualTo(first)
+        assertThatThrownBy { service.commit("cat", request.copy(message = "different")) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+        jdbi.useHandle<Exception> { h ->
+            assertThat(h.createQuery("SELECT SUM(record_count) FROM hog_data_file").mapTo(Long::class.java).one())
+                .isEqualTo(7L)
+            // Receipts must not disappear when snapshot history is expired.
+            h.execute("DELETE FROM hog_snapshot_change")
+            h.execute("DELETE FROM hog_snapshot")
+        }
+        assertThat(service.commit("cat", request)).isEqualTo(first)
+    }
+
+    @Test
+    fun `simultaneous publication retries allocate rows only once`() {
+        seed()
+        val request =
+            CommitRequest(
+                idempotencyKey = java.util.UUID.randomUUID(),
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/race.parquet", 7)))),
+            )
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val start = CountDownLatch(1)
+            val futures =
+                (1..2).map {
+                    pool.submit<com.posthog.hoglake.model.CommitResult> {
+                        start.await()
+                        service.commit("cat", request)
+                    }
+                }
+            start.countDown()
+            assertThat(futures[0].get(10, TimeUnit.SECONDS)).isEqualTo(futures[1].get(10, TimeUnit.SECONDS))
+            jdbi.useHandle<Exception> { h ->
+                assertThat(h.createQuery("SELECT COUNT(*) FROM hog_data_file").mapTo(Long::class.java).one())
+                    .isEqualTo(1L)
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
     /** Mint a snapshot with one change row via direct SQL (DDL simulation). */
     private fun seedChange(
         catalogId: Long,

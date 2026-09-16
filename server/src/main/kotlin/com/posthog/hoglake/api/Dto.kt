@@ -234,6 +234,7 @@ data class CommitRequestDto(
     val deletes: List<TableDeletesDto> = emptyList(),
     val author: String? = null,
     val message: String? = null,
+    val idempotencyKey: UUID? = null,
 ) {
     fun toModel() =
         CommitRequest(
@@ -242,6 +243,7 @@ data class CommitRequestDto(
             deletes = deletes.map { it.toModel() },
             author = author,
             message = message,
+            idempotencyKey = idempotencyKey,
         )
 }
 

@@ -425,3 +425,42 @@ def test_append_without_s3_config(httpx_mock):
     with pytest.raises(HoglakeError, match="S3 configuration"):
         t.append(pa.table({"id": [1], "name": ["a"]}))
     client.close()
+
+
+def test_prepared_files_upload_then_commit_exact_request(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "sorted.parquet"
+    data = pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema)
+    pq.write_table(data, path)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    key = str(uuid.uuid4())
+    request = table.prepare_append_files([(str(path), None)], idempotency_key=key)
+    assert request["idempotency_key"] == key
+    assert request["read_snapshot"] == 5
+    assert request["appends"][0]["expected_table_uuid"] == TABLE_WIRE["table_uuid"]
+    assert len(fake_s3.files) == 1
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    # Publication has not happened as part of prepare. Persisting this request
+    # is the caller's responsibility; publication uses a capability-safe route.
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit/prepared",
+        json={"snapshot_id": 6, "schema_version": 2},
+        is_reusable=True,
+    )
+    catalog = table._namespace._catalog
+    assert catalog.commit_prepared(request) == catalog.commit_prepared(request)
+    posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    assert len(posts) == 2
+    assert posts[0].content == posts[1].content

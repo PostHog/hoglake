@@ -620,6 +620,7 @@ data class CommitRequest(
     val deletes: List<TableDeletes> = emptyList(),
     val author: String? = null,
     val message: String? = null,
+    val idempotencyKey: UUID? = null,
 )
 
 data class CommitResult(
