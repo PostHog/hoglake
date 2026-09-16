@@ -1501,6 +1501,52 @@ class QeFooterStatsBoundsPropertyTest {
     }
 
     @Test
+    fun `a struct over a LIST-annotated group SAYS SO rather than going quiet`() {
+        // The reader's half of the rewriter's refusal, and the only
+        // thing that half can be asserted on. findField would never have
+        // matched the struct's children inside a LIST wrapper anyway —
+        // its one child is the unnamed, id-less repetition layer — so
+        // the outcome was already "no stats". The guard's whole value is
+        // that the outcome stops being SILENT: the rewriter refuses this
+        // file outright, and an operator whose table quietly lost its
+        // struct bounds needs the two surfaces saying the same thing.
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(FooterStats::class.java.name) as Logger
+        logger.addAppender(appender)
+        try {
+            val cell =
+                NestedCell(
+                    name = "struct over a list",
+                    column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema = MessageType("root", listOf(listGroup(1, "s", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                )
+            val aggs = FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/sol.parquet")
+            assertThat(aggs).describedAs("no stats, with or without the guard").isEmpty()
+            assertThat(events.filter { it.level == Level.WARN }.map { it.formattedMessage })
+                .describedAs("...but the reason is now in the log")
+                .anySatisfy({ m -> assertThat(m).contains("not a struct") })
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
     fun `a legacy 2-level list's repeated element is NOT exempt`() {
         // In the 2-level encoding the repeated node IS the element — a
         // real column that needs its id. The exemption is by SHAPE (a
