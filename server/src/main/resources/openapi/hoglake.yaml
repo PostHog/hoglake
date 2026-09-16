@@ -880,9 +880,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TableCreation" }
-        "404": { description: Catalog or operation not found }
-        "409": { description: Operation ID reused with a different request }
-        "422": { description: Invalid definition or file registrations; no publication occurred }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
     get:
       operationId: getTableCreation
       summary: Read a durable receipt; prepared is not permission to delete files
@@ -895,9 +911,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TableCreation" }
-        "404": { description: Catalog or operation not found }
-        "409": { description: Operation ID reused with a different request }
-        "422": { description: Invalid definition or file registrations; no publication occurred }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
   /catalogs/{catalog}/table-creations/{operation}/commit:
     post:
       operationId: publishTableCreation
@@ -930,9 +962,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TableCreation" }
-        "404": { description: Catalog or operation not found }
-        "409": { description: Operation ID reused with a different request }
-        "422": { description: Invalid definition or file registrations; no publication occurred }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
   /catalogs/{catalog}/table-creations/{operation}/abort:
     post:
       operationId: abortTableCreation
@@ -946,9 +994,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/TableCreation" }
-        "404": { description: Catalog or operation not found }
-        "409": { description: Operation ID reused with a different request }
-        "422": { description: Invalid definition or file registrations; no publication occurred }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/commit:
     post:
