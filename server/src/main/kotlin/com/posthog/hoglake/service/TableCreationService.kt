@@ -2,7 +2,6 @@ package com.posthog.hoglake.service
 
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
@@ -63,7 +62,7 @@ class TableCreationService(
         return observed("prepare", catalog, operationId, { if (replay) "replayed" else it.state }) {
             operationTransaction { h ->
                 val cat = CatalogRepo.require(h, catalog)
-                val encoded = mapper.writeValueAsString(definition)
+                val encoded = TableCreationDefinitionCodec.encode(definition)
                 if (exists(h, cat.catalogId, operationId)) {
                     replay = true
                     requireSame(h, cat.catalogId, operationId, "definition", encoded)
@@ -276,6 +275,23 @@ class TableCreationService(
         encoded: String,
     ) {
         check(column == "definition" || column == "files")
+        if (column == "definition") {
+            val stored =
+                h.createQuery(
+                    """
+                SELECT definition::text FROM hog_table_creation
+                WHERE catalog_id = :catalog AND operation_id = :operation
+                """,
+                ).bind("catalog", catalog).bind("operation", operation).mapTo(String::class.java).one()
+            val normalized = TableCreationDefinitionCodec.encode(TableCreationDefinitionCodec.decode(stored))
+            val same =
+                h.createQuery("SELECT CAST(:stored AS jsonb) = CAST(:requested AS jsonb)")
+                    .bind("stored", normalized).bind("requested", encoded).mapTo(Boolean::class.java).one()
+            if (!same) {
+                throw HoglakeException.CommitConflict("operation id reused with a different definition")
+            }
+            return
+        }
         val same =
             h.createQuery(
                 """
@@ -333,7 +349,7 @@ class TableCreationService(
         )
             .bind("catalog", catalog).bind("operation", operation)
             .map { rs, _ ->
-                val definition = mapper.readValue<TableCreationDefinition>(rs.getString("definition"))
+                val definition = TableCreationDefinitionCodec.decode(rs.getString("definition"))
                 TableCreation(
                     operation, rs.getObject("table_uuid", UUID::class.java), definition,
                     initialColumns(definition.columns),

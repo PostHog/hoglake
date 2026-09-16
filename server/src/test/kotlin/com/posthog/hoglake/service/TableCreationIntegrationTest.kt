@@ -40,6 +40,42 @@ class TableCreationIntegrationTest {
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
     @Test
+    fun `versioned definitions use wire names and legacy receipts still retry and publish`() {
+        val catalog = catalog()
+        val def =
+            definition.copy(
+                columns =
+                    listOf(
+                        ColumnDef("id", ColType.LONG),
+                        ColumnDef("uuid", ColType.UUID_T),
+                        ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 38, "scale" to 2)),
+                    ),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), def)
+        db.jdbi.open().use { h ->
+            val encoded =
+                h.createQuery("SELECT definition::text FROM hog_table_creation WHERE operation_id = :id")
+                    .bind("id", prepared.operationId).mapTo(String::class.java).one()
+            val tree = com.fasterxml.jackson.databind.ObjectMapper().readTree(encoded)
+            assertThat(tree["version"].asInt()).isEqualTo(1)
+            assertThat(tree["columns"].map { it["type"].asText() }).containsExactly("long", "uuid", "decimal")
+            val legacy = """{"namespace":"test","name":"target","columns":[
+                {"name":"id","type":"LONG","typeParams":null,"nullable":true},
+                {"name":"uuid","type":"UUID_T","typeParams":null,"nullable":true},
+                {"name":"amount","type":"DECIMAL","typeParams":{"precision":38,"scale":2},"nullable":true}]}"""
+            h.createUpdate(
+                "UPDATE hog_table_creation SET definition = CAST(:definition AS jsonb) WHERE operation_id = :id",
+            )
+                .bind("definition", legacy).bind("id", prepared.operationId).execute()
+        }
+        assertThat(creations.status(catalog, prepared.operationId)).isEqualTo(prepared)
+        assertThat(creations.prepare(catalog, prepared.operationId, def)).isEqualTo(prepared)
+        val committed = creations.publish(catalog, prepared.operationId, emptyList())
+        assertThat(committed.state).isEqualTo("committed")
+        assertThat(creations.publish(catalog, prepared.operationId, emptyList())).isEqualTo(committed)
+    }
+
+    @Test
     fun `prepared and directly created schemas share initial field identities`() {
         val catalog = catalog()
         val columns =
