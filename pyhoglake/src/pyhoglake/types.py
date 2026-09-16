@@ -354,9 +354,11 @@ def _field_to_column_def(f: pa.Field) -> dict[str, Any]:
     elif type_ == "map":
         key = _field_to_column_def(f.type.key_field)
         key["name"] = "key"
-        # Arrow map keys are always non-nullable, and Iceberg requires
-        # it; state it explicitly rather than relying on the default.
-        key["nullable"] = False
+        # `nullable` is NOT overridden here: arrow refuses to construct a
+        # map with a nullable key at all ("Map key field should be
+        # non-nullable" — pinned by a test), and Iceberg requires the
+        # same, so the value already read off the field is False. Writing
+        # it again would be a guard no test could ever fail.
         value = _field_to_column_def(f.type.item_field)
         value["name"] = "value"
         col["children"] = [key, value]

@@ -475,3 +475,23 @@ def test_align_table_carries_nested_field_ids_onto_a_foreign_shaped_batch():
     # And the stats still resolve, which is the end-to-end proof that the
     # ids and the leaf paths agree after the cast.
     assert {s.field_id for s in extract_column_stats(footer, columns)} == {2, 4, 6, 7}
+
+
+def test_arrow_itself_refuses_a_nullable_map_key():
+    """The premise schema_to_column_defs leans on.
+
+    It emits the key's own ``nullable`` verbatim rather than forcing it,
+    because arrow will not build a map with a nullable key and Iceberg
+    would not accept one either. If arrow ever relaxes that, this test
+    fails and the emitted DDL becomes a server-side 422 instead of a
+    silent wrong claim — which is the point of pinning a premise.
+    """
+    with pytest.raises(TypeError, match="non-nullable"):
+        pa.map_(
+            pa.field("key", pa.string(), nullable=True), pa.field("value", pa.int64())
+        )
+    # ...and the honest consequence: the def always says False.
+    (col,) = schema_to_column_defs(
+        pa.schema([pa.field("m", pa.map_(pa.string(), pa.int64()))])
+    )
+    assert col["children"][0]["nullable"] is False
