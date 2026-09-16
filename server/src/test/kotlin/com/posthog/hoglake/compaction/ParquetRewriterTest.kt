@@ -15,6 +15,7 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
@@ -24,6 +25,7 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.math.BigInteger
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -114,6 +116,68 @@ class ParquetRewriterTest {
                 }
             }
         return path
+    }
+
+    @Test
+    fun `decimal physical encodings compact without narrowing or losing nulls`() {
+        val inputs = mutableListOf<ParquetRewriter.Input>()
+        val expected = mutableListOf<BigInteger?>()
+        for (precision in listOf(9, 10, 18, 19, 38)) {
+            val physical =
+                when {
+                    precision <= 9 -> PrimitiveTypeName.INT32
+                    precision <= 18 -> PrimitiveTypeName.INT64
+                    else -> PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+                }
+            val field = Types.optional(physical)
+            if (physical == PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY) field.length(16)
+            val schema =
+                Types.buildMessage().addField(
+                    field.`as`(LogicalTypeAnnotation.decimalType(2, precision)).id(1).named("amount"),
+                ).named("decimals")
+            val max = BigInteger.TEN.pow(precision).subtract(BigInteger.ONE)
+            val values = listOf(max, max.negate(), BigInteger.ZERO, null)
+            val path =
+                writeCustom(
+                    "decimal-$precision.parquet",
+                    schema,
+                    values.map { value ->
+                        { group: Group ->
+                            if (value != null) {
+                                when (physical) {
+                                    PrimitiveTypeName.INT32 -> group.add(0, value.intValueExact())
+                                    PrimitiveTypeName.INT64 -> group.add(0, value.longValueExact())
+                                    else -> {
+                                        val bytes = ByteArray(16) { if (value.signum() < 0) (-1).toByte() else 0 }
+                                        val encoded = value.toByteArray()
+                                        encoded.copyInto(bytes, 16 - encoded.size)
+                                        group.add(0, Binary.fromConstantByteArray(bytes))
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+            inputs.add(ParquetRewriter.Input(path, expected.size.toLong()))
+            expected.addAll(values)
+        }
+        val columns = listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 38, "scale" to 2))))
+        val output = tmp.resolve("decimal-output.parquet")
+        ParquetRewriter.rewrite(inputs, columns, emptyList(), output)
+        val actual = mutableListOf<BigInteger?>()
+        ParquetFileReader.open(LocalInputFile(output)).use { reader ->
+            val schema = reader.footer.fileMetaData.schema
+            var pages = reader.readNextRowGroup()
+            while (pages != null) {
+                val records = ColumnIOFactory().getColumnIO(schema).getRecordReader(pages, GroupRecordConverter(schema))
+                repeat(pages.rowCount.toInt()) {
+                    val row = records.read()
+                    actual.add(if (row.getFieldRepetitionCount(0) == 0) null else BigInteger(row.getBinary(0, 0).bytes))
+                }
+                pages = reader.readNextRowGroup()
+            }
+        }
+        assertThat(actual).containsExactlyElementsOf(expected)
     }
 
     private fun dv(vararg positions: Long): DeletionVector =

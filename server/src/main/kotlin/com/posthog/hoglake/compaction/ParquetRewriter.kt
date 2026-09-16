@@ -16,6 +16,7 @@ import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType
@@ -113,7 +114,15 @@ object ParquetRewriter {
      * way to reach one is a writer disagreeing with its own DDL, and
      * refusing that is the rewriter's job.
      */
-    private enum class CopyMode { IDENTITY, INT_TO_LONG, UINT32_TO_LONG, FLOAT_TO_DOUBLE }
+    private enum class CopyMode {
+        IDENTITY,
+        INT_TO_LONG,
+        UINT32_TO_LONG,
+        FLOAT_TO_DOUBLE,
+        DECIMAL_INT32,
+        DECIMAL_INT64,
+        DECIMAL_BINARY,
+    }
 
     /**
      * Merge [inputs] (caller orders them by rowIdStart) into [output]
@@ -512,13 +521,18 @@ object ParquetRewriter {
                     src.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
                         ?: refuse()
                 val liveScale = decimalScale(column)
-                val binaryish =
-                    srcName == PrimitiveType.PrimitiveTypeName.BINARY ||
-                        srcName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
-                if (binaryish && (liveScale == null || annotation.scale == liveScale)) {
-                    CopyMode.IDENTITY
-                } else {
+                if ((liveScale != null && annotation.scale != liveScale) ||
+                    annotation.precision > decimalPrecision(column)
+                ) {
                     refuse()
+                }
+                when (srcName) {
+                    PrimitiveType.PrimitiveTypeName.INT32 -> CopyMode.DECIMAL_INT32
+                    PrimitiveType.PrimitiveTypeName.INT64 -> CopyMode.DECIMAL_INT64
+                    PrimitiveType.PrimitiveTypeName.BINARY,
+                    PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
+                    -> CopyMode.DECIMAL_BINARY
+                    else -> refuse()
                 }
             }
         }
@@ -571,6 +585,21 @@ object ParquetRewriter {
             CopyMode.UINT32_TO_LONG ->
                 dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong() and 0xFFFFFFFFL)
             CopyMode.FLOAT_TO_DOUBLE -> dst.add(dstIdx, src.getFloat(srcIdx, 0).toDouble())
+            CopyMode.DECIMAL_INT32, CopyMode.DECIMAL_INT64, CopyMode.DECIMAL_BINARY -> {
+                // Binary decimals can exceed Long.MAX_VALUE. Never narrow them through Long.
+                val unscaled =
+                    when (step.mode) {
+                        CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(src.getInteger(srcIdx, 0).toLong())
+                        CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(src.getLong(srcIdx, 0))
+                        else -> BigInteger(src.getBinary(srcIdx, 0).bytes)
+                    }
+                val annotation = primitive.logicalTypeAnnotation as LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
+                val precision = annotation.precision
+                if (unscaled.abs().toString().length > precision) {
+                    throw UnconvertibleSchemaException("decimal value exceeds destination precision $precision")
+                }
+                dst.add(dstIdx, Binary.fromConstantByteArray(unscaled.toByteArray()))
+            }
             CopyMode.IDENTITY ->
                 when (primitive.primitiveTypeName) {
                     PrimitiveType.PrimitiveTypeName.BOOLEAN -> dst.add(dstIdx, src.getBoolean(srcIdx, 0))
