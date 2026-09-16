@@ -1,6 +1,7 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.statistics.Statistics
@@ -44,6 +45,9 @@ data class CatalogColumn(
  */
 object FooterStats {
     private val log = KotlinLogging.logger {}
+
+    /** 2^64, for reading an unsigned int64 out of its signed bit pattern. */
+    private val TWO_POW_64: BigInteger = BigInteger.ONE.shiftLeft(64)
 
     data class ColumnAgg(
         val fieldId: Long,
@@ -219,6 +223,35 @@ object FooterStats {
         upper: Boolean,
     ): Any? {
         val physical = leaf.primitive.primitiveTypeName
+
+        // An unsigned INT annotation is not decoration. It says the bits
+        // are a magnitude rather than a signed value, AND that parquet
+        // ordered this chunk's min/max unsigned. A catalog type may read
+        // one only if its own domain CONTAINS [0, 2^width): otherwise the
+        // top of the file's range does not fit the bound, and the
+        // orderings disagree — which is how a bound pair comes back with
+        // lower > upper, the shape a pruner reads as "no rows here",
+        // silently dropping the file from every scan.
+        //
+        // The rule is per-width rather than per-type, because the same
+        // annotation is fine or fatal depending on both: int16 reads
+        // INT(8, unsigned) happily (255 fits) and must refuse
+        // INT(16, unsigned) (65535 does not), and int8 refuses even the
+        // 8-bit one.
+        val unsignedWidth = unsignedIntWidth(leaf)
+        if (unsignedWidth != null && unsignedWidth > col.type.maxUnsignedParquetWidth) {
+            // Loud, like the decimal-scale mismatch below: a fleet-wide
+            // loss of bounds on a whole column type is a pruning
+            // regression, and silence would make it invisible until
+            // someone noticed scans got slower.
+            log.warn {
+                "column ${col.name} is '${col.type.wire}' but the parquet leaf is " +
+                    "INT($unsignedWidth, unsigned), whose values do not all fit that type; " +
+                    "skipping bounds (counts are unaffected)"
+            }
+            return null
+        }
+
         return when (col.type) {
             ColType.BOOLEAN ->
                 if (physical == PrimitiveType.PrimitiveTypeName.BOOLEAN && raw.size == 1) {
@@ -226,12 +259,57 @@ object FooterStats {
                 } else {
                     null
                 }
-            ColType.INT ->
+            // int8/int16/uint8/uint16 all ride parquet INT32 (with an
+            // INT(width, signed) annotation writers add): the physical
+            // int32 already holds the true value, and for widths <= 16 the
+            // signed and unsigned parquet sort orders agree, so the
+            // footer's min/max are trustworthy either way. All four map to
+            // Iceberg int, hence the 4-byte bound. (A full-width unsigned
+            // int32 never reaches here — the guard above sent it away.)
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
                 if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
+            // uint32 maps to Iceberg long. hoglake's own writers emit INT64
+            // (see iceberg-federation.md §2), but pyarrow/DuckDB emit
+            // INT32 + INT(32, unsigned) natively, so both are read. The
+            // INT32 form REQUIRES the unsigned annotation: without it
+            // parquet computed the chunk's min/max in SIGNED order, and
+            // reinterpreting those bounds as unsigned would invert them.
+            ColType.UINT32 ->
+                when (physical) {
+                    PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)
+                    PrimitiveType.PrimitiveTypeName.INT32 ->
+                        if (isUnsignedInt(leaf, 32)) readIntLE(raw)?.let { it.toLong() and 0xFFFFFFFFL } else null
+                    else -> null
+                }
+            // uint64 maps to decimal(20,0); the bound is a BigInteger in
+            // [0, 2^64). Same sort-order argument as uint32's INT32 form,
+            // and here it bites at 2^63, so the unsigned annotation is
+            // mandatory — an unannotated INT64's footer bounds are
+            // signed-ordered and simply are not uint64 bounds.
+            ColType.UINT64 ->
+                if (physical == PrimitiveType.PrimitiveTypeName.INT64 && isUnsignedInt(leaf, 64)) {
+                    readLongLE(raw)?.let { unsignedLong(it) }
+                } else {
+                    null
+                }
+            // The read-path twin of ParquetRewriter's UINT32_TO_LONG.
+            // No PROMOTION produces this pairing (DuckLake has no
+            // unsigned -> signed rung), but a foreign writer does: arrow
+            // and DuckDB both emit unsigned 32-bit data as INT32 +
+            // INT(32, unsigned), and a client is free to declare that
+            // column `long`, whose domain contains every uint32 value.
+            // Sign-extending one turns 0xFFFFFFFF into -1, putting the
+            // upper bound BELOW the lower and making every pruner drop the
+            // file. Zero-extend at any width instead; the annotation is
+            // also what tells us parquet ordered the chunk unsigned, so
+            // the bounds are the unsigned min/max we want.
             ColType.LONG ->
                 when (physical) {
                     PrimitiveType.PrimitiveTypeName.INT64 -> readLongLE(raw)
-                    PrimitiveType.PrimitiveTypeName.INT32 -> readIntLE(raw)?.toLong()
+                    PrimitiveType.PrimitiveTypeName.INT32 ->
+                        readIntLE(raw)?.let { bits ->
+                            if (isUnsignedInt(leaf)) bits.toLong() and 0xFFFFFFFFL else bits.toLong()
+                        }
                     else -> null
                 }
             ColType.FLOAT ->
@@ -250,8 +328,22 @@ object FooterStats {
             ColType.DATE ->
                 if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
             ColType.TIME -> decodeTime(leaf, raw)
-            ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> decodeTimestamp(leaf, raw, upper)
-            ColType.STRING ->
+            // Unit-driven, always: the parquet annotation is authoritative
+            // for what a file's int64s MEAN, and the catalog type only says
+            // what the column was declared as. (Parquet has no seconds
+            // timestamp unit at all — pyarrow 25 coerces timestamp[s] to
+            // TIMESTAMP(MILLIS) on write, verified — so a timestamp_s
+            // column's files are physically millis and decode through the
+            // same arm.) All of these map to Iceberg timestamp, so the
+            // bound is micros.
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP, ColType.TIMESTAMPTZ ->
+                decodeTimestamp(leaf, raw, upper)
+            // The one temporal type whose bound unit is NOT micros.
+            ColType.TIMESTAMP_NS -> decodeTimestampNanos(leaf, raw)
+            // json maps to Iceberg string and rides the same BYTE_ARRAY;
+            // the JSON logical annotation is metadata we do not require,
+            // because it changes neither the bytes nor their sort order.
+            ColType.STRING, ColType.JSON ->
                 if (physical == PrimitiveType.PrimitiveTypeName.BINARY) raw else null
             ColType.UUID_T ->
                 if (physical == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && raw.size == 16) {
@@ -322,6 +414,68 @@ object FooterStats {
         }
     }
 
+    /**
+     * timestamp_ns bounds are NANOS (Iceberg V3 single-value
+     * serialization), so the conversion runs the other way from
+     * [decodeTimestamp]: millis and micros scale UP, which is exact.
+     * Overflow degrades to a null bound, never an escaping failure —
+     * same contract as every other decode here.
+     */
+    private fun decodeTimestampNanos(
+        leaf: Leaf,
+        raw: ByteArray,
+    ): Long? {
+        if (leaf.primitive.primitiveTypeName != PrimitiveType.PrimitiveTypeName.INT64) return null
+        val unit =
+            (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)
+                ?.unit ?: return null
+        val v = readLongLE(raw) ?: return null
+        return try {
+            when (unit) {
+                LogicalTypeAnnotation.TimeUnit.NANOS -> v
+                LogicalTypeAnnotation.TimeUnit.MICROS -> Math.multiplyExact(v, 1_000L)
+                LogicalTypeAnnotation.TimeUnit.MILLIS -> Math.multiplyExact(v, 1_000_000L)
+            }
+        } catch (_: ArithmeticException) {
+            null
+        }
+    }
+
+    /**
+     * True when the leaf carries parquet INT(*, isSigned = false) at ANY
+     * width. Two things follow from an unsigned annotation and both
+     * matter: the physical bits are a magnitude rather than a signed
+     * value, and parquet computed the chunk's min/max in UNSIGNED order.
+     */
+    private fun isUnsignedInt(leaf: Leaf): Boolean =
+        (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+            ?.isSigned == false
+
+    /** The leaf's unsigned INT width, or null when it is not unsigned-annotated. */
+    private fun unsignedIntWidth(leaf: Leaf): Int? =
+        (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation)
+            ?.takeIf { !it.isSigned }
+            ?.bitWidth
+
+    /** True when the leaf carries parquet INT(width, isSigned = false). */
+    private fun isUnsignedInt(
+        leaf: Leaf,
+        width: Int,
+    ): Boolean {
+        val a =
+            leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.IntLogicalTypeAnnotation
+                ?: return false
+        return a.bitWidth == width && !a.isSigned
+    }
+
+    /** The unsigned value of a 64-bit pattern, as a BigInteger in [0, 2^64). */
+    private fun unsignedLong(bits: Long): BigInteger =
+        if (bits >= 0) {
+            BigInteger.valueOf(bits)
+        } else {
+            BigInteger.valueOf(bits).add(TWO_POW_64)
+        }
+
     private fun decodeDecimal(
         col: CatalogColumn,
         leaf: Leaf,
@@ -353,7 +507,8 @@ object FooterStats {
         v: Any,
     ): ByteArray =
         when (type) {
-            ColType.STRING, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
+            // These four decode to raw bytes that ARE the Iceberg encoding.
+            ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
             else -> IcebergSingleValue.encode(type, v)
         }
 
@@ -364,8 +519,10 @@ object FooterStats {
         b: Any,
     ): Int =
         when (type) {
-            ColType.STRING, ColType.UUID_T, ColType.BINARY ->
+            ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY ->
                 java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
+            // uint32 decodes to a non-negative Long and uint64 to a
+            // non-negative BigInteger, so natural order is unsigned order.
             else -> (a as Comparable<Any>).compareTo(b)
         }
 

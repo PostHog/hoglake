@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.service.CatalogService
@@ -42,6 +43,8 @@ fun Application.installApiRoutes(
             call.respond(
                 InstanceInfoDto(
                     name = instanceName.ifBlank { null },
+                    version = BuildInfo.version,
+                    build = BuildInfo.buildStamp,
                     totalRows = totals?.totalRows,
                     totalSizeBytes = totals?.totalSizeBytes,
                 ),

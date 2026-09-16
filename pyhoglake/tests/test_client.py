@@ -214,9 +214,10 @@ def test_create_table_body_shape(client, httpx_mock):
 
 
 def test_create_table_reserved_hog_column_fast_fails(client, httpx_mock):
-    """`_hog*` column names are server-reserved (_hog_row_id is
-    compaction's row-id carrier; 422 at create). The client fast-fails
-    them BEFORE the POST leaves the building."""
+    """`_hog*` column names are reserved for hoglake internals
+    (_hog_row_id is compaction's row-id carrier). The server does not
+    enforce the prefix (hoglake#36); the client fast-fails them BEFORE
+    the POST leaves the building."""
     cat = _catalog(client, httpx_mock)
     from pyhoglake.client import Namespace
 

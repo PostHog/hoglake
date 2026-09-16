@@ -67,15 +67,24 @@ class IcebergSingleValueCompareFuzzTest {
     ): Any? =
         when (type) {
             ColType.BOOLEAN -> data.consumeBoolean()
-            ColType.INT, ColType.DATE -> data.consumeInt()
-            ColType.LONG, ColType.TIME, ColType.TIMESTAMP, ColType.TIMESTAMPTZ -> data.consumeLong()
+            // Every int-mapped type shares the 4-byte encoding, so the
+            // generator is the same Int for all of them; the codec does no
+            // domain narrowing (by design), so unconstrained ints are the
+            // right fuzz input even for uint8.
+            ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16,
+            ColType.INT, ColType.DATE,
+            -> data.consumeInt()
+            ColType.UINT32, ColType.LONG, ColType.TIME,
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP,
+            ColType.TIMESTAMP_NS, ColType.TIMESTAMPTZ,
+            -> data.consumeLong()
             // Raw bit patterns cover NaN payloads, infinities, and both zeros.
             ColType.FLOAT -> Float.fromBits(data.consumeInt())
             ColType.DOUBLE -> Double.fromBits(data.consumeLong())
-            ColType.STRING -> data.consumeString(64)
+            ColType.STRING, ColType.JSON -> data.consumeString(64)
             ColType.UUID_T -> UUID(data.consumeLong(), data.consumeLong())
             ColType.BINARY -> data.consumeBytes(data.consumeInt(0, 64))
-            ColType.DECIMAL ->
+            ColType.UINT64, ColType.DECIMAL ->
                 data.consumeBytes(data.consumeInt(1, 32)).takeIf { it.isNotEmpty() }?.let { BigInteger(it) }
         }
 }

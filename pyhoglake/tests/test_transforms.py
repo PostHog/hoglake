@@ -12,9 +12,11 @@ If any of these ever fails, the implementation is wrong — the vectors
 are normative, shared by every Iceberg implementation.
 """
 
+import re
 import uuid
 from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pyarrow as pa
 import pytest
@@ -94,9 +96,341 @@ def test_bucket_value_from_spec_hash():
 
 
 def test_bucket_rejected_types():
-    for bad in ("boolean", "float", "double"):
+    for bad in ("boolean", "float", "double", "json"):
         with pytest.raises(ValidationError, match="bucket cannot be applied"):
             bucket_hash(bad, 1)
+
+
+_ARROW_FOR_COLTYPE = {
+    "uint32": pa.uint32(),
+    "uint64": pa.uint64(),
+    "timestamp_s": pa.timestamp("s"),
+    "timestamp_ms": pa.timestamp("ms"),
+    "timestamp_ns": pa.timestamp("ns"),
+}
+
+# The five withheld for the hash-domain mismatch (see _BUCKETABLE): the
+# Appendix-B hash is defined over the MAPPED Iceberg type (micros for the
+# timestamps, decimal(20,0) two's-complement for uint64, a zero-extended
+# long for uint32), and no cross-language vector proves the two sides
+# agree on that. Truncate keeps working on the ones that had it.
+HASH_DOMAIN_MISMATCHED = [
+    ("uint32", 34),
+    ("uint64", 2**64 - 1),
+    ("timestamp_s", datetime(2017, 11, 16, 22, 31, 8)),
+    ("timestamp_ms", datetime(2017, 11, 16, 22, 31, 8)),
+    ("timestamp_ns", 1_788_609_600_123_456_789),
+]
+
+
+@pytest.mark.parametrize(("col_type", "value"), HASH_DOMAIN_MISMATCHED)
+def test_bucket_refuses_hash_domain_mismatched_types(col_type, value):
+    """A bucket value nobody has verified cross-language looks perfectly
+    fine and prunes wrong, so the encoder refuses rather than guessing —
+    every entry point, not just the gate set."""
+    assert col_type not in transforms._BUCKETABLE
+    for call in (
+        lambda: transforms.bucket_encode(col_type, value),
+        lambda: bucket_hash(col_type, value),
+        lambda: bucket(col_type, value, 16),
+        lambda: transform_value("bucket", 16, col_type, value),
+    ):
+        with pytest.raises(ValidationError, match="bucket cannot be applied"):
+            call()
+
+
+@pytest.mark.parametrize(("col_type", "value"), HASH_DOMAIN_MISMATCHED)
+def test_bucket_refusal_survives_the_array_driver(col_type, value):
+    """The fanout path must refuse too, not silently emit a partition
+    value for a column the spec was never validated against."""
+    arr = pa.array([value], _ARROW_FOR_COLTYPE[col_type])
+    with pytest.raises(ValidationError, match="bucket cannot be applied"):
+        transform_strings("bucket", 16, arr, col_type)
+
+
+@pytest.mark.parametrize(
+    ("col_type", "top"), [("uint32", 2**32 - 1), ("uint64", 2**64 - 1)]
+)
+def test_hash_domain_mismatched_ints_still_truncate(col_type, top):
+    """Only bucket is withdrawn: truncate operates on the value itself,
+    not on a hash of a mapped representation, so it needs no vector — and
+    the whole unsigned domain still works, above 2^63 included."""
+    assert col_type in transforms._TRUNCATABLE
+    assert truncate(col_type, top, 10) == top - (top % 10)
+    assert truncate(col_type, 0, 10) == 0
+
+
+@pytest.mark.parametrize("col_type", ["timestamp_s", "timestamp_ms", "timestamp_ns"])
+def test_withheld_timestamps_keep_identity_and_temporal_transforms(col_type):
+    """The withdrawal is bucket-shaped, not type-shaped: the temporal
+    transforms read the instant directly and are unaffected."""
+    assert col_type in transforms._YEAR_MONTH_DAY_TYPES
+    assert col_type in transforms._HOUR_TYPES
+    ts = datetime(2017, 11, 16, 22, 31, 8)
+    assert transform_value("day", None, col_type, ts) == 17486
+    assert transform_value("identity", None, col_type, ts) is ts
+
+
+# ---------------------------------------------------------------------------
+# type gates: the exact vocabulary each transform accepts
+# ---------------------------------------------------------------------------
+
+ALL_COLTYPES = frozenset(
+    {
+        "boolean",
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float",
+        "double",
+        "decimal",
+        "date",
+        "time",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp",
+        "timestamp_ns",
+        "timestamptz",
+        "string",
+        "json",
+        "uuid",
+        "binary",
+    }
+)
+
+EXPECTED_BUCKETABLE = frozenset(
+    {
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "string",
+        "uuid",
+        "binary",
+        "decimal",
+    }
+)
+EXPECTED_TRUNCATABLE = frozenset(
+    {
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "string",
+        "binary",
+        "decimal",
+    }
+)
+EXPECTED_YMD = frozenset(
+    {"date", "timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz"}
+)
+EXPECTED_HOUR = frozenset(
+    {"timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz"}
+)
+
+
+def test_transform_type_gates_are_exactly_these_sets():
+    """Drift here means a client writes partition values the server would
+    have refused (or refuses ones it would have taken)."""
+    assert transforms._BUCKETABLE == EXPECTED_BUCKETABLE
+    assert transforms._TRUNCATABLE == EXPECTED_TRUNCATABLE
+    assert transforms._YEAR_MONTH_DAY_TYPES == EXPECTED_YMD
+    assert transforms._HOUR_TYPES == EXPECTED_HOUR
+    # every gate is a subset of the closed vocabulary — no typos
+    for gate in (EXPECTED_BUCKETABLE, EXPECTED_TRUNCATABLE, EXPECTED_YMD):
+        assert gate <= ALL_COLTYPES
+
+
+# ---------------------------------------------------------------------------
+# cross-language parity: _BUCKETABLE == AlterService.BUCKETABLE_TYPES
+# ---------------------------------------------------------------------------
+
+_KOTLIN_REL = Path("server/src/main/kotlin")
+_MODEL_REL = _KOTLIN_REL / "com/posthog/hoglake/model/Model.kt"
+_ALTER_REL = _KOTLIN_REL / "com/posthog/hoglake/service/AlterService.kt"
+
+
+def _server_file(relative: Path) -> Path:
+    """Locate a server source file by walking up from this test.
+
+    Resolved by SEARCH rather than a fixed parents[n] hop, and FAILING
+    rather than skipping when it is missing: a skip reads as green, so a
+    moved directory would silently retire the only check that the server
+    and client bucket sets agree.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / relative
+        if candidate.exists():
+            return candidate
+    raise AssertionError(
+        f"cannot find {relative} above {here}. This test compares the client's "
+        f"bucket set against the server's; if the trees really are separate now, "
+        f"delete it deliberately rather than letting it skip."
+    )
+
+
+def _wire(name: str) -> str:
+    # Model.kt: `val wire get() = if (this == UUID_T) "uuid" else lowercase`
+    return "uuid" if name == "UUID_T" else name.lower()
+
+
+def _kotlin_coltypes() -> frozenset[str]:
+    """The ColType vocabulary as wire names, read from Model.kt."""
+    enum_body = re.search(
+        r"enum class ColType \{(.*?)\n\s*;",
+        _server_file(_MODEL_REL).read_text(),
+        re.DOTALL,
+    )
+    assert enum_body, f"ColType enum not found in {_MODEL_REL}"
+    entries = re.findall(
+        r"^\s+([A-Z][A-Z0-9_]*),\s*$", enum_body.group(1), re.MULTILINE
+    )
+    assert len(entries) >= 20, f"suspiciously few ColType entries: {entries}"
+    return frozenset(map(_wire, entries))
+
+
+def _kotlin_bucketable() -> frozenset[str]:
+    """AlterService.BUCKETABLE_TYPES as wire names, read from the source.
+
+    Parsed rather than duplicated: a literal copy of the set here is a
+    second place to forget, and the failure it would hide (server accepts
+    a bucket spec the writer cannot compute, or vice versa) only shows up
+    as wrong partition values in production.
+
+    Parses the POSITIVE form. The declaration used to be
+    ``ColType.entries.toSet() - setOf(...)``, which made every future
+    ColType bucketable by default; it is now an explicit allowlist, so
+    this reads the members directly instead of subtracting.
+    """
+    allowed_src = re.search(
+        r"val BUCKETABLE_TYPES\s*=\s*\n?\s*setOf\((?P<body>[^)]*)\)",
+        _server_file(_ALTER_REL).read_text(),
+        re.DOTALL,
+    )
+    assert allowed_src, (
+        f"BUCKETABLE_TYPES not found in {_ALTER_REL}. If the declaration "
+        f"changed shape, update this parser — do not delete the check."
+    )
+    allowed = re.findall(r"ColType\.([A-Z0-9_]+)", allowed_src.group("body"))
+    # The rot guard: a regex that silently matched nothing would make the
+    # two sets "agree" only because one of them came back empty.
+    assert allowed, "parsed an EMPTY bucketable set — the regex has rotted"
+    return frozenset(map(_wire, allowed))
+
+
+def test_bucketable_matches_the_server_gate():
+    """The server accepts a bucket partition spec; the CLIENT computes the
+    values. If the sets diverge, one side silently produces or admits
+    partition values the other considers unverified."""
+    kotlin = _kotlin_bucketable()
+    assert transforms._BUCKETABLE == kotlin
+    assert kotlin <= ALL_COLTYPES  # the Kotlin vocabulary is the same closed set
+
+
+def test_bucketable_is_an_allowlist_so_a_new_type_is_not_bucketable():
+    """Both sides must FAIL CLOSED.
+
+    A new ColType has to be absent from both allowlists until someone
+    decides how it hashes — that decision is what the cross-language
+    bucket contract rests on, and a default of "bucketable" would let a
+    type into partition specs before anyone had made it.
+    """
+    vocabulary = _kotlin_coltypes()
+    assert transforms._BUCKETABLE < vocabulary, (
+        "the bucketable set must be a strict subset of the vocabulary; "
+        "if they are equal, the allowlist has stopped excluding anything"
+    )
+    # Pinned by contents on both sides, so adding a member is a conscious
+    # edit here as well as in the Kotlin.
+    assert transforms._BUCKETABLE == frozenset(
+        {
+            "int8",
+            "int16",
+            "int",
+            "long",
+            "uint8",
+            "uint16",
+            "decimal",
+            "date",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "string",
+            "uuid",
+            "binary",
+        }
+    )
+    assert vocabulary - transforms._BUCKETABLE == frozenset(
+        {
+            "boolean",
+            "float",
+            "double",
+            "json",
+            "uint32",
+            "uint64",
+            "timestamp_s",
+            "timestamp_ms",
+            "timestamp_ns",
+        }
+    )
+
+
+def test_json_takes_identity_only():
+    """bucket hashes bytes and truncate slices them, but two documents
+    equal as JSON (key order, whitespace, number spelling) have different
+    bytes: either transform would scatter equal values across partitions
+    and prune away files that do match."""
+    assert "json" not in transforms._BUCKETABLE
+    assert "json" not in transforms._TRUNCATABLE
+    assert "json" not in transforms._YEAR_MONTH_DAY_TYPES
+    with pytest.raises(ValidationError, match="bucket cannot be applied"):
+        transform_value("bucket", 16, "json", "{}")
+    with pytest.raises(ValidationError, match="truncate cannot be applied"):
+        transform_value("truncate", 4, "json", "{}")
+    with pytest.raises(ValidationError, match="day transform cannot be applied"):
+        transform_value("day", None, "json", "{}")
+    # identity passes the document through untouched
+    assert transform_value("identity", None, "json", '{ "b":1 }') == '{ "b":1 }'
+    assert wire_string("json", "identity", '{ "b":1 }') == '{ "b":1 }'
+
+
+@pytest.mark.parametrize("col_type", ["int8", "int16", "uint8", "uint16"])
+def test_new_int_widths_hash_as_8_byte_longs(col_type):
+    """Appendix B: hashInt(v) = hashLong(long(v)). Every BUCKETABLE
+    integer width hashes through the same 8-byte LE long, so 34 buckets
+    identically whatever width declared it. (uint32/uint64 are withheld:
+    Iceberg hashes them as their mapped types, long and decimal(20,0).)"""
+    assert transforms.bucket_encode(col_type, 34) == (34).to_bytes(8, "little")
+    assert bucket_hash(col_type, 34) == bucket_hash("int", 34)
+
+
+@pytest.mark.parametrize(
+    "col_type", ["int8", "int16", "uint8", "uint16", "uint32", "uint64"]
+)
+def test_new_int_widths_truncate_like_int(col_type):
+    assert truncate(col_type, 15, 10) == 10
+    assert truncate(col_type, 10, 10) == 10
+
+
+def test_signed_narrow_width_truncate_floors_negatives():
+    assert truncate("int8", -1, 10) == -10  # floors, never toward zero
+    assert truncate("int16", -11, 10) == -20
 
 
 def test_bucket_bad_count():
@@ -312,6 +646,35 @@ def test_wire_strings():
     assert wire_string("long", "identity", None) is None
 
 
+def test_wire_strings_new_types():
+    for t in ("int8", "int16", "uint8", "uint16", "uint32", "uint64"):
+        assert wire_string(t, "identity", 42) == "42"
+    assert wire_string("uint64", "identity", 2**64 - 1) == "18446744073709551615"
+    ts = datetime(2026, 1, 2, 3, 4, 5)
+    assert wire_string("timestamp_s", "identity", ts) == "2026-01-02T03:04:05"
+    assert wire_string("timestamp_ms", "identity", ts) == "2026-01-02T03:04:05"
+    # timestamp_ns is nanos, NOT isoformat: a datetime cannot carry them,
+    # and the array driver can only produce ints, so both paths must
+    # agree on the integer or one value lands in two partitions
+    assert wire_string("timestamp_ns", "identity", 1_000_000_001) == "1000000001"
+    assert wire_string("timestamp_ns", "identity", ts) == str(
+        int((ts - datetime(1970, 1, 1)).total_seconds()) * 10**9
+    )
+    assert wire_string("json", "identity", '{"a": 1}') == '{"a": 1}'
+    for t in ("int8", "timestamp_ns", "json"):
+        assert wire_string(t, "identity", None) is None
+
+
+def test_transform_strings_json_identity_roundtrips_documents():
+    """json arrays have no arrow dictionary encoding, so this exercises
+    the per-value fallback; the document text must survive verbatim."""
+    values = ["{}", '{"a": 1}', None, '{ "b" : 2 }']
+    arr = pa.array(values, pa.json_()) if hasattr(pa, "json_") else None
+    if arr is None:  # pragma: no cover - pyarrow < 19
+        pytest.skip("pyarrow without pa.json_()")
+    assert transform_strings("identity", None, arr, "json").to_pylist() == values
+
+
 # ---------------------------------------------------------------------------
 # array driver: arrow-native paths agree with the scalar transforms
 # ---------------------------------------------------------------------------
@@ -342,12 +705,109 @@ def test_transform_strings_temporal_matches_scalars(transform):
     assert got == _scalar_strings(transform, None, values, "timestamp")
 
 
+@pytest.mark.parametrize(
+    ("unit", "col_type", "tick"),
+    [
+        # 2^62 seconds scales to exactly 0 micros under a wrapping
+        # multiply — the whole column would partition as the epoch.
+        ("s", "timestamp_s", 2**62),
+        # The millis edge: the smallest tick whose x1000 leaves int64.
+        ("ms", "timestamp_ms", 2**63 // 1_000 + 1),
+        ("s", "timestamp_s", -(2**62)),
+    ],
+)
+@pytest.mark.parametrize("transform", ["day", "hour"])
+def test_temporal_scaling_overflow_raises_instead_of_wrapping(
+    transform, unit, col_type, tick
+):
+    """A tick too large to express in micros must RAISE, not wrap.
+
+    arrow's unchecked ``multiply`` wraps silently, so an out-of-range
+    timestamp would be assigned a partition value for some unrelated
+    instant — and pruning would then skip the file when querying its
+    real range. A partition value that cannot be computed is not a
+    partition value.
+    """
+    arr = pa.array([tick], pa.timestamp(unit))
+    with pytest.raises(pa.ArrowInvalid, match="overflow"):
+        transform_strings(transform, None, arr, col_type)
+
+
+def test_temporal_scaling_accepts_the_largest_representable_tick():
+    """The control: the boundary itself still works, so the check is a
+    range test and not an arbitrary ceiling."""
+    largest_s = (2**63 - 1) // 1_000_000
+    arr = pa.array([largest_s], pa.timestamp("s"))
+    (got,) = transform_strings("day", None, arr, "timestamp_s").to_pylist()
+    assert got == str(largest_s * 1_000_000 // 86_400_000_000)
+
+
 @pytest.mark.parametrize("transform", ["year", "month", "day"])
 def test_transform_strings_date_matches_scalars(transform):
     values = [date(2017, 11, 16), date(1969, 12, 31), None, date(1970, 1, 1)]
     arr = pa.array(values, pa.date32())
     got = transform_strings(transform, None, arr, "date").to_pylist()
     assert got == _scalar_strings(transform, None, values, "date")
+
+
+@pytest.mark.parametrize("transform", ["year", "month", "day", "hour"])
+@pytest.mark.parametrize(
+    ("unit", "col_type"),
+    [("s", "timestamp_s"), ("ms", "timestamp_ms"), ("us", "timestamp")],
+)
+def test_transform_strings_non_micro_units_match_scalars(transform, unit, col_type):
+    """Regression: _temporal_ints used to cast the arrow array straight to
+    int64 and divide by the MICROS-per-day/hour constants, which is wrong
+    by 10^6 for a timestamp[s] column and 10^3 for timestamp[ms] — every
+    day/hour partition landed on 1970-01-01. The conversion is now keyed
+    on arr.type.unit."""
+    values = [
+        datetime(2017, 11, 16, 22, 31, 8),
+        datetime(1969, 12, 31, 23, 59, 58),  # pre-epoch flooring
+        None,
+        datetime(1970, 1, 1, 0, 0, 0),
+        datetime(2026, 3, 1, 4, 5, 6),
+    ]
+    arr = pa.array(values, pa.timestamp(unit))
+    got = transform_strings(transform, None, arr, col_type).to_pylist()
+    assert got == _scalar_strings(transform, None, values, col_type)
+    # and the answers are unit-independent: same instants, same partitions
+    us = pa.array(values, pa.timestamp("us"))
+    assert got == transform_strings(transform, None, us, "timestamp").to_pylist()
+
+
+@pytest.mark.parametrize("transform", ["day", "hour"])
+def test_transform_strings_nanos_floor_pre_epoch(transform):
+    """Nanos convert to micros by FLOOR division, not arrow's
+    truncate-toward-zero divide: a pre-epoch instant with a sub-micro
+    remainder must stay in the earlier micro, or day/hour round the wrong
+    way across the epoch."""
+    nanos = [-1, -1000, 0, 1000, 86_400_000_000_001]
+    arr = pa.array(nanos, pa.timestamp("ns"))
+    got = transform_strings(transform, None, arr, "timestamp_ns").to_pylist()
+    per_micro_day = 86_400_000_000
+    per_micro_hour = 3_600_000_000
+    divisor = per_micro_day if transform == "day" else per_micro_hour
+    expected = [str((n // 1000) // divisor) for n in nanos]
+    assert got == expected
+    assert got[0] == "-1"  # one nanosecond before the epoch is day/hour -1
+
+
+def test_transform_strings_nanos_identity_uses_raw_nanos():
+    """Arrow refuses to render a sub-microsecond timestamp[ns] as a
+    datetime at all (to_pylist raises), so the per-value path must see
+    raw int64 nanos — which is also the codec's carrier for the type.
+    (bucket is not exercised here: timestamp_ns is not bucketable.)"""
+    nanos = [1, 1_000_000_001, None, 1]
+    arr = pa.array(nanos, pa.timestamp("ns"))
+    with pytest.raises(ValueError, match="not safely convertible"):
+        arr.to_pylist()  # pinned: the hazard this path routes around
+    assert transform_strings("identity", None, arr, "timestamp_ns").to_pylist() == [
+        "1",
+        "1000000001",
+        None,
+        "1",
+    ]
 
 
 def test_transform_strings_timestamptz_utc():

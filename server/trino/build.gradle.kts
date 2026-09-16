@@ -5,20 +5,20 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.0.1-dev"
+version = "1.1.0-dev"
 
 repositories {
     mavenCentral()
 }
 
-val testcontainersVersion = "1.21.3"
-val ktorVersion = "3.2.0"
+val testcontainersVersion = "1.21.4"
+val ktorVersion = "3.5.2"
 
 dependencies {
-    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.18.2")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.2")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
-    testImplementation("org.assertj:assertj-core:3.26.3")
+    testImplementation("org.assertj:assertj-core:3.27.7")
     // Integration tests: the hoglake server runs in-process from the
     // root project's main classes (patterns copied from the root test
     // fixtures — cross-subproject test-source imports are not a thing).
@@ -28,19 +28,19 @@ dependencies {
     testImplementation("io.ktor:ktor-server-core:$ktorVersion")
     testImplementation("io.ktor:ktor-server-netty:$ktorVersion")
     testImplementation("com.zaxxer:HikariCP:6.2.1")
-    testImplementation("org.jdbi:jdbi3-core:3.45.4")
+    testImplementation("org.jdbi:jdbi3-core:3.54.0")
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
     testImplementation("org.testcontainers:junit-jupiter:$testcontainersVersion")
     testImplementation("org.testcontainers:postgresql:$testcontainersVersion")
     testImplementation("org.testcontainers:minio:$testcontainersVersion")
     testImplementation("org.testcontainers:trino:$testcontainersVersion")
     // The JDBC client is independent of the server SPI and remains Java 21 compatible.
-    testImplementation("io.trino:trino-jdbc:446")
+    testImplementation("io.trino:trino-jdbc:483")
     // Real parquet files for the end-to-end read test (same writer the
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
     // Bucket creation + parquet upload to MinIO.
-    testImplementation("software.amazon.awssdk:s3:2.29.29")
+    testImplementation("software.amazon.awssdk:s3:2.54.13")
 }
 
 kotlin {

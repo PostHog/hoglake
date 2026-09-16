@@ -75,12 +75,10 @@ data class ColumnDefDto(
     fun toModel(): ColumnDef =
         ColumnDef(
             name = name,
-            type =
-                try {
-                    ColType.fromWire(type)
-                } catch (_: IllegalArgumentException) {
-                    throw HoglakeException.Validation("unknown column type '$type' for column '$name'")
-                },
+            // parseWire, not fromWire: a permanently unsupported DuckLake
+            // type name gets a 422 that names the type and says WHY, so a
+            // client stops trying instead of hunting for a spelling.
+            type = ColType.parseWire(type) { "unknown column type '$type' for column '$name'" },
             typeParams = typeParams,
             nullable = nullable,
         )
@@ -408,9 +406,20 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * GET /v1/info — instance identity plus live-data totals for the webui
  * header. Name omitted when unset; totals come from the metrics
  * sampler's last pass and are omitted in the boot window before it.
+ * Version is the running server's own, always present (BuildInfo falls
+ * back to "unknown" rather than omitting it — "which version is this?"
+ * having no answer is itself the answer an operator needs).
+ *
+ * Build is the packaging stamp and is omitted on any build nobody
+ * stamped — every local build, every PR image. Absent means "not off
+ * the pipeline", which is why it is a separate optional field and not
+ * folded into `version`: `version` is the contract version the spec is
+ * gated against, and it must keep meaning exactly that.
  */
 data class InstanceInfoDto(
     val name: String?,
+    val version: String,
+    val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
 )

@@ -21,6 +21,46 @@ permissions:
   contents: read
 
 jobs:
+  # Flyway detects a duplicate migration version only at runtime, and a
+  # PR's checks run against the merge result AT PUSH TIME — a migration
+  # that lands on main after this PR's last CI run makes the green
+  # checks stale (PR #65 collided with #66's V4 exactly this way, with
+  # every check passing). This job fetches main FRESH at run time and
+  # checks the union, so a re-run — or a merge-queue run — catches the
+  # collision. Residual gap: nothing forces the re-run; "require
+  # branches to be up to date before merging" closes it fully.
+  migration-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: No duplicate versions, no edits to shipped migrations
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          MIG=server/src/main/resources/db/migration
+
+          # Append-only: every migration file on CURRENT main must be
+          # byte-identical here. Only additions are allowed.
+          bad=$(git diff --name-status origin/main HEAD -- "$MIG" | grep -v '^A' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Migration chain is append-only; changed or removed vs latest main:"
+            echo "$bad"
+            exit 1
+          fi
+
+          # Version collision: one basename per V<number> across the
+          # union of latest main and this branch.
+          { git ls-tree -r --name-only origin/main -- "$MIG"
+            git ls-files -- "$MIG"; } |
+            grep -E '/V[0-9]+__[^/]+\.sql$' | sed 's:.*/::' | sort -u |
+            sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
+            awk '$1 == prev { printf "::error::Duplicate migration version V%s: %s and %s\n", $1, last, $2; dup = 1 }
+                 { prev = $1; last = $2 }
+                 END { exit dup }'
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -46,10 +86,57 @@ jobs:
         working-directory: server
         run: ./gradlew --no-daemon :test :ktlintCheck :checkOpenapiVersion
 
-  # The trino-test job is gone: the connector moved to PostHog/trino
-  # (repo PR #1) and :trino:test now refuses to run without a fork
-  # image (HOGLAKE_TRINO_IMAGE). The harness runs manually against a
-  # fork build — see server/trino/README.md.
+  trino-test:
+    # The connector lives in PostHog/trino (repo PR #1); this runs the
+    # in-repo integration harness against the fork's PUBLIC server
+    # image (ghcr.io/posthog/trino, mirrored by its publish workflow on
+    # every master push). The image is arm64-only, hence the ARM
+    # runner. Deliberately NOT in deploy's `needs` and not a required
+    # check: a broken fork build or a flaky ~1GB pull must never wedge
+    # hoglake CD (that failure mode killed the original job).
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    concurrency:
+      group: server-trino-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Image selection: the HOGLAKE_TRINO_IMAGE repo variable pins an
+      # exact ref when set; otherwise resolve the newest ordered
+      # release tag (r<position>-<sha6>, lexicographically sortable by
+      # construction) from the public ghcr mirror — anonymous, no
+      # cross-repo auth, and new fork releases are picked up with zero
+      # changes here.
+      - name: Resolve Trino image
+        id: image
+        env:
+          PINNED: ${{ vars.HOGLAKE_TRINO_IMAGE }}
+        run: |
+          if [ -n "$PINNED" ]; then
+            echo "ref=$PINNED" >> "$GITHUB_OUTPUT"
+            echo "Using pinned image: $PINNED"
+            exit 0
+          fi
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:posthog/trino:pull" | jq -r .token)
+          tag=$(curl -fsS -H "Authorization: Bearer $token" \
+            "https://ghcr.io/v2/posthog/trino/tags/list?n=1000" \
+            | jq -r '.tags[]' | grep -E '^r[0-9]{12}-[0-9a-f]{6}$' | sort | tail -1)
+          [ -n "$tag" ] || { echo "::error::No ordered release tag found on ghcr.io/posthog/trino"; exit 1; }
+          echo "ref=ghcr.io/posthog/trino:$tag" >> "$GITHUB_OUTPUT"
+          echo "Resolved latest fork release: $tag"
+
+      - name: Trino connector integration tests
+        working-directory: server
+        env:
+          HOGLAKE_TRINO_IMAGE: ${{ steps.image.outputs.ref }}
+        run: ./gradlew --no-daemon :trino:test
 
   image:
     # The deployable image must assemble and BOOT from every PR —
@@ -133,6 +220,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The build identity GET /v1/info reports, so the webui names which
+      # build is live within a version that stays constant between
+      # releases. UTC, minute resolution, sortable as a plain string.
+      # Only this job stamps: an unstamped build is by definition not a
+      # deployed one.
+      - name: Build stamp
+        id: stamp
+        run: echo "value=$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
+
       # Multi-arch: the mw fleet runs Graviton nodes. The Dockerfile's
       # build stage is pinned to $BUILDPLATFORM, so gradle runs once
       # natively; only the JRE runtime layer is per-arch.
@@ -142,6 +238,8 @@ jobs:
           context: server
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            HOGLAKE_BUILD_STAMP=${{ steps.stamp.outputs.value }}
           tags: |
             ghcr.io/posthog/hoglake-server:${{ github.sha }}
             ghcr.io/posthog/hoglake-server:latest

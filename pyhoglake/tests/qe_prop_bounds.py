@@ -13,8 +13,14 @@ Pinned policies (verified here, and load-bearing for the JVM port):
 * Strings: UTF-8; lone surrogates are rejected at encode time with
   UnicodeEncodeError (a ValueError subclass); decode of invalid UTF-8
   raises UnicodeDecodeError. Astral-plane text round-trips.
-* Fixed widths: boolean=1, int/float/date=4, long/double/time/
-  timestamp/timestamptz=8, uuid=16 bytes — always.
+* Fixed widths: boolean=1, int/int8/int16/uint8/uint16/float/date=4,
+  long/uint32/double/time/timestamp_s/timestamp_ms/timestamp/
+  timestamp_ns/timestamptz=8, uuid=16 bytes — always. uint64 and json
+  are variable-width by construction.
+* Totality: the codec never range-checks. A uint8 bound holding 300
+  encodes and decodes without complaint, because a decoder that threw
+  would be un-invertible for hostile footers. Domain policing belongs to
+  the writer, and the Kotlin codec makes the same choice.
 * Decimal: minimal-length big-endian two's-complement unscaled value.
   Encoding is exact and canonical (no redundant sign-extension byte).
   Decode of unscaled values wider than the default decimal-context
@@ -84,6 +90,54 @@ def test_int_out_of_range_raises(v):
 def test_long_out_of_range_raises(v):
     with pytest.raises((struct.error, OverflowError)):
         encode_bound("long", v)
+
+
+# -- the narrow / unsigned integer widths ----------------------------------
+
+#: (coltype, low, high) over each type's own domain.
+_INT_DOMAINS = [
+    ("int8", -(2**7), 2**7 - 1),
+    ("int16", -(2**15), 2**15 - 1),
+    ("uint8", 0, 2**8 - 1),
+    ("uint16", 0, 2**16 - 1),
+]
+
+
+@given(st.data())
+def test_narrow_int_roundtrip_and_width(data):
+    col_type, lo, hi = data.draw(st.sampled_from(_INT_DOMAINS))
+    v = data.draw(st.integers(lo, hi))
+    enc = encode_bound(col_type, v)
+    assert len(enc) == 4  # Iceberg int, whatever the declared width
+    assert enc == encode_bound("int", v)  # identical bytes to plain int
+    assert decode_bound(col_type, enc) == v
+
+
+@given(st.sampled_from([d[0] for d in _INT_DOMAINS]), st.integers(INT32_MIN, INT32_MAX))
+def test_narrow_int_codec_is_total_over_int32(col_type, v):
+    """Pinned policy: NO domain validation. A uint8 bound holding 300
+    encodes and decodes cleanly — range enforcement is the writer's job,
+    and a throwing decoder could not invert a hostile footer."""
+    assert decode_bound(col_type, encode_bound(col_type, v)) == v
+
+
+@given(st.integers(0, 2**32 - 1))
+def test_uint32_roundtrip_as_long(v):
+    enc = encode_bound("uint32", v)
+    assert len(enc) == 8  # maps to Iceberg long, not int
+    assert enc == encode_bound("long", v)
+    assert decode_bound("uint32", enc) == v
+
+
+@given(st.integers(0, 2**64 - 1))
+def test_uint64_roundtrip_as_decimal_unscaled(v):
+    enc = encode_bound("uint64", v)
+    # decimal(20, 0) minimal two's complement: 9 bytes only once the
+    # value needs a 0x00 sign byte, i.e. from 2^63 up
+    assert 1 <= len(enc) <= 9
+    assert (len(enc) == 9) == (v >= 2**63)
+    assert enc == encode_bound("decimal", v, {"scale": 0})
+    assert decode_bound("uint64", enc) == v
 
 
 # -- floats: full domain incl. nan / inf / subnormal / -0.0 ----------------
@@ -239,11 +293,79 @@ def test_timestamp_micros_passthrough_encoding(micros):
     assert encode_bound("timestamptz", micros) == struct.pack("<q", micros)
 
 
-def test_timestamp_decode_2_pow_62_overflows():
-    # Pinned: encode accepts any int64 micros; decode of instants beyond
-    # datetime.max raises OverflowError.
-    with pytest.raises(OverflowError):
-        decode_bound("timestamp", struct.pack("<q", 2**62))
+def test_timestamp_decode_past_datetime_max_returns_raw_micros():
+    # Pinned: encode accepts any int64 micros, and decode of an instant
+    # beyond datetime.max falls back to the raw micros rather than
+    # raising. Python's calendar stops at year 9999 (~2.5e17 micros)
+    # while the bound domain is the whole int64 (~9.2e18) — refusing
+    # there would make the top of our own domain undecodable in one
+    # language only, since Kotlin decodes it to a plain Long.
+    raw = struct.pack("<q", 2**62)
+    assert decode_bound("timestamp", raw) == 2**62
+    # And the round trip still closes, which is the property that matters.
+    assert encode_bound("timestamp", decode_bound("timestamp", raw)) == raw
+
+
+@given(
+    st.sampled_from(["timestamp_s", "timestamp_ms"]),
+    st.datetimes(
+        min_value=datetime(1, 1, 1),
+        max_value=datetime(9999, 12, 31, 23, 59, 59, 999999),
+    ),
+)
+def test_timestamp_seconds_millis_encode_identically_to_timestamp(col_type, v):
+    """The declared precision is metadata: all three map to Iceberg
+    timestamp, so all three store MICROS and must be byte-identical.
+    Anything else would make the same instant prune differently
+    depending on which width the column was declared with."""
+    enc = encode_bound(col_type, v)
+    assert len(enc) == 8
+    assert enc == encode_bound("timestamp", v)
+    assert decode_bound(col_type, enc) == v
+
+
+@given(st.sampled_from(["timestamp_s", "timestamp_ms"]), st.integers(-(2**60), 2**60))
+def test_timestamp_seconds_millis_int_passthrough_is_micros(col_type, micros):
+    # a passed int is ALWAYS the stored unit, never the declared one
+    assert encode_bound(col_type, micros) == struct.pack("<q", micros)
+
+
+@given(st.integers(INT64_MIN, INT64_MAX))
+def test_timestamp_nanos_roundtrip_is_int_exact(nanos):
+    enc = encode_bound("timestamp_ns", nanos)
+    assert len(enc) == 8
+    # decode returns nanos as an int: a datetime cannot hold them, and
+    # rounding to micros would break encode(decode(b)) == b
+    assert decode_bound("timestamp_ns", enc) == nanos
+    assert encode_bound("timestamp_ns", decode_bound("timestamp_ns", enc)) == enc
+
+
+@given(
+    st.datetimes(
+        min_value=datetime(1678, 1, 1),  # int64 nanos spans ~1678..2262
+        max_value=datetime(2261, 12, 31, 23, 59, 59, 999999),
+    )
+)
+def test_timestamp_nanos_from_datetime_scales_exactly(v):
+    # a datetime carries whole micros only, so *1000 is exact, not a
+    # guess. Floor-divide, never `/`: true division goes through a float
+    # and loses digits past 2^53 micros (~year 2255).
+    micros = (v - datetime(1970, 1, 1)) // timedelta(microseconds=1)
+    assert encode_bound("timestamp_ns", v) == struct.pack("<q", micros * 1000)
+
+
+# -- json -------------------------------------------------------------------
+
+
+@given(st.text())
+def test_json_is_byte_identical_to_string(v):
+    """json maps to Iceberg string. Same bytes, no canonicalization — two
+    documents equal as JSON but written differently stay different
+    bounds, which is exactly why json takes no bucket/truncate."""
+    enc = encode_bound("json", v)
+    assert enc == encode_bound("string", v)
+    assert enc == v.encode("utf-8")
+    assert decode_bound("json", enc) == v
 
 
 # -- string -----------------------------------------------------------------
@@ -401,33 +523,34 @@ def test_decimal_scale_overflow_rejected():
 # -- canonical byte-level second-preimage sanity ---------------------------
 
 
-@given(
-    st.sampled_from(
-        ["int", "long", "float", "double", "date", "time", "timestamp", "timestamptz"]
-    )
-)
+_FIXED_WIDTHS = {
+    "int8": 4,
+    "int16": 4,
+    "int": 4,
+    "uint8": 4,
+    "uint16": 4,
+    "uint32": 8,
+    "long": 8,
+    "float": 4,
+    "double": 8,
+    "date": 4,
+    "time": 8,
+    "timestamp_s": 8,
+    "timestamp_ms": 8,
+    "timestamp": 8,
+    "timestamp_ns": 8,
+    "timestamptz": 8,
+}
+
+
+@given(st.sampled_from(sorted(_FIXED_WIDTHS)))
 def test_fixed_width_table(col_type):
-    widths = {
-        "int": 4,
-        "long": 8,
-        "float": 4,
-        "double": 8,
-        "date": 4,
-        "time": 8,
-        "timestamp": 8,
-        "timestamptz": 8,
-    }
     sample = {
-        "int": 1,
-        "long": 1,
         "float": 1.0,
         "double": 1.0,
-        "date": 1,
         "time": time(1, 2, 3),
-        "timestamp": 1,
-        "timestamptz": 1,
-    }[col_type]
-    assert len(encode_bound(col_type, sample)) == widths[col_type]
+    }.get(col_type, 1)
+    assert len(encode_bound(col_type, sample)) == _FIXED_WIDTHS[col_type]
 
 
 def test_unknown_coltype_rejected_both_directions():

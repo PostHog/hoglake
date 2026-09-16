@@ -37,6 +37,32 @@ function InstanceName() {
   return <span className="instance-name">{data.name}</span>;
 }
 
+function ServerVersion() {
+  // Shares the fetch-once key with InstanceName: both read identity that
+  // cannot change without the server restarting, which drops the query.
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  if (!data?.version) return null;
+  // The version alone cannot tell two deploys apart: it stays constant
+  // between releases. The build stamp is what names WHICH build is live,
+  // and it is absent on anything not packaged by the pipeline.
+  const title = data.build
+    ? `Running hoglake server version ${data.version}, build ${data.build} ` +
+      "(the packaging stamp, UTC; GET /v1/info)"
+    : `Running hoglake server version ${data.version}, built locally ` +
+      "(no pipeline build stamp; GET /v1/info)";
+  return (
+    <span className="server-version" title={title}>
+      v{data.version}
+      {data.build && <span className="server-build">+{data.build}</span>}
+    </span>
+  );
+}
+
 function InstanceTotals() {
   // Same endpoint as InstanceName under its own key: the name is
   // fetch-once (staleTime Infinity), the totals refresh. The server
@@ -127,6 +153,7 @@ export function Layout() {
         <Link to="/" className="brand">
           hoglake
         </Link>
+        <ServerVersion />
         <InstanceName />
         <InstanceTotals />
         <Breadcrumbs />

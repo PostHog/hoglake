@@ -470,4 +470,290 @@ class ParquetRewriterTest {
         assertThat(rows.map { it.rowId }).containsExactly(52L, 50L)
         assertThat(rows.map { it.id }).containsExactly(3L, 1L)
     }
+
+    // ---- the DuckLake scalar-parity types ----------------------------------
+
+    /** Reads the single data column of a one-column output, plus its schema. */
+    private fun readSingle(path: Path): Pair<org.apache.parquet.schema.PrimitiveType, List<Group>> {
+        val groups = mutableListOf<Group>()
+        lateinit var schema: MessageType
+        ParquetFileReader.open(LocalInputFile(path)).use { reader ->
+            schema = reader.footer.fileMetaData.schema
+            val columnIO = ColumnIOFactory().getColumnIO(schema)
+            var pages = reader.readNextRowGroup()
+            while (pages != null) {
+                val rr = columnIO.getRecordReader(pages, GroupRecordConverter(schema))
+                repeat(Math.toIntExact(pages.rowCount)) { groups += rr.read() }
+                pages = reader.readNextRowGroup()
+            }
+        }
+        return schema.getType(0).asPrimitiveType() to groups
+    }
+
+    /** One column named "v" with field id 1, plus the rows to write into it. */
+    private fun rewriteOne(
+        name: String,
+        input: MessageType,
+        live: ColType,
+        rows: List<(Group) -> Unit>,
+        sort: List<SortFieldDef> = emptyList(),
+    ): Pair<org.apache.parquet.schema.PrimitiveType, List<Group>> {
+        val f = writeCustom("$name-in.parquet", input, rows)
+        val out = tmp.resolve("$name-out.parquet")
+        ParquetRewriter.rewrite(
+            listOf(ParquetRewriter.Input(f, 0)),
+            listOf(Column(1, 0, ColumnDef("v", live))),
+            sort,
+            out,
+        )
+        return readSingle(out)
+    }
+
+    private fun oneColumn(
+        physical: PrimitiveTypeName,
+        logical: LogicalTypeAnnotation? = null,
+    ): MessageType {
+        var b = Types.optional(physical)
+        if (logical != null) b = b.`as`(logical)
+        return Types.buildMessage().addField(b.id(1).named("v")).named("t")
+    }
+
+    @Test
+    fun `the small int widths rewrite as int32 carrying their INT annotation`() {
+        val widths =
+            listOf(
+                Triple(ColType.INT8, 8, true),
+                Triple(ColType.INT16, 16, true),
+                Triple(ColType.UINT8, 8, false),
+                Triple(ColType.UINT16, 16, false),
+            )
+        for ((type, width, signed) in widths) {
+            val input = oneColumn(PrimitiveTypeName.INT32, LogicalTypeAnnotation.intType(width, signed))
+            val (prim, rows) = rewriteOne("i$width-$signed", input, type, listOf({ g -> g.add("v", 7) }))
+            assertThat(prim.primitiveTypeName).describedAs(type.wire).isEqualTo(PrimitiveTypeName.INT32)
+            assertThat(prim.logicalTypeAnnotation)
+                .describedAs(type.wire)
+                .isEqualTo(LogicalTypeAnnotation.intType(width, signed))
+            assertThat(rows.single().getInteger(0, 0)).isEqualTo(7)
+        }
+    }
+
+    @Test
+    fun `an int8 file rewrites unchanged under a promoted int16 column`() {
+        // The int8 -> int16 promotion is a physical no-op: both are int32.
+        val input = oneColumn(PrimitiveTypeName.INT32, LogicalTypeAnnotation.intType(8, true))
+        val (prim, rows) = rewriteOne("i8-to-i16", input, ColType.INT16, listOf({ g -> g.add("v", -128) }))
+        assertThat(prim.primitiveTypeName).isEqualTo(PrimitiveTypeName.INT32)
+        assertThat(rows.single().getInteger(0, 0)).isEqualTo(-128)
+    }
+
+    @Test
+    fun `uint32 rewrites to a plain INT64, converting an arrow unsigned int32 without sign-extending`() {
+        // The whole reason uint32's writer contract is INT64: 0xFFFFFFFF
+        // must come out as 4294967295, not -1.
+        val input = oneColumn(PrimitiveTypeName.INT32, LogicalTypeAnnotation.intType(32, false))
+        val (prim, rows) = rewriteOne("u32", input, ColType.UINT32, listOf({ g -> g.add("v", -1) }))
+        assertThat(prim.primitiveTypeName).isEqualTo(PrimitiveTypeName.INT64)
+        assertThat(prim.logicalTypeAnnotation).isNull()
+        assertThat(rows.single().getLong(0, 0)).isEqualTo(4_294_967_295L)
+    }
+
+    @Test
+    fun `an unsigned int32 promoted into a long column zero-extends too`() {
+        val input = oneColumn(PrimitiveTypeName.INT32, LogicalTypeAnnotation.intType(32, false))
+        val (prim, rows) = rewriteOne("u32-long", input, ColType.LONG, listOf({ g -> g.add("v", -1) }))
+        assertThat(prim.primitiveTypeName).isEqualTo(PrimitiveTypeName.INT64)
+        assertThat(rows.single().getLong(0, 0)).isEqualTo(4_294_967_295L)
+    }
+
+    @Test
+    fun `a SIGNED int32 promoted into a long column still sign-extends`() {
+        // The control for the test above: the pre-existing int -> long
+        // promotion must keep its meaning.
+        val input = oneColumn(PrimitiveTypeName.INT32)
+        val (_, rows) = rewriteOne("i32-long", input, ColType.LONG, listOf({ g -> g.add("v", -1) }))
+        assertThat(rows.single().getLong(0, 0)).isEqualTo(-1L)
+    }
+
+    @Test
+    fun `uint64 keeps its native unsigned int64 form`() {
+        val input = oneColumn(PrimitiveTypeName.INT64, LogicalTypeAnnotation.intType(64, false))
+        val (prim, rows) =
+            rewriteOne("u64", input, ColType.UINT64, listOf({ g -> g.add("v", Long.MIN_VALUE) }))
+        assertThat(prim.logicalTypeAnnotation).isEqualTo(LogicalTypeAnnotation.intType(64, false))
+        // The bit pattern survives; reading it as unsigned is the catalog's job.
+        assertThat(rows.single().getLong(0, 0)).isEqualTo(Long.MIN_VALUE)
+    }
+
+    @Test
+    fun `unsigned sort keys sort unsigned, not signed`() {
+        // 2^63 (Long.MIN_VALUE's bits) is the LARGEST uint64, so a signed
+        // comparator would sort it first. Pinned because the merged output
+        // order is what a sorted table's readers prune against.
+        val input = oneColumn(PrimitiveTypeName.INT64, LogicalTypeAnnotation.intType(64, false))
+        val (_, rows) =
+            rewriteOne(
+                "u64-sort",
+                input,
+                ColType.UINT64,
+                listOf(
+                    { g -> g.add("v", Long.MIN_VALUE) },
+                    { g -> g.add("v", 1L) },
+                ),
+                sort = listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)),
+            )
+        assertThat(rows.map { it.getLong(0, 0) }).containsExactly(1L, Long.MIN_VALUE)
+    }
+
+    @Test
+    fun `timestamp_s and timestamp_ms rewrite as millis, verbatim`() {
+        for (type in listOf(ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS)) {
+            val input =
+                oneColumn(
+                    PrimitiveTypeName.INT64,
+                    LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+                )
+            val (prim, rows) = rewriteOne("${type.wire}", input, type, listOf({ g -> g.add("v", -1_500L) }))
+            assertThat(prim.logicalTypeAnnotation)
+                .describedAs(type.wire)
+                .isEqualTo(
+                    LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+                )
+            assertThat(rows.single().getLong(0, 0)).describedAs(type.wire).isEqualTo(-1_500L)
+        }
+    }
+
+    @Test
+    fun `a millis file under a micros timestamp column is refused, not silently scaled`() {
+        // There is no legal path to this pairing: PROMOTIONS follows
+        // DuckLake's documented table, which has no timestamp rungs, so a
+        // millis file can only sit under a micros column if a writer
+        // disagreed with its own DDL. Refusing keeps compaction from
+        // inventing a unit conversion nobody asked for.
+        val input =
+            oneColumn(
+                PrimitiveTypeName.INT64,
+                LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        assertThatThrownBy {
+            rewriteOne("ms-under-us", input, ColType.TIMESTAMP, listOf({ g -> g.add("v", 1L) }))
+        }.isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("cannot be produced")
+    }
+
+    @Test
+    fun `timestamp_ns rewrites as nanos and refuses any other unit`() {
+        val nanos =
+            oneColumn(
+                PrimitiveTypeName.INT64,
+                LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS),
+            )
+        val (prim, rows) = rewriteOne("ts-ns", nanos, ColType.TIMESTAMP_NS, listOf({ g -> g.add("v", 42L) }))
+        assertThat(prim.logicalTypeAnnotation)
+            .isEqualTo(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS))
+        assertThat(rows.single().getLong(0, 0)).isEqualTo(42L)
+
+        val micros =
+            oneColumn(
+                PrimitiveTypeName.INT64,
+                LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MICROS),
+            )
+        assertThatThrownBy {
+            rewriteOne("ts-ns-bad", micros, ColType.TIMESTAMP_NS, listOf({ g -> g.add("v", 42L) }))
+        }.isInstanceOf(UnconvertibleSchemaException::class.java)
+    }
+
+    @Test
+    fun `an unsigned source wider than the live type is refused, per width`() {
+        // The rewriter's domain gate, which had no coverage at all:
+        // deleting it left every other test green, because every OTHER
+        // test pairs an unsigned source with a type that can hold it.
+        //
+        // Each row is (live type, source annotation width): an unsigned
+        // leaf of width w is convertible only under a type whose domain
+        // contains [0, 2^w). Without the gate these copy through IDENTITY
+        // and get re-stamped with the LIVE column's annotation —
+        // compaction laundering a file the hydrator refuses to read, and
+        // turning "no bounds" into "wrong bounds".
+        val refused =
+            listOf(
+                // int8 holds 127; it cannot take any unsigned width.
+                Triple(ColType.INT8, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.INT8, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.INT8, 8, PrimitiveTypeName.INT32),
+                // int16 takes INT(8,u) but not INT(16,u).
+                Triple(ColType.INT16, 16, PrimitiveTypeName.INT32),
+                // int and date are int32-domain: 16 bits yes, 32 no.
+                Triple(ColType.INT, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.DATE, 32, PrimitiveTypeName.INT32),
+                // uint16 holds 65535; INT(32,u) overflows it.
+                Triple(ColType.UINT16, 32, PrimitiveTypeName.INT32),
+                // 64-bit unsigned belongs to uint64 alone.
+                Triple(ColType.LONG, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.TIME, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.TIMESTAMP, 64, PrimitiveTypeName.INT64),
+                Triple(ColType.UINT32, 64, PrimitiveTypeName.INT64),
+            )
+        for ((live, width, physical) in refused) {
+            val input = oneColumn(physical, LogicalTypeAnnotation.intType(width, false))
+            val rows =
+                if (physical == PrimitiveTypeName.INT32) {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1) })
+                } else {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1L) })
+                }
+            assertThatThrownBy { rewriteOne("refuse-${live.wire}-u$width", input, live, rows) }
+                .describedAs("%s must refuse an INT(%d, unsigned) source", live.wire, width)
+                .isInstanceOf(UnconvertibleSchemaException::class.java)
+                .hasMessageContaining("cannot be produced")
+        }
+    }
+
+    @Test
+    fun `an unsigned source the live type CAN hold still converts`() {
+        // The control: the gate must bite on width, not on the mere
+        // presence of an unsigned annotation.
+        val allowed =
+            listOf(
+                Triple(ColType.INT16, 8, PrimitiveTypeName.INT32),
+                Triple(ColType.INT, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT8, 8, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT16, 16, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT32, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.LONG, 32, PrimitiveTypeName.INT32),
+                Triple(ColType.UINT64, 64, PrimitiveTypeName.INT64),
+            )
+        for ((live, width, physical) in allowed) {
+            val input = oneColumn(physical, LogicalTypeAnnotation.intType(width, false))
+            val rows =
+                if (physical == PrimitiveTypeName.INT32) {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1) })
+                } else {
+                    listOf<(Group) -> Unit>({ g -> g.add("v", 1L) })
+                }
+            val (_, out) = rewriteOne("allow-${live.wire}-u$width", input, live, rows)
+            assertThat(out).describedAs("%s accepts INT(%d, unsigned)", live.wire, width).hasSize(1)
+        }
+    }
+
+    @Test
+    fun `json rewrites as BYTE_ARRAY with the JSON annotation, bytes untouched`() {
+        val input = oneColumn(PrimitiveTypeName.BINARY, LogicalTypeAnnotation.jsonType())
+        val document = """{ "b":1,  "a":[2] }"""
+        val (prim, rows) = rewriteOne("json", input, ColType.JSON, listOf({ g -> g.add("v", document) }))
+        assertThat(prim.logicalTypeAnnotation).isEqualTo(LogicalTypeAnnotation.jsonType())
+        // Verbatim: compaction never re-canonicalizes a document (which is
+        // also why json is identity-partition-only).
+        assertThat(rows.single().getBinary(0, 0).bytes).isEqualTo(document.toByteArray())
+    }
+
+    @Test
+    fun `a string file rewrites into a json column and vice versa - both are BYTE_ARRAY`() {
+        // Not a promotion (the ALTER path refuses string <-> json), but a
+        // group whose live column changed type out from under it must not
+        // fail here for a PHYSICAL reason; the type gate lives in ALTER.
+        val stringInput = oneColumn(PrimitiveTypeName.BINARY, LogicalTypeAnnotation.stringType())
+        val (prim, _) = rewriteOne("str-json", stringInput, ColType.JSON, listOf({ g -> g.add("v", "{}") }))
+        assertThat(prim.logicalTypeAnnotation).isEqualTo(LogicalTypeAnnotation.jsonType())
+    }
 }

@@ -181,9 +181,10 @@ def test_append_full(table, httpx_mock, fake_s3):
 
 def test_append_reserved_hog_column_fast_fails(table, httpx_mock, fake_s3):
     """A user ``_hog*`` field in the append batch fast-fails client-side
-    BEFORE the pre-flight resolve and the parquet upload — the server
-    reserves the prefix (``_hog_row_id`` is compaction's row-id carrier),
-    so shipping the file first would only waste the S3 write."""
+    BEFORE the pre-flight resolve and the parquet upload. The prefix is
+    reserved for hoglake internals (``_hog_row_id`` is compaction's row-id
+    carrier) but the server does not enforce it (hoglake#36), so this check
+    is the barrier — and failing early also saves the S3 write."""
     data = pa.table({"id": [1], "name": ["a"], "_hog_row_id": [7]})
     with pytest.raises(ValidationError, match="reserved"):
         table.append(data)
