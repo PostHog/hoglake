@@ -852,6 +852,168 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /catalogs/{catalog}/table-creations/{operation}:
+    put:
+      operationId: prepareTableCreation
+      summary: Prepare an unpublished, idempotent table definition (no target-name reservation)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns]
+              properties:
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+    get:
+      operationId: getTableCreation
+      summary: Read a durable receipt; prepared is not permission to delete files
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/commit:
+    post:
+      operationId: publishTableCreation
+      summary: Atomically publish the table, initial files, and durable receipt in one snapshot
+      description: >
+        Requires atomic-table-creation-v1 capability. Target must be absent at publication.
+        The exact ordered file list is compared as JSON on retries; an identical retry
+        returns the original terminal result even if the table was subsequently dropped.
+        Up to 10000 unique file paths, all under the operation write_path. Empty files
+        creates an empty table. No object-store reads occur during publication.
+        Aborted or expired operations cannot publish. Terminal receipts are retained.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/FileRegistration" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/abort:
+    post:
+      operationId: abortTableCreation
+      summary: Fence publication; a committed operation remains committed and its table is never dropped
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -1213,6 +1375,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
+        capabilities: { type: array, items: { type: string }, description: Includes atomic-table-creation-v1 when supported }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1238,6 +1401,24 @@ components:
       required: [name]
       properties:
         name: { type: string }
+
+    TableCreation:
+      type: object
+      required: [operation_id, table_uuid, namespace, name, columns, write_path, state, expires_at]
+      properties:
+        operation_id: { type: string, format: uuid }
+        table_uuid: { type: string, format: uuid }
+        namespace: { type: string }
+        name: { type: string }
+        columns:
+          type: array
+          items: { $ref: "#/components/schemas/Column" }
+        write_path: { type: string }
+        state: { type: string, enum: [prepared, committed, rejected, aborted] }
+        expires_at: { type: string, format: date-time, description: Prepared operations expire after 24 hours; terminal receipts do not expire }
+        snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+        reason: { type: string, enum: [target_exists, namespace_changed, client_abort, expired] }
 
     ColumnDef:
       type: object

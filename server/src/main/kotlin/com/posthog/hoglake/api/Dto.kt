@@ -49,6 +49,7 @@ data class CatalogDto(
     val schemaVersion: Long,
     /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
     val earliestSnapshotTime: Instant? = null,
+    val capabilities: List<String> = listOf("atomic-table-creation-v1"),
 )
 
 fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion, earliestSnapshotTime)

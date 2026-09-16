@@ -84,6 +84,55 @@ class AuditIntegrationTest {
         capture.stop()
     }
 
+    @Test
+    fun `atomic publication audits outcomes after transactions and counts publication once`() {
+        val catalogs = com.posthog.hoglake.service.CatalogService(db.jdbi)
+        val creations =
+            com.posthog.hoglake.service.TableCreationService(
+                db.jdbi,
+                catalogs,
+                com.posthog.hoglake.commit.CommitService(db.jdbi),
+            )
+        val catalog = "atomic-audit"
+        catalogs.createCatalog(catalog, "s3://bucket/audit")
+        catalogs.createNamespace(catalog, "test")
+        val definition =
+            com.posthog.hoglake.service.TableCreationDefinition(
+                "test",
+                "target",
+                listOf(com.posthog.hoglake.model.ColumnDef("id", com.posthog.hoglake.model.ColType.LONG)),
+            )
+        val registry = io.micrometer.core.instrument.simple.SimpleMeterRegistry()
+        Metrics.bind(registry)
+        try {
+            val id = java.util.UUID.randomUUID()
+            creations.prepare(catalog, id, definition)
+            creations.publish(catalog, id, emptyList())
+            creations.publish(catalog, id, emptyList())
+            creations.abort(catalog, id)
+            val rejected = java.util.UUID.randomUUID()
+            creations.prepare(catalog, rejected, definition)
+            creations.publish(catalog, rejected, emptyList())
+            val aborted = java.util.UUID.randomUUID()
+            creations.prepare(catalog, aborted, definition)
+            creations.abort(catalog, aborted)
+            org.assertj.core.api.Assertions.assertThatThrownBy {
+                creations.publish(catalog, id, listOf(com.posthog.hoglake.model.FileRegistration("bad", 1, 100, 20)))
+            }.isInstanceOf(com.posthog.hoglake.model.HoglakeException.CommitConflict::class.java)
+            assertThat(eventsFor("table_creation_publish").map { it["outcome"].asText() })
+                .containsExactly("committed", "replayed", "rejected", "conflict")
+            assertThat(eventsFor("table_creation_abort").map { it["outcome"].asText() })
+                .containsExactly("replayed", "aborted")
+            assertThat(eventsFor("table_creation_publish").first()["detail"].asText())
+                .contains("operation=$id", "snapshot=")
+            assertThat(registry.get("hoglake_commits_total").tag("catalog", catalog).counter().count()).isEqualTo(1.0)
+            assertThat(catalogs.listTables(catalog, "test")).hasSize(1)
+        } finally {
+            Metrics.clear()
+            registry.close()
+        }
+    }
+
     private fun events(): List<JsonNode> = capture.lines.map { json.readTree(it) }
 
     private fun eventsFor(action: String): List<JsonNode> = events().filter { it["action"]?.asText() == action }

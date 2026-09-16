@@ -126,6 +126,12 @@ object HogSchemaColumns {
                     "removal_id", "catalog_id", "path", "file_kind", "reason", "scheduled_at",
                     "attempts", "last_attempt_at", "drained_at", "drained_outcome",
                 ),
+            // TableCreationService: immutable preparation and terminal receipts.
+            "hog_table_creation" to
+                setOf(
+                    "catalog_id", "operation_id", "namespace_id", "definition", "table_uuid",
+                    "write_path", "state", "expires_at", "files", "snapshot_id", "schema_version", "reason",
+                ),
             // MaintenanceRunStore (insert + last-run/history mappers),
             // CleanupService (retention purge).
             "hog_maintenance_run" to

@@ -163,7 +163,7 @@ class CommitDeletesAndPartitionsTest {
         path: String,
         records: Long,
         partitionValues: List<String?>? = null,
-    ) = FileRegistration(path, records, records * 100, 1234, null, partitionValues)
+    ) = FileRegistration(path, records, records * 100, if (records > 0) 20 else null, null, partitionValues)
 
     private fun del(
         dataFileId: Long,
