@@ -195,16 +195,6 @@ class Column:
 
         return _wire("Column", d, build)
 
-    def leaves(self) -> tuple[Column, ...]:
-        """This column's scalar descendants, or itself when it is scalar.
-
-        Leaves are what parquet writes and what ``field_id``-keyed stats
-        describe; a container has no values of its own.
-        """
-        if not self.children:
-            return (self,)
-        return tuple(leaf for c in self.children for leaf in c.leaves())
-
 
 @dataclass(frozen=True)
 class PartitionField:

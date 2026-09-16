@@ -45,9 +45,64 @@ data class CompactionConfig(
     val tierTarget: Int,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
+    /**
+     * How far the SORTED path's group budget is derated for a table with
+     * nested columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
+     *
+     * The sorted path materializes every survivor of a group as
+     * parquet-java `Group` objects so it can sort them — that is what
+     * makes sorting safe at all, since the row ids are explicit data
+     * rather than position. For FLAT rows the object graph is a few
+     * boxed values per row and [targetBytes] is a fair proxy for the
+     * heap. For NESTED rows it is not, and not by a little: a measured
+     * `list<long>` table with five elements per row peaked at 343 MiB of
+     * heap from a 4.6 MiB compressed input — **70x** — because every
+     * element becomes its own `SimpleGroup` with its own object header,
+     * field array and boxed value, and compression that packs an int64
+     * column 10:1 does nothing for object headers.
+     *
+     * So the planner derates: for a table that has BOTH nested columns
+     * and a live sort order, the effective group budget is
+     * `targetBytes / expansion`, which brings the materialized heap back
+     * under roughly targetBytes. 64 is deliberately near the top of the
+     * measured 30-70x range — erring large costs smaller compaction
+     * groups, erring small costs an OOM in a background loop.
+     *
+     * NOT a spill implementation, and not a promise. It bounds the
+     * SORTED path only, and only per GROUP: one pathological ROW (a
+     * million-element list) still materializes whole on either path, and
+     * nothing here changes that — a per-row bound would need a limit the
+     * commit path does not have.
+     */
+    val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
 ) {
     init {
         CompactionTiers.of(targetBytes, tierTarget)
+        require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
+    }
+
+    /**
+     * The group byte budget to plan [table] under: [targetBytes] unless
+     * the table both nests and sorts, in which case the sorted path's
+     * materialization forces the derate. Never below 2 — the tier ladder
+     * refuses a smaller target, and a table whose target derated to
+     * nothing would stop compacting entirely.
+     */
+    fun effectiveTargetBytes(
+        columns: List<Column>,
+        sorted: Boolean,
+    ): Long {
+        if (!sorted || nestedSortExpansion == 1) return targetBytes
+        if (columns.allNodes().none { it.def.type.isNested }) return targetBytes
+        return maxOf(2L, targetBytes / nestedSortExpansion)
+    }
+
+    companion object {
+        /**
+         * Erring at the top of the measured 30-70x expansion; see
+         * [nestedSortExpansion].
+         */
+        const val DEFAULT_NESTED_SORT_EXPANSION = 64
     }
 }
 
@@ -287,6 +342,14 @@ class CompactionService(
 
         data class Row(val candidate: CompactionCandidate, val bucket: Bucket)
 
+        // The DERATED budget, not the raw one: a nested+sorted table's
+        // group has to stay small enough that materializing it to sort
+        // fits in heap (CompactionConfig.nestedSortExpansion). It
+        // narrows the candidate filter too — a file above the derated
+        // target can never reach a tier quota under it, so fetching it
+        // would only be work.
+        val budget = cfg.effectiveTargetBytes(ctx.columns, ctx.sortFields.isNotEmpty())
+
         val rows =
             h.createQuery(
                 """
@@ -310,7 +373,7 @@ class CompactionService(
             )
                 .bind("catalogId", ctx.catalogId)
                 .bind("tableId", ctx.tableId)
-                .bind("targetBytes", cfg.targetBytes)
+                .bind("targetBytes", budget)
                 .map { rs, _ ->
                     Row(
                         CompactionCandidate(
@@ -339,7 +402,7 @@ class CompactionService(
                 }
                 .list()
 
-        val tiers = CompactionTiers.of(cfg.targetBytes, cfg.tierTarget)
+        val tiers = CompactionTiers.of(budget, cfg.tierTarget)
         val out = mutableListOf<Pair<Int, CompactionGroup>>()
         for ((bucket, bucketRows) in rows.groupBy { it.bucket }) {
             for (take in tiers.groups(bucketRows.map { it.candidate }) { it.fileSizeBytes }) {

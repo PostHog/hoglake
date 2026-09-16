@@ -86,6 +86,21 @@ object ColumnTrees {
             return
         }
 
+        // type_params describe a SCALAR's parameters (decimal's precision
+        // and scale, and nothing else today). A container's shape lives
+        // in its children, so a container carrying them means the caller
+        // believes something about this column that is not true — and
+        // accepting them persists that belief into hog_column.type_params
+        // and hands it back on every read. Symmetric with the
+        // children-on-a-scalar refusal above: each type takes exactly the
+        // one it has a meaning for.
+        if (def.typeParams != null && def.typeParams.isNotEmpty()) {
+            throw HoglakeException.Validation(
+                "column '$qualified' is '${def.type.wire}', a nested container, and cannot have " +
+                    "type_params: a container's shape is its children, not its parameters",
+            )
+        }
+
         val required = def.type.requiredChildCount
         if (required != null && children.size != required) {
             throw HoglakeException.Validation(nestedArityMessage(def.type, qualified, children.size))

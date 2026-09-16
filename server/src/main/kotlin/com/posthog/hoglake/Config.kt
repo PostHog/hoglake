@@ -76,6 +76,21 @@ data class Config(
     val compactionTierTarget: Int = env("HOGLAKE_COMPACTION_TIER_TARGET", "8").toInt(),
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
+    /**
+     * Sorted-path heap derate for NESTED tables: the group byte budget a
+     * table with both nested columns and a live sort order is planned
+     * under is compaction_target_bytes / this. The sorted path
+     * materializes a whole group to sort it, and a nested row's object
+     * graph measured 30-70x its compressed bytes, so the raw target is
+     * not a heap bound for such a table. 1 disables the derate — which
+     * is the setting to reach for only with a heap sized for it.
+     * See CompactionConfig.nestedSortExpansion.
+     */
+    val compactionNestedSortExpansion: Int =
+        env(
+            "HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
+        ).toInt(),
     /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
     val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),

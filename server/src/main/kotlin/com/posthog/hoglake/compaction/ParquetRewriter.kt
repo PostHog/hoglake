@@ -170,6 +170,12 @@ object ParquetRewriter {
             // the whole group's Group objects on the heap and OOM'd the
             // server on a 400 MB catalog; heap must stay flat in group
             // size (parquet-java's own row-group buffering bounds it).
+            //
+            // Flat in GROUP size, not in ROW size. One row still
+            // materializes whole — a million-element list is a million
+            // SimpleGroups at once — and nothing here bounds that,
+            // because nothing upstream bounds a row's element count.
+            // Accepted limit, stated rather than implied.
             var written = 0L
             var minRowId: Long? = null
             newWriter(outputSchema, output).use { writer ->
@@ -186,9 +192,24 @@ object ParquetRewriter {
 
         // Sorted: survivors must be materialized to sort. Sorting is safe
         // ONLY because ids are explicit; sortedWith is stable, so ties
-        // keep row-id order. (Heap grows with group size here — sorted
-        // tables opt into that via their sort spec; the group's byte
-        // budget is the planner's targetBytes.)
+        // keep row-id order.
+        //
+        // The heap here is the group's OBJECT GRAPH, which is emphatically
+        // NOT its byte budget — an earlier version of this comment
+        // claimed the planner's targetBytes bounded it, and that is
+        // false. A measured `list<long>` table with five elements per
+        // row peaked at 343 MiB from a 4.6 MiB compressed input (70x):
+        // every element is its own SimpleGroup with an object header, a
+        // field array and a boxed value, and the compression that packs
+        // an int64 column 10:1 does nothing for any of that. Flat rows
+        // are a few boxed values each and stay near their byte size.
+        //
+        // The bound is therefore the planner's, not this loop's:
+        // CompactionService derates the group budget by
+        // CompactionConfig.nestedSortExpansion for a table that both
+        // nests and sorts, so the materialized graph lands back under
+        // roughly targetBytes. Per GROUP only — one pathological ROW
+        // still materializes whole, as on the streaming path above.
         val rows = ArrayList<Row>()
         var minRowId: Long? = null
         for (input in inputs) {
@@ -481,7 +502,28 @@ object ParquetRewriter {
             planNode(srcFields[srcIndex], srcIndex, column, inputPath)
         }
 
-    /** The step producing [column] from the input field [src]. */
+    /**
+     * The step producing [column] from the input field [src].
+     *
+     * **An unmatched child INSIDE a container aborts the group; an
+     * unmatched TOP-LEVEL column null-fills.** The asymmetry is
+     * deliberate. A top-level column the input lacks is ordinary schema
+     * evolution — the column was added after the file was written, every
+     * reader already shows null for it, and null-filling reproduces
+     * exactly what a reader sees. Inside a container there is no such
+     * reading: a list with no element, or a map with no key, is not a
+     * column that arrived late, it is a shape disagreement about a
+     * structure that cannot exist without that member. Null-filling it
+     * would invent a row count and a repetition structure nothing in the
+     * input implies. So the group skips with `unconvertible_schema` —
+     * self-healing once the schema or the file set changes, and never
+     * wrong bytes in the meantime. Never guess inside a container.
+     *
+     * A STRUCT field is the one interior that does null-fill, and for
+     * the top-level reason: a struct's members ARE independently
+     * evolvable columns (add_column with a `parent`), so one the input
+     * predates is the same situation one level down.
+     */
     private fun planNode(
         src: Type,
         srcIndex: Int,

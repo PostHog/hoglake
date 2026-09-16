@@ -297,8 +297,22 @@ tree of steps; the copy recurses through `addGroup`/`getGroup`). The
 alternative — making a nested schema `unconvertible_schema` — was
 cheaper and permanently wrong: a table with one `map` column could then
 never be compacted, and its small-file debt would grow forever with no
-operator lever. The cost is per-ROW heap proportional to the nested
-payload; the unsorted path still holds exactly one record at a time.
+operator lever. The costs are worth stating precisely, because one of them is much
+larger than it looks. The **unsorted** path holds exactly one record at
+a time, so its heap is one row's object graph — bounded by the widest
+row, and nothing bounds a row (a million-element list is a million
+`SimpleGroup`s at once). The **sorted** path materializes the whole
+group to sort it, and a nested group's object graph is **not** its byte
+size: a measured `list<long>` table with five elements per row peaked at
+343 MiB of heap from a 4.6 MiB compressed input — 70x — because every
+element carries an object header, a field array and a boxed value, none
+of which compression touches. `compaction_target_bytes` is therefore not
+a heap bound for such a table, and the planner derates instead: a table
+with BOTH nested columns and a live sort order is planned under
+`target / HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near
+the top of the measured 30-70x range), which puts the materialized graph
+back under roughly the target. That is a bounded mitigation per GROUP,
+not spilling, and not a per-ROW bound.
 Inputs are matched by SHAPE, not by the synthetic group names (the
 parquet spec says those are insignificant), but a shape that disagrees
 with the live column — a struct over a primitive, a 2-level legacy list,

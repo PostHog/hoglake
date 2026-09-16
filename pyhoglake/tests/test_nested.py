@@ -495,3 +495,102 @@ def test_arrow_itself_refuses_a_nullable_map_key():
         pa.schema([pa.field("m", pa.map_(pa.string(), pa.int64()))])
     )
     assert col["children"][0]["nullable"] is False
+
+
+# -- container-typed map keys -------------------------------------------------
+
+#: Iceberg permits a non-scalar map key, so hoglake does too — refusing
+#: one would mean refusing a shape the facade would have been happy to
+#: serve. These pin that the CLIENT half holds: arrow builds them,
+#: schema_to_column_defs shapes them Iceberg's way, the writer stamps
+#: field ids through them, and the stats walk finds the leaves inside
+#: the key exactly as it finds the ones inside the value.
+STRUCT_KEY_MAP = _col(
+    "mk",
+    "map",
+    1,
+    0,
+    children=(
+        _col(
+            "key",
+            "struct",
+            2,
+            0,
+            nullable=False,
+            children=(_col("x", "long", 3),),
+        ),
+        _col("value", "string", 4, 1),
+    ),
+)
+
+LIST_KEY_MAP = _col(
+    "ml",
+    "map",
+    1,
+    0,
+    children=(
+        _col(
+            "key",
+            "list",
+            2,
+            0,
+            nullable=False,
+            children=(_col("element", "int", 3),),
+        ),
+        _col("value", "long", 4, 1),
+    ),
+)
+
+
+def test_arrow_maps_with_container_keys_map_both_ways():
+    schema = pa.schema(
+        [
+            pa.field("mk", pa.map_(pa.struct([("x", pa.int64())]), pa.string())),
+            pa.field("ml", pa.map_(pa.list_(pa.int32()), pa.int64())),
+        ]
+    )
+    defs = {d["name"]: d for d in schema_to_column_defs(schema)}
+    mk_key = defs["mk"]["children"][0]
+    assert mk_key["name"] == "key"
+    assert mk_key["type"] == "struct"
+    assert mk_key["nullable"] is False  # a container key is still required
+    assert [c["name"] for c in mk_key["children"]] == ["x"]
+    ml_key = defs["ml"]["children"][0]
+    assert ml_key["type"] == "list"
+    assert [c["name"] for c in ml_key["children"]] == ["element"]
+
+
+def test_container_key_maps_carry_field_ids_and_yield_leaf_stats():
+    columns = (STRUCT_KEY_MAP,)
+    table = pa.table(
+        {"mk": [[({"x": 7}, "a"), ({"x": 3}, "b")], []]},
+        schema=columns_to_arrow_schema(columns),
+    )
+    footer = _footer(table)
+    arrow = footer.schema.to_arrow_schema()
+    key_field = arrow.field("mk").type.key_field
+    assert int(key_field.metadata[PARQUET_FIELD_ID_KEY]) == 2
+    assert int(key_field.type.field(0).metadata[PARQUET_FIELD_ID_KEY]) == 3
+    assert key_field.nullable is False
+
+    stats = {s.field_id: s for s in extract_column_stats(footer, columns)}
+    # Leaves only: the map (1) and the struct key (2) are containers.
+    assert set(stats) == {3, 4}
+    assert stats[3].lower_bound == struct.pack("<q", 3)
+    assert stats[3].upper_bound == struct.pack("<q", 7)
+    assert stats[4].lower_bound == b"a"
+    assert stats[4].upper_bound == b"b"
+
+
+def test_list_key_map_leaves_are_found_through_two_repetition_layers():
+    columns = (LIST_KEY_MAP,)
+    table = pa.table(
+        {"ml": [[([1, 2], 10), ([9], 20)]]},
+        schema=columns_to_arrow_schema(columns),
+    )
+    stats = {s.field_id: s for s in extract_column_stats(_footer(table), columns)}
+    assert set(stats) == {3, 4}
+    assert stats[3].lower_bound == struct.pack("<i", 1)
+    assert stats[3].upper_bound == struct.pack("<i", 9)
+    # Three elements across two keys: value_count counts VALUES.
+    assert stats[3].value_count == 3

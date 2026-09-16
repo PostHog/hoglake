@@ -210,6 +210,207 @@ class NestedTypeRewriteRoundTripTest {
         }
     }
 
+    // ---- container-typed map keys ------------------------------------------
+
+    /** `mk map<struct{x long}, string>` — ids 1, 2(key), 3(x), 4(value). */
+    private val structKeyMapColumn =
+        Column(
+            1,
+            0,
+            ColumnDef("mk", ColType.MAP),
+            listOf(
+                Column(
+                    2,
+                    0,
+                    ColumnDef("key", ColType.STRUCT, nullable = false),
+                    listOf(Column(3, 0, ColumnDef("x", ColType.LONG))),
+                ),
+                Column(4, 1, ColumnDef("value", ColType.STRING)),
+            ),
+        )
+
+    /** `ml map<list<int>, long>` — ids 1, 2(key), 3(element), 4(value). */
+    private val listKeyMapColumn =
+        Column(
+            1,
+            0,
+            ColumnDef("ml", ColType.MAP),
+            listOf(
+                Column(
+                    2,
+                    0,
+                    ColumnDef("key", ColType.LIST, nullable = false),
+                    listOf(Column(3, 0, ColumnDef("element", ColType.INT))),
+                ),
+                Column(4, 1, ColumnDef("value", ColType.LONG)),
+            ),
+        )
+
+    @Test
+    fun `a map with a STRUCT key survives compaction, keys and values intact`() {
+        // Iceberg permits non-scalar map keys and nothing in this
+        // pipeline breaks on one — but "nothing breaks" is a claim, and
+        // an untested claim about a shape the DDL accepts is the kind
+        // that stops being true quietly.
+        val rows = listOf(listOf(7L to "a", 3L to "b"), emptyList(), null)
+        val schema = structKeyMapSchema()
+        val path =
+            write("skmap-in", schema, rows = rows.size) { g, i ->
+                val value = rows[i]
+                if (value != null) {
+                    val outer = g.addGroup(0)
+                    for ((k, v) in value) {
+                        val entry = outer.addGroup(0)
+                        entry.addGroup(0).add(0, k)
+                        entry.add(1, v)
+                    }
+                }
+            }
+        for (out in roundTrip("skmap", path, listOf(structKeyMapColumn))) {
+            assertThat(readStructKeyMaps(out)).describedAs("values in %s", out.fileName).isEqualTo(rows)
+        }
+
+        // The key's LEAF bounds are ordinary leaf bounds; the key group
+        // itself, like every container, gets none.
+        val catalog =
+            listOf(
+                CatalogColumn(
+                    1,
+                    "mk",
+                    ColType.MAP,
+                    null,
+                    listOf(
+                        CatalogColumn(
+                            2,
+                            "key",
+                            ColType.STRUCT,
+                            null,
+                            listOf(CatalogColumn(3, "x", ColType.LONG, null)),
+                        ),
+                        CatalogColumn(4, "value", ColType.STRING, null),
+                    ),
+                ),
+            )
+        val bounds = boundsOf(path, catalog)
+        assertThat(bounds.keys).describedAs("only LEAVES bound").containsExactlyInAnyOrder(3L, 4L)
+        assertThat(bounds.getValue(3L).first).isEqualTo(IcebergSingleValue.encodeLong(3))
+        assertThat(bounds.getValue(3L).second).isEqualTo(IcebergSingleValue.encodeLong(7))
+        for (out in roundTrip("skmap2", path, listOf(structKeyMapColumn))) {
+            // Byte-for-byte, per field: ByteArray equality is identity,
+            // so comparing the maps directly would compare references.
+            val after = boundsOf(out, catalog)
+            assertThat(after.keys).isEqualTo(bounds.keys)
+            for ((fieldId, pair) in bounds) {
+                assertThat(after.getValue(fieldId).first)
+                    .describedAs("lower bound of field %d in %s", fieldId, out.fileName)
+                    .isEqualTo(pair.first)
+                assertThat(after.getValue(fieldId).second)
+                    .describedAs("upper bound of field %d in %s", fieldId, out.fileName)
+                    .isEqualTo(pair.second)
+            }
+        }
+    }
+
+    @Test
+    fun `a map with a LIST key survives compaction`() {
+        val rows = listOf(listOf(listOf(1, 2) to 10L), listOf(listOf(3) to 20L, emptyList<Int>() to 30L))
+        val schema = listKeyMapSchema()
+        val path =
+            write("lkmap-in", schema, rows = rows.size) { g, i ->
+                val outer = g.addGroup(0)
+                for ((k, v) in rows[i]) {
+                    val entry = outer.addGroup(0)
+                    val keyList = entry.addGroup(0)
+                    for (e in k) keyList.addGroup(0).add(0, e)
+                    entry.add(1, v)
+                }
+            }
+        for (out in roundTrip("lkmap", path, listOf(listKeyMapColumn))) {
+            assertThat(readListKeyMaps(out)).describedAs("values in %s", out.fileName).isEqualTo(rows)
+        }
+        // And the output's key is still REQUIRED — the parquet MAP shape
+        // demands it whether the key is a scalar or a whole list.
+        val out = tmp.resolve("lkmap-shape.parquet")
+        rewrite(path, listOf(listKeyMapColumn), out)
+        val entry = schemaOf(out).getType("ml").asGroupType().getType(0).asGroupType()
+        assertThat(entry.getType(0).isRepetition(Type.Repetition.REQUIRED)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schemaOf(out))).isFalse()
+    }
+
+    private fun structKeyMapSchema(): MessageType =
+        Types.buildMessage()
+            .addField(
+                Types.optionalGroup()
+                    .addField(
+                        Types.repeatedGroup()
+                            .addFields(
+                                Types.requiredGroup()
+                                    .addField(Types.optional(PrimitiveTypeName.INT64).id(3).named("x"))
+                                    .id(2).named("key"),
+                                Types.optional(PrimitiveTypeName.BINARY)
+                                    .`as`(LogicalTypeAnnotation.stringType()).id(4).named("value"),
+                            )
+                            .named("key_value"),
+                    )
+                    .`as`(LogicalTypeAnnotation.mapType())
+                    .id(1).named("mk"),
+            )
+            .named("t")
+
+    private fun listKeyMapSchema(): MessageType =
+        Types.buildMessage()
+            .addField(
+                Types.optionalGroup()
+                    .addField(
+                        Types.repeatedGroup()
+                            .addFields(
+                                Types.requiredGroup()
+                                    .addField(
+                                        Types.repeatedGroup()
+                                            .addField(
+                                                Types.optional(PrimitiveTypeName.INT32).id(3).named("element"),
+                                            )
+                                            .named("list"),
+                                    )
+                                    .`as`(LogicalTypeAnnotation.listType())
+                                    .id(2).named("key"),
+                                Types.optional(PrimitiveTypeName.INT64).id(4).named("value"),
+                            )
+                            .named("key_value"),
+                    )
+                    .`as`(LogicalTypeAnnotation.mapType())
+                    .id(1).named("ml"),
+            )
+            .named("t")
+
+    private fun readStructKeyMaps(path: Path): List<List<Pair<Long, String>>?> =
+        readRows(path) { g ->
+            if (g.getFieldRepetitionCount(0) == 0) {
+                null
+            } else {
+                val outer = g.getGroup(0, 0)
+                (0 until outer.getFieldRepetitionCount(0)).map {
+                    val entry = outer.getGroup(0, it)
+                    entry.getGroup(0, 0).getLong(0, 0) to entry.getString(1, 0)
+                }
+            }
+        }
+
+    private fun readListKeyMaps(path: Path): List<List<Pair<List<Int>, Long>>> =
+        readRows(path) { g ->
+            val outer = g.getGroup(0, 0)
+            (0 until outer.getFieldRepetitionCount(0)).map {
+                val entry = outer.getGroup(0, it)
+                val keyList = entry.getGroup(0, 0)
+                val key =
+                    (0 until keyList.getFieldRepetitionCount(0)).map {
+                            j ->
+                        keyList.getGroup(0, j).getInteger(0, 0)
+                    }
+                key to entry.getLong(1, 0)
+            }
+        }
+
     // ---- the output's SHAPE ------------------------------------------------
 
     @Test

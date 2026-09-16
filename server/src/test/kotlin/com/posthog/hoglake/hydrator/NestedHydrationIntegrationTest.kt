@@ -9,6 +9,9 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
@@ -221,6 +224,125 @@ class NestedHydrationIntegrationTest {
         compaction.runOnce(cat, cfg)
         assertBounds(cat, "after re-compaction")
     }
+
+    @Test
+    fun `a nested SORTED table is planned under the derated group budget`() {
+        // F2's boundary, end to end through the planner. The sorted path
+        // materializes a whole group to sort it, and a nested group's
+        // object graph measured 30-70x its compressed bytes — so
+        // targetBytes is not a heap bound for such a table and the
+        // planner derates it by nestedSortExpansion.
+        //
+        // The test pins the BOUNDARY, not the arithmetic: with a budget
+        // the pair exactly reaches, the group forms; with the same raw
+        // budget and a derate applied, it does not — and an UNSORTED
+        // table with the same derate still groups, because only the
+        // sorted path materializes.
+        val cat = "nested-derate-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "sorted", nestedColumns())
+        catalogs.createTable(cat, "ns", "unsorted", nestedColumns())
+        // id is field 1 on both tables; sort only the first.
+        AlterService(db.jdbi).alterTable(
+            cat,
+            "ns",
+            "sorted",
+            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+        )
+
+        val sizes = mutableListOf<Long>()
+        for (table in listOf("sorted", "unsorted")) {
+            val regs =
+                listOf(0, 1).map { half ->
+                    val bytes = nestedParquet(half)
+                    val path = "s3://$BUCKET/$cat/data/ns/$table/f$half.parquet"
+                    store.put(path, bytes)
+                    sizes += bytes.size.toLong()
+                    FileRegistration(
+                        path = path,
+                        recordCount = 2,
+                        fileSizeBytes = bytes.size.toLong(),
+                        footerSize = footerSizeOf(bytes),
+                        columnStats = null,
+                    )
+                }
+            commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", table, regs))))
+        }
+        hydrator.runOnce()
+
+        // The budget at which the pair exactly reaches a tier quota.
+        val raw = configFor(sizes.take(2))
+
+        // Derate OFF: both tables group, which is the premise — without
+        // it "does not group" below would prove nothing.
+        val noDerate = raw.copy(nestedSortExpansion = 1)
+        assertThat(noDerate.effectiveTargetBytes(columnsOf(cat, "sorted"), sorted = true))
+            .isEqualTo(raw.targetBytes)
+        assertThat(compaction.runOnce(cat, noDerate).groupsCompacted)
+            .describedAs("premise: at the raw budget both tables have a group")
+            .isEqualTo(2)
+
+        // Now the same files again, with the derate ON.
+        for (table in listOf("sorted", "unsorted")) {
+            val regs =
+                listOf(0, 1).map { half ->
+                    val bytes = nestedParquet(half)
+                    val path = "s3://$BUCKET/$cat/data/ns/$table/g$half.parquet"
+                    store.put(path, bytes)
+                    FileRegistration(
+                        path = path,
+                        recordCount = 2,
+                        fileSizeBytes = bytes.size.toLong(),
+                        footerSize = footerSizeOf(bytes),
+                        columnStats = null,
+                    )
+                }
+            commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", table, regs))))
+        }
+        hydrator.runOnce()
+
+        val derated = raw.copy(nestedSortExpansion = 64)
+        assertThat(derated.effectiveTargetBytes(columnsOf(cat, "sorted"), sorted = true))
+            .describedAs("a nested SORTED table is planned smaller")
+            .isEqualTo(maxOf(2L, raw.targetBytes / 64))
+        assertThat(derated.effectiveTargetBytes(columnsOf(cat, "unsorted"), sorted = false))
+            .describedAs("an UNSORTED table streams, so it keeps the raw budget")
+            .isEqualTo(raw.targetBytes)
+
+        // Only the unsorted table still forms a group: the sorted one's
+        // files are now each above its derated budget.
+        val result = compaction.runOnce(cat, derated)
+        assertThat(result.groupsCompacted)
+            .describedAs("the derate splits the nested sorted table out of the plan")
+            .isEqualTo(1)
+        assertThat(liveFileCount(cat, "sorted"))
+            .describedAs("the sorted table's new files stayed uncompacted")
+            .isEqualTo(3) // the earlier run's output + the two new ones
+    }
+
+    @Test
+    fun `a FLAT sorted table keeps the raw budget however large the derate`() {
+        // The derate is about nested object graphs, not about sorting.
+        // Applying it to every sorted table would shrink flat tables'
+        // groups 64-fold for nothing.
+        val flat =
+            listOf(ColumnDef("id", ColType.LONG, nullable = false), ColumnDef("name", ColType.STRING))
+        val cfg = CompactionConfig(targetBytes = 1_000_000, tierTarget = 4, maxGroupsPerRun = 4)
+        val cols = flat.mapIndexed { i, d -> com.posthog.hoglake.model.Column(i + 1L, i, d) }
+        assertThat(cfg.effectiveTargetBytes(cols, sorted = true)).isEqualTo(1_000_000)
+    }
+
+    /** The live column forest of one table, for the derate decision. */
+    private fun columnsOf(
+        cat: String,
+        table: String,
+    ) = catalogs.getTable(cat, "ns", table).columns
+
+    private fun liveFileCount(
+        cat: String,
+        table: String,
+    ): Int = catalogs.listFiles(cat, "ns", table).size
 
     @Test
     fun `a foreign file with no id on its struct group blocks renames after hydration`() {

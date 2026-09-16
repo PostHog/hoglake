@@ -190,6 +190,107 @@ class NestedColumnApiTest {
         return """{"name": "$name", "columns": [$body]}"""
     }
 
+    @Test
+    fun `a map key may itself be a container, and round-trips`() =
+        api { client ->
+            // Iceberg permits non-scalar map keys, so hoglake does too — the
+            // alternative would be refusing a shape the facade would have
+            // been happy to serve. Pinned because "we accept it" was true
+            // before any test said so, which is how a shape stops being
+            // accepted by accident.
+            val name = table()
+            val response =
+                client.postJson(
+                    tablesUrl,
+                    """{"name": "$name", "columns": [
+                    {"name": "mk", "type": "map", "children": [
+                        {"name": "key", "type": "struct", "nullable": false, "children": [
+                            {"name": "x", "type": "long"}]},
+                        {"name": "value", "type": "string"}]},
+                    {"name": "ml", "type": "map", "children": [
+                        {"name": "key", "type": "list", "nullable": false, "children": [
+                            {"name": "element", "type": "int"}]},
+                        {"name": "value", "type": "long"}]}]}""",
+                )
+            assertThat(response.status)
+                .describedAs("body was: %s", response.bodyAsText())
+                .isEqualTo(HttpStatusCode.Created)
+
+            val table = body(client.get("$tablesUrl/$name"))
+            val mk = table["columns"].first { it["name"].asText() == "mk" }
+            assertThat(mk["children"].map { it["name"].asText() }).containsExactly("key", "value")
+            assertThat(mk["children"][0]["type"].asText()).isEqualTo("struct")
+            assertThat(mk["children"][0]["children"].map { it["name"].asText() }).containsExactly("x")
+            // Depth-first ids hold through a container key: 1 mk, 2 key,
+            // 3 key.x, 4 value, 5 ml, 6 key, 7 element, 8 value.
+            assertThat(mk["children"][0]["children"][0]["field_id"].asLong()).isEqualTo(3L)
+            val ml = table["columns"].first { it["name"].asText() == "ml" }
+            assertThat(ml["children"][0]["type"].asText()).isEqualTo("list")
+            assertThat(ml["children"][0]["children"][0]["field_id"].asLong()).isEqualTo(7L)
+
+            // A container key is still REQUIRED, and a nullable one is still
+            // the named refusal — the rule is about the key slot, not about
+            // the key's type.
+            val nullableKey =
+                client.postJson(
+                    tablesUrl,
+                    """{"name": "${table()}", "columns": [
+                    {"name": "m", "type": "map", "children": [
+                        {"name": "key", "type": "struct", "children": [
+                            {"name": "x", "type": "long"}]},
+                        {"name": "value", "type": "int"}]}]}""",
+                )
+            assertValidation(nullableKey) { assertThat(it).contains("must be required (nullable=false)") }
+        }
+
+    @Test
+    fun `the depth cap is measured from the GRAFT POINT on alter, not from zero`() =
+        api { client ->
+            // Create-time depth is covered above; ALTER is where the cap is
+            // easy to get wrong, because the subtree being added is shallow
+            // and only its POSITION makes it illegal. A cap that measured
+            // the added subtree alone would wave a 4-deep graft onto a
+            // 5-deep struct straight past.
+            val name = table()
+            // s4 > s3 > s2 > s1 > s0 > leaf: six levels.
+            var chain = """{"name": "leaf", "type": "int"}"""
+            repeat(5) { chain = """{"name": "s$it", "type": "struct", "children": [$chain]}""" }
+            assertThat(client.postJson(tablesUrl, """{"name": "$name", "columns": [$chain]}""").status)
+                .isEqualTo(HttpStatusCode.Created)
+            val alterUrl = "$tablesUrl/$name/alter"
+            val parent = "s4.s3.s2.s1.s0" // depth 5
+
+            // 5 + 3 = 8, exactly the cap.
+            val ok =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "add_column", "parent": "$parent",
+                    "column": {"name": "g3", "type": "struct", "children": [
+                        {"name": "g2", "type": "struct", "children": [
+                            {"name": "g1", "type": "int"}]}]}}]}""",
+                )
+            assertThat(ok.status).describedAs("body was: %s", ok.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+
+            // 5 + 4 = 9, one past it.
+            val tooDeep =
+                client.postJson(
+                    alterUrl,
+                    """{"ops": [{"op": "add_column", "parent": "$parent",
+                    "column": {"name": "h4", "type": "struct", "children": [
+                        {"name": "h3", "type": "struct", "children": [
+                            {"name": "h2", "type": "struct", "children": [
+                                {"name": "h1", "type": "int"}]}]}]}}]}""",
+                )
+            assertValidation(tooDeep) { detail ->
+                assertThat(detail).contains("nesting depth ${MAX_COLUMN_NESTING_DEPTH + 1}")
+                assertThat(detail).contains("maximum $MAX_COLUMN_NESTING_DEPTH")
+            }
+            // Refused BEFORE any id was allocated: the legal graft above is
+            // still the last thing in the schema.
+            val after = body(client.get("$tablesUrl/$name"))
+            assertThat(after.toString()).doesNotContain("h4")
+        }
+
     // ---- the named refusals -----------------------------------------------
 
     @ParameterizedTest(name = "{0}")
@@ -647,6 +748,18 @@ class NestedColumnApiTest {
                     "a scalar with children",
                     """{"name": "c", "type": "int", "children": [{"name": "x", "type": "int"}]}""",
                     "a scalar type, and cannot have children",
+                ),
+                args(
+                    "a container carrying type_params",
+                    """{"name": "c", "type": "list", "type_params": {"precision": 5, "scale": 2},
+                        "children": [{"name": "element", "type": "int"}]}""",
+                    "a nested container, and cannot have type_params",
+                ),
+                args(
+                    "a struct carrying type_params",
+                    """{"name": "c", "type": "struct", "type_params": {"precision": 5},
+                        "children": [{"name": "a", "type": "int"}]}""",
+                    "a nested container, and cannot have type_params",
                 ),
                 args(
                     "a malformed container nested inside a good one",
