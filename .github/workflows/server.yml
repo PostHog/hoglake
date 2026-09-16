@@ -61,7 +61,22 @@ jobs:
                  { prev = $1; last = $2 }
                  END { exit dup }'
 
-  test:
+          # Ordering: a new migration must be numbered ABOVE everything
+          # already on main. Flyway (outOfOrder=false, our setting)
+          # refuses a pending version below an applied one, so a branch
+          # that merges "under" main's max wedges every deployed
+          # database at startup — dev auto-deploys, so that wedge is
+          # immediate. (#65 landed V6 while V5 was still on a branch;
+          # this check would have forced the branch to renumber.)
+          main_max=$(git ls-tree -r --name-only origin/main -- "$MIG" |
+            grep -E '/V[0-9]+__[^/]+\.sql$' | sed -E 's:.*/V([0-9]+)__.*:\1:' | sort -n | tail -1)
+          comm -13 \
+            <(git ls-tree -r --name-only origin/main -- "$MIG" | grep -E '\.sql$' | sed 's:.*/::' | sort) \
+            <(git ls-files -- "$MIG" | grep -E '\.sql$' | sed 's:.*/::' | sort) |
+            grep -E '^V[0-9]+__' | sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
+            awk -v max="$main_max" '
+              $1 <= max { printf "::error::Migration %s is numbered at or below main'\''s newest (V%s); renumber above it\n", $2, max; bad = 1 }
+              END { exit bad }'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
