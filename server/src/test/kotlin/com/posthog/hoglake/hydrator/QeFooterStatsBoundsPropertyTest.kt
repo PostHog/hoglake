@@ -1182,6 +1182,71 @@ class QeFooterStatsBoundsPropertyTest {
     }
 
     @Test
+    fun `the exemption is by SHAPE, so a foreign-named repetition layer is still exempt`() {
+        // The name-regression fence. `list` and `key_value` are parquet's
+        // CONVENTIONS, not its rules — the spec says the repetition
+        // layer's name is insignificant, and writers in the wild use
+        // `bag`, `array`, `map`, `entries`. An exemption that matched
+        // those two literals would pass every other test in this file
+        // (they all use the canonical names) and then flag every
+        // foreign-written nested file as id-less, blocking renames on
+        // its table for a reason that is not true.
+        //
+        // Every binding node below HAS its id; only the repetition
+        // layer's name is exotic. The answer must be false.
+        val exoticMap =
+            MessageType(
+                "m",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addFields(reqString(2, "k"), optLong(3, "v"))
+                                .named("zzz_entries"),
+                        )
+                        .`as`(LogicalTypeAnnotation.mapType())
+                        .id(1).named("m"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticMap))
+            .describedAs("a MAP repetition layer named 'zzz_entries' is exempt by shape")
+            .isFalse()
+
+        val exoticList =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(Types.repeatedGroup().addField(optInt(2, "el")).named("bag"))
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticList))
+            .describedAs("a LIST repetition layer named 'bag' is exempt by shape")
+            .isFalse()
+
+        // ...and the exemption does not become a blanket one: the same
+        // exotic shapes with an id-less ELEMENT are still flagged, so
+        // "by shape" is not "by wishful thinking".
+        val exoticListIdlessElement =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(Types.optional(PrimitiveTypeName.INT32).named("el"))
+                                .named("bag"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticListIdlessElement)).isTrue()
+    }
+
+    @Test
     fun `a LIST wrapper without its own field id is still flagged`() {
         // The wrapper binds; only the repetition layer under it is
         // exempt. An exemption written per-annotation rather than
