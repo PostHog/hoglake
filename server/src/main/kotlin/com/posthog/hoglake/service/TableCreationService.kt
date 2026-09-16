@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.initialColumns
+import com.posthog.hoglake.model.nodeCount
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
@@ -69,9 +70,21 @@ class TableCreationService(
                     requireSame(h, cat.catalogId, operationId, "definition", encoded)
                     return@operationTransaction load(h, cat.catalogId, operationId)
                 }
+                // NODES, not top-level columns, and BEFORE the walk: a
+                // nested definition costs one hog_column row (and one
+                // field id) per node, so a forest of 10000 structs of
+                // ten fields each is 110000 rows under a cap that reads
+                // 10000. Counting first also means the pathological
+                // request is refused before validateTableDefinition
+                // recurses over it.
+                val nodes = nodeCount(definition.columns)
+                if (nodes > MAX_COLUMN_NODES) {
+                    throw HoglakeException.Validation(
+                        "too many columns: $nodes nested column nodes exceeds the maximum $MAX_COLUMN_NODES",
+                    )
+                }
                 catalogs.validateTableDefinition(definition.name, definition.columns)
                 Identifiers.validate("namespace", definition.namespace)
-                if (definition.columns.size > 10000) throw HoglakeException.Validation("too many columns")
                 val ns =
                     NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
                         ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
@@ -363,5 +376,16 @@ class TableCreationService(
                     rs.getObject("schema_version")?.let { (it as Number).toLong() }, rs.getString("reason"),
                 )
             }.findOne().orElseThrow { HoglakeException.NotFound("table creation operation '$operation'") }
+    }
+
+    companion object {
+        /**
+         * Ceiling on a prepared definition's total column NODES.
+         *
+         * Nodes, not top-level columns: each one is a hog_column row and
+         * a field id, so a forest counted by its roots hides its real
+         * cost by a factor of its fan-out.
+         */
+        const val MAX_COLUMN_NODES = 10000
     }
 }

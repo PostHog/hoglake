@@ -202,6 +202,14 @@ object FooterStats {
         // which is right, so there is no binding to make: the whole
         // file's stats are refused, loudly, and the file keeps whatever
         // it already had rather than gaining something invented.
+        //
+        // The file still flips to 'provided' with ZERO stats rows, and
+        // the hydrator never revisits it — deliberate, and worth naming.
+        // The alternative is 'failed', which buys a rehydrate lever for
+        // a condition rehydrating cannot fix (the FILE is malformed, not
+        // the read) at the cost of an alert that never clears. Missing
+        // bounds cost pruning, not correctness; the warn is the signal,
+        // and a rewrite or an expiry is the remedy.
         val duplicates = duplicateFieldIds(schema)
         if (duplicates.isNotEmpty()) {
             log.warn {

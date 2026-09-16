@@ -39,6 +39,131 @@ class TableCreationIntegrationTest {
 
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
+    /** One of every container shape, plus a three-level combination. */
+    private val nestedColumns =
+        listOf(
+            ColumnDef("id", ColType.LONG, nullable = false),
+            ColumnDef(
+                "addr",
+                ColType.STRUCT,
+                children = listOf(ColumnDef("zip", ColType.STRING), ColumnDef("city", ColType.STRING)),
+            ),
+            ColumnDef("tags", ColType.LIST, children = listOf(ColumnDef("element", ColType.STRING))),
+        )
+
+    @Test
+    fun `a NESTED definition survives prepare, and publish creates exactly the receipt's columns`() {
+        // The whole chain, because every link broke at once when the
+        // codec dropped `children`: prepare accepted the definition
+        // (the wire and the OpenAPI both advertise children), stored a
+        // gutted one, handed back a receipt promising FLAT field ids —
+        // id=1, addr=2, tags=3 where the real assignment is depth-first
+        // — and publish then 422'd forever on a definition nobody had
+        // sent, with the operation stuck `prepared` and the client's
+        // uploaded objects orphaned.
+        val catalog = catalog()
+        val operation = UUID.randomUUID()
+        val prepared =
+            creations.prepare(catalog, operation, TableCreationDefinition("test", "nested", nestedColumns))
+        assertThat(prepared.state).isEqualTo("prepared")
+
+        // The receipt's definition still has its children...
+        assertThat(prepared.definition.columns.map { it.children?.size })
+            .containsExactly(null, 2, 1)
+        // ...and its promised ids are DEPTH-FIRST over the whole forest.
+        assertThat(prepared.columns.flatMap { it.selfAndDescendants() }.map { it.def.name to it.fieldId })
+            .containsExactly(
+                "id" to 1L,
+                "addr" to 2L,
+                "zip" to 3L,
+                "city" to 4L,
+                "tags" to 5L,
+                "element" to 6L,
+            )
+
+        val published = creations.publish(catalog, operation, listOf(file(prepared)))
+        assertThat(published.state).isEqualTo("committed")
+
+        // The PROMISE and the TABLE agree — which is the receipt's whole
+        // reason to exist.
+        val live = catalogs.getTable(catalog, "test", "nested")
+        assertThat(live.columns.flatMap { it.selfAndDescendants() }.map { it.def.name to it.fieldId })
+            .isEqualTo(prepared.columns.flatMap { it.selfAndDescendants() }.map { it.def.name to it.fieldId })
+        assertThat(live.columns.first { it.def.name == "addr" }.children.map { it.def.name })
+            .containsExactly("zip", "city")
+    }
+
+    @Test
+    fun `replaying a prepare with DIFFERENT children is a conflict, not a match`() {
+        // requireSame normalises the stored blob through the codec, so
+        // whatever the codec cannot represent is invisible to the
+        // comparison. With children dropped, two definitions differing
+        // only in their struct's fields compared EQUAL and the second
+        // caller silently adopted the first one's table.
+        val catalog = catalog()
+        val operation = UUID.randomUUID()
+        creations.prepare(catalog, operation, TableCreationDefinition("test", "replay", nestedColumns))
+
+        val different =
+            nestedColumns.map { column ->
+                if (column.name == "addr") {
+                    column.copy(children = listOf(ColumnDef("zip", ColType.STRING)))
+                } else {
+                    column
+                }
+            }
+        assertThatThrownBy {
+            creations.prepare(catalog, operation, TableCreationDefinition("test", "replay", different))
+        }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("different definition")
+
+        // The control: an IDENTICAL replay still replays.
+        val again =
+            creations.prepare(catalog, operation, TableCreationDefinition("test", "replay", nestedColumns))
+        assertThat(again.state).isEqualTo("prepared")
+    }
+
+    @Test
+    fun `the column cap counts NODES, not top-level columns`() {
+        // A forest counted by its roots hides its real cost by a factor
+        // of its fan-out: each node is a hog_column row and a field id,
+        // so 10000 two-field structs is 30000 rows under a cap reading
+        // 10000.
+        val catalog = catalog()
+
+        fun structs(n: Int) =
+            (0 until n).map {
+                ColumnDef(
+                    "s$it",
+                    ColType.STRUCT,
+                    children = listOf(ColumnDef("a", ColType.INT), ColumnDef("b", ColType.INT)),
+                )
+            }
+
+        // 3333 structs = 9999 nodes: under the cap.
+        val ok = structs(3333)
+        assertThat(com.posthog.hoglake.model.nodeCount(ok)).isEqualTo(9999)
+        creations.prepare(
+            catalog,
+            UUID.randomUUID(),
+            TableCreationDefinition("test", "capok", ok),
+        )
+
+        // 3334 structs = 10002 nodes: over it, and refused by NODE count.
+        val tooMany = structs(3334)
+        assertThat(com.posthog.hoglake.model.nodeCount(tooMany)).isEqualTo(10002)
+        assertThatThrownBy {
+            creations.prepare(
+                catalog,
+                UUID.randomUUID(),
+                TableCreationDefinition("test", "capbad", tooMany),
+            )
+        }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("10002 nested column nodes")
+    }
+
     @Test
     fun `append validates supplied footer bounds and still accepts omitted metadata`() {
         val catalog = catalog()

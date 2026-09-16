@@ -588,17 +588,20 @@ object ParquetRewriter {
         column: Column,
         inputPath: Path,
     ): Step? {
-        val byId = srcFields.indexOfFirst { it.id?.intValue()?.toLong() == column.fieldId }
-        val srcIndex =
-            when {
-                byId >= 0 -> byId
-                // Only fall back when the candidate declares no id at
-                // all: a child naming a DIFFERENT id is a mismatch, not
-                // an unnamed one.
-                position < srcFields.size && srcFields[position].id == null -> position
-                else -> return null
-            }
-        return planNode(srcFields[srcIndex], srcIndex, column, inputPath)
+        // POSITION decides, and the id only VERIFIES — the reader's rule
+        // (FooterStats.childBinds), and the two have to hold the same
+        // one. Searching for the id ANYWHERE accepted an entry group
+        // whose key and value are in the other order, and then the copy
+        // below writes the key unconditionally into slot 0 on the
+        // strength of the input key being REQUIRED — which is only true
+        // of the field actually in slot 0. Measured: a swapped-order
+        // file planned fine and threw `not found 1(key) element number
+        // 0` mid-copy, which the sweep counts as a FAILED group (error
+        // level, retried forever) rather than the skip-with-reason it is.
+        val candidate = srcFields.getOrNull(position) ?: return null
+        val id = candidate.id
+        if (id != null && id.intValue().toLong() != column.fieldId) return null
+        return planNode(candidate, position, column, inputPath)
     }
 
     /**

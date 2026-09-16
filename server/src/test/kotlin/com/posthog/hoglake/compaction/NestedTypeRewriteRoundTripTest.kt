@@ -814,6 +814,71 @@ class NestedTypeRewriteRoundTripTest {
     }
 
     @Test
+    fun `a map entry group in the WRONG ORDER is refused cleanly, not thrown out of`() {
+        // The reader binds map entry children POSITIONALLY and verifies
+        // the id; the rewriter used to search for the id ANYWHERE, so it
+        // accepted an entry group whose key and value are in the other
+        // order — and then the copy writes the key unconditionally into
+        // slot 0, on the strength of the input key being REQUIRED, which
+        // is only true of the field actually in slot 0. Measured: the
+        // plan succeeded and the copy threw `not found 1(key) element
+        // number 0 in group`, which the sweep counts as a FAILED group
+        // (error level, retried every run) rather than the
+        // skip-with-reason it is.
+        val swapped =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addFields(
+                                    // value first, and REQUIRED so the
+                                    // required-key check cannot catch it
+                                    Types.required(PrimitiveTypeName.INT64).id(3).named("value"),
+                                    Types.optional(PrimitiveTypeName.BINARY)
+                                        .`as`(LogicalTypeAnnotation.stringType()).id(2).named("key"),
+                                )
+                                .named("key_value"),
+                        )
+                        .`as`(LogicalTypeAnnotation.mapType())
+                        .id(1).named("m"),
+                )
+                .named("t")
+        val path =
+            write("swapentry-in", swapped, rows = 2) { g, i ->
+                val e = g.addGroup(0).addGroup(0)
+                e.add(0, 100L + i)
+                // The second row leaves the OPTIONAL key absent, which is
+                // what turned the mis-binding into a throw.
+                if (i == 0) e.add(1, "k$i")
+            }
+        assertThatThrownBy { rewrite(path, listOf(mapColumn), tmp.resolve("swapentry-out.parquet")) }
+            .describedAs("a clean skip-with-reason, not a raw throw")
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("key does not match the live key field id")
+
+        // The reader's answer for the same file: no stats, same refusal
+        // in spirit. The two surfaces must accept the same files.
+        assertThat(
+            boundsOf(
+                path,
+                listOf(
+                    CatalogColumn(
+                        1,
+                        "m",
+                        ColType.MAP,
+                        null,
+                        listOf(
+                            CatalogColumn(2, "key", ColType.STRING, null),
+                            CatalogColumn(3, "value", ColType.LONG, null),
+                        ),
+                    ),
+                ),
+            ),
+        ).describedAs("the reader refuses the same file").isEmpty()
+    }
+
+    @Test
     fun `an id-less list element binds by SHAPE whatever it is named`() {
         // The reader binds this positionally and produces stats; the
         // rewriter demanded the live column's name (`element`) even
