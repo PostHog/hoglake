@@ -611,7 +611,14 @@ POST `/abort` to atomically fence publication; if publication already won, abort
 returns `committed` and never deletes the table. HTTP 200 reports operation state,
 including `rejected` and `aborted`; clients must inspect the response state.
 
-Prepared operations expire after 24 hours, checked under the publication lock on
+Only publication takes the catalog-wide commit lock, followed by the operation
+row lock. Status, abort, and expiry serialize on the operation row; preparation
+uses the unique operation key to resolve concurrent retries. No operation takes
+the catalog lock while holding an operation row lock. Both row and catalog waits
+honor `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` (default 30000; 0 disables the bound),
+returning 503 with `Retry-After` when the bound is exceeded.
+
+Prepared operations expire after 24 hours, checked under the operation row lock on
 status, abort, preparation retry, or publication. Terminal receipts are retained
 for the lifetime of the catalog in this version. No automatic object deletion is added: failed or
 aborted writes can leave objects. A `prepared` status or an unavailable receipt is
@@ -625,3 +632,14 @@ operation, and validates registration metadata using the existing append checks.
 It does not open Parquet objects at publication time. Field IDs are table-local,
 start at one, and are installed with the prepared UUID at publication. Expanding
 receipt retention, automated orphan cleanup, or idempotent INSERT is separate work.
+
+Atomic preparation, publication, and abort emit `table_creation_*` audit events
+after their transactions finish. `hoglake_table_creation_total` labels attempts
+by catalog, action, and outcome; terminal retries are `replayed`. Only first-time
+successful publication increments `hoglake_commits_total{result="committed"}`.
+Stored definitions carry a format version and stable wire type names; existing
+unversioned receipts remain readable and retryable.
+
+A supplied `footer_size` must be nonnegative and fit within `file_size_bytes - 8`
+for both initial publication and INSERT. Atomic publication requires this field;
+ordinary INSERT retains support for omitted footer metadata.
