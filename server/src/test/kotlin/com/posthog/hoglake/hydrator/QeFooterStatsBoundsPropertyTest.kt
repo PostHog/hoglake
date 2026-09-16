@@ -1,5 +1,10 @@
 package com.posthog.hoglake.hydrator
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.LoggerContext
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.AppenderBase
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.IcebergType
 import com.posthog.hoglake.model.icebergType
@@ -19,8 +24,10 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.random.Random
 
 /**
@@ -1193,6 +1200,86 @@ class QeFooterStatsBoundsPropertyTest {
                 ),
             )
         assertThat(FooterStats.missingFieldIds(schema)).isTrue()
+    }
+
+    @Test
+    fun `a LIST wrapper holding a non-repeated group exempts nothing`() {
+        // The exemption's SHAPE clause, isolated. `repeated` is what
+        // makes a group the repetition layer; a LIST-annotated wrapper
+        // whose single child is an OPTIONAL group is a foreign shape
+        // (FooterStats.matchInto refuses it for stats too), and that
+        // inner group binds like any other — id or flag. Dropping the
+        // repetition clause would exempt it and let an id-less group
+        // through under a LIST annotation.
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            // OPTIONAL, not repeated — and no id.
+                            Types.optionalGroup().addField(reqString(3, "element")).named("inner"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema))
+            .describedAs("an id-less non-repeated group under a LIST wrapper still binds")
+            .isTrue()
+    }
+
+    @Test
+    fun `an unmatched CONTAINER logs at warn, an unmatched scalar does not`() {
+        // The level is the finding. A scalar the file predates is
+        // ordinary schema evolution and belongs at debug; a container
+        // that cannot be matched silently drops every leaf beneath it —
+        // the same unmatchability that made the compaction rewriter
+        // null-fill a whole subtree — and has to be findable in a log.
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(FooterStats::class.java.name) as Logger
+        logger.addAppender(appender)
+        try {
+            // A file holding only `k`; the catalog also knows a struct
+            // and a scalar the file has never seen.
+            val cell =
+                NestedCell(
+                    name = "absent",
+                    column = scalarChild(1, "k", ColType.INT),
+                    schema = MessageType("root", listOf(optInt(1, "k"))),
+                    leaves = listOf(NestedLeaf(listOf("k"), optInt(1, "k"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = emptySet(),
+                )
+            FooterStats.aggregate(
+                nestedFooter(cell),
+                listOf(
+                    cell.column,
+                    scalarChild(7, "added_later", ColType.STRING),
+                    container(8, "addr", ColType.STRUCT, scalarChild(9, "city", ColType.STRING)),
+                ),
+                "s3://qe/absent.parquet",
+            )
+            val warns = events.filter { it.level == Level.WARN }.map { it.formattedMessage }
+            assertThat(warns)
+                .describedAs("the missing container is loud")
+                .anySatisfy({ m -> assertThat(m).contains("addr").contains("child field(s)") })
+            assertThat(warns)
+                .describedAs("the missing scalar is not")
+                .noneSatisfy({ m -> assertThat(m).contains("added_later") })
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
     }
 
     @Test
