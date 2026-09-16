@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
@@ -335,7 +336,7 @@ class TableCreationService(
                 val definition = mapper.readValue<TableCreationDefinition>(rs.getString("definition"))
                 TableCreation(
                     operation, rs.getObject("table_uuid", UUID::class.java), definition,
-                    definition.columns.mapIndexed { i, def -> Column(i.toLong() + 1, i, def) },
+                    initialColumns(definition.columns),
                     rs.getString(
                         "write_path",
                     ),

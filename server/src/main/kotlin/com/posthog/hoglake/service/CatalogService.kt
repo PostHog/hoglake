@@ -3,7 +3,6 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ChangesPlan
-import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
@@ -12,6 +11,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.DeleteFileReadRepo
@@ -211,10 +211,8 @@ class CatalogService(private val jdbi: Jdbi) {
         )
         val createdUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid)
         val firstFieldId = TableRepo.allocateFieldIds(h, cat.catalogId, tableId, columns.size)
-        val cols =
-            columns.mapIndexed { i, def ->
-                Column(fieldId = firstFieldId + i, ordinal = i, def = def)
-            }
+        val cols = initialColumns(columns)
+        check(firstFieldId == cols.first().fieldId) { "new table field allocation must start at one" }
         TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
         TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
         TableRepo.insertStatsRow(h, cat.catalogId, tableId)

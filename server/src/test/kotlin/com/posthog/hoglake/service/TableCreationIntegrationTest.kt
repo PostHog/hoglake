@@ -40,6 +40,23 @@ class TableCreationIntegrationTest {
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
     @Test
+    fun `prepared and directly created schemas share initial field identities`() {
+        val catalog = catalog()
+        val columns =
+            listOf(
+                ColumnDef("number", ColType.LONG, nullable = false),
+                ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 38, "scale" to 2)),
+                ColumnDef("text", ColType.STRING),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), definition.copy(columns = columns))
+        creations.publish(catalog, prepared.operationId, emptyList())
+        val published = catalogs.getTable(catalog, "test", "target")
+        val direct = catalogs.createTable(catalog, "test", "direct", columns)
+        assertThat(prepared.columns).isEqualTo(published.columns).isEqualTo(direct.columns)
+        assertThat(prepared.columns.map { it.fieldId }).containsExactly(1L, 2L, 3L)
+    }
+
+    @Test
     fun `prepare status and abort do not wait for unrelated catalog publication`() {
         val catalog = catalog()
         val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
