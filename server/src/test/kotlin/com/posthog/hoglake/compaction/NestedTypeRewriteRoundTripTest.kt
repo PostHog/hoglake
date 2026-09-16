@@ -388,6 +388,36 @@ class NestedTypeRewriteRoundTripTest {
             .hasMessageContaining("not sortable")
     }
 
+    @Test
+    fun `a sort key inside an unannotated repeated group is refused`() {
+        // Reached through sortKeyPath directly: rewrite() only ever sees
+        // the schema outputSchema just built, which always annotates its
+        // LIST and MAP wrappers, so this shape cannot arrive through the
+        // public entry point. The check still has to be here — the
+        // annotation is what tells a struct from a repetition layer, and
+        // a repeated group WITHOUT one (a legacy 2-level list, say) would
+        // otherwise be walked into as though it were a struct, handing
+        // the comparator a leaf with many values per row.
+        val schema =
+            MessageType(
+                "t",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(Types.optional(PrimitiveTypeName.INT32).id(9).named("element"))
+                                .named("bag"),
+                        )
+                        .id(1).named("l"),
+                ),
+            )
+        assertThatThrownBy {
+            ParquetRewriter.sortKeyPath(schema, SortFieldDef(9, SortDirection.ASC, NullOrder.NULLS_LAST))
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("not sortable")
+    }
+
     // ---- schema disagreements ----------------------------------------------
 
     @Test

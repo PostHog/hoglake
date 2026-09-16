@@ -844,7 +844,7 @@ object ParquetRewriter {
      * refused at DDL time, and [sortKeyPath] refuses them again here so
      * a hand-built spec cannot reach the comparator.
      */
-    private class SortKey(
+    internal class SortKey(
         val path: List<Int>,
         val primitive: PrimitiveType,
         val field: SortFieldDef,
@@ -891,8 +891,17 @@ object ParquetRewriter {
         return g
     }
 
-    /** Resolve one sort field to its index chain in the output schema. */
-    private fun sortKeyPath(
+    /**
+     * Resolve one sort field to its index chain in the output schema.
+     *
+     * Internal rather than private so the refusals can be tested
+     * directly: [rewrite] only ever hands this the schema [outputSchema]
+     * just built, so the shapes it has to refuse — a repeated group with
+     * no logical annotation, a container carrying the sort field's id —
+     * are unreachable through the public entry point. A guard no test
+     * can reach is not a guard.
+     */
+    internal fun sortKeyPath(
         schema: MessageType,
         field: SortFieldDef,
     ): SortKey {

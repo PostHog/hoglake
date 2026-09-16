@@ -906,6 +906,37 @@ class QeFooterStatsBoundsPropertyTest {
             )
             add(
                 NestedCell(
+                    name = "list whose middle group is OPTIONAL, not repeated",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // The repetition layer is what makes a LIST a list.
+                    // A wrapper group holding a non-repeated group is not
+                    // the 3-level encoding, whatever its annotation says,
+                    // and reading its leaf as the element would report
+                    // one value per row for a column that has many.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(
+                                        Types.optionalGroup()
+                                            .addField(optInt(2, "element"))
+                                            .named("list"),
+                                    )
+                                    .`as`(LogicalTypeAnnotation.listType())
+                                    .id(1).named("l"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
                     name = "map whose key_value group has three fields",
                     column =
                         container(
@@ -1025,6 +1056,73 @@ class QeFooterStatsBoundsPropertyTest {
         // exercise production AND refusal.
         assertThat(nestedCells.flatMap { it.mustProduce }).isNotEmpty()
         assertThat(nestedCells.flatMap { it.mustRefuse }).isNotEmpty()
+    }
+
+    @Test
+    fun `two structs with a same-named leaf do not pool their chunks`() {
+        // Leaves are matched on the FULL chunk path. A name-only match
+        // sums `a.id` and `b.id` into one row whose bounds describe
+        // neither column — and both still look perfectly well-formed.
+        val columns =
+            listOf(
+                container(1, "a", ColType.STRUCT, scalarChild(2, "id", ColType.INT)),
+                container(3, "b", ColType.STRUCT, scalarChild(4, "id", ColType.INT)),
+            )
+        val schema =
+            MessageType(
+                "root",
+                listOf(
+                    Types.optionalGroup().addField(optInt(2, "id")).id(1).named("a"),
+                    Types.optionalGroup().addField(optInt(4, "id")).id(3).named("b"),
+                ),
+            )
+        val cell =
+            NestedCell(
+                name = "two structs, one leaf name",
+                column = columns[0],
+                schema = schema,
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("a", "id"), optInt(2, "id"), le(1), le(2)),
+                        NestedLeaf(listOf("b", "id"), optInt(4, "id"), le(100), le(200)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = emptySet(),
+            )
+        val aggs = FooterStats.aggregate(nestedFooter(cell), columns, "s3://qe/two.parquet")
+        val byField = aggs.associateBy { it.fieldId }
+        assertThat(byField.keys).containsExactlyInAnyOrder(2L, 4L)
+        assertThat(byField.getValue(2L).upperBound).isEqualTo(IcebergSingleValue.encodeInt(2))
+        assertThat(byField.getValue(4L).lowerBound).isEqualTo(IcebergSingleValue.encodeInt(100))
+    }
+
+    @Test
+    fun `a schema whose only columns are nested still binds by field id`() {
+        // usesFieldIds decides whether the hydrator binds by id (the LIVE
+        // column set) or by NAME (the set at the file's begin_snapshot).
+        // A nested-only file has no top-level primitive leaf at all, so a
+        // top-level-only check answers FALSE for a perfectly id-bearing
+        // file and sends it down the name-binding path — where a
+        // synthetic `element` or `key` matches nothing and every bound
+        // disappears.
+        val schema =
+            MessageType(
+                "root",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(optInt(2, "element"))
+                                .named("list"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.usesFieldIds(schema)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schema))
+            .describedAs("the synthetic repetition group carries no id, and that is not a gap")
+            .isFalse()
     }
 
     private fun declaredFieldIds(col: CatalogColumn): Set<Long> =
