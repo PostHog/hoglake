@@ -311,9 +311,13 @@ installed metadata, so they are not version strings to bump.
   to reclaim, and the commit re-claims the ticket first so a drain that
   won the race just aborts the group. Still deliberate: the background
   loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
-  on is an ops decision, not a code gap. Remaining rewrite deferrals
-  (all surface as `unconvertible_schema` skips, never wrong bytes):
-  nested schemas, INT96, decimal-scale changes, and non-native
+  on is an ops decision, not a code gap. **Nested schemas rewrite** —
+  list/struct/map are copied through recursively (the plan is a tree of
+  steps; parquet-java's Group API already is one), so a nested table is
+  compactable like any other; an input whose nested SHAPE disagrees with
+  the live column is `unconvertible_schema`, never a guess. Remaining
+  rewrite deferrals (all surface as `unconvertible_schema` skips, never
+  wrong bytes): INT96, decimal-scale changes, and non-native
   time(stamp) units — each timestamp type accepts only the unit its own
   files carry (millis for `timestamp_s`/`timestamp_ms`, micros for
   `timestamp`/`timestamptz`, nanos for `timestamp_ns`), and `time`

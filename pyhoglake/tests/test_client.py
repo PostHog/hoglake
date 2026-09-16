@@ -213,6 +213,66 @@ def test_create_table_body_shape(client, httpx_mock):
     assert t.columns[0].field_id == 1
 
 
+def test_create_table_body_shape_for_nested_columns(client, httpx_mock):
+    """The exact JSON a nested create-table sends.
+
+    Pinned as a literal because this body is a CONTRACT with the server's
+    ColumnDefDto: the key is `children`, the list child is named
+    `element`, the map's are `key` (nullable false) and `value`, and a
+    scalar carries no `children` key at all. Any of those wrong is a 400
+    or a 422 from a server this client cannot see in a unit test.
+    """
+    cat = _catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
+        json=TABLE_WIRE,
+        status_code=201,
+    )
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("tags", pa.list_(pa.string())),
+            pa.field("addr", pa.struct([("city", pa.string()), ("zip", pa.int32())])),
+            pa.field("props", pa.map_(pa.string(), pa.int64())),
+        ]
+    )
+    Namespace(cat, "ns1").create_table("nested", schema)
+    body = json.loads(httpx_mock.get_requests()[-1].content)
+    assert body == {
+        "name": "nested",
+        "columns": [
+            {"name": "id", "type": "long", "nullable": False},
+            {
+                "name": "tags",
+                "type": "list",
+                "nullable": True,
+                "children": [{"name": "element", "type": "string", "nullable": True}],
+            },
+            {
+                "name": "addr",
+                "type": "struct",
+                "nullable": True,
+                "children": [
+                    {"name": "city", "type": "string", "nullable": True},
+                    {"name": "zip", "type": "int", "nullable": True},
+                ],
+            },
+            {
+                "name": "props",
+                "type": "map",
+                "nullable": True,
+                "children": [
+                    {"name": "key", "type": "string", "nullable": False},
+                    {"name": "value", "type": "long", "nullable": True},
+                ],
+            },
+        ],
+    }
+
+
 def test_create_table_reserved_hog_column_fast_fails(client, httpx_mock):
     """`_hog*` column names are reserved for hoglake internals
     (_hog_row_id is compaction's row-id carrier). The server does not

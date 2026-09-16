@@ -215,8 +215,97 @@ reason** — never a generic unknown-type error, because "stop trying" and
 | `point`, `linestring`, `polygon`, `multipoint`, `multilinestring`, `multipolygon`, `linestring_z`, `geometrycollection` | DuckLake geometry; out of scope |
 
 Still open from the DuckLake type system: VARIANT (Iceberg V3 has
-`variant` — tracking V3 for `timestamp_ns` does not commit us to it),
-and nested types generally, which the flat model does not admit yet.
+`variant` — tracking V3 for `timestamp_ns` does not commit us to it).
+
+### 2.8 Nested types: `list`, `struct`, `map`
+
+| col_type | Iceberg | parquet | bounds |
+|---|---|---|---|
+| `list` | list | `optional group x (LIST) { repeated group list { <t> element } }` | **none** |
+| `struct` | struct | `optional group x { <fields> }` | **none** |
+| `map` | map | `optional group x (MAP) { repeated group key_value { required <k> key; <v> value } }` | **none** |
+
+The mapping is native and one for one, element/key/value **field ids
+included**: an Iceberg facade presents these columns without converting
+anything or synthesizing an id.
+
+**The column model is a tree.** `hog_column` gained
+`parent_field_id` (V5) — a same-table reference by
+`(catalog_id, table_id, field_id)` identity, deliberately **not** a
+foreign key, because these rows are versioned and an FK would have to
+name one *version* of a parent that a rename or a promote immediately
+retires. Field ids are stable across versions; versions are not.
+`ordinal` orders **siblings**, so the live-ordinal unique index is
+per-parent (`NULLS NOT DISTINCT`, so top-level columns — whose parent is
+NULL — keep the guarantee they always had). Ids are assigned
+**depth-first**, parent before children, which keeps a subtree's ids
+contiguous.
+
+**Shape rules are Iceberg's, and each has its own named 422.** A `list`
+has exactly one child, named `element`, whose nullability is declarable
+(Iceberg's `element-required`). A `map` has exactly two, `key` then
+`value`, and the key is **required** — Iceberg map keys are
+non-nullable and the parquet MAP shape says so too. A `struct` has one
+or more children, which keep the user's names. A scalar has none.
+Nesting depth is capped at **8**, counting a top-level column as 1 — not
+a physical limit (parquet and Iceberg have none) but a blast-radius one:
+every level multiplies field ids, definition/repetition levels, and the
+recursion every surface performs per row.
+
+**Bounds are per LEAF.** A container carries no values, so it gets no
+`hog_file_column_stats` row at all, and a commit shipping
+`column_stats` for a container's field id is refused by name (the server
+never sees the file, so this is the only place it can be caught). A
+list's `element` and a map's `key`/`value` DO get counts and bounds —
+that is Iceberg's own rule for nested fields — and a struct leaf behaves
+exactly like a top-level scalar, same encoding, same width. `value_count`
+for a repeated leaf is the number of VALUES, not of rows.
+
+**Partition and sort sources must be leaves with no repeated ancestor.**
+Iceberg's `source-id` may point at a struct's leaf field, so `addr.zip`
+is a legal source and a struct leaf of a bucketable scalar type is
+bucketable — that is a property of the leaf, and §2.6's allowlist is
+untouched. A container itself is refused (no single value per row), and
+so is anything under a `list` or a `map` (many values per row). Both
+refusals name which of the two applies.
+
+**Promotion: containers never, struct leaves by the ordinary matrix.**
+Promotion is keyed on field id, so a struct leaf promotes and re-encodes
+its bounds exactly like a top-level column; §2.5's intersection applies
+unchanged. A container has no promotion at all, in either direction, and
+says so rather than reporting that this particular target was wrong.
+
+**The alter matrix for nested columns**, by dotted path (`addr.zip`;
+names cannot contain `.`, so the path is unambiguous):
+
+| op | struct interior | list / map interior |
+|---|---|---|
+| `add_column` (with `parent`) | ✅ new field id, appended ordinal | ❌ 422 |
+| `drop_column` | ✅ (not the last field; takes its subtree) | ❌ 422 |
+| `rename_column` | ✅ | ❌ 422 |
+| `promote_column` | ✅ scalar matrix on the leaf | ❌ 422 |
+| anything on the container itself | drop/rename ✅, promote ❌ | drop/rename ✅, promote ❌ |
+
+There is no op for a list's element or a map's key/value because Iceberg
+has none: the container's shape is part of its type, and changing it
+would be a type change, not a column op.
+
+**Compaction rewrites nested columns; it does not refuse them.**
+parquet-java's Group API is already a tree, so the existing
+plan-and-copy pipeline extends one level at a time (the plan becomes a
+tree of steps; the copy recurses through `addGroup`/`getGroup`). The
+alternative — making a nested schema `unconvertible_schema` — was
+cheaper and permanently wrong: a table with one `map` column could then
+never be compacted, and its small-file debt would grow forever with no
+operator lever. The cost is per-ROW heap proportional to the nested
+payload; the unsorted path still holds exactly one record at a time.
+Inputs are matched by SHAPE, not by the synthetic group names (the
+parquet spec says those are insignificant), but a shape that disagrees
+with the live column — a struct over a primitive, a 2-level legacy list,
+an optional map key — is `unconvertible_schema`, never a guess.
+
+Still open: VARIANT, and `list`/`map` internals as partition sources
+(Iceberg does not define them either).
 
 ## 3. Iceberg-identical partition transforms only
 

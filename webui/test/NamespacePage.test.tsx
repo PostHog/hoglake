@@ -46,6 +46,12 @@ describe("NamespacePage", () => {
     expect(options).not.toEqual(expect.arrayContaining(["interval"]));
     expect(options).not.toEqual(expect.arrayContaining(["point"]));
     expect(options).not.toEqual(expect.arrayContaining(["geometrycollection"]));
+    // list/struct/map are real server types now, and still absent here:
+    // they REQUIRE children and this form has no child editor, so picking
+    // one would be a guaranteed 422 exactly like the refused names above.
+    expect(options).not.toEqual(expect.arrayContaining(["list"]));
+    expect(options).not.toEqual(expect.arrayContaining(["struct"]));
+    expect(options).not.toEqual(expect.arrayContaining(["map"]));
   });
 
   it("adds and removes column rows dynamically", async () => {
