@@ -1096,6 +1096,124 @@ class QeFooterStatsBoundsPropertyTest {
         assertThat(byField.getValue(4L).lowerBound).isEqualTo(IcebergSingleValue.encodeInt(100))
     }
 
+    // ---- the field-id contract over nested schemas -------------------------
+
+    /**
+     * A foreign file with ids on every LEAF but none on the struct group
+     * holding them. Iceberg puts an id on the struct too; a writer that
+     * does not has produced a file whose struct binds by NAME.
+     */
+    private fun leafIdsOnlySchema(structName: String): MessageType =
+        MessageType(
+            "foreign",
+            listOf(
+                optInt(1, "k"),
+                Types.optionalGroup()
+                    .addFields(optInt(4, "a"), reqString(5, "b"))
+                    // deliberately NO .id(...) on the group
+                    .named(structName),
+            ),
+        )
+
+    @Test
+    fun `a container group without a field id is flagged, so the rename guard fires`() {
+        // THE data-loss scenario, at its first link. Unflagged, the
+        // rename guard does not fire; after `rename_column addr ->
+        // location` the compaction rewriter can match the subtree
+        // neither by id (the group has none) nor by name (it changed),
+        // null-fills it, and end-snapshots the input — which expiry then
+        // deletes. Silent, permanent, uncounted.
+        assertThat(FooterStats.missingFieldIds(leafIdsOnlySchema("addr")))
+            .describedAs("a struct group with no field id binds by NAME and must be flagged")
+            .isTrue()
+        // The same file still USES field ids for its leaves, so stats
+        // still bind by id — the two questions are different, and only
+        // one of them is about renames.
+        assertThat(FooterStats.usesFieldIds(leafIdsOnlySchema("addr"))).isTrue()
+    }
+
+    @Test
+    fun `a fully id-bearing nested schema is not flagged`() {
+        // The control. Every binding node — leaves AND container
+        // wrappers — carries an id, which is what pyarrow and hoglake's
+        // own writer both emit.
+        val schema =
+            MessageType(
+                "ok",
+                listOf(
+                    optInt(1, "k"),
+                    Types.optionalGroup()
+                        .addFields(optInt(4, "a"), reqString(5, "b"))
+                        .id(3).named("addr"),
+                    listGroup(6, "tags", reqString(7, "element")),
+                    mapGroup(8, "props", reqString(9, "key"), optLong(10, "value")),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isFalse()
+    }
+
+    @Test
+    fun `the synthetic repetition groups are exempt, or every rewrite would self-flag`() {
+        // THE trap. parquet inserts `repeated group list` inside a LIST
+        // and `repeated group key_value` inside a MAP; neither is a
+        // column, Iceberg has no id to match against one, and neither
+        // pyarrow nor hoglake's own compaction output writes one.
+        // Flagging them would make every rewrite produce a file that
+        // instantly fails its own contract check and blocks renames on
+        // its own table forever.
+        val listSchema = MessageType("l", listOf(listGroup(1, "tags", reqString(2, "element"))))
+        val mapSchema =
+            MessageType("m", listOf(mapGroup(1, "props", reqString(2, "key"), optLong(3, "value"))))
+        for (schema in listOf(listSchema, mapSchema)) {
+            assertThat(schema.getFields()[0].asGroupType().getType(0).id)
+                .describedAs("the fixture really does omit the repetition layer's id")
+                .isNull()
+            assertThat(FooterStats.missingFieldIds(schema))
+                .describedAs("%s", schema.getFields()[0].name)
+                .isFalse()
+        }
+    }
+
+    @Test
+    fun `a LIST wrapper without its own field id is still flagged`() {
+        // The wrapper binds; only the repetition layer under it is
+        // exempt. An exemption written per-annotation rather than
+        // per-shape would have swallowed this one too.
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    // .named without .id: the wrapper carries no field id.
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup().addField(reqString(2, "element")).named("list"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isTrue()
+    }
+
+    @Test
+    fun `a legacy 2-level list's repeated element is NOT exempt`() {
+        // In the 2-level encoding the repeated node IS the element — a
+        // real column that needs its id. The exemption is by SHAPE (a
+        // repeated GROUP under the wrapper), never by "it sits under a
+        // LIST annotation".
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(Types.repeated(PrimitiveTypeName.INT32).named("element"))
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isTrue()
+    }
+
     @Test
     fun `a schema whose only columns are nested still binds by field id`() {
         // usesFieldIds decides whether the hydrator binds by id (the LIVE

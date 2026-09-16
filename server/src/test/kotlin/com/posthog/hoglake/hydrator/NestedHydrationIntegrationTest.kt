@@ -3,11 +3,14 @@ package com.posthog.hoglake.hydrator
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
+import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
@@ -22,6 +25,7 @@ import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
@@ -216,6 +220,148 @@ class NestedHydrationIntegrationTest {
         // invisible in a single run.
         compaction.runOnce(cat, cfg)
         assertBounds(cat, "after re-compaction")
+    }
+
+    @Test
+    fun `a foreign file with no id on its struct group blocks renames after hydration`() {
+        // The end of the data-loss chain, walked from the top. A writer
+        // that puts ids on every LEAF but none on the struct group has
+        // produced a file whose struct binds by NAME. Until the flag
+        // covered containers, nothing recorded that: the rename guard
+        // stayed quiet, and `rename_column addr -> location` left the
+        // compaction rewriter unable to match the subtree by id (no id)
+        // or by name (changed), so it null-filled the lot and
+        // end-snapshotted the input for expiry to delete.
+        val cat = "nested-idless-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("k", ColType.INT),
+                ColumnDef(
+                    "addr",
+                    ColType.STRUCT,
+                    children = listOf(ColumnDef("a", ColType.INT), ColumnDef("b", ColType.STRING)),
+                ),
+            ),
+        )
+
+        val bytes = leafIdsOnlyParquet()
+        val path = "s3://$BUCKET/$cat/data/ns/t/foreign.parquet"
+        store.put(path, bytes)
+        commits.commit(
+            cat,
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(
+                                FileRegistration(
+                                    path = path,
+                                    recordCount = 3,
+                                    fileSizeBytes = bytes.size.toLong(),
+                                    footerSize = footerSizeOf(bytes),
+                                    columnStats = null,
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+
+        assertThat(missingFieldIdsFlag(cat))
+            .describedAs("the id-less struct GROUP must flag the file")
+            .isTrue()
+
+        // ...and the flag is what the rename guard reads.
+        assertThatThrownBy {
+            AlterService(db.jdbi).alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(AlterOp.RenameColumn("addr", "location")),
+            )
+        }
+            .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+            .hasMessageContaining("id-less")
+
+        // The leaves still bind by id, so stats are unaffected: the two
+        // questions ("can I rename?" and "can I read stats?") are
+        // different, and only one of them is about names.
+        assertThat(statsFieldIds(cat)).containsExactlyInAnyOrder(1L, 3L, 4L)
+    }
+
+    /** `hog_data_file.missing_field_ids` for the catalog's one live file. */
+    private fun missingFieldIdsFlag(cat: String): Boolean =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT f.missing_field_ids FROM hog_data_file f
+                JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                WHERE c.name = :cat AND f.end_snapshot IS NULL
+                """,
+            ).bind("cat", cat).mapTo(Boolean::class.javaObjectType).one()
+        }
+
+    private fun statsFieldIds(cat: String): List<Long> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT s.field_id FROM hog_file_column_stats s
+                JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                WHERE c.name = :cat
+                """,
+            ).bind("cat", cat).mapTo(Long::class.java).list()
+        }
+
+    /**
+     * The probe file: ids on `k`, `addr.a` and `addr.b`, none on the
+     * `addr` group itself.
+     */
+    private fun leafIdsOnlyParquet(): ByteArray {
+        val schema =
+            MessageType(
+                "foreign",
+                listOf(
+                    Types.optional(PrimitiveTypeName.INT32).id(1).named("k"),
+                    Types.optionalGroup()
+                        .addFields(
+                            Types.optional(PrimitiveTypeName.INT32).id(3).named("a"),
+                            Types.optional(PrimitiveTypeName.BINARY)
+                                .`as`(LogicalTypeAnnotation.stringType()).id(4).named("b"),
+                        )
+                        // NO .id(...): that is the whole point of the fixture.
+                        .named("addr"),
+                ),
+            )
+        val tmp = Files.createTempFile("hoglake-foreign", ".parquet")
+        Files.deleteIfExists(tmp)
+        val factory = SimpleGroupFactory(schema)
+        ExampleParquetWriter.builder(LocalOutputFile(tmp))
+            .withType(schema)
+            .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+            .build()
+            .use { w ->
+                for (i in 0 until 3) {
+                    val g = factory.newGroup()
+                    g.add(0, i)
+                    val inner = g.addGroup(1)
+                    inner.add(0, 100 + i)
+                    inner.add(1, "v$i")
+                    w.write(g)
+                }
+            }
+        return try {
+            Files.readAllBytes(tmp)
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
     }
 
     /**

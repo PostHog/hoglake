@@ -249,6 +249,62 @@ class NestedTypeRewriteRoundTripTest {
     }
 
     @Test
+    fun `a compaction output never flags itself id-less, for any nested shape`() {
+        // THE trap in the field-id contract check. The check now covers
+        // container WRAPPER groups, and it must keep exempting the
+        // synthetic repetition layers parquet inserts (`list`,
+        // `key_value`) — which this writer deliberately emits without
+        // ids, because Iceberg has nothing to match one against. Get
+        // that wrong and every rewrite produces a file that instantly
+        // fails its own contract and blocks renames on its own table
+        // forever, with compaction re-creating the condition each run.
+        val cases =
+            listOf(
+                Triple("selfflag-list", listSchema(), listColumn),
+                Triple("selfflag-struct", structSchema(), structColumn),
+                Triple("selfflag-map", mapSchema(), mapColumn),
+                Triple("selfflag-deep", deepSchema(), deepColumn),
+            )
+        for ((name, schema, live) in cases) {
+            val path = write("$name-in", schema, rows = 1) { g, _ -> fillOne(schema, g) }
+            val out = tmp.resolve("$name-out.parquet")
+            rewrite(path, listOf(live), out)
+            assertThat(FooterStats.missingFieldIds(schemaOf(out)))
+                .describedAs("%s output flags itself", name)
+                .isFalse()
+            // ...and re-compacting it keeps the property, which is what
+            // makes the run idempotent rather than one-shot-clean.
+            val out2 = tmp.resolve("$name-out2.parquet")
+            rewrite(out, listOf(live), out2)
+            assertThat(FooterStats.missingFieldIds(schemaOf(out2)))
+                .describedAs("%s re-compacted output flags itself", name)
+                .isFalse()
+        }
+    }
+
+    /** One minimal row for whichever fixture schema is passed. */
+    private fun fillOne(
+        schema: MessageType,
+        g: Group,
+    ) {
+        when (schema.getType(0).name) {
+            "l" -> g.addGroup(0).addGroup(0).add(0, 1)
+            "s" ->
+                g.addGroup(0).also {
+                    it.add(0, 1)
+                    it.add(1, "x")
+                }
+            "m" ->
+                g.addGroup(0).addGroup(0).also {
+                    it.add(0, "k")
+                    it.add(1, 1L)
+                }
+            "d" -> g.addGroup(0).addGroup(0).addGroup(0).addGroup(0).add(0, 1.0)
+            else -> error("unknown fixture ${schema.getType(0).name}")
+        }
+    }
+
+    @Test
     fun `explicit row ids survive a nested rewrite and its re-compaction`() {
         // The lineage guarantee does not get a pass because the schema is
         // complicated: every survivor still carries its own id, and a

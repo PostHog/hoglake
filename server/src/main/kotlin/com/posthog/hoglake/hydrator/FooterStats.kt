@@ -7,6 +7,7 @@ import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.statistics.Statistics
 import org.apache.parquet.hadoop.metadata.BlockMetaData
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
+import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType
@@ -79,15 +80,40 @@ object FooterStats {
     )
 
     /**
-     * The field-id contract check: true when ANY primitive leaf of the
-     * schema lacks a `PARQUET:field_id`. Such files bind columns by
-     * name, so a later column rename would silently NULL their history
-     * in readers — hog_data_file.missing_field_ids records the hazard
-     * and AlterService refuses renames while a flagged file is live.
-     * The reserved `_hog_row_id` id 2147483646 on compacted files is an
-     * id like any other and never trips this.
+     * The field-id contract check: true when ANY node of the schema that
+     * binds to a catalog column lacks a `PARQUET:field_id` — every
+     * primitive leaf AND every CONTAINER wrapper group. Such files bind
+     * that node by name, so a later column rename would silently NULL its
+     * history in readers — hog_data_file.missing_field_ids records the
+     * hazard and AlterService refuses renames while a flagged file is
+     * live. The reserved `_hog_row_id` id 2147483646 on compacted files
+     * is an id like any other and never trips this.
+     *
+     * **Containers count, and the omission was a data-loss bug.** A
+     * foreign writer that puts ids on every leaf but none on the struct
+     * group holding them used to pass this check. Nothing flagged the
+     * file, so the rename guard did not fire; after `rename_column
+     * addr -> location` the compaction rewriter could match the subtree
+     * neither by id (the group has none) nor by name (it changed), and
+     * [com.posthog.hoglake.compaction.ParquetRewriter] null-filled the
+     * WHOLE subtree — then end-snapshotted the input, which expiry
+     * eventually deleted. Silent, permanent, uncounted.
+     *
+     * **The synthetic repetition layers are exempt, and must be.** The
+     * `repeated group list` inside a LIST and the `repeated group
+     * key_value` inside a MAP are parquet's own structure, not columns:
+     * Iceberg has no id to match against one, pyarrow does not write one,
+     * and neither does hoglake's own compaction output. Flagging them
+     * would make every rewrite produce a file that instantly fails its
+     * own contract check and blocks renames on its own table forever.
+     *
+     * The exemption is by SHAPE, not by name: the single REPEATED GROUP
+     * child of a LIST/MAP-annotated wrapper. A legacy 2-level list
+     * (`repeated <primitive> element` directly under the wrapper) is NOT
+     * exempt — there the repeated node IS the element, a real column
+     * that needs its id.
      */
-    fun missingFieldIds(schema: MessageType): Boolean = anyLeafWithoutId(schema.fields)
+    fun missingFieldIds(schema: MessageType): Boolean = anyBindingNodeWithoutId(schema.fields)
 
     /**
      * Whether [aggregate] will map columns by field id for this schema:
@@ -103,14 +129,43 @@ object FooterStats {
      */
     fun usesFieldIds(schema: MessageType): Boolean = allLeaves(schema).any { it.fieldId != null }
 
-    private fun anyLeafWithoutId(fields: List<Type>): Boolean =
+    private fun anyBindingNodeWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
             if (field.isPrimitive) {
                 field.id == null
             } else {
-                anyLeafWithoutId(field.asGroupType().fields)
+                val group = field.asGroupType()
+                val synthetic = syntheticRepetitionLayer(group)
+                // The wrapper itself always binds; only the repetition
+                // layer under it is exempt, and only its CHILDREN are
+                // then checked.
+                (group.id == null) ||
+                    if (synthetic != null) {
+                        anyBindingNodeWithoutId(synthetic.fields)
+                    } else {
+                        anyBindingNodeWithoutId(group.fields)
+                    }
             }
         }
+
+    /**
+     * The synthetic repetition group parquet inserts between a LIST/MAP
+     * wrapper and its element/key/value, or null when [group] is not
+     * that shape (a struct, or a legacy 2-level list whose repeated
+     * child is the element itself).
+     */
+    private fun syntheticRepetitionLayer(group: GroupType): GroupType? {
+        val annotation = group.logicalTypeAnnotation
+        if (annotation !is LogicalTypeAnnotation.ListLogicalTypeAnnotation &&
+            annotation !is LogicalTypeAnnotation.MapLogicalTypeAnnotation &&
+            annotation !is LogicalTypeAnnotation.MapKeyValueTypeAnnotation
+        ) {
+            return null
+        }
+        val only = group.fields.singleOrNull() ?: return null
+        if (only.isPrimitive || !only.isRepetition(Type.Repetition.REPEATED)) return null
+        return only.asGroupType()
+    }
 
     /**
      * Per-LEAF aggregates for the catalog columns present in [footer].
@@ -149,8 +204,19 @@ object FooterStats {
         for (col in columns) {
             val field = findField(schema.fields, col, useFieldIds)
             if (field == null) {
-                log.debug {
-                    "column ${col.name} (field ${col.fieldId}) not present in $filePath; no stats"
+                // WARN, not debug, when a CONTAINER goes unmatched: an
+                // absent scalar is ordinary (a column added after the
+                // file was written), but an absent container silently
+                // takes its whole subtree's stats with it — several
+                // columns' worth of pruning, gone, and the same
+                // unmatchability that made the compaction rewriter
+                // null-fill the subtree. If it is in the log, somebody
+                // can find it.
+                val detail = "column ${col.name} (field ${col.fieldId}) not present in $filePath; no stats"
+                if (col.type.isNested) {
+                    log.warn { "$detail for it or any of its ${col.children.size} child field(s)" }
+                } else {
+                    log.debug { detail }
                 }
                 continue
             }
@@ -205,10 +271,13 @@ object FooterStats {
                 for (child in col.children) {
                     val sub = findField(group.fields, child, useFieldIds)
                     if (sub == null) {
-                        log.debug {
+                        // Same rule one level down: a missing scalar
+                        // field is ordinary schema evolution, a missing
+                        // CONTAINER quietly drops everything under it.
+                        val detail =
                             "struct field ${child.name} (field ${child.fieldId}) absent from " +
                                 "${path.joinToString(".")} in $filePath; no stats"
-                        }
+                        if (child.type.isNested) log.warn { detail } else log.debug { detail }
                         continue
                     }
                     matchInto(child, sub, path, useFieldIds, filePath, out)
