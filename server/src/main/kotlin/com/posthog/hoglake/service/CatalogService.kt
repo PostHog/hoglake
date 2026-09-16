@@ -3,7 +3,6 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ChangesPlan
-import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
@@ -182,10 +181,10 @@ class CatalogService(private val jdbi: Jdbi) {
                 throw HoglakeException.Validation("table '$name' must have at least one column")
             }
             columns.forEach { Identifiers.validate("column", it.name) }
-            val dupes = columns.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
-            if (dupes.isNotEmpty()) {
-                throw HoglakeException.Validation("duplicate column names: ${dupes.sorted()}")
-            }
+            // Nesting shape, depth cap, synthetic child names, map-key
+            // requiredness, per-parent duplicate names — all of it BEFORE
+            // a field id is allocated for any part of the request.
+            ColumnTrees.validate(columns)
             jdbi.inTransactionUnchecked { h ->
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
@@ -206,11 +205,13 @@ class CatalogService(private val jdbi: Jdbi) {
                     tableId,
                 )
                 val tableUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId)
-                val firstFieldId = TableRepo.allocateFieldIds(h, cat.catalogId, tableId, columns.size)
-                val cols =
-                    columns.mapIndexed { i, def ->
-                        Column(fieldId = firstFieldId + i, ordinal = i, def = def)
-                    }
+                // One allocation for the whole FOREST — a nested column
+                // needs an id per node, not per top-level column — and
+                // depth-first assignment, so a subtree's ids stay
+                // contiguous and a parent always precedes its children.
+                val firstFieldId =
+                    TableRepo.allocateFieldIds(h, cat.catalogId, tableId, ColumnTrees.nodeCount(columns))
+                val cols = ColumnTrees.assignFieldIds(columns, firstFieldId)
                 TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
                 TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
                 TableRepo.insertStatsRow(h, cat.catalogId, tableId)

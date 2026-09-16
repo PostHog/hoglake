@@ -35,7 +35,14 @@ export interface Namespace {
 // (ColumnDef.type in openapi/hoglake.yaml). Types the server refuses
 // permanently — int128, uint128, timetz, interval, geometry — are absent
 // on purpose: the console must not offer what the API always rejects.
-export const COLUMN_TYPES = [
+/**
+ * The types the create-table form can build. Scalars only, on purpose:
+ * list/struct/map require `children`, the form has no child editor, and
+ * offering them in the dropdown would make every such choice a
+ * guaranteed 422 — the same reason the permanently refused DuckLake
+ * names are absent.
+ */
+export const SCALAR_COLUMN_TYPES = [
   "boolean",
   "int8",
   "int16",
@@ -61,6 +68,18 @@ export const COLUMN_TYPES = [
   "binary",
 ] as const;
 
+/**
+ * The container types. Readable everywhere (a table can have them), but
+ * not creatable from the console — see SCALAR_COLUMN_TYPES.
+ */
+export const NESTED_COLUMN_TYPES = ["list", "struct", "map"] as const;
+
+/** Everything the server's ColumnDef.type enum accepts. */
+export const COLUMN_TYPES = [
+  ...SCALAR_COLUMN_TYPES,
+  ...NESTED_COLUMN_TYPES,
+] as const;
+
 export type ColumnType = (typeof COLUMN_TYPES)[number];
 
 export interface ColumnDef {
@@ -68,11 +87,38 @@ export interface ColumnDef {
   type: ColumnType;
   type_params?: Record<string, unknown>;
   nullable?: boolean;
+  /** Present only for list/struct/map. */
+  children?: ColumnDef[];
 }
 
 export interface Column extends ColumnDef {
   field_id: Int64;
+  /** 0-based among SIBLINGS, not table-wide. */
   ordinal: number;
+  children?: Column[];
+}
+
+/**
+ * A container column's type as one readable signature —
+ * `list&lt;int&gt;`, `map&lt;string, long&gt;`,
+ * `struct&lt;a: int, b: string&gt;` — and a scalar's as its own name.
+ */
+export function formatColumnType(c: ColumnDef): string {
+  const kids = c.children ?? [];
+  if (c.type === "list") {
+    return `list<${kids.length === 1 ? formatColumnType(kids[0]) : "?"}>`;
+  }
+  if (c.type === "map") {
+    return kids.length === 2
+      ? `map<${formatColumnType(kids[0])}, ${formatColumnType(kids[1])}>`
+      : "map<?>";
+  }
+  if (c.type === "struct") {
+    return `struct<${kids
+      .map((k) => `${k.name}: ${formatColumnType(k)}`)
+      .join(", ")}>`;
+  }
+  return c.type;
 }
 
 export interface CreateTableRequest {

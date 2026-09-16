@@ -248,7 +248,22 @@ object IcebergSingleValue {
                     is BigInteger -> encodeDecimalUnscaled(value)
                     else -> mismatch(type, value)
                 }
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
         }
+
+    /**
+     * Containers have no Iceberg single-value serialization — a list is
+     * not a value, it is a shape — so encode/decode/compare refuse them
+     * outright rather than inventing bytes. [IllegalArgumentException]
+     * is the codec's documented refusal, so the fuzz target's contract
+     * ("decode never throws anything but IllegalArgumentException")
+     * holds unchanged for the three new members.
+     */
+    private fun noSingleValue(type: ColType): Nothing =
+        throw IllegalArgumentException(
+            "column type '${type.wire}' is a nested container and has no Iceberg single-value " +
+                "encoding; bounds are per LEAF field",
+        )
 
     /**
      * Inverse of [encode] — mirrors pyhoglake's `decode_bound` (the two
@@ -304,6 +319,7 @@ object IcebergSingleValue {
                 require(data.isNotEmpty()) { "empty ${type.wire} encoding" }
                 BigInteger(data)
             }
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
         }
 
     /**
@@ -333,6 +349,10 @@ object IcebergSingleValue {
                 java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
             ColType.UUID_T ->
                 java.util.Arrays.compareUnsigned(encodeUuid(a as UUID), encodeUuid(b as UUID))
+            // Unreachable through decode (it refuses containers first),
+            // but a caller holding two values and a container type is
+            // asking a question with no answer — say so.
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
             else -> (a as Comparable<Any>).compareTo(b)
         }
 

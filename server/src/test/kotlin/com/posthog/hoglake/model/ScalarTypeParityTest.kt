@@ -53,11 +53,48 @@ class ScalarTypeParityTest {
         }
 
         @Test
-        fun `the V4 migration's CHECK lists exactly the enum, in order`() {
-            val sql = read("src/main/resources/db/migration/V4__scalar_types.sql")
+        fun `the latest migration's CHECK lists exactly the enum, in order`() {
+            // The LAST migration that recreates the CHECK is the one that
+            // must agree with the enum — the chain is append-only, so V4's
+            // list is history and V5's is the live vocabulary. Adding a
+            // type means adding a migration, and this assertion is what
+            // makes forgetting one a red test rather than a 500 at insert.
+            val sql = read("src/main/resources/db/migration/V5__nested_types.sql")
             assertThat(checkMembers(sql))
-                .describedAs("V4__scalar_types.sql col_type CHECK")
+                .describedAs("V5__nested_types.sql col_type CHECK")
                 .isEqualTo(wireNames)
+        }
+
+        @Test
+        fun `the three container types are present and classified`() {
+            assertThat(wireNames).containsSubsequence("list", "struct", "map")
+            for (t in listOf(ColType.LIST, ColType.STRUCT, ColType.MAP)) {
+                assertThat(t.isNested).describedAs("%s.isNested", t.wire).isTrue()
+            }
+            assertThat(ColType.entries.filter { it.isNested })
+                .containsExactly(ColType.LIST, ColType.STRUCT, ColType.MAP)
+            // Appended, never inserted: the fuzz seed corpus encodes
+            // ColType.ordinal as its first byte, so inserting a member
+            // silently re-points every committed seed at another type.
+            assertThat(ColType.entries.takeLast(3))
+                .describedAs("containers are the LAST three members")
+                .containsExactly(ColType.LIST, ColType.STRUCT, ColType.MAP)
+        }
+
+        @Test
+        fun `container child arity is fixed for list and map, open for struct`() {
+            assertThat(ColType.LIST.requiredChildCount).isEqualTo(1)
+            assertThat(ColType.MAP.requiredChildCount).isEqualTo(2)
+            assertThat(ColType.STRUCT.requiredChildCount).isNull()
+            assertThat(ColType.syntheticChildNames(ColType.LIST)).containsExactly("element")
+            assertThat(ColType.syntheticChildNames(ColType.MAP)).containsExactly("key", "value")
+            // struct children keep the user's names, so there is nothing
+            // synthetic to impose.
+            assertThat(ColType.syntheticChildNames(ColType.STRUCT)).isNull()
+            for (t in ColType.entries.filter { !it.isNested }) {
+                assertThat(t.requiredChildCount).describedAs("%s", t.wire).isNull()
+                assertThat(ColType.syntheticChildNames(t)).describedAs("%s", t.wire).isNull()
+            }
         }
 
         @Test
@@ -127,10 +164,27 @@ class ScalarTypeParityTest {
                     ColType.JSON to IcebergType.STRING,
                     ColType.UUID_T to IcebergType.UUID,
                     ColType.BINARY to IcebergType.BINARY,
+                    // Native, one for one (iceberg-federation.md §2.8).
+                    ColType.LIST to IcebergType.LIST,
+                    ColType.STRUCT to IcebergType.STRUCT,
+                    ColType.MAP to IcebergType.MAP,
                 )
             assertThat(expected.keys).containsExactlyInAnyOrderElementsOf(ColType.entries)
             for ((type, iceberg) in expected) {
                 assertThat(type.icebergType).describedAs(type.wire).isEqualTo(iceberg)
+            }
+        }
+
+        @Test
+        fun `isScalar splits the Iceberg types exactly where isNested splits ours`() {
+            // The two predicates must agree, because every bounds and
+            // promotion decision keys on the MAPPED type: an Iceberg
+            // container reachable from a scalar ColType (or the reverse)
+            // would put a single-value encoding where there is none.
+            for (t in ColType.entries) {
+                assertThat(t.icebergType.isScalar)
+                    .describedAs("%s -> %s", t.wire, t.icebergType.wire)
+                    .isEqualTo(!t.isNested)
             }
         }
     }

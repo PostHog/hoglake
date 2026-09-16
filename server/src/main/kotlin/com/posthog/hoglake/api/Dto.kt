@@ -70,6 +70,15 @@ data class ColumnDefDto(
     val type: String,
     val typeParams: Map<String, Any?>? = null,
     val nullable: Boolean = true,
+    /**
+     * Children of a container type (list/struct/map). Recursive, and
+     * bounded by the depth cap the service enforces
+     * ([com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH]) — Jackson
+     * itself will refuse a pathologically deep body first
+     * (StreamReadConstraints), which is a 400 rather than a stack
+     * overflow.
+     */
+    val children: List<ColumnDefDto>? = null,
 ) {
     fun toModel(): ColumnDef =
         ColumnDef(
@@ -80,6 +89,7 @@ data class ColumnDefDto(
             type = ColType.parseWire(type) { "unknown column type '$type' for column '$name'" },
             typeParams = typeParams,
             nullable = nullable,
+            children = children?.map { it.toModel() },
         )
 }
 
@@ -92,9 +102,15 @@ data class ColumnDto(
     val nullable: Boolean,
     val fieldId: Long,
     val ordinal: Int,
+    /**
+     * Children of a container type, with their assigned field ids;
+     * NON_NULL omits it entirely for a scalar column, so a pre-phase-2
+     * client sees the shape it always saw.
+     */
+    val children: List<ColumnDto>? = null,
 )
 
-fun Column.toDto() =
+fun Column.toDto(): ColumnDto =
     ColumnDto(
         name = def.name,
         type = def.type.wire,
@@ -102,6 +118,7 @@ fun Column.toDto() =
         nullable = def.nullable,
         fieldId = fieldId,
         ordinal = ordinal,
+        children = if (def.type.isNested) children.map { it.toDto() } else null,
     )
 
 data class TableSummaryDto(val name: String, val tableUuid: UUID)

@@ -1,5 +1,6 @@
 package com.posthog.hoglake.commit
 
+import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
@@ -856,17 +857,24 @@ class CommitService(
         append: ResolvedAppend,
     ) {
         val qualified = "${append.namespace}.${append.table}"
-        val liveFieldIds: Set<Long> by lazy {
+        // field_id -> col_type. The TYPE is carried because a stats row
+        // is only meaningful for a LEAF: hog_file_column_stats holds
+        // counts and bounds, and a list/struct/map has neither. A client
+        // shipping stats for a container id is confused about the shape
+        // of its own file, and a silent accept would put a bound on a
+        // column no reader can decode it for.
+        val liveColumnTypes: Map<Long, String> by lazy {
             h.createQuery(
                 """
-                SELECT field_id FROM hog_column
+                SELECT field_id, col_type FROM hog_column
                  WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL
                 """,
             )
                 .bind(0, catalogId)
                 .bind(1, append.tableId)
-                .mapTo(Long::class.java)
-                .toSet()
+                .map { rs, _ -> rs.getLong("field_id") to rs.getString("col_type") }
+                .toList()
+                .toMap()
         }
         for (file in append.files) {
             if (file.path.isBlank()) {
@@ -911,9 +919,16 @@ class CommitService(
             val stats = file.columnStats ?: continue
             val seenFieldIds = HashSet<Long>()
             for (stat in stats) {
-                if (stat.fieldId !in liveFieldIds) {
+                val colType =
+                    liveColumnTypes[stat.fieldId]
+                        ?: throw HoglakeException.Validation(
+                            "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",
+                        )
+                if (ColType.fromWire(colType).isNested) {
                     throw HoglakeException.Validation(
-                        "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",
+                        "field_id ${stat.fieldId} in stats for ${file.path} in $qualified is a " +
+                            "'$colType' column; nested containers carry no values, so stats are " +
+                            "per LEAF field — ship the element/key/value/struct-field ids instead",
                     )
                 }
                 if (!seenFieldIds.add(stat.fieldId)) {

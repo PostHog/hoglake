@@ -123,6 +123,11 @@ class QeBoundsVectorsTest {
             // uint64 shares decimal's carrier: the unsigned value as a
             // BigInteger, which is also its unscaled decimal(20,0) value.
             ColType.UINT64, ColType.DECIMAL -> BigInteger(value)
+            // Containers never appear in the bounds vector file — they
+            // have no single-value encoding — so reaching this arm means
+            // someone put one there.
+            ColType.LIST, ColType.STRUCT, ColType.MAP ->
+                error("nested container '${type.wire}' has no bounds vector")
         }
 
     // ---- hex helpers -----------------------------------------------------

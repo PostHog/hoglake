@@ -15,13 +15,20 @@ import java.math.BigInteger
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
-/** A live catalog column (hog_column, end_snapshot IS NULL) as the hydrator sees it. */
+/**
+ * A live catalog column (hog_column, end_snapshot IS NULL) as the
+ * hydrator sees it. Recursive since phase 2: a container carries its
+ * [children], and only the LEAVES (the scalar descendants) ever produce
+ * a stats row — `hog_file_column_stats` is field-id-keyed, and a
+ * container has no values to count or bound.
+ */
 data class CatalogColumn(
     val fieldId: Long,
     val name: String,
     val type: ColType,
     /** From type_params for decimal columns; null when absent. */
     val decimalScale: Int?,
+    val children: List<CatalogColumn> = emptyList(),
 )
 
 /**
@@ -59,9 +66,14 @@ object FooterStats {
         val upperBound: ByteArray?,
     )
 
-    /** A top-level primitive leaf of the parquet schema. */
+    /**
+     * A primitive leaf of the parquet schema, at any depth. [path] is
+     * the full chunk path (`ColumnChunkMetaData.path.toArray()`), which
+     * for a top-level column is just its name and for a list element is
+     * `[name, "list", "element"]`.
+     */
     private data class Leaf(
-        val name: String,
+        val path: List<String>,
         val fieldId: Int?,
         val primitive: PrimitiveType,
     )
@@ -79,12 +91,17 @@ object FooterStats {
 
     /**
      * Whether [aggregate] will map columns by field id for this schema:
-     * true when any top-level primitive leaf carries a `PARQUET:field_id`
-     * (the same signal aggregate keys off). False = the name-fallback
-     * path, whose column set the hydrator must resolve at the FILE's
-     * begin_snapshot, not live-at-hydration.
+     * true when any primitive leaf ANYWHERE in the schema carries a
+     * `PARQUET:field_id`. False = the name-fallback path, whose column
+     * set the hydrator must resolve at the FILE's begin_snapshot, not
+     * live-at-hydration.
+     *
+     * "Anywhere", not "top level": a file whose only columns are nested
+     * has no top-level primitive leaf at all, and answering false for it
+     * would send a perfectly id-bearing file down the name-binding path.
+     * For a flat schema every leaf IS top-level, so nothing changes.
      */
-    fun usesFieldIds(schema: MessageType): Boolean = topLevelLeaves(schema).any { it.fieldId != null }
+    fun usesFieldIds(schema: MessageType): Boolean = allLeaves(schema).any { it.fieldId != null }
 
     private fun anyLeafWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
@@ -95,15 +112,32 @@ object FooterStats {
             }
         }
 
+    /**
+     * Per-LEAF aggregates for the catalog columns present in [footer].
+     *
+     * The walk is structural: each catalog column is matched against the
+     * parquet field with its id (name, for id-less files), and a
+     * container recurses into the parquet shape its type implies — the
+     * 3-level LIST encoding, the MAP `key_value` group, a plain group
+     * for a struct. A node whose parquet counterpart has the WRONG SHAPE
+     * (a struct over a primitive, a list over a bare group) takes its
+     * whole subtree out of the results with a warning: a stats row bound
+     * to the wrong physical column is worse than no row, and the
+     * "NULL, never guessed" rule is what the caller relies on.
+     *
+     * Only leaves produce rows. Containers get none — Iceberg's
+     * `value_counts`/`lower_bounds` are keyed on leaf ids too, and a
+     * bound on "the list" has no meaning. Leaves UNDER a list or map do
+     * get counts and bounds, which is exactly Iceberg's rule for
+     * elements, keys and values.
+     */
     fun aggregate(
         footer: ParquetMetadata,
         columns: List<CatalogColumn>,
         filePath: String,
     ): List<ColumnAgg> {
-        val leaves = topLevelLeaves(footer.fileMetaData.schema)
-        val byName = leaves.associateBy { it.name }
-        val useFieldIds = leaves.any { it.fieldId != null }
-        val byFieldId = leaves.filter { it.fieldId != null }.associateBy { it.fieldId!! }
+        val schema = footer.fileMetaData.schema
+        val useFieldIds = usesFieldIds(schema)
         if (!useFieldIds && columns.isNotEmpty()) {
             log.warn {
                 "parquet schema of $filePath carries no field ids; " +
@@ -111,23 +145,130 @@ object FooterStats {
             }
         }
 
-        val out = ArrayList<ColumnAgg>(columns.size)
+        val matched = LinkedHashMap<Long, Pair<CatalogColumn, Leaf>>()
         for (col in columns) {
-            val leaf =
-                if (useFieldIds) {
-                    byFieldId[Math.toIntExact(col.fieldId)]
-                } else {
-                    byName[col.name]
-                }
-            if (leaf == null) {
+            val field = findField(schema.fields, col, useFieldIds)
+            if (field == null) {
                 log.debug {
                     "column ${col.name} (field ${col.fieldId}) not present in $filePath; no stats"
                 }
                 continue
             }
+            matchInto(col, field, emptyList(), useFieldIds, filePath, matched)
+        }
+
+        val out = ArrayList<ColumnAgg>(matched.size)
+        for ((col, leaf) in matched.values) {
             aggregateColumn(footer.blocks, col, leaf, filePath)?.let(out::add)
         }
         return out
+    }
+
+    /**
+     * Match one catalog column against one parquet field, recursing
+     * through containers and recording every LEAF pairing in [out].
+     * Silent about children the file simply does not have (a column
+     * added after the file was written); loud about shape disagreements.
+     */
+    private fun matchInto(
+        col: CatalogColumn,
+        field: Type,
+        parentPath: List<String>,
+        useFieldIds: Boolean,
+        filePath: String,
+        out: MutableMap<Long, Pair<CatalogColumn, Leaf>>,
+    ) {
+        val path = parentPath + field.name
+
+        fun shapeMismatch(detail: String) {
+            log.warn {
+                "column ${col.name} (field ${col.fieldId}) is '${col.type.wire}' but the parquet " +
+                    "field at ${path.joinToString(".")} in $filePath $detail; skipping its stats"
+            }
+        }
+
+        if (!col.type.isNested) {
+            if (!field.isPrimitive) {
+                shapeMismatch("is a group, not a primitive leaf")
+                return
+            }
+            out[col.fieldId] = col to Leaf(path, field.id?.intValue(), field.asPrimitiveType())
+            return
+        }
+        if (field.isPrimitive) {
+            shapeMismatch("is a primitive leaf, not a group")
+            return
+        }
+        val group = field.asGroupType()
+        when (col.type) {
+            ColType.STRUCT -> {
+                for (child in col.children) {
+                    val sub = findField(group.fields, child, useFieldIds)
+                    if (sub == null) {
+                        log.debug {
+                            "struct field ${child.name} (field ${child.fieldId}) absent from " +
+                                "${path.joinToString(".")} in $filePath; no stats"
+                        }
+                        continue
+                    }
+                    matchInto(child, sub, path, useFieldIds, filePath, out)
+                }
+            }
+            ColType.LIST -> {
+                // The parquet 3-level LIST encoding: one repeated group
+                // holding exactly one field, the element. Names are not
+                // significant (the spec says so), the SHAPE is.
+                val repeated = group.fields.singleOrNull()
+                if (repeated == null || repeated.isPrimitive || !repeated.isRepetition(Type.Repetition.REPEATED)) {
+                    shapeMismatch(
+                        "is not the 3-level LIST encoding (one repeated group holding the element)",
+                    )
+                    return
+                }
+                val entry = repeated.asGroupType()
+                val element = entry.fields.singleOrNull()
+                if (element == null) {
+                    shapeMismatch("has a repeated group with ${entry.fieldCount} fields, not 1 (element)")
+                    return
+                }
+                matchInto(col.children.single(), element, path + repeated.name, useFieldIds, filePath, out)
+            }
+            ColType.MAP -> {
+                // MAP / MAP_KEY_VALUE: one repeated group with exactly
+                // two fields, key then value.
+                val repeated = group.fields.singleOrNull()
+                if (repeated == null || repeated.isPrimitive || !repeated.isRepetition(Type.Repetition.REPEATED)) {
+                    shapeMismatch("is not the MAP encoding (one repeated key_value group)")
+                    return
+                }
+                val entry = repeated.asGroupType()
+                if (entry.fieldCount != 2) {
+                    shapeMismatch("has a key_value group with ${entry.fieldCount} fields, not 2 (key, value)")
+                    return
+                }
+                val entryPath = path + repeated.name
+                matchInto(col.children[0], entry.getType(0), entryPath, useFieldIds, filePath, out)
+                matchInto(col.children[1], entry.getType(1), entryPath, useFieldIds, filePath, out)
+            }
+            else -> error("unreachable: ${col.type} is not a container")
+        }
+    }
+
+    /**
+     * The parquet field for [col] among [fields]: by field id when the
+     * candidate carries one, else by name. Per-node rather than
+     * per-file, because a nested file can carry ids on its leaves and
+     * none on a synthesized container group.
+     */
+    private fun findField(
+        fields: List<Type>,
+        col: CatalogColumn,
+        useFieldIds: Boolean,
+    ): Type? {
+        if (useFieldIds) {
+            fields.firstOrNull { it.id?.intValue()?.toLong() == col.fieldId }?.let { return it }
+        }
+        return fields.firstOrNull { it.id == null && it.name == col.name }
     }
 
     private fun aggregateColumn(
@@ -147,8 +288,10 @@ object FooterStats {
 
         for (block in blocks) {
             for (chunk in block.columns) {
-                val path = chunk.path.toArray()
-                if (path.size != 1 || path[0] != leaf.name) continue
+                // Full path equality, not just the leaf name: two
+                // different structs can both hold a field called `id`,
+                // and a name-only match would sum them together.
+                if (!chunk.path.toArray().contentEquals(leaf.path.toTypedArray())) continue
                 chunks++
                 valueCount += chunk.valueCount
                 sizeBytes += chunk.totalSize
@@ -359,6 +502,10 @@ object FooterStats {
                     else -> null
                 }
             ColType.DECIMAL -> decodeDecimal(col, leaf, raw)
+            // Unreachable: only leaves reach decode, and a container is
+            // never a leaf. Refusing rather than erroring keeps the
+            // "bounds NULL, never guessed" contract total.
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> null
         }
     }
 
@@ -532,19 +679,22 @@ object FooterStats {
     private fun readLongLE(raw: ByteArray): Long? =
         if (raw.size == 8) ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).long else null
 
-    /**
-     * The root's direct primitive children. Nested structures are
-     * skipped (their leaf chunks have multi-element paths and are
-     * ignored by [aggregateColumn]).
-     */
-    private fun topLevelLeaves(schema: MessageType): List<Leaf> =
-        schema.fields
-            .filter { it.isPrimitive }
-            .map { field ->
-                Leaf(
-                    name = field.name,
-                    fieldId = field.id?.intValue(),
-                    primitive = field.asPrimitiveType(),
-                )
+    /** Every primitive leaf of the schema, at any depth, with its full chunk path. */
+    private fun allLeaves(schema: MessageType): List<Leaf> =
+        buildList { collectLeaves(schema.fields, emptyList(), this) }
+
+    private fun collectLeaves(
+        fields: List<Type>,
+        prefix: List<String>,
+        out: MutableList<Leaf>,
+    ) {
+        for (field in fields) {
+            val path = prefix + field.name
+            if (field.isPrimitive) {
+                out.add(Leaf(path, field.id?.intValue(), field.asPrimitiveType()))
+            } else {
+                collectLeaves(field.asGroupType().fields, path, out)
             }
+        }
+    }
 }

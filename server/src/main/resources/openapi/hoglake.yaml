@@ -1243,7 +1243,8 @@ components:
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
                  uint64, float, double, decimal, date, time, timestamp_s,
                  timestamp_ms, timestamp, timestamp_ns, timestamptz,
-                 string, json, uuid, binary]
+                 string, json, uuid, binary,
+                 list, struct, map]
           description: >
             The closed column-type vocabulary: every member has a
             defined Iceberg facade mapping (iceberg-federation.md §2),
@@ -1261,6 +1262,22 @@ components:
             timestamp_ns bounds are NANOSECONDS; json bounds are UTF-8
             bytes, like string.
 
+            list, struct and map are CONTAINERS: they carry no values of
+            their own, they require `children`, and they NEVER carry
+            stats. Bounds and counts are per LEAF field — the element of
+            a list, the key and value of a map, the scalar fields of a
+            struct — so a commit shipping column_stats for a container's
+            field_id is refused with a 422. They map natively to the
+            Iceberg V2 list/struct/map, element/key/value field ids
+            included.
+
+            Shape rules, each its own named 422: a list has exactly one
+            child, named `element`; a map has exactly two, `key` then
+            `value`, and the key must have nullable=false (Iceberg map
+            keys are non-nullable); a struct has one or more children,
+            which keep their own names; a scalar type has none. Nesting
+            depth is capped at 8, counting a top-level column as 1.
+
             These DuckLake type names are permanently unsupported and
             are refused with a 422 naming the type and the reason, never
             an unknown-type error: int128 and uint128 (39 decimal
@@ -1273,6 +1290,12 @@ components:
           type: object
           additionalProperties: true
         nullable: { type: boolean, default: true }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/ColumnDef" }
+          description: >
+            Required for list/struct/map, forbidden for every scalar
+            type. Recursive, bounded by the depth cap above.
 
     Column:
       allOf:
@@ -1281,7 +1304,19 @@ components:
           required: [field_id, ordinal]
           properties:
             field_id: { type: integer, format: int64 }
-            ordinal: { type: integer }
+            ordinal:
+              type: integer
+              description: >
+                0-based position among the column's SIBLINGS — top-level
+                columns share one sequence, and each container's children
+                have their own. Not a table-wide position.
+            children:
+              type: array
+              items: { $ref: "#/components/schemas/Column" }
+              description: >
+                Present only for list/struct/map, with the field ids the
+                server assigned. Ids are allocated depth-first, so a
+                container's id is always below its descendants'.
 
     CreateTableRequest:
       type: object
@@ -1453,7 +1488,15 @@ components:
       type: object
       required: [source_field_id, transform]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         transform:
           type: string
           enum: [identity, bucket, year, month, day, hour]
@@ -1474,7 +1517,15 @@ components:
       type: object
       required: [source_field_id, direction, null_order]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         direction:
           type: string
           enum: [asc, desc]
@@ -1500,13 +1551,32 @@ components:
     AlterOp:
       type: object
       required: [op]
-      description: Discriminated by `op`.
+      description: >
+        Discriminated by `op`.
+
+        Column-addressing ops (`drop_column`, `rename_column`,
+        `promote_column`, and `add_column`'s `parent`) name their target
+        by a DOTTED PATH of column names — `addr` for a top-level column,
+        `addr.zip` for a field of the struct `addr`. Names cannot contain
+        `.` (the identifier pattern), so the path is unambiguous.
+
+        Only STRUCT interiors are addressable. A path stepping through a
+        list or a map is a 422: Iceberg has no add/drop/rename for an
+        element, a key or a value, and the container's shape is part of
+        its type. Nested containers are also not promotable — promote a
+        struct's LEAF field, which follows the ordinary scalar matrix.
       properties:
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        parent:                       # add_column, optional
+          type: string
+          description: >
+            Dotted path of an existing STRUCT to append the new field
+            to (new field id, ordinal = max sibling + 1). Absent = a new
+            top-level column. Naming a list or a map here is a 422.
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
         # rename_column target (must satisfy the ColumnDef.name identifier

@@ -493,6 +493,9 @@ class QeFooterStatsBoundsPropertyTest {
             IcebergType.UUID -> 16
             // decimal/string/binary are legitimately variable-length.
             IcebergType.DECIMAL, IcebergType.STRING, IcebergType.BINARY -> null
+            // Containers have no bound at all; no catalog column in this
+            // matrix is one (the shapes are scalar leaves).
+            IcebergType.LIST, IcebergType.STRUCT, IcebergType.MAP -> null
         }
 
     private fun footerFor(
@@ -562,12 +565,27 @@ class QeFooterStatsBoundsPropertyTest {
                 val forbidden = (type to shape.name) in mustRefuse
 
                 for ((min, max) in pairs) {
-                    val agg =
+                    val aggs =
                         FooterStats.aggregate(
                             footerFor(shape, min, max),
                             listOf(columnOf(type)),
                             "s3://qe/f.parquet",
-                        ).singleOrNull()
+                        )
+                    if (type.isNested) {
+                        // A container column over a SCALAR leaf is a shape
+                        // disagreement, and the whole subtree drops — no
+                        // stats row for the container (it has no values)
+                        // and none for a child that is not in the file.
+                        // This is the mustRefuse claim for the three
+                        // container types, over every leaf shape at once.
+                        if (aggs.isNotEmpty()) {
+                            failures +=
+                                "${type.wire} on ${shape.name}: produced ${aggs.size} stats row(s); " +
+                                "a nested container over a scalar leaf must produce none"
+                        }
+                        continue
+                    }
+                    val agg = aggs.singleOrNull()
                     if (agg == null) {
                         // Counts are unconditional: dropping the whole stats row
                         // loses null_count too, not just the bounds.
@@ -618,6 +636,399 @@ class QeFooterStatsBoundsPropertyTest {
             .describedAs("cell values that produced a bound (refused %d)", refused)
             .isGreaterThan(600)
     }
+
+    // ---- the nested half of the matrix ------------------------------------
+
+    /**
+     * One nested cell: a catalog column tree, the parquet schema a
+     * writer produced for it, and which LEAF field ids must come back
+     * with a bound.
+     *
+     * The mustProduce/mustRefuse split is the same discipline as the
+     * scalar matrix above, and it exists for the same reason: every
+     * structural refusal here is a SAFE answer, so a walk that only
+     * asserted "no wrong bounds" would pass just as happily against a
+     * FooterStats that had stopped descending into nested schemas at
+     * all. Naming the ids that must appear is what keeps it honest.
+     */
+    private class NestedCell(
+        val name: String,
+        val column: CatalogColumn,
+        val schema: MessageType,
+        /** (chunk path, leaf type, min, max) per parquet leaf with statistics. */
+        val leaves: List<NestedLeaf>,
+        /** Field ids that must come back WITH bounds. */
+        val mustProduce: Set<Long>,
+        /** Field ids that must not appear in the results at all. */
+        val mustRefuse: Set<Long>,
+    )
+
+    private class NestedLeaf(
+        val path: List<String>,
+        val type: PrimitiveType,
+        val min: ByteArray,
+        val max: ByteArray,
+    )
+
+    private fun nestedFooter(cell: NestedCell): ParquetMetadata {
+        val block =
+            BlockMetaData().apply {
+                rowCount = 10
+                totalByteSize = 100
+            }
+        for (leaf in cell.leaves) {
+            val st =
+                Statistics.getBuilderForReading(leaf.type)
+                    .withMin(leaf.min)
+                    .withMax(leaf.max)
+                    .withNumNulls(0L)
+                    .build()
+            block.addColumn(
+                ColumnChunkMetaData.get(
+                    ColumnPath.get(*leaf.path.toTypedArray()),
+                    leaf.type,
+                    CompressionCodecName.UNCOMPRESSED,
+                    null,
+                    setOf(Encoding.PLAIN),
+                    st,
+                    4L,
+                    0L,
+                    10L,
+                    100L,
+                    200L,
+                ),
+            )
+        }
+        return ParquetMetadata(FileMetaData(cell.schema, emptyMap(), "qe"), listOf(block))
+    }
+
+    private fun scalarChild(
+        fieldId: Long,
+        name: String,
+        type: ColType,
+    ) = CatalogColumn(fieldId = fieldId, name = name, type = type, decimalScale = null)
+
+    private fun container(
+        fieldId: Long,
+        name: String,
+        type: ColType,
+        vararg children: CatalogColumn,
+    ) = CatalogColumn(fieldId, name, type, null, children.toList())
+
+    private fun optInt(
+        id: Int,
+        name: String,
+    ): PrimitiveType = Types.optional(PrimitiveTypeName.INT32).id(id).named(name)
+
+    private fun optLong(
+        id: Int,
+        name: String,
+    ): PrimitiveType = Types.optional(PrimitiveTypeName.INT64).id(id).named(name)
+
+    private fun reqString(
+        id: Int,
+        name: String,
+    ): PrimitiveType =
+        Types.required(PrimitiveTypeName.BINARY)
+            .`as`(LogicalTypeAnnotation.stringType()).id(id).named(name)
+
+    private fun listGroup(
+        id: Int,
+        name: String,
+        element: org.apache.parquet.schema.Type,
+    ) = Types.optionalGroup()
+        .addField(Types.repeatedGroup().addField(element).named("list"))
+        .`as`(LogicalTypeAnnotation.listType())
+        .id(id).named(name)
+
+    private fun mapGroup(
+        id: Int,
+        name: String,
+        vararg entryFields: org.apache.parquet.schema.Type,
+    ) = Types.optionalGroup()
+        .addField(Types.repeatedGroup().addFields(*entryFields).named("key_value"))
+        .`as`(LogicalTypeAnnotation.mapType())
+        .id(id).named(name)
+
+    private val nestedCells: List<NestedCell> by lazy {
+        buildList {
+            add(
+                NestedCell(
+                    name = "list<int> in the 3-level encoding",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    schema = MessageType("root", listOf(listGroup(1, "l", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(-7), le(9)),
+                        ),
+                    // Iceberg records value_counts and bounds for list
+                    // ELEMENTS; only the container itself gets none.
+                    mustProduce = setOf(2L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map<string,long>",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(2, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                reqString(2, "key"),
+                                bytes(0x41),
+                                bytes(0x7A),
+                            ),
+                            NestedLeaf(
+                                listOf("m", "key_value", "value"),
+                                optLong(3, "value"),
+                                le(-1L),
+                                le(1L shl 40),
+                            ),
+                        ),
+                    mustProduce = setOf(2L, 3L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct{a:int, b:string}",
+                    column =
+                        container(
+                            1,
+                            "s",
+                            ColType.STRUCT,
+                            scalarChild(2, "a", ColType.INT),
+                            scalarChild(3, "b", ColType.STRING),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addFields(optInt(2, "a"), reqString(3, "b"))
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(3), le(300)),
+                            NestedLeaf(listOf("s", "b"), reqString(3, "b"), bytes(0x00), bytes(0xFF)),
+                        ),
+                    mustProduce = setOf(2L, 3L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct{l: list<struct{x: long}>} (three levels)",
+                    column =
+                        container(
+                            1,
+                            "s",
+                            ColType.STRUCT,
+                            container(
+                                2,
+                                "l",
+                                ColType.LIST,
+                                container(3, "element", ColType.STRUCT, scalarChild(4, "x", ColType.LONG)),
+                            ),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(
+                                        listGroup(
+                                            2,
+                                            "l",
+                                            Types.optionalGroup().addField(optLong(4, "x")).id(3).named("element"),
+                                        ),
+                                    )
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("s", "l", "list", "element", "x"),
+                                optLong(4, "x"),
+                                le(Long.MIN_VALUE),
+                                le(Long.MAX_VALUE),
+                            ),
+                        ),
+                    mustProduce = setOf(4L),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list<int> over the LEGACY 2-level encoding",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // repeated PRIMITIVE, not repeated group: the pre-2.x
+                    // shape. Refused rather than guessed — the element's
+                    // field id is not where the 3-level rule says it is.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(Types.repeated(PrimitiveTypeName.INT32).id(2).named("element"))
+                                    .`as`(LogicalTypeAnnotation.listType())
+                                    .id(1).named("l"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "element"),
+                                Types.repeated(PrimitiveTypeName.INT32).id(2).named("element"),
+                                le(1),
+                                le(2),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose key_value group has three fields",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                mapGroup(
+                                    1,
+                                    "m",
+                                    reqString(2, "key"),
+                                    optLong(3, "value"),
+                                    optInt(9, "extra"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                reqString(2, "key"),
+                                bytes(0x41),
+                                bytes(0x7A),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct declared over a primitive leaf",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema = MessageType("root", listOf(optInt(1, "s"))),
+                    leaves = listOf(NestedLeaf(listOf("s"), optInt(1, "s"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list<int> whose element leaf is physically BOOLEAN",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                listGroup(
+                                    1,
+                                    "l",
+                                    Types.optional(PrimitiveTypeName.BOOLEAN).id(2).named("element"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "list", "element"),
+                                Types.optional(PrimitiveTypeName.BOOLEAN).id(2).named("element"),
+                                bytes(0),
+                                bytes(1),
+                            ),
+                        ),
+                    // The element MATCHES structurally, so its counts are
+                    // honest; only the per-arm decode refuses, leaving the
+                    // bounds NULL. This is the phase-1 discipline reaching
+                    // one level down, and the reason mustRefuse is checked
+                    // separately from "no row at all".
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `nested shapes produce leaf bounds and refuse container and shape-mismatched ones`() {
+        val failures = mutableListOf<String>()
+        for (cell in nestedCells) {
+            val aggs =
+                FooterStats.aggregate(
+                    nestedFooter(cell),
+                    listOf(cell.column),
+                    "s3://qe/nested.parquet",
+                )
+            val byField = aggs.associateBy { it.fieldId }
+            for (id in cell.mustProduce) {
+                val agg = byField[id]
+                when {
+                    agg == null -> failures += "${cell.name}: field $id produced no stats row"
+                    agg.lowerBound == null || agg.upperBound == null ->
+                        failures += "${cell.name}: field $id produced a stats row with NULL bounds"
+                }
+            }
+            for (id in cell.mustRefuse) {
+                if (byField.containsKey(id)) {
+                    failures += "${cell.name}: field $id produced a stats row and must not have"
+                }
+            }
+            // Nothing outside the declared tree may appear at all.
+            val declared = declaredFieldIds(cell.column)
+            for (agg in aggs) {
+                if (agg.fieldId !in declared) {
+                    failures += "${cell.name}: stats row for field ${agg.fieldId}, which is not in the column tree"
+                }
+            }
+        }
+        assertThat(failures).describedAs("nested decode-matrix violations").isEmpty()
+        // Non-vacuity, both directions: the cells above must actually
+        // exercise production AND refusal.
+        assertThat(nestedCells.flatMap { it.mustProduce }).isNotEmpty()
+        assertThat(nestedCells.flatMap { it.mustRefuse }).isNotEmpty()
+    }
+
+    private fun declaredFieldIds(col: CatalogColumn): Set<Long> =
+        setOf(col.fieldId) + col.children.flatMap { declaredFieldIds(it) }
 
     /** Claims 1 and 2 for one produced bound pair. */
     private fun violations(

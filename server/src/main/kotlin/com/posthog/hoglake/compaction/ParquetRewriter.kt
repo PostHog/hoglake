@@ -67,6 +67,28 @@ class UnconvertibleSchemaException(message: String) : IllegalArgumentException(m
  * the output must hold every live column (null-filled ones included),
  * all data columns are written OPTIONAL; catalog nullability is
  * metadata, not parquet repetition.
+ *
+ * **Nested columns rewrite, they are not copied around.** The record
+ * pipeline above is already the parquet-java Group API, and a `Group`
+ * is a tree: `GroupRecordConverter` materializes the whole nested
+ * record and `addGroup`/`getGroup` reach into it. So list, struct and
+ * map extend the SAME plan-and-copy shape one level at a time — the
+ * plan becomes a tree of [Step]s instead of a flat array — rather than
+ * needing a copy-only escape hatch. That matters: making nested tables
+ * `unconvertible_schema` would have meant a table with one `map` column
+ * could never be compacted, which is a permanent debt leak, not a
+ * deferral. The cost is per-ROW heap proportional to the nested payload
+ * (the unsorted path still holds exactly one Group at a time) and a
+ * recursive copy per row.
+ *
+ * Nested structure is spec-shaped on both sides: the 3-level LIST
+ * encoding (`optional group x (LIST) { repeated group list { optional
+ * <t> element } }`) and the MAP encoding (`optional group x (MAP) {
+ * repeated group key_value { required <k> key; optional <v> value } }`).
+ * Inputs are matched by SHAPE, not by the synthetic names, because the
+ * parquet spec says those names are not significant — but an input whose
+ * shape disagrees with the live column's type is
+ * [UnconvertibleSchemaException], never a guess.
  */
 object ParquetRewriter {
     /** The explicit row-id column compaction outputs carry. */
@@ -78,6 +100,15 @@ object ParquetRewriter {
      * Int.MAX_VALUE - 1, far outside hog_table.next_field_id's reach.
      */
     const val ROW_ID_FIELD_ID = 2147483646
+
+    /**
+     * The synthetic repeated-group names the parquet LIST and MAP
+     * encodings use. Written, never required on read: the parquet spec
+     * says these names are not significant, and writers disagree about
+     * them, so inputs are matched by SHAPE.
+     */
+    const val LIST_ENTRY_GROUP = "list"
+    const val MAP_ENTRY_GROUP = "key_value"
 
     /**
      * One input file staged to local disk: its row-id range start and
@@ -195,7 +226,7 @@ object ParquetRewriter {
             val dst = factory.newGroup()
             for ((outIdx, step) in plan.withIndex()) {
                 if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
-                    copyValue(src, step, dst, outIdx, dataFields[outIdx].asPrimitiveType())
+                    copyField(src, step, dst, outIdx, dataFields[outIdx])
                 }
             }
             val rowId =
@@ -244,19 +275,33 @@ object ParquetRewriter {
         return MessageType("hoglake_compacted", dataFields + rowIdField)
     }
 
-    /** Catalog type -> parquet type (pyhoglake's writer conventions: micros times, fixed(16) uuid). */
-    private fun parquetTypeFor(column: Column): Type {
+    /**
+     * Catalog type -> parquet type (pyhoglake's writer conventions:
+     * micros times, fixed(16) uuid), recursive for the containers.
+     *
+     * [repetition] is OPTIONAL everywhere except a map's key, which the
+     * parquet MAP encoding requires — catalog nullability is metadata,
+     * so the output null-fills freely, but a required key is structure,
+     * not metadata.
+     */
+    private fun parquetTypeFor(
+        column: Column,
+        repetition: Type.Repetition = Type.Repetition.OPTIONAL,
+    ): Type {
         val id = Math.toIntExact(column.fieldId)
         val name = column.def.name
+
+        fun prim(physical: PrimitiveType.PrimitiveTypeName) = Types.primitive(physical, repetition)
+
         return when (column.def.type) {
             ColType.BOOLEAN ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
-            ColType.INT8 -> intColumn(id, name, 8, signed = true)
-            ColType.INT16 -> intColumn(id, name, 16, signed = true)
-            ColType.UINT8 -> intColumn(id, name, 8, signed = false)
-            ColType.UINT16 -> intColumn(id, name, 16, signed = false)
+                prim(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
+            ColType.INT8 -> intColumn(id, name, 8, signed = true, repetition = repetition)
+            ColType.INT16 -> intColumn(id, name, 16, signed = true, repetition = repetition)
+            ColType.UINT8 -> intColumn(id, name, 8, signed = false, repetition = repetition)
+            ColType.UINT16 -> intColumn(id, name, 16, signed = false, repetition = repetition)
             ColType.INT ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT32).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.INT32).id(id).named(name)
             // uint32 is written as a plain INT64, NOT as the INT32 +
             // INT(32, unsigned) pyarrow and DuckDB emit natively: it maps
             // to Iceberg long, and an Iceberg reader takes an INT32 column
@@ -264,27 +309,27 @@ object ParquetRewriter {
             // through the facade. Reads still accept both forms; rewriting
             // converges files on the facade-readable one.
             ColType.UINT32 ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
             // uint64 keeps its native physical form. Its facade mapping is
             // decimal(20,0), which parquet cannot express as an INT64, so
             // uint64 is the one type whose FILES are not facade-readable in
             // place even though its BOUNDS already are (iceberg-federation.md §2).
-            ColType.UINT64 -> intColumn(id, name, 64, signed = false)
+            ColType.UINT64 -> intColumn(id, name, 64, signed = false, repetition = repetition)
             ColType.LONG ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)
             ColType.FLOAT ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.FLOAT).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.FLOAT).id(id).named(name)
             ColType.DOUBLE ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.DOUBLE).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.DOUBLE).id(id).named(name)
             ColType.DECIMAL ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                prim(PrimitiveType.PrimitiveTypeName.BINARY)
                     .`as`(LogicalTypeAnnotation.decimalType(decimalScale(column) ?: 0, decimalPrecision(column)))
                     .id(id).named(name)
             ColType.DATE ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT32)
+                prim(PrimitiveType.PrimitiveTypeName.INT32)
                     .`as`(LogicalTypeAnnotation.dateType()).id(id).named(name)
             ColType.TIME ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                prim(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timeType(false, LogicalTypeAnnotation.TimeUnit.MICROS))
                     .id(id).named(name)
             // Parquet has no seconds timestamp unit, so timestamp_s files
@@ -292,35 +337,70 @@ object ParquetRewriter {
             // write; verified) and rewrite to MILLIS unchanged. The
             // declared precision lives in the catalog, never in the file.
             ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                prim(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS))
                     .id(id).named(name)
             ColType.TIMESTAMP ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                prim(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MICROS))
                     .id(id).named(name)
             ColType.TIMESTAMP_NS ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                prim(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS))
                     .id(id).named(name)
             ColType.TIMESTAMPTZ ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                prim(PrimitiveType.PrimitiveTypeName.INT64)
                     .`as`(LogicalTypeAnnotation.timestampType(true, LogicalTypeAnnotation.TimeUnit.MICROS))
                     .id(id).named(name)
             ColType.STRING ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                prim(PrimitiveType.PrimitiveTypeName.BINARY)
                     .`as`(LogicalTypeAnnotation.stringType()).id(id).named(name)
             // json maps to Iceberg string; the JSON annotation is the only
             // thing that distinguishes it physically, and the bytes are
             // copied verbatim — compaction never reformats a document.
             ColType.JSON ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                prim(PrimitiveType.PrimitiveTypeName.BINARY)
                     .`as`(LogicalTypeAnnotation.jsonType()).id(id).named(name)
             ColType.UUID_T ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY).length(16)
+                prim(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY).length(16)
                     .`as`(LogicalTypeAnnotation.uuidType()).id(id).named(name)
             ColType.BINARY ->
-                Types.optional(PrimitiveType.PrimitiveTypeName.BINARY).id(id).named(name)
+                prim(PrimitiveType.PrimitiveTypeName.BINARY).id(id).named(name)
+            // A struct is a plain group; its FIELDS are optional for the
+            // same reason top-level columns are (an input predating one
+            // null-fills it).
+            ColType.STRUCT ->
+                Types.buildGroup(repetition)
+                    .addFields(*column.children.map { parquetTypeFor(it) }.toTypedArray())
+                    .id(id).named(name)
+            // The 3-level LIST encoding. The middle `list` group is
+            // synthetic and carries NO field id: Iceberg puts the
+            // element's id on the element, and a reader has nothing to
+            // match an id on the repetition layer against.
+            ColType.LIST ->
+                Types.buildGroup(repetition)
+                    .addField(
+                        Types.repeatedGroup()
+                            .addField(parquetTypeFor(column.children.single()))
+                            .named(LIST_ENTRY_GROUP),
+                    )
+                    .`as`(LogicalTypeAnnotation.listType())
+                    .id(id).named(name)
+            // The MAP encoding. The key is REQUIRED — Iceberg map keys are
+            // non-nullable and the parquet MAP shape says so too — which
+            // is the one place the "write everything optional" rule yields.
+            ColType.MAP ->
+                Types.buildGroup(repetition)
+                    .addFields(
+                        Types.repeatedGroup()
+                            .addFields(
+                                parquetTypeFor(column.children[0], Type.Repetition.REQUIRED),
+                                parquetTypeFor(column.children[1]),
+                            )
+                            .named(MAP_ENTRY_GROUP),
+                    )
+                    .`as`(LogicalTypeAnnotation.mapType())
+                    .id(id).named(name)
         }
     }
 
@@ -330,9 +410,11 @@ object ParquetRewriter {
         name: String,
         width: Int,
         signed: Boolean,
+        repetition: Type.Repetition = Type.Repetition.OPTIONAL,
     ): Type =
-        Types.optional(
+        Types.primitive(
             if (width == 64) PrimitiveType.PrimitiveTypeName.INT64 else PrimitiveType.PrimitiveTypeName.INT32,
+            repetition,
         )
             .`as`(LogicalTypeAnnotation.intType(width, signed))
             .id(id).named(name)
@@ -342,7 +424,31 @@ object ParquetRewriter {
     private fun decimalPrecision(column: Column): Int =
         (column.def.typeParams?.get("precision") as? Number)?.toInt() ?: 38
 
-    private class CopyStep(val srcIndex: Int, val mode: CopyMode)
+    /**
+     * One node of the copy plan: where this output field's value comes
+     * from in the INPUT group holding it ([srcIndex], an index into the
+     * parent group), and what to do with it.
+     *
+     * The plan is a tree because the record is: a struct copies its
+     * children, a list copies its element once per repetition, a map
+     * copies key and value per entry. [srcIndex] is always relative to
+     * the group the step is read from, never absolute.
+     */
+    private sealed class Step {
+        abstract val srcIndex: Int
+
+        /** A primitive: copy the value, up-casting per [mode]. */
+        class Scalar(override val srcIndex: Int, val mode: CopyMode) : Step()
+
+        /** A struct: per OUTPUT child, its step (null = null-fill). */
+        class StructStep(override val srcIndex: Int, val children: List<Step?>) : Step()
+
+        /** A 3-level list: [element] reads out of each repeated entry group. */
+        class ListStep(override val srcIndex: Int, val element: Step) : Step()
+
+        /** A map: [key] and [value] read out of each repeated key_value group. */
+        class MapStep(override val srcIndex: Int, val key: Step, val value: Step) : Step()
+    }
 
     /**
      * Per live column (output order): where its value comes from in
@@ -357,22 +463,95 @@ object ParquetRewriter {
         schema: MessageType,
         liveColumns: List<Column>,
         inputPath: Path,
-    ): List<CopyStep?> =
+    ): List<Step?> = planChildren(schema.fields, liveColumns, inputPath)
+
+    /** [columnPlan]'s recursion: one step per live column among [srcFields]. */
+    private fun planChildren(
+        srcFields: List<Type>,
+        liveColumns: List<Column>,
+        inputPath: Path,
+    ): List<Step?> =
         liveColumns.map { column ->
             val srcIndex =
-                schema.fields.indexOfFirst { it.id?.intValue()?.toLong() == column.fieldId }
+                srcFields.indexOfFirst { it.id?.intValue()?.toLong() == column.fieldId }
                     .takeIf { it >= 0 }
-                    ?: schema.fields.indexOfFirst { it.id == null && it.name == column.def.name }
+                    ?: srcFields.indexOfFirst { it.id == null && it.name == column.def.name }
                         .takeIf { it >= 0 }
                     ?: return@map null
-            val src = schema.fields[srcIndex]
-            if (!src.isPrimitive) {
-                throw UnconvertibleSchemaException(
-                    "column '${column.def.name}' is nested in $inputPath; compaction supports flat schemas only",
-                )
-            }
-            CopyStep(srcIndex, copyMode(src.asPrimitiveType(), column, inputPath))
+            planNode(srcFields[srcIndex], srcIndex, column, inputPath)
         }
+
+    /** The step producing [column] from the input field [src]. */
+    private fun planNode(
+        src: Type,
+        srcIndex: Int,
+        column: Column,
+        inputPath: Path,
+    ): Step {
+        fun refuseShape(detail: String): Nothing =
+            throw UnconvertibleSchemaException(
+                "column '${column.def.name}' (live type ${column.def.type.wire}) cannot be " +
+                    "produced from $inputPath: $detail",
+            )
+
+        if (!column.def.type.isNested) {
+            if (!src.isPrimitive) refuseShape("the input field is a group, not a primitive leaf")
+            return Step.Scalar(srcIndex, copyMode(src.asPrimitiveType(), column, inputPath))
+        }
+        if (src.isPrimitive) refuseShape("the input field is a primitive leaf, not a group")
+        val group = src.asGroupType()
+        return when (column.def.type) {
+            ColType.STRUCT ->
+                Step.StructStep(srcIndex, planChildren(group.fields, column.children, inputPath))
+            ColType.LIST -> {
+                val entry =
+                    repeatedEntryGroup(group)
+                        ?: refuseShape("the input field is not the 3-level LIST encoding")
+                if (entry.fieldCount != 1) {
+                    refuseShape("the input list's repeated group has ${entry.fieldCount} fields, not 1")
+                }
+                val element =
+                    planChildren(entry.fields, listOf(column.children.single()), inputPath).single()
+                        ?: refuseShape("the input list's element does not match the live element field id")
+                Step.ListStep(srcIndex, element)
+            }
+            ColType.MAP -> {
+                val entry =
+                    repeatedEntryGroup(group)
+                        ?: refuseShape("the input field is not the MAP encoding")
+                if (entry.fieldCount != 2) {
+                    refuseShape("the input map's key_value group has ${entry.fieldCount} fields, not 2")
+                }
+                // A key the input marks OPTIONAL cannot be copied into
+                // the required output key: some row may have none, and
+                // parquet would fail the write halfway through the group.
+                // Refuse at plan time instead — the whole point of
+                // unconvertible_schema.
+                if (!entry.getType(0).isRepetition(Type.Repetition.REQUIRED)) {
+                    refuseShape("the input map's key is not REQUIRED; Iceberg map keys are non-nullable")
+                }
+                val planned = planChildren(entry.fields, column.children, inputPath)
+                val key = planned[0] ?: refuseShape("the input map's key does not match the live key field id")
+                val value =
+                    planned[1] ?: refuseShape("the input map's value does not match the live value field id")
+                Step.MapStep(srcIndex, key, value)
+            }
+            else -> error("unreachable: ${column.def.type} is not a container")
+        }
+    }
+
+    /**
+     * The single repeated group inside a LIST/MAP wrapper, or null when
+     * [group] is not that shape. The group's NAME is not checked: the
+     * parquet spec says the synthetic names are insignificant, and
+     * writers disagree about them (`list` vs `bag`, `key_value` vs
+     * `map`). The shape is what carries meaning.
+     */
+    private fun repeatedEntryGroup(group: org.apache.parquet.schema.GroupType): org.apache.parquet.schema.GroupType? {
+        val only = group.fields.singleOrNull() ?: return null
+        if (only.isPrimitive || !only.isRepetition(Type.Repetition.REPEATED)) return null
+        return only.asGroupType()
+    }
 
     /**
      * How the live column is produced from the input's physical type:
@@ -521,6 +700,9 @@ object ParquetRewriter {
                     refuse()
                 }
             }
+            // Unreachable: planNode routes containers to their own steps
+            // and only ever calls copyMode for a scalar live column.
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> refuse()
         }
     }
 
@@ -556,9 +738,69 @@ object ParquetRewriter {
         }
     }
 
+    /**
+     * Copy one present field from [src] into [dst] at [dstIdx], where
+     * [dstType] is the OUTPUT type at that position. Recursive for the
+     * containers; the caller has already checked the source field is
+     * present (repetition count > 0).
+     */
+    private fun copyField(
+        src: Group,
+        step: Step,
+        dst: Group,
+        dstIdx: Int,
+        dstType: Type,
+    ) {
+        when (step) {
+            is Step.Scalar -> copyValue(src, step, dst, dstIdx, dstType.asPrimitiveType())
+            is Step.StructStep -> {
+                val srcGroup = src.getGroup(step.srcIndex, 0)
+                val dstGroup = dst.addGroup(dstIdx)
+                val dstStruct = dstType.asGroupType()
+                for ((i, child) in step.children.withIndex()) {
+                    if (child != null && srcGroup.getFieldRepetitionCount(child.srcIndex) > 0) {
+                        copyField(srcGroup, child, dstGroup, i, dstStruct.getType(i))
+                    }
+                }
+            }
+            is Step.ListStep -> {
+                // An EMPTY list stays an empty list, distinct from null:
+                // the output group is created either way, and only the
+                // entries repeat.
+                val srcList = src.getGroup(step.srcIndex, 0)
+                val dstList = dst.addGroup(dstIdx)
+                val dstEntryType = dstType.asGroupType().getType(0).asGroupType()
+                val n = srcList.getFieldRepetitionCount(0)
+                for (i in 0 until n) {
+                    val srcEntry = srcList.getGroup(0, i)
+                    val dstEntry = dstList.addGroup(0)
+                    if (srcEntry.getFieldRepetitionCount(step.element.srcIndex) > 0) {
+                        copyField(srcEntry, step.element, dstEntry, 0, dstEntryType.getType(0))
+                    }
+                }
+            }
+            is Step.MapStep -> {
+                val srcMap = src.getGroup(step.srcIndex, 0)
+                val dstMap = dst.addGroup(dstIdx)
+                val dstEntryType = dstType.asGroupType().getType(0).asGroupType()
+                val n = srcMap.getFieldRepetitionCount(0)
+                for (i in 0 until n) {
+                    val srcEntry = srcMap.getGroup(0, i)
+                    val dstEntry = dstMap.addGroup(0)
+                    // The key is REQUIRED on both sides (planNode refuses
+                    // an optional input key), so it is always present.
+                    copyField(srcEntry, step.key, dstEntry, 0, dstEntryType.getType(0))
+                    if (srcEntry.getFieldRepetitionCount(step.value.srcIndex) > 0) {
+                        copyField(srcEntry, step.value, dstEntry, 1, dstEntryType.getType(1))
+                    }
+                }
+            }
+        }
+    }
+
     private fun copyValue(
         src: Group,
-        step: CopyStep,
+        step: Step.Scalar,
         dst: Group,
         dstIdx: Int,
         primitive: PrimitiveType,
@@ -591,34 +833,103 @@ object ParquetRewriter {
 
     // ---- sorting ---------------------------------------------------------
 
+    /**
+     * One resolved sort key: the chain of field indexes from the record
+     * root down to the primitive leaf, and the leaf's type.
+     *
+     * The chain has more than one element only for a STRUCT leaf, which
+     * Iceberg (and AlterService) allow as a sort source. Nothing under a
+     * list or a map can be one — a row has many such values — and the
+     * container types themselves are not sortable at all; both are
+     * refused at DDL time, and [sortKeyPath] refuses them again here so
+     * a hand-built spec cannot reach the comparator.
+     */
+    private class SortKey(
+        val path: List<Int>,
+        val primitive: PrimitiveType,
+        val field: SortFieldDef,
+    )
+
     private fun comparator(
         schema: MessageType,
         sortFields: List<SortFieldDef>,
     ): Comparator<Row> {
-        val keys =
-            sortFields.map { f ->
-                val idx =
-                    schema.fields.indexOfFirst { it.id?.intValue()?.toLong() == f.sourceFieldId }
-                require(idx >= 0) {
-                    "sort source field_id ${f.sourceFieldId} not present in the output schema"
-                }
-                Triple(idx, schema.getType(idx).asPrimitiveType(), f)
-            }
+        val keys = sortFields.map { sortKeyPath(schema, it) }
         return Comparator { a, b ->
-            for ((idx, primitive, f) in keys) {
-                val aNull = a.group.getFieldRepetitionCount(idx) == 0
-                val bNull = b.group.getFieldRepetitionCount(idx) == 0
+            for (key in keys) {
+                val aGroup = navigate(a.group, key.path)
+                val bGroup = navigate(b.group, key.path)
+                val leafIdx = key.path.last()
+                val aNull = aGroup == null || aGroup.getFieldRepetitionCount(leafIdx) == 0
+                val bNull = bGroup == null || bGroup.getFieldRepetitionCount(leafIdx) == 0
                 if (aNull || bNull) {
                     if (aNull && bNull) continue
-                    val nullsFirst = f.nullOrder == com.posthog.hoglake.model.NullOrder.NULLS_FIRST
+                    val nullsFirst = key.field.nullOrder == com.posthog.hoglake.model.NullOrder.NULLS_FIRST
                     return@Comparator if (aNull == nullsFirst) -1 else 1
                 }
-                var c = compareNonNull(primitive, a.group, b.group, idx)
-                if (f.direction == SortDirection.DESC) c = -c
+                var c = compareNonNull(key.primitive, aGroup!!, bGroup!!, leafIdx)
+                if (key.field.direction == SortDirection.DESC) c = -c
                 if (c != 0) return@Comparator c
             }
             0
         }
+    }
+
+    /**
+     * The group holding the leaf, walking [path]'s struct levels; null
+     * when an ancestor struct is itself null (which makes the leaf null).
+     */
+    private fun navigate(
+        root: Group,
+        path: List<Int>,
+    ): Group? {
+        var g: Group = root
+        for (i in 0 until path.size - 1) {
+            if (g.getFieldRepetitionCount(path[i]) == 0) return null
+            g = g.getGroup(path[i], 0)
+        }
+        return g
+    }
+
+    /** Resolve one sort field to its index chain in the output schema. */
+    private fun sortKeyPath(
+        schema: MessageType,
+        field: SortFieldDef,
+    ): SortKey {
+        fun search(
+            group: org.apache.parquet.schema.GroupType,
+            prefix: List<Int>,
+        ): Pair<List<Int>, Type>? {
+            group.fields.forEachIndexed { i, type ->
+                val here = prefix + i
+                if (type.id?.intValue()?.toLong() == field.sourceFieldId) return here to type
+                // Only STRUCT interiors are searched: a repeated group
+                // (list/map) holds many values per row, so nothing under
+                // one is addressable as a single sort key.
+                if (!type.isPrimitive && !type.isRepetition(Type.Repetition.REPEATED)) {
+                    val group2 = type.asGroupType()
+                    if (group2.logicalTypeAnnotation == null) {
+                        search(group2, here)?.let { return it }
+                    }
+                }
+            }
+            return null
+        }
+        val found =
+            search(schema, emptyList())
+                ?: throw UnconvertibleSchemaException(
+                    "sort source field_id ${field.sourceFieldId} is not a top-level column or a " +
+                        "struct leaf of the output schema; list/map internals and nested containers " +
+                        "are not sortable",
+                )
+        val (path, type) = found
+        if (!type.isPrimitive) {
+            throw UnconvertibleSchemaException(
+                "sort source field_id ${field.sourceFieldId} is a nested container " +
+                    "('${type.name}'), and nested containers have no sort order",
+            )
+        }
+        return SortKey(path, type.asPrimitiveType(), field)
     }
 
     /**

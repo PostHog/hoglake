@@ -99,6 +99,11 @@ fun SortSpec.toAlterDto() = AlterSortSpecDto(sortId, fields.map { it.toAlterDto(
 data class AlterOpDto(
     val op: String,
     val column: ColumnDefDto? = null,
+    /**
+     * add_column only: the dotted path of an existing STRUCT to append
+     * the new field to. Absent = a new top-level column.
+     */
+    val parent: String? = null,
     val name: String? = null,
     val from: String? = null,
     val to: String? = null,
@@ -108,7 +113,7 @@ data class AlterOpDto(
 ) {
     fun toModel(): AlterOp =
         when (op) {
-            "add_column" -> AlterOp.AddColumn(required(column, "column").toModel())
+            "add_column" -> AlterOp.AddColumn(required(column, "column").toModel(), parent)
             "drop_column" -> AlterOp.DropColumn(required(name, "name"))
             "rename_column" -> AlterOp.RenameColumn(required(from, "from"), required(to, "to"))
             "promote_column" ->

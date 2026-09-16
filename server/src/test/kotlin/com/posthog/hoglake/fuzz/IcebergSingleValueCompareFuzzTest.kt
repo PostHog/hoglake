@@ -86,5 +86,10 @@ class IcebergSingleValueCompareFuzzTest {
             ColType.BINARY -> data.consumeBytes(data.consumeInt(0, 64))
             ColType.UINT64, ColType.DECIMAL ->
                 data.consumeBytes(data.consumeInt(1, 32)).takeIf { it.isNotEmpty() }?.let { BigInteger(it) }
+            // Containers have no single-value encoding at all, so there
+            // is no value to generate and nothing for the comparator
+            // contract to say. Skipping the iteration is the honest
+            // answer; IcebergSingleValueTest pins the refusal itself.
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> null
         }
 }

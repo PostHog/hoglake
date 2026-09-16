@@ -87,9 +87,7 @@ class AlterService(private val jdbi: Jdbi) {
                 // Live shape as of the pre-alter head (read under the lock).
                 val state =
                     TableState(
-                        cols =
-                            TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1)
-                                .toMutableList(),
+                        cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         name = t.name,
                         spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
@@ -123,12 +121,24 @@ class AlterService(private val jdbi: Jdbi) {
 
     // ---- op application --------------------------------------------------
 
-    /** The evolving in-request view of the table's live shape. */
+    /**
+     * The evolving in-request view of the table's live shape. [cols] is
+     * the column FOREST (top-level columns, each container carrying its
+     * children), rebuilt rather than mutated — the tree is immutable, so
+     * every op produces a new forest.
+     */
     private class TableState(
-        val cols: MutableList<Column>,
+        var cols: List<Column>,
         var name: String,
         var spec: PartitionSpec?,
         var sortSpec: SortSpec?,
+    )
+
+    /** A column found by dotted path, with the chain that reached it. */
+    private class Located(
+        val column: Column,
+        /** null when [column] is top-level. */
+        val parent: Column?,
     )
 
     private fun applyOp(
@@ -151,6 +161,19 @@ class AlterService(private val jdbi: Jdbi) {
         is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
     }
 
+    /**
+     * Add a column, either at top level or as a new field of an
+     * existing STRUCT ([AlterOp.AddColumn.parent], a dotted path).
+     *
+     * The new column may itself be nested: the whole subtree is
+     * validated (shape, synthetic names, depth — measured from the
+     * graft point, so adding a 3-deep struct into a 6-deep one is
+     * refused exactly like declaring a 9-deep column would be) and its
+     * ids are allocated depth-first in one go.
+     *
+     * Adding into a LIST or a MAP is refused: Iceberg has no "add a
+     * field to a list", and the only thing a list HAS is its element.
+     */
     private fun addColumn(
         h: Handle,
         catalogId: Long,
@@ -160,20 +183,35 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.AddColumn,
     ) {
         Identifiers.validate("column", op.def.name)
-        if (state.cols.any { it.def.name == op.def.name }) {
-            throw HoglakeException.Validation("column '${op.def.name}' already exists")
+        val parent = op.parent?.let { requireStructParent(state, it) }
+        val siblings = parent?.children ?: state.cols
+        val where = if (parent == null) "" else " of struct '${op.parent}'"
+        if (siblings.any { it.def.name == op.def.name }) {
+            throw HoglakeException.Validation("column '${op.def.name}'$where already exists")
         }
-        val fieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, 1)
-        val col =
-            Column(
-                fieldId = fieldId,
-                ordinal = (state.cols.maxOfOrNull { it.ordinal } ?: -1) + 1,
-                def = op.def,
-            )
-        TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(col))
-        state.cols += col
+        ColumnTrees.validate(listOf(op.def), depthOffset = parent?.let { depthOf(state, it) } ?: 0)
+        val count = ColumnTrees.nodeCount(listOf(op.def))
+        val firstFieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, count)
+        val assigned = ColumnTrees.assignFieldIds(listOf(op.def), firstFieldId).single()
+        val col = assigned.copy(ordinal = (siblings.maxOfOrNull { it.ordinal } ?: -1) + 1)
+        TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(col), parent?.fieldId)
+        state.cols =
+            if (parent == null) {
+                state.cols + col
+            } else {
+                replaceNode(state.cols, parent.fieldId) { it.copy(children = it.children + col) }
+            }
     }
 
+    /**
+     * Drop a column — top-level, or a field of a struct by dotted path.
+     * The whole SUBTREE goes: a dropped struct takes its fields with it,
+     * and each of their versioned rows is retired at [snapshot].
+     *
+     * A field of a list or a map cannot be dropped (there is nothing
+     * left of a list without its element); the path resolver refuses to
+     * address one at all.
+     */
     private fun dropColumn(
         h: Handle,
         catalogId: Long,
@@ -182,25 +220,56 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.DropColumn,
     ) {
-        val col = requireColumn(state, op.name)
-        if (state.cols.size == 1) {
+        val located = requireColumn(state, op.name)
+        val col = located.column
+        val parent = located.parent
+        if (parent == null && state.cols.size == 1) {
             throw HoglakeException.Validation("cannot drop '${op.name}': it is the last column")
         }
-        val spec = state.spec
-        if (spec != null && spec.fields.any { it.sourceFieldId == col.fieldId }) {
+        if (parent != null && parent.children.size == 1) {
             throw HoglakeException.Validation(
-                "cannot drop column '${op.name}': it is a source of the live partition spec",
+                "cannot drop '${op.name}': it is the last field of struct '${parent.def.name}', " +
+                    "and a struct with no fields has no representation in parquet or Iceberg",
+            )
+        }
+        // The whole subtree's ids, not just this node's: a partition or
+        // sort source hiding inside the dropped struct is exactly as
+        // fatal as the struct itself being one.
+        val doomed = col.selfAndDescendants().map { it.fieldId }.toSet()
+        val spec = state.spec
+        spec?.fields?.firstOrNull { it.sourceFieldId in doomed }?.let { f ->
+            throw HoglakeException.Validation(
+                dropBlockedMessage(op.name, col, f.sourceFieldId, "partition spec"),
             )
         }
         val sortSpec = state.sortSpec
-        if (sortSpec != null && sortSpec.fields.any { it.sourceFieldId == col.fieldId }) {
+        sortSpec?.fields?.firstOrNull { it.sourceFieldId in doomed }?.let { f ->
             throw HoglakeException.Validation(
-                "cannot drop column '${op.name}': it is a source of the live sort order",
+                dropBlockedMessage(op.name, col, f.sourceFieldId, "sort order"),
             )
         }
-        endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
-        state.cols.remove(col)
+        for (id in doomed) endOrDeleteColumnRow(h, catalogId, tableId, id, snapshot)
+        state.cols =
+            if (parent == null) {
+                state.cols.filter { it.fieldId != col.fieldId }
+            } else {
+                replaceNode(state.cols, parent.fieldId) { p ->
+                    p.copy(children = p.children.filter { it.fieldId != col.fieldId })
+                }
+            }
     }
+
+    private fun dropBlockedMessage(
+        path: String,
+        dropped: Column,
+        sourceFieldId: Long,
+        what: String,
+    ): String =
+        if (sourceFieldId == dropped.fieldId) {
+            "cannot drop column '$path': it is a source of the live $what"
+        } else {
+            "cannot drop column '$path': field_id $sourceFieldId inside it is a source of the live $what"
+        }
 
     private fun renameColumn(
         h: Handle,
@@ -211,9 +280,12 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.RenameColumn,
     ) {
         Identifiers.validate("column", op.to)
-        val col = requireColumn(state, op.from)
-        if (state.cols.any { it.def.name == op.to }) {
-            throw HoglakeException.Validation("column '${op.to}' already exists")
+        val located = requireColumn(state, op.from)
+        val col = located.column
+        val siblings = located.parent?.children ?: state.cols
+        if (siblings.any { it.def.name == op.to }) {
+            val where = located.parent?.let { " of struct '${it.def.name}'" } ?: ""
+            throw HoglakeException.Validation("column '${op.to}'$where already exists")
         }
         // The field-id contract guard: files whose parquet schema carries
         // no field ids bind columns by NAME. Renaming while any such file
@@ -258,9 +330,20 @@ class AlterService(private val jdbi: Jdbi) {
             )
         }
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
+        // Only THIS row is rewritten; the children keep their own live
+        // rows (and their parent_field_id, which is the stable field id,
+        // not the version) — so renaming a struct does not churn its
+        // fields' history.
         val renamed = col.copy(def = col.def.copy(name = op.to))
-        TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(renamed))
-        state.cols[state.cols.indexOf(col)] = renamed
+        TableRepo.insertColumns(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            listOf(renamed.copy(children = emptyList())),
+            located.parent?.fieldId,
+        )
+        state.cols = replaceNode(state.cols, col.fieldId) { renamed }
     }
 
     private fun promoteColumn(
@@ -271,7 +354,19 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.PromoteColumn,
     ) {
-        val col = requireColumn(state, op.name)
+        val located = requireColumn(state, op.name)
+        val col = located.column
+        // Containers first, with their own reason: "cannot promote list
+        // to long" is true but unhelpful, and the honest answer is that
+        // a container has no promotion at all — not that this particular
+        // target is wrong.
+        if (col.def.type.isNested || op.to.isNested) {
+            throw HoglakeException.Validation(
+                "cannot promote column '${op.name}': '${col.def.type.wire}' and '${op.to.wire}' " +
+                    "include a nested container type, and nested containers are not promotable; " +
+                    "promote a struct's LEAF field instead",
+            )
+        }
         if (!col.def.type.canPromoteTo(op.to)) {
             throw HoglakeException.Validation(
                 "cannot promote column '${op.name}' from '${col.def.type.wire}' to '${op.to.wire}'",
@@ -279,8 +374,18 @@ class AlterService(private val jdbi: Jdbi) {
         }
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
         val promoted = col.copy(def = col.def.copy(type = op.to))
-        TableRepo.insertColumns(h, catalogId, tableId, snapshot, listOf(promoted))
-        state.cols[state.cols.indexOf(col)] = promoted
+        TableRepo.insertColumns(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            listOf(promoted.copy(children = emptyList())),
+            located.parent?.fieldId,
+        )
+        state.cols = replaceNode(state.cols, col.fieldId) { promoted }
+        // Field-id-keyed, so a struct LEAF re-encodes exactly like a
+        // top-level column: nothing about the stats path knows or cares
+        // that the column lives inside a struct.
         reencodeStatsOnPromote(h, catalogId, tableId, col.fieldId, col.def.type, op.to)
     }
 
@@ -418,11 +523,7 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.SetPartitionSpec,
     ) {
         for (f in op.fields) {
-            val col =
-                state.cols.find { it.fieldId == f.sourceFieldId }
-                    ?: throw HoglakeException.Validation(
-                        "partition source field_id ${f.sourceFieldId} is not a live column",
-                    )
+            val col = requireSourceField(state, f.sourceFieldId, "partition")
             when (f.transform) {
                 Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -538,11 +639,7 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val seen = HashSet<Long>()
         for (f in op.fields) {
-            if (state.cols.none { it.fieldId == f.sourceFieldId }) {
-                throw HoglakeException.Validation(
-                    "sort source field_id ${f.sourceFieldId} is not a live column",
-                )
-            }
+            requireSourceField(state, f.sourceFieldId, "sort")
             if (!seen.add(f.sourceFieldId)) {
                 throw HoglakeException.Validation(
                     "duplicate sort source field_id ${f.sourceFieldId}",
@@ -601,12 +698,151 @@ class AlterService(private val jdbi: Jdbi) {
 
     // ---- row lifecycle helpers -------------------------------------------
 
+    /**
+     * Resolve a column by DOTTED PATH — `addr` for a top-level column,
+     * `addr.zip` for a field of the struct `addr`. Names cannot contain
+     * `.` (the identifier policy), so the split is unambiguous.
+     *
+     * Only STRUCT interiors are addressable. A path that steps through a
+     * `list` or a `map` is refused by name, because Iceberg has no
+     * add/drop/rename for an element, a key or a value — the container's
+     * shape IS its type, and changing it would be a type change, not a
+     * column op.
+     */
     private fun requireColumn(
         state: TableState,
-        name: String,
-    ): Column =
-        state.cols.find { it.def.name == name }
-            ?: throw HoglakeException.Validation("column '$name' does not exist")
+        path: String,
+    ): Located {
+        val segments = path.split('.')
+        if (segments.any { it.isEmpty() }) {
+            throw HoglakeException.Validation(
+                "invalid column path '$path': a path is dot-separated column names, none empty",
+            )
+        }
+        var siblings = state.cols
+        var parent: Column? = null
+        var current: Column? = null
+        for ((i, segment) in segments.withIndex()) {
+            if (i > 0) {
+                val container =
+                    current ?: throw HoglakeException.Validation("column '$path' does not exist")
+                assertStructInterior(container, segments.take(i).joinToString("."), path)
+                parent = container
+                siblings = container.children
+            }
+            current =
+                siblings.find { it.def.name == segment }
+                    ?: throw HoglakeException.Validation(
+                        if (i == 0) {
+                            "column '$path' does not exist"
+                        } else {
+                            "column '$path' does not exist: struct " +
+                                "'${segments.take(i).joinToString(".")}' has no field '$segment'"
+                        },
+                    )
+        }
+        return Located(current!!, parent)
+    }
+
+    /** Resolve a dotted path that must name an existing struct (add_column's `parent`). */
+    private fun requireStructParent(
+        state: TableState,
+        path: String,
+    ): Column {
+        val located = requireColumn(state, path)
+        assertStructInterior(located.column, path, path)
+        return located.column
+    }
+
+    /** [container] must be a struct for [path] to be addressable inside it. */
+    private fun assertStructInterior(
+        container: Column,
+        containerPath: String,
+        fullPath: String,
+    ) {
+        if (container.def.type == ColType.STRUCT) return
+        if (container.def.type.isNested) {
+            throw HoglakeException.Validation(
+                "cannot address '$fullPath': '$containerPath' is a '${container.def.type.wire}', " +
+                    "and list/map internals (element, key, value) cannot be added, dropped or " +
+                    "renamed — only struct fields can",
+            )
+        }
+        throw HoglakeException.Validation(
+            "cannot address '$fullPath': '$containerPath' is '${container.def.type.wire}', not a struct",
+        )
+    }
+
+    /**
+     * A partition or sort source must be a LEAF that no list or map
+     * sits above. Iceberg's `source-id` may point at a struct leaf, so
+     * `addr.zip` is a legal partition source — but nothing under a
+     * repeated element is, because a row has many of those values and a
+     * partition/sort key is one value per row.
+     */
+    private fun requireSourceField(
+        state: TableState,
+        fieldId: Long,
+        what: String,
+    ): Column {
+        val chain =
+            findChain(state.cols, fieldId, emptyList())
+                ?: throw HoglakeException.Validation(
+                    "$what source field_id $fieldId is not a live column",
+                )
+        val col = chain.last()
+        val path = chain.joinToString(".") { it.def.name }
+        if (col.def.type.isNested) {
+            throw HoglakeException.Validation(
+                "$what source field_id $fieldId ('$path') is a '${col.def.type.wire}': a nested " +
+                    "container has no single value per row and cannot be a $what source; use one " +
+                    "of its leaf fields",
+            )
+        }
+        val repeated = chain.dropLast(1).firstOrNull { it.def.type == ColType.LIST || it.def.type == ColType.MAP }
+        if (repeated != null) {
+            throw HoglakeException.Validation(
+                "$what source field_id $fieldId ('$path') sits under '${repeated.def.name}', a " +
+                    "'${repeated.def.type.wire}': a row has many such values, so it cannot be a " +
+                    "$what source; struct leaves are the only nested fields that can",
+            )
+        }
+        return col
+    }
+
+    /** The root-to-node chain for [fieldId], or null when it is not in the forest. */
+    private fun findChain(
+        siblings: List<Column>,
+        fieldId: Long,
+        prefix: List<Column>,
+    ): List<Column>? {
+        for (c in siblings) {
+            val here = prefix + c
+            if (c.fieldId == fieldId) return here
+            findChain(c.children, fieldId, here)?.let { return it }
+        }
+        return null
+    }
+
+    /** Depth of [node] in [state]'s forest, top-level counting as 1. */
+    private fun depthOf(
+        state: TableState,
+        node: Column,
+    ): Int = findChain(state.cols, node.fieldId, emptyList())?.size ?: 1
+
+    /** Rebuild the forest with [transform] applied to the node carrying [fieldId]. */
+    private fun replaceNode(
+        siblings: List<Column>,
+        fieldId: Long,
+        transform: (Column) -> Column,
+    ): List<Column> =
+        siblings.map { c ->
+            when {
+                c.fieldId == fieldId -> transform(c)
+                c.children.isEmpty() -> c
+                else -> c.copy(children = replaceNode(c.children, fieldId, transform))
+            }
+        }
 
     /**
      * Retire a field's live column row at [snapshot]: delete it if this
