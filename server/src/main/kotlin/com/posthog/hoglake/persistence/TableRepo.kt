@@ -221,13 +221,14 @@ object TableRepo {
                 .bind("typeParams", Pg.toJson(c.def.typeParams))
                 .bind("nullable", c.def.nullable)
                 .bind("ordinal", c.ordinal)
-                .apply {
-                    if (parent == null) {
-                        bindNull("parentFieldId", java.sql.Types.BIGINT)
-                    } else {
-                        bind("parentFieldId", parent)
-                    }
-                }
+                // bindByType, NOT bind + bindNull: a prepared BATCH binds
+                // one argument factory per name, and a null bound with
+                // bindNull registers a NullArgument that the next row's
+                // real Long cannot reuse ("No argument factory registered
+                // for '1' of qualified type NullArgument"). A nested
+                // create-table is exactly a batch with both — a top-level
+                // column's NULL parent followed by a child's real one.
+                .bindByType("parentFieldId", parent, Long::class.javaObjectType)
                 .add()
         }
         batch.execute()

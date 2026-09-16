@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
@@ -196,8 +197,19 @@ class CompactionService(
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
         val sortFields: List<SortFieldDef>,
     ) {
-        /** Live column types by field id (stats aggregation). */
-        val columnTypes: Map<Long, ColType> get() = columns.associate { it.fieldId to it.def.type }
+        /**
+         * Live column types by field id (stats aggregation), over EVERY
+         * node of the column forest — not just the top level.
+         *
+         * Stats are keyed on LEAF field ids, and a leaf inside a struct,
+         * a list or a map is not a top-level column. Built from the
+         * top-level list alone, the merge silently dropped every nested
+         * leaf's stats row on the way through compaction: counts and
+         * bounds present before the rewrite, gone after it, with nothing
+         * anywhere saying so.
+         */
+        val columnTypes: Map<Long, ColType>
+            get() = columns.allNodes().associate { it.fieldId to it.def.type }
     }
 
     private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
