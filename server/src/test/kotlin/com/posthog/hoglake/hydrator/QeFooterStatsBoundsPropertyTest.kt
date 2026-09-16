@@ -992,6 +992,159 @@ class QeFooterStatsBoundsPropertyTest {
             )
             add(
                 NestedCell(
+                    name = "list whose element carries NO field id (positional fallback)",
+                    column = container(2, "l", ColType.LIST, scalarChild(3, "element", ColType.INT)),
+                    // The identity check must not become "ids required".
+                    // An id-less child keeps the positional binding —
+                    // the same exemption missingFieldIds grants the
+                    // repetition layer — and such a file is already
+                    // flagged, so renames on its table are blocked and
+                    // position cannot drift out from under it. Tighten
+                    // this to "must have an id" and every element in a
+                    // partially-id'd file loses its bounds.
+                    //
+                    // The sibling `k` is what makes the file id-BEARING
+                    // (usesFieldIds walks leaves): without it the whole
+                    // file would take the name-binding path and this
+                    // cell would be testing something else entirely.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                optInt(1, "k"),
+                                listGroup(
+                                    2,
+                                    "l",
+                                    Types.optional(PrimitiveTypeName.INT32).named("element"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "list", "element"),
+                                Types.optional(PrimitiveTypeName.INT32).named("element"),
+                                le(5),
+                                le(9),
+                            ),
+                        ),
+                    mustProduce = setOf(3L),
+                    mustRefuse = setOf(2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list whose element carries a DIFFERENT field id",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // The wrapper matches by id; the element does not.
+                    // Bound by POSITION alone, the file's leaf 99 would
+                    // have its counts and bounds recorded under catalog
+                    // field 2 — a range describing other data, on a field
+                    // id this file never claimed, which is what a pruner
+                    // then skips files on.
+                    schema = MessageType("root", listOf(listGroup(1, "l", optInt(99, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(99, "element"), le(1000), le(1002)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 99L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose value carries an id the catalog does not know",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(2, "key"), optLong(99, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("m", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                            NestedLeaf(listOf("m", "key_value", "value"), optLong(99, "value"), le(500L), le(501L)),
+                        ),
+                    // The KEY matches and the VALUE does not, and the
+                    // whole entry is refused rather than half-recorded:
+                    // a map whose members disagree with the catalog is
+                    // not a map the catalog can describe.
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L, 99L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose key is OPTIONAL",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    // The rewriter refuses this file outright (the output
+                    // key is REQUIRED, so a row with none would fail the
+                    // write mid-group). The reader used to accept it, so
+                    // the two surfaces disagreed about which files they
+                    // handle — the drift maxUnsignedParquetWidth is
+                    // shared to prevent. A file compaction will never
+                    // rewrite should not accumulate stats as though it
+                    // will.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                mapGroup(
+                                    1,
+                                    "m",
+                                    Types.optional(PrimitiveTypeName.BINARY)
+                                        .`as`(LogicalTypeAnnotation.stringType()).id(2).named("key"),
+                                    optLong(3, "value"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                Types.optional(PrimitiveTypeName.BINARY)
+                                    .`as`(LogicalTypeAnnotation.stringType()).id(2).named("key"),
+                                bytes(0x61),
+                                bytes(0x7A),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct declared over a LIST-annotated group with its field id",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    // The reader's half of the rewriter's refusal. A
+                    // container wearing a struct's id is a type mismatch,
+                    // and saying so beats every child quietly missing.
+                    schema = MessageType("root", listOf(listGroup(1, "s", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
                     name = "list<int> whose element leaf is physically BOOLEAN",
                     column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
                     schema =

@@ -259,6 +259,65 @@ class V5NestedTypesMigrationIntegrationTest {
                 .hasMessageContaining("V5 expected the index hog_column_live_ordinal")
         }
 
+    @Test
+    fun `the migration refuses an index that merely shares V1's NAME`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            // EXISTENCE was never the check. V5 DROPs this index and
+            // replaces it, so an index sharing V1's name while guarding
+            // something else would be discarded silently — the exact
+            // divergence the guard's own comment claims to catch. Here
+            // it guards the wrong KEY.
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("DROP INDEX hog_column_live_ordinal")
+                h.execute(
+                    """
+                    CREATE UNIQUE INDEX hog_column_live_ordinal
+                        ON hog_column (catalog_id, table_id, name)
+                        WHERE end_snapshot IS NULL
+                    """,
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("whose definition is not the one V1__init.sql created")
+                .hasMessageContaining("(catalog_id, table_id, ordinal)")
+        }
+
+    @Test
+    fun `the migration refuses an index that lost V1's partiality`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            // Same name, same key, no WHERE: a total unique index is a
+            // STRICTER guarantee, and replacing it silently would drop a
+            // constraint the catalog had been relying on.
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("DROP INDEX hog_column_live_ordinal")
+                h.execute(
+                    "CREATE UNIQUE INDEX hog_column_live_ordinal ON hog_column (catalog_id, table_id, ordinal)",
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("whose definition is not the one V1__init.sql created")
+        }
+
+    @Test
+    fun `the migration refuses an index that is no longer UNIQUE`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("DROP INDEX hog_column_live_ordinal")
+                h.execute(
+                    """
+                    CREATE INDEX hog_column_live_ordinal
+                        ON hog_column (catalog_id, table_id, ordinal)
+                        WHERE end_snapshot IS NULL
+                    """,
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("whose definition is not the one V1__init.sql created")
+        }
+
     /** Catalog 1 + namespace + table, so hog_column inserts have parents. */
     private fun seedTable(db: PgTestSupport.TestDb) {
         db.jdbi.useHandleUnchecked { h ->

@@ -78,7 +78,13 @@ object ColumnTrees {
         val children = def.children ?: emptyList()
 
         if (!def.type.isNested) {
-            if (children.isNotEmpty()) {
+            // PRESENT, not non-empty. `"children": []` on a scalar is
+            // still a caller stating something about this column that is
+            // not true, and normalising it to "omitted" answered 201 to
+            // a request the error message promises a 422 for. The two
+            // shapes get the same message because they are the same
+            // mistake.
+            if (def.children != null) {
                 throw HoglakeException.Validation(
                     "column '$qualified' is '${def.type.wire}', a scalar type, and cannot have children",
                 )

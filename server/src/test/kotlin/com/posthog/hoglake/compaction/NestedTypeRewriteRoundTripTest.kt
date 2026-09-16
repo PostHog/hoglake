@@ -692,6 +692,85 @@ class NestedTypeRewriteRoundTripTest {
     }
 
     @Test
+    fun `a LIST wrapper wearing a struct's field id is refused, not null-filled`() {
+        // F1's data-loss shape through a different door, and the reason
+        // it is worth its own guard: a struct's fields are the ONE
+        // interior that null-fills. Treat a LIST wrapper as a struct and
+        // every field misses, so the rewrite emits rows of EMPTY structs
+        // and the commit end-snapshots the input that held the real
+        // values. Measured before the fix: 3 rows in, 3 rows of
+        // `s | _hog_row_id: n` out, every element gone.
+        val listShaped =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(Types.optional(PrimitiveTypeName.INT32).id(9).named("element"))
+                                .named("list"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        // the STRUCT's field id, on a LIST wrapper
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("structoverlist-in", listShaped, rows = 3) { g, i ->
+                val l = g.addGroup(0)
+                l.addGroup(0).add(0, i * 10)
+                l.addGroup(0).add(0, i * 10 + 1)
+            }
+        assertThatThrownBy { rewrite(path, listOf(structColumn), tmp.resolve("structoverlist-out.parquet")) }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("not a struct")
+    }
+
+    @Test
+    fun `a MAP wrapper wearing a struct's field id is refused too`() {
+        val mapShaped =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addFields(
+                                    Types.required(PrimitiveTypeName.BINARY)
+                                        .`as`(LogicalTypeAnnotation.stringType()).id(8).named("key"),
+                                    Types.optional(PrimitiveTypeName.INT64).id(9).named("value"),
+                                )
+                                .named("key_value"),
+                        )
+                        .`as`(LogicalTypeAnnotation.mapType())
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("structovermap-in", mapShaped, rows = 1) { g, _ ->
+                val e = g.addGroup(0).addGroup(0)
+                e.add(0, "k")
+                e.add(1, 1L)
+            }
+        assertThatThrownBy { rewrite(path, listOf(structColumn), tmp.resolve("structovermap-out.parquet")) }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("not a struct")
+    }
+
+    @Test
+    fun `a plain group is still accepted for a struct, annotation-free`() {
+        // The control: the refusal is about the ANNOTATION, not about
+        // groups. An ordinary struct still rewrites.
+        val path =
+            write("plainstruct-in", structSchema(), rows = 2) { g, i ->
+                val inner = g.addGroup(0)
+                inner.add(0, i)
+                inner.add(1, "r$i")
+            }
+        val out = tmp.resolve("plainstruct-out.parquet")
+        rewrite(path, listOf(structColumn), out)
+        assertThat(readStructs(out)).containsExactly(0 to "r0", 1 to "r1")
+    }
+
+    @Test
     fun `an input map with an optional key is refused rather than half-written`() {
         // The output key is REQUIRED (the parquet MAP shape says so), so
         // a row whose key is absent would fail the write halfway through

@@ -750,6 +750,21 @@ class NestedColumnApiTest {
                     "a scalar type, and cannot have children",
                 ),
                 args(
+                    // PRESENT, not non-empty. An explicit empty list was
+                    // normalised to "omitted" and answered 201 — to a
+                    // request the error message above promises a 422 for.
+                    // Same mistake, same message.
+                    "a scalar with an explicitly EMPTY children list",
+                    """{"name": "c", "type": "int", "children": []}""",
+                    "a scalar type, and cannot have children",
+                ),
+                args(
+                    "a scalar with an empty children list nested inside a struct",
+                    """{"name": "c", "type": "struct", "children": [
+                        {"name": "inner", "type": "long", "children": []}]}""",
+                    "column 'c.inner' is 'long', a scalar type, and cannot have children",
+                ),
+                args(
                     "a container carrying type_params",
                     """{"name": "c", "type": "list", "type_params": {"precision": 5, "scale": 2},
                         "children": [{"name": "element", "type": "int"}]}""",

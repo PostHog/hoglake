@@ -268,6 +268,19 @@ object FooterStats {
         val group = field.asGroupType()
         when (col.type) {
             ColType.STRUCT -> {
+                // Same rule the rewriter applies: a struct's counterpart
+                // is a PLAIN group, and a LIST/MAP wrapper carrying the
+                // struct's id is a type mismatch. Without this the
+                // children simply fail to match one by one and the
+                // subtree goes quiet — safe, but silent, and the two
+                // surfaces would disagree about a file the rewriter
+                // refuses outright.
+                if (group.logicalTypeAnnotation != null) {
+                    shapeMismatch(
+                        "is a '${group.logicalTypeAnnotation}' group, not a struct",
+                    )
+                    return
+                }
                 for (child in col.children) {
                     val sub = findField(group.fields, child, useFieldIds)
                     if (sub == null) {
@@ -300,7 +313,15 @@ object FooterStats {
                     shapeMismatch("has a repeated group with ${entry.fieldCount} fields, not 1 (element)")
                     return
                 }
-                matchInto(col.children.single(), element, path + repeated.name, useFieldIds, filePath, out)
+                val child = col.children.single()
+                if (!childBinds(child, element, useFieldIds)) {
+                    shapeMismatch(
+                        "has an element with field id ${element.id?.intValue()}, not the live " +
+                            "element's ${child.fieldId}",
+                    )
+                    return
+                }
+                matchInto(child, element, path + repeated.name, useFieldIds, filePath, out)
             }
             ColType.MAP -> {
                 // MAP / MAP_KEY_VALUE: one repeated group with exactly
@@ -315,12 +336,59 @@ object FooterStats {
                     shapeMismatch("has a key_value group with ${entry.fieldCount} fields, not 2 (key, value)")
                     return
                 }
+                // The rewriter refuses an OPTIONAL key (the output key is
+                // REQUIRED, so a row with none would fail the write
+                // halfway through the group). The two surfaces have to
+                // agree about which files they accept — that agreement is
+                // the whole reason maxUnsignedParquetWidth is shared —
+                // and a file the rewriter will never compact should not
+                // be accumulating stats as though it will.
+                if (!entry.getType(0).isRepetition(Type.Repetition.REQUIRED)) {
+                    shapeMismatch("has an OPTIONAL key; Iceberg map keys are non-nullable")
+                    return
+                }
+                col.children.forEachIndexed { i, child ->
+                    if (!childBinds(child, entry.getType(i), useFieldIds)) {
+                        shapeMismatch(
+                            "has a ${if (i == 0) "key" else "value"} with field id " +
+                                "${entry.getType(i).id?.intValue()}, not the live one's ${child.fieldId}",
+                        )
+                        return
+                    }
+                }
                 val entryPath = path + repeated.name
                 matchInto(col.children[0], entry.getType(0), entryPath, useFieldIds, filePath, out)
                 matchInto(col.children[1], entry.getType(1), entryPath, useFieldIds, filePath, out)
             }
             else -> error("unreachable: ${col.type} is not a container")
         }
+    }
+
+    /**
+     * Whether the synthetic child [field] — a list's element, a map's
+     * key or value — really IS [col].
+     *
+     * The synthetic children have no useful names (every list's element
+     * is called `element`), so they are reached by POSITION. Position is
+     * not identity: a file whose wrapper matches but whose element
+     * carries a different id would have its counts and bounds recorded
+     * under a catalog field the file never claimed, and a pruner would
+     * then skip files on a range that describes other data. When the
+     * file declares an id, that id decides.
+     *
+     * An id-LESS child keeps the positional binding, and must: that is
+     * the same exemption `missingFieldIds` grants the repetition layer,
+     * and such a file is already flagged, so renames on its table are
+     * blocked and position cannot drift out from under it.
+     */
+    private fun childBinds(
+        col: CatalogColumn,
+        field: Type,
+        useFieldIds: Boolean,
+    ): Boolean {
+        if (!useFieldIds) return true
+        val id = field.id ?: return true
+        return id.intValue().toLong() == col.fieldId
     }
 
     /**

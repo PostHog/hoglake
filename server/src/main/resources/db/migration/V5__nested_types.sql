@@ -91,12 +91,41 @@ $$;
 -- index this migration does not recognise would silently drop whatever
 -- guarantee the divergent one was carrying.
 DO $$
+DECLARE
+    found_def text;
 BEGIN
     IF to_regclass('hog_column_live_ordinal') IS NULL THEN
         RAISE EXCEPTION
             'V5 expected the index hog_column_live_ordinal on hog_column (created by '
             'V1__init.sql) but it is absent. This catalog has diverged from the migration '
             'chain; reconcile it with V1 before re-running.';
+    END IF;
+
+    -- EXISTENCE is not the check. The next statement DROPs this index
+    -- and replaces it with a per-parent one, so an index that merely
+    -- shares V1's NAME while guarding something else would be discarded
+    -- silently — which is precisely the divergence this guard claims to
+    -- catch. Compare the DEFINITION.
+    --
+    -- Matched by shape rather than by one exact string: pg_get_indexdef
+    -- schema-qualifies the table and normalises spacing, and both vary
+    -- with search_path and server version. The three clauses below are
+    -- the guarantee V1 actually made — unique, keyed on
+    -- (catalog_id, table_id, ordinal), partial on the live rows — and
+    -- losing any one of them is what would matter.
+    SELECT pg_get_indexdef(indexrelid) INTO found_def
+    FROM pg_index
+    WHERE indexrelid = 'hog_column_live_ordinal'::regclass;
+
+    IF found_def NOT LIKE 'CREATE UNIQUE INDEX%'
+       OR found_def NOT LIKE '%(catalog_id, table_id, ordinal)%'
+       OR found_def NOT LIKE '%WHERE (end_snapshot IS NULL)%' THEN
+        RAISE EXCEPTION
+            'V5 found an index named hog_column_live_ordinal whose definition is not the one '
+            'V1__init.sql created. Expected a UNIQUE index on '
+            '(catalog_id, table_id, ordinal) WHERE end_snapshot IS NULL; found: %. '
+            'V5 replaces this index with a per-parent one and will not silently discard a '
+            'guarantee it does not recognise; reconcile it with V1 before re-running.', found_def;
     END IF;
 END
 $$;

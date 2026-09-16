@@ -290,6 +290,20 @@ def _walk_leaves(
 ) -> list[tuple[str, Column, pa.DataType | None]]:
     """Every LEAF under ``col`` as (parquet path, column, arrow type).
 
+    Synthetic children (a list's element, a map's key and value) are
+    reached by POSITION, without the field-id identity check the Kotlin
+    hydrator applies. That is safe HERE and only here, because of a
+    premise worth stating: this module is reached from exactly one call
+    site, :func:`pyhoglake.client._write_one_file`, on the footer of the
+    parquet this process just wrote from
+    ``columns_to_arrow_schema(info.columns)``. The ids in that footer
+    came from the catalog by construction, so position and identity
+    cannot disagree. The Kotlin side reads FOREIGN footers, where they
+    very much can, and checks accordingly.
+
+    If this ever grows a second caller that hands it someone else's
+    file, the identity check has to come with it.
+
     The parquet path and the arrow leaf type are resolved TOGETHER,
     walking the catalog tree and the footer's arrow schema in step: the
     catalog says what the column was declared as, the footer says what

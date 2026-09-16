@@ -543,8 +543,28 @@ object ParquetRewriter {
         if (src.isPrimitive) refuseShape("the input field is a primitive leaf, not a group")
         val group = src.asGroupType()
         return when (column.def.type) {
-            ColType.STRUCT ->
+            ColType.STRUCT -> {
+                // A struct's parquet counterpart is a PLAIN group. A
+                // LIST or MAP wrapper carrying the struct's field id is
+                // not "a struct with unfamiliar children", it is a
+                // different type wearing the same id — and treating it
+                // as a struct is the one shape that loses data silently:
+                // the wrapper's only child is the repetition layer, so
+                // every one of the struct's fields fails to match, and
+                // a struct's fields are the ONE interior that null-fills
+                // (see the note above). The rewrite would then produce
+                // rows of empty structs, and the commit would
+                // end-snapshot the input that held the real values —
+                // F1's shape through a different door. Refuse instead.
+                val annotation = group.logicalTypeAnnotation
+                if (annotation != null) {
+                    refuseShape(
+                        "the input field is a '$annotation' group, not a struct; a container " +
+                            "wearing a struct's field id is a type mismatch, not a schema evolution",
+                    )
+                }
                 Step.StructStep(srcIndex, planChildren(group.fields, column.children, inputPath))
+            }
             ColType.LIST -> {
                 val entry =
                     repeatedEntryGroup(group)
