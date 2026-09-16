@@ -1,7 +1,8 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import type { Table } from "../src/api/types";
+import type { Column, Table } from "../src/api/types";
 import { formatColumnType } from "../src/api/types";
+import { formatPartitionField } from "../src/lib/format";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
 /**
@@ -129,5 +130,67 @@ describe("TablePage schema tab", () => {
     // The map key's required-ness is real schema, not decoration.
     const keyRow = rows[7];
     expect(within(keyRow).getByTitle("not null")).toBeInTheDocument();
+  });
+});
+
+describe("nested partition sources", () => {
+  it("labels a struct leaf by its dotted path, not its bare name", () => {
+    // Two structs each holding a `zip`: by bare name both render "zip"
+    // and the page shows one table partitioned twice by the same
+    // apparent column. The server's partition-stats endpoint labels
+    // them by path for exactly this reason.
+    const columns: Column[] = [
+      {
+        field_id: "1",
+        ordinal: 0,
+        name: "home",
+        type: "struct",
+        children: [
+          { field_id: "2", ordinal: 0, name: "zip", type: "string" },
+        ],
+      },
+      {
+        field_id: "3",
+        ordinal: 1,
+        name: "work",
+        type: "struct",
+        children: [
+          { field_id: "4", ordinal: 0, name: "zip", type: "string" },
+        ],
+      },
+    ];
+    expect(
+      formatPartitionField(
+        { source_field_id: "2", transform: "identity" },
+        columns,
+      ),
+    ).toBe("identity(home.zip)");
+    expect(
+      formatPartitionField(
+        { source_field_id: "4", transform: "bucket", transform_param: 16 },
+        columns,
+      ),
+    ).toBe("bucket(16, work.zip)");
+    // A source the schema does not hold still degrades to the field id.
+    expect(
+      formatPartitionField(
+        { source_field_id: "99", transform: "identity" },
+        columns,
+      ),
+    ).toBe("identity(field 99)");
+  });
+
+  it("renders a struct signature in ordinal order, not array order", () => {
+    // ordinal is the contract; array order is not.
+    expect(
+      formatColumnType({
+        name: "s",
+        type: "struct",
+        children: [
+          { field_id: "3", ordinal: 1, name: "b", type: "string" },
+          { field_id: "2", ordinal: 0, name: "a", type: "int" },
+        ] as Column[],
+      }),
+    ).toBe("struct<a: int, b: string>");
   });
 });

@@ -1,4 +1,4 @@
-import type { Column, PartitionField } from "../api/types";
+import type { Column, Int64, PartitionField } from "../api/types";
 
 const DECIMAL_INT_RE = /^-?\d+$/;
 
@@ -70,13 +70,35 @@ export function formatTime(iso: string): string {
   return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
 }
 
-/** Render a partition field, e.g. "bucket(16, field 3)" or "identity(field 1)". */
+/**
+ * The DOTTED PATH of the column carrying `fieldId`, searched through
+ * nested children, or undefined when the schema does not hold it.
+ *
+ * Struct leaves are legal partition sources, and two structs may each
+ * hold a `zip`: by bare name both render "zip" and the page shows one
+ * table partitioned twice by the same apparent column. The server's
+ * partition-stats endpoint labels them by path for the same reason.
+ */
+export function columnPath(
+  columns: Column[] | undefined,
+  fieldId: Int64,
+  prefix = "",
+): string | undefined {
+  for (const c of columns ?? []) {
+    const path = prefix ? `${prefix}.${c.name}` : c.name;
+    if (c.field_id === fieldId) return path;
+    const nested = columnPath(c.children, fieldId, path);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+/** Render a partition field, e.g. "bucket(16, field 3)" or "identity(addr.zip)". */
 export function formatPartitionField(
   f: PartitionField,
   columns?: Column[],
 ): string {
-  const col = columns?.find((c) => c.field_id === f.source_field_id);
-  const source = col ? col.name : `field ${f.source_field_id}`;
+  const source = columnPath(columns, f.source_field_id) ?? `field ${f.source_field_id}`;
   if (f.transform === "bucket" && f.transform_param !== undefined) {
     return `bucket(${f.transform_param}, ${source})`;
   }

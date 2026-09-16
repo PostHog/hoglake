@@ -1145,6 +1145,118 @@ class QeFooterStatsBoundsPropertyTest {
             )
             add(
                 NestedCell(
+                    name = "struct over a REPEATED plain group",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    // "many per row" where the catalog says "one". This
+                    // side counted every repetition as a value (vc=6 for
+                    // 3 rows) while the rewriter copied repetition 0 and
+                    // dropped the rest — two wrong answers to one file.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(Types.repeatedGroup().addField(optInt(2, "a")).id(1).named("s")),
+                        ),
+                    leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "scalar over a REPEATED primitive",
+                    column = scalarChild(1, "x", ColType.INT),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(Types.repeated(PrimitiveTypeName.INT32).id(1).named("x")),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("x"),
+                                Types.repeated(PrimitiveTypeName.INT32).id(1).named("x"),
+                                le(1),
+                                le(9),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct over a MAP-annotated group",
+                    // The reader's half of the rewriter's refusal, for
+                    // MAP as well as LIST — the LIST cell alone left the
+                    // map door untested.
+                    column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "s", reqString(2, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose KEY carries a different field id",
+                    // The key twin of the value cell above: an id
+                    // mismatch on either member is a map the catalog
+                    // cannot describe, and only one of the two was pinned.
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(98, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("m", "key_value", "key"), reqString(98, "key"), bytes(0x61), bytes(0x7A)),
+                            NestedLeaf(listOf("m", "key_value", "value"), optLong(3, "value"), le(1L), le(2L)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L, 98L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct-shaped group with a NON-container annotation",
+                    // The overreach control. ENUM says nothing about
+                    // shape, so this must still bound — refusing it made
+                    // the table uncompactable AND unbounded at once.
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(optInt(2, "a"))
+                                    .`as`(LogicalTypeAnnotation.enumType())
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(3), le(300))),
+                    mustProduce = setOf(2L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
                     name = "list<int> whose element leaf is physically BOOLEAN",
                     column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
                     schema =
@@ -1216,6 +1328,101 @@ class QeFooterStatsBoundsPropertyTest {
         // exercise production AND refusal.
         assertThat(nestedCells.flatMap { it.mustProduce }).isNotEmpty()
         assertThat(nestedCells.flatMap { it.mustRefuse }).isNotEmpty()
+    }
+
+    @Test
+    fun `a file declaring one field id twice produces NO stats at all`() {
+        // Every lookup elects the FIRST match, so one id on two fields
+        // had whichever came first silently elected — measured, bounds
+        // from `first` recorded for a column the file also declares as
+        // `second`. There is no rule saying which is right, so there is
+        // no binding to make: the file keeps whatever stats it already
+        // had rather than gaining something invented.
+        val cell =
+            NestedCell(
+                name = "duplicate ids",
+                column = scalarChild(1, "x", ColType.INT),
+                schema =
+                    MessageType(
+                        "root",
+                        listOf(optInt(1, "first"), optInt(1, "second")),
+                    ),
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("first"), optInt(1, "first"), le(0), le(2)),
+                        NestedLeaf(listOf("second"), optInt(1, "second"), le(1000), le(1002)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/dup.parquet"))
+            .isEmpty()
+
+        // Deep, too: a duplicate inside a struct is the same hazard, and
+        // a sweep that only looked at the top level would miss it.
+        val deep =
+            NestedCell(
+                name = "duplicate ids inside a struct",
+                column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                schema =
+                    MessageType(
+                        "root",
+                        listOf(
+                            optInt(2, "top"),
+                            Types.optionalGroup().addField(optInt(2, "a")).id(1).named("s"),
+                        ),
+                    ),
+                leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(1), le(2))),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(deep), listOf(deep.column), "s3://qe/dupdeep.parquet"))
+            .isEmpty()
+    }
+
+    @Test
+    fun `a container CATALOG row with the wrong child count degrades, never throws`() {
+        // A corrupt or hand-edited catalog: a map column with three
+        // children indexed past the end and threw IndexOutOfBounds
+        // straight out of the hydrator sweep, which fails the file AND
+        // burns a retry every pass.
+        val cell =
+            NestedCell(
+                name = "3-child map",
+                column =
+                    container(
+                        1,
+                        "m",
+                        ColType.MAP,
+                        scalarChild(2, "key", ColType.STRING),
+                        scalarChild(3, "value", ColType.LONG),
+                        scalarChild(4, "extra", ColType.INT),
+                    ),
+                schema =
+                    MessageType("root", listOf(mapGroup(1, "m", reqString(2, "key"), optLong(3, "value")))),
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("m", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L, 3L, 4L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/arity.parquet"))
+            .isEmpty()
+
+        val listCell =
+            NestedCell(
+                name = "childless list",
+                column = container(1, "l", ColType.LIST),
+                schema = MessageType("root", listOf(listGroup(1, "l", optInt(2, "element")))),
+                leaves =
+                    listOf(NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(1), le(2))),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L),
+            )
+        assertThat(
+            FooterStats.aggregate(nestedFooter(listCell), listOf(listCell.column), "s3://qe/arity2.parquet"),
+        ).isEmpty()
     }
 
     @Test
@@ -1488,11 +1695,19 @@ class QeFooterStatsBoundsPropertyTest {
                 "s3://qe/absent.parquet",
             )
             val warns = events.filter { it.level == Level.WARN }.map { it.formattedMessage }
+            // Anchored on the FACTS an operator greps for — the file and
+            // the column — not on the wording. A prose edit that left the
+            // guard intact used to kill this test, which trains people
+            // to loosen the assertion rather than read it.
             assertThat(warns)
-                .describedAs("the missing container is loud")
-                .anySatisfy({ m -> assertThat(m).contains("addr").contains("child field(s)") })
+                .describedAs("the missing container names its file and column")
+                .anySatisfy({ m ->
+                    assertThat(m).contains("s3://qe/absent.parquet")
+                    assertThat(m).contains("addr")
+                    assertThat(m).contains("8") // its field id
+                })
             assertThat(warns)
-                .describedAs("the missing scalar is not")
+                .describedAs("the missing scalar is not loud")
                 .noneSatisfy({ m -> assertThat(m).contains("added_later") })
         } finally {
             logger.detachAppender(appender)
@@ -1538,8 +1753,12 @@ class QeFooterStatsBoundsPropertyTest {
             val aggs = FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/sol.parquet")
             assertThat(aggs).describedAs("no stats, with or without the guard").isEmpty()
             assertThat(events.filter { it.level == Level.WARN }.map { it.formattedMessage })
-                .describedAs("...but the reason is now in the log")
-                .anySatisfy({ m -> assertThat(m).contains("not a struct") })
+                .describedAs("...but the file, the column and the reason are in the log")
+                .anySatisfy({ m ->
+                    assertThat(m).contains("s3://qe/sol.parquet")
+                    assertThat(m).contains("field 1")
+                    assertThat(m).contains("not a struct")
+                })
         } finally {
             logger.detachAppender(appender)
             appender.stop()

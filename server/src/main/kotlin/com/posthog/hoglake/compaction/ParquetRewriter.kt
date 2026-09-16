@@ -322,6 +322,26 @@ object ParquetRewriter {
         val id = Math.toIntExact(column.fieldId)
         val name = column.def.name
 
+        // The CATALOG's arity, checked where the OUTPUT schema is built
+        // — which happens before any planning, so a corrupt container
+        // row reached `single()` here first and threw a raw
+        // NoSuchElementException out of the sweep. Every other
+        // disagreement with a file or a catalog is a typed skip; this
+        // one has to be too.
+        column.def.type.requiredChildCount?.let { required ->
+            if (column.children.size != required) {
+                throw UnconvertibleSchemaException(
+                    "live ${column.def.type.wire} column '$name' has ${column.children.size} " +
+                        "children, not $required; its catalog row is inconsistent",
+                )
+            }
+        }
+        if (column.def.type == ColType.STRUCT && column.children.isEmpty()) {
+            throw UnconvertibleSchemaException(
+                "live struct column '$name' has no children; its catalog row is inconsistent",
+            )
+        }
+
         fun prim(physical: PrimitiveType.PrimitiveTypeName) = Types.primitive(physical, repetition)
 
         return when (column.def.type) {

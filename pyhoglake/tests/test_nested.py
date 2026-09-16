@@ -18,14 +18,21 @@ container encodes exactly as the same scalar would at top level.
 """
 
 import io
+import re
 import struct
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
 from pyhoglake import UnsupportedTypeError
-from pyhoglake.client import _align_table, _field_id_chains, _partition_groups
+from pyhoglake.client import (
+    _align_table,
+    _check_reserved_columns,
+    _field_id_chains,
+    _partition_groups,
+)
 from pyhoglake.errors import ValidationError
 from pyhoglake.models import Column, PartitionField, PartitionSpec, TableInfo
 from pyhoglake.stats import extract_column_stats
@@ -232,7 +239,53 @@ def test_list_element_nullability_is_declarable():
     assert col["children"][0]["nullable"] is False
 
 
-def test_depth_cap_is_mirrored_from_the_server():
+def test_depth_cap_matches_the_server_and_both_docs():
+    """The cap is MIRRORED, so the mirror has to be checked.
+
+    This used to assert the client against its own constant, which is a
+    tautology: the two could drift by exactly the amount that matters
+    and nothing would notice until a schema the client accepted came
+    back a 422. Read the server's MAX_COLUMN_NESTING_DEPTH off disk, the
+    way test_transforms already reads ColType and BUCKETABLE_TYPES, and
+    the two doc copies as well — a documented 8 against a coded 6 is its
+    own kind of wrong.
+    """
+    model = _server_file(
+        Path("server/src/main/kotlin/com/posthog/hoglake/model/Model.kt")
+    ).read_text()
+    m = re.search(r"const val MAX_COLUMN_NESTING_DEPTH:\s*Int\s*=\s*(\d+)", model)
+    assert m, "MAX_COLUMN_NESTING_DEPTH not found in Model.kt"
+    assert int(m.group(1)) == MAX_COLUMN_NESTING_DEPTH, (
+        f"server caps nesting at {m.group(1)}, client at {MAX_COLUMN_NESTING_DEPTH}"
+    )
+
+    spec = _server_file(
+        Path("server/src/main/resources/openapi/hoglake.yaml")
+    ).read_text()
+    assert f"capped at {MAX_COLUMN_NESTING_DEPTH}" in spec, (
+        "the OpenAPI description states a different cap"
+    )
+    federation = _server_file(Path("iceberg-federation.md")).read_text()
+    assert f"**{MAX_COLUMN_NESTING_DEPTH}**" in federation, (
+        "iceberg-federation.md §2.8 states a different cap"
+    )
+
+
+def _server_file(relative: Path) -> Path:
+    """Locate a repo file by walking up from this test.
+
+    Resolved by SEARCH rather than a fixed parents[n] hop, and FAILING
+    rather than skipping when missing: a skip reads as green.
+    """
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / relative
+        if candidate.exists():
+            return candidate
+    raise AssertionError(f"could not locate {relative} above {here}")
+
+
+def test_depth_cap_is_enforced_at_the_boundary():
     """The cap exists so a pathological schema fails BEFORE the upload.
     Checked at the boundary in both directions: the deepest legal schema
     is accepted and one level more is refused, naming the cap."""
@@ -594,3 +647,175 @@ def test_list_key_map_leaves_are_found_through_two_repetition_layers():
     assert stats[3].upper_bound == struct.pack("<i", 9)
     # Three elements across two keys: value_count counts VALUES.
     assert stats[3].value_count == 3
+
+
+# -- recursive schema alignment (nested typos are refusals) -------------------
+
+_ALIGN_COLUMNS = (
+    _col(
+        "s",
+        "struct",
+        1,
+        0,
+        children=(_col("a", "int", 2), _col("b", "string", 3, 1)),
+    ),
+    _col("v", "long", 4, 1),
+)
+
+
+def _aligned(struct_type: pa.DataType) -> pa.Table:
+    return _align_table(
+        pa.table(
+            {
+                "s": pa.array([None], struct_type),
+                "v": pa.array([1], pa.int64()),
+            }
+        ),
+        columns_to_arrow_schema(_ALIGN_COLUMNS),
+    )
+
+
+def test_a_missing_NESTED_field_is_refused_like_a_missing_column():
+    """`cast` null-filled what the caller had not supplied, so a typo'd
+    struct field appended as an all-NULL column whose own stats said
+    ``null_count == record_count`` — the data simply was not there, and
+    nothing said so. Top level has always refused this; below it the
+    same mistake deserves the same answer."""
+    with pytest.raises(ValidationError) as ei:
+        _aligned(pa.struct([("a", pa.int32())]))  # `b` missing
+    assert "missing nested table fields" in str(ei.value)
+    assert "s.b" in str(ei.value)
+
+
+def test_an_extra_NESTED_field_is_refused_like_an_extra_column():
+    with pytest.raises(ValidationError) as ei:
+        _aligned(
+            pa.struct([("a", pa.int32()), ("b", pa.string()), ("typo", pa.int32())])
+        )
+    assert "nested fields not in the table schema" in str(ei.value)
+    assert "s.typo" in str(ei.value)
+
+
+def test_nested_mismatches_are_found_under_a_list_of_structs():
+    """Two levels down, through a repetition layer — the walk has to
+    descend list elements, not just struct members."""
+    columns = (
+        _col(
+            "runs",
+            "list",
+            1,
+            0,
+            children=(
+                _col(
+                    "element",
+                    "struct",
+                    2,
+                    0,
+                    children=(_col("score", "double", 3), _col("tag", "string", 4, 1)),
+                ),
+            ),
+        ),
+    )
+    target = columns_to_arrow_schema(columns)
+    missing = pa.table(
+        {"runs": pa.array([None], pa.list_(pa.struct([("score", pa.float64())])))}
+    )
+    with pytest.raises(ValidationError) as ei:
+        _align_table(missing, target)
+    assert "runs.element.tag" in str(ei.value)
+
+    extra = pa.table(
+        {
+            "runs": pa.array(
+                [None],
+                pa.list_(
+                    pa.struct(
+                        [
+                            ("score", pa.float64()),
+                            ("tag", pa.string()),
+                            ("oops", pa.int32()),
+                        ]
+                    )
+                ),
+            )
+        }
+    )
+    with pytest.raises(ValidationError) as ei:
+        _align_table(extra, target)
+    assert "runs.element.oops" in str(ei.value)
+
+
+def test_a_matching_nested_batch_still_aligns():
+    """The control: the refusals are about MISMATCHES, not about nesting
+    having become unalignable."""
+    out = _aligned(pa.struct([("a", pa.int32()), ("b", pa.string())]))
+    assert out.num_rows == 1
+    assert out.schema.field("s").type.num_fields == 2
+
+
+# -- reserved names, at every level ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("field", "path"),
+    [
+        (pa.field("_hog_row_id", pa.int64()), "_hog_row_id"),
+        (
+            pa.field("s", pa.struct([("_hog_row_id", pa.int64())])),
+            "s._hog_row_id",
+        ),
+        (
+            pa.field("l", pa.list_(pa.field("_hogx", pa.int32()))),
+            "l._hogx",
+        ),
+        (
+            pa.field("m", pa.map_(pa.string(), pa.field("_hog_v", pa.int64()))),
+            "m._hog_v",
+        ),
+    ],
+    ids=["top-level", "struct-field", "list-element", "map-value"],
+)
+def test_the_reserved_prefix_is_reserved_at_every_level(field, path):
+    """`_hog_row_id` inside a struct reaches parquet exactly like a
+    top-level one, and compaction writes its own at the output's top
+    level — so a nested collision is a clash in waiting. The SERVER does
+    not enforce this at any level (hoglake#36); this client-side check
+    is the only barrier on the pyhoglake path, and it was top-level
+    only."""
+    with pytest.raises(ValidationError) as ei:
+        _check_reserved_columns(pa.schema([field]))
+    assert path in str(ei.value)
+
+
+def test_an_ordinary_nested_schema_is_not_flagged_reserved():
+    _check_reserved_columns(columns_to_arrow_schema(NESTED_COLUMNS))
+
+
+# -- the single-caller premise stats.py leans on -----------------------------
+
+
+def test_extract_column_stats_has_exactly_one_production_caller():
+    """stats.py binds a list's element and a map's key/value by POSITION,
+    with none of the field-id identity checking the Kotlin hydrator
+    does. That is safe for exactly one reason, stated in _walk_leaves'
+    docstring: this module only ever sees the footer of the parquet this
+    process just wrote from the catalog's own schema, so position and
+    identity cannot disagree.
+
+    A premise nothing checks is a comment. If a second caller appears —
+    one handed someone else's file — the identity check has to come with
+    it, and this failing test is where that conversation starts.
+    """
+    src = Path(__file__).resolve().parent.parent / "src" / "pyhoglake"
+    callers = []
+    for path in sorted(src.glob("*.py")):
+        for line in path.read_text().splitlines():
+            stripped = line.strip()
+            if "extract_column_stats(" in stripped and not stripped.startswith("def "):
+                callers.append(f"{path.name}: {stripped}")
+    # File and call text, not line numbers: a line number pins where the
+    # call sits, which every edit above moves, and the claim is about
+    # WHICH callers exist.
+    assert callers == [
+        "client.py: column_stats = extract_column_stats(metadata, info.columns)",
+    ], f"unexpected caller(s) of extract_column_stats: {callers}"

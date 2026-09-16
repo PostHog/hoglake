@@ -316,7 +316,7 @@ def _walk_leaves(
     kids = col.children or ()
     if col.type == "struct":
         out: list[tuple[str, Column, pa.DataType | None]] = []
-        for child in sorted(kids, key=lambda k: k.ordinal):
+        for child in kids:
             sub = None
             if arrow_type is not None and pa.types.is_struct(arrow_type):
                 try:
@@ -325,6 +325,11 @@ def _walk_leaves(
                     sub = None
             out += _walk_leaves(child, here, sub)
         return out
+    # Sorted like types.py sorts them: the parquet the writer produced
+    # laid its children out in ORDINAL order, so a walk that trusted
+    # array order would pair a key with a value's leaf the moment the two
+    # disagreed.
+    kids = tuple(sorted(kids, key=lambda k: k.ordinal))
     if col.type == "list":
         if not kids:
             return []

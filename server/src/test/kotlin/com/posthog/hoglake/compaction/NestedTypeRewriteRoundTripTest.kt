@@ -675,6 +675,352 @@ class NestedTypeRewriteRoundTripTest {
             .hasMessageContaining("not sortable")
     }
 
+    // ---- repetition, duplicate ids, synthetic names ------------------------
+
+    @Test
+    fun `a REPEATED group wearing a struct's field id is refused, not half-copied`() {
+        // The copy reads repetition 0 and only repetition 0. Measured
+        // before the guard: a 2-repetition struct rewrote to its first
+        // repetition alone — half the values gone, rowsWritten still
+        // equal to the record count so nothing looked wrong — and then
+        // the commit end-snapshotted the input and expiry deleted it.
+        val repeated =
+            Types.buildMessage()
+                .addField(
+                    Types.repeatedGroup()
+                        .addFields(
+                            Types.optional(PrimitiveTypeName.INT32).id(2).named("a"),
+                            Types.optional(PrimitiveTypeName.BINARY)
+                                .`as`(LogicalTypeAnnotation.stringType()).id(3).named("b"),
+                        )
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("repstruct-in", repeated, rows = 3) { g, i ->
+                g.addGroup(0).also {
+                    it.add(0, i * 10)
+                    it.add(1, "r$i")
+                }
+                g.addGroup(0).also {
+                    it.add(0, i * 10 + 1)
+                    it.add(1, "z$i")
+                }
+            }
+        assertThatThrownBy { rewrite(path, listOf(structColumn), tmp.resolve("repstruct-out.parquet")) }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("REPEATED")
+            .hasMessageContaining("one value per row")
+    }
+
+    @Test
+    fun `a REPEATED primitive under a scalar column is refused`() {
+        val repeated =
+            Types.buildMessage()
+                .addField(Types.repeated(PrimitiveTypeName.INT32).id(1).named("x"))
+                .named("t")
+        val path =
+            write("repscalar-in", repeated, rows = 3) { g, i ->
+                g.add(0, i * 10)
+                g.add(0, i * 10 + 1)
+            }
+        assertThatThrownBy {
+            rewrite(
+                path,
+                listOf(Column(1, 0, ColumnDef("x", ColType.INT))),
+                tmp.resolve("repscalar-out.parquet"),
+            )
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("REPEATED")
+    }
+
+    @Test
+    fun `a 2-level-list-shaped input under a STRUCT column is refused`() {
+        // A plain group holding a repeated primitive — the legacy list
+        // shape — wearing a struct's id. The struct's `a` would have
+        // bound to the repeated leaf and taken its first value per row.
+        val twoLevel =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(Types.repeated(PrimitiveTypeName.INT32).id(2).named("a"))
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("twolevel-in", twoLevel, rows = 2) { g, i ->
+                val inner = g.addGroup(0)
+                inner.add(0, i)
+                inner.add(0, i + 100)
+            }
+        assertThatThrownBy { rewrite(path, listOf(structColumn), tmp.resolve("twolevel-out.parquet")) }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("REPEATED")
+    }
+
+    @Test
+    fun `a file declaring one field id twice is refused rather than first-wins`() {
+        // planChildren elects the FIRST match, so the rewrite would have
+        // sourced live data from whichever field came first and then
+        // end-snapshotted the input, making the guess permanent. There
+        // is no correct resolution, so there is no binding to make.
+        val dupes =
+            Types.buildMessage()
+                .addFields(
+                    Types.optional(PrimitiveTypeName.INT32).id(1).named("first"),
+                    Types.optional(PrimitiveTypeName.INT32).id(1).named("second"),
+                )
+                .named("t")
+        val path =
+            write("dupid-in", dupes, rows = 3) { g, i ->
+                g.add(0, i)
+                g.add(1, 1000 + i)
+            }
+        assertThatThrownBy {
+            rewrite(
+                path,
+                listOf(Column(1, 0, ColumnDef("x", ColType.INT))),
+                tmp.resolve("dupid-out.parquet"),
+            )
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("more than once")
+        // Deep, too: a duplicate inside a struct is the same hazard.
+        val deepDupes =
+            Types.buildMessage()
+                .addFields(
+                    Types.optional(PrimitiveTypeName.INT32).id(2).named("top"),
+                    Types.optionalGroup()
+                        .addFields(
+                            Types.optional(PrimitiveTypeName.INT32).id(2).named("a"),
+                            Types.optional(PrimitiveTypeName.BINARY)
+                                .`as`(LogicalTypeAnnotation.stringType()).id(3).named("b"),
+                        )
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val deepPath =
+            write("dupdeep-in", deepDupes, rows = 1) { g, _ ->
+                g.add(0, 7)
+                g.addGroup(1).also {
+                    it.add(0, 1)
+                    it.add(1, "x")
+                }
+            }
+        assertThatThrownBy { rewrite(deepPath, listOf(structColumn), tmp.resolve("dupdeep-out.parquet")) }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("more than once")
+    }
+
+    @Test
+    fun `an id-less list element binds by SHAPE whatever it is named`() {
+        // The reader binds this positionally and produces stats; the
+        // rewriter demanded the live column's name (`element`) even
+        // though its own repeatedEntryGroup doc says the spec makes
+        // those names insignificant. So an id-less `item` under a `bag`
+        // layer produced stats and refused to compact — the two surfaces
+        // disagreeing about one file.
+        val foreign =
+            Types.buildMessage()
+                .addFields(
+                    Types.optional(PrimitiveTypeName.INT32).id(9).named("k"),
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(Types.optional(PrimitiveTypeName.INT32).named("item"))
+                                .named("bag"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                )
+                .named("t")
+        val path =
+            write("foreignlist-in", foreign, rows = 2) { g, i ->
+                g.add(0, i)
+                val l = g.addGroup(1)
+                l.addGroup(0).add(0, i * 10)
+                l.addGroup(0).add(0, i * 10 + 1)
+            }
+        val out = tmp.resolve("foreignlist-out.parquet")
+        rewrite(path, listOf(listColumn), out)
+        assertThat(readLists(out)).containsExactly(listOf(0, 1), listOf(10, 11))
+    }
+
+    @Test
+    fun `id-less map key and value bind by SHAPE whatever they are named`() {
+        val foreign =
+            Types.buildMessage()
+                .addFields(
+                    Types.optional(PrimitiveTypeName.INT32).id(9).named("k"),
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addFields(
+                                    Types.required(PrimitiveTypeName.BINARY)
+                                        .`as`(LogicalTypeAnnotation.stringType()).named("kk"),
+                                    Types.optional(PrimitiveTypeName.INT64).named("vv"),
+                                )
+                                .named("entries"),
+                        )
+                        .`as`(LogicalTypeAnnotation.mapType())
+                        .id(1).named("m"),
+                )
+                .named("t")
+        val path =
+            write("foreignmap-in", foreign, rows = 2) { g, i ->
+                g.add(0, i)
+                val e = g.addGroup(1).addGroup(0)
+                e.add(0, "k$i")
+                e.add(1, 10L + i)
+            }
+        val out = tmp.resolve("foreignmap-out.parquet")
+        rewrite(path, listOf(mapColumn), out)
+        assertThat(readMaps(out)).containsExactly(listOf("k0" to 10L), listOf("k1" to 11L))
+    }
+
+    @Test
+    fun `a container CATALOG row with the wrong child count is refused, never thrown out of`() {
+        // A corrupt or hand-edited catalog. `single()` threw a raw
+        // NoSuchElementException straight out of the sweep; the failure
+        // has to be a skip-with-reason like every other disagreement.
+        val path =
+            write("arity-in", listSchema(), rows = 1) { g, _ ->
+                g.addGroup(0).addGroup(0).add(0, 1)
+            }
+        assertThatThrownBy {
+            rewrite(
+                path,
+                listOf(Column(1, 0, ColumnDef("l", ColType.LIST), emptyList())),
+                tmp.resolve("arity-out.parquet"),
+            )
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("children, not 1")
+
+        val mapPath =
+            write("arity2-in", mapSchema(), rows = 1) { g, _ ->
+                val e = g.addGroup(0).addGroup(0)
+                e.add(0, "k")
+                e.add(1, 1L)
+            }
+        assertThatThrownBy {
+            rewrite(
+                mapPath,
+                listOf(
+                    Column(
+                        1,
+                        0,
+                        ColumnDef("m", ColType.MAP),
+                        listOf(
+                            Column(2, 0, ColumnDef("key", ColType.STRING, nullable = false)),
+                            Column(3, 1, ColumnDef("value", ColType.LONG)),
+                            Column(4, 2, ColumnDef("extra", ColType.INT)),
+                        ),
+                    ),
+                ),
+                tmp.resolve("arity2-out.parquet"),
+            )
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("children, not 2")
+    }
+
+    @Test
+    fun `a struct-shaped group with a NON-container annotation still rewrites`() {
+        // My own overreach from the previous round: refusing ANY
+        // annotation made a struct-shaped group carrying a stray
+        // unrelated one permanently uncompactable, and the reader
+        // stopped bounding it too. Only LIST/MAP mean "this is a
+        // container"; ENUM says nothing about shape.
+        val odd =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addFields(
+                            Types.optional(PrimitiveTypeName.INT32).id(2).named("a"),
+                            Types.optional(PrimitiveTypeName.BINARY)
+                                .`as`(LogicalTypeAnnotation.stringType()).id(3).named("b"),
+                        )
+                        .`as`(LogicalTypeAnnotation.enumType())
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("enumstruct-in", odd, rows = 2) { g, i ->
+                val inner = g.addGroup(0)
+                inner.add(0, i)
+                inner.add(1, "r$i")
+            }
+        val out = tmp.resolve("enumstruct-out.parquet")
+        rewrite(path, listOf(structColumn), out)
+        assertThat(readStructs(out)).containsExactly(0 to "r0", 1 to "r1")
+    }
+
+    // ---- #65's decimal modes, one level down -------------------------------
+
+    @Test
+    fun `a decimal leaf INSIDE a struct takes the decimal copy modes`() {
+        // #65 added DECIMAL_INT32/INT64/BINARY to copyMode. copyField
+        // dispatches Step.Scalar into the same copyValue at any depth,
+        // so nested decimals inherit them — asserted rather than assumed,
+        // since "it composes" is exactly the claim a later refactor
+        // breaks quietly.
+        val live =
+            Column(
+                1,
+                0,
+                ColumnDef("s", ColType.STRUCT),
+                listOf(
+                    Column(
+                        2,
+                        0,
+                        ColumnDef("amount", ColType.DECIMAL, typeParams = mapOf("precision" to 9, "scale" to 2)),
+                    ),
+                ),
+            )
+        // An INT32-backed decimal input — the form #65's DECIMAL_INT32
+        // arm exists for — under a struct.
+        val int32Decimal =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.optional(PrimitiveTypeName.INT32)
+                                .`as`(LogicalTypeAnnotation.decimalType(2, 9)).id(2).named("amount"),
+                        )
+                        .id(1).named("s"),
+                )
+                .named("t")
+        val path =
+            write("decstruct-in", int32Decimal, rows = 3) { g, i ->
+                g.addGroup(0).add(0, (i - 1) * 12345)
+            }
+        val out = tmp.resolve("decstruct-out.parquet")
+        rewrite(path, listOf(live), out)
+
+        // The output's leaf is the catalog's BINARY decimal form...
+        val leaf = schemaOf(out).getType("s").asGroupType().getType("amount").asPrimitiveType()
+        assertThat(leaf.primitiveTypeName).isEqualTo(PrimitiveTypeName.BINARY)
+        assertThat(leaf.logicalTypeAnnotation)
+            .isEqualTo(LogicalTypeAnnotation.decimalType(2, 9))
+        // ...and the VALUES survived the widening, negatives included.
+        val catalog =
+            listOf(
+                CatalogColumn(
+                    1,
+                    "s",
+                    ColType.STRUCT,
+                    null,
+                    listOf(CatalogColumn(2, "amount", ColType.DECIMAL, 2)),
+                ),
+            )
+        val bounds = boundsOf(out, catalog)
+        assertThat(bounds.keys).containsExactly(2L)
+        assertThat(java.math.BigInteger(bounds.getValue(2L).first)).isEqualTo(java.math.BigInteger.valueOf(-12345))
+        assertThat(java.math.BigInteger(bounds.getValue(2L).second)).isEqualTo(java.math.BigInteger.valueOf(12345))
+    }
+
     // ---- schema disagreements ----------------------------------------------
 
     @Test

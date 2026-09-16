@@ -104,7 +104,15 @@ export interface Column extends ColumnDef {
  * `struct&lt;a: int, b: string&gt;` — and a scalar's as its own name.
  */
 export function formatColumnType(c: ColumnDef): string {
-  const kids = c.children ?? [];
+  // Ordered by ordinal where there is one: ordinal is the contract and
+  // array order is not, and a struct signature that listed its fields in
+  // whatever order the JSON arrived in would disagree with the table
+  // below it on the same page.
+  const kids = [...(c.children ?? [])].sort((a, b) =>
+    "ordinal" in a && "ordinal" in b
+      ? (a as Column).ordinal - (b as Column).ordinal
+      : 0,
+  );
   if (c.type === "list") {
     return `list<${kids.length === 1 ? formatColumnType(kids[0]) : "?"}>`;
   }

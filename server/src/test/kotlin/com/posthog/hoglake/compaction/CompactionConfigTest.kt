@@ -67,9 +67,14 @@ class CompactionConfigTest {
         // MiB compressed). Erring large costs smaller compaction groups;
         // erring small costs an OOM in a background loop, so the floor is
         // the top of the measured band, not the bottom.
+        // EXACTLY 64, not "at least". The number is documented — in
+        // CompactionConfig's KDoc, in Config's, and in
+        // iceberg-federation.md §2.8 — and a `>=` assertion lets the code
+        // drift upward while all three keep saying 64. If the value
+        // should change, the docs change with it in the same commit.
         assertThat(CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION)
-            .describedAs("at least the worst measured expansion")
-            .isGreaterThanOrEqualTo(64)
+            .describedAs("the documented default, exactly")
+            .isEqualTo(64)
     }
 
     @Test

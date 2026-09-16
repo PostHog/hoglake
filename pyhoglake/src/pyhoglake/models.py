@@ -190,7 +190,18 @@ class Column:
                         "Column: children must be an array or null, got "
                         f"{type(kids).__name__}"
                     )
-                kw["children"] = tuple(Column.from_wire(c) for c in kids)
+                # Sorted by ordinal HERE, once, at the wire boundary.
+                # The server returns children in ordinal order today, but
+                # ordinal is the contract and array order is not — and
+                # every consumer downstream (the Arrow schema builder,
+                # the stats walk, the console) reads position. One sort
+                # at the edge beats three that can disagree.
+                kw["children"] = tuple(
+                    sorted(
+                        (Column.from_wire(c) for c in kids),
+                        key=lambda c: c.ordinal,
+                    )
+                )
             return cls(**kw)
 
         return _wire("Column", d, build)

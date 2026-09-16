@@ -495,6 +495,44 @@ class NestedColumnApiTest {
     }
 
     @Test
+    fun `an ambiguous column path is refused rather than resolved to the first match`() =
+        api { client ->
+            // The DDL path refuses duplicate sibling names, but the
+            // DATABASE only enforces unique (parent, ordinal) — not
+            // (parent, name). A catalog that acquired two siblings called
+            // the same thing (a hand-edited row, a restored dump) would
+            // otherwise have alter ops act on whichever came first,
+            // silently, forever.
+            val name = table()
+            client.postJson(
+                tablesUrl,
+                """{"name": "$name", "columns": [
+                    {"name": "id", "type": "long"},
+                    {"name": "s", "type": "struct", "children": [
+                        {"name": "a", "type": "int"},
+                        {"name": "b", "type": "int"}]}]}""",
+            )
+            // Forge the inconsistency the DDL cannot produce.
+            db.jdbi.useHandle<Exception> { h ->
+                h.createUpdate(
+                    """
+                    UPDATE hog_column SET name = 'a'
+                    WHERE end_snapshot IS NULL AND name = 'b'
+                      AND table_id = (
+                        SELECT table_id FROM hog_table_version
+                        WHERE name = :t AND end_snapshot IS NULL)
+                    """,
+                ).bind("t", name).execute()
+            }
+            val response =
+                client.postJson("$tablesUrl/$name/alter", """{"ops": [{"op": "drop_column", "name": "s.a"}]}""")
+            assertValidation(response) { detail ->
+                assertThat(detail).contains("ambiguous")
+                assertThat(detail).contains("2 live columns are named 'a'")
+            }
+        }
+
+    @Test
     fun `dropping the last field of a struct is refused`() =
         api { client ->
             val name = table()
@@ -509,6 +547,45 @@ class NestedColumnApiTest {
             assertValidation(response) { detail ->
                 assertThat(detail).contains("last field of struct 's'")
             }
+        }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(
+        delimiter = '|',
+        value = [
+            """drop_column|{"op":"drop_column","parent":"addr","name":"zip"}""",
+            """rename_column|{"op":"rename_column","parent":"addr","from":"addr.zip","to":"pc"}""",
+            """promote_column|{"op":"promote_column","parent":"addr","name":"addr.zip","to":"long"}""",
+            """rename_table|{"op":"rename_table","parent":"addr","new_name":"t9"}""",
+        ],
+    )
+    fun `parent supplied to an op that does not take it is refused, naming the op`(
+        op: String,
+        body: String,
+    ) = api { client ->
+        // Silently dropping it reads as "supported, and it did nothing".
+        // A caller who writes `{"op":"drop_column","parent":"addr",
+        // "name":"zip"}` means `addr.zip` and would otherwise get a 200
+        // and the WRONG column dropped — the top-level `zip`, if one
+        // exists, or a 422 about a column that does exist nested.
+        val response = client.postJson("$tablesUrl/${nestedFixture(client)}/alter", """{"ops": [$body]}""")
+        assertValidation(response) { detail ->
+            assertThat(detail).contains("'$op' does not take 'parent'")
+            assertThat(detail).contains("dotted path")
+        }
+    }
+
+    @Test
+    fun `add_column still takes parent, which is the control`() =
+        api { client ->
+            val name = nestedFixture(client)
+            val response =
+                client.postJson(
+                    "$tablesUrl/$name/alter",
+                    """{"ops": [{"op": "add_column", "parent": "addr",
+                        "column": {"name": "country", "type": "string"}}]}""",
+                )
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
         }
 
     // ---- partition and sort sources ---------------------------------------
@@ -767,6 +844,15 @@ class NestedColumnApiTest {
                 args(
                     "a container carrying type_params",
                     """{"name": "c", "type": "list", "type_params": {"precision": 5, "scale": 2},
+                        "children": [{"name": "element", "type": "int"}]}""",
+                    "a nested container, and cannot have type_params",
+                ),
+                args(
+                    // PRESENT, not non-empty — the same criterion the
+                    // children check uses. `{}` was normalised to
+                    // "omitted" and answered 201.
+                    "a container carrying an EMPTY type_params",
+                    """{"name": "c", "type": "list", "type_params": {},
                         "children": [{"name": "element", "type": "int"}]}""",
                     "a nested container, and cannot have type_params",
                 ),
