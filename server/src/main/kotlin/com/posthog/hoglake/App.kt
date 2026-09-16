@@ -7,6 +7,7 @@ import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
+import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
@@ -28,6 +29,7 @@ import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.service.ViewService
 import io.ktor.http.ContentType
@@ -207,6 +209,9 @@ class App private constructor(
             commitService,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
+        )
+        app.installTableCreationRoutes(
+            TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
         )
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)

@@ -11,12 +11,12 @@ import org.junit.jupiter.api.Test
 import javax.sql.DataSource
 
 /**
- * V5 against a POPULATED catalog, not an empty one — V4's test, one
+ * V7 against a POPULATED catalog, not an empty one — V4's test, one
  * migration on.
  *
  * The schema-equivalence gate only proves fold(migrations) ==
- * schema.sql on a virgin database, which says nothing about what V5
- * does to a catalog that already has columns in it. V5 does three
+ * schema.sql on a virgin database, which says nothing about what V7
+ * does to a catalog that already has columns in it. V7 does three
  * things to a live table, and all three can go wrong on existing rows:
  * it ADDS a nullable column (must not rewrite or default anything), it
  * drops and recreates a CHECK (must not reject rows that were legal
@@ -30,9 +30,9 @@ import javax.sql.DataSource
  * top-level columns, which are exactly the rows it used to cover.
  */
 @Tag("integration")
-class V5NestedTypesMigrationIntegrationTest {
-    /** Everything a pre-V5 catalog can contain (V1 + V4). */
-    private val preV5Types =
+class V7NestedTypesMigrationIntegrationTest {
+    /** Everything a pre-V7 catalog can contain (V1 + V4). */
+    private val preV7Types =
         listOf(
             "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
             "uint32", "uint64", "float", "double", "decimal", "date", "time",
@@ -40,8 +40,8 @@ class V5NestedTypesMigrationIntegrationTest {
             "timestamptz", "string", "json", "uuid", "binary",
         )
 
-    /** The three V5 adds. */
-    private val v5Types = listOf("list", "struct", "map")
+    /** The three V7 adds. */
+    private val v7Types = listOf("list", "struct", "map")
 
     /** Flyway configured exactly as Database.migrate does, optionally stopping at [target]. */
     private fun migrate(
@@ -58,16 +58,16 @@ class V5NestedTypesMigrationIntegrationTest {
     }
 
     @Test
-    fun `V5 widens the vocabulary and adds the tree edge on a populated catalog`(): Unit =
+    fun `V7 widens the vocabulary and adds the tree edge on a populated catalog`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             migrate(db.dataSource, target = "4")
 
-            // A pre-V5 catalog: one table, one column per pre-V5 type.
+            // A pre-V7 catalog: one table, one column per pre-V7 type.
             db.jdbi.useHandleUnchecked { h ->
-                h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('pre-v5', 's3://b/')")
+                h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('pre-v7', 's3://b/')")
                 h.execute("INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (1, 1, 'ns')")
                 h.execute("INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (1, 1, 1)")
-                preV5Types.forEachIndexed { i, type ->
+                preV7Types.forEachIndexed { i, type ->
                     h.execute(
                         """
                         INSERT INTO hog_column
@@ -97,12 +97,12 @@ class V5NestedTypesMigrationIntegrationTest {
                     )
                 }
             }
-                .describedAs("V4 must not already accept the V5 vocabulary")
+                .describedAs("V4 must not already accept the V7 vocabulary")
                 .hasMessageContaining("hog_column_col_type_check")
 
             migrate(db.dataSource)
 
-            // Nothing was lost, rewritten, or defaulted: every pre-V5 row
+            // Nothing was lost, rewritten, or defaulted: every pre-V7 row
             // keeps its type AND comes out a top-level column, which is
             // what a NULL parent_field_id means.
             val surviving =
@@ -115,10 +115,10 @@ class V5NestedTypesMigrationIntegrationTest {
                     ).map { rs, _ -> rs.getString("col_type") to rs.getBoolean("top_level") }.list()
                 }
             assertThat(surviving.map { it.first })
-                .describedAs("pre-V5 rows survive the constraint swap")
-                .isEqualTo(preV5Types)
+                .describedAs("pre-V7 rows survive the constraint swap")
+                .isEqualTo(preV7Types)
             assertThat(surviving.map { it.second })
-                .describedAs("every pre-V5 row is top-level (parent_field_id IS NULL)")
+                .describedAs("every pre-V7 row is top-level (parent_field_id IS NULL)")
                 .allMatch { it }
 
             // The vocabulary actually widened, and a child row links back.
@@ -134,7 +134,7 @@ class V5NestedTypesMigrationIntegrationTest {
                     ).mapTo(Long::class.java).one()
                 },
             ).isEqualTo(2L)
-            assertThat(v5Types).hasSize(3) // the three names exercised above
+            assertThat(v7Types).hasSize(3) // the three names exercised above
         }
 
     @Test
@@ -214,7 +214,7 @@ class V5NestedTypesMigrationIntegrationTest {
     fun `the constraint kept the name V1 gave it, and lists the containers`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // schema.sql declares the CHECK inline, so Postgres names it
-            // hog_column_col_type_check there. V5 must recreate it under
+            // hog_column_col_type_check there. V7 must recreate it under
             // the same name or the schema-equivalence gate compares two
             // differently-named constraints and fails obscurely.
             migrate(db.dataSource)
@@ -227,8 +227,8 @@ class V5NestedTypesMigrationIntegrationTest {
                         """,
                     ).mapTo(String::class.java).findOne().orElse(null)
                 }
-            assertThat(def).describedAs("hog_column_col_type_check exists after V5").isNotNull()
-            for (type in v5Types) {
+            assertThat(def).describedAs("hog_column_col_type_check exists after V7").isNotNull()
+            for (type in v7Types) {
                 assertThat(def).describedAs("constraint lists %s", type).contains("'$type'")
             }
             // Order is load-bearing (the equivalence gate compares the
@@ -240,14 +240,14 @@ class V5NestedTypesMigrationIntegrationTest {
     fun `the migration refuses a catalog whose constraint it does not recognise`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // The loud guard. A hand-patched or doctored catalog gets a
-            // message naming what V5 expected, not "constraint does not
+            // message naming what V7 expected, not "constraint does not
             // exist" from a bare DROP.
             migrate(db.dataSource, target = "4")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
             }
             assertThatThrownBy { migrate(db.dataSource) }
-                .hasMessageContaining("V5 expected the constraint hog_column_col_type_check")
+                .hasMessageContaining("V7 expected the constraint hog_column_col_type_check")
         }
 
     @Test
@@ -256,13 +256,13 @@ class V5NestedTypesMigrationIntegrationTest {
             migrate(db.dataSource, target = "4")
             db.jdbi.useHandleUnchecked { h -> h.execute("DROP INDEX hog_column_live_ordinal") }
             assertThatThrownBy { migrate(db.dataSource) }
-                .hasMessageContaining("V5 expected the index hog_column_live_ordinal")
+                .hasMessageContaining("V7 expected the index hog_column_live_ordinal")
         }
 
     @Test
     fun `the migration refuses an index that merely shares V1's NAME`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
-            // EXISTENCE was never the check. V5 DROPs this index and
+            // EXISTENCE was never the check. V7 DROPs this index and
             // replaces it, so an index sharing V1's name while guarding
             // something else would be discarded silently — the exact
             // divergence the guard's own comment claims to catch. Here
@@ -321,7 +321,7 @@ class V5NestedTypesMigrationIntegrationTest {
     /** Catalog 1 + namespace + table, so hog_column inserts have parents. */
     private fun seedTable(db: PgTestSupport.TestDb) {
         db.jdbi.useHandleUnchecked { h ->
-            h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('v5-test', 's3://b/')")
+            h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('v7-test', 's3://b/')")
             h.execute("INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (1, 1, 'ns')")
             h.execute("INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (1, 1, 1)")
         }

@@ -162,34 +162,20 @@ object ColumnTrees {
         }
 
     /** How many hog_column rows (and field ids) this forest needs. */
-    fun nodeCount(defs: List<ColumnDef>): Int = defs.sumOf { 1 + (it.children?.let { c -> nodeCount(c) } ?: 0) }
+    fun nodeCount(defs: List<ColumnDef>): Int = com.posthog.hoglake.model.nodeCount(defs)
 
     /**
      * Assign field ids DEPTH-FIRST from [firstFieldId] (a parent before
      * its children, a subtree before its next sibling) and ordinals per
-     * sibling group. Depth-first is the order Iceberg's own schema
-     * assignment uses, and it keeps a subtree's ids contiguous, which is
-     * what makes "drop this struct" a range in the versioned rows rather
-     * than a scatter.
+     * sibling group.
+     *
+     * Delegates to the model, which is where the atomic-creation
+     * receipt reaches for the same answer: the ids a table WILL have are
+     * promised before any row exists, so the prediction and the
+     * assignment have to be one function.
      */
     fun assignFieldIds(
         defs: List<ColumnDef>,
         firstFieldId: Long,
-    ): List<Column> {
-        var next = firstFieldId
-
-        fun build(siblings: List<ColumnDef>): List<Column> =
-            siblings.mapIndexed { ordinal, def ->
-                val fieldId = next++
-                Column(
-                    fieldId = fieldId,
-                    ordinal = ordinal,
-                    // children live on Column.children; clearing them on the
-                    // def keeps one source of truth for the subtree.
-                    def = def.copy(children = null),
-                    children = def.children?.let { build(it) } ?: emptyList(),
-                )
-            }
-        return build(defs)
-    }
+    ): List<Column> = com.posthog.hoglake.model.assignFieldIds(defs, firstFieldId)
 }

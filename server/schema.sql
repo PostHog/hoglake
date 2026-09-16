@@ -169,7 +169,7 @@ CREATE TABLE hog_column (
     -- Closed type set: every member has a defined Iceberg mapping
     -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
     -- Member ORDER is load-bearing: V4__scalar_types.sql and
-    -- V5__nested_types.sql recreate this constraint and the
+    -- V7__nested_types.sql recreate this constraint and the
     -- schema-equivalence gate compares the normalized
     -- pg_get_constraintdef text, which preserves the order.
     -- list/struct/map are CONTAINERS: they carry no values, they have
@@ -185,7 +185,7 @@ CREATE TABLE hog_column (
     -- Orders SIBLINGS: 0-based within the parent (top-level columns
     -- share the NULL parent).
     ordinal        int    NOT NULL CHECK (ordinal >= 0),
-    -- The tree edge (V5): NULL = top-level column, else the field_id of
+    -- The tree edge (V7): NULL = top-level column, else the field_id of
     -- the containing list/struct/map. A same-table reference by
     -- (catalog_id, table_id, field_id) IDENTITY and deliberately NOT a
     -- foreign key: these rows are versioned (begin_snapshot is in the
@@ -214,7 +214,7 @@ CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
 -- Writers stamp parquet field order from ordinals: a duplicate live
 -- ordinal is a silent corruption vector, so the DB refuses it.
--- Per-PARENT since V5 — ordinals order siblings, so two struct fields in
+-- Per-PARENT since V7 — ordinals order siblings, so two struct fields in
 -- different structs are both legitimately ordinal 0. NULLS NOT DISTINCT
 -- keeps the guarantee for top-level columns, whose parent_field_id is
 -- NULL: without it Postgres treats every NULL as distinct and the
@@ -590,3 +590,21 @@ CREATE INDEX hog_data_file_changefeed
     ON hog_data_file (catalog_id, table_id, begin_snapshot);
 CREATE INDEX hog_delete_file_changefeed
     ON hog_delete_file (catalog_id, table_id, begin_snapshot);
+-- Durable receipts are deliberately retained; expiry only closes prepared operations.
+CREATE TABLE hog_table_creation (
+    catalog_id bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    operation_id uuid NOT NULL,
+    namespace_id bigint NOT NULL,
+    definition jsonb NOT NULL,
+    table_uuid uuid NOT NULL,
+    write_path text NOT NULL,
+    state text NOT NULL DEFAULT 'prepared' CHECK (state IN ('prepared', 'committed', 'rejected', 'aborted')),
+    expires_at timestamptz NOT NULL DEFAULT clock_timestamp() + interval '24 hours',
+    files jsonb,
+    snapshot_id bigint,
+    schema_version bigint,
+    reason text,
+    PRIMARY KEY (catalog_id, operation_id),
+    UNIQUE (catalog_id, table_uuid),
+    CHECK ((state = 'committed') = (snapshot_id IS NOT NULL AND schema_version IS NOT NULL))
+);

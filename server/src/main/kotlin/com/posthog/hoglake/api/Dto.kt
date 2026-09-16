@@ -49,6 +49,7 @@ data class CatalogDto(
     val schemaVersion: Long,
     /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
     val earliestSnapshotTime: Instant? = null,
+    val capabilities: List<String> = listOf("atomic-table-creation-v1"),
 )
 
 fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion, earliestSnapshotTime)
@@ -425,10 +426,17 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * Version is the running server's own, always present (BuildInfo falls
  * back to "unknown" rather than omitting it — "which version is this?"
  * having no answer is itself the answer an operator needs).
+ *
+ * Build is the packaging stamp and is omitted on any build nobody
+ * stamped — every local build, every PR image. Absent means "not off
+ * the pipeline", which is why it is a separate optional field and not
+ * folded into `version`: `version` is the contract version the spec is
+ * gated against, and it must keep meaning exactly that.
  */
 data class InstanceInfoDto(
     val name: String?,
     val version: String,
+    val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
 )

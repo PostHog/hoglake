@@ -133,7 +133,7 @@ class CommitServiceTest {
         path: String,
         records: Long,
         bytes: Long = records * 100,
-        footerSize: Long? = 1234,
+        footerSize: Long? = if (bytes >= 28) 20 else null,
         stats: List<ColumnStats>? = null,
     ) = FileRegistration(path, records, bytes, footerSize, stats)
 
@@ -288,10 +288,10 @@ class CommitServiceTest {
         assertThat(files).hasSize(2)
         assertThat(files.map { it.dataFileId }).containsExactly(1L, 2L)
         assertThat(files[0]).isEqualTo(
-            DbFile(1, tableId, "s3://b/cat/f1.parquet", 10, 0, "provided", 1, 1234),
+            DbFile(1, tableId, "s3://b/cat/f1.parquet", 10, 0, "provided", 1, 20),
         )
         assertThat(files[1]).isEqualTo(
-            DbFile(2, tableId, "s3://b/cat/f2.parquet", 5, 10, "provided", 1, 1234),
+            DbFile(2, tableId, "s3://b/cat/f2.parquet", 5, 10, "provided", 1, 20),
         )
 
         // Stats rows for every (file, field).

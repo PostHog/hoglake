@@ -111,17 +111,19 @@ object TableRepo {
         catalogId: Long,
         tableId: Long,
         createdSnapshot: Long,
+        tableUuid: UUID = UUID.randomUUID(),
     ): UUID =
         handle.createQuery(
             """
-            INSERT INTO hog_table (catalog_id, table_id, created_snapshot)
-            VALUES (:catalogId, :tableId, :createdSnapshot)
+            INSERT INTO hog_table (catalog_id, table_id, created_snapshot, table_uuid)
+            VALUES (:catalogId, :tableId, :createdSnapshot, :tableUuid)
             RETURNING table_uuid
             """,
         )
             .bind("catalogId", catalogId)
             .bind("tableId", tableId)
             .bind("createdSnapshot", createdSnapshot)
+            .bind("tableUuid", tableUuid)
             .map { rs, _ -> rs.getObject("table_uuid") as UUID }
             .one()
 

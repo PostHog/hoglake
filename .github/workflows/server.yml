@@ -21,6 +21,46 @@ permissions:
   contents: read
 
 jobs:
+  # Flyway detects a duplicate migration version only at runtime, and a
+  # PR's checks run against the merge result AT PUSH TIME — a migration
+  # that lands on main after this PR's last CI run makes the green
+  # checks stale (PR #65 collided with #66's V4 exactly this way, with
+  # every check passing). This job fetches main FRESH at run time and
+  # checks the union, so a re-run — or a merge-queue run — catches the
+  # collision. Residual gap: nothing forces the re-run; "require
+  # branches to be up to date before merging" closes it fully.
+  migration-chain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: No duplicate versions, no edits to shipped migrations
+        run: |
+          git fetch --no-tags --depth=1 origin main
+          MIG=server/src/main/resources/db/migration
+
+          # Append-only: every migration file on CURRENT main must be
+          # byte-identical here. Only additions are allowed.
+          bad=$(git diff --name-status origin/main HEAD -- "$MIG" | grep -v '^A' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::Migration chain is append-only; changed or removed vs latest main:"
+            echo "$bad"
+            exit 1
+          fi
+
+          # Version collision: one basename per V<number> across the
+          # union of latest main and this branch.
+          { git ls-tree -r --name-only origin/main -- "$MIG"
+            git ls-files -- "$MIG"; } |
+            grep -E '/V[0-9]+__[^/]+\.sql$' | sed 's:.*/::' | sort -u |
+            sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
+            awk '$1 == prev { printf "::error::Duplicate migration version V%s: %s and %s\n", $1, last, $2; dup = 1 }
+                 { prev = $1; last = $2 }
+                 END { exit dup }'
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -180,6 +220,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The build identity GET /v1/info reports, so the webui names which
+      # build is live within a version that stays constant between
+      # releases. UTC, minute resolution, sortable as a plain string.
+      # Only this job stamps: an unstamped build is by definition not a
+      # deployed one.
+      - name: Build stamp
+        id: stamp
+        run: echo "value=$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
+
       # Multi-arch: the mw fleet runs Graviton nodes. The Dockerfile's
       # build stage is pinned to $BUILDPLATFORM, so gradle runs once
       # natively; only the JRE runtime layer is per-arch.
@@ -189,6 +238,8 @@ jobs:
           context: server
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            HOGLAKE_BUILD_STAMP=${{ steps.stamp.outputs.value }}
           tags: |
             ghcr.io/posthog/hoglake-server:${{ github.sha }}
             ghcr.io/posthog/hoglake-server:latest

@@ -6,6 +6,8 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
@@ -130,6 +132,39 @@ class CommitService(
             detail = "snapshot=${result.snapshotId} files=$files deletes=$deletes",
         )
         return result
+    }
+
+    /** Register initial files in a caller-owned DDL snapshot, under the catalog lock. */
+    internal fun registerInitialFiles(
+        h: Handle,
+        catalogId: Long,
+        dataPath: String,
+        namespace: String,
+        table: String,
+        tableId: Long,
+        snapshotId: Long,
+        files: List<FileRegistration>,
+    ) {
+        val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
+        validatePathsUnderDataPath(dataPath, request)
+        val append = ResolvedAppend(namespace, table, tableId, files, null)
+        validateFiles(h, catalogId, append)
+        checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
+        if (files.isEmpty()) return
+        val firstId =
+            h.createQuery(
+                """
+                UPDATE hog_catalog SET next_file_id = next_file_id + :count WHERE catalog_id = :catalogId RETURNING
+                next_file_id - :count
+                """,
+            ).bind("count", files.size).bind("catalogId", catalogId).mapTo(Long::class.java).one()
+        h.createUpdate(
+            """
+            INSERT INTO hog_snapshot_change (catalog_id, snapshot_id, kind, object_id) VALUES (:catalogId,
+            :snapshotId, 'table_inserted_into', :tableId)
+            """,
+        ).bind("catalogId", catalogId).bind("snapshotId", snapshotId).bind("tableId", tableId).execute()
+        writeAppends(h, catalogId, snapshotId, firstId, listOf(append))
     }
 
     /** hog_catalog head-of-line state, read once under the commit lock. */
@@ -602,6 +637,7 @@ class CommitService(
             var rowId = rowIdStart
 
             for (file in append.files) {
+                file.validateFooterSize()
                 val dataFileId = nextFileId++
                 fileBatch
                     .bind("catalogId", catalogId)
