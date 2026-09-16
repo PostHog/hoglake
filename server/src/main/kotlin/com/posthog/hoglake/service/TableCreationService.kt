@@ -8,6 +8,8 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.observability.Audit
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
@@ -55,35 +57,42 @@ class TableCreationService(
         catalog: String,
         operationId: UUID,
         definition: TableCreationDefinition,
-    ): TableCreation =
-        operationTransaction { h ->
-            val cat = CatalogRepo.require(h, catalog)
-            val encoded = mapper.writeValueAsString(definition)
-            if (exists(h, cat.catalogId, operationId)) {
-                requireSame(h, cat.catalogId, operationId, "definition", encoded)
-                return@operationTransaction load(h, cat.catalogId, operationId)
-            }
-            catalogs.validateTableDefinition(definition.name, definition.columns)
-            Identifiers.validate("namespace", definition.namespace)
-            if (definition.columns.size > 10000) throw HoglakeException.Validation("too many columns")
-            val ns =
-                NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
-                    ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
-            // Prefix includes a server-generated identity: even a future catalog recreation
-            // and reused client operation id cannot reuse old object paths.
-            val uuid = UUID.randomUUID()
-            h.createUpdate(
-                """
+    ): TableCreation {
+        var replay = false
+        return observed("prepare", catalog, operationId, { if (replay) "replayed" else it.state }) {
+            operationTransaction { h ->
+                val cat = CatalogRepo.require(h, catalog)
+                val encoded = mapper.writeValueAsString(definition)
+                if (exists(h, cat.catalogId, operationId)) {
+                    replay = true
+                    requireSame(h, cat.catalogId, operationId, "definition", encoded)
+                    return@operationTransaction load(h, cat.catalogId, operationId)
+                }
+                catalogs.validateTableDefinition(definition.name, definition.columns)
+                Identifiers.validate("namespace", definition.namespace)
+                if (definition.columns.size > 10000) throw HoglakeException.Validation("too many columns")
+                val ns =
+                    NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
+                        ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
+                // Prefix includes a server-generated identity: even a future catalog recreation
+                // and reused client operation id cannot reuse old object paths.
+                val uuid = UUID.randomUUID()
+                val inserted =
+                    h.createUpdate(
+                        """
                 INSERT INTO hog_table_creation (catalog_id, operation_id, namespace_id, definition, table_uuid, write_path)
                 VALUES (:catalog, :operation, :namespace, CAST(:definition AS jsonb), :uuid, :path)
                 ON CONFLICT (catalog_id, operation_id) DO NOTHING
                 """,
-            ).bind("catalog", cat.catalogId).bind("operation", operationId)
-                .bind("namespace", ns.namespaceId).bind("definition", encoded).bind("uuid", uuid)
-                .bind("path", cat.dataPath.trimEnd('/') + "/data/$uuid/").execute()
-            requireSame(h, cat.catalogId, operationId, "definition", encoded)
-            load(h, cat.catalogId, operationId)
+                    ).bind("catalog", cat.catalogId).bind("operation", operationId)
+                        .bind("namespace", ns.namespaceId).bind("definition", encoded).bind("uuid", uuid)
+                        .bind("path", cat.dataPath.trimEnd('/') + "/data/$uuid/").execute()
+                replay = inserted == 0
+                requireSame(h, cat.catalogId, operationId, "definition", encoded)
+                load(h, cat.catalogId, operationId)
+            }
         }
+    }
 
     fun status(
         catalog: String,
@@ -97,98 +106,136 @@ class TableCreationService(
     fun abort(
         catalog: String,
         operationId: UUID,
-    ): TableCreation =
-        operationTransaction { h ->
-            val cat = CatalogRepo.require(h, catalog)
-            val operation = load(h, cat.catalogId, operationId)
-            if (operation.state == "prepared") transition(h, cat.catalogId, operationId, "aborted", "client_abort")
-            load(h, cat.catalogId, operationId)
+    ): TableCreation {
+        var replay = false
+        return observed("abort", catalog, operationId, { if (replay) "replayed" else it.state }) {
+            operationTransaction { h ->
+                val cat = CatalogRepo.require(h, catalog)
+                val operation = load(h, cat.catalogId, operationId)
+                replay = operation.state != "prepared"
+                if (operation.state == "prepared") transition(h, cat.catalogId, operationId, "aborted", "client_abort")
+                load(h, cat.catalogId, operationId)
+            }
         }
+    }
 
     fun publish(
         catalog: String,
         operationId: UUID,
         files: List<FileRegistration>,
-    ): TableCreation =
-        operationTransaction { h ->
-            val cat = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, cat.catalogId, lockTimeoutMs)
-            val operation = load(h, cat.catalogId, operationId)
-            val encoded = mapper.writeValueAsString(files)
-            if (operation.state == "committed" || operation.state == "rejected") {
-                requireSame(h, cat.catalogId, operationId, "files", encoded)
-                return@operationTransaction operation
-            }
-            if (operation.state == "aborted") return@operationTransaction operation
-            if (files.size > 10000) throw HoglakeException.Validation("too many files")
-            if (files.map { it.path }.toSet().size != files.size) {
-                throw HoglakeException.Validation(
-                    "duplicate file paths",
-                )
-            }
-            files.forEach {
-                if (!it.path.startsWith(
-                        operation.writePath,
+    ): TableCreation {
+        var replay = false
+        return observed("publish", catalog, operationId, { if (replay) "replayed" else it.state }) {
+            operationTransaction { h ->
+                val cat = CatalogRepo.require(h, catalog)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId, lockTimeoutMs)
+                val operation = load(h, cat.catalogId, operationId)
+                replay = operation.state != "prepared"
+                val encoded = mapper.writeValueAsString(files)
+                if (operation.state == "committed" || operation.state == "rejected") {
+                    requireSame(h, cat.catalogId, operationId, "files", encoded)
+                    return@operationTransaction operation
+                }
+                if (operation.state == "aborted") return@operationTransaction operation
+                if (files.size > 10000) throw HoglakeException.Validation("too many files")
+                if (files.map { it.path }.toSet().size != files.size) {
+                    throw HoglakeException.Validation(
+                        "duplicate file paths",
                     )
-                ) {
-                    throw HoglakeException.Validation("file outside operation write_path")
                 }
-                if (it.footerSize == null || it.footerSize < 0 || it.footerSize > it.fileSizeBytes - 8) {
-                    throw HoglakeException.Validation("invalid footer_size")
+                files.forEach {
+                    if (!it.path.startsWith(
+                            operation.writePath,
+                        )
+                    ) {
+                        throw HoglakeException.Validation("file outside operation write_path")
+                    }
+                    if (it.footerSize == null || it.footerSize < 0 || it.footerSize > it.fileSizeBytes - 8) {
+                        throw HoglakeException.Validation("invalid footer_size")
+                    }
                 }
-            }
-            h.createUpdate(
-                """
+                h.createUpdate(
+                    """
                 UPDATE hog_table_creation SET files = CAST(:files AS jsonb) WHERE catalog_id = :catalog AND
                 operation_id = :operation
                 """,
-            )
-                .bind("files", encoded).bind("catalog", cat.catalogId).bind("operation", operationId).execute()
-            val definition = operation.definition
-            val ns = NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
-            val originalNamespace =
-                h.createQuery(
-                    """
+                )
+                    .bind("files", encoded).bind("catalog", cat.catalogId).bind("operation", operationId).execute()
+                val definition = operation.definition
+                val ns = NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
+                val originalNamespace =
+                    h.createQuery(
+                        """
                     SELECT namespace_id FROM hog_table_creation
                     WHERE catalog_id = :catalog AND operation_id = :operation
                     """,
-                )
-                    .bind("catalog", cat.catalogId).bind("operation", operationId).mapTo(Long::class.java).one()
-            if (ns == null || ns.namespaceId != originalNamespace) {
-                transition(h, cat.catalogId, operationId, "rejected", "namespace_changed")
-            } else if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, definition.name) != null) {
-                transition(h, cat.catalogId, operationId, "rejected", "target_exists")
-            } else {
-                val table =
-                    catalogs.createTable(
+                    )
+                        .bind("catalog", cat.catalogId).bind("operation", operationId).mapTo(Long::class.java).one()
+                if (ns == null || ns.namespaceId != originalNamespace) {
+                    transition(h, cat.catalogId, operationId, "rejected", "namespace_changed")
+                } else if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, definition.name) != null) {
+                    transition(h, cat.catalogId, operationId, "rejected", "target_exists")
+                } else {
+                    val table =
+                        catalogs.createTable(
+                            h,
+                            catalog,
+                            definition.namespace,
+                            definition.name,
+                            definition.columns,
+                            operation.tableUuid,
+                        )
+                    check(table.columns == operation.columns)
+                    val published = CatalogRepo.require(h, catalog)
+                    commits.registerInitialFiles(
                         h,
-                        catalog,
+                        cat.catalogId,
+                        cat.dataPath,
                         definition.namespace,
                         definition.name,
-                        definition.columns,
-                        operation.tableUuid,
+                        table.tableId,
+                        published.headSnapshotId,
+                        files,
                     )
-                check(table.columns == operation.columns)
-                val published = CatalogRepo.require(h, catalog)
-                commits.registerInitialFiles(
-                    h,
-                    cat.catalogId,
-                    cat.dataPath,
-                    definition.namespace,
-                    definition.name,
-                    table.tableId,
-                    published.headSnapshotId,
-                    files,
-                )
-                h.createUpdate(
-                    """
+                    h.createUpdate(
+                        """
                     UPDATE hog_table_creation SET state = 'committed', snapshot_id = :snapshot, schema_version = :version
                     WHERE catalog_id = :catalog AND operation_id = :operation
                     """,
-                ).bind("snapshot", published.headSnapshotId).bind("version", published.schemaVersion)
-                    .bind("catalog", cat.catalogId).bind("operation", operationId).execute()
+                    ).bind("snapshot", published.headSnapshotId).bind("version", published.schemaVersion)
+                        .bind("catalog", cat.catalogId).bind("operation", operationId).execute()
+                }
+                load(h, cat.catalogId, operationId)
             }
-            load(h, cat.catalogId, operationId)
+        }
+    }
+
+    private fun observed(
+        action: String,
+        catalog: String,
+        operation: UUID,
+        outcome: (TableCreation) -> String,
+        block: () -> TableCreation,
+    ): TableCreation =
+        Audit.audited(
+            "table_creation_$action",
+            catalog,
+            operation.toString(),
+            successOutcome = outcome,
+            detail = { "operation=$operation state=${it.state} snapshot=${it.snapshotId}" },
+        ) {
+            // The block returns only after its database transaction commits or rolls back.
+            val result =
+                try {
+                    block()
+                } catch (e: Throwable) {
+                    Metrics.tableCreationRecorded(catalog, action, Audit.failureOutcome(e))
+                    throw e
+                }
+            val status = outcome(result)
+            Metrics.tableCreationRecorded(catalog, action, status)
+            if (action == "publish" && status == "committed") Metrics.commitRecorded(catalog, "committed")
+            result
         }
 
     private fun <T> operationTransaction(block: (Handle) -> T): T =
