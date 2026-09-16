@@ -520,8 +520,8 @@ object ParquetRewriter {
                 val annotation =
                     src.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
                         ?: refuse()
-                val liveScale = decimalScale(column)
-                if ((liveScale != null && annotation.scale != liveScale) ||
+                val liveScale = decimalScale(column) ?: 0
+                if (annotation.scale != liveScale ||
                     annotation.precision > decimalPrecision(column)
                 ) {
                     refuse()

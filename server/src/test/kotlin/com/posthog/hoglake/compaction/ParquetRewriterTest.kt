@@ -119,6 +119,40 @@ class ParquetRewriterTest {
     }
 
     @Test
+    fun `decimal conversion rejects scale changes and precision overflow`() {
+        val schema =
+            Types.buildMessage().addField(
+                Types.optional(PrimitiveTypeName.INT64)
+                    .`as`(LogicalTypeAnnotation.decimalType(2, 10)).id(1).named("amount"),
+            ).named("decimal")
+        val input = writeCustom("decimal-scale.parquet", schema, listOf({ it.add(0, 12345L) }))
+        for ((index, params) in listOf(
+            // Omitted scale means zero in the destination.
+            mapOf("precision" to 10),
+            mapOf("precision" to 10, "scale" to 3),
+            mapOf("precision" to 9, "scale" to 2),
+        ).withIndex()) {
+            assertThatThrownBy {
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(input, 0)),
+                    listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, params))),
+                    emptyList(),
+                    tmp.resolve("decimal-refused-$index.parquet"),
+                )
+            }.isInstanceOf(UnconvertibleSchemaException::class.java)
+        }
+        val overflow = writeCustom("decimal-overflow.parquet", schema, listOf({ it.add(0, 10000000000L) }))
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(overflow, 0)),
+                listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 2)))),
+                emptyList(),
+                tmp.resolve("decimal-overflow-output.parquet"),
+            )
+        }.isInstanceOf(UnconvertibleSchemaException::class.java).hasMessageContaining("precision")
+    }
+
+    @Test
     fun `decimal physical encodings compact without narrowing or losing nulls`() {
         val inputs = mutableListOf<ParquetRewriter.Input>()
         val expected = mutableListOf<BigInteger?>()
