@@ -11,10 +11,12 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.NamespaceRepo
+import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.TableRepo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 import java.time.Instant
 import java.util.UUID
 
@@ -35,13 +37,14 @@ data class TableCreation(
 
 /**
  * Unpublished definitions plus permanent publication receipts. Every state transition takes
- * the catalog lock, including abort/expiry. A prepared status is never a cleanup permit:
+ * an operation row lock; publication takes the catalog lock first. A prepared status is never a cleanup permit:
  * only a terminal rejected/aborted receipt fences an in-flight publication.
  */
 class TableCreationService(
     private val jdbi: Jdbi,
     private val catalogs: CatalogService,
     private val commits: CommitService,
+    private val lockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
 ) {
     private val mapper =
         jacksonObjectMapper().findAndRegisterModules().enable(
@@ -53,13 +56,12 @@ class TableCreationService(
         operationId: UUID,
         definition: TableCreationDefinition,
     ): TableCreation =
-        jdbi.inTransactionUnchecked { h ->
+        operationTransaction { h ->
             val cat = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, cat.catalogId)
             val encoded = mapper.writeValueAsString(definition)
             if (exists(h, cat.catalogId, operationId)) {
                 requireSame(h, cat.catalogId, operationId, "definition", encoded)
-                return@inTransactionUnchecked load(h, cat.catalogId, operationId)
+                return@operationTransaction load(h, cat.catalogId, operationId)
             }
             catalogs.validateTableDefinition(definition.name, definition.columns)
             Identifiers.validate("namespace", definition.namespace)
@@ -74,10 +76,12 @@ class TableCreationService(
                 """
                 INSERT INTO hog_table_creation (catalog_id, operation_id, namespace_id, definition, table_uuid, write_path)
                 VALUES (:catalog, :operation, :namespace, CAST(:definition AS jsonb), :uuid, :path)
+                ON CONFLICT (catalog_id, operation_id) DO NOTHING
                 """,
             ).bind("catalog", cat.catalogId).bind("operation", operationId)
                 .bind("namespace", ns.namespaceId).bind("definition", encoded).bind("uuid", uuid)
                 .bind("path", cat.dataPath.trimEnd('/') + "/data/$uuid/").execute()
+            requireSame(h, cat.catalogId, operationId, "definition", encoded)
             load(h, cat.catalogId, operationId)
         }
 
@@ -85,9 +89,8 @@ class TableCreationService(
         catalog: String,
         operationId: UUID,
     ): TableCreation =
-        jdbi.inTransactionUnchecked { h ->
+        operationTransaction { h ->
             val cat = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, cat.catalogId)
             load(h, cat.catalogId, operationId)
         }
 
@@ -95,9 +98,8 @@ class TableCreationService(
         catalog: String,
         operationId: UUID,
     ): TableCreation =
-        jdbi.inTransactionUnchecked { h ->
+        operationTransaction { h ->
             val cat = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, cat.catalogId)
             val operation = load(h, cat.catalogId, operationId)
             if (operation.state == "prepared") transition(h, cat.catalogId, operationId, "aborted", "client_abort")
             load(h, cat.catalogId, operationId)
@@ -108,16 +110,16 @@ class TableCreationService(
         operationId: UUID,
         files: List<FileRegistration>,
     ): TableCreation =
-        jdbi.inTransactionUnchecked { h ->
+        operationTransaction { h ->
             val cat = CatalogRepo.require(h, catalog)
-            Locks.acquireCatalogCommitLock(h, cat.catalogId)
+            Locks.acquireCatalogCommitLock(h, cat.catalogId, lockTimeoutMs)
             val operation = load(h, cat.catalogId, operationId)
             val encoded = mapper.writeValueAsString(files)
             if (operation.state == "committed" || operation.state == "rejected") {
                 requireSame(h, cat.catalogId, operationId, "files", encoded)
-                return@inTransactionUnchecked operation
+                return@operationTransaction operation
             }
-            if (operation.state == "aborted") return@inTransactionUnchecked operation
+            if (operation.state == "aborted") return@operationTransaction operation
             if (files.size > 10000) throw HoglakeException.Validation("too many files")
             if (files.map { it.path }.toSet().size != files.size) {
                 throw HoglakeException.Validation(
@@ -189,6 +191,22 @@ class TableCreationService(
             load(h, cat.catalogId, operationId)
         }
 
+    private fun <T> operationTransaction(block: (Handle) -> T): T =
+        try {
+            jdbi.inTransactionUnchecked { h ->
+                if (lockTimeoutMs > 0) {
+                    h.createQuery("SELECT set_config('lock_timeout', :timeout, true)")
+                        .bind("timeout", lockTimeoutMs.toString()).mapTo(String::class.java).one()
+                }
+                block(h)
+            }
+        } catch (e: UnableToExecuteStatementException) {
+            if (Pg.isLockTimeout(e)) {
+                throw HoglakeException.CommitQueueTimeout("table creation lock timed out after ${lockTimeoutMs}ms")
+            }
+            throw e
+        }
+
     private fun exists(
         h: Handle,
         catalog: Long,
@@ -245,6 +263,15 @@ class TableCreationService(
         catalog: Long,
         operation: UUID,
     ): TableCreation {
+        // Always lock before inspecting state. Publish acquires catalog -> operation;
+        // other endpoints never acquire the catalog lock while holding this row.
+        h.createQuery(
+            """
+            SELECT operation_id FROM hog_table_creation
+            WHERE catalog_id = :catalog AND operation_id = :operation FOR UPDATE
+            """,
+        ).bind("catalog", catalog).bind("operation", operation).mapTo(UUID::class.java)
+            .findOne().orElseThrow { HoglakeException.NotFound("table creation operation '$operation'") }
         // Lazy expiry is sufficient to fence late publication; no object deletion is performed.
         h.createUpdate(
             """

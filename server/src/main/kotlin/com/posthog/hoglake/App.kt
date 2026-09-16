@@ -209,7 +209,9 @@ class App private constructor(
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
         )
-        app.installTableCreationRoutes(TableCreationService(jdbi, catalogService, commitService))
+        app.installTableCreationRoutes(
+            TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
+        )
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)

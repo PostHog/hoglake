@@ -40,6 +40,46 @@ class TableCreationIntegrationTest {
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
     @Test
+    fun `prepare status and abort do not wait for unrelated catalog publication`() {
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val id = catalogs.getCatalog(catalog).catalogId
+        db.jdbi.open().use { lock ->
+            lock.begin()
+            com.posthog.hoglake.persistence.Locks.acquireCatalogCommitLock(lock, id)
+            try {
+                Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+                    executor.submit {
+                        assertThat(creations.status(catalog, operation.operationId).state).isEqualTo("prepared")
+                        assertThat(creations.abort(catalog, operation.operationId).state).isEqualTo("aborted")
+                        assertThat(
+                            creations.prepare(catalog, UUID.randomUUID(), definition).state,
+                        ).isEqualTo("prepared")
+                    }.get(5, TimeUnit.SECONDS)
+                }
+                val bounded = TableCreationService(db.jdbi, catalogs, CommitService(db.jdbi), 100)
+                assertThatThrownBy { bounded.publish(catalog, operation.operationId, emptyList()) }
+                    .isInstanceOf(HoglakeException.CommitQueueTimeout::class.java)
+            } finally {
+                lock.rollback()
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent preparation returns one identity and rejects different definitions`() {
+        val catalog = catalog()
+        val id = UUID.randomUUID()
+        Executors.newVirtualThreadPerTaskExecutor().use { executor ->
+            val futures = (1..8).map { executor.submit<TableCreation> { creations.prepare(catalog, id, definition) } }
+            val results = futures.map { it.get(10, TimeUnit.SECONDS) }
+            assertThat(results.map { it.tableUuid }.toSet()).hasSize(1)
+        }
+        assertThatThrownBy { creations.prepare(catalog, id, definition.copy(name = "different")) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+    }
+
+    @Test
     fun `prepare is invisible and retries publish exactly once`() {
         val catalog = catalog()
         val head = catalogs.getCatalog(catalog)
