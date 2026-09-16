@@ -285,14 +285,13 @@ def _server_file(relative: Path) -> Path:
     )
 
 
-def _kotlin_bucketable() -> frozenset[str]:
-    """AlterService.BUCKETABLE_TYPES as wire names, read from the source.
+def _wire(name: str) -> str:
+    # Model.kt: `val wire get() = if (this == UUID_T) "uuid" else lowercase`
+    return "uuid" if name == "UUID_T" else name.lower()
 
-    Parsed rather than duplicated: a literal copy of the set here is a
-    second place to forget, and the failure it would hide (server accepts
-    a bucket spec the writer cannot compute, or vice versa) only shows up
-    as wrong partition values in production.
-    """
+
+def _kotlin_coltypes() -> frozenset[str]:
+    """The ColType vocabulary as wire names, read from Model.kt."""
     enum_body = re.search(
         r"enum class ColType \{(.*?)\n\s*;",
         _server_file(_MODEL_REL).read_text(),
@@ -303,22 +302,36 @@ def _kotlin_bucketable() -> frozenset[str]:
         r"^\s+([A-Z][A-Z0-9_]*),\s*$", enum_body.group(1), re.MULTILINE
     )
     assert len(entries) >= 20, f"suspiciously few ColType entries: {entries}"
+    return frozenset(map(_wire, entries))
 
-    excluded_src = re.search(
-        r"val BUCKETABLE_TYPES\s*=\s*ColType\.entries\.toSet\(\)\s*-\s*setOf\("
-        r"(?P<body>[^)]*)\)",
+
+def _kotlin_bucketable() -> frozenset[str]:
+    """AlterService.BUCKETABLE_TYPES as wire names, read from the source.
+
+    Parsed rather than duplicated: a literal copy of the set here is a
+    second place to forget, and the failure it would hide (server accepts
+    a bucket spec the writer cannot compute, or vice versa) only shows up
+    as wrong partition values in production.
+
+    Parses the POSITIVE form. The declaration used to be
+    ``ColType.entries.toSet() - setOf(...)``, which made every future
+    ColType bucketable by default; it is now an explicit allowlist, so
+    this reads the members directly instead of subtracting.
+    """
+    allowed_src = re.search(
+        r"val BUCKETABLE_TYPES\s*=\s*\n?\s*setOf\((?P<body>[^)]*)\)",
         _server_file(_ALTER_REL).read_text(),
         re.DOTALL,
     )
-    assert excluded_src, f"BUCKETABLE_TYPES not found in {_ALTER_REL}"
-    excluded = re.findall(r"ColType\.([A-Z0-9_]+)", excluded_src.group("body"))
-    assert excluded, "parsed an EMPTY exclusion set — the regex has rotted"
-
-    # Model.kt: `val wire get() = if (this == UUID_T) "uuid" else lowercase`
-    def wire(name: str) -> str:
-        return "uuid" if name == "UUID_T" else name.lower()
-
-    return frozenset(map(wire, entries)) - frozenset(map(wire, excluded))
+    assert allowed_src, (
+        f"BUCKETABLE_TYPES not found in {_ALTER_REL}. If the declaration "
+        f"changed shape, update this parser — do not delete the check."
+    )
+    allowed = re.findall(r"ColType\.([A-Z0-9_]+)", allowed_src.group("body"))
+    # The rot guard: a regex that silently matched nothing would make the
+    # two sets "agree" only because one of them came back empty.
+    assert allowed, "parsed an EMPTY bucketable set — the regex has rotted"
+    return frozenset(map(_wire, allowed))
 
 
 def test_bucketable_matches_the_server_gate():
@@ -328,6 +341,54 @@ def test_bucketable_matches_the_server_gate():
     kotlin = _kotlin_bucketable()
     assert transforms._BUCKETABLE == kotlin
     assert kotlin <= ALL_COLTYPES  # the Kotlin vocabulary is the same closed set
+
+
+def test_bucketable_is_an_allowlist_so_a_new_type_is_not_bucketable():
+    """Both sides must FAIL CLOSED.
+
+    A new ColType has to be absent from both allowlists until someone
+    decides how it hashes — that decision is what the cross-language
+    bucket contract rests on, and a default of "bucketable" would let a
+    type into partition specs before anyone had made it.
+    """
+    vocabulary = _kotlin_coltypes()
+    assert transforms._BUCKETABLE < vocabulary, (
+        "the bucketable set must be a strict subset of the vocabulary; "
+        "if they are equal, the allowlist has stopped excluding anything"
+    )
+    # Pinned by contents on both sides, so adding a member is a conscious
+    # edit here as well as in the Kotlin.
+    assert transforms._BUCKETABLE == frozenset(
+        {
+            "int8",
+            "int16",
+            "int",
+            "long",
+            "uint8",
+            "uint16",
+            "decimal",
+            "date",
+            "time",
+            "timestamp",
+            "timestamptz",
+            "string",
+            "uuid",
+            "binary",
+        }
+    )
+    assert vocabulary - transforms._BUCKETABLE == frozenset(
+        {
+            "boolean",
+            "float",
+            "double",
+            "json",
+            "uint32",
+            "uint64",
+            "timestamp_s",
+            "timestamp_ms",
+            "timestamp_ns",
+        }
+    )
 
 
 def test_json_takes_identity_only():
@@ -642,6 +703,43 @@ def test_transform_strings_temporal_matches_scalars(transform):
     arr = pa.chunked_array([pa.array(values, pa.timestamp("us"))])
     got = transform_strings(transform, None, arr, "timestamp").to_pylist()
     assert got == _scalar_strings(transform, None, values, "timestamp")
+
+
+@pytest.mark.parametrize(
+    ("unit", "col_type", "tick"),
+    [
+        # 2^62 seconds scales to exactly 0 micros under a wrapping
+        # multiply — the whole column would partition as the epoch.
+        ("s", "timestamp_s", 2**62),
+        # The millis edge: the smallest tick whose x1000 leaves int64.
+        ("ms", "timestamp_ms", 2**63 // 1_000 + 1),
+        ("s", "timestamp_s", -(2**62)),
+    ],
+)
+@pytest.mark.parametrize("transform", ["day", "hour"])
+def test_temporal_scaling_overflow_raises_instead_of_wrapping(
+    transform, unit, col_type, tick
+):
+    """A tick too large to express in micros must RAISE, not wrap.
+
+    arrow's unchecked ``multiply`` wraps silently, so an out-of-range
+    timestamp would be assigned a partition value for some unrelated
+    instant — and pruning would then skip the file when querying its
+    real range. A partition value that cannot be computed is not a
+    partition value.
+    """
+    arr = pa.array([tick], pa.timestamp(unit))
+    with pytest.raises(pa.ArrowInvalid, match="overflow"):
+        transform_strings(transform, None, arr, col_type)
+
+
+def test_temporal_scaling_accepts_the_largest_representable_tick():
+    """The control: the boundary itself still works, so the check is a
+    range test and not an arbitrary ceiling."""
+    largest_s = (2**63 - 1) // 1_000_000
+    arr = pa.array([largest_s], pa.timestamp("s"))
+    (got,) = transform_strings("day", None, arr, "timestamp_s").to_pylist()
+    assert got == str(largest_s * 1_000_000 // 86_400_000_000)
 
 
 @pytest.mark.parametrize("transform", ["year", "month", "day"])

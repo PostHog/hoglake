@@ -236,10 +236,8 @@ class AlterScalarTypeIntegrationTest {
 
     @Test
     fun `bucket is refused outside the Iceberg hash domain`() {
-        // json: two documents equal as JSON hash differently, so bucketing
-        // would scatter equal values and prune wrong. boolean/float/double:
-        // the Iceberg spec excludes them outright.
-        for (type in listOf(ColType.JSON, ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE)) {
+        // boolean/float/double really are outside Appendix B's hash domain.
+        for (type in listOf(ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE)) {
             val (cat, ns, _) = fixture(ColumnDef("v", type))
             val field = fieldId(cat, "v")
             assertThatThrownBy {
@@ -255,6 +253,56 @@ class AlterScalarTypeIntegrationTest {
                 .hasMessageContaining("bucket")
                 .hasMessageContaining("excludes it from the bucket hash domain")
         }
+    }
+
+    @Test
+    fun `the json bucket refusal blames JSON's byte forms, not the Iceberg spec`() {
+        // json maps to Iceberg string, and Iceberg buckets strings
+        // perfectly well — so "the spec excludes it" was simply false,
+        // and a caller who knew the spec would have read it as a hoglake
+        // bug. The real reason is that JSON has no canonical byte form,
+        // which makes the hash depend on the writer rather than the value.
+        val (cat, ns, _) = fixture(ColumnDef("v", ColType.JSON))
+        val field = fieldId(cat, "v")
+        assertThatThrownBy {
+            alter.alterTable(
+                cat,
+                ns,
+                "t",
+                listOf(AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(field, Transform.BUCKET, 8)))),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("'json'")
+            .hasMessageContaining("equal")
+            .hasMessageContaining("different bytes")
+            .hasMessageContaining("which writer serialized the value")
+            // The claim that was wrong must not come back.
+            .hasMessageNotContaining("spec excludes")
+    }
+
+    @Test
+    fun `bucketable types are an explicit allowlist, so a new ColType is not bucketable`() {
+        // The set used to be `entries - exclusions`, which made every
+        // future type bucketable by default — the opposite of the
+        // admit-deliberately policy. Pinned by CONTENTS so that adding a
+        // type to the vocabulary cannot quietly add it here too.
+        assertThat(AlterService.BUCKETABLE_TYPES).containsExactlyInAnyOrder(
+            ColType.INT8, ColType.INT16, ColType.INT, ColType.LONG,
+            ColType.UINT8, ColType.UINT16, ColType.DECIMAL, ColType.DATE,
+            ColType.TIME, ColType.TIMESTAMP, ColType.TIMESTAMPTZ,
+            ColType.STRING, ColType.UUID_T, ColType.BINARY,
+        )
+        // The fail-closed property, stated directly: every member of the
+        // vocabulary that is NOT named above must be refused.
+        val notBucketable = ColType.entries.toSet() - AlterService.BUCKETABLE_TYPES
+        assertThat(notBucketable).containsExactlyInAnyOrder(
+            ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE, ColType.JSON,
+            ColType.UINT32, ColType.UINT64,
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP_NS,
+        )
+        assertThat(AlterService.BUCKETABLE_TYPES + notBucketable)
+            .describedAs("every type is classified exactly once")
+            .isEqualTo(ColType.entries.toSet())
     }
 
     @Test

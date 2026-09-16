@@ -265,19 +265,42 @@ _FOREIGN_FOOTERS = {
 _MUST_PRODUCE = {
     ("int64", "long"),
     ("double", "double"),
-    ("double", "float"),
+    # NOT ("double", "float"): a float64 footer under a `float` column is
+    # a NARROWING, and Kotlin's FLOAT arm takes only a FLOAT physical.
+    # Python used to produce a bound here purely because it never looked
+    # at the footer's type; it now refuses, like the hydrator. (The
+    # reverse, float32 under `double`, is a legal widening and is
+    # accepted by both — covered by the property test's own matrix.)
     ("string", "string"),
     ("string", "json"),
     ("binary", "binary"),
     ("boolean", "boolean"),
-    ("timestamp_us", "timestamp"),
     # timestamptz is absent from COLUMN_KINDS, so there is no cell to
     # claim — caught by the seen == _MUST_PRODUCE check, which is what it
     # is for.
+    #
+    # Every timestamp precision reads a timestamp footer of ANY unit:
+    # the decode is unit-driven (the file's annotation says what its
+    # int64s mean) and scales to the type's own stored unit. So the
+    # timestamp footers x timestamp catalog types form a full block, not
+    # a diagonal.
+    ("timestamp_us", "timestamp"),
+    ("timestamp_us", "timestamp_s"),
+    ("timestamp_us", "timestamp_ms"),
+    ("timestamp_ms", "timestamp"),
+    ("timestamp_ms", "timestamp_s"),
+    ("timestamp_ms", "timestamp_ms"),
     # A millis footer scales UP to nanos exactly; a nanos footer is read
     # raw. Both are the paths a timestamp_ns column actually takes.
     ("timestamp_ms", "timestamp_ns"),
     ("timestamp_ns", "timestamp_ns"),
+    # BYTE_ARRAY is BYTE_ARRAY: string, json and binary share a physical
+    # form, and the catalog type decides only how the bytes are read.
+    ("binary", "string"),
+    ("binary", "json"),
+    # uint32 maps to Iceberg long, and hoglake's own writer emits INT64
+    # for it — so an int64 footer is the NATIVE shape, not a mismatch.
+    ("int64", "uint32"),
 }
 
 
@@ -292,9 +315,15 @@ def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
     neither was reachable from the paths anyone had thought to test.
     A foreign footer is an INPUT, not a given — the writer does not get
     to fail a commit because someone else's file had a statistic it
-    could not read. The cells in _MUST_PRODUCE pin the other side: where
-    footer and catalog type agree, a bound has to come out, so a codec
-    that degraded EVERYTHING to null cannot pass.
+    could not read.
+
+    The assertion is TWO-SIDED. _MUST_PRODUCE pins the cells where
+    footer and catalog type correspond — a codec that degraded
+    everything to null cannot pass — and every other cell must produce
+    NO bound at all, so a codec that coerces mismatched values into
+    plausible-looking bytes cannot pass either. A cell that legitimately
+    starts producing belongs in _MUST_PRODUCE explicitly; it does not
+    belong in a weakened else-branch.
     """
     seen: set[tuple[str, str]] = set()
     for footer, (arrow_type, values) in sorted(_FOREIGN_FOOTERS.items()):
@@ -311,6 +340,16 @@ def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
                 assert stats[0].lower_bound is not None, (kind, footer)
                 assert stats[0].upper_bound is not None, (kind, footer)
                 seen.add((footer, kind))
+            else:
+                # Two-sided, and this half is the one that matters most:
+                # a cell where footer and catalog type do NOT correspond
+                # must produce NO bound, not an arbitrary one. Before the
+                # physical-type check existed, a boolean footer under a
+                # `long` column truthiness-coerced False/True into bounds
+                # of 0/1 — well-formed bytes describing data that is not
+                # there, which prunes real rows away.
+                assert stats[0].lower_bound is None, (kind, footer)
+                assert stats[0].upper_bound is None, (kind, footer)
     # Every declared cell was actually reachable: a typo in _MUST_PRODUCE
     # would otherwise make it a set of assertions nobody runs.
     assert seen == _MUST_PRODUCE, _MUST_PRODUCE - seen

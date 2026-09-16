@@ -423,9 +423,12 @@ def _floordiv(arr: pa.Array, divisor: int) -> pa.Array:
     """Floor division on an int64 array (arrow's ``divide`` truncates
     toward zero; Iceberg's day/hour need flooring for pre-epoch values)."""
     q = pc.divide(arr, divisor)
-    r = pc.subtract(arr, pc.multiply(q, divisor))
+    # |q * divisor| <= |arr| by construction, so this cannot overflow —
+    # the checked kernels are used anyway so that no unchecked integer
+    # arithmetic survives in the partition-value path at all.
+    r = pc.subtract_checked(arr, pc.multiply_checked(q, divisor))
     adjust = pc.and_(pc.less(arr, 0), pc.not_equal(r, 0))
-    return pc.subtract(q, pc.cast(adjust, pa.int64()))
+    return pc.subtract_checked(q, pc.cast(adjust, pa.int64()))
 
 
 def _timestamp_micros(arr: pa.Array) -> pa.Array:
@@ -443,10 +446,16 @@ def _timestamp_micros(arr: pa.Array) -> pa.Array:
     """
     raw = pc.cast(arr, pa.int64())
     unit = arr.type.unit
+    # multiply_CHECKED, not multiply: arrow's unchecked kernel wraps on
+    # int64 overflow, and the wrap is silent. A timestamp[s] tick of 2^62
+    # is a perfectly legal value that scales to exactly 0 micros — every
+    # such row would partition as the epoch, and pruning would then miss
+    # the file for its real range. Raising is the only honest answer; the
+    # caller cannot partition what it cannot represent.
     if unit == "s":
-        return pc.multiply(raw, 1_000_000)
+        return pc.multiply_checked(raw, 1_000_000)
     if unit == "ms":
-        return pc.multiply(raw, 1_000)
+        return pc.multiply_checked(raw, 1_000)
     if unit == "ns":
         return _floordiv(raw, 1_000)
     return raw  # "us": already the stored unit
@@ -456,10 +465,13 @@ def _temporal_ints(transform: str, arr: pa.Array, col_type: str) -> pa.Array:
     """Arrow-native year/month/day/hour over a date/timestamp column."""
     _check_temporal(transform, col_type)
     if transform == "year":
-        return pc.subtract(pc.year(arr), 1970)
+        return pc.subtract_checked(pc.year(arr), 1970)
     if transform == "month":
-        years = pc.subtract(pc.year(arr), 1970)
-        return pc.add(pc.multiply(years, 12), pc.subtract(pc.month(arr), 1))
+        years = pc.subtract_checked(pc.year(arr), 1970)
+        return pc.add_checked(
+            pc.multiply_checked(years, 12),
+            pc.subtract_checked(pc.month(arr), 1),
+        )
     if col_type == "date":  # day; hour is rejected for date by _check_temporal
         return pc.cast(pc.cast(arr, pa.int32()), pa.int64())
     micros = _timestamp_micros(arr)

@@ -435,13 +435,21 @@ class AlterService(private val jdbi: Jdbi) {
                         // caller looking for a syntax error, when the answer
                         // is that nobody has specified how to hash this type.
                         val why =
-                            if (col.def.type in HASH_DOMAIN_MISMATCHED) {
-                                "Iceberg hashes the MAPPED type's representation " +
-                                    "('${col.def.type.wire}' maps to " +
-                                    "'${col.def.type.icebergType.wire}'), and hoglake has no " +
-                                    "cross-language contract for that hash yet"
-                            } else {
-                                "the Iceberg spec excludes it from the bucket hash domain"
+                            when (col.def.type) {
+                                in HASH_DOMAIN_MISMATCHED ->
+                                    "Iceberg hashes the MAPPED type's representation " +
+                                        "('${col.def.type.wire}' maps to " +
+                                        "'${col.def.type.icebergType.wire}'), and hoglake has no " +
+                                        "cross-language contract for that hash yet"
+                                // NOT "the spec excludes it" — Iceberg buckets
+                                // strings, and json maps to string. The problem
+                                // is that JSON has no canonical byte form.
+                                ColType.JSON ->
+                                    "the bucket hash runs over bytes, and documents that are equal " +
+                                        "as JSON can have different bytes (key order, whitespace, " +
+                                        "number spelling), so bucket assignment would depend on " +
+                                        "which writer serialized the value rather than on the value"
+                                else -> "the Iceberg spec excludes it from the bucket hash domain"
                             }
                         throw HoglakeException.Validation(
                             "bucket transform cannot be applied to column '${col.def.name}' of type " +
@@ -742,7 +750,12 @@ class AlterService(private val jdbi: Jdbi) {
         }
     }
 
-    private companion object {
+    /**
+     * Not private: BUCKETABLE_TYPES is a contract the tests assert by
+     * CONTENTS (so adding a type is a conscious act) and that
+     * pyhoglake's parity test compares against its own allowlist.
+     */
+    companion object {
         val TEMPORAL_TRANSFORMS =
             setOf(Transform.YEAR, Transform.MONTH, Transform.DAY, Transform.HOUR)
 
@@ -765,15 +778,34 @@ class AlterService(private val jdbi: Jdbi) {
             )
 
         /**
-         * Sources bucket(n) accepts. Three exclusion reasons, all
-         * recorded in iceberg-federation.md §3:
+         * Sources bucket(n) accepts — an explicit ALLOWLIST, not the
+         * complement of an exclusion list.
+         *
+         * That shape is the point. Written as `entries - excluded`, every
+         * ColType added in future became bucketable by default, and the
+         * only thing standing between a new type and an unverified hash
+         * contract was someone remembering to add a line. The policy is
+         * admit-deliberately (iceberg-federation.md §3), so the code has
+         * to fail closed: a new member is NOT bucketable until it is
+         * named here, and naming it means having decided how it hashes.
+         * pyhoglake's `_BUCKETABLE` is already a positive list, and the
+         * two must stay set-equal (test_transforms.py parses this
+         * declaration); the client is where bucket values are actually
+         * computed, so a divergence means the server accepting a spec the
+         * writer cannot honour.
+         *
+         * What is deliberately absent, and why:
          *
          *  - boolean/float/double: outside the Iceberg spec's Appendix-B
          *    hash domain outright.
-         *  - json: bucketing hashes BYTES, and two documents that are
-         *    equal as JSON (key order, whitespace, number spelling) have
-         *    different bytes, so equal values would scatter across
-         *    partitions and prune wrong.
+         *  - json: two documents that are equal AS JSON (key order,
+         *    whitespace, number spelling, unicode escaping) have
+         *    different bytes, and the hash runs over bytes — so bucket
+         *    assignment depends on which writer serialized the value,
+         *    not on the value. Equal data would scatter across
+         *    partitions and prune wrong. Iceberg buckets strings
+         *    perfectly well; it is JSON's lack of a canonical byte form
+         *    that makes this unsafe.
          *  - uint32/uint64/timestamp_s/timestamp_ms/timestamp_ns: the
          *    hash-domain mismatch. Appendix B hashes the MAPPED type's
          *    representation — timestamps as micros, uint64-as-decimal as
@@ -786,25 +818,24 @@ class AlterService(private val jdbi: Jdbi) {
          *    partition values nobody has verified. Identity and truncate
          *    only; re-admitting them is a deliberate future change with
          *    those vectors attached, not a default.
-         *
-         * pyhoglake's `_BUCKETABLE` must equal this set exactly (there
-         * is a test); the client is where bucket values are actually
-         * computed, so a divergence would mean the server accepts a spec
-         * the writer cannot honour.
          */
         val BUCKETABLE_TYPES =
-            ColType.entries.toSet() -
-                setOf(
-                    ColType.BOOLEAN,
-                    ColType.FLOAT,
-                    ColType.DOUBLE,
-                    ColType.JSON,
-                    ColType.UINT32,
-                    ColType.UINT64,
-                    ColType.TIMESTAMP_S,
-                    ColType.TIMESTAMP_MS,
-                    ColType.TIMESTAMP_NS,
-                )
+            setOf(
+                ColType.INT8,
+                ColType.INT16,
+                ColType.INT,
+                ColType.LONG,
+                ColType.UINT8,
+                ColType.UINT16,
+                ColType.DECIMAL,
+                ColType.DATE,
+                ColType.TIME,
+                ColType.TIMESTAMP,
+                ColType.TIMESTAMPTZ,
+                ColType.STRING,
+                ColType.UUID_T,
+                ColType.BINARY,
+            )
 
         /** Types whose bucket refusal is about the mapped type's hash domain. */
         val HASH_DOMAIN_MISMATCHED =
