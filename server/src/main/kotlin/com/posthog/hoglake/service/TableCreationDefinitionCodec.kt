@@ -32,6 +32,7 @@ import com.posthog.hoglake.model.ColumnDef
  * already stored changes meaning and `requireSame`'s normalize-then-
  * compare is unaffected.
  */
+
 internal object TableCreationDefinitionCodec {
     private val mapper = jacksonObjectMapper().enable(SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS)
     private val paramsType = object : TypeReference<Map<String, Any?>>() {}
@@ -68,22 +69,61 @@ internal object TableCreationDefinitionCodec {
             column.children?.let { kids -> put("children", kids.map { encodeColumn(it) }) }
         }
 
+    /**
+     * Read a stored receipt. Anything unreadable — bad JSON, a missing
+     * field, an unknown type spelling, an unknown version — comes back
+     * as one [CorruptDefinitionException] naming the defect, never as a
+     * raw NPE from a chained `.asText()`.
+     */
     fun decode(encoded: String): TableCreationDefinition {
-        val node = mapper.readTree(encoded)
+        val node =
+            try {
+                mapper.readTree(encoded)
+            } catch (e: Exception) {
+                throw CorruptDefinitionException("stored table creation definition is not valid JSON", e)
+            }
+        if (node == null || !node.isObject) {
+            throw CorruptDefinitionException("stored table creation definition is not a JSON object")
+        }
         val version = node["version"]?.asInt() ?: 0
-        check(version in 0..NESTED_VERSION) { "unsupported table creation definition version $version" }
+        if (version !in 0..NESTED_VERSION) {
+            throw CorruptDefinitionException("unsupported table creation definition version $version")
+        }
+        val columns =
+            node["columns"]
+                ?.takeIf { it.isArray }
+                ?: throw CorruptDefinitionException("stored table creation definition has no 'columns' array")
         return TableCreationDefinition(
-            node["namespace"].asText(),
-            node["name"].asText(),
-            node["columns"].map { decodeColumn(it, version) },
+            text(node, "namespace", "the definition"),
+            text(node, "name", "the definition"),
+            columns.map { decodeColumn(it, version) },
         )
+    }
+
+    /** A required string field, or the named refusal. */
+    private fun text(
+        node: JsonNode,
+        field: String,
+        where: String,
+    ): String {
+        val value = node[field]
+        if (value == null || value.isNull || !value.isTextual) {
+            throw CorruptDefinitionException(
+                "stored table creation definition is missing the string field '$field' in $where",
+            )
+        }
+        return value.asText()
     }
 
     private fun decodeColumn(
         column: JsonNode,
         version: Int,
     ): ColumnDef {
-        val storedType = column["type"].asText()
+        if (!column.isObject) {
+            throw CorruptDefinitionException("stored table creation definition has a non-object column")
+        }
+        val name = text(column, "name", "a column")
+        val storedType = text(column, "type", "column '$name'")
         val wireType =
             if (version == 0) {
                 // Compatibility with receipts written before the versioned format.
@@ -93,10 +133,33 @@ internal object TableCreationDefinitionCodec {
             }
         val params = column[if (version == 0) "typeParams" else "type_params"]
         val children = column["children"]
+        val type =
+            try {
+                ColType.fromWire(wireType)
+            } catch (e: Exception) {
+                throw CorruptDefinitionException(
+                    "stored table creation definition gives column '$name' the unknown type '$storedType'",
+                    e,
+                )
+            }
+        val decodedParams =
+            try {
+                if (params == null || params.isNull) null else mapper.convertValue(params, paramsType)
+            } catch (e: Exception) {
+                throw CorruptDefinitionException(
+                    "stored table creation definition has unreadable type_params for column '$name'",
+                    e,
+                )
+            }
+        if (children != null && !children.isNull && !children.isArray) {
+            throw CorruptDefinitionException(
+                "stored table creation definition has non-array 'children' for column '$name'",
+            )
+        }
         return ColumnDef(
-            column["name"].asText(),
-            ColType.fromWire(wireType),
-            if (params == null || params.isNull) null else mapper.convertValue(params, paramsType),
+            name,
+            type,
+            decodedParams,
             column["nullable"]?.asBoolean() ?: true,
             // ABSENT children decode to null, not to an empty list: every
             // version-0 and version-1 receipt is a scalar definition, and
@@ -107,3 +170,23 @@ internal object TableCreationDefinitionCodec {
         )
     }
 }
+
+/**
+ * A stored table-creation receipt that cannot be read back.
+ *
+ * Every field [TableCreationDefinitionCodec.decode] reads was written by
+ * [TableCreationDefinitionCodec.encode], so reaching this means the row
+ * was truncated, hand-edited, or written by something else — and the
+ * blob is caller-supplied only in the sense that a caller's definition
+ * went in. What came back out is the server's own storage, so this is
+ * not a 422; it is one named 500 that says WHICH receipt is unreadable
+ * and why.
+ *
+ * It exists because the alternative was five different raw
+ * NullPointerExceptions (one per missing field), an
+ * IllegalArgumentException out of `ColType.fromWire`, and a Jackson
+ * parse error, each surfacing as a bare "500 internal error" with a
+ * stack trace pointing at a `.asText()` call rather than at the row.
+ */
+internal class CorruptDefinitionException(message: String, cause: Throwable? = null) :
+    IllegalStateException(message, cause)

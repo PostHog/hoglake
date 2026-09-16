@@ -615,10 +615,32 @@ fun List<Column>.allNodes(): List<Column> = flatMap { it.selfAndDescendants() }
 
 /**
  * Depth of the deepest node in [defs], counting a top-level column as
- * depth 1. Used by the create/alter depth cap.
+ * depth 1, stopping at [cap]. Used by the create/alter depth cap.
+ *
+ * ITERATIVE, level by level, and that is the whole point: this function
+ * is the depth CHECK, so it is the one place that must survive input the
+ * check exists to refuse. The recursive version overflowed the stack at
+ * roughly twenty thousand levels — a StackOverflowError out of the
+ * validator, before the named 422 the caller was owed, from the code
+ * whose documented job was preventing exactly that.
+ *
+ * [cap] bails early: past it the exact depth stops mattering, since
+ * every answer means the same refusal. The return is therefore
+ * `min(depth, cap)`, and a caller that needs to know whether it bailed
+ * compares against [cap].
  */
-fun columnDefDepth(defs: List<ColumnDef>): Int =
-    defs.maxOfOrNull { 1 + (it.children?.let { c -> columnDefDepth(c) } ?: 0) } ?: 0
+fun columnDefDepth(
+    defs: List<ColumnDef>,
+    cap: Int = Int.MAX_VALUE,
+): Int {
+    var depth = 0
+    var level = defs
+    while (level.isNotEmpty() && depth < cap) {
+        depth++
+        level = level.flatMap { it.children ?: emptyList() }
+    }
+    return depth
+}
 
 /**
  * The maximum nesting depth a hoglake column may have, top-level
@@ -845,6 +867,16 @@ data class CompactionResult(
      * schema or the file set changes; skip-with-reason, not a failure.
      */
     val unconvertibleSchema: Long = 0,
+    /**
+     * Groups skipped because an input holds a value that cannot exist
+     * under the type its own file declares (an empty byte array under a
+     * decimal, an unscaled value wider than the destination precision),
+     * or a row large enough to threaten the heap. Skip-with-reason, like
+     * [unconvertibleSchema] — but where a schema skip clears when the
+     * schema or the file set moves, bad bytes are durable, so this one
+     * never self-heals. Nonzero means a WRITER is at fault.
+     */
+    val invalidData: Long = 0,
     /**
      * Groups that FAILED outright (unreadable input, S3 error, corrupt
      * DV): the group is retried next run, and unlike the skip flavors

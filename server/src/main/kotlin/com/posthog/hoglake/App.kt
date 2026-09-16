@@ -98,6 +98,7 @@ class App private constructor(
                 tierTarget = cfg.compactionTierTarget,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
+                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
             ),
         )
 

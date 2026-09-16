@@ -18,6 +18,7 @@ import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
+import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType
@@ -25,6 +26,7 @@ import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import java.math.BigInteger
 import java.nio.file.Path
+import kotlin.io.path.deleteIfExists
 
 /**
  * A compaction group whose inputs cannot be rewritten under the live
@@ -34,6 +36,27 @@ import java.nio.file.Path
  * (CompactionResult.unconvertibleSchema), never a failure.
  */
 class UnconvertibleSchemaException(message: String) : IllegalArgumentException(message)
+
+/**
+ * A compaction group whose SCHEMA is convertible but whose DATA is not:
+ * a value that cannot exist under the type its own file declares (an
+ * empty byte array under a decimal, an unscaled value wider than the
+ * destination precision), or a row so large it would exhaust the heap.
+ *
+ * Distinct from [UnconvertibleSchemaException] on the axis that matters
+ * operationally: a schema skip clears when the schema or the file set
+ * moves, so a re-plan is free. A data skip does NOT clear — the bad
+ * bytes are durable — so retrying it hot is a permanent loop over the
+ * same failing rows. Both are skip-with-reason; this one is counted
+ * separately (CompactionResult.invalidData) because a nonzero count
+ * means a WRITER is producing values its own schema forbids, and that
+ * is a bug report, not a compaction backlog.
+ *
+ * Before this existed these threw raw NumberFormatException out of
+ * BigInteger and landed in the catch-all as failed_groups, which retried
+ * them every run forever.
+ */
+class InvalidDataException(message: String) : IllegalArgumentException(message)
 
 /**
  * The compaction rewrite writer, on parquet-java — the project's one
@@ -104,6 +127,26 @@ object ParquetRewriter {
     const val ROW_ID_FIELD_ID = 2147483646
 
     /**
+     * Default per-ROW node budget: how many parquet-java `Group`/value
+     * nodes one input row may materialize before the group is refused as
+     * [InvalidDataException].
+     *
+     * Both rewrite paths materialize a row whole — one list element is
+     * one `SimpleGroup` with a header, a field array and a boxed value,
+     * roughly 50-100 bytes of heap — so a single row with a
+     * hundred-million-element list is an OOM, and an OOM in a background
+     * loop is process-fatal, not group-fatal: it takes the whole server
+     * down with it, including the request path. Nothing upstream bounds
+     * a row's element count (the commit path has no such limit), so the
+     * bound lives here.
+     *
+     * A million nodes is ~100 MB of graph — deliberately far above any
+     * honest row and far below the heap. The point is to convert a
+     * process kill into one counted skip, not to police row shape.
+     */
+    const val DEFAULT_MAX_NODES_PER_ROW = 1_000_000
+
+    /**
      * The synthetic repeated-group names the parquet LIST and MAP
      * encodings use. Written, never required on read: the parquet spec
      * says these names are not significant, and writers disagree about
@@ -129,6 +172,26 @@ object ParquetRewriter {
     data class RewriteResult(val rowsWritten: Long, val minRowId: Long?)
 
     private class Row(val group: Group, val rowId: Long)
+
+    /**
+     * One row's node allowance, spent as the copy descends. Checked
+     * DURING construction, not after: an after-the-fact count would have
+     * to build the graph first, which is the thing that kills the
+     * process.
+     */
+    private class NodeBudget(private val limit: Int, private val source: Path) {
+        private var spent = 0
+
+        fun spend() {
+            spent++
+            if (spent > limit) {
+                throw InvalidDataException(
+                    "a row in $source materializes more than $limit nodes; refusing the group " +
+                        "rather than risking a process-fatal OOM in the compaction loop",
+                )
+            }
+        }
+    }
 
     /**
      * How one matched input column lands in the output.
@@ -167,8 +230,30 @@ object ParquetRewriter {
         liveColumns: List<Column>,
         sortFields: List<SortFieldDef>,
         output: Path,
+        maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
+        // A refusal mid-write leaves a truncated parquet file on disk —
+        // no footer, unreadable, and (when the caller reuses the path)
+        // indistinguishable from a real output. The rewriter owns the
+        // path it was handed, so it owns the cleanup: nothing survives a
+        // throw. Callers still clean their own temp dirs; this makes the
+        // contract hold for every caller, not just the careful one.
+        try {
+            return rewriteInto(inputs, liveColumns, sortFields, output, maxNodesPerRow)
+        } catch (e: Throwable) {
+            runCatching { output.deleteIfExists() }
+            throw e
+        }
+    }
+
+    private fun rewriteInto(
+        inputs: List<Input>,
+        liveColumns: List<Column>,
+        sortFields: List<SortFieldDef>,
+        output: Path,
+        maxNodesPerRow: Int,
+    ): RewriteResult {
         val outputSchema = outputSchema(liveColumns)
         val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
         val rowIdIndex = outputSchema.fieldCount - 1
@@ -181,16 +266,23 @@ object ParquetRewriter {
             // server on a 400 MB catalog; heap must stay flat in group
             // size (parquet-java's own row-group buffering bounds it).
             //
-            // Flat in GROUP size, not in ROW size. One row still
-            // materializes whole — a million-element list is a million
-            // SimpleGroups at once — and nothing here bounds that,
-            // because nothing upstream bounds a row's element count.
-            // Accepted limit, stated rather than implied.
+            // Flat in GROUP size, not in ROW size: one row still
+            // materializes whole. That used to be an accepted limit with
+            // no bound at all, which made a single pathological row a
+            // process-fatal OOM; [maxNodesPerRow] now caps it, so the
+            // worst case is one counted invalid_data skip.
             var written = 0L
             var minRowId: Long? = null
             newWriter(outputSchema, output).use { writer ->
                 for (input in inputs) {
-                    forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory) { group, rowId ->
+                    forEachSurvivor(
+                        input,
+                        liveColumns,
+                        dataFields,
+                        rowIdIndex,
+                        factory,
+                        maxNodesPerRow,
+                    ) { group, rowId ->
                         writer.write(group)
                         written++
                         minRowId = minOf(minRowId ?: rowId, rowId)
@@ -218,12 +310,12 @@ object ParquetRewriter {
         // CompactionService derates the group budget by
         // CompactionConfig.nestedSortExpansion for a table that both
         // nests and sorts, so the materialized graph lands back under
-        // roughly targetBytes. Per GROUP only — one pathological ROW
-        // still materializes whole, as on the streaming path above.
+        // roughly targetBytes. That bound is per GROUP; the per-ROW one
+        // is [maxNodesPerRow], as on the streaming path above.
         val rows = ArrayList<Row>()
         var minRowId: Long? = null
         for (input in inputs) {
-            forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory) { group, rowId ->
+            forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory, maxNodesPerRow) { group, rowId ->
                 rows.add(Row(group, rowId))
                 minRowId = minOf(minRowId ?: rowId, rowId)
             }
@@ -240,13 +332,14 @@ object ParquetRewriter {
         dataFields: List<Type>,
         rowIdIndex: Int,
         factory: SimpleGroupFactory,
+        maxNodesPerRow: Int,
         emit: (Group, Long) -> Unit,
     ) {
         val schema = readSchema(input.localPath)
+        refuseDuplicateNames(schema, emptyList())
         // A previously-compacted input carries its ids in its own
         // row-id column; positional ids would be wrong for it.
-        val srcRowIdIndex =
-            schema.fields.indexOfFirst { it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
+        val srcRowIdIndex = rowIdCarrier(schema, input.localPath)
         val plan = columnPlan(schema, liveColumns, input.localPath)
         var applied = 0L
         readRows(input.localPath, schema) { src, ordinal ->
@@ -255,13 +348,29 @@ object ParquetRewriter {
                 return@readRows
             }
             val dst = factory.newGroup()
+            val budget = NodeBudget(maxNodesPerRow, input.localPath)
             for ((outIdx, step) in plan.withIndex()) {
                 if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
-                    copyField(src, step, dst, outIdx, dataFields[outIdx])
+                    copyField(src, step, dst, outIdx, dataFields[outIdx], budget)
                 }
             }
             val rowId =
                 if (srcRowIdIndex != null) {
+                    // PRESENT, not merely declared. A compaction output's
+                    // row id is required, so a null in the carrier means
+                    // the file is not what it says it is — and reading it
+                    // anyway threw a raw RuntimeException out of
+                    // parquet-java's Group ("not found ... element
+                    // number 0"). Falling back to the positional id would
+                    // be worse than the crash: it would silently give the
+                    // row a DIFFERENT identity from the one it was
+                    // committed with.
+                    if (src.getFieldRepetitionCount(srcRowIdIndex) == 0) {
+                        throw InvalidDataException(
+                            "row $ordinal of ${input.localPath} has a null $ROW_ID_COLUMN; the " +
+                                "row id of a compacted file is required",
+                        )
+                    }
                     src.getLong(srcRowIdIndex, 0)
                 } else {
                     input.rowIdStart + ordinal
@@ -273,6 +382,78 @@ object ParquetRewriter {
         check(applied == expected) {
             "deletion vector for ${input.localPath} claims $expected positions but only " +
                 "$applied fell inside the file — refusing a lossy compaction"
+        }
+    }
+
+    /**
+     * The index of this input's row-id carrier, or null when it has
+     * none (an uncompacted input, whose ids come from its position).
+     *
+     * Bound by RESERVED FIELD ID first and by name only as a fallback
+     * for the id-less files the hydrator also tolerates — and either way
+     * the carrier must be what the contract says it is: a primitive
+     * int64. The old check was `name == ROW_ID_COLUMN` and nothing else,
+     * so an input whose `_hog_row_id` was a struct (or a string, or a
+     * list) reached `getLong` and came back out as a ClassCastException
+     * from inside the copy loop — an untyped crash counted as a failed
+     * group and retried every run. A field wearing the reserved name
+     * without the reserved shape is a refusal, never a guess: treating
+     * it as "no carrier" would silently renumber every row in a
+     * previously-compacted file.
+     */
+    private fun rowIdCarrier(
+        schema: MessageType,
+        source: Path,
+    ): Int? {
+        val index =
+            schema.fields.indexOfFirst { it.id?.intValue() == ROW_ID_FIELD_ID }
+                .takeIf { it >= 0 }
+                ?: schema.fields.indexOfFirst { it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
+                ?: return null
+        val field = schema.fields[index]
+        val primitive = if (field.isPrimitive) field.asPrimitiveType() else null
+        if (primitive?.primitiveTypeName != PrimitiveType.PrimitiveTypeName.INT64) {
+            throw UnconvertibleSchemaException(
+                "$source carries a field '${field.name}' in the reserved row-id position " +
+                    "(field id $ROW_ID_FIELD_ID / name $ROW_ID_COLUMN) that is not a primitive " +
+                    "int64; refusing rather than renumbering the file's rows",
+            )
+        }
+        if (field.isRepetition(Type.Repetition.REPEATED)) {
+            throw UnconvertibleSchemaException(
+                "$source carries a REPEATED row-id column '${field.name}'; the row id is one " +
+                    "value per row",
+            )
+        }
+        return index
+    }
+
+    /**
+     * Refuse an input whose schema names two siblings the same thing, at
+     * any level.
+     *
+     * Parquet's own type model does not forbid it, but everything above
+     * it assumes otherwise: name-based binding picks one arbitrarily,
+     * and the writer's `GroupType` lookups resolve by name too, so a
+     * duplicate surfaced as a raw ParquetEncodingException (or an NPE)
+     * from inside parquet-java rather than as a refusal here. Whichever
+     * of the two columns a rewrite happened to pick would have been a
+     * coin flip about the user's data.
+     */
+    private fun refuseDuplicateNames(
+        group: GroupType,
+        path: List<String>,
+    ) {
+        val dupes = group.fields.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+        if (dupes.isNotEmpty()) {
+            val where = if (path.isEmpty()) "the file schema" else "'${path.joinToString(".")}'"
+            throw UnconvertibleSchemaException(
+                "input schema names more than one field ${dupes.sorted()} inside $where; " +
+                    "columns bind by name or id, and a duplicate name makes the binding a guess",
+            )
+        }
+        for (field in group.fields) {
+            if (!field.isPrimitive) refuseDuplicateNames(field.asGroupType(), path + field.name)
         }
     }
 
@@ -298,6 +479,19 @@ object ParquetRewriter {
      */
     private fun outputSchema(liveColumns: List<Column>): MessageType {
         require(liveColumns.isNotEmpty()) { "table has no live columns" }
+        // The DDL path reserves the `_hog` prefix
+        // (Identifiers.validateColumn), so a live column with this name
+        // can only be a pre-reservation table or a hand-edited catalog
+        // row. Either way the schema below would declare the name TWICE
+        // with two different field ids, and parquet-java answers that
+        // with a raw ParquetDecodingException from inside the writer.
+        // Refuse it here, typed, and let the table be fixed by a rename.
+        liveColumns.firstOrNull { it.def.name == ROW_ID_COLUMN }?.let {
+            throw UnconvertibleSchemaException(
+                "live column '${it.def.name}' (field ${it.fieldId}) collides with compaction's " +
+                    "reserved row-id column; rename it before this table can be compacted",
+            )
+        }
         val dataFields = liveColumns.map { parquetTypeFor(it) }
         val rowIdField: Type =
             Types.required(PrimitiveType.PrimitiveTypeName.INT64)
@@ -528,7 +722,10 @@ object ParquetRewriter {
                     "are the binding contract and a duplicate has no correct resolution",
             )
         }
-        return planChildren(schema.fields, liveColumns, inputPath)
+        // The FILE-level gate, computed once and threaded down — the
+        // reader's gate, so the two surfaces answer the same question
+        // about the same file.
+        return planChildren(schema.fields, liveColumns, FooterStats.usesFieldIds(schema), inputPath)
     }
 
     /** Field ids [fields] declares more than once, at any depth. */
@@ -546,20 +743,30 @@ object ParquetRewriter {
         return dupes
     }
 
-    /** [columnPlan]'s recursion: one step per live column among [srcFields]. */
+    /**
+     * [columnPlan]'s recursion: one step per live column among
+     * [srcFields], bound by [FooterStats.bindsTo] — the reader's rule,
+     * called rather than re-implemented.
+     *
+     * [useFieldIds] is the FILE-level gate the reader applies, and the
+     * rewriter now applies it too. Without it the two surfaces answered
+     * differently about the same file: a file with ids on its wrappers
+     * and none on its leaves produced zero stats on the read side and a
+     * complete copy on the write side.
+     */
     private fun planChildren(
         srcFields: List<Type>,
         liveColumns: List<Column>,
+        useFieldIds: Boolean,
         inputPath: Path,
     ): List<Step?> =
         liveColumns.map { column ->
             val srcIndex =
-                srcFields.indexOfFirst { it.id?.intValue()?.toLong() == column.fieldId }
+                srcFields
+                    .indexOfFirst { FooterStats.bindsTo(it, column.fieldId, column.def.name, useFieldIds) }
                     .takeIf { it >= 0 }
-                    ?: srcFields.indexOfFirst { it.id == null && it.name == column.def.name }
-                        .takeIf { it >= 0 }
                     ?: return@map null
-            planNode(srcFields[srcIndex], srcIndex, column, inputPath)
+            planNode(srcFields[srcIndex], srcIndex, column, useFieldIds, inputPath)
         }
 
     /**
@@ -586,6 +793,7 @@ object ParquetRewriter {
         srcFields: List<Type>,
         position: Int,
         column: Column,
+        useFieldIds: Boolean,
         inputPath: Path,
     ): Step? {
         // POSITION decides, and the id only VERIFIES — the reader's rule
@@ -600,8 +808,10 @@ object ParquetRewriter {
         // level, retried forever) rather than the skip-with-reason it is.
         val candidate = srcFields.getOrNull(position) ?: return null
         val id = candidate.id
-        if (id != null && id.intValue().toLong() != column.fieldId) return null
-        return planNode(candidate, position, column, inputPath)
+        // ...and only when the FILE binds by id at all, matching the
+        // reader's file-level gate.
+        if (id != null && (!useFieldIds || id.intValue().toLong() != column.fieldId)) return null
+        return planNode(candidate, position, column, useFieldIds, inputPath)
     }
 
     /**
@@ -631,6 +841,7 @@ object ParquetRewriter {
         src: Type,
         srcIndex: Int,
         column: Column,
+        useFieldIds: Boolean,
         inputPath: Path,
     ): Step {
         fun refuseShape(detail: String): Nothing =
@@ -688,7 +899,7 @@ object ParquetRewriter {
                             "wearing a struct's field id is a type mismatch, not a schema evolution",
                     )
                 }
-                Step.StructStep(srcIndex, planChildren(group.fields, column.children, inputPath))
+                Step.StructStep(srcIndex, planChildren(group.fields, column.children, useFieldIds, inputPath))
             }
             ColType.LIST -> {
                 val entry =
@@ -706,7 +917,7 @@ object ParquetRewriter {
                     )
                 }
                 val element =
-                    planSynthetic(entry.fields, 0, column.children[0], inputPath)
+                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath)
                         ?: refuseShape("the input list's element does not match the live element field id")
                 Step.ListStep(srcIndex, element)
             }
@@ -731,10 +942,10 @@ object ParquetRewriter {
                     )
                 }
                 val key =
-                    planSynthetic(entry.fields, 0, column.children[0], inputPath)
+                    planSynthetic(entry.fields, 0, column.children[0], useFieldIds, inputPath)
                         ?: refuseShape("the input map's key does not match the live key field id")
                 val value =
-                    planSynthetic(entry.fields, 1, column.children[1], inputPath)
+                    planSynthetic(entry.fields, 1, column.children[1], useFieldIds, inputPath)
                         ?: refuseShape("the input map's value does not match the live value field id")
                 Step.MapStep(srcIndex, key, value)
             }
@@ -878,10 +1089,36 @@ object ParquetRewriter {
             }
             // json and string are both BYTE_ARRAY; the bytes pass through
             // untouched either way.
+            // The bytes pass through untouched either way — but the
+            // ANNOTATION does not: the output re-stamps this leaf
+            // STRING/JSON/none, so copying a DECIMAL-annotated BINARY
+            // would relabel a signed two's-complement number as text and
+            // hand the new footer's statistics an ordering the bytes do
+            // not have. Annotation laundering, and the reader refuses the
+            // same pairing (FooterStats.bytesSortUnsigned).
             ColType.STRING, ColType.JSON ->
-                if (srcName == PrimitiveType.PrimitiveTypeName.BINARY) CopyMode.IDENTITY else refuse()
+                if (srcName == PrimitiveType.PrimitiveTypeName.BINARY &&
+                    FooterStats.bytesSortUnsigned(src.logicalTypeAnnotation)
+                ) {
+                    CopyMode.IDENTITY
+                } else {
+                    refuse()
+                }
+            // FIXED_LEN_BYTE_ARRAY too: a fixed-width blob IS bytes, the
+            // reader has always bounded one under a binary column, and
+            // refusing it here left such a table bounded but permanently
+            // uncompactable. The output is BINARY, which holds them.
             ColType.BINARY ->
-                if (srcName == PrimitiveType.PrimitiveTypeName.BINARY) CopyMode.IDENTITY else refuse()
+                if ((
+                        srcName == PrimitiveType.PrimitiveTypeName.BINARY ||
+                            srcName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY
+                    ) &&
+                    FooterStats.bytesSortUnsigned(src.logicalTypeAnnotation)
+                ) {
+                    CopyMode.IDENTITY
+                } else {
+                    refuse()
+                }
             ColType.UUID_T ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && src.typeLength == 16) {
                     CopyMode.IDENTITY
@@ -957,7 +1194,9 @@ object ParquetRewriter {
         dst: Group,
         dstIdx: Int,
         dstType: Type,
+        budget: NodeBudget,
     ) {
+        budget.spend()
         when (step) {
             is Step.Scalar -> copyValue(src, step, dst, dstIdx, dstType.asPrimitiveType())
             is Step.StructStep -> {
@@ -966,7 +1205,7 @@ object ParquetRewriter {
                 val dstStruct = dstType.asGroupType()
                 for ((i, child) in step.children.withIndex()) {
                     if (child != null && srcGroup.getFieldRepetitionCount(child.srcIndex) > 0) {
-                        copyField(srcGroup, child, dstGroup, i, dstStruct.getType(i))
+                        copyField(srcGroup, child, dstGroup, i, dstStruct.getType(i), budget)
                     }
                 }
             }
@@ -982,7 +1221,7 @@ object ParquetRewriter {
                     val srcEntry = srcList.getGroup(0, i)
                     val dstEntry = dstList.addGroup(0)
                     if (srcEntry.getFieldRepetitionCount(step.element.srcIndex) > 0) {
-                        copyField(srcEntry, step.element, dstEntry, 0, dstEntryType.getType(0))
+                        copyField(srcEntry, step.element, dstEntry, 0, dstEntryType.getType(0), budget)
                     }
                 }
             }
@@ -996,9 +1235,9 @@ object ParquetRewriter {
                     val dstEntry = dstMap.addGroup(0)
                     // The key is REQUIRED on both sides (planNode refuses
                     // an optional input key), so it is always present.
-                    copyField(srcEntry, step.key, dstEntry, 0, dstEntryType.getType(0))
+                    copyField(srcEntry, step.key, dstEntry, 0, dstEntryType.getType(0), budget)
                     if (srcEntry.getFieldRepetitionCount(step.value.srcIndex) > 0) {
-                        copyField(srcEntry, step.value, dstEntry, 1, dstEntryType.getType(1))
+                        copyField(srcEntry, step.value, dstEntry, 1, dstEntryType.getType(1), budget)
                     }
                 }
             }
@@ -1026,12 +1265,28 @@ object ParquetRewriter {
                     when (step.mode) {
                         CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(src.getInteger(srcIdx, 0).toLong())
                         CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(src.getLong(srcIdx, 0))
-                        else -> BigInteger(src.getBinary(srcIdx, 0).bytes)
+                        else -> {
+                            // A zero-length byte array is not a decimal:
+                            // BigInteger("") throws, and there is no
+                            // sensible value to invent. The file declared
+                            // DECIMAL and then stored something else.
+                            val bytes = src.getBinary(srcIdx, 0).bytes
+                            if (bytes.isEmpty()) {
+                                throw InvalidDataException(
+                                    "empty byte array under decimal column '${primitive.name}' — " +
+                                        "a decimal's unscaled value needs at least one byte",
+                                )
+                            }
+                            BigInteger(bytes)
+                        }
                     }
                 val annotation = primitive.logicalTypeAnnotation as LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
                 val precision = annotation.precision
                 if (unscaled.abs().toString().length > precision) {
-                    throw UnconvertibleSchemaException("decimal value exceeds destination precision $precision")
+                    // The VALUE is wrong, not the schema pairing: same
+                    // two schemas with in-range values rewrite fine, so
+                    // re-planning this group will never help.
+                    throw InvalidDataException("decimal value exceeds destination precision $precision")
                 }
                 dst.add(dstIdx, Binary.fromConstantByteArray(unscaled.toByteArray()))
             }
@@ -1205,7 +1460,7 @@ object ParquetRewriter {
                 val ab = a.getBinary(idx, 0).bytes
                 val bb = b.getBinary(idx, 0).bytes
                 if (primitive.logicalTypeAnnotation is LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) {
-                    BigInteger(ab).compareTo(BigInteger(bb))
+                    decimalOf(primitive, ab).compareTo(decimalOf(primitive, bb))
                 } else {
                     java.util.Arrays.compareUnsigned(ab, bb)
                 }
@@ -1213,4 +1468,18 @@ object ParquetRewriter {
             PrimitiveType.PrimitiveTypeName.INT96, null ->
                 throw IllegalArgumentException("unsupported sort key type ${primitive.primitiveTypeName}")
         }
+
+    /** Same refusal as the copy path: an empty blob is not a decimal. */
+    private fun decimalOf(
+        primitive: PrimitiveType,
+        bytes: ByteArray,
+    ): BigInteger {
+        if (bytes.isEmpty()) {
+            throw InvalidDataException(
+                "empty byte array under decimal sort key '${primitive.name}' — " +
+                    "a decimal's unscaled value needs at least one byte",
+            )
+        }
+        return BigInteger(bytes)
+    }
 }

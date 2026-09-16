@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.columnDefDepth
+import com.posthog.hoglake.model.nodeCount
 
 /**
  * The column-TREE rules: what a nested [ColumnDef] must look like before
@@ -46,36 +47,62 @@ object ColumnTrees {
     fun validate(
         defs: List<ColumnDef>,
         depthOffset: Int = 0,
+        existingNodes: Int = 0,
     ) {
-        val depth = depthOffset + columnDefDepth(defs)
-        if (depth > MAX_COLUMN_NESTING_DEPTH) {
+        // Size FIRST, and by NODES: a forest counted by its roots hides
+        // its real cost by its fan-out, and the walks below should never
+        // run over a request this cap already refuses.
+        val nodes = existingNodes + nodeCount(defs)
+        if (nodes > MAX_COLUMN_NODES) {
             throw HoglakeException.Validation(
-                "column nesting depth $depth exceeds the maximum $MAX_COLUMN_NESTING_DEPTH " +
+                "too many columns: $nodes nested column nodes exceeds the maximum $MAX_COLUMN_NODES",
+            )
+        }
+        // Bail one past the cap: every depth beyond it means the same
+        // refusal, and walking a twenty-thousand-level request to learn
+        // its exact depth is work spent on an answer nobody reads.
+        val cap = MAX_COLUMN_NESTING_DEPTH + 2
+        val measured = columnDefDepth(defs, cap)
+        val depth = depthOffset + measured
+        if (depth > MAX_COLUMN_NESTING_DEPTH) {
+            val shown = if (measured == cap) "$depth or more" else "$depth"
+            throw HoglakeException.Validation(
+                "column nesting depth $shown exceeds the maximum $MAX_COLUMN_NESTING_DEPTH " +
                     "(a top-level column is depth 1)",
             )
         }
-        validateSiblings(defs, path = emptyList())
+        validateSiblings(defs, path = emptyList(), syntheticallyNamed = false)
     }
 
     private fun validateSiblings(
         defs: List<ColumnDef>,
         path: List<String>,
+        syntheticallyNamed: Boolean,
     ) {
         val dupes = defs.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
         if (dupes.isNotEmpty()) {
             val where = if (path.isEmpty()) "" else " in '${path.joinToString(".")}'"
             throw HoglakeException.Validation("duplicate column names$where: ${dupes.sorted()}")
         }
-        for (def in defs) validateNode(def, path)
+        for (def in defs) validateNode(def, path, syntheticallyNamed)
     }
 
     private fun validateNode(
         def: ColumnDef,
         path: List<String>,
+        syntheticallyNamed: Boolean,
     ) {
         val here = path + def.name
         val qualified = here.joinToString(".")
         val children = def.children ?: emptyList()
+
+        // Names are policed HERE, at every level, rather than only on
+        // the top-level list the callers pass: a struct field carrying a
+        // reserved prefix (or any name the identifier policy refuses) is
+        // the same defect one level down. Synthetic names — the
+        // element/key/value this code mandates — are checked against
+        // the literal expected name below instead.
+        if (!syntheticallyNamed) Identifiers.validateColumn(def.name, qualified)
 
         if (!def.type.isNested) {
             // PRESENT, not non-empty. `"children": []` on a scalar is
@@ -138,13 +165,8 @@ object ColumnTrees {
                         "Iceberg map keys are non-nullable",
                 )
             }
-        } else {
-            // struct children are user-named, so they face the ordinary
-            // identifier policy; list/map children are synthetic names
-            // this code produced and already match it.
-            for (child in children) Identifiers.validate("column", child.name)
         }
-        validateSiblings(children, here)
+        validateSiblings(children, here, syntheticallyNamed = synthetic != null)
     }
 
     /** The named arity refusal for a container with the wrong child count. */
@@ -160,6 +182,23 @@ object ColumnTrees {
                 "map column '$qualified' requires exactly two children ('key' then 'value'); got $actual"
             else -> "column '$qualified' of type '${type.wire}' has the wrong number of children: $actual"
         }
+
+    /**
+     * Ceiling on a table's total column NODES.
+     *
+     * Nodes, not top-level columns: each one is a hog_column row and a
+     * field id, so a forest counted by its roots hides its real cost by
+     * a factor of its fan-out.
+     *
+     * Enforced in [validate], which every DDL path runs, rather than in
+     * one service: it started life capping only the atomic-creation
+     * PREPARE path, which left plain createTable and add_column able to
+     * build the very forest prepare refused. ALTER passes the table's
+     * existing node count as `existingNodes`, so the cap is on the
+     * POST-GRAFT total — a cap on the addition alone is no cap at all
+     * when the caller can add repeatedly.
+     */
+    const val MAX_COLUMN_NODES = 10000
 
     /** How many hog_column rows (and field ids) this forest needs. */
     fun nodeCount(defs: List<ColumnDef>): Int = com.posthog.hoglake.model.nodeCount(defs)

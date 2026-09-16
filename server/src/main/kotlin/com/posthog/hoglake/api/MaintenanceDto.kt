@@ -80,6 +80,7 @@ data class CompactionResultDto(
     val skippedConflicts: Long,
     val dvSuperseded: Long,
     val unconvertibleSchema: Long,
+    val invalidData: Long,
     val failedGroups: Long,
 )
 
@@ -93,6 +94,7 @@ fun CompactionResult.toDto() =
         skippedConflicts = skippedConflicts,
         dvSuperseded = dvSuperseded,
         unconvertibleSchema = unconvertibleSchema,
+        invalidData = invalidData,
         failedGroups = failedGroups,
     )
 

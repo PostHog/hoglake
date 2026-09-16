@@ -91,6 +91,17 @@ data class Config(
             "HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION",
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
+    /**
+     * Per-ROW node budget for the compaction rewrite. Bounds one row's
+     * materialized object graph, which no group-level budget can; a row
+     * above it is refused as invalid_data instead of OOM-ing the
+     * process. See ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW.
+     */
+    val compactionMaxNodesPerRow: Int =
+        env(
+            "HOGLAKE_COMPACTION_MAX_NODES_PER_ROW",
+            "${com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW}",
+        ).toInt(),
     /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
     val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),

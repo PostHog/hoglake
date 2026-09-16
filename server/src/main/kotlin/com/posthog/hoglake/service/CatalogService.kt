@@ -242,8 +242,9 @@ class CatalogService(private val jdbi: Jdbi) {
         if (columns.isEmpty()) {
             throw HoglakeException.Validation("table '$name' must have at least one column")
         }
-        columns.forEach { Identifiers.validate("column", it.name) }
-        // Nesting shape, depth cap, synthetic child names, map-key
+        // Column NAMES are validated by ColumnTrees too, at every
+        // nesting level rather than only this top one.
+        // Nesting shape, node cap, depth cap, synthetic child names, map-key
         // requiredness, per-parent duplicate names — all of it BEFORE a
         // field id is allocated for any part of the request, and here
         // rather than in createTable so the PREPARE side of an atomic

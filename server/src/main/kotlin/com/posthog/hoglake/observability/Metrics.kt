@@ -56,6 +56,18 @@ object Metrics {
         if (count > 0) increment("hoglake_files_removed_total", count.toDouble(), "catalog", catalog)
     }
 
+    /**
+     * hoglake_stats_repaired_total{source=commit|hydrator} — stats rows
+     * stored only after StatsSanity had to repair them (an undecodable
+     * or inverted bound dropped, an impossible count clamped).
+     *
+     * Nonzero means a WRITER is producing metadata its own data
+     * contradicts. Silence here is the normal state; a rising line is a
+     * bug report against whoever is writing those files, and without the
+     * counter the repair would be invisible — the commit still succeeds.
+     */
+    fun statsRepaired(source: String) = increment("hoglake_stats_repaired_total", 1.0, "source", source)
+
     /** hoglake_stats_hydrated_total{result=provided|failed} */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 

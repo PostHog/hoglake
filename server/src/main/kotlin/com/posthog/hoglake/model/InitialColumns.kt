@@ -16,9 +16,22 @@ package com.posthog.hoglake.model
  */
 fun initialColumns(definitions: List<ColumnDef>): List<Column> = assignFieldIds(definitions, 1)
 
-/** How many hog_column rows (and field ids) this forest needs. */
-fun nodeCount(definitions: List<ColumnDef>): Int =
-    definitions.sumOf { 1 + (it.children?.let { c -> nodeCount(c) } ?: 0) }
+/**
+ * How many hog_column rows (and field ids) this forest needs.
+ *
+ * Iterative for the same reason as `columnDefDepth`: it runs on
+ * unvalidated request input, ahead of the caps, so it must not be the
+ * thing that dies on a pathological one.
+ */
+fun nodeCount(definitions: List<ColumnDef>): Int {
+    var count = 0
+    var level = definitions
+    while (level.isNotEmpty()) {
+        count += level.size
+        level = level.flatMap { it.children ?: emptyList() }
+    }
+    return count
+}
 
 /**
  * Assign field ids depth-first from [firstFieldId], and ordinals per

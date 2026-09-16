@@ -308,6 +308,11 @@ class Hydrator(
             } else {
                 catalogColumns(h, file, at = file.beginSnapshot)
             }
+        // FooterStats.aggregate applies StatsSanity before it returns,
+        // so these are already checked: a bound the catalog type cannot
+        // decode, or one that sorts above its partner, never reaches
+        // here (same rule the commit path runs on client-supplied
+        // column_stats).
         val aggs = FooterStats.aggregate(footer, columns, file.path)
         for (agg in aggs) upsertStats(h, file, agg)
         val flipped =

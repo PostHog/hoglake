@@ -69,11 +69,13 @@ UNGUARDED = object()
 _RECREATED_MARKER = "the table was recreated"
 
 # COLUMN names starting with this prefix are reserved for hoglake internals
-# (``_hog_row_id`` is compaction's row-id carrier). The SERVER DOES NOT
-# enforce this: its column-name check is the identifier pattern only
-# (Identifiers.validate), which a leading underscore satisfies, so a
-# `_hog_row_id` column is accepted at create/add/rename. This client-side
-# check is the only barrier on the pyhoglake path (hoglake#36).
+# (``_hog_row_id`` is compaction's row-id carrier). The SERVER enforces
+# this too, at every nesting level (Identifiers.validateColumn, reached
+# from ColumnTrees for create/add and directly for rename) — it did not
+# when this check was written, which is what hoglake#36 was about. The
+# client check stays as a FAST FAIL: it refuses before the parquet upload
+# and the request, and the message names every offending path at once
+# instead of the first one the server trips on.
 # Namespace/table/view names are NOT affected.
 _RESERVED_COLUMN_PREFIX = "_hog"
 
@@ -112,13 +114,15 @@ def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
 
 def _check_reserved_columns(schema: pa.Schema) -> None:
     """Fast-fail schema field names using the reserved ``_hog`` column
-    prefix BEFORE any request or parquet upload. The server accepts such
-    names (see [_RESERVED_COLUMN_PREFIX]), so this is enforcement, not an
-    optimisation: without it the column lands in the catalog and collides
-    with compaction's row-id carrier.
+    prefix BEFORE any request or parquet upload.
 
-    Checked at every nesting level — the server's gap (hoglake#36) is at
-    every level too."""
+    The server refuses these as well (see [_RESERVED_COLUMN_PREFIX]), so
+    this is an optimisation rather than the only barrier it once was — it
+    saves an upload, and reports every offending path together instead of
+    one per round trip.
+
+    Checked at every nesting level, which is the level the server checks
+    at too."""
     reserved = _reserved_field_paths(list(schema))
     if reserved:
         raise ValidationError(

@@ -139,6 +139,7 @@ val fuzzTargets =
         "PuffinDeletionVectorFuzzTest",
         "IdentifiersFuzzTest",
         "WireDtoParseFuzzTest",
+        "NestedAgreementFuzzTest",
     )
 
 val fuzzSeconds = (project.findProperty("fuzzSeconds") as String?)?.toLongOrNull() ?: 60L
@@ -260,3 +261,5 @@ tasks.register("checkOpenapiVersion") {
     }
 }
 tasks.named("check") { dependsOn("checkOpenapiVersion") }
+
+// Scratch runner for the imported fuzz repro mains (temporary).

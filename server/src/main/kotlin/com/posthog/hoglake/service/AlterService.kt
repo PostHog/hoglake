@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.boundReencodeFor
 import com.posthog.hoglake.model.canPromoteTo
 import com.posthog.hoglake.model.icebergType
@@ -182,14 +183,20 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.AddColumn,
     ) {
-        Identifiers.validate("column", op.def.name)
         val parent = op.parent?.let { requireStructParent(state, it) }
         val siblings = parent?.children ?: state.cols
         val where = if (parent == null) "" else " of struct '${op.parent}'"
         if (siblings.any { it.def.name == op.def.name }) {
             throw HoglakeException.Validation("column '${op.def.name}'$where already exists")
         }
-        ColumnTrees.validate(listOf(op.def), depthOffset = parent?.let { depthOf(state, it) } ?: 0)
+        // existingNodes makes the node cap a cap on the POST-GRAFT
+        // total. Capping the addition alone would be no cap at all: the
+        // caller simply adds again.
+        ColumnTrees.validate(
+            listOf(op.def),
+            depthOffset = parent?.let { depthOf(state, it) } ?: 0,
+            existingNodes = state.cols.allNodes().size,
+        )
         val count = ColumnTrees.nodeCount(listOf(op.def))
         val firstFieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, count)
         val assigned = ColumnTrees.assignFieldIds(listOf(op.def), firstFieldId).single()
@@ -279,7 +286,7 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.RenameColumn,
     ) {
-        Identifiers.validate("column", op.to)
+        Identifiers.validateColumn(op.to)
         val located = requireColumn(state, op.from)
         val col = located.column
         val siblings = located.parent?.children ?: state.cols

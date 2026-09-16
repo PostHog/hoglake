@@ -1972,7 +1972,7 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema, failed_groups]
+                 unconvertible_schema, invalid_data, failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -2003,6 +2003,17 @@ components:
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions).
+        invalid_data:
+          type: integer
+          format: int64
+          description: >
+            Groups skipped because an input holds a value that cannot
+            exist under the type its own file declares (an empty byte
+            array under a decimal, an unscaled value wider than the
+            destination precision), or a row large enough to threaten
+            the heap. Unlike unconvertible_schema this never clears on
+            its own - the bytes are durable - so a nonzero count is a
+            writer bug, not a backlog.
         failed_groups:
           type: integer
           format: int64

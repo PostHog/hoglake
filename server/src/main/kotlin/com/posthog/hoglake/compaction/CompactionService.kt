@@ -75,10 +75,19 @@ data class CompactionConfig(
      * commit path does not have.
      */
     val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
+    /**
+     * Per-ROW node budget for the rewrite
+     * (HOGLAKE_COMPACTION_MAX_NODES_PER_ROW). [nestedSortExpansion]
+     * bounds a GROUP's materialized heap; this bounds a single ROW's,
+     * which no group budget can. See
+     * ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW.
+     */
+    val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
 ) {
     init {
         CompactionTiers.of(targetBytes, tierTarget)
         require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
+        require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
     }
 
     /**
@@ -251,6 +260,8 @@ class CompactionService(
         val columns: List<Column>,
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
         val sortFields: List<SortFieldDef>,
+        /** Per-row node budget for the rewrite (CompactionConfig.maxNodesPerRow). */
+        val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
     ) {
         /**
          * Live column types by field id (stats aggregation), over EVERY
@@ -329,6 +340,7 @@ class CompactionService(
                 sortFields =
                     SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
                         ?.fields ?: emptyList(),
+                maxNodesPerRow = cfg.maxNodesPerRow,
             )
         return PlanWithContext(ctx, CompactionPlan(t.tableId, ns.name, t.name, groups(h, ctx, cfg)))
     }
@@ -455,7 +467,7 @@ class CompactionService(
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
-                    "failed_groups=${r.failedGroups}"
+                    "invalid_data=${r.invalidData} failed_groups=${r.failedGroups}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -481,9 +493,12 @@ class CompactionService(
         var skipped = 0L
         var dvSuperseded = 0L
         var unconvertible = 0L
+        var invalidData = 0L
         var failed = 0L
 
-        fun budgetSpent() = groupsCompacted + skipped + dvSuperseded + unconvertible + failed >= cfg.maxGroupsPerRun
+        fun budgetSpent() =
+            groupsCompacted + skipped + dvSuperseded + unconvertible + invalidData + failed >=
+                cfg.maxGroupsPerRun
         outer@ for ((namespace, table) in tables) {
             if (budgetSpent()) break
             val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
@@ -509,6 +524,19 @@ class CompactionService(
                             "schema (${e.message}); skipping"
                     }
                     unconvertible++
+                } catch (e: InvalidDataException) {
+                    // Skip-with-reason as well, but a DIFFERENT reason:
+                    // the bytes are bad and durable, so unlike a schema
+                    // skip this will not clear on its own. Counted apart
+                    // so a nonzero value reads as "some writer emitted
+                    // values its own schema forbids", and logged at warn
+                    // with the offending detail for exactly that hunt.
+                    log.warn {
+                        "compaction group of ${group.files.size} files for " +
+                            "$catalog/$namespace.$table holds data that is invalid under its own " +
+                            "schema (${e.message}); skipping"
+                    }
+                    invalidData++
                 } catch (e: Exception) {
                     // One bad group (unreadable input, corrupt DV, S3
                     // hiccup) never wedges the sweep — but it IS counted:
@@ -531,6 +559,7 @@ class CompactionService(
             skippedConflicts = skipped,
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertible,
+            invalidData = invalidData,
             failedGroups = failed,
         )
     }
@@ -609,7 +638,13 @@ class CompactionService(
             val outLocal = tmpDir.resolve("out.parquet")
             tmpFiles.add(outLocal)
             val rewritten =
-                ParquetRewriter.rewrite(inputs, ctx.columns, ctx.sortFields, outLocal)
+                ParquetRewriter.rewrite(
+                    inputs,
+                    ctx.columns,
+                    ctx.sortFields,
+                    outLocal,
+                    ctx.maxNodesPerRow,
+                )
             check(rewritten.rowsWritten == group.survivingRecords) {
                 "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
                     "${group.survivingRecords} survivors — refusing to commit a lossy compaction"

@@ -1,7 +1,10 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnStats
+import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
+import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.statistics.Statistics
@@ -30,7 +33,17 @@ data class CatalogColumn(
     /** From type_params for decimal columns; null when absent. */
     val decimalScale: Int?,
     val children: List<CatalogColumn> = emptyList(),
-)
+) {
+    /** This node and every descendant, parents before children. */
+    fun selfAndDescendants(): List<CatalogColumn> =
+        buildList {
+            add(this@CatalogColumn)
+            for (c in children) addAll(c.selfAndDescendants())
+        }
+}
+
+/** Every node of a catalog-column forest, parents before children. */
+fun List<CatalogColumn>.allNodes(): List<CatalogColumn> = flatMap { it.selfAndDescendants() }
 
 /**
  * Pure footer-to-stats aggregation: takes a parquet footer
@@ -127,7 +140,54 @@ object FooterStats {
      * would send a perfectly id-bearing file down the name-binding path.
      * For a flat schema every leaf IS top-level, so nothing changes.
      */
-    fun usesFieldIds(schema: MessageType): Boolean = allLeaves(schema).any { it.fieldId != null }
+    fun usesFieldIds(schema: MessageType): Boolean = anyBindingNodeWithId(schema.fields)
+
+    /**
+     * True when any node that BINDS to a catalog column carries an id —
+     * the same node set [missingFieldIds] checks, and deliberately so.
+     *
+     * Leaves alone was wrong, and wrong in the direction that loses
+     * data quietly. A file with ids on its container WRAPPERS and none
+     * on its leaves answered false here, which sent it down the
+     * name-binding path — where [findField]'s fallback requires
+     * `id == null` and the wrapper HAS one, so nothing matched and the
+     * whole subtree produced ZERO stats. Meanwhile the rewriter, which
+     * had no file-level gate at all, bound the same file happily and
+     * copied every value. Two surfaces, one file, opposite answers.
+     */
+    private fun anyBindingNodeWithId(fields: List<Type>): Boolean =
+        fields.any { field ->
+            if (field.isPrimitive) {
+                field.id != null
+            } else {
+                val group = field.asGroupType()
+                val synthetic = syntheticRepetitionLayer(group)
+                group.id != null ||
+                    anyBindingNodeWithId((synthetic ?: group).fields)
+            }
+        }
+
+    /**
+     * THE binding rule, shared with
+     * [com.posthog.hoglake.compaction.ParquetRewriter] so the reader and
+     * the rewriter cannot disagree about which field of a file is which
+     * catalog column.
+     *
+     * By id when the file binds by id AND the candidate declares one;
+     * by NAME only for a candidate that declares no id at all. An
+     * id-bearing field never answers to a name — that is what makes a
+     * rename safe on an id-bearing file, and it is why the file-level
+     * gate above has to see the same nodes this does.
+     */
+    fun bindsTo(
+        field: Type,
+        fieldId: Long,
+        name: String,
+        useFieldIds: Boolean,
+    ): Boolean {
+        val id = field.id
+        return if (id != null) useFieldIds && id.intValue().toLong() == fieldId else field.name == name
+    }
 
     private fun anyBindingNodeWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
@@ -245,9 +305,61 @@ object FooterStats {
 
         val out = ArrayList<ColumnAgg>(matched.size)
         for ((col, leaf) in matched.values) {
-            aggregateColumn(footer.blocks, col, leaf, filePath)?.let(out::add)
+            aggregateColumn(footer.blocks, col, leaf, filePath)?.let { out.add(sane(it, col, filePath)) }
         }
         return out
+    }
+
+    /**
+     * One aggregate through [StatsSanity] before it leaves this object.
+     *
+     * HERE rather than in the caller because a footer is written by the
+     * same client that writes the data, one layer down, and this
+     * function's output is trusted as ground truth by everything
+     * downstream. A hostile (or merely broken) writer shipping
+     * `min=500, max=100` for a date column got that pair copied through
+     * verbatim — the exact shape a pruner reads as "no rows here", which
+     * drops the file out of every scan silently. Same for a null_count
+     * above the value_count it is a subset of.
+     *
+     * The commit path runs the identical rule on client-supplied
+     * `column_stats`; one contract, both doors.
+     */
+    private fun sane(
+        agg: ColumnAgg,
+        col: CatalogColumn,
+        filePath: String,
+    ): ColumnAgg {
+        val checked =
+            StatsSanity.check(
+                ColumnStats(
+                    fieldId = agg.fieldId,
+                    valueCount = agg.valueCount,
+                    nullCount = agg.nullCount,
+                    nanCount = agg.nanCount,
+                    sizeBytes = agg.sizeBytes,
+                    lowerBound = agg.lowerBound,
+                    upperBound = agg.upperBound,
+                ),
+                col.type,
+            )
+        if (checked.repairs.isEmpty()) return agg
+        Metrics.statsRepaired("hydrator")
+        log.warn {
+            "footer stats for column ${col.name} (field ${col.fieldId}) in $filePath are not " +
+                "internally consistent (${checked.repairs.joinToString("; ")}); " +
+                "storing the repaired row"
+        }
+        val fixed = checked.stats
+        return ColumnAgg(
+            fieldId = fixed.fieldId,
+            valueCount = fixed.valueCount,
+            nullCount = fixed.nullCount,
+            nanCount = fixed.nanCount,
+            sizeBytes = fixed.sizeBytes,
+            lowerBound = fixed.lowerBound,
+            upperBound = fixed.upperBound,
+        )
     }
 
     /**
@@ -478,12 +590,7 @@ object FooterStats {
         fields: List<Type>,
         col: CatalogColumn,
         useFieldIds: Boolean,
-    ): Type? {
-        if (useFieldIds) {
-            fields.firstOrNull { it.id?.intValue()?.toLong() == col.fieldId }?.let { return it }
-        }
-        return fields.firstOrNull { it.id == null && it.name == col.name }
-    }
+    ): Type? = fields.firstOrNull { bindsTo(it, col.fieldId, col.name, useFieldIds) }
 
     private fun aggregateColumn(
         blocks: List<BlockMetaData>,
@@ -701,7 +808,11 @@ object FooterStats {
             // the JSON logical annotation is metadata we do not require,
             // because it changes neither the bytes nor their sort order.
             ColType.STRING, ColType.JSON ->
-                if (physical == PrimitiveType.PrimitiveTypeName.BINARY) raw else null
+                if (physical == PrimitiveType.PrimitiveTypeName.BINARY && bytesSortUnsigned(col, leaf)) {
+                    raw
+                } else {
+                    null
+                }
             ColType.UUID_T ->
                 if (physical == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && raw.size == 16) {
                     raw
@@ -712,7 +823,7 @@ object FooterStats {
                 when (physical) {
                     PrimitiveType.PrimitiveTypeName.BINARY,
                     PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
-                    -> raw
+                    -> if (bytesSortUnsigned(col, leaf)) raw else null
                     else -> null
                 }
             ColType.DECIMAL -> decodeDecimal(col, leaf, raw)
@@ -721,6 +832,55 @@ object FooterStats {
             // "bounds NULL, never guessed" contract total.
             ColType.LIST, ColType.STRUCT, ColType.MAP -> null
         }
+    }
+
+    /**
+     * Whether a byte-array leaf's bounds may be taken VERBATIM as an
+     * unsigned-byte-ordered bound.
+     *
+     * The bytes are only half the story; the leaf's annotation decides
+     * what ORDER parquet put them in, and a string/json/binary column
+     * stores its bound unsigned-lexicographic. Take the min/max of a
+     * DECIMAL-annotated BINARY leaf verbatim and you get parquet's
+     * SIGNED two's-complement ordering reinterpreted as unsigned —
+     * measured, a column holding 0x01 and 0xff stored
+     * lower=ff upper=01, an INVERTED pair, which every pruner reads as
+     * "no rows here" and drops the file from every scan. The counts look
+     * healthy the whole time.
+     *
+     * Same family as the INT(w, unsigned) rule above, and a positive
+     * ALLOWLIST for the same reason: an annotation nobody has thought
+     * about must not inherit "bytes are bytes" by default.
+     *
+     *  - none / STRING / JSON / BSON / ENUM: unsigned byte order. Yes.
+     *  - UUID: 16 big-endian bytes, unsigned lexicographic. Yes.
+     *  - DECIMAL: signed two's-complement. No.
+     *  - FLOAT16: IEEE half order, not byte order. No.
+     *  - INTERVAL: parquet defines no order for it at all. No.
+     */
+    fun bytesSortUnsigned(annotation: LogicalTypeAnnotation?): Boolean =
+        annotation == null ||
+            annotation is LogicalTypeAnnotation.StringLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.JsonLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.BsonLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.EnumLogicalTypeAnnotation ||
+            annotation is LogicalTypeAnnotation.UUIDLogicalTypeAnnotation
+
+    private fun bytesSortUnsigned(
+        col: CatalogColumn,
+        leaf: Leaf,
+    ): Boolean {
+        val annotation = leaf.primitive.logicalTypeAnnotation
+        val ok = bytesSortUnsigned(annotation)
+        if (!ok) {
+            log.warn {
+                "column ${col.name} (field ${col.fieldId}) is '${col.type.wire}', whose bounds are " +
+                    "unsigned byte order, but the parquet leaf at ${leaf.path.joinToString(".")} is " +
+                    "annotated '$annotation', which parquet sorted differently; skipping bounds " +
+                    "(counts are unaffected)"
+            }
+        }
+        return ok
     }
 
     private fun decodeTime(

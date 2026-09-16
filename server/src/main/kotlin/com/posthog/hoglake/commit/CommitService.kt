@@ -6,11 +6,13 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import java.util.UUID
@@ -147,8 +149,7 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
-        val append = ResolvedAppend(namespace, table, tableId, files, null)
-        validateFiles(h, catalogId, append)
+        val append = validateFiles(h, catalogId, ResolvedAppend(namespace, table, tableId, files, null))
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =
@@ -178,6 +179,8 @@ class CommitService(
         /** ", reached at <time>" suffix for 410 messages (TimeTravelRepo's convention). */
         fun reachedAtSuffix(): String = earliestSnapshotTime?.let { ", reached at $it" } ?: ""
     }
+
+    private val log = KotlinLogging.logger {}
 
     /** Live partition spec header: id + field arity. */
     private data class LiveSpec(val specId: Long, val fieldCount: Int)
@@ -308,10 +311,10 @@ class CommitService(
                 ResolvedDeletes(namespace, table, tableId, files)
             }
 
-        // 3. Structural validation. Nothing is written unless all of it passes.
-        for (append in resolvedAppends) {
-            validateFiles(h, catalogId, append)
-        }
+        // 3. Structural validation. Nothing is written unless all of it
+        // passes. The RESULT is what gets written: validateFiles also
+        // sanitizes each file's stats (StatsSanity).
+        val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
         validateDeleteRegistrations(resolvedDeletes)
 
         // 3b. Removal-queue collision check (under the commit lock, so it
@@ -429,7 +432,7 @@ class CommitService(
         changeBatch.execute()
 
         var nextFileId = firstFileId
-        nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, resolvedAppends)
+        nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, validatedAppends)
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
         return CommitResult(snapshotId, schemaVersion)
@@ -887,11 +890,19 @@ class CommitService(
             .orElse(null)
             ?.takeIf { it.fieldCount > 0 }
 
+    /**
+     * Structural checks on one append's files, returning the append with
+     * its stats SANITIZED (StatsSanity): a bound that cannot be decoded
+     * as its column's type, or that sorts above its partner, is dropped
+     * rather than stored, and impossible counts are clamped. The return
+     * value is what gets written — using the argument instead would
+     * store exactly the rows this pass exists to repair.
+     */
     private fun validateFiles(
         h: Handle,
         catalogId: Long,
         append: ResolvedAppend,
-    ) {
+    ): ResolvedAppend {
         val qualified = "${append.namespace}.${append.table}"
         // field_id -> col_type. The TYPE is carried because a stats row
         // is only meaningful for a LEAF: hog_file_column_stats holds
@@ -980,6 +991,46 @@ class CommitService(
                 }
             }
         }
+        return sanitizeStats(append, liveColumnTypes)
+    }
+
+    /**
+     * Drop the bounds a client cannot have meant and clamp the counts it
+     * cannot have measured, per file, warning once per repaired row.
+     *
+     * The commit is NOT refused: the file's data is fine, its metadata
+     * is not, and a 422 here would reject a correct append over a
+     * cosmetic field the writer can fix later. Readers prune on these
+     * bounds, though, so storing a wrong one is a wrong answer — hence
+     * drop rather than keep, counted so the writer's bug is visible.
+     */
+    private fun sanitizeStats(
+        append: ResolvedAppend,
+        liveColumnTypes: Map<Long, String>,
+    ): ResolvedAppend {
+        val qualified = "${append.namespace}.${append.table}"
+        var repaired = false
+        val files =
+            append.files.map { file ->
+                val stats = file.columnStats ?: return@map file
+                val checked =
+                    stats.map { stat ->
+                        val type = liveColumnTypes[stat.fieldId]?.let { ColType.fromWire(it) }
+                        val result = StatsSanity.check(stat, type)
+                        if (result.repairs.isNotEmpty()) {
+                            repaired = true
+                            Metrics.statsRepaired("commit")
+                            log.warn {
+                                "column_stats for field_id ${stat.fieldId} of ${file.path} in " +
+                                    "$qualified are not internally consistent " +
+                                    "(${result.repairs.joinToString("; ")}); storing the repaired row"
+                            }
+                        }
+                        result.stats
+                    }
+                if (repaired) file.copy(columnStats = checked) else file
+            }
+        return if (repaired) append.copy(files = files) else append
     }
 
     /** DB-independent DV registration checks: shapes, ranges, duplicate targets. */

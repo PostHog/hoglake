@@ -27,7 +27,7 @@ Encodings (little-endian unless stated):
     timestamp_ns NANOseconds since epoch, 8-byte LE signed (Iceberg V3
                  timestamp_ns — the one temporal type not stored in micros)
     timestamptz  microseconds since epoch UTC, 8-byte LE signed
-    string       UTF-8 bytes
+    string       UTF-8 bytes (see "Bytes in, bytes out" below)
     json         UTF-8 bytes (maps to Iceberg string; the document text
                  verbatim, never re-canonicalized)
     uuid         16 bytes, big-endian
@@ -46,6 +46,22 @@ writer's job; range checks here would make ``decode_bound``
 un-invertible for hostile footers, which is the failure mode this design
 refuses. The Kotlin ``IcebergSingleValue`` makes the same choice, byte
 for byte.
+
+**Bytes in, bytes out.** ``string`` and ``json`` bounds are BYTES on the
+wire and the codec never changes them. ``encode_bound`` passes a
+``bytes`` value through untouched, and ``decode_bound`` returns a ``str``
+only when the bound really is UTF-8 — otherwise it returns the raw
+``bytes``. Decoding with replacement characters would turn
+``b"\xfe\x02"`` into four different bytes (``b"\xef\xbf\xbd\x02"``)
+that sort elsewhere, breaking the round-trip above and putting this
+codec at odds with the Kotlin hydrator, which copies a string bound
+verbatim. A non-UTF-8 bound under a ``string`` column means the FILE is
+mislabelled; the bytes say so, a mangled string does not.
+
+One caveat this codec cannot fix: pyarrow decodes a UTF8-annotated
+column's ``Statistics.min``/``max`` to ``str`` before pyhoglake sees
+them, so stats read from such a FOOTER are already lossy at the source.
+That is a property of the malformed file, not of this module.
 """
 
 from __future__ import annotations
@@ -235,7 +251,24 @@ def decode_bound(
         # that wants a datetime divides by 1000 and owns the loss.
         return struct.unpack("<q", data)[0]
     if col_type in ("string", "json"):
-        return data.decode("utf-8")
+        # BYTES IN, BYTES OUT. A str is returned when the bound really is
+        # UTF-8, which is every honest string bound; when it is not, the
+        # raw bytes are returned UNCHANGED rather than decoded with
+        # replacement characters.
+        #
+        # The distinction is not academic. `b"\xfe\x02"` decoded with
+        # errors="replace" becomes "\ufffd\x02", and re-encoding THAT
+        # yields b"\xef\xbf\xbd\x02" — four bytes where there were
+        # two, sorting differently, and silently. The Kotlin hydrator
+        # copies a string bound's bytes verbatim, so a lossy decode here
+        # would put the two implementations into disagreement about a
+        # value neither of them chose. A non-UTF-8 bound under a string
+        # column means the FILE is mislabelled; surfacing the bytes says
+        # so, while mangling them hides it.
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return data
     if col_type == "uuid":
         return _uuid.UUID(bytes=data)
     if col_type == "binary":
