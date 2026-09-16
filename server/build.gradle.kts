@@ -187,6 +187,33 @@ tasks.register("fuzz") {
     dependsOn(fuzzTasks)
 }
 
+// Deterministic seed-loop soak runner for the nested campaigns
+// (NestedFuzzSoak): the same oracles the jazzer target uses, driven by a
+// seeded RNG instead of libFuzzer, so every finding replays exactly with
+// -Pseeds=<seed>..<seed>. Complements `fuzz` rather than replacing it —
+// libFuzzer brings coverage feedback, this brings reproducibility and a
+// per-iteration hang timeout.
+//
+//   ./gradlew nestedSoak -Pcampaign=agreement -Pseeds=0..100000 -PtimeBudget=1200
+//
+// campaigns: agreement | footer | data | trees | codec
+tasks.register<JavaExec>("nestedSoak") {
+    description = "Deterministic nested fuzz soak (manual; -Pcampaign, -Pseeds, -PtimeBudget)"
+    group = "verification"
+    mainClass.set("com.posthog.hoglake.fuzz.NestedFuzzSoak")
+    classpath = sourceSets.test.get().runtimeClasspath
+    val seeds = (project.findProperty("seeds") as String?) ?: "0..10000"
+    val range = seeds.split("..")
+    args(
+        (project.findProperty("campaign") as String?) ?: "agreement",
+        range.first(),
+        range.getOrElse(1) { range.first() },
+        (project.findProperty("timeBudget") as String?) ?: "600",
+        (project.findProperty("iterationTimeout") as String?) ?: "30",
+        (project.findProperty("strictDomains") as String?) ?: "true",
+    )
+}
+
 // One-shot (manual) seed-corpus generator: writes the committed corpus under
 // src/test/resources/com/posthog/hoglake/fuzz from the cross-language vector
 // file plus freshly built parquet footers / puffin DV blobs. Rerun only when

@@ -300,8 +300,9 @@ never be compacted, and its small-file debt would grow forever with no
 operator lever. The costs are worth stating precisely, because one of them is much
 larger than it looks. The **unsorted** path holds exactly one record at
 a time, so its heap is one row's object graph — bounded by the widest
-row, and nothing bounds a row (a million-element list is a million
-`SimpleGroup`s at once). The **sorted** path materializes the whole
+row, which `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default 1,000,000
+nodes) is what bounds: a row past it is an `invalid_data` skip rather
+than a process-fatal OOM in a background loop. The **sorted** path materializes the whole
 group to sort it, and a nested group's object graph is **not** its byte
 size: a measured `list<long>` table with five elements per row peaked at
 343 MiB of heap from a 4.6 MiB compressed input — 70x — because every
@@ -312,11 +313,38 @@ with BOTH nested columns and a live sort order is planned under
 `target / HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near
 the top of the measured 30-70x range), which puts the materialized graph
 back under roughly the target. That is a bounded mitigation per GROUP,
-not spilling, and not a per-ROW bound.
+not spilling; the per-ROW bound is the node budget above.
 Inputs are matched by SHAPE, not by the synthetic group names (the
 parquet spec says those are insignificant), but a shape that disagrees
 with the live column — a struct over a primitive, a 2-level legacy list,
 an optional map key — is `unconvertible_schema`, never a guess.
+
+The reader and the rewriter share ONE binding rule (`FooterStats.bindsTo`
+and one file-level "does this file use field ids" gate), because they
+had two and disagreed: a file carrying ids on its container wrappers and
+none on its leaves read as id-less to the reader (zero stats) and
+id-bearing to the rewriter (everything copied). They also share one rule
+about which byte-array bounds may be taken verbatim: only when the
+source leaf's annotation sorts in unsigned-byte order (none, `STRING`,
+`JSON`, `BSON`, `ENUM`, `UUID`). A `DECIMAL`-annotated `BINARY` leaf
+under a `string` column does not — parquet ordered those bytes signed —
+so the reader records null bounds and the rewriter refuses, rather than
+one inventing an inverted pair and the other re-stamping the bytes
+`STRING`.
+
+A value that cannot exist under the type its own file declares — an
+empty byte array under a decimal, an unscaled value past the
+destination precision, a row past the node budget — is the second typed
+skip, `invalid_data`. It is counted apart from `unconvertible_schema`
+because a schema skip clears when the schema or the file set moves,
+while bad bytes are durable: retrying one hot is a permanent loop over
+the same rows, and a nonzero count is a writer bug rather than a
+backlog. Column stats are checked the same way wherever they enter (the
+commit path's client-supplied `column_stats` and the hydrator's footer
+read, one rule): a bound the catalog type cannot decode, or one that
+sorts above its partner IN THAT TYPE'S ORDER, is dropped rather than
+stored — readers prune on these, so a missing bound costs a scan and a
+wrong one costs a wrong answer.
 
 Still open: VARIANT, and `list`/`map` internals as partition sources
 (Iceberg does not define them either).
@@ -360,6 +388,27 @@ mechanical re-encode. Same rule for `value_counts`/`null_value_counts`
 the registration API's stats shape should be Iceberg-`Metrics`-shaped
 from day one (see [trino-integration.md](trino-integration.md) §2 for
 why this pays twice).
+
+**Bytes in, bytes out.** A `string`/`json` bound IS bytes, and both
+codecs (Kotlin `IcebergSingleValue`, pyhoglake `bounds`) return the raw
+bytes for a bound that is not valid UTF-8 instead of decoding it with
+replacement characters. Decoding `fe 02` lossily gives
+`ef bf bd 02` — four bytes where there were two, sorting somewhere
+else — and compaction's bounds merge is decode → compare → encode, so
+the lossy step silently rewrote a file's bound during a rewrite. A
+non-UTF-8 bound under a `string` column means the FILE is mislabelled;
+the bytes say so.
+
+**Stats are checked where they enter.** Both doors — the commit path's
+client-supplied `column_stats` and the hydrator's footer read — run one
+rule: a bound the catalog type cannot decode (wrong length for a fixed
+-width type, empty for a decimal), or a pair whose `lower` sorts above
+its `upper` IN THAT TYPE'S ORDER, is DROPPED, and a `null_count` above
+its `value_count` is clamped. Every repair warns and increments
+`hoglake_stats_repaired_total{source}`, because it means a writer is
+shipping metadata its own data contradicts. The comparison is typed, not
+bytewise: little-endian `-1` byte-compares ABOVE `1`, so a bytewise
+check would have deleted good pairs and kept bad ones.
 
 ## 6. Metadata-artifact generation and bucket layout
 

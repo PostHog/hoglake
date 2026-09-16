@@ -368,6 +368,13 @@ The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
 executed attempts per catalog, including failures and skips. There is
 no separate minimum-file-count knob.
 
+`HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
+one ROW's materialized object graph, which no group-level budget can:
+both rewrite paths materialize a row whole, so a single row holding a
+hundred-million-element list is an OOM, and an OOM in a background loop
+takes the request path down with it. A row past the budget is refused
+as `invalid_data` — one counted skip instead of a process kill.
+
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are
 only a promotion estimate: encoding, schema changes and DV removal can

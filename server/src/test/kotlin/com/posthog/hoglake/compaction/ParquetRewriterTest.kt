@@ -141,15 +141,22 @@ class ParquetRewriterTest {
                 )
             }.isInstanceOf(UnconvertibleSchemaException::class.java)
         }
+        // The overflow is a DATA refusal, not a schema one: the same two
+        // schemas rewrite fine with in-range values, so re-planning the
+        // group can never help and the counter must say so.
         val overflow = writeCustom("decimal-overflow.parquet", schema, listOf({ it.add(0, 10000000000L) }))
+        val out = tmp.resolve("decimal-overflow-output.parquet")
         assertThatThrownBy {
             ParquetRewriter.rewrite(
                 listOf(ParquetRewriter.Input(overflow, 0)),
                 listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 2)))),
                 emptyList(),
-                tmp.resolve("decimal-overflow-output.parquet"),
+                out,
             )
-        }.isInstanceOf(UnconvertibleSchemaException::class.java).hasMessageContaining("precision")
+        }.isInstanceOf(InvalidDataException::class.java).hasMessageContaining("precision")
+        // And nothing truncated is left behind: a refusal mid-write used
+        // to leave a footer-less file on the path it was handed.
+        assertThat(out).doesNotExist()
     }
 
     @Test

@@ -394,9 +394,13 @@ def test_string_lone_surrogates_rejected(cp):
         encode_bound("string", chr(cp))
 
 
-def test_string_decode_invalid_utf8_raises():
-    with pytest.raises(UnicodeDecodeError):
-        decode_bound("string", b"\xff\xfe")
+def test_string_decode_invalid_utf8_returns_the_bytes():
+    # BYTES IN, BYTES OUT. Decoding with replacement characters would
+    # turn two bytes into four on the way back out through encode, and
+    # the Kotlin hydrator copies a string bound verbatim — so a lossy
+    # decode here would put the two implementations at odds over a value
+    # neither of them chose.
+    assert decode_bound("string", b"\xff\xfe") == b"\xff\xfe"
 
 
 def test_string_empty_is_empty_payload():
@@ -404,12 +408,14 @@ def test_string_empty_is_empty_payload():
     assert decode_bound("string", b"") == ""
 
 
-def test_string_bytes_input_passes_through_unvalidated():
-    # Pinned wart: encode accepts bytes verbatim without UTF-8
-    # validation, so encode(b"\xff") produces a payload decode rejects.
+def test_string_bytes_round_trip_is_lossless():
+    # encode takes bytes verbatim and decode hands the same bytes back,
+    # so the codec's round-trip identity holds for a bound that is not
+    # valid UTF-8 — the case a mislabelled file produces.
     assert encode_bound("string", b"\xff") == b"\xff"
-    with pytest.raises(UnicodeDecodeError):
-        decode_bound("string", encode_bound("string", b"\xff"))
+    assert decode_bound("string", encode_bound("string", b"\xff")) == b"\xff"
+    # Valid UTF-8 still comes back as str.
+    assert decode_bound("string", encode_bound("string", "hi")) == "hi"
 
 
 # -- uuid -------------------------------------------------------------------

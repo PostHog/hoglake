@@ -332,6 +332,13 @@ export interface CompactionResult {
   skipped_conflicts: Int64;
   dv_superseded: Int64;
   unconvertible_schema: Int64;
+  /**
+   * Groups skipped because an input holds a value that cannot exist
+   * under the type its own file declares. Unlike unconvertible_schema
+   * this never clears on its own — the bytes are durable — so a nonzero
+   * count is a writer bug, not a backlog.
+   */
+  invalid_data: Int64;
   /** Groups that failed outright (logged, retried next run) — red-flag counter. */
   failed_groups: Int64;
 }

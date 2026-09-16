@@ -450,6 +450,21 @@ object NestedFuzz {
     @JvmStatic
     var strictDomains: Boolean = true
 
+    /**
+     * A generated ROW's node ceiling.
+     *
+     * The generator repeats up to `maxRep` times at EVERY repeated level,
+     * so a five-deep schema with maxRep=400 asks for 400^5 nodes and the
+     * harness OOMs building its own input — 28 wasted iterations in a
+     * measured 51k-execution campaign, all of them reported as findings
+     * against code that never ran. This caps the generator, not the
+     * product: hoglake's own per-row bound is
+     * ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW, and it is deliberately
+     * far above this so the fuzzer reaches it on purpose (via an
+     * explicitly small budget) rather than by accident.
+     */
+    private const val MAX_GENERATED_NODES_PER_ROW = 200_000
+
     /** Write [rows] generated records under [schema]; returns the record count. */
     fun writeFile(
         e: Entropy,
@@ -467,11 +482,22 @@ object NestedFuzz {
             .use { w ->
                 repeat(rows) {
                     val g = factory.newGroup()
-                    fill(e, g, schema, maxRep)
+                    fill(e, g, schema, maxRep, Budget())
                     w.write(g)
                 }
             }
         return rows
+    }
+
+    /** One generated row's remaining node allowance. */
+    private class Budget {
+        var left: Int = MAX_GENERATED_NODES_PER_ROW
+
+        fun take(): Boolean {
+            if (left <= 0) return false
+            left--
+            return true
+        }
     }
 
     private fun fill(
@@ -479,6 +505,7 @@ object NestedFuzz {
         g: Group,
         type: GroupType,
         maxRep: Int,
+        budget: Budget,
     ) {
         type.fields.forEachIndexed { i, f ->
             val n =
@@ -488,10 +515,15 @@ object NestedFuzz {
                     else -> if (e.int(0, 9) < 8) 1 else 0
                 }
             repeat(n) {
-                if (f.isPrimitive) {
-                    addValue(e, g, i, f.asPrimitiveType())
-                } else {
-                    fill(e, g.addGroup(i), f.asGroupType(), maxRep)
+                // A REQUIRED field still has to be written even past the
+                // budget: skipping one produces a file parquet refuses,
+                // which would be a harness failure of a different colour.
+                if (budget.take() || f.isRepetition(Type.Repetition.REQUIRED)) {
+                    if (f.isPrimitive) {
+                        addValue(e, g, i, f.asPrimitiveType())
+                    } else {
+                        fill(e, g.addGroup(i), f.asGroupType(), maxRep, budget)
+                    }
                 }
             }
         }

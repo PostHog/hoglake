@@ -18,6 +18,8 @@ import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.SeekableInputStream
+import org.apache.parquet.schema.GroupType
+import org.apache.parquet.schema.LogicalTypeAnnotation
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -130,6 +132,8 @@ object NestedAgreement {
 
         // ---- per top-level column: rewrite + agreement --------------------
         val duplicates = NestedFuzz.duplicateIds(schema)
+        val duplicateNames = duplicateSiblingNames(schema)
+        val partlyIdless = FooterStats.missingFieldIds(schema)
         for ((i, col) in live.withIndex()) {
             val out = tmp.resolve("out$i.parquet")
             val sortFields = maybeSort(e, col)
@@ -183,7 +187,18 @@ object NestedAgreement {
                     }
                 val wanted = leafIdsUnder(catalogOf(catalog, col.fieldId)!!)
                 val bounded = perColRefused.filter { it.lowerBound != null }.map { it.fieldId }.toSet()
-                if (!dataRefused && wanted.isNotEmpty() && bounded.containsAll(wanted)) {
+                // Duplicate NAMES are the same class of sanctioned
+                // asymmetry as duplicate IDS, and for a concrete reason:
+                // the reader only READS, and reads by id, so a file with
+                // two `z1` fields carrying distinct ids is unambiguous to
+                // it. The rewriter has to BUILD a schema and then address
+                // its fields, and parquet-java addresses a group's fields
+                // by name — so the same file is a coin flip on the write
+                // side. Refusing it there is the fix, not a disagreement.
+                if (!dataRefused && duplicateNames.isEmpty() && !unitDeferral(col, schema) &&
+                    !decimalDeferral(col, schema) &&
+                    wanted.isNotEmpty() && bounded.containsAll(wanted)
+                ) {
                     sink(
                         Finding(
                             "agreement-reader-bounded-writer-refused",
@@ -193,7 +208,9 @@ object NestedAgreement {
                         ),
                     )
                 }
-                if (canonical && !dataRefused && duplicates.isEmpty()) {
+                if (canonical && !dataRefused && duplicates.isEmpty() && duplicateNames.isEmpty() &&
+                    !unitDeferral(col, schema) && !decimalDeferral(col, schema)
+                ) {
                     sink(
                         Finding(
                             "canonical-schema-refused",
@@ -261,9 +278,17 @@ object NestedAgreement {
                     )
                 }
 
-                // CONSERVATION: bound by a unique id on the input side.
+                // CONSERVATION: bound by a unique id on the input side —
+                // and ONLY when every binding node of the input carries
+                // one. In a partly id-less file "the leaf with parquet id
+                // N" and "the column the binding rule chose for catalog
+                // field N" are different columns: an id-less field
+                // matching by NAME is a legal binding, and the same
+                // number may sit on some unrelated nested leaf. Comparing
+                // those two is comparing different columns, not measuring
+                // loss.
                 val srcLeaf = inById[fid]?.singleOrNull()
-                if (srcLeaf != null && duplicates.isEmpty() && srcLeaf.nullCount != null) {
+                if (srcLeaf != null && duplicates.isEmpty() && !partlyIdless && srcLeaf.nullCount != null) {
                     val srcNonNull = srcLeaf.valueCount - srcLeaf.nullCount
                     if (srcNonNull != nonNull) {
                         sink(
@@ -277,6 +302,115 @@ object NestedAgreement {
                 }
             }
         }
+    }
+
+    /** The parquet time/timestamp unit a catalog type's own files carry. */
+    private fun nativeUnit(type: ColType): LogicalTypeAnnotation.TimeUnit? =
+        when (type) {
+            // Parquet has no seconds unit, so timestamp_s files are millis.
+            ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS -> LogicalTypeAnnotation.TimeUnit.MILLIS
+            ColType.TIMESTAMP, ColType.TIMESTAMPTZ, ColType.TIME -> LogicalTypeAnnotation.TimeUnit.MICROS
+            ColType.TIMESTAMP_NS -> LogicalTypeAnnotation.TimeUnit.NANOS
+            else -> null
+        }
+
+    /**
+     * Whether the rewriter's refusal of [col] is the DOCUMENTED
+     * non-native-unit deferral (AGENT.md, iceberg-federation.md §2.8)
+     * rather than a disagreement with the reader.
+     *
+     * The two surfaces really do differ here, and on purpose. A bound is
+     * eight bytes of metadata, so the reader converts a millis or nanos
+     * footer bound into the micros an Iceberg `timestamp` bound is
+     * defined to be — exact, and the only way a bound can be correct at
+     * all. A REWRITE would have to convert every value of every row,
+     * which is a data rewrite the compactor deliberately does not do:
+     * no legal promotion produces a unit mismatch (PROMOTIONS has no
+     * timestamp rungs), so the only way to reach one is a writer
+     * disagreeing with its own DDL, and refusing that is the job.
+     */
+    private fun unitDeferral(
+        col: Column,
+        schema: GroupType,
+    ): Boolean {
+        // Over the whole catalog SUBTREE, not just the top-level column:
+        // the mismatch is as likely to sit on a map key four levels down
+        // as on the column itself, and a list's own type has no unit at
+        // all.
+        val want = col.selfAndDescendants().mapNotNull { nativeUnit(it.def.type) }.toSet()
+        if (want.isEmpty()) return false
+
+        fun walk(g: GroupType): Boolean {
+            for (f in g.fields) {
+                if (f.isPrimitive) {
+                    val unit =
+                        when (val a = f.logicalTypeAnnotation) {
+                            is LogicalTypeAnnotation.TimestampLogicalTypeAnnotation -> a.unit
+                            is LogicalTypeAnnotation.TimeLogicalTypeAnnotation -> a.unit
+                            else -> null
+                        }
+                    if (unit != null && unit !in want) return true
+                } else if (walk(f.asGroupType())) {
+                    return true
+                }
+            }
+            return false
+        }
+        return walk(schema)
+    }
+
+    /**
+     * Whether the rewriter's refusal of [col] is the DOCUMENTED decimal
+     * deferral: a source annotation whose scale differs from the live
+     * column's, or whose declared precision exceeds it.
+     *
+     * The surfaces differ here for the same reason as the unit case. A
+     * decimal BOUND is the unscaled value, so it depends on the scale
+     * and not on the precision — the reader can encode one correctly
+     * from a wider-precision file. A REWRITE would be writing values
+     * from a domain the destination column does not have, so it refuses
+     * the shape instead. Only a writer disagreeing with its own DDL
+     * produces the pairing.
+     */
+    private fun decimalDeferral(
+        col: Column,
+        schema: GroupType,
+    ): Boolean {
+        val decimals = col.selfAndDescendants().filter { it.def.type == ColType.DECIMAL }
+        if (decimals.isEmpty()) return false
+        val scales = decimals.map { (it.def.typeParams?.get("scale") as? Number)?.toInt() ?: 0 }.toSet()
+        val maxPrecision =
+            decimals.maxOf { (it.def.typeParams?.get("precision") as? Number)?.toInt() ?: 0 }
+
+        fun walk(g: GroupType): Boolean {
+            for (f in g.fields) {
+                if (f.isPrimitive) {
+                    val a = f.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
+                    if (a != null && (a.scale !in scales || a.precision > maxPrecision)) return true
+                } else if (walk(f.asGroupType())) {
+                    return true
+                }
+            }
+            return false
+        }
+        return walk(schema)
+    }
+
+    /**
+     * Sibling names repeated at any level of [group] — the shape the
+     * rewriter refuses (parquet addresses a group's fields by name, so
+     * a duplicate makes every write-side lookup a guess) and the reader
+     * tolerates (it binds by id).
+     */
+    private fun duplicateSiblingNames(group: GroupType): Set<String> {
+        val out = HashSet<String>()
+
+        fun walk(g: GroupType) {
+            out += g.fields.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+            for (f in g.fields) if (!f.isPrimitive) walk(f.asGroupType())
+        }
+        walk(group)
+        return out
     }
 
     private fun maybeSort(
@@ -338,15 +472,28 @@ object NestedAgreement {
                     ),
                 )
             }
-            if ((col.type == ColType.STRING || col.type == ColType.JSON) && (!isUtf8(lo) || !isUtf8(hi))) {
-                sink(
-                    Finding(
-                        "non-utf8-string-bound",
-                        "field ${agg.fieldId} type=${col.type.wire} lo=${lo.toHex()} hi=${hi.toHex()}; " +
-                            "IcebergSingleValue.decode(${col.type.wire}, .) round-trips through a JVM String " +
-                            "and mangles these bytes",
-                    ),
-                )
+            // A non-UTF-8 string bound is LEGAL — the encoding is bytes,
+            // and a mislabelled file produces one. What must hold is that
+            // it survives the codec: compaction's bounds merge is
+            // decode -> compare -> encode, so a lossy decode rewrites a
+            // file's bound during a rewrite. Check the property, not the
+            // proxy: this oracle used to flag every non-UTF-8 bound on
+            // the premise that decode mangled it, which it did until
+            // decode started returning the raw bytes for exactly these.
+            if (col.type == ColType.STRING || col.type == ColType.JSON) {
+                for (bound in listOf(lo, hi)) {
+                    val through =
+                        IcebergSingleValue.encode(col.type, IcebergSingleValue.decode(col.type, bound))
+                    if (!through.contentEquals(bound)) {
+                        sink(
+                            Finding(
+                                "string-bound-not-round-trippable",
+                                "field ${agg.fieldId} type=${col.type.wire} in=${bound.toHex()} " +
+                                    "out=${through.toHex()}; the codec changed a bound's bytes",
+                            ),
+                        )
+                    }
+                }
             }
             if (col.type == ColType.UUID_T && (lo.size != 16 || hi.size != 16)) {
                 sink(Finding("bound-width", "uuid field ${agg.fieldId} lo=${lo.size}B hi=${hi.size}B"))

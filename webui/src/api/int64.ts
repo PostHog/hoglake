@@ -76,6 +76,7 @@ const INT64_FIELDS = new Set([
   "skipped_conflicts",
   "dv_superseded",
   "unconvertible_schema",
+  "invalid_data",
   "failed_groups",
   "violations",
 ]);

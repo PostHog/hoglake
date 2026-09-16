@@ -1009,16 +1009,18 @@ class CommitService(
         liveColumnTypes: Map<Long, String>,
     ): ResolvedAppend {
         val qualified = "${append.namespace}.${append.table}"
-        var repaired = false
+        var anyRepaired = false
         val files =
             append.files.map { file ->
                 val stats = file.columnStats ?: return@map file
+                var fileRepaired = false
                 val checked =
                     stats.map { stat ->
                         val type = liveColumnTypes[stat.fieldId]?.let { ColType.fromWire(it) }
                         val result = StatsSanity.check(stat, type)
                         if (result.repairs.isNotEmpty()) {
-                            repaired = true
+                            fileRepaired = true
+                            anyRepaired = true
                             Metrics.statsRepaired("commit")
                             log.warn {
                                 "column_stats for field_id ${stat.fieldId} of ${file.path} in " +
@@ -1028,9 +1030,9 @@ class CommitService(
                         }
                         result.stats
                     }
-                if (repaired) file.copy(columnStats = checked) else file
+                if (fileRepaired) file.copy(columnStats = checked) else file
             }
-        return if (repaired) append.copy(files = files) else append
+        return if (anyRepaired) append.copy(files = files) else append
     }
 
     /** DB-independent DV registration checks: shapes, ranges, duplicate targets. */

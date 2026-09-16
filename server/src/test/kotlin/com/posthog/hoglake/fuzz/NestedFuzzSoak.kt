@@ -294,6 +294,13 @@ object NestedFuzzSoak {
                     ),
                 )
                 return
+            } catch (t: com.posthog.hoglake.compaction.InvalidDataException) {
+                // A VALUE refusal, not a shape one: this campaign writes
+                // random values into a canonical schema, so it generates
+                // empty blobs under decimals and rows past the node
+                // budget on purpose. Typed is the contract; the refusal
+                // itself is the fix working.
+                return
             } catch (t: Throwable) {
                 sink(Finding("rewriter-raw-throw", "canonical schema=${derived.schema}", t))
                 return
