@@ -298,9 +298,12 @@ installed metadata, so they are not version strings to bump.
   `dv_superseded` — a post-plan delete is never dropped).
   **Heterogeneous-schema groups — LANDED**: inputs map to the LIVE
   schema by field id (missing columns null-fill, int→long/float→double
-  up-cast, dropped field ids drop their data); only a live column
-  unproducible from an input's physical type skips the group
-  (`unconvertible_schema`). **Aborted-upload orphans — LANDED**: the
+  up-cast, unsigned int32→long ZERO-extension, dropped field ids drop
+  their data); only a live column unproducible from an input's physical
+  type skips the group (`unconvertible_schema`). The rewriter applies
+  the same unsigned-annotation domain rule as the hydrator's footer
+  decode (`ColType.maxUnsignedParquetWidth`) so compaction cannot
+  launder an annotation the hydrator refuses. **Aborted-upload orphans — LANDED**: the
   output path pre-registers as an undrained `hog_file_removal` row
   (reason `compaction_staging`) before upload; a successful group
   commit settles it (`drained_outcome='registered'`) in the same
@@ -310,8 +313,13 @@ installed metadata, so they are not version strings to bump.
   loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
   on is an ops decision, not a code gap. Remaining rewrite deferrals
   (all surface as `unconvertible_schema` skips, never wrong bytes):
-  nested schemas, INT96, decimal-scale changes, non-micros time(stamp)
-  units.
+  nested schemas, INT96, decimal-scale changes, and non-native
+  time(stamp) units — each timestamp type accepts only the unit its own
+  files carry (millis for `timestamp_s`/`timestamp_ms`, micros for
+  `timestamp`/`timestamptz`, nanos for `timestamp_ns`), and `time`
+  stays micros-only. No unit CONVERSION exists, because no legal
+  promotion produces a unit mismatch: `PROMOTIONS` follows DuckLake's
+  documented table, which has no timestamp rungs.
 - **Field ids are a contract**: the hydrator's footer read flags files
   whose parquet schema has any leaf without `PARQUET:field_id`
   (`hog_data_file.missing_field_ids`; gauge

@@ -168,10 +168,14 @@ CREATE TABLE hog_column (
     name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     -- Closed type set: every member has a defined Iceberg mapping
     -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
+    -- Member ORDER is load-bearing: V4__scalar_types.sql recreates this
+    -- constraint and the schema-equivalence gate compares the normalized
+    -- pg_get_constraintdef text, which preserves the order.
     col_type       text   NOT NULL CHECK (col_type IN (
-                       'boolean', 'int', 'long', 'float', 'double',
-                       'decimal', 'date', 'time', 'timestamp',
-                       'timestamptz', 'string', 'uuid', 'binary')),
+                       'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
+                       'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
+                       'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
+                       'timestamptz', 'string', 'json', 'uuid', 'binary')),
     type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
     nullable       boolean NOT NULL DEFAULT true,
     ordinal        int    NOT NULL CHECK (ordinal >= 0),

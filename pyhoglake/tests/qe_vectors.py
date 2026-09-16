@@ -9,13 +9,21 @@ header's value_conventions, then assert encode(value) == unhex(hex)
 and — unless verify == "encode_only" — decode(unhex(hex)) == value and
 re-encode(decode(...)) == unhex(hex).
 
-The two decimal "encode_only" vectors document the pyhoglake
-decode_bound context-precision bug (see qe_prop_bounds.py); the JVM
-side has no such context and SHOULD run them as full round-trips.
+Every "encode_only" vector documents a PYTHON decode_bound defect, not
+a codec disagreement: the precision-38 decimals hit its decimal-context
+rounding (see qe_prop_bounds.py), the two top-of-int64 timestamps hit
+datetime's year-9999 ceiling. The JVM decoder shares neither limit
+(BigInteger, Long) and SHOULD run all of them as full round-trips —
+QeBoundsDecodeVectorsTest does, which is why the marker is read
+per-type there rather than as a blanket skip.
 
-Regeneration (only when the codec intentionally changes): the vectors
-were produced by feeding these exact values through
-pyhoglake.bounds.encode_bound — see the file's generated_by key.
+Regeneration (only when the codec intentionally changes): feed the
+exact value through pyhoglake.bounds.encode_bound and paste .hex() —
+never hand-compute a byte. The file carried a "generated_by" provenance
+string until it was dropped: nothing could falsify it, because every
+run re-derives all 107 encodings from the INSTALLED codec anyway, and
+pinning it to a version number would only have added a seventh string
+to the release bump for a claim no regeneration backed.
 """
 
 import base64
@@ -42,6 +50,36 @@ _EPOCH_DATE = date(1970, 1, 1)
 _EPOCH_NAIVE = datetime(1970, 1, 1)
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=UTC)
 
+#: hoglake's closed column-type vocabulary, in spec enum order. The file
+#: must document a convention for every one of these AND carry vectors
+#: for every one: a type with no vector is a type whose two codecs have
+#: never been compared.
+ALL_COLTYPES = {
+    "boolean",
+    "int8",
+    "int16",
+    "int",
+    "long",
+    "uint8",
+    "uint16",
+    "uint32",
+    "uint64",
+    "float",
+    "double",
+    "decimal",
+    "date",
+    "time",
+    "timestamp_s",
+    "timestamp_ms",
+    "timestamp",
+    "timestamp_ns",
+    "timestamptz",
+    "string",
+    "json",
+    "uuid",
+    "binary",
+}
+
 
 def _parse_value(vec):
     """value string -> the Python value fed to encode_bound (per the
@@ -49,7 +87,25 @@ def _parse_value(vec):
     t, v = vec["type"], vec["value"]
     if t == "boolean":
         return {"true": True, "false": False}[v]
-    if t in ("int", "long", "date", "time", "timestamp", "timestamptz"):
+    if t in (
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "date",
+        "time",
+        # micros for these three, nanos for timestamp_ns: the STORED unit
+        # in both cases, which is what the codec takes an int to mean
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp",
+        "timestamp_ns",
+        "timestamptz",
+    ):
         return int(v)  # integer-domain conventions; codec accepts ints
     if t in ("float", "double"):
         if v == "NaN":
@@ -62,7 +118,7 @@ def _parse_value(vec):
         if v == "-Infinity":
             return -math.inf
         return float(v)
-    if t == "string":
+    if t in ("string", "json"):
         return v
     if t == "uuid":
         return _uuid.UUID(v)
@@ -78,7 +134,19 @@ def _decoded_matches(vec, decoded):
     t, v = vec["type"], vec["value"]
     if t == "boolean":
         return decoded is ({"true": True, "false": False}[v])
-    if t in ("int", "long"):
+    if t in (
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        # nanos as a plain int: decode_bound deliberately does NOT build a
+        # datetime, which would round the sub-microsecond digits away
+        "timestamp_ns",
+    ):
         return decoded == int(v)
     if t in ("float", "double"):
         fmt = "<f" if t == "float" else "<d"
@@ -93,11 +161,19 @@ def _decoded_matches(vec, decoded):
             micros % 60_000_000 // 1_000_000,
             micros % 1_000_000,
         )
-    if t == "timestamp":
-        return decoded == _EPOCH_NAIVE + timedelta(microseconds=int(v))
-    if t == "timestamptz":
-        return decoded == _EPOCH_UTC + timedelta(microseconds=int(v))
-    if t == "string":
+    if t in ("timestamp", "timestamp_s", "timestamp_ms", "timestamptz"):
+        # All four decode to the same calendar object — micros is the
+        # stored unit for every hoglake type mapped to Iceberg timestamp —
+        # EXCEPT past year 9999, where datetime cannot go and the codec
+        # falls back to raw micros (the same answer timestamp_ns always
+        # gives). Accept whichever the value's magnitude implies.
+        micros = int(v)
+        base = _EPOCH_UTC if t == "timestamptz" else _EPOCH_NAIVE
+        try:
+            return decoded == base + timedelta(microseconds=micros)
+        except OverflowError:
+            return decoded == micros
+    if t in ("string", "json"):
         return decoded == v
     if t == "uuid":
         return decoded == _uuid.UUID(v)
@@ -121,22 +197,11 @@ def _vector_id(vec):
 def test_vector_file_header_contract():
     assert DOC["format"] == "hoglake-bounds-vectors"
     assert DOC["version"] == 1
-    assert set(DOC["value_conventions"]) >= {
-        "boolean",
-        "int",
-        "long",
-        "float",
-        "double",
-        "date",
-        "time",
-        "timestamp",
-        "timestamptz",
-        "string",
-        "uuid",
-        "binary",
-        "decimal",
-    }
-    assert len(VECTORS) >= 40
+    assert set(DOC["value_conventions"]) >= ALL_COLTYPES
+    # Exact, not >=: a vector deleted by a bad merge is otherwise a silent
+    # loss of coverage. Bump deliberately when adding vectors, and keep
+    # BoundsVectorFile.EXPECTED_COUNT on the Kotlin side in step.
+    assert len(VECTORS) == 107
     for vec in VECTORS:
         assert set(vec) >= {"type", "type_params", "value", "hex", "note"}
         # hex must be lowercase and byte-aligned
@@ -169,33 +234,48 @@ def test_python_codec_matches_vector(vec):
 
 def test_all_coltypes_are_covered():
     covered = {v["type"] for v in VECTORS}
-    assert covered == {
-        "boolean",
-        "int",
-        "long",
-        "float",
-        "double",
-        "date",
-        "time",
-        "timestamp",
-        "timestamptz",
-        "string",
-        "uuid",
-        "binary",
-        "decimal",
-    }
+    assert covered == ALL_COLTYPES
+
+
+def test_every_new_type_is_verified_both_ways():
+    """No new type may hide behind `encode_only`. The only remaining
+    member is a PYTHON decode defect the vector pins rather than papers
+    over, and the JVM does not share it (BigInteger has no ambient
+    precision), so the Kotlin decode test runs it as a full round-trip:
+
+      decimal -- decode_bound rounds >28-digit unscaled values through
+                 the ambient decimal context
+
+    The two timestamp boundary vectors used to be here too: correcting
+    them to true micros (~9.2e18) walked straight past datetime's year
+    9999 ceiling (~2.5e17). That was a real codec gap, not a vector
+    problem, and decode_bound now falls back to raw micros there — so
+    they are two-way again.
+    """
+    encode_only = {v["type"] for v in VECTORS if v.get("verify") == "encode_only"}
+    assert encode_only == {"decimal"}
 
 
 def test_fixed_width_vectors_have_fixed_width_hex():
+    # uint64 and json are absent on purpose: uint64's minimal
+    # two's-complement form is 1-9 bytes wide, json's is the document.
     widths = {
         "boolean": 1,
+        "int8": 4,
+        "int16": 4,
         "int": 4,
+        "uint8": 4,
+        "uint16": 4,
+        "uint32": 8,
         "long": 8,
         "float": 4,
         "double": 8,
         "date": 4,
         "time": 8,
+        "timestamp_s": 8,
+        "timestamp_ms": 8,
         "timestamp": 8,
+        "timestamp_ns": 8,
         "timestamptz": 8,
         "uuid": 16,
     }

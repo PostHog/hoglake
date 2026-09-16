@@ -74,12 +74,10 @@ data class ColumnDefDto(
     fun toModel(): ColumnDef =
         ColumnDef(
             name = name,
-            type =
-                try {
-                    ColType.fromWire(type)
-                } catch (_: IllegalArgumentException) {
-                    throw HoglakeException.Validation("unknown column type '$type' for column '$name'")
-                },
+            // parseWire, not fromWire: a permanently unsupported DuckLake
+            // type name gets a 422 that names the type and says WHY, so a
+            // client stops trying instead of hunting for a spelling.
+            type = ColType.parseWire(type) { "unknown column type '$type' for column '$name'" },
             typeParams = typeParams,
             nullable = nullable,
         )

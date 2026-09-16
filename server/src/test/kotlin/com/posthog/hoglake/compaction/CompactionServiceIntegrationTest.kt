@@ -596,6 +596,230 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a mixed-width bound pair from a promotion race merges to null, not to garbage`() {
+        // The race AlterService documents: the promote-time re-encode
+        // rewrites existing 4-byte bounds to 8, but a hydrator already
+        // in flight under the OLD type can land another 4-byte row
+        // AFTER it. The merge then sees one bound of each width for the
+        // same column, and decoding a 4-byte payload as the live 8-byte
+        // type is not a near miss — it is an exception, which used to
+        // wedge the group on every sweep until its inputs expired.
+        //
+        // Exercised on a NEW type so the backstop is known to cover the
+        // parity set too: uint8 -> uint32 is int -> long in Iceberg
+        // terms, so it is a width-changing promotion exactly like
+        // int -> long, just with neither name saying "long".
+        val fx = fixture(dvOnMiddle = false)
+        val added =
+            alter.alterTable(
+                fx.cat,
+                "ns",
+                "t",
+                listOf(AlterOp.AddColumn(ColumnDef("small", ColType.UINT8))),
+            )
+        val field = added.columns.single { it.def.name == "small" }.fieldId
+
+        // Pre-promotion bounds on every input, in the 4-byte int encoding.
+        db.jdbi.useHandleUnchecked { h ->
+            for (fileId in fx.fileIds) {
+                h.execute(
+                    """
+                    INSERT INTO hog_file_column_stats
+                        (catalog_id, data_file_id, field_id, value_count, null_count,
+                         lower_bound, upper_bound)
+                    VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
+                    """,
+                    fx.cat,
+                    fileId,
+                    field,
+                    IcebergSingleValue.encodeInt(1),
+                    IcebergSingleValue.encodeInt(200),
+                )
+            }
+        }
+
+        alter.alterTable(
+            fx.cat,
+            "ns",
+            "t",
+            listOf(AlterOp.PromoteColumn("small", ColType.UINT32)),
+        )
+
+        // The promote widened all of them; now simulate the racing
+        // hydrator by putting ONE back to the pre-promotion width.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                UPDATE hog_file_column_stats SET lower_bound = ?, upper_bound = ?
+                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)
+                  AND data_file_id = ? AND field_id = ?
+                """,
+                IcebergSingleValue.encodeInt(1),
+                IcebergSingleValue.encodeInt(200),
+                fx.cat,
+                fx.fileIds[0],
+                field,
+            )
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).describedAs("the sweep is not wedged").isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val merged =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = :field
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .map { rs, _ -> rs.getBytes("lower_bound") to rs.getBytes("upper_bound") }
+                    .one()
+            }
+        // Honest absence, not a bound merged from a payload that was
+        // reinterpreted at the wrong width.
+        assertThat(merged.first).describedAs("mixed-width merge yields no lower bound").isNull()
+        assertThat(merged.second).describedAs("mixed-width merge yields no upper bound").isNull()
+
+        // The columns that were consistent still merged normally — one
+        // poisoned field must not null the whole file's stats.
+        val others =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                      AND s.field_id <> :field AND s.lower_bound IS NOT NULL
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .mapTo(Long::class.java)
+                    .one()
+            }
+        assertThat(others).describedAs("unaffected columns keep their merged bounds").isGreaterThan(0)
+    }
+
+    @Test
+    fun `bound-merge is unsigned for uint64 and byte-ordered for json`() {
+        // The two new types whose merge is NOT its natural JVM ordering.
+        // uint64 decodes to a BigInteger, so the winner must be picked by
+        // magnitude across the 2^63 boundary where a signed long would
+        // flip; json decodes to a String, which must compare as UTF-8
+        // BYTES (String.compareTo is UTF-16 unit order, and the two
+        // disagree above the BMP).
+        val fx = fixture(dvOnMiddle = false)
+        val added =
+            alter.alterTable(
+                fx.cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("big", ColType.UINT64)),
+                    AlterOp.AddColumn(ColumnDef("doc", ColType.JSON)),
+                ),
+            )
+        val bigField = added.columns.single { it.def.name == "big" }.fieldId
+        val docField = added.columns.single { it.def.name == "doc" }.fieldId
+
+        // Per input file: a uint64 bound pair straddling 2^63, and a json
+        // pair whose UTF-8 order differs from UTF-16 order. The first
+        // file's uint64 lower is written NON-MINIMALLY (a redundant
+        // leading sign byte), which is what a sloppy writer produces and
+        // which the merge must re-minimalise on re-encode.
+        val twoPow63 = java.math.BigInteger.ONE.shiftLeft(63)
+        val uintBounds =
+            listOf(
+                byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 7) to twoPow63.toByteArray(),
+                twoPow63.toByteArray() to twoPow63.add(java.math.BigInteger.TEN).toByteArray(),
+                java.math.BigInteger.valueOf(9).toByteArray() to
+                    java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray(),
+            )
+        // The orders only diverge ABOVE the BMP, so the discriminating
+        // pair needs an astral codepoint: U+1F600 is F0 9F 98 80 in
+        // UTF-8, above U+FFFD's EF BF BD, but its UTF-16 lead surrogate
+        // D83D is BELOW FFFD. A String.compareTo merge would pick the
+        // replacement character as the upper bound; the byte order picks
+        // the emoji.
+        val jsonBounds =
+            listOf(
+                """{"a":1}""" to """{"z":1}""",
+                """{"b":1}""" to """{"😀":1}""",
+                """{"c":1}""" to """{"�":1}""",
+            )
+        db.jdbi.useHandleUnchecked { h ->
+            for ((i, fileId) in fx.fileIds.withIndex()) {
+                val rows =
+                    listOf(
+                        bigField to uintBounds[i],
+                        docField to
+                            (
+                                IcebergSingleValue.encodeString(jsonBounds[i].first) to
+                                    IcebergSingleValue.encodeString(jsonBounds[i].second)
+                            ),
+                    )
+                for ((field, pair) in rows) {
+                    h.execute(
+                        """
+                        INSERT INTO hog_file_column_stats
+                            (catalog_id, data_file_id, field_id, value_count, null_count,
+                             lower_bound, upper_bound)
+                        VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
+                        """,
+                        fx.cat,
+                        fileId,
+                        field,
+                        pair.first,
+                        pair.second,
+                    )
+                }
+            }
+        }
+
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val merged =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .map { rs, _ ->
+                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
+                    }
+                    .list()
+                    .toMap()
+            }
+
+        // uint64: smallest is 7, largest 2^64-1 — a signed merge would
+        // have called 2^63 and above negative and picked 7 as the max.
+        assertThat(merged[bigField]!!.first)
+            .describedAs("uint64 lower re-minimalises the 9-byte input")
+            .isEqualTo(java.math.BigInteger.valueOf(7).toByteArray())
+        assertThat(merged[bigField]!!.second)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+
+        // json: byte order puts the two-byte UTF-8 sequence on top.
+        assertThat(merged[docField]!!.first).isEqualTo(IcebergSingleValue.encodeString("""{"a":1}"""))
+        assertThat(merged[docField]!!.second)
+            .describedAs("json upper is the UTF-8 byte winner, not the UTF-16 one")
+            .isEqualTo(IcebergSingleValue.encodeString("""{"😀":1}"""))
+    }
+
+    @Test
     fun `changefeed replays original files and never the compacted output`() {
         val fx = fixture()
         svc.runOnce(fx.cat, cfg)

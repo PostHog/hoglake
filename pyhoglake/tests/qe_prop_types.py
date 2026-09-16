@@ -6,10 +6,13 @@ Two totality claims under test:
    type and back to itself; every canonical arrow type is a fixed point
    after one round-trip (non-canonical spellings — large_string,
    tz-of-any-name, uuid extension — converge to a fixed point in one
-   hop and never drift further).
-2. Rejection completeness: every generated exotic arrow type (other
-   int widths, other temporal units, decimal256, and ANY nested or
-   parameterized combinator, even over supported inner types) raises
+   hop and never drift further). "uint32" is the ONE exception, carved
+   out into its own test: its writer contract is pa.int64(), so it
+   settles on "long" — see test_uint32_converges_to_long_in_one_hop.
+2. Rejection completeness: every generated exotic arrow type (float16,
+   date64, the time32/time64(ns) widths, tz-aware non-micros
+   timestamps, durations, decimal256, and ANY nested or parameterized
+   combinator, even over supported inner types) raises
    UnsupportedTypeError — never a silent wrong mapping, never a
    different exception type.
 """
@@ -31,20 +34,36 @@ from pyhoglake.types import (
 
 # -- generators -------------------------------------------------------------
 
+#: pa.json_() arrived in pyarrow 19; the project floor is 17. Without it
+#: "json" maps to pa.string() and comes back as "string", so it is not a
+#: round-trip type on that pyarrow and must leave the identity property.
+HAS_JSON = hasattr(pa, "json_")
+
+#: Round-trip coltypes: coltype -> arrow -> the SAME coltype. "uint32" is
+#: deliberately absent (it maps to pa.int64(), i.e. "long" on the way
+#: back) — see test_uint32_converges_to_long_in_one_hop.
 SIMPLE_COLTYPES = [
     "boolean",
+    "int8",
+    "int16",
     "int",
     "long",
+    "uint8",
+    "uint16",
+    "uint64",
     "float",
     "double",
     "string",
     "binary",
     "date",
     "time",
+    "timestamp_s",
+    "timestamp_ms",
     "timestamp",
+    "timestamp_ns",
     "timestamptz",
     "uuid",
-]
+] + (["json"] if HAS_JSON else [])
 
 coltype_with_params = st.one_of(
     st.tuples(st.sampled_from(SIMPLE_COLTYPES), st.none()),
@@ -60,18 +79,27 @@ canonical_arrow = st.one_of(
     st.sampled_from(
         [
             pa.bool_(),
+            pa.int8(),
+            pa.int16(),
             pa.int32(),
             pa.int64(),
+            pa.uint8(),
+            pa.uint16(),
+            pa.uint64(),
             pa.float32(),
             pa.float64(),
             pa.string(),
             pa.binary(),
             pa.date32(),
             pa.time64("us"),
+            pa.timestamp("s"),
+            pa.timestamp("ms"),
             pa.timestamp("us"),
+            pa.timestamp("ns"),
             pa.timestamp("us", tz="UTC"),
             pa.binary(16),
         ]
+        + ([pa.json_()] if HAS_JSON else [])
     ),
     st.integers(1, 38).flatmap(
         lambda p: st.integers(0, p).map(lambda s: pa.decimal128(p, s))
@@ -87,20 +115,15 @@ noncanonical_arrow = st.one_of(
 
 _unsupported_scalars = [
     pa.null(),
-    pa.int8(),
-    pa.int16(),
-    pa.uint8(),
-    pa.uint16(),
-    pa.uint32(),
-    pa.uint64(),
     pa.float16(),
     pa.date64(),
     pa.time32("s"),
     pa.time32("ms"),
     pa.time64("ns"),
-    pa.timestamp("s"),
-    pa.timestamp("ms"),
-    pa.timestamp("ns"),
+    # tz-aware is micros-only: hoglake has no timestamptz_s/_ms/_ns, so a
+    # tz-aware second/milli/nano column has nowhere to land.
+    pa.timestamp("s", tz="UTC"),
+    pa.timestamp("ms", tz="UTC"),
     pa.timestamp("ns", tz="UTC"),
     pa.timestamp("s", tz="America/New_York"),
     pa.duration("s"),
@@ -176,6 +199,28 @@ def test_noncanonical_arrow_converges_in_one_hop(t):
     assert coltype_to_arrow(c2, p2).equals(a1)  # stable thereafter
 
 
+def test_uint32_converges_to_long_in_one_hop():
+    """The single mapping that is not a round trip in EITHER direction,
+    and the only one excluded from the two identity properties above.
+
+    ``coltype_to_arrow("uint32")`` is ``pa.int64()`` on purpose (the
+    writer contract — pyarrow's pa.uint32() becomes parquet INT32 +
+    Int(32, unsigned), which an Iceberg reader takes as SIGNED, so
+    values above 2^31 would read back negative). So "uint32" settles on
+    "long" after one hop, and ``pa.uint32()`` settles on ``pa.int64()``.
+    Both then stay put — the mapping loses the unsigned NAME, never a
+    value, and never drifts further.
+    """
+    assert coltype_to_arrow("uint32") == pa.int64()
+    assert arrow_type_to_coltype(pa.int64()) == ("long", None)
+    assert coltype_to_arrow("long") == pa.int64()  # fixed point reached
+
+    assert arrow_type_to_coltype(pa.uint32()) == ("uint32", None)
+    a1 = coltype_to_arrow("uint32")
+    assert arrow_type_to_coltype(a1)[0] == "long"
+    assert coltype_to_arrow("long").equals(a1)  # stable thereafter
+
+
 # -- rejection completeness -------------------------------------------------
 
 
@@ -195,7 +240,7 @@ def test_unsupported_type_error_is_typeerror_and_hoglake_error():
     from pyhoglake import HoglakeError
 
     try:
-        arrow_type_to_coltype(pa.int8())
+        arrow_type_to_coltype(pa.float16())  # int8 is a supported type now
     except UnsupportedTypeError as e:
         assert isinstance(e, TypeError)
         assert isinstance(e, HoglakeError)

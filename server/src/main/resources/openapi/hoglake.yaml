@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.0.1-dev
+  version: 1.1.0-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -1240,8 +1240,35 @@ components:
             underscore, hyphen; max 128 chars. Violations are 422.
         type:
           type: string
-          enum: [boolean, int, long, float, double, decimal, date, time,
-                 timestamp, timestamptz, string, uuid, binary]
+          enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
+                 uint64, float, double, decimal, date, time, timestamp_s,
+                 timestamp_ms, timestamp, timestamp_ns, timestamptz,
+                 string, json, uuid, binary]
+          description: >
+            The closed column-type vocabulary: every member has a
+            defined Iceberg facade mapping (iceberg-federation.md §2),
+            which is the membership rule.
+
+            Stats bounds for a column are stored — and returned — in the
+            Iceberg single-value binary serialization of the MAPPED
+            Iceberg type, not of the hoglake type. Consequences worth
+            knowing before decoding: int8/int16/uint8/uint16 bounds are
+            4-byte little-endian ints; uint32 bounds are 8-byte
+            little-endian longs; uint64 bounds are the minimal
+            two's-complement big-endian unscaled value of a
+            decimal(20,0); timestamp_s and timestamp_ms bounds are
+            MICROSECONDS since the epoch (like timestamp), while
+            timestamp_ns bounds are NANOSECONDS; json bounds are UTF-8
+            bytes, like string.
+
+            These DuckLake type names are permanently unsupported and
+            are refused with a 422 naming the type and the reason, never
+            an unknown-type error: int128 and uint128 (39 decimal
+            digits, past Iceberg's widest exact numeric decimal(38)),
+            timetz and interval (no Iceberg mapping), and the geometry
+            family — point, linestring, polygon, multipoint,
+            multilinestring, multipolygon, linestring_z,
+            geometrycollection (out of scope).
         type_params:
           type: object
           additionalProperties: true
