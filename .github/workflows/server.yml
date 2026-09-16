@@ -77,6 +77,8 @@ jobs:
             awk -v max="$main_max" '
               $1 <= max { printf "::error::Migration %s is numbered at or below main'\''s newest (V%s); renumber above it\n", $2, max; bad = 1 }
               END { exit bad }'
+
+  test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
