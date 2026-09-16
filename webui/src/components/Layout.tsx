@@ -47,12 +47,18 @@ function ServerVersion() {
     retry: false,
   });
   if (!data?.version) return null;
+  // The version alone cannot tell two deploys apart: it stays constant
+  // between releases. The build stamp is what names WHICH build is live,
+  // and it is absent on anything not packaged by the pipeline.
+  const title = data.build
+    ? `Running hoglake server version ${data.version}, build ${data.build} ` +
+      "(the packaging stamp, UTC; GET /v1/info)"
+    : `Running hoglake server version ${data.version}, built locally ` +
+      "(no pipeline build stamp; GET /v1/info)";
   return (
-    <span
-      className="server-version"
-      title={`Running hoglake server version ${data.version} (GET /v1/info)`}
-    >
+    <span className="server-version" title={title}>
       v{data.version}
+      {data.build && <span className="server-build">+{data.build}</span>}
     </span>
   );
 }

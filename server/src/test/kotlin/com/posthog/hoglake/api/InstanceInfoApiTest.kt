@@ -119,6 +119,23 @@ class InstanceInfoApiTest {
         }
 
     @Test
+    fun `build is present exactly when this build carries a stamp`() =
+        api { client ->
+            // The invariant is the WIRING — the field mirrors BuildInfo,
+            // present iff stamped and never null-or-empty, because a
+            // client tells "off the pipeline" from "built locally" by
+            // presence alone. Asserted this way rather than hard-coding
+            // "absent" so the test still holds if the suite is ever run
+            // from a stamped build. That an ORDINARY build is unstamped
+            // is pinned in BuildInfoTest, where it belongs.
+            val root = body(client.get("/v1/info"))
+            assertThat(root.has("build")).isEqualTo(BuildInfo.buildStamp != null)
+            BuildInfo.buildStamp?.let { assertThat(root["build"].asText()).isEqualTo(it) }
+            // ...while version stays present regardless.
+            assertThat(root["version"].asText()).isEqualTo(BuildInfo.version)
+        }
+
+    @Test
     fun `totals hold the last sample until the next one and drop dead files then`() {
         val cat = "info-totals-resample"
         seed(cat)

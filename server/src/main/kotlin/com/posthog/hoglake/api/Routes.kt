@@ -44,6 +44,7 @@ fun Application.installApiRoutes(
                 InstanceInfoDto(
                     name = instanceName.ifBlank { null },
                     version = BuildInfo.version,
+                    build = BuildInfo.buildStamp,
                     totalRows = totals?.totalRows,
                     totalSizeBytes = totals?.totalSizeBytes,
                 ),

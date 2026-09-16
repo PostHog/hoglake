@@ -209,17 +209,30 @@ tasks.register<JavaExec>("generateFuzzSeeds") {
 // likely to be wrong. project.version is the single source (build.gradle
 // -> here -> GET /v1/info -> webui badge), so there is nothing to keep in
 // sync by hand.
+// The build stamp is SUPPLIED, never generated here: an ordinary local
+// build has nothing to stamp with and reports no build, which is the
+// point — only a packaged image (the CD Docker build) carries one, so a
+// stamp in the webui always means "this came off the pipeline". Gradle
+// generating a timestamp per invocation would make every local `gradle
+// build` claim a distinct build and make the field meaningless.
+val buildStamp =
+    providers.gradleProperty("buildStamp")
+        .orElse(providers.environmentVariable("HOGLAKE_BUILD_STAMP"))
+        .orElse("")
+
 val generateVersionResource =
     tasks.register("generateVersionResource") {
-        description = "Write the project version into a resource the server reads at runtime"
+        description = "Write the project version and build stamp into a resource the server reads at runtime"
         val outputDir = layout.buildDirectory.dir("generated/version")
         val projectVersion = version.toString()
+        val stamp = buildStamp
         inputs.property("version", projectVersion)
+        inputs.property("buildStamp", stamp)
         outputs.dir(outputDir)
         doLast {
             val file = outputDir.get().file("com/posthog/hoglake/version.properties").asFile
             file.parentFile.mkdirs()
-            file.writeText("version=$projectVersion\n")
+            file.writeText("version=$projectVersion\nbuild=${stamp.get()}\n")
         }
     }
 

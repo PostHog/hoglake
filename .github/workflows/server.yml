@@ -180,6 +180,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # The build identity GET /v1/info reports, so the webui names which
+      # build is live within a version that stays constant between
+      # releases. UTC, minute resolution, sortable as a plain string.
+      # Only this job stamps: an unstamped build is by definition not a
+      # deployed one.
+      - name: Build stamp
+        id: stamp
+        run: echo "value=$(date -u +%Y%m%dT%H%MZ)" >> "$GITHUB_OUTPUT"
+
       # Multi-arch: the mw fleet runs Graviton nodes. The Dockerfile's
       # build stage is pinned to $BUILDPLATFORM, so gradle runs once
       # natively; only the JRE runtime layer is per-arch.
@@ -189,6 +198,8 @@ jobs:
           context: server
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            HOGLAKE_BUILD_STAMP=${{ steps.stamp.outputs.value }}
           tags: |
             ghcr.io/posthog/hoglake-server:${{ github.sha }}
             ghcr.io/posthog/hoglake-server:latest
