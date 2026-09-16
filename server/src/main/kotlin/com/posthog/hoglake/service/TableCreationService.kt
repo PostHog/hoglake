@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.initialColumns
+import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
@@ -150,9 +151,7 @@ class TableCreationService(
                     ) {
                         throw HoglakeException.Validation("file outside operation write_path")
                     }
-                    if (it.footerSize == null || it.footerSize < 0 || it.footerSize > it.fileSizeBytes - 8) {
-                        throw HoglakeException.Validation("invalid footer_size")
-                    }
+                    it.validateFooterSize(required = true)
                 }
                 h.createUpdate(
                     """

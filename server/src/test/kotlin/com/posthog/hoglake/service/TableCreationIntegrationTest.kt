@@ -40,6 +40,44 @@ class TableCreationIntegrationTest {
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
     @Test
+    fun `append validates supplied footer bounds and still accepts omitted metadata`() {
+        val catalog = catalog()
+        catalogs.createTable(catalog, "test", "target", definition.columns)
+        val head = catalogs.getCatalog(catalog)
+        val commits = CommitService(db.jdbi)
+        val valid = FileRegistration(head.dataPath + "/part.parquet", 1, 100, 20)
+        for (file in listOf(
+            valid.copy(footerSize = -1),
+            valid.copy(footerSize = 93),
+            valid.copy(fileSizeBytes = 7, footerSize = 0),
+            valid.copy(fileSizeBytes = Long.MIN_VALUE, footerSize = 0),
+        )) {
+            assertThatThrownBy {
+                commits.commit(
+                    catalog,
+                    com.posthog.hoglake.model.CommitRequest(
+                        appends =
+                            listOf(
+                                com.posthog.hoglake.model.TableAppend("test", "target", listOf(file)),
+                            ),
+                    ),
+                )
+            }.isInstanceOf(HoglakeException.Validation::class.java)
+            assertThat(catalogs.getCatalog(catalog)).isEqualTo(head)
+        }
+        commits.commit(
+            catalog,
+            com.posthog.hoglake.model.CommitRequest(
+                appends =
+                    listOf(
+                        com.posthog.hoglake.model.TableAppend("test", "target", listOf(valid.copy(footerSize = null))),
+                    ),
+            ),
+        )
+        assertThat(catalogs.getTable(catalog, "test", "target").fileCount).isEqualTo(1)
+    }
+
+    @Test
     fun `versioned definitions use wire names and legacy receipts still retry and publish`() {
         val catalog = catalog()
         val def =

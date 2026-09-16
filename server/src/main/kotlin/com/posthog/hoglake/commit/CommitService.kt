@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
@@ -635,6 +636,7 @@ class CommitService(
             var rowId = rowIdStart
 
             for (file in append.files) {
+                file.validateFooterSize()
                 val dataFileId = nextFileId++
                 fileBatch
                     .bind("catalogId", catalogId)
