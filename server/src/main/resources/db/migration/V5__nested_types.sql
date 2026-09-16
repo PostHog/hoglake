@@ -28,7 +28,7 @@
 --
 --  2. The col_type CHECK is recreated with 'list', 'struct' and 'map'
 --     APPENDED. Order is load-bearing (the schema-equivalence gate
---     compares pg_get_constraintdef text, and NestedTypeParityTest
+--     compares pg_get_constraintdef text, and ScalarTypeParityTest
 --     compares this list against the ColType enum and the OpenAPI enum),
 --     and appending rather than inserting also keeps the committed fuzz
 --     seed corpus pointed at the types its file names claim.

@@ -27,7 +27,7 @@ import java.util.UUID
  *
  * Member ORDER is load-bearing twice over: the migration CHECK and the
  * OpenAPI enum must list the same names in the same order
- * (`NestedTypeParityTest`), and the fuzz seed corpus encodes
+ * (`ScalarTypeParityTest`), and the fuzz seed corpus encodes
  * `ColType.ordinal` as its first byte — which is why new members are
  * APPENDED, never inserted (phase 1 inserted, and re-pointed every
  * committed seed at a different type).
@@ -602,17 +602,15 @@ data class Column(
         out.add(this)
         for (c in children) c.collectInto(out)
     }
-
-    /**
-     * The scalar descendants (or this column, when it is itself
-     * scalar). Leaves are what parquet writes, what
-     * hog_file_column_stats is keyed on, and the only columns that can
-     * carry bounds.
-     */
-    fun leaves(): List<Column> = selfAndDescendants().filter { !it.def.type.isNested }
 }
 
-/** Every node of a column FOREST, parents before children. */
+/**
+ * Every node of a column FOREST, parents before children.
+ *
+ * The one thing callers reach for when "the table's columns" has to mean
+ * every field id rather than every top-level column — which is what
+ * hog_file_column_stats is keyed on, since bounds are per LEAF.
+ */
 fun List<Column>.allNodes(): List<Column> = flatMap { it.selfAndDescendants() }
 
 /**
