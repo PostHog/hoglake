@@ -128,10 +128,16 @@ REJECTED = [
     pa.timestamp("ms", tz="UTC"),
     pa.timestamp("ns", tz="UTC"),
     pa.binary(8),  # fixed-size but not 16
-    pa.list_(pa.int64()),
-    pa.struct([("a", pa.int64())]),
-    pa.map_(pa.string(), pa.int64()),
     pa.duration("us"),
+    # Containers are supported since phase 2 — but only over supported
+    # inner types. A container carrying an unsupported leaf is still
+    # rejected, at any depth.
+    pa.list_(pa.duration("us")),
+    pa.struct([("a", pa.float16())]),
+    pa.map_(pa.string(), pa.date64()),
+    pa.list_(pa.struct([("a", pa.list_(pa.time32("s")))])),
+    # An empty struct has no parquet or Iceberg representation.
+    pa.struct([]),
 ]
 
 

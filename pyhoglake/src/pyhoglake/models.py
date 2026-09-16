@@ -161,16 +161,49 @@ class TableSummary:
 
 @dataclass(frozen=True)
 class Column:
+    """One catalog column.
+
+    Recursive: a container type (``list``/``struct``/``map``) carries its
+    ``children``, each with its own server-assigned ``field_id``.
+    ``ordinal`` orders a column among its SIBLINGS — top-level columns
+    share one sequence, and each container's children have their own —
+    so it is not a table-wide position.
+    """
+
     name: str
     type: str
     field_id: int
     ordinal: int
     nullable: bool = True
     type_params: dict[str, Any] | None = None
+    #: Present only for list/struct/map.
+    children: tuple[Column, ...] | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> Column:
-        return _wire("Column", d, lambda d: cls(**_pick(cls, d)))
+        def build(d: Mapping[str, Any]) -> Column:
+            kw = dict(_pick(cls, d))
+            kids = kw.get("children")
+            if kids is not None:
+                if not isinstance(kids, (list, tuple)):
+                    raise MalformedResponseError(
+                        "Column: children must be an array or null, got "
+                        f"{type(kids).__name__}"
+                    )
+                kw["children"] = tuple(Column.from_wire(c) for c in kids)
+            return cls(**kw)
+
+        return _wire("Column", d, build)
+
+    def leaves(self) -> tuple[Column, ...]:
+        """This column's scalar descendants, or itself when it is scalar.
+
+        Leaves are what parquet writes and what ``field_id``-keyed stats
+        describe; a container has no values of its own.
+        """
+        if not self.children:
+            return (self,)
+        return tuple(leaf for c in self.children for leaf in c.leaves())
 
 
 @dataclass(frozen=True)

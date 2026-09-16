@@ -416,6 +416,50 @@ def wire_string(col_type: str, transform: str, transformed: Any) -> str | None:
     raise ValidationError(f"cannot stringify partition value for type {col_type!r}")
 
 
+# -- nested partition sources ------------------------------------------------
+
+#: Container column types. A partition or sort source is always a LEAF —
+#: a container has no single value per row to transform.
+_NESTED_TYPES = frozenset({"list", "struct", "map"})
+
+
+def partition_source_array(data: pa.Table, chain: list[Any]) -> pa.ChunkedArray:
+    """The source array for a partition field, given the root-to-leaf
+    ``chain`` of catalog Columns that reaches it.
+
+    A top-level column is ``data.column(name)``; a STRUCT leaf is
+    extracted with ``struct_field``, which Iceberg allows as a partition
+    source (``source-id`` may point at a struct's leaf field).
+
+    Refused, by name: a container itself (no single value per row), and
+    anything under a list or a map (MANY values per row — a partition key
+    would have to pick one, and there is no rule that says which). The
+    server refuses the same specs at DDL time; this is the client-side
+    twin, so a hand-built spec fails before it writes a file.
+    """
+    leaf = chain[-1]
+    path = ".".join(c.name for c in chain)
+    if leaf.type in _NESTED_TYPES:
+        raise ValidationError(
+            f"partition source {path!r} is a {leaf.type!r}: a nested container has "
+            "no single value per row and cannot be a partition source; use one of "
+            "its leaf fields",
+            status_code=None,
+        )
+    repeated = next((c for c in chain[:-1] if c.type in ("list", "map")), None)
+    if repeated is not None:
+        raise ValidationError(
+            f"partition source {path!r} sits under {repeated.name!r}, a "
+            f"{repeated.type!r}: a row has many such values, so it cannot be a "
+            "partition source; struct leaves are the only nested fields that can",
+            status_code=None,
+        )
+    column = data.column(chain[0].name)
+    for step in chain[1:]:
+        column = pc.struct_field(column, step.name)
+    return column
+
+
 # -- array-level driver (the fanout path) -----------------------------------
 
 

@@ -242,22 +242,18 @@ def _bound_readable(col: Column, raw_type: pa.DataType) -> bool:
     return False
 
 
-def _nanos_scale(metadata: pq.FileMetaData, name: str) -> int | None:
-    """Nanos-per-tick for the footer field ``name``, or None when it is
-    not a timestamp we can read.
+def _nanos_scale(leaf_type: pa.DataType | None) -> int | None:
+    """Nanos-per-tick for a footer leaf, or None when it is not a
+    timestamp we can read.
 
-    The unit comes from the footer's own arrow schema rather than the
+    The unit comes from the footer's own arrow type rather than the
     catalog type: the catalog says what the column was DECLARED as, the
     file says what its int64s MEAN, and only the second one can be
     trusted to interpret raw statistics.
     """
-    try:
-        field = metadata.schema.to_arrow_schema().field(name)
-    except (KeyError, pa.ArrowInvalid, pa.ArrowNotImplementedError):
+    if leaf_type is None or not pa.types.is_timestamp(leaf_type):
         return None
-    if not pa.types.is_timestamp(field.type):
-        return None
-    return _NANOS_PER_UNIT.get(field.type.unit)
+    return _NANOS_PER_UNIT.get(leaf_type.unit)
 
 
 def _float_total_order_key(v: float) -> int:
@@ -275,35 +271,120 @@ def _float_total_order_key(v: float) -> int:
     return bits if bits >= 0 else -(bits & 0x7FFFFFFFFFFFFFFF) - 1
 
 
-def extract_column_stats(
+#: The synthetic repetition groups parquet inserts between a container
+#: and its children. pyarrow writes exactly these (verified against
+#: pyarrow 25), and this module only ever reads footers the pyhoglake
+#: writer itself just produced — so predicting the leaf paths from the
+#: catalog tree is exact here. A foreign footer using other names (the
+#: spec permits any) yields NO stats for those leaves rather than wrong
+#: ones, which is the same "absent, never guessed" rule the rest of this
+#: module holds to.
+_LIST_GROUP = "list"
+_MAP_GROUP = "key_value"
+
+
+def _walk_leaves(
+    col: Column,
+    path: tuple[str, ...],
+    arrow_type: pa.DataType | None,
+) -> list[tuple[str, Column, pa.DataType | None]]:
+    """Every LEAF under ``col`` as (parquet path, column, arrow type).
+
+    The parquet path and the arrow leaf type are resolved TOGETHER,
+    walking the catalog tree and the footer's arrow schema in step: the
+    catalog says what the column was declared as, the footer says what
+    the leaf physically is, and only the second can interpret a
+    statistic. Either may run out first (a column the file predates, a
+    shape disagreement) — then the arrow type is None and the leaf
+    simply gets no bounds.
+    """
+    here = path + (col.name,)
+    kids = col.children or ()
+    if col.type == "struct":
+        out: list[tuple[str, Column, pa.DataType | None]] = []
+        for child in sorted(kids, key=lambda k: k.ordinal):
+            sub = None
+            if arrow_type is not None and pa.types.is_struct(arrow_type):
+                try:
+                    sub = arrow_type.field(child.name).type
+                except (KeyError, IndexError, pa.ArrowInvalid):
+                    sub = None
+            out += _walk_leaves(child, here, sub)
+        return out
+    if col.type == "list":
+        if not kids:
+            return []
+        sub = None
+        if arrow_type is not None and pa.types.is_list(arrow_type):
+            sub = arrow_type.value_field.type
+        return _walk_leaves(kids[0], here + (_LIST_GROUP,), sub)
+    if col.type == "map":
+        if len(kids) != 2:
+            return []
+        key_t = value_t = None
+        if arrow_type is not None and pa.types.is_map(arrow_type):
+            key_t = arrow_type.key_field.type
+            value_t = arrow_type.item_field.type
+        entry = here + (_MAP_GROUP,)
+        return _walk_leaves(kids[0], entry, key_t) + _walk_leaves(
+            kids[1], entry, value_t
+        )
+    return [(".".join(here), col, arrow_type)]
+
+
+def _resolve_leaves(
     metadata: pq.FileMetaData, columns: list[Column] | tuple[Column, ...]
-) -> list[ColumnStats]:
-    by_name = {c.name: c for c in columns}
-
-    # Map parquet leaf index -> top-level column name (flat schemas only;
-    # nested types are not in the supported type set).
-    n_cols = metadata.num_columns
-    leaf_names: list[str] = []
-    if metadata.num_row_groups > 0:
-        rg0 = metadata.row_group(0)
-        for j in range(n_cols):
-            # Full path, verbatim: for the flat schemas we support the leaf
-            # path IS the column name — splitting on "." misattributed a
-            # top-level column literally named "a.b" (QE find, 2026-09-05).
-            leaf_names.append(rg0.column(j).path_in_schema)
-
-    # The footer's own arrow schema, resolved once: it is what says what
-    # each leaf physically IS, which the catalog type cannot.
+) -> dict[str, tuple[Column, pa.DataType | None]]:
+    """Catalog LEAF columns keyed by the parquet chunk path they own."""
     try:
         footer_schema: pa.Schema | None = metadata.schema.to_arrow_schema()
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
         footer_schema = None
 
+    out: dict[str, tuple[Column, pa.DataType | None]] = {}
+    for col in columns:
+        top: pa.DataType | None = None
+        if footer_schema is not None:
+            try:
+                top = footer_schema.field(col.name).type
+            except KeyError:
+                top = None
+        for path, leaf, leaf_type in _walk_leaves(col, (), top):
+            out[path] = (leaf, leaf_type)
+    return out
+
+
+def extract_column_stats(
+    metadata: pq.FileMetaData, columns: list[Column] | tuple[Column, ...]
+) -> list[ColumnStats]:
+    """Per-LEAF stats for one written file.
+
+    Only leaves produce rows: ``hog_file_column_stats`` is field-id-keyed
+    and a list/struct/map has no values of its own, so a container
+    contributes nothing (the server refuses stats addressed to one). A
+    list's element and a map's key/value DO get counts and bounds —
+    that is Iceberg's own rule for nested fields — and a struct leaf
+    behaves exactly like a top-level scalar.
+    """
+    leaves = _resolve_leaves(metadata, columns)
+
+    # Map parquet leaf index -> its chunk path. Full path, verbatim: the
+    # catalog-side paths above are built the same way, and splitting on
+    # "." misattributed a top-level column literally named "a.b" (QE
+    # find, 2026-09-05) before nesting was even in the picture.
+    n_cols = metadata.num_columns
+    leaf_names: list[str] = []
+    if metadata.num_row_groups > 0:
+        rg0 = metadata.row_group(0)
+        for j in range(n_cols):
+            leaf_names.append(rg0.column(j).path_in_schema)
+
     out: list[ColumnStats] = []
     for j, name in enumerate(leaf_names):
-        col = by_name.get(name)
-        if col is None:
+        entry = leaves.get(name)
+        if entry is None:
             continue  # file column not in the catalog schema; nothing to report
+        col, leaf_type = entry
 
         value_count = 0
         null_count = 0
@@ -317,9 +398,7 @@ def extract_column_stats(
         # cannot read, leaves the bounds NULL rather than guessing nanos
         # — and reading st.min instead is not an option, since that is
         # the call that raises on sub-microsecond values.
-        raw_scale = (
-            _nanos_scale(metadata, name) if col.type in _RAW_STAT_TYPES else None
-        )
+        raw_scale = _nanos_scale(leaf_type) if col.type in _RAW_STAT_TYPES else None
         if col.type in _RAW_STAT_TYPES and raw_scale is None:
             have_min_max = False
 
@@ -330,20 +409,20 @@ def extract_column_stats(
         # stats. An unreadable shape is an ABSENT bound, never a coerced
         # one: pyarrow will happily hand back False for a boolean footer
         # and int() will happily turn it into 0.
-        try:
-            leaf_type = (
-                None if footer_schema is None else footer_schema.field(name).type
-            )
-        except KeyError:
-            # A nested leaf's dotted path is not a top-level field.
-            leaf_type = None
         if leaf_type is None or not _bound_readable(col, leaf_type):
             have_min_max = False
 
         for r in range(metadata.num_row_groups):
             rg = metadata.row_group(r)
             chunk = rg.column(j)
-            value_count += rg.num_rows
+            # num_values, not rg.num_rows: for a LEAF under a list or a
+            # map one row contributes many values (or none), and Iceberg
+            # defines value_counts as the number of VALUES. For a flat
+            # column the two are equal, so nothing about the existing
+            # behaviour changes — but the Kotlin hydrator already sums
+            # ColumnChunkMetaData.valueCount, and the two must not drift
+            # apart the moment a repeated leaf appears.
+            value_count += chunk.num_values
             size_bytes += chunk.total_compressed_size
             st = chunk.statistics
             if st is None or not st.has_null_count:
@@ -353,7 +432,7 @@ def extract_column_stats(
             null_count += st.null_count
             if not have_min_max:
                 continue  # bounds already written off; never touch st.min
-            if st.has_min_max and rg.num_rows > st.null_count:
+            if st.has_min_max and chunk.num_values > st.null_count:
                 try:
                     if raw_scale is not None:
                         # Scaling up to nanos is exact for every unit, but
@@ -380,7 +459,7 @@ def extract_column_stats(
                     # single unreadable statistic would otherwise abort an
                     # append whose data is perfectly fine.
                     have_min_max = False
-            elif rg.num_rows > st.null_count:
+            elif chunk.num_values > st.null_count:
                 have_min_max = False
             # an all-null row group legitimately has no min/max; skip it
 

@@ -38,6 +38,7 @@ from .models import (
     CatalogOptions,
     ChangesPlan,
     CleanupResult,
+    Column,
     CommitResult,
     ConsumerOffset,
     DataFile,
@@ -51,7 +52,7 @@ from .models import (
 )
 from .ops import AlterOp
 from .stats import extract_column_stats
-from .transforms import transform_strings
+from .transforms import partition_source_array, transform_strings
 from .types import columns_to_arrow_schema, schema_to_column_defs
 
 DEFAULT_TIMEOUT = 30.0
@@ -872,6 +873,26 @@ def _write_one_file(
     return file_reg
 
 
+def _field_id_chains(
+    columns: tuple[Column, ...] | list[Column],
+    prefix: tuple[Column, ...] = (),
+) -> dict[int, list[Column]]:
+    """Every column NODE by field id, mapped to its root-to-node chain.
+
+    Containers are included: the partition path needs to see them to
+    refuse a spec that points at one (or at something under a list or a
+    map), and a "not a live column" error would be the wrong answer for a
+    field that plainly exists.
+    """
+    out: dict[int, list[Column]] = {}
+    for c in columns:
+        chain = (*prefix, c)
+        out[c.field_id] = list(chain)
+        if c.children:
+            out.update(_field_id_chains(c.children, chain))
+    return out
+
+
 def _partition_groups(
     data: pa.Table, info: TableInfo, spec: PartitionSpec
 ) -> list[tuple[tuple[str | None, ...], pa.Table]]:
@@ -885,23 +906,27 @@ def _partition_groups(
     a null source value yields a null partition value forming its own
     group, per Iceberg.
     """
-    by_field_id = {c.field_id: c for c in info.columns}
+    # Chains, not a flat map: a partition source may be a struct LEAF, so
+    # reaching it needs the whole root-to-leaf path (and the path is what
+    # tells us whether a list or a map sits in the way).
+    chains = _field_id_chains(info.columns)
     key_names = [f"__hog_pk_{i}" for i in range(len(spec.fields))]
     key_arrays: list[pa.Array] = []
     for pf in spec.fields:
-        col = by_field_id.get(pf.source_field_id)
-        if col is None:
+        chain = chains.get(pf.source_field_id)
+        if chain is None:
             raise ValidationError(
                 f"partition spec (spec_id={spec.spec_id}) references "
                 f"field_id {pf.source_field_id}, which is not a live column "
                 f"of {info.namespace}.{info.name}",
                 status_code=None,
             )
+        col = chain[-1]
         key_arrays.append(
             transform_strings(
                 pf.transform,
                 pf.transform_param,
-                data.column(col.name),
+                partition_source_array(data, chain),
                 col.type,
                 col.type_params,
             )

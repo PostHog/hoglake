@@ -4,7 +4,6 @@ import io
 import struct
 from datetime import date, datetime
 from decimal import Decimal
-from types import SimpleNamespace
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -228,8 +227,9 @@ def test_timestamp_nanos_scales_a_foreign_unit_footer(unit, nanos_per_tick):
     )
     # Assert WHICH scale fired, not just the answer: without this, a unit
     # parquet silently rewrote would let the case pass on a coincidence.
-    assert meta.schema.to_arrow_schema().field("x").type.unit == unit
-    assert _nanos_scale(meta, "x") == nanos_per_tick
+    leaf_type = meta.schema.to_arrow_schema().field("x").type
+    assert leaf_type.unit == unit
+    assert _nanos_scale(leaf_type) == nanos_per_tick
     (s,) = extract_column_stats(meta, columns)
     # Scaling up is exact, so the bound is the TRUE nanosecond instant
     # whatever the file's unit turned out to be.
@@ -247,21 +247,12 @@ def test_timestamp_seconds_input_arrives_as_a_millis_footer():
     meta = _write(pa.table({"x": pa.array(ticks, pa.timestamp("s"))}), row_group_size=2)
     assert meta.schema.to_arrow_schema().field("x").type.unit == "ms"
     assert meta.row_group(0).column(0).statistics.min_raw == -3000  # rescaled ticks
-    assert _nanos_scale(meta, "x") == 1_000_000  # the millis branch, never seconds
+    # the millis branch, never seconds
+    assert _nanos_scale(meta.schema.to_arrow_schema().field("x").type) == 1_000_000
     columns = (Column(name="x", type="timestamp_ns", field_id=1, ordinal=0),)
     (s,) = extract_column_stats(meta, columns)
     assert s.lower_bound == struct.pack("<q", -3 * 10**9)
     assert s.upper_bound == struct.pack("<q", 5 * 10**9)
-
-
-def _footer_with_arrow_schema(schema):
-    """Stand-in for the two attributes _nanos_scale reaches through.
-
-    Handmade because the cases below cannot be written as parquet: a
-    seconds unit has no TimeUnit to encode, and a to_arrow_schema() that
-    raises needs a parquet type pyarrow has no arrow mapping for.
-    """
-    return SimpleNamespace(schema=SimpleNamespace(to_arrow_schema=lambda: schema))
 
 
 @pytest.mark.parametrize(
@@ -273,33 +264,18 @@ def test_nanos_scale_unit_table(unit, expected):
     though parquet cannot encode one. The row stays (a future reader that
     builds its schema from somewhere other than the parquet types would
     reach it) and is pinned here, since no footer test can be."""
-    assert (
-        _nanos_scale(
-            _footer_with_arrow_schema(pa.schema([("x", pa.timestamp(unit))])), "x"
-        )
-        == expected
-    )
+    assert _nanos_scale(pa.timestamp(unit)) == expected
 
 
-def test_nanos_scale_none_for_a_non_timestamp_field():
-    schema = pa.schema([("x", pa.int64())])
-    assert _nanos_scale(_footer_with_arrow_schema(schema), "x") is None
+def test_nanos_scale_none_for_a_non_timestamp_leaf():
+    assert _nanos_scale(pa.int64()) is None
 
 
-def test_nanos_scale_none_when_the_field_is_absent():
-    schema = pa.schema([("other", pa.timestamp("ns"))])
-    assert _nanos_scale(_footer_with_arrow_schema(schema), "x") is None
-
-
-def test_nanos_scale_none_when_the_arrow_schema_cannot_be_built():
-    """A parquet type with no arrow mapping makes to_arrow_schema() raise.
-    No schema means no unit, which means no bound — never a guess."""
-
-    def boom():
-        raise pa.ArrowNotImplementedError("no arrow type for this parquet type")
-
-    meta = SimpleNamespace(schema=SimpleNamespace(to_arrow_schema=boom))
-    assert _nanos_scale(meta, "x") is None
+def test_nanos_scale_none_when_the_leaf_type_is_unknown():
+    """No leaf type means no unit, which means no bound — never a guess.
+    Reached whenever the footer's arrow schema cannot be built, or the
+    leaf is not where the catalog's shape says it should be."""
+    assert _nanos_scale(None) is None
 
 
 def test_timestamp_nanos_on_a_non_timestamp_footer_drops_bounds():
