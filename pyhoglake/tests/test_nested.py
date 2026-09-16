@@ -819,3 +819,83 @@ def test_extract_column_stats_has_exactly_one_production_caller():
     assert callers == [
         "client.py: column_stats = extract_column_stats(metadata, info.columns)",
     ], f"unexpected caller(s) of extract_column_stats: {callers}"
+
+
+# -- ordinal is the contract; array order is not ------------------------------
+
+
+def test_children_arriving_out_of_order_are_ordered_by_ORDINAL():
+    """The wire's array order is not the contract — ``ordinal`` is.
+
+    The server happens to emit children in ordinal order today, so array
+    order and ordinal agree and nothing downstream notices which it is
+    reading. Every consumer reads POSITION (the Arrow schema builder
+    pairs a map's first child with the key slot; the stats walk pairs it
+    with the key's leaf path), so the day the two disagree, a map's key
+    would be built from its value. Sorted once at the wire boundary.
+    """
+    wire = {
+        "name": "m",
+        "type": "map",
+        "field_id": 1,
+        "ordinal": 0,
+        "children": [
+            # value FIRST in the array, ordinal 1.
+            {"name": "value", "type": "long", "field_id": 3, "ordinal": 1},
+            {
+                "name": "key",
+                "type": "string",
+                "field_id": 2,
+                "ordinal": 0,
+                "nullable": False,
+            },
+        ],
+    }
+    col = Column.from_wire(wire)
+    assert [c.name for c in col.children] == ["key", "value"]
+
+    # ...and the Arrow schema built from it puts the key in the key slot.
+    schema = columns_to_arrow_schema((col,))
+    assert schema.field("m").type.key_field.type == pa.string()
+    assert schema.field("m").type.item_field.type == pa.int64()
+
+
+def test_the_stats_walk_pairs_children_by_ordinal_not_array_order():
+    """stats._walk_leaves predicts each leaf's parquet path from the
+    catalog tree. The writer laid the file out in ORDINAL order, so a
+    walk trusting array order pairs the key's column with the value's
+    path and records each one's bounds under the other's field id."""
+    out_of_order = _col(
+        "m",
+        "map",
+        1,
+        0,
+        children=(
+            _col("value", "long", 3, 1),
+            _col("key", "string", 2, 0, nullable=False),
+        ),
+    )
+    in_order = _col(
+        "m",
+        "map",
+        1,
+        0,
+        children=(
+            _col("key", "string", 2, 0, nullable=False),
+            _col("value", "long", 3, 1),
+        ),
+    )
+    table = pa.table(
+        {"m": [[("a", 10), ("z", 20)]]},
+        schema=columns_to_arrow_schema((in_order,)),
+    )
+    footer = _footer(table)
+    scrambled = {s.field_id: s for s in extract_column_stats(footer, (out_of_order,))}
+    correct = {s.field_id: s for s in extract_column_stats(footer, (in_order,))}
+    assert set(scrambled) == {2, 3}
+    # The key is a string and the value a long; swapping them would put
+    # UTF-8 bytes under field 3 and a packed int64 under field 2.
+    assert scrambled[2].lower_bound == b"a"
+    assert scrambled[3].lower_bound == struct.pack("<q", 10)
+    assert scrambled[2].lower_bound == correct[2].lower_bound
+    assert scrambled[3].lower_bound == correct[3].lower_bound
