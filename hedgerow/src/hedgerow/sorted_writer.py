@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import heapq
 import itertools
+import math
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .halts import DataIntegrityError
@@ -22,19 +22,46 @@ from .halts import DataIntegrityError
 EVENT_SORT = ("event_date", "event", "timestamp", "uuid")
 
 
+def _component(value) -> tuple:
+    # Match compaction's nulls-first Java Float/Double.compare ordering:
+    # null < -inf < finite (-0 before +0) < +inf < NaN.
+    if value is None:
+        return (0, 0, 0)
+    if isinstance(value, float):
+        if math.isnan(value):
+            return (2, 0, 0)
+        if value == 0:
+            return (1, value, math.copysign(1, value))
+    return (1, value, 0)
+
+
 def _key(row: dict, columns: Sequence[str]) -> tuple:
-    # Explicit NULLS FIRST, matching the declared catalog sort order.
-    return tuple((row[name] is not None, row[name]) for name in columns)
+    return tuple(_component(row[name]) for name in columns)
+
+
+def _values(row: pa.RecordBatch) -> dict:
+    # Python datetime cannot represent sub-microsecond timestamps without
+    # pandas. Integer timestamp values round-trip through Arrow in the schema's
+    # unit, preserving precision for payloads and sort keys alike.
+    return {
+        field.name: (
+            column[0].value if pa.types.is_timestamp(field.type) else column[0].as_py()
+        )
+        for field, column in zip(row.schema, row.columns, strict=True)
+    }
 
 
 def _rows(
-    path: Path, batch_rows: int, max_batch_bytes: int
+    path: Path, batch_rows: int, max_batch_bytes: int, schema: pa.Schema
 ) -> Iterator[tuple[dict, int]]:
     with pq.ParquetFile(path) as file:
         # Every spill row group was written from a byte-bounded batch. Never
         # combine groups into a row-count-only read after intermediate merges.
         for group in range(file.num_row_groups):
             for batch in file.iter_batches(batch_size=batch_rows, row_groups=[group]):
+                # timestamp_s spill files read back as milliseconds. Normalize
+                # before extracting integer values so their units stay correct.
+                batch = batch.cast(schema)
                 if batch.nbytes > max_batch_bytes:
                     raise DataIntegrityError(
                         "spill batch exceeds sorted-writer memory budget"
@@ -45,7 +72,7 @@ def _rows(
                     # and reserves a validity byte per column, including all-valid
                     # columns whose bitmap the Parquet reader may materialize.
                     size = row.nbytes + len(batch.schema)
-                    yield row.to_pylist()[0], size
+                    yield _values(row), size
 
 
 def _merge(
@@ -56,7 +83,10 @@ def _merge(
     max_batch_bytes: int,
 ) -> Iterator[pa.RecordBatch]:
     rows = heapq.merge(
-        *(_rows(p, max(1, batch_rows // len(paths)), max_batch_bytes) for p in paths),
+        *(
+            _rows(p, max(1, batch_rows // len(paths)), max_batch_bytes, schema)
+            for p in paths
+        ),
         key=lambda item: _key(item[0], columns),
     )
     chunk = []
@@ -131,10 +161,12 @@ def write_sorted_partition(
                 raise DataIntegrityError(
                     "aligned batch exceeds sorted-writer memory budget"
                 )
-            order = pc.sort_indices(
-                table,
-                sort_keys=[(c, "ascending") for c in sort_columns],
-                null_placement="at_start",
+            # Use the same total comparator for run generation and merging;
+            # Arrow's null placement also moves NaNs, unlike compaction.
+            keys = table.select(sort_columns).combine_chunks().to_batches()[0]
+            order = sorted(
+                range(table.num_rows),
+                key=lambda index: _key(_values(keys.slice(index, 1)), sort_columns),
             )
             run = Path(temp) / f"{next(counter)}.parquet"
             pq.write_table(
