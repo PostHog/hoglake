@@ -308,7 +308,9 @@ fresh allowance by the copy — not counted afterwards, which would be a
 report on memory already taken rather than a bound, and not shared
 across the two phases, which charged the same graph twice and halved the
 ceiling the docs advertised. The unit is NODES: a list element costs two
-of them (entry group plus value), a map entry three. The **sorted** path materializes the whole
+of them (entry group plus value), a map entry three, and peak live heap
+is up to twice the budget because both graphs are reachable at once
+(measured: a 999,999-node row rewrites under `-Xmx192m`). The **sorted** path materializes the whole
 group to sort it, and a nested group's object graph is **not** its byte
 size: a measured `list<long>` table with five elements per row peaked at
 343 MiB of heap from a 4.6 MiB compressed input — 70x — because every

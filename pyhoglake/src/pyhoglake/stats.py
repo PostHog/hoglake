@@ -335,10 +335,17 @@ def _walk_leaves(
         if not kids:
             return []
         sub = None
-        # The list FAMILY: large_list and fixed_size_list normalize to
-        # catalog `list` too, and recognising only the canonical member
-        # left `sub` None for the other two — which silently dropped the
-        # leaf's arrow type and with it every bound under that list.
+        # The list FAMILY, defensively. Unlike the client-side check in
+        # `_align_table` — where recognising only the canonical member
+        # was a live bug — this one cannot currently be reached with a
+        # non-canonical type: `_walk_leaves` has a single caller, on a
+        # footer this process just wrote, and the write path casts
+        # through `_align_table` first, so `large_list` and
+        # `fixed_size_list` have already become `list<element: ...>` by
+        # the time a footer exists. (Measured on pyarrow 25.0.1.) Kept
+        # because the predicate is the canonical answer and a second
+        # caller should not have to rediscover the mapping — NOT because
+        # a bug was observed here.
         if arrow_type is not None and is_list_family(arrow_type):
             sub = arrow_type.value_field.type
         return _walk_leaves(kids[0], here + (_LIST_GROUP,), sub)

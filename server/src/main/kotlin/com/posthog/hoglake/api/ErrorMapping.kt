@@ -61,13 +61,15 @@ fun StatusPagesConfig.installErrorMapping() {
     // identify.
     //
     // The message is the codec's own prose plus an operation id, and
-    // TWO bounded echoes of stored content: the offending column's name
-    // and up to 40 characters of the offending node. Both originated
-    // with whoever prepared the receipt, so this is not "no
-    // caller-supplied text" — an earlier version of this comment said
-    // that and it was wrong. They are echoed deliberately (a corrupt
-    // receipt is unidentifiable without them), length-capped, and go to
-    // the same caller who supplied them.
+    // echoes of stored content: a column name, a type spelling, a field
+    // location, and the offending JSON node. All of them originated
+    // with whoever prepared the receipt. Two earlier versions of this
+    // comment got this wrong in turn — first claiming no caller text
+    // reached the message at all, then claiming only two echoes did and
+    // both were capped, when three more were interpolated raw. They are
+    // echoed deliberately (a corrupt receipt is unidentifiable without
+    // them), every one of them now goes through the codec's `cap`, and
+    // they go back to the same caller who supplied them.
     exception<CorruptDefinitionException> { call, cause ->
         log.error(cause) { "unreadable table creation definition: ${cause.message}" }
         call.respond(

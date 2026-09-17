@@ -89,6 +89,14 @@ internal object TableCreationDefinitionCodec {
             cause: Throwable? = null,
         ): Nothing = throw CorruptDefinitionException("$receipt: $what", cause)
 
+        // Every echo of stored content goes through this. The messages
+        // below quote a column NAME, a TYPE spelling and a JSON node,
+        // all of which came from whoever prepared the receipt — so
+        // "bounded" has to mean bounded everywhere, not only on the node
+        // echoes that happened to get a `take(40)` first. A stored name
+        // is `Identifiers`-shaped today, but the whole point of this
+        // codec is reading rows that are NOT what they should be.
+
         val node =
             try {
                 mapper.readTree(encoded)
@@ -112,13 +120,13 @@ internal object TableCreationDefinitionCodec {
             if (!versionNode.isIntegralNumber) {
                 corrupt(
                     "the stored definition has a non-integer 'version' " +
-                        "(${versionNode.toString().take(40)})",
+                        "(${cap(versionNode.toString())})",
                 )
             }
             if (!versionNode.canConvertToInt()) {
                 corrupt(
                     "the stored definition has a 'version' outside the int range " +
-                        "(${versionNode.toString().take(40)}); narrowing it would invent a " +
+                        "(${cap(versionNode.toString())}); narrowing it would invent a " +
                         "version this codec appears to support",
                 )
             }
@@ -137,6 +145,9 @@ internal object TableCreationDefinitionCodec {
         )
     }
 
+    /** A stored fragment, capped for an error message. */
+    private fun cap(value: String): String = if (value.length > 40) value.take(37) + "..." else value
+
     /** A required string field, or the named refusal. */
     private fun text(
         node: JsonNode,
@@ -146,7 +157,7 @@ internal object TableCreationDefinitionCodec {
     ): String {
         val value = node[field]
         if (value == null || value.isNull || !value.isTextual) {
-            corrupt("the stored definition is missing the string field '$field' in $where", null)
+            corrupt("the stored definition is missing the string field '$field' in ${cap(where)}", null)
         }
         return value.asText()
     }
@@ -172,12 +183,12 @@ internal object TableCreationDefinitionCodec {
     ): Boolean {
         val value = node[field] ?: return default
         if (value.isNull) {
-            corrupt("the stored definition has a null '$field' in $where; omit it or give a boolean", null)
+            corrupt("the stored definition has a null '$field' in ${cap(where)}; omit it or give a boolean", null)
         }
         if (!value.isBoolean) {
             corrupt(
                 "the stored definition has a non-boolean '$field' " +
-                    "(${value.toString().take(40)}) in $where",
+                    "(${cap(value.toString())}) in ${cap(where)}",
                 null,
             )
         }
@@ -191,7 +202,7 @@ internal object TableCreationDefinitionCodec {
     ): ColumnDef {
         if (!column.isObject) corrupt("the stored definition has a non-object column", null)
         val name = text(column, "name", "a column", corrupt)
-        val storedType = text(column, "type", "column '$name'", corrupt)
+        val storedType = text(column, "type", "column '${cap(name)}'", corrupt)
         val wireType =
             if (version == 0) {
                 // Compatibility with receipts written before the versioned format.
@@ -205,16 +216,25 @@ internal object TableCreationDefinitionCodec {
             try {
                 ColType.fromWire(wireType)
             } catch (e: Exception) {
-                corrupt("the stored definition gives column '$name' the unknown type '$storedType'", e)
+                corrupt(
+                    "the stored definition gives column '${cap(name)}' the unknown type " +
+                        "'${cap(storedType)}'",
+                    e,
+                )
             }
-        // SHAPE first, then the conversion. A textual or array
-        // type_params happened to throw inside convertValue and reach
-        // the same refusal, but by accident — the node type is the thing
-        // being asserted, so assert it.
+        // SHAPE first, then the conversion — for the MESSAGE, not for
+        // the catch. Measured on this Jackson: every non-object node
+        // (array, number, boolean, string, even `[]`) already throws
+        // inside convertValue and reaches the same typed refusal, so
+        // this guard catches nothing the fallback would miss. What it
+        // buys is a diagnostic that names the defect — "non-object
+        // 'type_params'" — instead of Jackson's generic conversion
+        // failure. That is the only claim it should make, and the test
+        // pins the message rather than the refusal.
         if (params != null && !params.isNull && !params.isObject) {
             corrupt(
                 "the stored definition has a non-object 'type_params' " +
-                    "(${params.toString().take(40)}) for column '$name'",
+                    "(${cap(params.toString())}) for column '${cap(name)}'",
                 null,
             )
         }
@@ -222,16 +242,16 @@ internal object TableCreationDefinitionCodec {
             try {
                 if (params == null || params.isNull) null else mapper.convertValue(params, paramsType)
             } catch (e: Exception) {
-                corrupt("the stored definition has unreadable type_params for column '$name'", e)
+                corrupt("the stored definition has unreadable type_params for column '${cap(name)}'", e)
             }
         if (children != null && !children.isNull && !children.isArray) {
-            corrupt("the stored definition has non-array 'children' for column '$name'", null)
+            corrupt("the stored definition has non-array 'children' for column '${cap(name)}'", null)
         }
         return ColumnDef(
             name,
             type,
             decodedParams,
-            bool(column, "nullable", "column '$name'", default = true, corrupt = corrupt),
+            bool(column, "nullable", "column '${cap(name)}'", default = true, corrupt = corrupt),
             // ABSENT children decode to null, not to an empty list: every
             // version-0 and version-1 receipt is a scalar definition, and
             // `children: []` on a scalar is a named 422 (ColumnTrees), so

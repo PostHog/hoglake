@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.columnDefDepth
 import com.posthog.hoglake.model.nodeCount
@@ -34,6 +35,7 @@ import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.ByteBuffer
@@ -149,6 +151,40 @@ class NestedCampaignRegressionTest {
                 ),
             ),
         )
+    }
+
+    @Test
+    fun `every targeted B probe still reaches its fixed verdict`(
+        @TempDir tmp: Path,
+    ) {
+        // The B-class campaign findings, replayed in `:test`. They were
+        // a `main` nobody ran: B1/B2/B3/B6 acquired hand-written tests
+        // and B4, B5 and B7 had none at all, so three fixed findings
+        // were regression-covered by a program CI never invokes.
+        //
+        // Asserted on the VERDICT STRING, which is what the probe
+        // produces. Coarse on purpose — the point is that each shape
+        // still lands where it was fixed to land, not to restate the
+        // messages a dedicated test already pins.
+        val byName = NestedTargetedProbe.run(tmp).associate { it.name.substringBefore(" ") to it.verdict }
+        assertThat(byName.keys).containsExactlyInAnyOrder("B1", "B2", "B3", "B4", "B5", "B6", "B7")
+
+        // A foreign field wearing the reserved name: refusal, both for
+        // the wrong TYPE and the foreign ID.
+        assertThat(byName["B1"]).contains("UnconvertibleSchemaException")
+        // A null in a real carrier is invalid DATA, not a schema fault.
+        assertThat(byName["B2"]).contains("InvalidDataException")
+        // A catalog column called _hog_row_id: refused by the DDL, and
+        // refused again by the rewriter for tables that predate it.
+        assertThat(byName["B3"]).contains("refused: Validation").contains("collides with compaction")
+        assertThat(byName["B6"]).contains("collides with compaction")
+        // Heterogeneous inputs still rewrite, losing nothing.
+        assertThat(byName["B4"]).contains("element values=3 nulls=0")
+        // A map whose key id sits on the group only: no stats, and a
+        // typed refusal — the two surfaces agreeing to decline.
+        assertThat(byName["B5"]).contains("readerStats=[]").contains("UnconvertibleSchemaException")
+        // And the name one level down is nobody's carrier.
+        assertThat(byName["B7"]).contains("no carrier confusion")
     }
 
     // ---- binding: ids outrank names, at every level ----------------------
@@ -456,15 +492,16 @@ class NestedCampaignRegressionTest {
     }
 
     @Test
-    fun `a field with its own id never becomes the row-id carrier by name`(
+    fun `a field wearing the reserved name with a foreign id is a refusal`(
         @TempDir tmp: Path,
     ) {
-        // The same "only id-less fields answer to a name" rule the
-        // catalog binding enforces. A pre-reservation table could hold a
-        // user column named _hog_row_id carrying its OWN field id;
-        // taking it as the carrier would read that column's values as
-        // row identities, which is the row-identity version of the
-        // binding substitution this branch already fixed once.
+        // Two wrong answers and no right one, so the only honest move is
+        // to refuse. Taking it as the carrier reads a user column's
+        // values as row IDENTITIES; ignoring it renumbers every row in
+        // the file. An earlier version of this test asserted the second
+        // — it checked that the rows took positional ids — which pinned
+        // the silent renumbering the KDoc two files over forbids in so
+        // many words.
         val schema =
             MessageType(
                 "m",
@@ -483,17 +520,62 @@ class NestedCampaignRegressionTest {
                 }
             }
         }
-        // Field 2 is a data column here, not the carrier, so the rows
-        // take POSITIONAL ids from rowIdStart — never the -999s.
-        val out =
+        assertThatThrownBy {
             ParquetRewriter.rewrite(
                 listOf(ParquetRewriter.Input(src, 5000L, null)),
                 listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                 emptyList(),
                 tmp.resolve("named-carrier-out.parquet"),
             )
-        assertThat(out.minRowId).describedAs("positional, not the column's values").isEqualTo(5000L)
-        assertThat(out.rowsWritten).isEqualTo(3)
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("not the reserved ${ParquetRewriter.ROW_ID_FIELD_ID}")
+    }
+
+    @Test
+    fun `a real carrier still works, by id and by name`(
+        @TempDir tmp: Path,
+    ) {
+        // The refusal above must not swallow the two legal shapes: the
+        // reserved id (every compaction output this project writes), and
+        // the bare name with no id at all (what the hydrator tolerates).
+        for ((label, carrier) in listOf(
+            "by-id" to
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                    .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                    .named(ParquetRewriter.ROW_ID_COLUMN),
+            "by-name" to
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                    .named(ParquetRewriter.ROW_ID_COLUMN),
+        )) {
+            val schema =
+                MessageType(
+                    "m",
+                    listOf<Type>(
+                        Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+                        carrier,
+                    ),
+                )
+            val src = tmp.resolve("carrier-$label.parquet")
+            write(schema, src) { f ->
+                (0 until 3).map { i ->
+                    f.newGroup().also {
+                        it.add(0, i.toLong())
+                        it.add(1, 700L + i)
+                    }
+                }
+            }
+            val out =
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(src, 5000L, null)),
+                    listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                    emptyList(),
+                    tmp.resolve("carrier-$label-out.parquet"),
+                )
+            assertThat(out.minRowId)
+                .describedAs("%s: the carrier's ids are kept, not the positional ones", label)
+                .isEqualTo(700L)
+        }
     }
 
     // ---- the per-row node budget ----------------------------------------
@@ -622,6 +704,17 @@ class NestedCampaignRegressionTest {
         // an equivalent mutant rather than a missing assertion. What is
         // asserted is the bail itself.
         assertThat(columnDefDepth(listOf(def), cap = 12)).isEqualTo(12)
+        // And the message says "or more" when the walk BAILED, rather
+        // than quoting a depth it stopped short of measuring.
+        var deep: ColumnDef = ColumnDef("leaf", ColType.LONG)
+        repeat(MAX_COLUMN_NESTING_DEPTH + 4) { deep = ColumnDef("s", ColType.STRUCT, children = listOf(deep)) }
+        assertThatThrownBy { ColumnTrees.validate(listOf(deep)) }.hasMessageContaining("or more")
+        // Exactly one past the cap: the exact depth IS known there, so
+        // it is reported rather than approximated.
+        var justOver: ColumnDef = ColumnDef("leaf", ColType.LONG)
+        repeat(MAX_COLUMN_NESTING_DEPTH) { justOver = ColumnDef("s", ColType.STRUCT, children = listOf(justOver)) }
+        assertThatThrownBy { ColumnTrees.validate(listOf(justOver)) }
+            .hasMessageContaining("depth ${MAX_COLUMN_NESTING_DEPTH + 1} exceeds")
         assertThat(nodeCount(listOf(def))).isEqualTo(20_001)
     }
 
@@ -668,6 +761,10 @@ class NestedCampaignRegressionTest {
                     """"columns":[{"name":"c","type":"decimal","type_params":"nope"}]}""",
                 """{"version":1,"namespace":"n","name":"t",""" +
                     """"columns":[{"name":"c","type":"decimal","type_params":[1,2]}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"decimal","type_params":7}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"decimal","type_params":true}]}""",
                 // `asBoolean()` coerces every one of these to FALSE,
                 // which for `nullable` meant a corrupt receipt silently
                 // became a REQUIRED-column definition and published.
@@ -692,6 +789,67 @@ class NestedCampaignRegressionTest {
                 // operator find one row among millions.
                 .hasMessageContaining("operation deadbeef")
         }
+    }
+
+    @Test
+    fun `a non-object type_params is named, not left to Jackson`() {
+        // The guard's whole value is the DIAGNOSTIC: every non-object
+        // node already throws inside convertValue, so removing it still
+        // produces a refusal — just a generic one. Asserting the
+        // refusal therefore proves nothing about the guard, which is why
+        // this asserts the message.
+        for (blob in listOf("[1,2]", "7", "true", "\"nope\"", "[]")) {
+            assertThatThrownBy {
+                TableCreationDefinitionCodec.decode(
+                    """{"version":1,"namespace":"n","name":"t",""" +
+                        """"columns":[{"name":"c","type":"decimal","type_params":$blob}]}""",
+                    "operation deadbeef",
+                )
+            }
+                .describedAs("type_params = %s", blob)
+                .isInstanceOf(CorruptDefinitionException::class.java)
+                .hasMessageContaining("non-object 'type_params'")
+                .hasMessageContaining("column 'c'")
+        }
+    }
+
+    @Test
+    fun `every stored echo in a corrupt-receipt message is capped`() {
+        // The message goes into a 500 body and every log line that
+        // records one. A stored column name is Identifiers-shaped in a
+        // healthy row — but this codec exists for rows that are NOT what
+        // they should be, so "bounded" has to mean bounded everywhere.
+        val huge = "x".repeat(5_000)
+        val blobs =
+            listOf(
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"$huge","type":"nope"}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"$huge"}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"$huge","type":"long","nullable":"$huge"}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"$huge","type":"decimal","type_params":"$huge"}]}""",
+                """{"version":"$huge","namespace":"n","name":"t","columns":[]}""",
+            )
+        for (blob in blobs) {
+            val thrown = catchThrowable { TableCreationDefinitionCodec.decode(blob, "operation deadbeef") }
+            assertThat(thrown).isInstanceOf(CorruptDefinitionException::class.java)
+            assertThat(thrown.message!!.length)
+                .describedAs("message for %s...", blob.take(60))
+                .isLessThan(400)
+        }
+    }
+
+    @Test
+    fun `a 422 for a decimal parameter does not echo the caller's blob`() {
+        val huge = "y".repeat(5_000)
+        val thrown =
+            catchThrowable {
+                ColumnTrees.validate(listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to huge))))
+            }
+        assertThat(thrown).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(thrown.message!!.length).isLessThan(200)
     }
 
     @Test
@@ -855,7 +1013,7 @@ class NestedCampaignRegressionTest {
         val oneF = intLE(java.lang.Float.floatToRawIntBits(1.0f))
         val nanChecked = StatsSanity.check(ColumnStats(1, 2, 0, null, null, nanF, oneF), ColType.FLOAT)
         assertThat(nanChecked.stats.lowerBound).isNull()
-        assertThat(nanChecked.repairs).anyMatch { it.contains("not decodable") }
+        assertThat(nanChecked.repairs).anyMatch { it.contains("is NaN") }
 
         val nanD =
             java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
@@ -872,6 +1030,40 @@ class NestedCampaignRegressionTest {
         val inf = intLE(java.lang.Float.floatToRawIntBits(Float.POSITIVE_INFINITY))
         assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, negZero, inf), ColType.FLOAT).repairs)
             .isEmpty()
+    }
+
+    @Test
+    fun `bounds on an all-null column are dropped, as the footer path drops them`() {
+        // A column with no non-null values has nothing to bound.
+        // FooterStats.chunkBounds refuses exactly this — it returns null
+        // unless hasNonNullValue() — so without the same rule here the
+        // commit door accepted pruning metadata a footer could never
+        // produce.
+        val checked =
+            StatsSanity.check(ColumnStats(1, 10, 10, null, null, intLE(5), intLE(9)), ColType.INT)
+        assertThat(checked.stats.lowerBound).isNull()
+        assertThat(checked.stats.upperBound).isNull()
+        assertThat(checked.repairs).anyMatch { it.contains("10 values and 10 nulls") }
+        // One non-null value is enough to bound.
+        assertThat(StatsSanity.check(ColumnStats(1, 10, 9, null, null, intLE(5), intLE(9)), ColType.INT).repairs)
+            .isEmpty()
+        // And a bound-less all-null row is perfectly ordinary.
+        assertThat(StatsSanity.check(ColumnStats(1, 10, 10, null, null, null, null), ColType.INT).repairs)
+            .isEmpty()
+    }
+
+    @Test
+    fun `the undecodable diagnostic does not blame the length of a NaN`() {
+        // The one line an operator gets has to be true. "not decodable
+        // as 'float' (4 bytes)" names the property that was CORRECT and
+        // sends them hunting a length bug that does not exist.
+        val nan = intLE(java.lang.Float.floatToRawIntBits(Float.NaN))
+        val repairs = StatsSanity.check(ColumnStats(1, 2, 0, null, null, nan, intLE(1)), ColType.FLOAT).repairs
+        assertThat(repairs).anyMatch { it.contains("is NaN") }
+        assertThat(repairs).noneMatch { it.contains("4 bytes") }
+        // A genuine length fault still says so.
+        assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, byteArrayOf(1), intLE(1)), ColType.FLOAT).repairs)
+            .anyMatch { it.contains("1 bytes") }
     }
 
     @Test

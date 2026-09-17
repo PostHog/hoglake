@@ -226,8 +226,13 @@ object ColumnTrees {
                 is Long -> raw
                 is Short, is Byte -> (raw as Number).toLong()
                 else ->
+                    // CAPPED, like the codec's echoes. This is a 422
+                    // body, `raw` is whatever JSON the caller sent, and
+                    // a map value can be arbitrarily large — quoting it
+                    // whole would put a caller-sized blob in an error
+                    // response and in every log line that records one.
                     throw HoglakeException.Validation(
-                        "decimal column '$qualified' has a non-integer '$key' ($raw)",
+                        "decimal column '$qualified' has a non-integer '$key' (${capped(raw)})",
                     )
             }
         if (asLong !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
@@ -236,6 +241,12 @@ object ColumnTrees {
             )
         }
         return asLong.toInt()
+    }
+
+    /** A caller-supplied value, capped for an error message. */
+    private fun capped(value: Any): String {
+        val text = value.toString()
+        return if (text.length > 40) text.take(37) + "..." else text
     }
 
     /** The named arity refusal for a container with the wrong child count. */

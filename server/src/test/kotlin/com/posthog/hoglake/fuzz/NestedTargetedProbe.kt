@@ -34,7 +34,22 @@ import java.nio.file.Path
 object NestedTargetedProbe {
     @JvmStatic
     fun main(args: Array<String>) {
-        val tmp = Files.createTempDirectory("hoglake-probe")
+        for (p in run(Files.createTempDirectory("hoglake-probe"))) println("${p.name} :: ${p.verdict}")
+    }
+
+    /**
+     * Every B probe, replayed once, as VERDICT STRINGS.
+     *
+     * Returned rather than printed so `:test` can assert on them. These
+     * were a `main` nobody ran automatically: four of the seven findings
+     * got hand-written tests and B4, B5 and B7 were pinned only by a
+     * program no CI job invokes. A finding whose only regression cover
+     * is a fuzz corpus or a manual main reaches CI as a green build —
+     * the `fuzz` task is separate from `:test`, and `:test` replays
+     * seeds, not campaigns.
+     */
+    fun run(tmp: Path): List<ProbeOutcome> {
+        outcomes.clear()
         probeRowIdCarrierWrongType(tmp)
         probeRowIdCarrierNull(tmp)
         probeRowIdCarrierAsCatalogColumn(tmp)
@@ -42,7 +57,10 @@ object NestedTargetedProbe {
         probeNestedMapKeyIdOnGroupOnly(tmp)
         probeRowIdCarrierHijack(tmp)
         probeRowIdCarrierInsideStruct(tmp)
+        return outcomes.toList()
     }
+
+    private val outcomes = mutableListOf<ProbeOutcome>()
 
     /**
      * B6 — the sharp one. A client declares a top-level `long` column
@@ -143,7 +161,9 @@ object NestedTargetedProbe {
     private fun say(
         name: String,
         verdict: String,
-    ) = println("$name :: $verdict")
+    ) {
+        outcomes += ProbeOutcome(name, verdict)
+    }
 
     // ---- B1: a foreign file with a STRING column called _hog_row_id ------
 
@@ -431,3 +451,6 @@ object NestedTargetedProbe {
             .use { w -> rows(f).forEach { w.write(it) } }
     }
 }
+
+/** One probe's name and the one-line verdict it produced. */
+data class ProbeOutcome(val name: String, val verdict: String)

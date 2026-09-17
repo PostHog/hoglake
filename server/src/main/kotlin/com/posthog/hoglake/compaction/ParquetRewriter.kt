@@ -163,6 +163,15 @@ object ParquetRewriter {
      * row — still far above any honest row, and far below what a 512 MB
      * heap can hold at ~50-100 bytes a node. The point is to convert a
      * process kill into one counted skip, not to police row shape.
+     *
+     * PEAK LIVE HEAP IS UP TO 2x THE BUDGET, and that is the cost of
+     * the per-phase allowance: the decoded row is still reachable while
+     * the copy builds its own, so both graphs are live at once. The
+     * shared allowance bounded their SUM at 1x instead — which is the
+     * only thing it had going for it, and it paid for that by halving
+     * the ceiling the documentation advertised. Measured rather than
+     * assumed: a 999,999-node row rewrites under `-Xmx192m`, so 2x the
+     * default is comfortably inside any heap this server runs with.
      */
     const val DEFAULT_MAX_NODES_PER_ROW = 1_000_000
 
@@ -549,28 +558,58 @@ object ParquetRewriter {
      * so an input whose `_hog_row_id` was a struct (or a string, or a
      * list) reached `getLong` and came back out as a ClassCastException
      * from inside the copy loop — an untyped crash counted as a failed
-     * group and retried every run. A field wearing the reserved name
-     * without the reserved shape is a refusal, never a guess: treating
-     * it as "no carrier" would silently renumber every row in a
-     * previously-compacted file.
+     * group and retried every run.
+     *
+     * A field WEARING THE RESERVED NAME is a refusal unless it is the
+     * carrier, and that covers two shapes, not one:
+     *
+     *  - the reserved name with the wrong TYPE;
+     *  - the reserved name with a FOREIGN id.
+     *
+     * Both are "this file says something about the reserved name that
+     * the contract does not allow", and the answer to both is the same
+     * one this KDoc has always given: a refusal, never a guess. The
+     * second shape spent one commit falling through to `return null`,
+     * which is the silent renumbering of every row in a
+     * previously-compacted file that the sentence above forbids — the
+     * outcome is worse than the ClassCastException it replaced, because
+     * nothing reports it.
+     *
+     * Reachable only from a FOREIGN writer. A hoglake table cannot hold
+     * a live column of this name (the DDL reserves the `_hog` prefix,
+     * and `outputSchema` refuses one that predates the reservation), and
+     * every compaction output this project has ever written stamps
+     * [ROW_ID_FIELD_ID] on its carrier. So the population is files
+     * hoglake did not write — which is exactly the population that has
+     * no reason to know what the name means.
      */
     private fun rowIdCarrier(
         schema: MessageType,
         source: Path,
     ): Int? {
         // ONLY ID-LESS FIELDS ANSWER TO A NAME — the same rule
-        // FooterStats.bindIndex enforces for catalog columns, and it
-        // belongs here for the same reason. A field carrying a DIFFERENT
-        // id is a different column that merely wears this name: a
-        // pre-reservation table could hold a user column called
-        // `_hog_row_id` with its own catalog id, and taking it as the
-        // carrier would read that column's values as row IDENTITIES.
+        // FooterStats.bindIndex enforces for catalog columns. Taking a
+        // foreign-id field as the carrier would read ITS values as row
+        // identities; ignoring it renumbers the file. Neither is a
+        // guess this code gets to make, so it refuses below.
         val index =
             schema.fields.indexOfFirst { it.id?.intValue() == ROW_ID_FIELD_ID }
                 .takeIf { it >= 0 }
                 ?: schema.fields.indexOfFirst { it.id == null && it.name == ROW_ID_COLUMN }
                     .takeIf { it >= 0 }
-                ?: return null
+                ?: run {
+                    val impostor = schema.fields.firstOrNull { it.name == ROW_ID_COLUMN }
+                    if (impostor != null) {
+                        throw UnconvertibleSchemaException(
+                            "$source carries a field named $ROW_ID_COLUMN with field id " +
+                                "${impostor.id?.intValue()}, not the reserved $ROW_ID_FIELD_ID. " +
+                                "Reading it as the row-id carrier would take its values as row " +
+                                "identities; ignoring it would renumber every row in the file. " +
+                                "Refusing rather than guessing",
+                        )
+                    }
+                    return null
+                }
         val field = schema.fields[index]
         val primitive = if (field.isPrimitive) field.asPrimitiveType() else null
         if (primitive?.primitiveTypeName != PrimitiveType.PrimitiveTypeName.INT64) {

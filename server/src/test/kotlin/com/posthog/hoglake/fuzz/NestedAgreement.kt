@@ -496,7 +496,7 @@ object NestedAgreement {
      * because nanos was in the set. One hit in 1.1M executions, and the
      * set was the reason.
      */
-    private fun documentedDeferral(
+    fun documentedDeferral(
         col: Column,
         schema: MessageType,
     ): Boolean {

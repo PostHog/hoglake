@@ -386,14 +386,30 @@ entry 3. The default therefore admits roughly half a million list
 elements in a single row — far above any honest row, and far below what
 a heap holds at ~50-100 bytes a node.
 
-Both durable skip reasons carry a counter:
-`hoglake_compaction_skipped_total{reason="unconvertible_schema"}` rising
-means a table has stopped compacting, and `{reason="invalid_data"}`
-rising means a writer is emitting values its own schema forbids. Neither
-shows up as a failure — a sweep with either can look perfectly healthy —
-which is exactly why they get a line rather than only a log and a ledger
-row. The self-healing skips (commit conflicts, DV supersession) stay
-uncounted: they re-plan on the next run.
+Per-phase allowances mean peak live heap is up to **2x** the budget: the
+decoded row is still reachable while the copy builds its own. That is
+the price of the advertised ceiling being the real one, and it is
+measured, not assumed — a 999,999-node row rewrites under `-Xmx192m`.
+
+Three non-success outcomes carry a counter, all under
+`hoglake_compaction_skipped_total{catalog, reason}`:
+`unconvertible_schema` rising means a table has stopped compacting,
+`invalid_data` rising means a writer is emitting values its own schema
+forbids, and `failed` is the outright failure that gets retried next
+run. The first two never show up as failures — a sweep with either can
+look perfectly healthy — which is why they get a line rather than only a
+log and a ledger row. The self-healing skips (commit conflicts, DV
+supersession) stay uncounted: they re-plan on the next run.
+
+**`reason="failed"` is a FAILURE filed under a metric named
+`skipped`.** That is deliberate — one series for "groups that did not
+compact, by reason" beats three — but it means
+`sum(rate(hoglake_compaction_skipped_total[5m]))` now includes failures,
+so an alert written against the two-reason version has silently changed
+meaning. Alert on the label: `{reason="failed"}` is the page-worthy one,
+`{reason="unconvertible_schema"}` is a backlog that will not clear on
+its own, and `{reason="invalid_data"}` is a bug report against whoever
+wrote the file.
 
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are

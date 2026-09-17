@@ -97,13 +97,25 @@ object StatsSanity {
             repairs += "size_bytes ${stats.sizeBytes} is negative; dropped"
         }
 
+        // A column with no non-null values has nothing to bound. The
+        // hydrator's footer path already refuses exactly this
+        // (`chunkBounds` returns null unless `hasNonNullValue()`), so
+        // without it the commit door accepted pruning metadata a footer
+        // could never produce — the same asymmetry as the NaN case
+        // below, one relationship over.
+        if (nonNull == 0L && (lower != null || upper != null)) {
+            repairs += "bounds present on a column with $valueCount values and $nullCount nulls; dropped"
+            lower = null
+            upper = null
+        }
+
         if (type != null) {
             if (lower != null && !decodable(type, lower)) {
-                repairs += "lower_bound is not decodable as '${type.wire}' (${lower.size} bytes); dropped"
+                repairs += "lower_bound ${undecodableReason(type, lower)}; dropped"
                 lower = null
             }
             if (upper != null && !decodable(type, upper)) {
-                repairs += "upper_bound is not decodable as '${type.wire}' (${upper.size} bytes); dropped"
+                repairs += "upper_bound ${undecodableReason(type, upper)}; dropped"
                 upper = null
             }
         }
@@ -146,6 +158,7 @@ object StatsSanity {
      * value, and zero bytes is not a number — the same rule the
      * compaction rewriter enforces on the data itself.
      */
+
     private fun decodable(
         type: ColType,
         bytes: ByteArray,
@@ -184,6 +197,33 @@ object StatsSanity {
         }
 
     /**
+     * Why [bytes] failed [decodable], in the operator's terms.
+     *
+     * The single diagnostic has to be true: reporting a NaN as "not
+     * decodable as 'float' (4 bytes)" names the one property that was
+     * correct, and an operator reading it goes looking for a length bug
+     * that is not there.
+     */
+    private fun undecodableReason(
+        type: ColType,
+        bytes: ByteArray,
+    ): String {
+        val nan =
+            when {
+                type.icebergType == IcebergType.FLOAT && bytes.size == 4 ->
+                    java.lang.Float.intBitsToFloat(intLE(bytes)).isNaN()
+                type.icebergType == IcebergType.DOUBLE && bytes.size == 8 ->
+                    java.lang.Double.longBitsToDouble(longLE(bytes)).isNaN()
+                else -> false
+            }
+        return if (nan) {
+            "is NaN, which has no place in a '${type.wire}' bound (NaNs are counted in nan_count)"
+        } else {
+            "is not decodable as '${type.wire}' (${bytes.size} bytes)"
+        }
+    }
+
+    /**
      * Compare two bounds in the ORDER OF THEIR TYPE, which is the only
      * order an inversion check can be asked in. A raw byte compare would
      * call every negative int32 "above" every positive one (little-endian
@@ -213,6 +253,12 @@ object StatsSanity {
      *    0x00 sign byte above 2^63 — which `BigInteger` reproduces.
      *  - string/json/binary/uuid: unsigned lexicographic, which for
      *    UTF-8 is code-point order.
+     *  - list/struct/map: no arm, and none needed. A container carries
+     *    no values, so it has no bound to compare — the commit door
+     *    refuses a stats row for a container field id outright, and the
+     *    hydrator only ever emits rows for leaves. They fall to the
+     *    unsigned-bytes branch, which is unreachable for them; listed
+     *    here so the audit is complete rather than merely long.
      *
      * A length this function cannot read has already been dropped by
      * [decodable], so the reads below are safe.
