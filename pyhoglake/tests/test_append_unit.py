@@ -561,3 +561,43 @@ def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_
     assert next(iter(fake_s3.files.values())) == path.read_bytes()
     stats = request["appends"][0]["files"][0]["column_stats"]
     assert [stat["field_id"] for stat in stats] == [1]
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_prepared_external_optional_fields_require_zero_nulls(
+    table, httpx_mock, fake_s3, tmp_path, null_id
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    schema = schema.set(0, schema.field(0).with_nullable(True))
+    path = tmp_path / "external.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": None if null_id else 1, "name": "a"}], schema=schema
+        ),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    if null_id:
+        with pytest.raises(ValidationError, match="non-null"):
+            table.prepare_append_files(
+                [(str(path), None)],
+                idempotency_key=str(uuid.uuid4()),
+                allow_optional_fields=True,
+            )
+        assert not fake_s3.files
+    else:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=True,
+        )
+        assert next(iter(fake_s3.files.values())) == path.read_bytes()

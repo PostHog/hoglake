@@ -1,4 +1,4 @@
-"""Native VARIANT event-file writer, not yet wired into catalog publication.
+"""Native VARIANT event-file writer, used by the buffered coordinator.
 
 Payloads stay in DuckDB from Parquet scan through COPY. Each call owns a separate
 connection and disposable scratch; immutable raw inputs remain the backup. Memory
@@ -14,8 +14,8 @@ from tempfile import TemporaryDirectory
 
 import duckdb
 
+from .events import EVENT_SORT
 from .halts import DataIntegrityError
-from .sorted_writer import EVENT_SORT
 
 
 def _identifier(value: str) -> str:
@@ -65,7 +65,7 @@ def write_duckdb_event_partition(
     ``month`` is the Iceberg epoch-relative month, not month-of-year. Field IDs
     enumerate the exact output projection, including derived ``event_date``.
     Only explicitly selected JSON/VARCHAR columns become VARIANT. Existing native
-    VARIANT columns pass through. Source UUID may be native UUID or 16-byte BLOB.
+    VARIANT columns pass through. Source UUID may be native UUID, 16-byte BLOB or a preserved VARCHAR.
 
     Top-level nulls in VARIANT output are refused: DuckDB conflates SQL NULL
     with VARIANT null. Nested nulls are accepted. Source schemas must agree exactly.
@@ -153,7 +153,7 @@ def write_duckdb_event_partition(
                     or schema["timestamp"]
                     not in ("TIMESTAMP", "TIMESTAMP WITH TIME ZONE")
                     or schema["event"] != "VARCHAR"
-                    or schema["uuid"] not in ("UUID", "BLOB")
+                    or schema["uuid"] not in ("UUID", "BLOB", "VARCHAR")
                 ):
                     raise DataIntegrityError(
                         "unsupported raw event routing/identity types"

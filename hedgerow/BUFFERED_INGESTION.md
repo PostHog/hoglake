@@ -6,11 +6,10 @@ provide the requested production raw_events → events CLI mode.** Existing CLI
 configurations continue to run direct replication with their documented
 at-least-once behavior.
 
-Native VARIANT catalog and prepared-file publication are supported. The Arrow-based
-coordinator still refuses VARIANT destination schemas. The separate [DuckDB event-file writer](DUCKDB_WRITER.md)
-now reads, transforms, sorts and writes native VARIANT Parquet, but is not yet
-wired into the coordinator or CLI. Do not deploy this library coordinator as the
-finished ingestion service.
+The coordinator uses the [DuckDB event-file writer](DUCKDB_WRITER.md) for every
+flush: source payload reads, transformation, sorting and Parquet output all stay
+in DuckDB. PyArrow still reads routing columns during discovery and footer
+metadata during publication. The CLI has not yet been wired to this coordinator.
 
 Raw files remain indefinitely as data backups. Raw-file retirement is out of scope
 and is not a prerequisite for enabling ingestion.
@@ -41,25 +40,34 @@ Readiness uses the bytes allocated to an individual destination partition and
 the oldest pending source **commit time**. Arrivals never reset that time. The
 compressed-byte readiness estimate allocates source row-group compressed sizes
 proportionally by row count; transformation/compression can change output size.
-Output files roll after reaching the configured compressed-byte target, with up
-to a row group plus footer of overshoot. Input batch boundaries do not create
+DuckDB rolls output files around the configured compressed-byte target; this is
+an approximate target, not a hard maximum. Input batch boundaries do not create
 output files.
 
 The default event sort is physical `(event_date, event, timestamp, uuid)`, all
 ascending with nulls first. `event_date` is derived in UTC; event UUIDs are
 preserved. The catalog sort specification must match, so later compaction has
-the same order. `EventTransform.sort_columns` permits another physical order
-with UUID last. The table must include an identity partition on team_id; routing
-uses the actual destination specification. The recommended team/calendar-month
-layout is **identity(team_id), month(timestamp)**. Iceberg month is a single
+the same order. The required partition layout is **identity(team_id), month(timestamp)**
+(or month(event_date)), in either order; other layouts and sort orders fail at
+startup. Iceberg month is a single
 epoch-relative month number, e.g. January 2026 is 672, not month-of-year 1. It
 already distinguishes years. A separate `year(timestamp)` is redundant.
 
-The bounded worker pool owns at most one frozen input set per team. Sorted
-output is built with bounded-fan-in external merge passes in temporary files;
-these are disposable flush scratch, not durable pending-event storage. Arrow
-batches are capped and oversized input batches are refused. Limits are per
-worker; provision memory and local scratch for the configured worker count.
+The bounded worker pool owns at most one frozen input set per team. DuckDB sorts
+using disposable local scratch. `writer_options` supplies per-worker memory and
+scratch budgets; `BufferPolicy.target_file_bytes` controls output size. DuckDB's
+memory budget is not an RSS ceiling. Provision for the configured worker count.
+
+Pass explicit `json_columns=("properties", ...)` to `BufferedIngestion` only for
+JSON/string source columns destined for VARIANT. Native VARIANT passes through.
+The mapping and writer version are part of durable job identity: incompatible
+state fails closed at startup. Existing Arrow coordinator state requires explicit
+reconciliation; do not discard pending state to bypass that guard.
+
+`configure_duckdb(connection)` configures each worker connection's S3 access
+(e.g. a DuckDB secret). It is separate from the Arrow filesystem used by discovery
+and the destination client's upload filesystem. It must be thread-safe and must
+not override writer resource limits. Credentials are not stored in pending state.
 
 A complete uploaded-file commit request is persisted before publication. The
 new `POST /catalogs/{catalog}/commit/prepared` endpoint requires a UUID
@@ -94,10 +102,9 @@ endpoint rather than silently ignoring an unfamiliar request field.
   commit. A persistent DDL conflict requires operator reconciliation.
 - Receipts currently retain the complete request indefinitely. A receipt GC
   protocol needs an explicit replay horizon before any deletion is safe.
-- Native VARIANT is not JSON. The standalone DuckDB writer pins stable 1.5.5 and
+- Native VARIANT is not JSON. The DuckDB writer pins stable 1.5.5 and
   keeps payloads inside DuckDB. Catalog types and prepared-file physical validation are implemented; VARIANT
-  statistics are omitted. VARIANT compaction, reader interoperability and
-  coordinator wiring still need implementation. No Arrow payload rewrite may be inserted: ordinary
+  statistics are omitted. VARIANT compaction, reader interoperability still need implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
   JSON column mappings must be explicit; no property names are assumed.
 

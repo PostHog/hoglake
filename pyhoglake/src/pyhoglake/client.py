@@ -804,6 +804,7 @@ class Table:
         idempotency_key: str,
         expected_table_uuid: str | None = None,
         expected_table_info: TableInfo | None = None,
+        allow_optional_fields: bool = False,
     ) -> dict[str, Any]:
         """Upload already partitioned/sorted local Parquet without loading it in RAM.
 
@@ -812,6 +813,8 @@ class Table:
         resolved table. Return an immutable commit request; persist it durably
         BEFORE calling ``Catalog.commit_prepared``. A failed prepare may orphan
         uploads, but cannot publish rows. Never regenerate files after preparing.
+        With allow_optional_fields, external writers may use optional physical
+        fields for required catalog columns only when footer counts prove no nulls.
         """
         _uuid.UUID(idempotency_key)
         catalog = self._namespace._catalog
@@ -848,7 +851,7 @@ class Table:
         registrations = []
         for index, (path, partition) in enumerate(files):
             with pq.ParquetFile(path) as parquet:
-                if has_variant:
+                if has_variant or allow_optional_fields:
                     validate_variant_file(path, parquet, info.columns)
                 elif not parquet.schema_arrow.equals(schema, check_metadata=True):
                     raise ValidationError(
