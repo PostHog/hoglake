@@ -616,6 +616,57 @@ class CommitServiceTest {
     }
 
     @Test
+    fun `a commit's zero bounds are stored with Iceberg's canonical signs`() {
+        // The commit door takes bounds from a client verbatim, and +0.0
+        // and -0.0 are IEEE-equal, so a writer may hand over either for
+        // either bound. Iceberg's evaluators compare float and double
+        // bounds in NATURAL order, where -0.0 < 0.0, so the pair
+        // (lower = +0.0, upper = -0.0) stored as given reads as an empty
+        // range and prunes away a file that holds 0.0. Each role gets the
+        // sign the spec fixes for it, here proved on the stored row.
+        val fx = seed()
+        jdbi.useHandle<Exception> { h ->
+            h.createUpdate("UPDATE hog_column SET col_type = 'double' WHERE catalog_id = ? AND field_id = 1")
+                .bind(0, fx.catalogId).execute()
+        }
+        val positiveZero = ByteArray(8)
+        val negativeZero = ByteArray(8).also { it[7] = 0x80.toByte() }
+        service.commit(
+            "cat",
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "events",
+                            listOf(
+                                file(
+                                    "s3://b/zero.parquet",
+                                    3,
+                                    stats =
+                                        listOf(
+                                            ColumnStats(1, 3, 0, 0, 24, positiveZero, negativeZero),
+                                        ),
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        val stored =
+            jdbi.withHandle<Pair<ByteArray, ByteArray>, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT lower_bound, upper_bound FROM hog_file_column_stats
+                     WHERE catalog_id = ? AND field_id = 1
+                    """,
+                ).bind(0, fx.catalogId).map { rs, _ -> rs.getBytes(1) to rs.getBytes(2) }.one()
+            }
+        assertThat(stored.first).describedAs("stored lower bound").isEqualTo(negativeZero)
+        assertThat(stored.second).describedAs("stored upper bound").isEqualTo(positiveZero)
+    }
+
+    @Test
     fun `negative counts and blank path are Validation`() {
         seed()
         val cases =

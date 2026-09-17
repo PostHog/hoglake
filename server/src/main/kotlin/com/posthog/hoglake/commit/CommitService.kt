@@ -1050,18 +1050,14 @@ class CommitService(
         liveColumnTypes: Map<Long, String>,
     ): ResolvedAppend {
         val qualified = "${append.namespace}.${append.table}"
-        var anyRepaired = false
         val files =
             append.files.map { file ->
                 val stats = file.columnStats ?: return@map file
-                var fileRepaired = false
                 val checked =
                     stats.map { stat ->
                         val type = liveColumnTypes[stat.fieldId]?.let { ColType.fromWire(it) }
                         val result = StatsSanity.check(stat, type)
                         if (result.repairs.isNotEmpty()) {
-                            fileRepaired = true
-                            anyRepaired = true
                             Metrics.statsRepaired("commit")
                             log.warn {
                                 "column_stats for field_id ${stat.fieldId} of ${file.path} in " +
@@ -1071,9 +1067,13 @@ class CommitService(
                         }
                         result.stats
                     }
-                if (fileRepaired) file.copy(columnStats = checked) else file
+                // The sanitizer's output is what gets stored, whether or
+                // not it reported anything. Taking it only when a repair
+                // was REPORTED dropped the signed-zero canonicalization
+                // on the floor, which is silent and not a repair.
+                file.copy(columnStats = checked)
             }
-        return if (anyRepaired) append.copy(files = files) else append
+        return append.copy(files = files)
     }
 
     /** DB-independent DV registration checks: shapes, ranges, duplicate targets. */

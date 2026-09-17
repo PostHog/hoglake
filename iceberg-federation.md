@@ -54,6 +54,20 @@ single-value serialization of the **mapped Iceberg type**, never of the
 hoglake type. That is what keeps manifest generation a mechanical copy
 (§5), and it is why several hoglake types share one encoding.
 
+**The signed zeros**: a `float`/`double` LOWER bound is stored as
+`-0.0` and an UPPER bound as `+0.0`. The two are IEEE-equal, so a
+writer may report either — DuckDB reports `+0.0` for both bounds of an
+all-zero column, pyarrow normalizes — but Iceberg's evaluators compare
+these bounds in NATURAL order, where `-0.0 < 0.0`, so a stored pair of
+(lower `+0.0`, upper `-0.0`) is an EMPTY range and prunes away a file
+that holds `0.0`. Every door that stores a bound canonicalizes by role
+(`StatsSanity.normalizeBound`, `pyhoglake.bounds.normalize_bound`);
+rewriting one zero as the other widens nothing. The cases are pinned
+cross-language under `bound_normalization` in
+`pyhoglake/tests/vectors/bounds_vectors.json`. No other value has two
+encodings a total order would separate: NaN is refused from bounds
+outright, and every remaining type has one encoding per value.
+
 | col_type | Iceberg | parquet physical | bounds |
 |---|---|---|---|
 | `boolean` | boolean | BOOLEAN | 1 byte |

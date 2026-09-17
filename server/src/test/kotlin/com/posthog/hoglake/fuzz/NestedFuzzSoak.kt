@@ -64,18 +64,7 @@ object NestedFuzzSoak {
             val s = seed
             val found = ArrayList<Finding>()
             val t0 = System.nanoTime()
-            val fut =
-                exec.submit {
-                    val e = RandomEntropy(s)
-                    when (campaign) {
-                        "agreement" -> NestedAgreement.runOne(e, tmp) { found.add(it) }
-                        "footer" -> footerCampaign(e, tmp) { found.add(it) }
-                        "data" -> dataCampaign(e, tmp) { found.add(it) }
-                        "trees" -> treeCampaign(e) { found.add(it) }
-                        "codec" -> codecCampaign(e) { found.add(it) }
-                        else -> error("unknown campaign $campaign")
-                    }
-                }
+            val fut = exec.submit { found.addAll(runSeed(campaign, s, tmp)) }
             try {
                 fut.get(perIterationTimeout, TimeUnit.SECONDS)
             } catch (t: java.util.concurrent.TimeoutException) {
@@ -129,6 +118,34 @@ object NestedFuzzSoak {
             seed++
         }
         report(campaign, executions, started, counts, firstSeed, examples, slowest, slowestSeed, emptyList(), seed)
+    }
+
+    /**
+     * One seed of one campaign, collected.
+     *
+     * [main] and the pinned regression tests both come through here, so
+     * a test that replays a fleet seed replays what the fleet actually
+     * ran rather than a reconstruction of it. `strictDomains` is the one
+     * input NOT taken from the seed — the fleet sets it from its
+     * arguments (true by default), and a caller that changes it is
+     * running a different campaign.
+     */
+    internal fun runSeed(
+        campaign: String,
+        seed: Long,
+        tmp: Path,
+    ): List<Finding> {
+        val found = ArrayList<Finding>()
+        val e = RandomEntropy(seed)
+        when (campaign) {
+            "agreement" -> NestedAgreement.runOne(e, tmp) { found.add(it) }
+            "footer" -> footerCampaign(e, tmp) { found.add(it) }
+            "data" -> dataCampaign(e, tmp) { found.add(it) }
+            "trees" -> treeCampaign(e) { found.add(it) }
+            "codec" -> codecCampaign(e) { found.add(it) }
+            else -> error("unknown campaign $campaign")
+        }
+        return found
     }
 
     @Suppress("LongParameterList")

@@ -1489,6 +1489,72 @@ class NestedCampaignRegressionTest {
         assertThat(StatsSanity.check(ok, ColType.STRING).repairs).isEmpty()
     }
 
+    @Test
+    fun `a zero bound is stored with the sign Iceberg fixes for its role`() {
+        // +0.0 and -0.0 are IEEE-equal, so which one a writer reports is
+        // arbitrary -- but Iceberg's evaluators compare float/double
+        // bounds in natural order, where -0.0 < 0.0, so the stored pair
+        // (lower = +0.0, upper = -0.0) is an EMPTY range and prunes away
+        // a file that holds 0.0. The rule fixes the sign per ROLE:
+        // lower stores -0.0, upper stores +0.0. Widens nothing.
+        val cases =
+            listOf(
+                ColType.DOUBLE to (8 to 0x80.toByte()),
+                ColType.FLOAT to (4 to 0x80.toByte()),
+            )
+        for ((type, shape) in cases) {
+            val (width, signByte) = shape
+            val posZero = ByteArray(width)
+            val negZero = ByteArray(width).also { it[width - 1] = signByte }
+            val checked =
+                StatsSanity.check(
+                    ColumnStats(1, 3, 0, 0, null, posZero, negZero),
+                    type,
+                )
+            assertThat(checked.stats.lowerBound)
+                .describedAs("%s lower bound stores -0.0", type.wire)
+                .isEqualTo(negZero)
+            assertThat(checked.stats.upperBound)
+                .describedAs("%s upper bound stores +0.0", type.wire)
+                .isEqualTo(posZero)
+            // A conforming writer is not a broken one: normalization is
+            // not reported as a repair, or every float column whose
+            // minimum is zero would warn and move the repair metric.
+            assertThat(checked.repairs).isEmpty()
+            // The pair that was already canonical survives unchanged,
+            // which is what says the roles are not swapped.
+            val already =
+                StatsSanity.check(
+                    ColumnStats(1, 3, 0, 0, null, negZero, posZero),
+                    type,
+                )
+            assertThat(already.stats.lowerBound).isEqualTo(negZero)
+            assertThat(already.stats.upperBound).isEqualTo(posZero)
+            // And a neighbouring type is NOT normalized: these bytes are
+            // a perfectly ordinary long/int value.
+            val untouched =
+                StatsSanity.check(
+                    ColumnStats(1, 3, 0, null, null, negZero, negZero),
+                    if (width == 8) ColType.LONG else ColType.INT,
+                )
+            assertThat(untouched.stats.lowerBound).isEqualTo(negZero)
+            assertThat(untouched.stats.upperBound).isEqualTo(negZero)
+        }
+    }
+
+    @Test
+    fun `fleet seed 698243 no longer produces an inverted zero pair`(
+        @TempDir tmp: Path,
+    ) {
+        // The footer campaign found this: a mutated footer reporting a
+        // DOUBLE min of +0.0 and a max of -0.0 was stored verbatim, and
+        // the campaign's own oracle compares with the total order every
+        // Iceberg evaluator uses. Replays through the same entry the
+        // fleet runs, so the pin cannot drift from the campaign.
+        val findings = NestedFuzzSoak.runSeed("footer", 698243L, tmp)
+        assertThat(findings.map { "${it.kind}: ${it.detail}" }).isEmpty()
+    }
+
     // ---- helpers ---------------------------------------------------------
 
     private fun intLE(v: Int): ByteArray = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(v).array()

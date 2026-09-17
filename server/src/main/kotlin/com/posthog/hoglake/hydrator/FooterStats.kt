@@ -422,12 +422,16 @@ object FooterStats {
                 ),
                 col.type,
             )
-        if (checked.repairs.isEmpty()) return agg
-        Metrics.statsRepaired("hydrator")
-        log.warn {
-            "footer stats for column ${col.name} (field ${col.fieldId}) in $filePath are not " +
-                "internally consistent (${checked.repairs.joinToString("; ")}); " +
-                "storing the repaired row"
+        // The sanitizer's output is what gets stored, reported or not:
+        // it also canonicalizes signed zeros, which is a conformance
+        // rewrite rather than a repair and so carries no warning.
+        if (checked.repairs.isNotEmpty()) {
+            Metrics.statsRepaired("hydrator")
+            log.warn {
+                "footer stats for column ${col.name} (field ${col.fieldId}) in $filePath are not " +
+                    "internally consistent (${checked.repairs.joinToString("; ")}); " +
+                    "storing the repaired row"
+            }
         }
         val fixed = checked.stats
         return ColumnAgg(

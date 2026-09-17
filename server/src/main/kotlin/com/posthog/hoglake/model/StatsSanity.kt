@@ -119,6 +119,16 @@ object StatsSanity {
                 upper = null
             }
         }
+        // SIGNED ZEROS, before the ordering check below rather than
+        // after: the pair this fixes is exactly the one that check is
+        // told to tolerate.
+        val normalizedLower = normalizeBound(type, lower, lower = true)
+        val normalizedUpper = normalizeBound(type, upper, lower = false)
+        val zeroNormalized =
+            !sameBytes(normalizedLower, lower) || !sameBytes(normalizedUpper, upper)
+        lower = normalizedLower
+        upper = normalizedUpper
+
         // BOTH go, not the "wrong" one: an inverted pair says one of the
         // two is wrong and there is nothing in the row that says which.
         // Keeping either would be picking at random, and the one kept
@@ -130,7 +140,7 @@ object StatsSanity {
         }
 
         val fixed =
-            if (repairs.isEmpty()) {
+            if (repairs.isEmpty() && !zeroNormalized) {
                 stats
             } else {
                 ColumnStats(
@@ -145,6 +155,71 @@ object StatsSanity {
             }
         return Checked(fixed, repairs)
     }
+
+    /**
+     * The bytes to STORE for a bound of [type] in this role.
+     *
+     * Only the signed zeros move. +0.0 and -0.0 are IEEE-equal, so which
+     * one a writer reports for a bound is arbitrary — DuckDB reports
+     * +0.0 for both bounds of an all-zero column, pyarrow normalizes to
+     * (-0.0, +0.0) — but Iceberg's evaluators compare float and double
+     * bounds in NATURAL order, where -0.0 < 0.0. Stored verbatim, the
+     * pair (lower = +0.0, upper = -0.0) is therefore an empty range, and
+     * a reader skips the file for `x = 0.0`: data that is there, pruned
+     * away. Iceberg removes the arbitrariness by fixing the sign per
+     * ROLE — a lower bound stores -0.0, an upper bound stores +0.0 —
+     * and iceberg-federation.md §2.1 requires the stored bound to BE the
+     * Iceberg single-value serialization, because manifest generation
+     * copies it mechanically. Rewriting one zero as the other widens
+     * nothing: they are the same number.
+     *
+     * The cases are pinned cross-language in
+     * `pyhoglake/tests/vectors/bounds_vectors.json` under
+     * `bound_normalization`; `pyhoglake.bounds.normalize_bound` is the
+     * other half and must answer that file identically.
+     *
+     * Anything that is not a float/double bound of the right width comes
+     * back untouched. A bound of the wrong width is not a zero to
+     * canonicalize; it is a malformed bound, and [decodable] drops those
+     * rather than rewriting them into something storable.
+     */
+    fun normalizeBound(
+        type: ColType?,
+        bytes: ByteArray?,
+        lower: Boolean,
+    ): ByteArray? {
+        if (type == null || bytes == null) return bytes
+        val zero =
+            when (type.icebergType) {
+                IcebergType.FLOAT ->
+                    if (bytes.size == 4 && java.lang.Float.intBitsToFloat(intLE(bytes)) == 0.0f) {
+                        if (lower) FLOAT_NEGATIVE_ZERO else FLOAT_POSITIVE_ZERO
+                    } else {
+                        null
+                    }
+                IcebergType.DOUBLE ->
+                    if (bytes.size == 8 && java.lang.Double.longBitsToDouble(longLE(bytes)) == 0.0) {
+                        if (lower) DOUBLE_NEGATIVE_ZERO else DOUBLE_POSITIVE_ZERO
+                    } else {
+                        null
+                    }
+                else -> null
+            }
+        return zero?.copyOf() ?: bytes
+    }
+
+    // Little-endian, like every other fixed-width Iceberg single value:
+    // the sign bit is the LAST byte. Pinned against the codec itself by
+    // QeBoundNormalizationVectorsTest through the shared vector file.
+    private val FLOAT_POSITIVE_ZERO = ByteArray(4)
+    private val FLOAT_NEGATIVE_ZERO = byteArrayOf(0, 0, 0, 0x80.toByte())
+    private val DOUBLE_POSITIVE_ZERO = ByteArray(8)
+    private val DOUBLE_NEGATIVE_ZERO = byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0x80.toByte())
+
+    private fun sameBytes(
+        a: ByteArray?,
+        b: ByteArray?,
+    ): Boolean = if (a == null || b == null) a === b else a.contentEquals(b)
 
     /**
      * Whether [bytes] can be read back as a single value of [type],
@@ -176,9 +251,12 @@ object StatsSanity {
             // the hydrator door refuses: a client could publish pruning
             // metadata a footer could never produce.
             //
-            // -0.0 is NOT refused: it is an ordinary value, and the
-            // pair (+0.0, -0.0) is not an inversion — [compare] uses
-            // IEEE equality rather than the total order for that reason.
+            // -0.0 is NOT refused: it is an ordinary value. The pair
+            // (+0.0, -0.0) is not an inversion either — [compare] uses
+            // IEEE equality, under which the two zeros are equal — but
+            // that tolerance now only ever describes RAW writer input:
+            // [normalizeBound] canonicalizes both zeros by role before
+            // the ordering check runs, so no such pair reaches storage.
             IcebergType.FLOAT ->
                 bytes.size == 4 && !java.lang.Float.intBitsToFloat(intLE(bytes)).isNaN()
             IcebergType.DOUBLE ->
@@ -245,7 +323,13 @@ object StatsSanity {
      *    against a NaN is not evidence of anything) and -0.0 EQUAL to
      *    +0.0. Kotlin's `compareTo` is the total order, which ranks
      *    -0.0 below +0.0 and would have deleted the perfectly good pair
-     *    (lower = +0.0, upper = -0.0).
+     *    (lower = +0.0, upper = -0.0). That pair is no longer stored
+     *    either: [normalizeBound] runs first and gives each zero the
+     *    sign Iceberg fixes for its role, which is what keeps a
+     *    total-order READER — every Iceberg evaluator — from reading an
+     *    empty range where hoglake sees an equal one. Dropping the pair
+     *    here instead would have thrown away a true bound to avoid a
+     *    problem the canonical bytes do not have.
      *  - decimal: unscaled big-endian two's complement. Both bounds of
      *    one column share that column's scale, so comparing unscaled IS
      *    comparing values. `uint64` maps here and decodes signed with a
@@ -298,6 +382,12 @@ object StatsSanity {
      * +0.0 (so a bound pair that merely disagrees about zero's sign is
      * not inverted). `compareTo` says otherwise on both counts, and both
      * of its answers here would have deleted sound bounds.
+     *
+     * The zero half of that is now belt over braces: [check] normalizes
+     * the signed zeros before it calls this, so the pair reaching here
+     * is already (-0.0, +0.0), which BOTH orders read the same way. The
+     * IEEE rule stays because this function is about what an inversion
+     * IS, not about what the last caller happened to hand it.
      */
     private fun ieee(
         x: Double,

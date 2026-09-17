@@ -633,7 +633,11 @@ class CompactionServiceIntegrationTest {
         assertThat(stats[2L]!!.second).isEqualTo(IcebergSingleValue.encodeString("a"))
         assertThat(stats[2L]!!.third).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
         assertThat(stats[3L]!!.first).isEqualTo(15L to 2L)
-        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(0.0))
+        // -0.0, not +0.0: a stored lower bound takes the sign Iceberg
+        // fixes for the role, so a total-order evaluator cannot read the
+        // pair as an empty range. Same number, canonical bytes — and
+        // this is the compaction door proving it all the way to the row.
+        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(-0.0))
         assertThat(stats[3L]!!.third).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
         assertVerifyPasses(fx.cat)
     }

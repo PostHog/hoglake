@@ -282,3 +282,46 @@ def decode_bound(
             ctx.prec = 60
             return Decimal(unscaled).scaleb(-scale)
     raise ValueError(f"cannot decode bound for column type {col_type!r}")
+
+
+#: The canonical stored encodings of zero, per Iceberg's single-value
+#: rule: a float/double LOWER bound stores -0.0 and an UPPER bound
+#: stores +0.0. Keyed (width, is_lower).
+_CANONICAL_ZERO = {
+    (4, True): struct.pack("<f", -0.0),
+    (4, False): struct.pack("<f", 0.0),
+    (8, True): struct.pack("<d", -0.0),
+    (8, False): struct.pack("<d", 0.0),
+}
+
+_FLOAT_BOUND_WIDTH = {"float": 4, "double": 8}
+
+
+def normalize_bound(col_type: str, raw: bytes | None, *, lower: bool) -> bytes | None:
+    """The bytes to STORE for a bound of ``col_type`` in this role.
+
+    Only the signed zeros move. +0.0 and -0.0 are IEEE-equal, so which
+    one a writer emits is arbitrary — but Iceberg's evaluators compare
+    float/double bounds in natural (total) order, where -0.0 < 0.0, so a
+    stored pair of (lower=+0.0, upper=-0.0) reads as an EMPTY range and
+    prunes away a file that holds 0.0. Iceberg resolves the arbitrariness
+    by fixing the role: lower bounds store -0.0, upper bounds store +0.0.
+    Rewriting one zero as the other widens nothing.
+
+    The cases are pinned cross-language in
+    ``tests/vectors/bounds_vectors.json`` under ``bound_normalization``;
+    the Kotlin door (StatsSanity) answers the same file.
+
+    Anything that is not a float/double bound of the right width comes
+    back untouched: a bound of the wrong width is not a zero to canonicalize,
+    it is a malformed bound, and the server drops those rather than
+    rewriting them.
+    """
+    width = _FLOAT_BOUND_WIDTH.get(col_type)
+    if raw is None or width is None or len(raw) != width:
+        return raw
+    fmt = "<f" if width == 4 else "<d"
+    (value,) = struct.unpack(fmt, raw)
+    if value != 0.0:  # NaN and every non-zero value included
+        return raw
+    return _CANONICAL_ZERO[(width, lower)]

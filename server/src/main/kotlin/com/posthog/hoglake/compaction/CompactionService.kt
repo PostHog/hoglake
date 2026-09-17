@@ -1120,11 +1120,15 @@ class CompactionService(
         where: String,
     ): ColumnStats {
         val checked = StatsSanity.check(stats, type)
-        if (checked.repairs.isEmpty()) return stats
-        Metrics.statsRepaired("compaction")
-        log.warn {
-            "column stats for field_id ${stats.fieldId} in the $where are not internally " +
-                "consistent (${checked.repairs.joinToString("; ")}); using the repaired row"
+        // The sanitizer's output is stored whether or not it reported
+        // anything: signed-zero canonicalization is a conformance
+        // rewrite, not a repair, so it carries no warning and no metric.
+        if (checked.repairs.isNotEmpty()) {
+            Metrics.statsRepaired("compaction")
+            log.warn {
+                "column stats for field_id ${stats.fieldId} in the $where are not internally " +
+                    "consistent (${checked.repairs.joinToString("; ")}); using the repaired row"
+            }
         }
         return checked.stats
     }

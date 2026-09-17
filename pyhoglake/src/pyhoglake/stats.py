@@ -20,7 +20,7 @@ import struct
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .bounds import encode_bound
+from .bounds import encode_bound, normalize_bound
 from .models import Column, ColumnStats
 from .types import is_list_family
 
@@ -609,8 +609,18 @@ def extract_column_stats(
                 else:
                     lo = min(mins)
                     hi = max(maxs)
-                lower = encode_bound(col.type, lo, col.type_params)
-                upper = encode_bound(col.type, hi, col.type_params)
+                # Normalized on the way out, not on the way in: the
+                # selection above prefers -0.0 for a min and +0.0 for a
+                # max, but it can only choose among the zeros the file
+                # OFFERS. A writer that normalizes neither (DuckDB) hands
+                # over +0.0 for both, and +0.0 stored as a lower bound is
+                # the pair Iceberg's rule exists to prevent.
+                lower = normalize_bound(
+                    col.type, encode_bound(col.type, lo, col.type_params), lower=True
+                )
+                upper = normalize_bound(
+                    col.type, encode_bound(col.type, hi, col.type_params), lower=False
+                )
             except _BOUND_ERRORS:
                 # The footer's value does not fit — or does not mean —
                 # what the catalog type needs: a foreign INT64 statistic

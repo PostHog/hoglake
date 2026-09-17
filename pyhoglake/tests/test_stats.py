@@ -4,6 +4,7 @@ import io
 import struct
 from datetime import date, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -433,6 +434,40 @@ def test_float_zero_bounds_deterministic_across_row_group_orders():
     assert (lo_a, hi_a) == (lo_b, hi_b)  # order-independent bytes
     assert lo_a == neg_zero  # min prefers -0.0
     assert hi_a == pos_zero  # max prefers +0.0
+
+
+def test_an_unnormalized_zero_footer_still_stores_the_canonical_bounds():
+    """Total-order SELECTION only helps when both zeros are on offer.
+
+    pyarrow normalizes each row group's zero stats on write, so a file
+    this library produced never exercises the gap. DuckDB does not: this
+    fixture's every row group reports min=+0.0 AND max=+0.0, which hands
+    the selection one candidate per bound. Stored verbatim that is what
+    Iceberg's rule forbids -- its evaluators compare float/double bounds
+    in natural order, where -0.0 < 0.0, so a (lower=+0.0, upper=-0.0)
+    pair is an empty range and the file holding 0.0 is skipped for
+    `x = 0.0`. Normalizing the stored bytes widens nothing, since the two
+    are IEEE-equal, and the Kotlin doors apply the same rule under the
+    shared bound_normalization vectors.
+
+    Reachable from ``prepare_append_files``, which reads a footer the
+    CALLER wrote.
+    """
+    path = Path(__file__).parent / "data" / "duckdb_zero_bounds.parquet"
+    meta = pq.read_metadata(path)
+    raw = meta.row_group(0).column(0).statistics
+    assert struct.pack("<d", raw.min) == struct.pack("<d", 0.0), (
+        "fixture must carry an UN-normalized +0.0 minimum, or it proves nothing"
+    )
+    columns = (
+        Column(name="x", type="double", field_id=1, ordinal=0),
+        Column(name="y", type="float", field_id=2, ordinal=1),
+    )
+    by_id = {s.field_id: s for s in extract_column_stats(meta, columns)}
+    assert by_id[1].lower_bound == struct.pack("<d", -0.0)
+    assert by_id[1].upper_bound == struct.pack("<d", 0.0)
+    assert by_id[2].lower_bound == struct.pack("<f", -0.0)
+    assert by_id[2].upper_bound == struct.pack("<f", 0.0)
 
 
 def test_float_total_order_key_matches_double_compare():
