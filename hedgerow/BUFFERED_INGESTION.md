@@ -6,11 +6,14 @@ provide the requested production raw_events → events CLI mode.** Existing CLI
 configurations continue to run direct replication with their documented
 at-least-once behavior.
 
-Two required pieces are still missing: native VARIANT conversion/support and
-catalog-safe retirement of fully consumed raw files. The coordinator deliberately
-refuses VARIANT destination schemas and never deletes raw objects. These are
-implementation gaps, not alternative product decisions. Do not deploy this
-library coordinator as the finished ingestion service.
+Native VARIANT catalog/publication support is still missing. The coordinator
+refuses VARIANT destination schemas. The separate [DuckDB event-file writer](DUCKDB_WRITER.md)
+now reads, transforms, sorts and writes native VARIANT Parquet, but is not yet
+wired into the coordinator or CLI. Do not deploy this library coordinator as the
+finished ingestion service.
+
+Raw files remain indefinitely as data backups. Raw-file retirement is out of scope
+and is not a prerequisite for enabling ingestion.
 
 ## Implemented behavior
 
@@ -83,23 +86,20 @@ endpoint rather than silently ignoring an unfamiliar request field.
   Routing expansion fails at its configured cap without checkpointing a partial
   window. Production sizing at 140K teams and indexed scheduling improvements
   are still needed; readiness currently aggregates pending metadata.
-- `cleanup_candidates()` exposes only whole files whose dependencies have all
-  published. It is **not deletion authorization**. Live raw rows/files remain
-  until a catalog retirement operation is implemented, coordinated with other
-  consumers and compaction. Snapshot expiry alone cannot retire live raw files.
+- `cleanup_candidates()` is unused legacy bookkeeping, not deletion authorization.
+  Raw files are retained indefinitely as backups; there is no retirement worker.
 - A failure before a commit request is persisted can orphan uploaded output
   files. Pending input remains intact; an upload reservation/reclamation path is
   still needed. Prepared requests must never be regenerated after an ambiguous
   commit. A persistent DDL conflict requires operator reconciliation.
 - Receipts currently retain the complete request indefinitely. A receipt GC
   protocol needs an explicit replay horizon before any deletion is safe.
-- Native VARIANT is not JSON. The installed PyArrow 25.0.1 has no Python VARIANT
-  constructor. DuckDB documents native VARIANT Parquet writing, but switching
-  the writer alone would not implement Hoglake's catalog type, physical field-ID
-  validation, statistics, compaction and reader contracts. Those must be changed
-  and verified together. The raw/events schema and intended VARIANT column
-  mapping are still required. References: [DuckDB VARIANT](https://duckdb.org/docs/current/sql/data_types/variant),
-  [Arrow VARIANT Python tracking](https://github.com/apache/arrow/issues/50132).
+- Native VARIANT is not JSON. The standalone DuckDB writer pins stable 1.5.5 and
+  keeps payloads inside DuckDB. Catalog type support, statistics/physical-schema
+  validation, compaction, reader interoperability and coordinator wiring still
+  need implementation. No Arrow payload rewrite may be inserted: ordinary
+  PyArrow read/write drops the native VARIANT annotation. Source-to-destination
+  JSON column mappings must be explicit; no property names are assumed.
 
 ## Verification
 

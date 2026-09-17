@@ -1,8 +1,8 @@
 """Buffered ingestion coordinator, exposed as a library while VARIANT is pending.
 
 The CLI deliberately continues to run direct replication. This coordinator is
-not a production raw_events mode yet: native VARIANT and catalog-safe raw-file
-retirement must be implemented before enabling it there.
+not a production raw_events mode yet: native VARIANT catalog/publication support
+must be implemented before enabling it there. Raw files remain as backups.
 """
 
 from __future__ import annotations
