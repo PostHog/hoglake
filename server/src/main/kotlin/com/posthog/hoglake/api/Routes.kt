@@ -165,6 +165,16 @@ fun Application.installApiRoutes(
                     call.respond(SnapshotPageDto(page.map { it.toDto() }, hasMore))
                 }
 
+                // Dedicated endpoint prevents old servers silently ignoring the
+                // new request key and degrading retries to at-least-once.
+                post("/commit/prepared") {
+                    val req = call.receive<CommitRequestDto>()
+                    if (req.idempotencyKey == null) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
+                    }
+                    call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
+                }
+
                 post("/commit") {
                     val req = call.receive<CommitRequestDto>()
                     call.respond(commits.commit(call.catalog(), req.toModel()).toDto())

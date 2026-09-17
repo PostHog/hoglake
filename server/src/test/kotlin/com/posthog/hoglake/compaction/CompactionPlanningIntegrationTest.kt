@@ -343,4 +343,11 @@ class CompactionPlanningIntegrationTest {
         )
             .isEqualTo(planned)
     }
+
+    @Test
+    fun `variant tables are excluded from scalar compaction`() {
+        val cat = fixture(listOf(ColumnDef("properties", ColType.VARIANT)))
+        append(cat, file("variant-a", 600), file("variant-b", 600))
+        assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+    }
 }

@@ -82,6 +82,7 @@ class QeBoundsVectorsTest {
         hexBytes: ByteArray,
     ): Any =
         when (type) {
+            ColType.VARIANT -> error("VARIANT has no scalar bounds vector")
             ColType.BOOLEAN -> value.toBooleanStrict()
             // Everything that maps to Iceberg int carries a decimal int32
             // string; everything that maps to long (or to Iceberg

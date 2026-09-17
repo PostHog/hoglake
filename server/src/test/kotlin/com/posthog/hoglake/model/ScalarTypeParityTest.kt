@@ -53,10 +53,10 @@ class ScalarTypeParityTest {
         }
 
         @Test
-        fun `the V4 migration's CHECK lists exactly the enum, in order`() {
-            val sql = read("src/main/resources/db/migration/V4__scalar_types.sql")
+        fun `the latest migration's CHECK lists exactly the enum, in order`() {
+            val sql = read("src/main/resources/db/migration/V8__variant_type.sql")
             assertThat(checkMembers(sql))
-                .describedAs("V4__scalar_types.sql col_type CHECK")
+                .describedAs("V8__variant_type.sql col_type CHECK")
                 .isEqualTo(wireNames)
         }
 
@@ -127,6 +127,7 @@ class ScalarTypeParityTest {
                     ColType.JSON to IcebergType.STRING,
                     ColType.UUID_T to IcebergType.UUID,
                     ColType.BINARY to IcebergType.BINARY,
+                    ColType.VARIANT to IcebergType.VARIANT,
                 )
             assertThat(expected.keys).containsExactlyInAnyOrderElementsOf(ColType.entries)
             for ((type, iceberg) in expected) {

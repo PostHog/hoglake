@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.wireObjectMapper
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import java.util.UUID
@@ -214,6 +215,26 @@ class CommitService(
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
         validatePathsUnderDataPath(dataPath, req)
         Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
+
+        // Under the same catalog lock as publication, so concurrent retries
+        // cannot both allocate rows. A receipt is not tied to snapshot expiry.
+        val requestJson = req.idempotencyKey?.let { wireObjectMapper().writeValueAsString(req) }
+        req.idempotencyKey?.let { key ->
+            val receipt =
+                h.createQuery(
+                    """
+                    SELECT snapshot_id, schema_version, request = CAST(:request AS jsonb) AS matches
+                    FROM hog_commit_receipt WHERE catalog_id = :catalog AND idempotency_key = :key
+                    """,
+                ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+                    .map { rs, _ ->
+                        if (!rs.getBoolean("matches")) {
+                            throw HoglakeException.Validation("idempotency_key reused with a different request")
+                        }
+                        CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version"))
+                    }.findOne().orElse(null)
+            if (receipt != null) return receipt
+        }
 
         val catalogHead =
             h.createQuery(
@@ -431,6 +452,15 @@ class CommitService(
         nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, resolvedAppends)
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
+        req.idempotencyKey?.let { key ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_commit_receipt (catalog_id, idempotency_key, request, snapshot_id, schema_version)
+                VALUES (:catalog, :key, CAST(:request AS jsonb), :snapshot, :schema)
+                """,
+            ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+                .bind("snapshot", snapshotId).bind("schema", schemaVersion).execute()
+        }
         return CommitResult(snapshotId, schemaVersion)
     }
 
@@ -904,6 +934,15 @@ class CommitService(
                 .mapTo(Long::class.java)
                 .toSet()
         }
+        val variantFieldIds: Set<Long> by lazy {
+            h.createQuery(
+                """
+                SELECT field_id FROM hog_column
+                WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL AND col_type = 'variant'
+                """,
+            )
+                .bind(0, catalogId).bind(1, append.tableId).mapTo(Long::class.java).toSet()
+        }
         for (file in append.files) {
             if (file.path.isBlank()) {
                 throw HoglakeException.Validation("blank file path in append to $qualified")
@@ -947,6 +986,11 @@ class CommitService(
             val stats = file.columnStats ?: continue
             val seenFieldIds = HashSet<Long>()
             for (stat in stats) {
+                if (stat.fieldId in variantFieldIds) {
+                    throw HoglakeException.Validation(
+                        "variant column statistics are not supported; omit field_id ${stat.fieldId}",
+                    )
+                }
                 if (stat.fieldId !in liveFieldIds) {
                     throw HoglakeException.Validation(
                         "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",

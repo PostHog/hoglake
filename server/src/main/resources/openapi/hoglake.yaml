@@ -1014,6 +1014,38 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /catalogs/{catalog}/commit/prepared:
+    post:
+      operationId: commitPrepared
+      summary: Publish an immutable request with durable replay protection
+      description: >
+        Same commit semantics as /commit, but requires idempotency_key.
+        Clients requiring replay protection use this endpoint so that an older
+        server cannot silently ignore the key. Receipts survive snapshot expiry.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -1436,11 +1468,14 @@ components:
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
                  uint64, float, double, decimal, date, time, timestamp_s,
                  timestamp_ms, timestamp, timestamp_ns, timestamptz,
-                 string, json, uuid, binary]
+                 string, json, uuid, binary, variant]
           description: >
             The closed column-type vocabulary: every member has a
             defined Iceberg facade mapping (iceberg-federation.md §2),
-            which is the membership rule.
+            which is the membership rule. VARIANT maps to Iceberg v3 variant and
+            requires native Parquet VARIANT(1), with its field ID on the group.
+            VARIANT has no whole-column statistics and cannot be a partition or
+            sort source. Scalar compaction skips tables containing VARIANT.
 
             Stats bounds for a column are stored — and returned — in the
             Iceberg single-value binary serialization of the MAPPED
@@ -1573,6 +1608,14 @@ components:
       type: object
       description: At least one of appends/deletes must be non-empty.
       properties:
+        idempotency_key:
+          type: string
+          format: uuid
+          description: >
+            Optional catalog-scoped publication identity. Exact request replays
+            return the original result without writing, including after snapshot
+            expiry. Reusing a key with a different request returns 422. Receipts
+            are retained indefinitely. Persist the complete request before sending.
         read_snapshot:
           type: integer
           format: int64

@@ -268,3 +268,16 @@ stats), and everything transactional happens server-side.
 | **Metrics/observability** | Server `/metrics` + audit log; client stays thin | N/A |
 | **Zero-infrastructure quickstart** | No — requires the service (docker compose up) | Yes with SQL/memory catalogs |
 | **Package size** | 2 deps (httpx, pyarrow) | ~200MB with PyArrow + optional deps |
+
+### Native VARIANT files
+
+Catalog columns may use `variant` (Iceberg v3). Publish native Parquet VARIANT(1)
+files with `Table.prepare_append_files` and the existing prepared-commit API.
+The client validates top-level field IDs, native annotations, scalar types and
+required-column null counts, then uploads the original bytes. Arrow `Table.append`
+does not construct VARIANT; an Arrow rewrite loses the annotation.
+
+VARIANT columns cannot be partition or sort keys, and have no whole-column
+statistics. Shredded child statistics are not published as catalog bounds.
+The server skips VARIANT tables during scalar compaction. Reader interoperability
+and the buffered-ingestion coordinator are separate work.

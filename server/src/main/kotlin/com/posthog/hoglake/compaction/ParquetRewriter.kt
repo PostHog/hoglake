@@ -137,6 +137,9 @@ object ParquetRewriter {
         output: Path,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
+        require(liveColumns.none { it.def.type == ColType.VARIANT }) {
+            "variant compaction is not supported"
+        }
         val outputSchema = outputSchema(liveColumns)
         val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
         val rowIdIndex = outputSchema.fieldCount - 1
@@ -258,6 +261,7 @@ object ParquetRewriter {
         val id = Math.toIntExact(column.fieldId)
         val name = column.def.name
         return when (column.def.type) {
+            ColType.VARIANT -> error("variant compaction is not supported")
             ColType.BOOLEAN ->
                 Types.optional(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
             ColType.INT8 -> intColumn(id, name, 8, signed = true)
@@ -415,6 +419,7 @@ object ParquetRewriter {
         if (unsignedWidth != null && unsignedWidth > live.maxUnsignedParquetWidth) refuse()
 
         return when (live) {
+            ColType.VARIANT -> error("variant compaction is not supported")
             ColType.BOOLEAN ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BOOLEAN) CopyMode.IDENTITY else refuse()
             // Every width <= 16 (signed or not) rides parquet INT32 and

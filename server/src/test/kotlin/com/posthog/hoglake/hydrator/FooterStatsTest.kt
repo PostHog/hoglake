@@ -885,4 +885,50 @@ class FooterStatsTest {
         val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
         assertThat(out[1L]!!.lowerBound).isEqualTo("[]".toByteArray())
     }
+
+    @Test
+    fun `variant group field id governs renames and child stats are omitted`() {
+        val variant =
+            Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                .named("old_properties")
+        val schema = schema(variant)
+        assertThat(FooterStats.usesFieldIds(schema)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schema)).isFalse()
+        assertThat(agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.VARIANT, null))).isEmpty()
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.STRING, null))
+        }.isInstanceOf(IllegalArgumentException::class.java)
+        val plain =
+            Types.optionalGroup().id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("properties")
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            agg(meta(schema(plain), 1), CatalogColumn(7, "properties", ColType.VARIANT, null))
+        }.isInstanceOf(IllegalArgumentException::class.java).hasMessageContaining("native Parquet VARIANT")
+    }
+
+    @Test
+    fun `DuckDB native fixture hydrates scalar stats and preserves variant field identity`() {
+        val path = java.nio.file.Path.of(javaClass.getResource("/variant/native_variant.parquet")!!.toURI())
+        org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(path)).use { reader ->
+            assertThat(FooterStats.missingFieldIds(reader.footer.fileMetaData.schema)).isFalse()
+            val stats =
+                agg(
+                    reader.footer,
+                    CatalogColumn(1, "id", ColType.LONG, null),
+                    CatalogColumn(2, "properties", ColType.VARIANT, null),
+                )
+            assertThat(stats.keys).containsExactly(1L)
+        }
+    }
+
+    @Test
+    fun `ordinary nested group id does not change scalar name binding`() {
+        val nested =
+            Types.optionalGroup().id(9)
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("child").named("nested")
+        assertThat(FooterStats.usesFieldIds(schema(nested))).isFalse()
+    }
 }
