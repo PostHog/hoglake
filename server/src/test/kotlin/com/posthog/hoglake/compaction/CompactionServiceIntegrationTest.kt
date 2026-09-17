@@ -80,6 +80,16 @@ class CompactionServiceIntegrationTest {
     private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
 
     private companion object {
+        /**
+         * An object name carrying nothing but identity: the pyhoglake
+         * writer's shape, and now compaction's too. A compaction output
+         * that announces itself in its name tells a reader something the
+         * catalog already owns (explicit_row_ids) and gives every output
+         * in a table the same lead-in — see #23.
+         */
+        private const val BARE_UUID_PARQUET =
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.parquet"
+
         const val BUCKET = "hoglake-compaction-test"
 
         val minio: MinIOContainer by lazy {
@@ -431,7 +441,15 @@ class CompactionServiceIntegrationTest {
         assertThat(filesAtHead).hasSize(1)
         val output = filesAtHead.single()
         assertThat(output.explicitRowIds).isTrue()
-        assertThat(output.path).contains("/data/ns/t/compacted-")
+        // A FRESH object in the table's data directory, named exactly as
+        // an ingested file is: a bare UUID (#23). Pinned positively
+        // rather than as "does not start with compacted-", so the
+        // convention itself is enforced and not just one former
+        // violation of it. explicit_row_ids above is what marks a
+        // compaction output; nothing may infer that from the path.
+        assertThat(output.path).contains("/data/ns/t/")
+        assertThat(output.path).isNotIn(fx.paths)
+        assertThat(output.path.substringAfterLast('/')).matches(BARE_UUID_PARQUET)
         assertThat(output.recordCount).isEqualTo(13) // 15 gross - 2 deleted
         assertThat(output.rowIdStart).isEqualTo(0) // min surviving id; positional meaning void
         assertThat(output.beginSnapshot).isEqualTo(compactionSnap)
@@ -1550,10 +1568,11 @@ class CompactionServiceIntegrationTest {
             .containsExactlyInAnyOrderElementsOf(fx.paths)
         assertThat(queued.filter { it.second == "delete" }.map { it.first })
             .containsExactly(fx.dvPath)
-        // Only the compacted output survives.
+        // Only the compaction output survives — identified as "none of
+        // the inputs" rather than by a name shape (#23).
         assertThat(catalogs.listFiles(fx.cat, "ns", "t").map { it.path })
             .singleElement()
-            .matches { it.contains("compacted-") }
+            .matches({ it !in fx.paths && it != fx.dvPath }, "a fresh path, not an input")
     }
 
     @Test
