@@ -201,6 +201,65 @@ class ParquetRewriterTest {
     }
 
     @Test
+    fun `the advertised per-row ceiling is the real one`() {
+        // THE missing test. One allowance shared by the decode and the
+        // copy charges the same graph twice, so the effective ceiling
+        // was HALF the configured value — a table whose widest row sat
+        // between N/2 and N compacted fine before the budget existed and
+        // was refused on every sweep after it, counted `invalid_data`,
+        // a signal documented as "a writer bug, not a backlog". The
+        // server tightened a limit and the telemetry blamed the client.
+        //
+        // The cost model, pinned so the calibration prose stays true: a
+        // list element is TWO nodes (its synthetic entry group plus the
+        // value), and the wrapper is one more.
+        val elements = 500
+        val cost = 2 * elements + 1
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("ceiling")
+        val input =
+            writeCustom(
+                "budget-ceiling.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    repeat(elements) { i -> list.addGroup(0).add(0, i.toLong()) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+
+        fun rewriteAt(budget: Int) =
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                live,
+                emptyList(),
+                tmp.resolve("budget-ceiling-out-$budget.parquet"),
+                maxNodesPerRow = budget,
+            )
+
+        // AT the row's own cost: accepted. Not at twice it.
+        assertThat(rewriteAt(cost).rowsWritten).isEqualTo(1)
+        // One below: refused, so the boundary is where it is claimed and
+        // the test cannot pass by the budget being loose.
+        assertThatThrownBy { rewriteAt(cost - 1) }
+            .isInstanceOf(InvalidDataException::class.java)
+    }
+
+    @Test
     fun `the budget renews at every row boundary`() {
         // Per ROW, not per file: a hundred ordinary rows must not add up
         // to a refusal, or the cap would be a file-size limit wearing a

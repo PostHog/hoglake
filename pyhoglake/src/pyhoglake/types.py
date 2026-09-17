@@ -214,17 +214,17 @@ def arrow_type_to_coltype(t: pa.DataType) -> tuple[str, dict[str, Any] | None]:
     # `list<float16>` would answer "list" and the rejection would move to
     # whichever caller happened to recurse, which is exactly the silent
     # wrong-mapping this function exists to prevent.
-    # is_map before is_list: arrow's map is a list of structs, and
-    # pa.types.is_list says yes to it.
+    # is_map FIRST. Arrow models a map as a list of key/value structs,
+    # and while pyarrow 25's `is_list` answers False for one, the
+    # ordering is what makes that an implementation detail rather than
+    # something this dispatch depends on. (An earlier comment here
+    # asserted `is_list` said yes; measured against pyarrow 25.0.1 it
+    # does not. Order it correctly and the question stops mattering.)
     if pa.types.is_map(t):
         arrow_type_to_coltype(t.key_type)
         arrow_type_to_coltype(t.item_type)
         return "map", None
-    if (
-        pa.types.is_list(t)
-        or pa.types.is_large_list(t)
-        or pa.types.is_fixed_size_list(t)
-    ):
+    if is_list_family(t):
         arrow_type_to_coltype(t.value_type)
         return "list", None
     if pa.types.is_struct(t):
@@ -363,6 +363,31 @@ def _field_to_column_def(f: pa.Field) -> dict[str, Any]:
         value["name"] = "value"
         col["children"] = [key, value]
     return col
+
+
+def is_list_family(t: pa.DataType) -> bool:
+    """Whether ``t`` is one of the Arrow types that map to catalog ``list``.
+
+    THE canonical answer, in one place, because the mapping is
+    many-to-one and every consumer has to agree with it. ``list``,
+    ``large_list`` and ``fixed_size_list`` all become ``list`` in
+    :func:`_field_to_column_def`, and a validator that recognised only
+    the canonical member skipped the other two: the recursive
+    nested-name check in ``_align_table`` walked into a ``list`` and
+    silently returned "no mismatch" for a ``large_list``, so a typo'd
+    inner struct field reached the very ``cast`` that check exists to
+    prevent and appended as an all-NULL column.
+
+    Callers must dispatch on ``is_map`` FIRST regardless: a map is
+    modelled as a list of key/value structs, and whether a given pyarrow
+    release reports one as a list is not a thing this code should depend
+    on either way.
+    """
+    return (
+        pa.types.is_list(t)
+        or pa.types.is_large_list(t)
+        or pa.types.is_fixed_size_list(t)
+    )
 
 
 def schema_to_column_defs(schema: pa.Schema) -> list[dict[str, Any]]:

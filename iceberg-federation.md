@@ -303,9 +303,12 @@ a time, so its heap is one row's object graph — bounded by the widest
 row, which `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default 1,000,000
 nodes) is what bounds: a row past it is an `invalid_data` skip rather
 than a process-fatal OOM in a background loop. The allowance is spent
-inside the record materializer as the row is DECODED, and then again by
-the copy — not counted afterwards, which would be a report on memory
-already taken rather than a bound. The **sorted** path materializes the whole
+inside the record materializer as the row is DECODED, and again from a
+fresh allowance by the copy — not counted afterwards, which would be a
+report on memory already taken rather than a bound, and not shared
+across the two phases, which charged the same graph twice and halved the
+ceiling the docs advertised. The unit is NODES: a list element costs two
+of them (entry group plus value), a map entry three. The **sorted** path materializes the whole
 group to sort it, and a nested group's object graph is **not** its byte
 size: a measured `list<long>` table with five elements per row peaked at
 343 MiB of heap from a 4.6 MiB compressed input — 70x — because every

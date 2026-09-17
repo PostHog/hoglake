@@ -481,6 +481,8 @@ class CompactionService(
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
             Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
             Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
+            // The red-flag outcome, and it had no series either.
+            Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
             result
         }
 

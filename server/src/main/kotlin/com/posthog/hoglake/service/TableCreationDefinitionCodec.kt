@@ -97,13 +97,31 @@ internal object TableCreationDefinitionCodec {
             }
         if (node == null || !node.isObject) corrupt("the stored definition is not a JSON object")
         val versionNode = node["version"]
-        // `asInt()` answers 0 for a STRING, a boolean, an object — the
-        // same 0 that means "the pre-versioned shape". So a definition
-        // whose version field is `"2"` would have been decoded as
-        // version 0, silently, with version-0 spellings applied to
-        // version-2 data.
-        if (versionNode != null && !versionNode.isNull && !versionNode.isIntegralNumber) {
-            corrupt("the stored definition has a non-integer 'version' (${versionNode.toString().take(40)})")
+        // TWO questions, not one: is the node the right KIND, and does
+        // its VALUE survive the accessor.
+        //
+        // `asInt()` answers 0 for a STRING, a boolean or an object — the
+        // same 0 that means "the pre-versioned shape", so `"2"` decoded
+        // as version 0 with version-0 spellings applied to version-2
+        // data. And for an integral node that does not fit, `asInt()`
+        // NARROWS: 4294967297 becomes 1, a valid-looking version that
+        // walks straight past the range check below. Both are the same
+        // defect — a reader inventing a value the document did not
+        // contain — and a kind check alone catches only the first.
+        if (versionNode != null && !versionNode.isNull) {
+            if (!versionNode.isIntegralNumber) {
+                corrupt(
+                    "the stored definition has a non-integer 'version' " +
+                        "(${versionNode.toString().take(40)})",
+                )
+            }
+            if (!versionNode.canConvertToInt()) {
+                corrupt(
+                    "the stored definition has a 'version' outside the int range " +
+                        "(${versionNode.toString().take(40)}); narrowing it would invent a " +
+                        "version this codec appears to support",
+                )
+            }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
         if (version !in 0..NESTED_VERSION) {
@@ -133,6 +151,39 @@ internal object TableCreationDefinitionCodec {
         return value.asText()
     }
 
+    /**
+     * An optional boolean field, [default] when absent — and a named
+     * refusal when PRESENT and not a boolean.
+     *
+     * `asBoolean()` coerces: a string, an object, a number and an
+     * explicit JSON null all answer `false`. `nullable` defaulting to
+     * `true`, that turned a corrupt receipt into a valid-looking
+     * definition with a REQUIRED column, which then published — a
+     * different table from the one the caller prepared, created
+     * silently, which is exactly what the named-corruption contract
+     * exists to prevent.
+     */
+    private fun bool(
+        node: JsonNode,
+        field: String,
+        where: String,
+        default: Boolean,
+        corrupt: (String, Throwable?) -> Nothing,
+    ): Boolean {
+        val value = node[field] ?: return default
+        if (value.isNull) {
+            corrupt("the stored definition has a null '$field' in $where; omit it or give a boolean", null)
+        }
+        if (!value.isBoolean) {
+            corrupt(
+                "the stored definition has a non-boolean '$field' " +
+                    "(${value.toString().take(40)}) in $where",
+                null,
+            )
+        }
+        return value.asBoolean()
+    }
+
     private fun decodeColumn(
         column: JsonNode,
         version: Int,
@@ -156,6 +207,17 @@ internal object TableCreationDefinitionCodec {
             } catch (e: Exception) {
                 corrupt("the stored definition gives column '$name' the unknown type '$storedType'", e)
             }
+        // SHAPE first, then the conversion. A textual or array
+        // type_params happened to throw inside convertValue and reach
+        // the same refusal, but by accident — the node type is the thing
+        // being asserted, so assert it.
+        if (params != null && !params.isNull && !params.isObject) {
+            corrupt(
+                "the stored definition has a non-object 'type_params' " +
+                    "(${params.toString().take(40)}) for column '$name'",
+                null,
+            )
+        }
         val decodedParams =
             try {
                 if (params == null || params.isNull) null else mapper.convertValue(params, paramsType)
@@ -169,7 +231,7 @@ internal object TableCreationDefinitionCodec {
             name,
             type,
             decodedParams,
-            column["nullable"]?.asBoolean() ?: true,
+            bool(column, "nullable", "column '$name'", default = true, corrupt = corrupt),
             // ABSENT children decode to null, not to an empty list: every
             // version-0 and version-1 receipt is a scalar definition, and
             // `children: []` on a scalar is a named 422 (ColumnTrees), so

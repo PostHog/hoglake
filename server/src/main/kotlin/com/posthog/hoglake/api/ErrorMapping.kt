@@ -58,8 +58,16 @@ fun StatusPagesConfig.installErrorMapping() {
     // the caller did nothing wrong and can do nothing about it — but a
     // named one carrying which receipt, because the catch-all's generic
     // internal_error body left an operator with a row they could not
-    // identify. No caller-supplied text reaches this message: every part
-    // of it is the codec's own, plus an operation id.
+    // identify.
+    //
+    // The message is the codec's own prose plus an operation id, and
+    // TWO bounded echoes of stored content: the offending column's name
+    // and up to 40 characters of the offending node. Both originated
+    // with whoever prepared the receipt, so this is not "no
+    // caller-supplied text" — an earlier version of this comment said
+    // that and it was wrong. They are echoed deliberately (a corrupt
+    // receipt is unidentifiable without them), length-capped, and go to
+    // the same caller who supplied them.
     exception<CorruptDefinitionException> { call, cause ->
         log.error(cause) { "unreadable table creation definition: ${cause.message}" }
         call.respond(

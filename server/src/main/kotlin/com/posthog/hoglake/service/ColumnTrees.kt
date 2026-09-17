@@ -104,6 +104,38 @@ object ColumnTrees {
         // the literal expected name below instead.
         if (!syntheticallyNamed) Identifiers.validateColumn(def.name, qualified)
 
+        // Decimal's parameters, which nothing validated. Found by the
+        // sweep the `version` narrowing prompted, one layer out from the
+        // codec: the question is not only "is the value the right kind"
+        // but "does it survive the accessor that reads it", and
+        // `(typeParams["precision"] as? Number).toInt()` in the
+        // compaction rewriter NARROWS — a precision of 4294967297,
+        // stored faithfully as a Long, came back as 1 and every value in
+        // the column became an over-precision refusal. Out-of-range but
+        // in-int values (0, 99) were simply accepted and produced a
+        // parquet annotation parquet itself refuses.
+        if (def.type == ColType.DECIMAL) {
+            val precision = decimalParam(def, "precision", qualified)
+            val scale = decimalParam(def, "scale", qualified)
+            if (precision != null && precision !in 1..MAX_DECIMAL_PRECISION) {
+                throw HoglakeException.Validation(
+                    "decimal column '$qualified' has precision $precision, outside " +
+                        "1..$MAX_DECIMAL_PRECISION",
+                )
+            }
+            if (scale != null && scale < 0) {
+                throw HoglakeException.Validation("decimal column '$qualified' has a negative scale $scale")
+            }
+            // Scale counts digits to the right of the point, so it
+            // cannot exceed the total the precision allows.
+            val effective = precision ?: MAX_DECIMAL_PRECISION
+            if (scale != null && scale > effective) {
+                throw HoglakeException.Validation(
+                    "decimal column '$qualified' has scale $scale above its precision $effective",
+                )
+            }
+        }
+
         if (!def.type.isNested) {
             // PRESENT, not non-empty. `"children": []` on a scalar is
             // still a caller stating something about this column that is
@@ -167,6 +199,43 @@ object ColumnTrees {
             }
         }
         validateSiblings(children, here, syntheticallyNamed = synthetic != null)
+    }
+
+    /**
+     * The widest decimal parquet and Iceberg both express. A column
+     * declared past it produces an annotation parquet refuses at write
+     * time, which is a 500 from inside the writer rather than a 422 here.
+     */
+    const val MAX_DECIMAL_PRECISION = 38
+
+    /**
+     * One decimal parameter as an Int, or null when absent — refusing
+     * anything that is not an integer that FITS. `as? Number` followed
+     * by `toInt()` is what the rest of the server does with these, and
+     * `toInt()` on a Long truncates silently.
+     */
+    private fun decimalParam(
+        def: ColumnDef,
+        key: String,
+        qualified: String,
+    ): Int? {
+        val raw = def.typeParams?.get(key) ?: return null
+        val asLong =
+            when (raw) {
+                is Int -> raw.toLong()
+                is Long -> raw
+                is Short, is Byte -> (raw as Number).toLong()
+                else ->
+                    throw HoglakeException.Validation(
+                        "decimal column '$qualified' has a non-integer '$key' ($raw)",
+                    )
+            }
+        if (asLong !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
+            throw HoglakeException.Validation(
+                "decimal column '$qualified' has a '$key' outside the int range ($asLong)",
+            )
+        }
+        return asLong.toInt()
     }
 
     /** The named arity refusal for a container with the wrong child count. */

@@ -145,18 +145,23 @@ object ParquetRewriter {
      * a row's element count (the commit path has no such limit), so the
      * bound lives here.
      *
-     * Spent DURING the decode ([budgetedMaterializer]) and then during
-     * the copy, against one allowance per row. That ordering is the
-     * whole guarantee: the first version charged only the copy, which
-     * runs after `recordReader.read()` has already built the source row,
-     * so the budget reported an allocation instead of preventing one and
-     * the OOM happened anyway. `BudgetOomRepro` demonstrates both halves
-     * in a small-heap JVM — at THIS default an eight-million-element row
-     * exhausts a 512 MB heap on the old read path and refuses cleanly on
-     * this one.
+     * Spent DURING the decode ([budgetedMaterializer]), where the bound
+     * has to act: `recordReader.read()` builds the whole row before it
+     * returns, so a budget charged afterwards reports an allocation
+     * rather than preventing one — which is what the first version did,
+     * and the OOM happened anyway. `BudgetOomRepro` demonstrates both
+     * halves in a small-heap JVM: at THIS default an eight-million
+     * -element row exhausts a 512 MB heap on the unbudgeted read path
+     * and refuses cleanly here. The copy is charged too, from a FRESH
+     * allowance — sharing one across both phases charged the same graph
+     * twice and silently halved the ceiling.
      *
-     * A million nodes is ~100 MB of graph — deliberately far above any
-     * honest row and far below the heap. The point is to convert a
+     * NODES, which is the unit to calibrate in. A scalar column costs 1
+     * per row; a list element costs 2 (its synthetic entry group plus
+     * the value), a map entry 3. So a million admits roughly half a
+     * million list elements or a third of a million map entries in one
+     * row — still far above any honest row, and far below what a 512 MB
+     * heap can hold at ~50-100 bytes a node. The point is to convert a
      * process kill into one counted skip, not to police row shape.
      */
     const val DEFAULT_MAX_NODES_PER_ROW = 1_000_000
@@ -267,7 +272,7 @@ object ParquetRewriter {
 
         override fun start() {
             // The root's start is the row boundary: the allowance is per
-            // ROW, so it renews here and nowhere else.
+            // ROW and per PHASE, so the decode's renews here.
             if (isRoot) budget.reset() else budget.spend()
             delegate.start()
         }
@@ -468,10 +473,21 @@ object ParquetRewriter {
         val srcRowIdIndex = rowIdCarrier(schema, input.localPath)
         val plan = columnPlan(schema, liveColumns, input.localPath)
         var applied = 0L
-        // ONE allowance per row, spent first by the decode and then by
-        // the copy of the same row — so the bound covers both sides of
-        // the pipeline rather than the cheaper half of it. The root
-        // converter renews it at each row boundary.
+        // One allowance per row PER PHASE. The root converter renews it
+        // at each row boundary for the decode; the copy renews it again
+        // below.
+        //
+        // Not one allowance shared across both, which is what this was
+        // and it was wrong twice over. Arithmetically: the copy walks
+        // the graph the decode just built, so a shared allowance charges
+        // the SAME nodes twice and the effective ceiling is half the
+        // configured value — a 500-element list<long> needed
+        // maxNodesPerRow=2002 to pass a limit documented as a million.
+        // Semantically: the decode is the phase that needs bounding,
+        // because a hostile file can declare any repetition count it
+        // likes, while the copy's size is already bounded by what the
+        // decode produced. Charging the copy is belt-and-braces; charging
+        // it from the same allowance turns the braces into a tighter belt.
         val budget = NodeBudget(maxNodesPerRow, input.localPath)
         readRows(input.localPath, schema, budget) { src, ordinal ->
             if (input.deletes?.contains(ordinal) == true) {
@@ -479,6 +495,13 @@ object ParquetRewriter {
                 return@readRows
             }
             val dst = factory.newGroup()
+            // The copy's own allowance. It cannot exceed the decode's
+            // spend in practice — every output node mirrors a source
+            // node, and dropped columns make it strictly smaller — so
+            // this bound is a backstop rather than the binding one, and
+            // resetting is what keeps the ADVERTISED ceiling the real
+            // ceiling.
+            budget.reset()
             for ((outIdx, step) in plan.withIndex()) {
                 if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
                     copyField(src, step, dst, outIdx, dataFields[outIdx], budget)
@@ -535,10 +558,18 @@ object ParquetRewriter {
         schema: MessageType,
         source: Path,
     ): Int? {
+        // ONLY ID-LESS FIELDS ANSWER TO A NAME — the same rule
+        // FooterStats.bindIndex enforces for catalog columns, and it
+        // belongs here for the same reason. A field carrying a DIFFERENT
+        // id is a different column that merely wears this name: a
+        // pre-reservation table could hold a user column called
+        // `_hog_row_id` with its own catalog id, and taking it as the
+        // carrier would read that column's values as row IDENTITIES.
         val index =
             schema.fields.indexOfFirst { it.id?.intValue() == ROW_ID_FIELD_ID }
                 .takeIf { it >= 0 }
-                ?: schema.fields.indexOfFirst { it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
+                ?: schema.fields.indexOfFirst { it.id == null && it.name == ROW_ID_COLUMN }
+                    .takeIf { it >= 0 }
                 ?: return null
         val field = schema.fields[index]
         val primitive = if (field.isPrimitive) field.asPrimitiveType() else null

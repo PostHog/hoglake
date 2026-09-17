@@ -61,8 +61,9 @@ SET lock_timeout = '5s';
 -- expected. Check first and say so.
 DO $$
 DECLARE
-    found_def   text;
-    found_types text[];
+    found_def      text;
+    found_types    text[];
+    found_skeleton text;
     -- V4's vocabulary, in V4's order. The order is load-bearing: the
     -- schema-equivalence gate compares the normalized constraint text,
     -- so a catalog whose CHECK lists the same 23 names in a different
@@ -112,6 +113,39 @@ BEGIN
             'silently discard a vocabulary it does not recognise; reconcile with V4 before '
             're-running.', expected_types, found_types, found_def;
     END IF;
+
+    -- The member list is only half the constraint. The other half is
+    -- what it DOES with them, and a list comparison cannot see that:
+    --   a NOT IN over the same 23 names        -- inverted
+    --   the same membership test, OR'd with true -- vacuous
+    --   a membership test on a DIFFERENT column, AND'd with a
+    --     col_type IS NOT NULL that mentions this one
+    -- all yield identical found_types and all passed. V7 then dropped
+    -- them and installed its own, discarding exactly the divergence this
+    -- guard exists to refuse.
+    --
+    -- So compare the SHAPE too, by skeletonising: strip the quoted
+    -- members and their ::text casts, drop the separators they leave
+    -- behind, and collapse whitespace. What remains is the operator and
+    -- the parenthesisation, which is the part being asserted. Casts and
+    -- spacing stay excluded on purpose -- those are Postgres's rendering
+    -- and have changed between versions; `= ANY (ARRAY[...])` is how
+    -- every supported version renders an IN-list.
+    found_skeleton := regexp_replace(found_def, '''[a-z0-9_]+''(::text)?', '', 'g');
+    found_skeleton := regexp_replace(found_skeleton, '[ ,]+', ' ', 'g');
+    found_skeleton := btrim(regexp_replace(found_skeleton, '\[ \]', '[]', 'g'));
+
+    IF found_skeleton NOT IN (
+        'CHECK ((col_type = ANY (ARRAY[])))',
+        'CHECK (col_type = ANY (ARRAY[]))'
+    ) THEN
+        RAISE EXCEPTION
+            'V7 found hog_column_col_type_check listing V4''s vocabulary, but its SHAPE is not '
+            'a plain membership test: expected a skeleton of CHECK ((col_type = ANY (ARRAY[]))), '
+            'found % (from %). A NOT IN, an OR, or an extra conjunct permits a different '
+            'vocabulary while listing the same names, and V7 will not silently discard one; '
+            'reconcile with V4 before re-running.', found_skeleton, found_def;
+    END IF;
 END
 $$;
 
@@ -141,6 +175,18 @@ BEGIN
     -- the guarantee V1 actually made — unique, keyed on
     -- (catalog_id, table_id, ordinal), partial on the live rows — and
     -- losing any one of them is what would matter.
+    -- ON THE RIGHT TABLE. Index names are unique per schema, not per
+    -- table, so a divergent catalog can carry V1's index NAME on some
+    -- other relation entirely -- and the definition checks below would
+    -- all pass while the guarantee they describe protects nothing here.
+    IF (SELECT indrelid FROM pg_index WHERE indexrelid = 'hog_column_live_ordinal'::regclass)
+       IS DISTINCT FROM 'hog_column'::regclass THEN
+        RAISE EXCEPTION
+            'V7 found an index named hog_column_live_ordinal, but it is not on hog_column. '
+            'This catalog has diverged from the migration chain; reconcile it with V1 before '
+            're-running.';
+    END IF;
+
     SELECT pg_get_indexdef(indexrelid) INTO found_def
     FROM pg_index
     WHERE indexrelid = 'hog_column_live_ordinal'::regclass;

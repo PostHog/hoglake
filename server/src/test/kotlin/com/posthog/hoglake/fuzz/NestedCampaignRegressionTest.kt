@@ -77,6 +77,80 @@ class NestedCampaignRegressionTest {
             .isEmpty()
     }
 
+    // ---- decimal parameters, which nothing validated ---------------------
+
+    @Test
+    fun `a decimal parameter that does not survive toInt is refused`() {
+        // The sweep the `version` narrowing prompted, one layer out from
+        // the codec. Every consumer reads these as
+        // `(as? Number)?.toInt()`, which TRUNCATES: a precision stored
+        // faithfully as 4294967297 came back as 1, and every value in
+        // the column then failed the rewriter's over-precision check.
+        for (bad in listOf(4294967297L, -4294967295L)) {
+            assertThatThrownBy {
+                ColumnTrees.validate(
+                    listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to bad))),
+                )
+            }.describedAs("precision %d", bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("outside the int range")
+        }
+    }
+
+    @Test
+    fun `a decimal precision outside parquet's range is refused`() {
+        for (bad in listOf(0, -1, 39, 99)) {
+            assertThatThrownBy {
+                ColumnTrees.validate(
+                    listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to bad))),
+                )
+            }.describedAs("precision %d", bad)
+                .isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining("outside 1..38")
+        }
+        // A scale above the precision describes a number with more
+        // fractional digits than digits.
+        assertThatThrownBy {
+            ColumnTrees.validate(
+                listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to 5, "scale" to 6))),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("above its precision")
+        assertThatThrownBy {
+            ColumnTrees.validate(
+                listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to 5, "scale" to -1))),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("negative scale")
+        assertThatThrownBy {
+            ColumnTrees.validate(
+                listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to "five"))),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("non-integer")
+    }
+
+    @Test
+    fun `sound decimal parameters, and absent ones, are accepted`() {
+        // Absent means the documented default (38, 0), which the
+        // rewriter already assumes — refusing it would break every
+        // existing plain `decimal` column.
+        ColumnTrees.validate(listOf(ColumnDef("d", ColType.DECIMAL)))
+        ColumnTrees.validate(listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to 1))))
+        ColumnTrees.validate(listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to 38, "scale" to 38))))
+        ColumnTrees.validate(listOf(ColumnDef("d", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 0))))
+        // And inside a container, since validation runs at every level.
+        ColumnTrees.validate(
+            listOf(
+                ColumnDef(
+                    "l",
+                    ColType.LIST,
+                    children = listOf(ColumnDef("element", ColType.DECIMAL, mapOf("precision" to 9, "scale" to 2))),
+                ),
+            ),
+        )
+    }
+
     // ---- binding: ids outrank names, at every level ----------------------
 
     @Test
@@ -161,6 +235,46 @@ class NestedCampaignRegressionTest {
         }.isInstanceOf(UnconvertibleSchemaException::class.java)
     }
 
+    @Test
+    fun `the reader refuses duplicate sibling NAMES, as it does duplicate ids`(
+        @TempDir tmp: Path,
+    ) {
+        // Two id-less siblings sharing a name have no correct binding,
+        // exactly like two fields sharing an id. The consequence was
+        // worse than an arbitrary pick: the chunk walk matches by PATH,
+        // both columns have the same path, so their statistics were
+        // SUMMED — a one-row two-column file reported valueCount=4 for
+        // field 1 and stored it. The rewriter refuses such a file, so
+        // the table was permanently uncompactable with permanently wrong
+        // stats, and a value count above the row count is the kind of
+        // number a planner divides by.
+        val schema =
+            MessageType(
+                "m",
+                listOf<Type>(
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).named("b"),
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).named("b"),
+                ),
+            )
+        val src = tmp.resolve("dupe-names.parquet")
+        write(schema, src) { f ->
+            listOf(
+                f.newGroup().also {
+                    it.add(0, 1L)
+                    it.add(1, 2L)
+                },
+            )
+        }
+        val footer = FooterParse.parse(LocalInputFile(src))
+        assertThat(FooterStats.aggregate(footer, listOf(CatalogColumn(1, "b", ColType.LONG, null)), src.toString()))
+            .describedAs("no stats beat summed stats from two different columns")
+            .isEmpty()
+        // And the rewriter still refuses it, so the two surfaces agree.
+        assertThatThrownBy {
+            rewrite(src, listOf(Column(1, 0, ColumnDef("b", ColType.LONG))), tmp.resolve("dupe-out.parquet"))
+        }.isInstanceOf(UnconvertibleSchemaException::class.java)
+    }
+
     // ---- the reserved column prefix, at every nesting level --------------
 
     @Test
@@ -242,27 +356,43 @@ class NestedCampaignRegressionTest {
         @TempDir tmp: Path,
     ) {
         val live = listOf(Column(1, 0, ColumnDef("a", ColType.LONG)))
-        val schema =
-            MessageType(
-                "m",
-                listOf<Type>(
-                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+        // BOTH ways a field can BE the carrier: by the reserved id, and
+        // by the name while declaring no id of its own. A field wearing
+        // the name with a DIFFERENT id is not a candidate at all — that
+        // is its own test below.
+        val candidates =
+            listOf(
+                "by-id" to
                     Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
                         .`as`(LogicalTypeAnnotation.stringType())
-                        .id(77)
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
                         .named(ParquetRewriter.ROW_ID_COLUMN),
-                ),
+                "by-name" to
+                    Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                        .`as`(LogicalTypeAnnotation.stringType())
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
             )
-        val src = tmp.resolve("wrong-type.parquet")
-        write(schema, src) { f ->
-            val g = f.newGroup()
-            g.add(0, 5L)
-            g.add(1, Binary.fromString("not-a-row-id"))
-            listOf(g)
+        for ((label, carrier) in candidates) {
+            val schema =
+                MessageType(
+                    "m",
+                    listOf<Type>(
+                        Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+                        carrier,
+                    ),
+                )
+            val src = tmp.resolve("wrong-type-$label.parquet")
+            write(schema, src) { f ->
+                val g = f.newGroup()
+                g.add(0, 5L)
+                g.add(1, Binary.fromString("not-a-row-id"))
+                listOf(g)
+            }
+            assertThatThrownBy { rewrite(src, live, tmp.resolve("o1-$label.parquet")) }
+                .describedAs("carrier %s", label)
+                .isInstanceOf(UnconvertibleSchemaException::class.java)
+                .hasMessageContaining("reserved row-id position")
         }
-        assertThatThrownBy { rewrite(src, live, tmp.resolve("o1.parquet")) }
-            .isInstanceOf(UnconvertibleSchemaException::class.java)
-            .hasMessageContaining("reserved row-id position")
     }
 
     @Test
@@ -317,6 +447,47 @@ class NestedCampaignRegressionTest {
         assertThatThrownBy { rewrite(src, live, tmp.resolve("o3.parquet")) }
             .isInstanceOf(UnconvertibleSchemaException::class.java)
             .hasMessageContaining("collides with compaction's reserved row-id column")
+    }
+
+    @Test
+    fun `a field with its own id never becomes the row-id carrier by name`(
+        @TempDir tmp: Path,
+    ) {
+        // The same "only id-less fields answer to a name" rule the
+        // catalog binding enforces. A pre-reservation table could hold a
+        // user column named _hog_row_id carrying its OWN field id;
+        // taking it as the carrier would read that column's values as
+        // row identities, which is the row-identity version of the
+        // binding substitution this branch already fixed once.
+        val schema =
+            MessageType(
+                "m",
+                listOf<Type>(
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(2)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+                ),
+            )
+        val src = tmp.resolve("named-carrier.parquet")
+        write(schema, src) { f ->
+            (0 until 3).map { i ->
+                f.newGroup().also {
+                    it.add(0, i.toLong())
+                    it.add(1, -999L - i)
+                }
+            }
+        }
+        // Field 2 is a data column here, not the carrier, so the rows
+        // take POSITIONAL ids from rowIdStart — never the -999s.
+        val out =
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(src, 5000L, null)),
+                listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                emptyList(),
+                tmp.resolve("named-carrier-out.parquet"),
+            )
+        assertThat(out.minRowId).describedAs("positional, not the column's values").isEqualTo(5000L)
+        assertThat(out.rowsWritten).isEqualTo(3)
     }
 
     // ---- the per-row node budget ----------------------------------------
@@ -468,6 +639,11 @@ class NestedCampaignRegressionTest {
                 """{"version":1,"namespace":"n","name":"t","columns":[{"name":"c","type":"nope"}]}""",
                 """{"version":1,"name":"t","columns":[]}""",
                 """{"version":99,"namespace":"n","name":"t","columns":[]}""",
+                // Integral, in range for a LONG, and `asInt()` narrows
+                // it to 1 — a valid-looking version that walks straight
+                // past the range check.
+                """{"version":4294967297,"namespace":"n","name":"t","columns":[]}""",
+                """{"version":-4294967295,"namespace":"n","name":"t","columns":[]}""",
                 // `asInt()` answers 0 for a string — the same 0 that
                 // means "the pre-versioned shape" — so this used to
                 // decode silently with version-0 spellings.
@@ -478,6 +654,22 @@ class NestedCampaignRegressionTest {
                     """"columns":[{"name":"c","type":"long","children":7}]}""",
                 """{"version":1,"namespace":"n","name":"t",""" +
                     """"columns":[{"name":"c","type":"decimal","type_params":"nope"}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"decimal","type_params":[1,2]}]}""",
+                // `asBoolean()` coerces every one of these to FALSE,
+                // which for `nullable` meant a corrupt receipt silently
+                // became a REQUIRED-column definition and published.
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"long","nullable":"yes"}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"long","nullable":1}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"long","nullable":null}]}""",
+                """{"version":1,"namespace":"n","name":"t",""" +
+                    """"columns":[{"name":"c","type":"long","nullable":{}}]}""",
+                // ...and one level down, where a nested definition lives.
+                """{"version":2,"namespace":"n","name":"t","columns":[{"name":"s","type":"struct",""" +
+                    """"children":[{"name":"f","type":"long","nullable":"no"}]}]}""",
             )
         for (blob in corpus) {
             assertThatThrownBy { TableCreationDefinitionCodec.decode(blob, "operation deadbeef") }
@@ -488,6 +680,23 @@ class NestedCampaignRegressionTest {
                 // operator find one row among millions.
                 .hasMessageContaining("operation deadbeef")
         }
+    }
+
+    @Test
+    fun `a sound receipt still decodes, nullable and all`() {
+        // The guard must not turn the legal shapes into refusals: absent
+        // means nullable, and both booleans are readable.
+        val ok =
+            TableCreationDefinitionCodec.decode(
+                """{"version":2,"namespace":"n","name":"t","columns":[""" +
+                    """{"name":"a","type":"long"},""" +
+                    """{"name":"b","type":"long","nullable":false},""" +
+                    """{"name":"s","type":"struct","children":[{"name":"f","type":"long","nullable":true}]}]}""",
+                "operation deadbeef",
+            )
+        assertThat(ok.columns.map { it.name to it.nullable })
+            .containsExactly("a" to true, "b" to false, "s" to true)
+        assertThat(ok.columns[2].children!!.single().nullable).isTrue()
     }
 
     // ---- stats that cannot be true never reach storage -------------------
@@ -556,6 +765,101 @@ class NestedCampaignRegressionTest {
         assertThat(checked.stats.nullCount).isEqualTo(2)
         assertThat(checked.stats.valueCount).isEqualTo(2)
         assertThat(checked.repairs).anyMatch { it.contains("exceeds value_count") }
+    }
+
+    @Test
+    fun `an inverted boolean pair is caught in the codec's own order`() {
+        // The codec reads ANY nonzero byte as true, so 0xff is true and
+        // 0x00 is false. A signed BYTE compare put -1 below 0 and waved
+        // the pair through: lower=true, upper=false, stored.
+        val checked =
+            StatsSanity.check(
+                ColumnStats(1, 2, 0, null, null, byteArrayOf(0xFF.toByte()), byteArrayOf(0)),
+                ColType.BOOLEAN,
+            )
+        assertThat(checked.stats.lowerBound).isNull()
+        assertThat(checked.stats.upperBound).isNull()
+        // ...and the sound direction survives, in both spellings of true.
+        for (t in listOf<Byte>(1, 0x7F, 0xFF.toByte())) {
+            assertThat(
+                StatsSanity.check(
+                    ColumnStats(1, 2, 0, null, null, byteArrayOf(0), byteArrayOf(t)),
+                    ColType.BOOLEAN,
+                ).repairs,
+            )
+                .describedAs("false..%s", t)
+                .isEmpty()
+        }
+    }
+
+    @Test
+    fun `a float pair that only disagrees about the sign of zero is not inverted`() {
+        // Kotlin's compareTo is the TOTAL order, which ranks -0.0 below
+        // +0.0; IEEE says they are equal. Under the total order this
+        // pair read as inverted and both bounds were deleted.
+        val plus = intLE(java.lang.Float.floatToRawIntBits(0.0f))
+        val minus = intLE(java.lang.Float.floatToRawIntBits(-0.0f))
+        assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, plus, minus), ColType.FLOAT).repairs)
+            .isEmpty()
+        // A genuine inversion is still caught.
+        val two = intLE(java.lang.Float.floatToRawIntBits(2.0f))
+        val one = intLE(java.lang.Float.floatToRawIntBits(1.0f))
+        assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, two, one), ColType.FLOAT).repairs)
+            .anyMatch { it.contains("sorts above") }
+    }
+
+    @Test
+    fun `nan_count cannot exceed the NON-NULL value count`() {
+        // NaNs are non-null floating values, so the ceiling is
+        // value_count - null_count. The old clamp accepted 10 values /
+        // 9 nulls / 10 NaNs.
+        val checked =
+            StatsSanity.check(ColumnStats(1, 10, 9, 10, null, null, null), ColType.DOUBLE)
+        assertThat(checked.stats.nanCount).isEqualTo(1)
+        assertThat(checked.repairs).anyMatch { it.contains("non-null value count 1") }
+        // At the ceiling exactly: sound.
+        assertThat(StatsSanity.check(ColumnStats(1, 10, 9, 1, null, null, null), ColType.DOUBLE).repairs)
+            .isEmpty()
+    }
+
+    @Test
+    fun `nan_count on a type that has no NaN is dropped`() {
+        // Iceberg's nan_value_counts is float/double only.
+        val checked = StatsSanity.check(ColumnStats(1, 5, 0, 2, null, null, null), ColType.LONG)
+        assertThat(checked.stats.nanCount).isNull()
+        assertThat(checked.repairs).anyMatch { it.contains("has no NaN") }
+    }
+
+    @Test
+    fun `a NaN bound is refused at the commit door, as the footer door refuses it`() {
+        // Length alone passes a NaN: it encodes in four or eight bytes
+        // like any other value. And compare() treats NaN as equal to
+        // everything (it is unordered), so an inverted pair containing
+        // one is not caught either. The hydrator's footer path drops any
+        // pair with a NaN, so without this a client could publish
+        // through the commit door exactly what a footer could never
+        // produce — pruning metadata no reader can use.
+        val nanF = intLE(java.lang.Float.floatToRawIntBits(Float.NaN))
+        val oneF = intLE(java.lang.Float.floatToRawIntBits(1.0f))
+        val nanChecked = StatsSanity.check(ColumnStats(1, 2, 0, null, null, nanF, oneF), ColType.FLOAT)
+        assertThat(nanChecked.stats.lowerBound).isNull()
+        assertThat(nanChecked.repairs).anyMatch { it.contains("not decodable") }
+
+        val nanD =
+            java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putLong(java.lang.Double.doubleToRawLongBits(Double.NaN)).array()
+        val oneD =
+            java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+                .putLong(java.lang.Double.doubleToRawLongBits(1.0)).array()
+        assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, oneD, nanD), ColType.DOUBLE).stats.upperBound)
+            .isNull()
+
+        // Infinities and -0.0 are ORDINARY values and must survive: they
+        // are orderable, unlike NaN.
+        val negZero = intLE(java.lang.Float.floatToRawIntBits(-0.0f))
+        val inf = intLE(java.lang.Float.floatToRawIntBits(Float.POSITIVE_INFINITY))
+        assertThat(StatsSanity.check(ColumnStats(1, 2, 0, null, null, negZero, inf), ColType.FLOAT).repairs)
+            .isEmpty()
     }
 
     @Test

@@ -251,6 +251,74 @@ class V7NestedTypesMigrationIntegrationTest {
         }
 
     @Test
+    fun `the migration refuses a constraint with V4's members and inverted semantics`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            // The member list is only half the constraint. NOT IN over
+            // the same 23 names yields byte-identical found_types: the
+            // list check passed, V7 dropped it, and a catalog that
+            // permitted EVERYTHING EXCEPT the vocabulary was silently
+            // replaced by one that permits it.
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
+                h.execute(
+                    "ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check " +
+                        "CHECK (col_type NOT IN (" + v4Types.joinToString(", ") { "'$it'" } + "))",
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("its SHAPE is not a plain membership test")
+        }
+
+    @Test
+    fun `the migration refuses a constraint with V4's members and no force`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            // Same members, same operator, vacuous: `OR true` constrains
+            // nothing at all and extracted identically.
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
+                h.execute(
+                    "ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check " +
+                        "CHECK (col_type IN (" + v4Types.joinToString(", ") { "'$it'" } + ") OR true)",
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("its SHAPE is not a plain membership test")
+        }
+
+    @Test
+    fun `the migration refuses an index of V1's shape on the wrong table`(): Unit =
+        PgTestSupport.freshDatabaseRaw("").use { db ->
+            // Index names are unique per SCHEMA, not per table. V1's
+            // name on some other relation passed every definition check
+            // while guarding nothing on hog_column.
+            migrate(db.dataSource, target = "4")
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute("DROP INDEX hog_column_live_ordinal")
+                h.execute(
+                    "CREATE TABLE decoy (catalog_id bigint, table_id bigint, ordinal int, " +
+                        "end_snapshot bigint)",
+                )
+                h.execute(
+                    "CREATE UNIQUE INDEX hog_column_live_ordinal ON decoy " +
+                        "(catalog_id, table_id, ordinal) WHERE end_snapshot IS NULL",
+                )
+            }
+            assertThatThrownBy { migrate(db.dataSource) }
+                .hasMessageContaining("it is not on hog_column")
+        }
+
+    /** V4's vocabulary, in V4's order — what V7's guard expects to find. */
+    private val v4Types =
+        listOf(
+            "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
+            "uint32", "uint64", "float", "double", "decimal", "date", "time",
+            "timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns",
+            "timestamptz", "string", "json", "uuid", "binary",
+        )
+
+    @Test
     fun `the migration refuses a catalog whose ordinal index it does not recognise`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             migrate(db.dataSource, target = "4")

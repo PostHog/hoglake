@@ -122,9 +122,14 @@ export function formatColumnType(c: ColumnDef): string {
       : "map<?>";
   }
   if (c.type === "struct") {
-    return `struct<${kids
-      .map((k) => `${k.name}: ${formatColumnType(k)}`)
-      .join(", ")}>`;
+    // `struct<>` reads as a valid empty struct; it is not one — a
+    // struct with no children is a shape the server refuses, so it can
+    // only mean the children were not loaded or were dropped on the way
+    // here. List and map say `<?>` for the same condition, and an
+    // unknown should look the same wherever it appears.
+    return kids.length === 0
+      ? "struct<?>"
+      : `struct<${kids.map((k) => `${k.name}: ${formatColumnType(k)}`).join(", ")}>`;
   }
   return c.type;
 }

@@ -69,17 +69,32 @@ object StatsSanity {
             repairs += "null_count $nullCount exceeds value_count $valueCount; clamped to $valueCount"
             nullCount = valueCount
         }
+        // nan_count counts NON-NULL floating-point values, so its
+        // ceiling is value_count MINUS null_count, not value_count. The
+        // looser clamp accepted 10 values / 9 nulls / 10 NaNs — a file
+        // claiming more NaNs than it has non-null values at all.
+        val nonNull = valueCount - nullCount
         nanCount?.let {
             if (it < 0) {
                 repairs += "nan_count $it is negative; dropped"
                 nanCount = null
-            } else if (it > valueCount) {
-                repairs += "nan_count $it exceeds value_count $valueCount; clamped to $valueCount"
-                nanCount = valueCount
+            } else if (type != null && type.icebergType != IcebergType.FLOAT &&
+                type.icebergType != IcebergType.DOUBLE
+            ) {
+                // Iceberg's nan_value_counts is defined for float and
+                // double only; there is no NaN in any other domain, so a
+                // count here describes something that cannot exist.
+                repairs += "nan_count $it on '${type.wire}', which has no NaN; dropped"
+                nanCount = null
+            } else if (it > nonNull) {
+                repairs +=
+                    "nan_count $it exceeds the non-null value count $nonNull " +
+                    "(value_count $valueCount - null_count $nullCount); clamped to $nonNull"
+                nanCount = nonNull
             }
         }
         if (stats.sizeBytes != null && stats.sizeBytes < 0) {
-            repairs += "size_bytes ${stats.sizeBytes} is negative"
+            repairs += "size_bytes ${stats.sizeBytes} is negative; dropped"
         }
 
         if (type != null) {
@@ -137,9 +152,26 @@ object StatsSanity {
     ): Boolean =
         when (type.icebergType) {
             IcebergType.BOOLEAN -> bytes.size == 1
-            IcebergType.INT, IcebergType.DATE, IcebergType.FLOAT -> bytes.size == 4
+            IcebergType.INT, IcebergType.DATE -> bytes.size == 4
+            // Length is NOT sufficient for the floating types: a NaN
+            // encodes in four or eight bytes like any other value, and
+            // it is UNORDERED — so [compare] treats it as equal to
+            // everything and an inverted pair containing one sails
+            // through. Iceberg keeps NaNs out of lower/upper bounds
+            // entirely (they are counted in nan_value_counts instead),
+            // and the hydrator's footer path already drops any pair with
+            // one. Without this the commit door accepted exactly what
+            // the hydrator door refuses: a client could publish pruning
+            // metadata a footer could never produce.
+            //
+            // -0.0 is NOT refused: it is an ordinary value, and the
+            // pair (+0.0, -0.0) is not an inversion — [compare] uses
+            // IEEE equality rather than the total order for that reason.
+            IcebergType.FLOAT ->
+                bytes.size == 4 && !java.lang.Float.intBitsToFloat(intLE(bytes)).isNaN()
+            IcebergType.DOUBLE ->
+                bytes.size == 8 && !java.lang.Double.longBitsToDouble(longLE(bytes)).isNaN()
             IcebergType.LONG,
-            IcebergType.DOUBLE,
             IcebergType.TIME,
             IcebergType.TIMESTAMP,
             IcebergType.TIMESTAMPTZ,
@@ -158,10 +190,32 @@ object StatsSanity {
      * two's complement), so a byte-wise check would have invented far
      * more inversions than it caught.
      *
-     * Numeric bounds are little-endian (Iceberg's encoding); decimal is
-     * big-endian two's complement; string/binary/uuid compare unsigned
-     * lexicographic. A length this function cannot read has already been
-     * dropped by [decodable], so the reads below are safe.
+     * Every arm is the order of the DECODED value, because the encoding
+     * and the value do not always sort alike. The full audit, so the
+     * next reader need not redo it:
+     *
+     *  - boolean: decoded, NOT the raw byte. The codec reads any nonzero
+     *    byte as true, and a signed byte compare put `0xff` (true) BELOW
+     *    `0x00` (false) — an inverted semantic range that passed.
+     *  - int/date: 4-byte LE signed. `int8`, `int16`, `uint8` and
+     *    `uint16` all map here and all fit int32 exactly, unsigned or
+     *    not, so one signed compare is right for the whole family.
+     *  - long/time/timestamp/timestamptz/timestamp_ns: 8-byte LE signed.
+     *    `uint32` maps to long precisely so its values stay positive.
+     *  - float/double: IEEE numeric, with NaN unordered (an "inversion"
+     *    against a NaN is not evidence of anything) and -0.0 EQUAL to
+     *    +0.0. Kotlin's `compareTo` is the total order, which ranks
+     *    -0.0 below +0.0 and would have deleted the perfectly good pair
+     *    (lower = +0.0, upper = -0.0).
+     *  - decimal: unscaled big-endian two's complement. Both bounds of
+     *    one column share that column's scale, so comparing unscaled IS
+     *    comparing values. `uint64` maps here and decodes signed with a
+     *    0x00 sign byte above 2^63 — which `BigInteger` reproduces.
+     *  - string/json/binary/uuid: unsigned lexicographic, which for
+     *    UTF-8 is code-point order.
+     *
+     * A length this function cannot read has already been dropped by
+     * [decodable], so the reads below are safe.
      */
     private fun compare(
         type: ColType,
@@ -169,7 +223,7 @@ object StatsSanity {
         b: ByteArray,
     ): Int =
         when (type.icebergType) {
-            IcebergType.BOOLEAN -> a[0].compareTo(b[0])
+            IcebergType.BOOLEAN -> (a[0] != 0.toByte()).compareTo(b[0] != 0.toByte())
             IcebergType.INT, IcebergType.DATE -> intLE(a).compareTo(intLE(b))
             IcebergType.LONG,
             IcebergType.TIME,
@@ -182,15 +236,33 @@ object StatsSanity {
             IcebergType.FLOAT -> {
                 val x = java.lang.Float.intBitsToFloat(intLE(a))
                 val y = java.lang.Float.intBitsToFloat(intLE(b))
-                if (x.isNaN() || y.isNaN()) 0 else x.compareTo(y)
+                ieee(x.toDouble(), y.toDouble())
             }
-            IcebergType.DOUBLE -> {
-                val x = java.lang.Double.longBitsToDouble(longLE(a))
-                val y = java.lang.Double.longBitsToDouble(longLE(b))
-                if (x.isNaN() || y.isNaN()) 0 else x.compareTo(y)
-            }
+            IcebergType.DOUBLE ->
+                ieee(
+                    java.lang.Double.longBitsToDouble(longLE(a)),
+                    java.lang.Double.longBitsToDouble(longLE(b)),
+                )
             IcebergType.DECIMAL -> java.math.BigInteger(a).compareTo(java.math.BigInteger(b))
             else -> java.util.Arrays.compareUnsigned(a, b)
+        }
+
+    /**
+     * IEEE comparison, not Kotlin's total order: NaN is unordered (so an
+     * apparent inversion against one proves nothing) and -0.0 equals
+     * +0.0 (so a bound pair that merely disagrees about zero's sign is
+     * not inverted). `compareTo` says otherwise on both counts, and both
+     * of its answers here would have deleted sound bounds.
+     */
+    private fun ieee(
+        x: Double,
+        y: Double,
+    ): Int =
+        when {
+            x.isNaN() || y.isNaN() -> 0
+            x < y -> -1
+            x > y -> 1
+            else -> 0
         }
 
     private fun intLE(raw: ByteArray): Int = java.nio.ByteBuffer.wrap(raw).order(java.nio.ByteOrder.LITTLE_ENDIAN).int

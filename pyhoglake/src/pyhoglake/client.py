@@ -53,7 +53,7 @@ from .models import (
 from .ops import AlterOp
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
-from .types import columns_to_arrow_schema, schema_to_column_defs
+from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
 
 DEFAULT_TIMEOUT = 30.0
 
@@ -103,11 +103,7 @@ def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
             )
         elif pa.types.is_map(t):
             out += _reserved_field_paths([t.key_field, t.item_field], path)
-        elif (
-            pa.types.is_list(t)
-            or pa.types.is_large_list(t)
-            or pa.types.is_fixed_size_list(t)
-        ):
+        elif is_list_family(t):
             out += _reserved_field_paths([t.value_field], path)
     return out
 
@@ -880,7 +876,13 @@ def _nested_field_mismatch(
             m, e = _nested_field_mismatch(h, w, f"{path}.{label}")
             missing += m
             extra += e
-    elif pa.types.is_list(want) and pa.types.is_list(have):
+    elif is_list_family(want) and is_list_family(have):
+        # The FAMILY, not the canonical member. large_list and
+        # fixed_size_list both normalize to catalog `list`, so a caller
+        # appending either walked into an `is_list`-only branch that
+        # answered "no mismatch" without looking — and the typo'd inner
+        # field the recursion exists to catch reached the cast and
+        # appended as an all-NULL column.
         m, e = _nested_field_mismatch(
             have.value_field.type, want.value_field.type, f"{path}.element"
         )

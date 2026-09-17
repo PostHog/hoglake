@@ -318,6 +318,27 @@ object FooterStats {
             return emptyList()
         }
 
+        // SYMMETRIC with the duplicate-id refusal above, and it was
+        // missing. A name is the binding contract for an id-less field,
+        // so two siblings sharing one have no correct resolution either
+        // — and the consequence here was worse than a wrong pick: the
+        // chunk walk matches by PATH, both columns have the same path,
+        // so their statistics were SUMMED. A one-row file with two
+        // id-less `b` columns produced `valueCount = 4` for field 1 and
+        // stored it. The rewriter refuses this file, so the table was
+        // left permanently uncompactable carrying permanently wrong
+        // stats — and a value count above the row count is the kind of
+        // number a planner divides by.
+        val duplicateNames = duplicateSiblingNames(schema)
+        if (duplicateNames.isNotEmpty()) {
+            log.warn {
+                "parquet schema of $filePath names more than one field ${duplicateNames.sorted()} " +
+                    "inside one group; a name is the binding contract for an id-less field and a " +
+                    "duplicate has no correct resolution, so no stats are produced for this file"
+            }
+            return emptyList()
+        }
+
         val matched = LinkedHashMap<Long, Pair<CatalogColumn, Leaf>>()
         for (col in columns) {
             val field = findField(schema.fields, col, useFieldIds)
@@ -624,11 +645,28 @@ object FooterStats {
      * file can carry ids on its leaves and none on a synthesized
      * container group.
      */
+
     private fun findField(
         fields: List<Type>,
         col: CatalogColumn,
         useFieldIds: Boolean,
     ): Type? = bindIndex(fields, col.fieldId, col.name, useFieldIds).takeIf { it >= 0 }?.let { fields[it] }
+
+    /**
+     * Sibling names repeated at any level — the same question
+     * [duplicateFieldIds] asks about ids, asked about the other half of
+     * the binding contract.
+     */
+    private fun duplicateSiblingNames(schema: MessageType): Set<String> {
+        val dupes = HashSet<String>()
+
+        fun walk(fields: List<Type>) {
+            dupes += fields.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
+            for (field in fields) if (!field.isPrimitive) walk(field.asGroupType().fields)
+        }
+        walk(schema.fields)
+        return dupes
+    }
 
     private fun aggregateColumn(
         blocks: List<BlockMetaData>,

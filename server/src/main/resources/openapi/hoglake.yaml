@@ -1438,9 +1438,18 @@ components:
       properties:
         name:
           type: string
-          allOf:
-            - pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
-            - not: { pattern: "^_hog" }
+          # PATTERN STAYS IN ITS SIBLING POSITION. Every other identifier
+          # in this spec declares it here, and a generator reads
+          # `schema.pattern`: moving it inside a composition keyword
+          # made column names the one field with NO pattern as far as
+          # codegen is concerned,
+          # which is strictly worse than the gap it was fixing. The
+          # `not` below carries the prefix rule for validators that
+          # implement it; generators that ignore it are no worse off
+          # than before, and the description states the rule for the
+          # humans writing the client.
+          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          not: { pattern: "^_hog" }
           description: >
             Identifier policy (shared by namespace/table/view/column
             names): letter or underscore start, then letters, digits,
@@ -1459,11 +1468,11 @@ components:
             where it is: "column name 'addr._hog_x' uses the reserved
             prefix '_hog'".
 
-            The rule is expressed as `allOf` (base pattern + a `not`)
-            rather than one regex with a negative lookahead: lookahead is
-            legal ECMA-262 but RE2 — which Go clients generate against —
-            cannot compile it, and a client that fails to build is worse
-            than one that checks the prefix a layer up.
+            The prefix rule is a sibling `not`, not a negative
+            lookahead inside `pattern`: lookahead is legal ECMA-262 but
+            RE2 — which Go clients generate against — cannot compile it,
+            and a client that fails to build is worse than one that
+            checks the prefix a layer up.
         type:
           type: string
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
@@ -1805,10 +1814,19 @@ components:
             top-level column. Naming a list or a map here is a 422.
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
-        # rename_column target (must satisfy ColumnDef.name in full: the
-        # identifier pattern AND the reserved `_hog` prefix rule);
-        # promote_column target type
-        to: { type: string }
+        to:
+          type: string
+          description: >
+            Dual-use: the new NAME for rename_column, the target TYPE
+            for promote_column. It therefore carries no `pattern` of its
+            own — a schema that constrained it to the identifier regex
+            would reject every promote_column, whose values are type
+            names from the ColumnDef.type vocabulary.
+
+            For rename_column the value must satisfy ColumnDef.name in
+            full: the identifier pattern AND the reserved `_hog` prefix
+            rule. Both are 422s, with the same messages ColumnDef.name
+            documents.
         new_name:                     # rename_table
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"

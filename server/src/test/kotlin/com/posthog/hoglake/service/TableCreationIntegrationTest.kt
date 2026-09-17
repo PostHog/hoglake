@@ -9,6 +9,7 @@ import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.awaitility.Awaitility.await
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -372,6 +373,63 @@ class TableCreationIntegrationTest {
             assertThat(creations.publish(catalog, rejected.operationId, emptyList())).isEqualTo(rejected)
             assertThat(catalogs.listTables(catalog, "test")).isEmpty()
         }
+    }
+
+    @Test
+    fun `a receipt whose definition a later rule refuses becomes rejected, not stuck`() {
+        // Prepared under a laxer rule set, published under a stricter
+        // one. The Validation used to escape from inside the publish
+        // transaction, roll it back, and leave the operation `prepared`
+        // FOREVER: every retry re-validated and re-failed, and only an
+        // abort the client had no reason to send could end it.
+        //
+        // Simulated by corrupting the STORED definition to a shape the
+        // current validator refuses — which is what a tightened rule
+        // looks like from publish's side — rather than by shipping two
+        // versions of the server.
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table_creation
+                   SET definition = jsonb_set(definition, '{columns,0,name}', '"_hog_row_id"')
+                 WHERE operation_id = :op
+                """,
+            ).bind("op", operation.operationId).execute()
+        }
+
+        val published = creations.publish(catalog, operation.operationId, emptyList())
+        assertThat(published.state).describedAs("terminal, not stuck").isEqualTo("rejected")
+        assertThat(published.reason).isEqualTo("definition_invalid")
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        // Terminal means terminal: a retry returns the same receipt
+        // rather than re-running the doomed validation.
+        assertThat(creations.publish(catalog, operation.operationId, emptyList()).state)
+            .isEqualTo("rejected")
+    }
+
+    @Test
+    fun `an unreadable stored definition is a named error, not a generic 500`() {
+        // CorruptDefinitionException promised to say WHICH receipt. It
+        // named none and, being an IllegalStateException, landed in the
+        // catch-all — so the client got `internal_error` and an operator
+        // got a row they could not identify.
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table_creation
+                   SET definition = jsonb_set(definition, '{columns,0,nullable}', '"yes"')
+                 WHERE operation_id = :op
+                """,
+            ).bind("op", operation.operationId).execute()
+        }
+        assertThatThrownBy { creations.status(catalog, operation.operationId) }
+            .isInstanceOf(CorruptDefinitionException::class.java)
+            .hasMessageContaining(operation.operationId.toString())
+            .hasMessageContaining("non-boolean 'nullable'")
     }
 
     @Test

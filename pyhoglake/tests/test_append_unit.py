@@ -426,3 +426,48 @@ def test_append_without_s3_config(httpx_mock):
     with pytest.raises(HoglakeError, match="S3 configuration"):
         t.append(pa.table({"id": [1], "name": ["a"]}))
     client.close()
+
+
+def test_nested_name_check_covers_the_whole_list_family():
+    """large_list and fixed_size_list normalize to catalog ``list``, so
+    the recursive nested-name check must know all three.
+
+    It knew only the canonical member, so appending either of the other
+    two walked into a branch that answered "no mismatch" without
+    looking — and the typo'd inner struct field the check exists to
+    catch reached the cast and appended as an all-NULL column whose own
+    stats said ``null_count == record_count``.
+    """
+    from pyhoglake.client import _nested_field_mismatch
+
+    inner_ok = pa.struct([pa.field("a", pa.int64())])
+    inner_typo = pa.struct([pa.field("aa", pa.int64())])
+    for maker in (
+        lambda t: pa.list_(t),
+        lambda t: pa.large_list(t),
+        lambda t: pa.list_(t, 3),
+    ):
+        missing, extra = _nested_field_mismatch(maker(inner_typo), maker(inner_ok), "l")
+        assert missing == ["l.element.a"], maker
+        assert extra == ["l.element.aa"], maker
+        # The matching shape stays quiet.
+        assert _nested_field_mismatch(maker(inner_ok), maker(inner_ok), "l") == ([], [])
+
+
+def test_list_family_predicate_puts_map_first():
+    """Arrow's map is physically a list of structs and answers yes to
+    ``is_list``; every caller of the family predicate must test
+    ``is_map`` first, so the predicate documents that rather than
+    pretending otherwise."""
+    from pyhoglake.types import is_list_family
+
+    assert is_list_family(pa.list_(pa.int64()))
+    assert is_list_family(pa.large_list(pa.int64()))
+    assert is_list_family(pa.list_(pa.int64(), 4))
+    assert not is_list_family(pa.struct([pa.field("a", pa.int64())]))
+    # Pinned as an OBSERVATION, not a dependency: pyarrow 25 reports a
+    # map as not-a-list, earlier comments in this package claimed the
+    # opposite, and every caller dispatches on is_map first so neither
+    # answer can change behaviour. If this flips, the ordering already
+    # covers it and only this assertion needs updating.
+    assert not is_list_family(pa.map_(pa.string(), pa.int64()))

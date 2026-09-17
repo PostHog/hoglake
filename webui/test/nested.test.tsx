@@ -57,6 +57,24 @@ const nestedTable: Table = {
 };
 
 describe("formatColumnType", () => {
+  it("says <?> for every container whose children are missing", () => {
+    // `struct<>` reads as a valid empty struct. It is not one: the
+    // server refuses a childless struct, so an empty children list can
+    // only mean they were not loaded. List and map already said `<?>`;
+    // an unknown should look the same wherever it appears.
+    const bare = (type: Column["type"]): Column => ({
+      field_id: "1",
+      ordinal: 0,
+      name: "c",
+      type,
+      nullable: true,
+    });
+    expect(formatColumnType(bare("struct"))).toBe("struct<?>");
+    expect(formatColumnType(bare("list"))).toBe("list<?>");
+    expect(formatColumnType(bare("map"))).toBe("map<?>");
+    expect(formatColumnType({ ...bare("struct"), children: [] })).toBe("struct<?>");
+  });
+
   it("renders each container as one readable signature", () => {
     expect(formatColumnType(nestedTable.columns[0])).toBe("long");
     expect(formatColumnType(nestedTable.columns[1])).toBe("list<string>");

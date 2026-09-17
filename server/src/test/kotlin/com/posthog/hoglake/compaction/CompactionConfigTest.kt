@@ -113,6 +113,64 @@ class CompactionConfigTest {
             .containsPattern("""nestedSortExpansion\s*=\s*cfg\.compactionNestedSortExpansion""")
     }
 
+    // ---- maxNodesPerRow: the same four things, for the same reasons ----
+    //
+    // Added in the same branch as the derate above and pinned by
+    // nothing, which is the identical hole this class was written to
+    // close: DEFAULT_MAX_NODES_PER_ROW quietly becoming small enough to
+    // refuse honest rows, or App's wiring line being dropped so the knob
+    // does nothing, both with the whole suite green.
+
+    @Test
+    fun `a config with NO override carries the per-row node budget`() {
+        assertThat(defaulted().maxNodesPerRow)
+            .isEqualTo(ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW)
+    }
+
+    @Test
+    fun `the env-backed Config defaults to the same per-row budget the rewriter does`() {
+        assertThat(Config().compactionMaxNodesPerRow)
+            .isEqualTo(ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW)
+    }
+
+    @Test
+    fun `App wires the per-row budget into the planner's config`() {
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .describedAs("App must pass Config.compactionMaxNodesPerRow into CompactionConfig")
+            .containsPattern("""maxNodesPerRow\s*=\s*cfg\.compactionMaxNodesPerRow""")
+    }
+
+    @Test
+    fun `a per-row budget of zero or less is refused at construction`() {
+        for (bad in listOf(0, -1)) {
+            assertThatThrownBy {
+                CompactionConfig(
+                    targetBytes = target,
+                    tierTarget = 8,
+                    maxGroupsPerRun = 1,
+                    maxNodesPerRow = bad,
+                )
+            }.describedAs("maxNodesPerRow=%d", bad).isInstanceOf(IllegalArgumentException::class.java)
+        }
+    }
+
+    @Test
+    fun `the documented per-row budget is the one the code uses`() {
+        // A default that drifts from its documentation is the same
+        // failure as one that drifts from App: the operator sizing a
+        // heap reads the number in the docs, not the constant.
+        val documented = "1,000,000"
+        for (doc in listOf("README.md", "../iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must document HOGLAKE_COMPACTION_MAX_NODES_PER_ROW's real default", doc)
+                .contains("HOGLAKE_COMPACTION_MAX_NODES_PER_ROW")
+                .contains(documented)
+        }
+        assertThat(ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW)
+            .isEqualTo(documented.replace(",", "").toInt())
+    }
+
     @Test
     fun `a derate of zero or less is refused at construction`() {
         // The knob is operator-settable; 0 would divide by zero and a

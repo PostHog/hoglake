@@ -296,20 +296,43 @@ class CompactionServiceIntegrationTest {
         // generation. Readers prune on these.
         val fx = fixture(dvOnMiddle = false)
 
-        // Corrupt what a pre-sanitizer commit could have stored: an
-        // inverted bound pair on EVERY input (so the merge inverts too,
-        // rather than being rescued by a sound sibling), and a
-        // null_count above the value_count it is a subset of.
+        // A MIXED population, which is the only one that tests what the
+        // comment claims. Corrupting every input makes input-repair and
+        // output-repair indistinguishable: both produce null bounds, so
+        // the assertion passes with the input-level repair deleted.
+        //
+        // Corrupt exactly ONE of the three inputs. The true range across
+        // them is -10..5. With the input repaired, the bad file
+        // contributes nothing and the merge is null (its counts no
+        // longer cover the field). WITHOUT it, min(-10, 500) = -10 and
+        // max(5, 100) = 100 — a pair that is NOT inverted, so
+        // StatsSanity sees nothing wrong and it is stored live. Every
+        // pruner then reads `lower = -10, upper = 100` and drops the
+        // file for `WHERE id < -10`... and worse, an inverted-looking
+        // pair would at least have been caught. A plausible wrong answer
+        // beats a detectable one, which is why this needs its own test.
+        val victim =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT min(f.data_file_id) FROM hog_data_file f
+                      JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                     WHERE c.name = :cat
+                    """,
+                ).bind("cat", fx.cat).mapTo(Long::class.java).one()
+            }
         db.jdbi.useHandleUnchecked { h ->
             h.createUpdate(
                 """
                 UPDATE hog_file_column_stats s
                    SET lower_bound = :lo, upper_bound = :hi, null_count = value_count + 7
                   FROM hog_catalog c
-                 WHERE c.catalog_id = s.catalog_id AND c.name = :cat AND s.field_id = 1
+                 WHERE c.catalog_id = s.catalog_id AND c.name = :cat
+                   AND s.field_id = 1 AND s.data_file_id = :victim
                 """,
             )
                 .bind("cat", fx.cat)
+                .bind("victim", victim)
                 .bind("lo", longLe(500))
                 .bind("hi", longLe(100))
                 .execute()
@@ -343,6 +366,11 @@ class CompactionServiceIntegrationTest {
         assertThat(counts[1])
             .describedAs("null_count must not exceed the value_count it is a subset of")
             .isLessThanOrEqualTo(counts[0])
+        // The merged bound must not be the plausible-looking blend of a
+        // sound file's minimum with a corrupt file's maximum.
+        assertThat(bounds.first to bounds.second)
+            .describedAs("a repaired input contributes no bound, so the merge has none")
+            .isEqualTo(null to null)
         // The inverted pair is DROPPED, not narrowed: nothing in the row
         // says which of the two was the wrong one, so keeping either
         // would be picking at random — and the kept one would prune.

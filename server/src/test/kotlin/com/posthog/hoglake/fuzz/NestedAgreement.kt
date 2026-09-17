@@ -406,38 +406,63 @@ object NestedAgreement {
     ) {
         val useFieldIds = FooterStats.usesFieldIds(schema)
         val byId = aggs.associateBy { it.fieldId }
-        for (col in catalog) {
-            if (col.children.isNotEmpty()) continue
-            val agg = byId[col.fieldId] ?: continue
-            val want = expectedBindIndex(schema.fields, col.fieldId, col.name, useFieldIds)
-            if (want < 0) {
-                sink(
-                    Finding(
-                        "stats-for-unbound-column",
-                        "column '${col.name}' (field ${col.fieldId}) binds to nothing, yet the " +
-                            "reader produced a stats row for it; schema=$schema",
-                    ),
-                )
-                continue
-            }
-            val field = schema.fields[want]
-            if (!field.isPrimitive) continue
-            val expectedValues =
-                footer.blocks.sumOf { b ->
-                    b.columns.filter { it.path.toArray().contentEquals(arrayOf(field.name)) }
-                        .sumOf { it.valueCount }
+
+        // Every catalog LEAF, at any depth — not just the top-level
+        // scalars. This is the genuinely method-independent half of the
+        // pair: it reads the FOOTER's own per-chunk counts instead of
+        // re-running a binding rule, so it cannot be satisfied by a
+        // consistent pair of wrong rules. Restricting it to depth 1 threw
+        // away most of that value on exactly the shapes this branch is
+        // about.
+        fun walk(
+            cols: List<CatalogColumn>,
+            fields: List<Type>,
+            path: List<String>,
+        ) {
+            for (col in cols) {
+                val want = expectedBindIndex(fields, col.fieldId, col.name, useFieldIds)
+                if (want < 0) {
+                    if (byId.containsKey(col.fieldId)) {
+                        sink(
+                            Finding(
+                                "stats-for-unbound-column",
+                                "column '${col.name}' (field ${col.fieldId}) binds to nothing, yet " +
+                                    "the reader produced a stats row for it; schema=$schema",
+                            ),
+                        )
+                    }
+                    continue
                 }
-            if (expectedValues != agg.valueCount) {
-                sink(
-                    Finding(
-                        "reader-read-the-wrong-column",
-                        "column '${col.name}' (field ${col.fieldId}) should bind to " +
-                            "'${field.name}#${field.id?.intValue()}' ($expectedValues values) but its " +
-                            "stats row counts ${agg.valueCount}; schema=$schema",
-                    ),
-                )
+                val field = fields[want]
+                val here = path + field.name
+                if (!field.isPrimitive) {
+                    // Struct interiors only, for the same reason the
+                    // binding walk stops there: a list/map child's path
+                    // runs through the synthetic repetition layer, which
+                    // this does not model.
+                    if (col.type == ColType.STRUCT) walk(col.children, field.asGroupType().fields, here)
+                    continue
+                }
+                val agg = byId[col.fieldId] ?: continue
+                val expectedValues =
+                    footer.blocks.sumOf { b ->
+                        b.columns.filter { it.path.toArray().contentEquals(here.toTypedArray()) }
+                            .sumOf { it.valueCount }
+                    }
+                if (expectedValues != agg.valueCount) {
+                    sink(
+                        Finding(
+                            "reader-read-the-wrong-column",
+                            "column '${col.name}' (field ${col.fieldId}) should bind to " +
+                                "'${here.joinToString(".")}#${field.id?.intValue()}' " +
+                                "($expectedValues values) but its stats row counts " +
+                                "${agg.valueCount}; schema=$schema",
+                        ),
+                    )
+                }
             }
         }
+        walk(catalog, schema.fields, emptyList())
     }
 
     /** The parquet time/timestamp unit a catalog type's own files carry. */

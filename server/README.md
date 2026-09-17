@@ -375,8 +375,16 @@ hundred-million-element list is an OOM, and an OOM in a background loop
 takes the request path down with it. A row past the budget is refused
 as `invalid_data` — one counted skip instead of a process kill. The
 allowance is spent inside the parquet record materializer as the row is
-decoded, and again by the copy; counting it after `read()` returned
-would only have reported the allocation that already happened.
+decoded, and again — from a FRESH allowance — by the copy; counting it
+after `read()` returned would only have reported the allocation that
+already happened, and sharing one allowance across both phases charged
+the same graph twice and silently halved the ceiling.
+
+Calibrate in NODES, not elements: a scalar column costs 1 per row, a
+list element costs 2 (its synthetic entry group plus the value), a map
+entry 3. The default therefore admits roughly half a million list
+elements in a single row — far above any honest row, and far below what
+a heap holds at ~50-100 bytes a node.
 
 Both durable skip reasons carry a counter:
 `hoglake_compaction_skipped_total{reason="unconvertible_schema"}` rising

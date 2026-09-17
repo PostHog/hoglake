@@ -246,8 +246,32 @@ object NestedFuzz {
             val name = if (hit()) "z${e.int(0, 9)}" else col.def.name
             return when (col.def.type) {
                 ColType.STRUCT -> {
-                    val kids = col.children.mapNotNull { field(it, Type.Repetition.OPTIONAL) }
+                    val kids =
+                        col.children.mapNotNull { field(it, Type.Repetition.OPTIONAL) }.toMutableList()
                     if (kids.isEmpty()) return null
+                    // A decoy INSIDE the struct, on the same terms as
+                    // the top-level one. Without it the generator could
+                    // not reach the name-versus-id shape below depth 1
+                    // at all: struct children are named f0..f2 while the
+                    // rename mutation emits z0..z9, so no id-less field
+                    // ever wore a sibling's catalog name. Struct binding
+                    // is correct today — this is the blind spot, not a
+                    // live bug, and a blind spot one level down from a
+                    // defect we already shipped is worth closing.
+                    if (mutRate > 0 && e.int(0, 99) < 25) {
+                        val victim = col.children[e.int(0, col.children.size - 1)]
+                        val victimIndex =
+                            kids.indexOfFirst { it.id?.intValue()?.toLong() == victim.fieldId }
+                        if (victimIndex >= 0) {
+                            kids[victimIndex] = renamed(kids[victimIndex], "zz${e.int(0, 99)}")
+                            kids.add(
+                                0,
+                                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                                    .named(victim.def.name),
+                            )
+                            muts++
+                        }
+                    }
                     val ordered = if (hit()) kids.reversed() else kids
                     var b = Types.buildGroup(rep).addFields(*ordered.toTypedArray())
                     if (hit()) {
@@ -352,6 +376,23 @@ object NestedFuzz {
         // SOME columns are real: foreign writers produce them.
         if (mutRate > 0 && fields.isNotEmpty() && e.int(0, 99) < 25) {
             val victim = cols[e.int(0, cols.size - 1)]
+            // The decoy wears the victim's name, so the victim's OWN
+            // generated field must not — parquet refuses a schema with
+            // two identically named siblings at write time, and when it
+            // did, `writeFile` threw and the whole execution was
+            // discarded before either surface ran. Measured: 79.4% of
+            // decoy fires wasted, ~10% of all executions, and only 37%
+            // of decoy shapes ever reached the subject.
+            //
+            // Renaming the victim's own field keeps the shape intact
+            // (the decoy still wears the catalog NAME, the victim's
+            // field still carries the catalog ID) while making the two
+            // distinguishable to the writer.
+            val victimIndex =
+                fields.indexOfFirst { it.id?.intValue()?.toLong() == victim.fieldId }
+            if (victimIndex >= 0) {
+                fields[victimIndex] = renamed(fields[victimIndex], "zz${e.int(0, 99)}")
+            }
             fields.add(
                 0,
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64).named(victim.def.name),
@@ -363,6 +404,28 @@ object NestedFuzz {
             fields.add(Types.optional(PrimitiveType.PrimitiveTypeName.INT32).id(9999).named("filler"))
         }
         return Derived(MessageType("fuzz", fields), muts)
+    }
+
+    /** [field] under a different name, id and shape unchanged. */
+    private fun renamed(
+        field: Type,
+        name: String,
+    ): Type {
+        val id = field.id?.intValue()
+        return if (field.isPrimitive) {
+            val p = field.asPrimitiveType()
+            var b = Types.primitive(p.primitiveTypeName, p.repetition)
+            if (p.typeLength > 0) b = b.length(p.typeLength)
+            p.logicalTypeAnnotation?.let { b = b.`as`(it) }
+            if (id != null) b = b.id(id)
+            b.named(name)
+        } else {
+            val g = field.asGroupType()
+            var b = Types.buildGroup(g.repetition).addFields(*g.fields.toTypedArray())
+            g.logicalTypeAnnotation?.let { b = b.`as`(it) }
+            if (id != null) b = b.id(id)
+            b.named(name)
+        }
     }
 
     private fun randomPrimitive(

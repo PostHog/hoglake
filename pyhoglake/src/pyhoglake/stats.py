@@ -16,6 +16,7 @@ import pyarrow.parquet as pq
 
 from .bounds import encode_bound
 from .models import Column, ColumnStats
+from .types import is_list_family
 
 # Column types whose bounds are IEEE floats: min/max over row-group
 # bounds must use total-order semantics (see _float_total_order_key).
@@ -334,7 +335,11 @@ def _walk_leaves(
         if not kids:
             return []
         sub = None
-        if arrow_type is not None and pa.types.is_list(arrow_type):
+        # The list FAMILY: large_list and fixed_size_list normalize to
+        # catalog `list` too, and recognising only the canonical member
+        # left `sub` None for the other two — which silently dropped the
+        # leaf's arrow type and with it every bound under that list.
+        if arrow_type is not None and is_list_family(arrow_type):
             sub = arrow_type.value_field.type
         return _walk_leaves(kids[0], here + (_LIST_GROUP,), sub)
     if col.type == "map":

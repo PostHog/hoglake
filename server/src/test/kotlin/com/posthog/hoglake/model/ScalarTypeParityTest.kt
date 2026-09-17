@@ -1,5 +1,6 @@
 package com.posthog.hoglake.model
 
+import com.posthog.hoglake.service.Identifiers
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Nested
@@ -127,15 +128,24 @@ class ScalarTypeParityTest {
             // `_hog_row_id` and met a 422 the spec never mentioned.
             val spec = read("src/main/resources/openapi/hoglake.yaml")
             val nameSchema = spec.substringAfter("\n    ColumnDef:").substringBefore("\n        type:\n")
+            // In its SIBLING position, where a generator reading
+            // `schema.pattern` finds it — the same place every other
+            // identifier in the spec declares one. Nesting it inside an
+            // allOf hid it from codegen entirely, which is why the
+            // assertion pins the LINE, not just the string.
+            val patternLine = "          pattern: \"" + Identifiers.PATTERN + "\""
+            assertThat(nameSchema.lines())
+                .describedAs("the base identifier pattern is a direct property of name")
+                .contains(patternLine)
             assertThat(nameSchema)
-                .describedAs("the base identifier pattern is still declared")
-                .contains(com.posthog.hoglake.service.Identifiers.PATTERN)
+                .describedAs("and not buried in a composition keyword generators ignore")
+                .doesNotContain("allOf")
             assertThat(nameSchema)
                 .describedAs("and the reserved prefix is machine-readable, not just prose")
-                .contains("not: { pattern: \"^${com.posthog.hoglake.service.Identifiers.RESERVED_COLUMN_PREFIX}\" }")
+                .contains("not: { pattern: \"^${Identifiers.RESERVED_COLUMN_PREFIX}\" }")
             assertThat(nameSchema)
                 .describedAs("and named, so a client author can find the refusal")
-                .contains(com.posthog.hoglake.service.Identifiers.RESERVED_COLUMN_PREFIX)
+                .contains(Identifiers.RESERVED_COLUMN_PREFIX)
         }
 
         @Test
