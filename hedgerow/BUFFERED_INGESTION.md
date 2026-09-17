@@ -64,6 +64,16 @@ The mapping and writer version are part of durable job identity: incompatible
 state fails closed at startup. Existing Arrow coordinator state requires explicit
 reconciliation; do not discard pending state to bypass that guard.
 
+Job identity is an **explicit projection** of what defines the job — table uuid,
+columns (field id, name, type, nullability, variant mapping), partition spec,
+sort spec, consumer id, writer version and JSON-column mapping — and nothing
+else. It is deliberately not derived from the pyhoglake dataclasses' shape: that
+made a field added upstream re-write the identity of every running job and halt
+the fleet at startup, with no change here at all. Adding a field to the
+projection is therefore a decision about what makes a job different, and it
+breaks every deployed coordinator, so it belongs in a change that says so.
+`tests/test_job_identity.py` pins both directions.
+
 `configure_duckdb(connection)` configures each worker connection's S3 access
 (e.g. a DuckDB secret). It is separate from the Arrow filesystem used by discovery
 and the destination client's upload filesystem. It must be thread-safe and must
