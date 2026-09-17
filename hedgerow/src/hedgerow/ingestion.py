@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, replace
+from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import pyarrow.parquet as pq
@@ -25,6 +25,88 @@ from .halts import DataIntegrityError, IncarnationChangedError, SplitBrainError
 from .pending import PendingStore, Work
 from .scheduler import FlushScheduler
 from .window import plan_window
+
+
+def _table_identity(info) -> dict:
+    """The job-defining shape of a table, as an EXPLICIT projection.
+
+    Durable job identity is compared byte-for-byte at startup: a
+    coordinator whose stored identity no longer matches refuses to open
+    its pending store, and the claimed work has to be reconciled by hand.
+    So the identity must change when the job really changes, and must NOT
+    change for any other reason.
+
+    This was `asdict(info)` with the three aggregate counts popped, which
+    made identity a function of pyhoglake's dataclass SHAPE: adding a
+    field to TableInfo, Column, PartitionField or SortField — or adopting
+    a new server field into one — silently re-wrote the identity of every
+    running job, and a routine library bump landed as a fleet-wide
+    startup halt with no code change here at all.
+
+    The fields below are exactly those `_guard` treats as job-defining
+    (table_uuid, columns, partition spec, sort spec); the two must agree,
+    or a change would either halt startup without tripping the guard or
+    trip the guard without changing identity. Everything else about a
+    table — its name, namespace, and the aggregate counts that move on
+    every append — is deliberately absent.
+
+    Adding a field here is a breaking change for every deployed
+    coordinator, so it is a decision, not a consequence of an upstream
+    edit. `test_job_identity` pins that by adding a synthetic field to
+    the dataclasses and asserting the identity is unchanged.
+    """
+    return {
+        "table_uuid": info.table_uuid,
+        "columns": [
+            {
+                "field_id": c.field_id,
+                "name": c.name,
+                "type": c.type,
+                "nullable": c.nullable,
+                "type_params": c.type_params or {},
+            }
+            # Ordinal is the wire order; identity sorts by field id so a
+            # pure reorder is not mistaken for a schema change.
+            for c in sorted(info.columns, key=lambda c: c.field_id)
+        ],
+        "partition_spec": _partition_identity(info.partition_spec),
+        "sort_spec": _sort_identity(info.sort_spec),
+    }
+
+
+def _partition_identity(spec) -> dict | None:
+    if spec is None:
+        return None
+    return {
+        "spec_id": spec.spec_id,
+        # Partition field ORDER is semantic (it is the directory nesting),
+        # so this list is not sorted.
+        "fields": [
+            {
+                "source_field_id": f.source_field_id,
+                "transform": f.transform,
+                "transform_param": f.transform_param,
+            }
+            for f in spec.fields
+        ],
+    }
+
+
+def _sort_identity(spec) -> dict | None:
+    if spec is None:
+        return None
+    return {
+        "sort_id": spec.sort_id,
+        # Sort field order is semantic too: it is the sort key sequence.
+        "fields": [
+            {
+                "source_field_id": f.source_field_id,
+                "direction": f.direction,
+                "null_order": f.null_order,
+            }
+            for f in spec.fields
+        ],
+    }
 
 
 class BufferedIngestion:
@@ -73,16 +155,12 @@ class BufferedIngestion:
                 "buffered ingestion requires source consumer_floor retention protection"
             )
         identity = {
-            "source": asdict(self.source_info),
-            "destination": asdict(self.destination_info),
+            "source": _table_identity(self.source_info),
+            "destination": _table_identity(self.destination_info),
             "consumer": consumer_id,
             "writer": "duckdb-v1",
             "json_columns": sorted(self.transform.json_columns),
         }
-        # Aggregate counts change on every append and are not part of identity.
-        for side in ("source", "destination"):
-            for key in ("record_count", "file_count", "file_size_bytes"):
-                identity[side].pop(key)
         self.store = PendingStore(state_path, identity, start_snapshot)
         self.scheduler = FlushScheduler(
             self.store, policy, self._prepare, destination_catalog.commit_prepared
