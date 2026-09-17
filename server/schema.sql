@@ -169,7 +169,7 @@ CREATE TABLE hog_column (
     -- Closed type set: every member has a defined Iceberg mapping
     -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
     -- Member ORDER is load-bearing: V4__scalar_types.sql and
-    -- V7__nested_types.sql recreate this constraint and the
+    -- V9__nested_types.sql recreate this constraint and the
     -- schema-equivalence gate compares the normalized
     -- pg_get_constraintdef text, which preserves the order.
     -- list/struct/map are CONTAINERS: they carry no values, they have
@@ -185,7 +185,7 @@ CREATE TABLE hog_column (
     -- Orders SIBLINGS: 0-based within the parent (top-level columns
     -- share the NULL parent).
     ordinal        int    NOT NULL CHECK (ordinal >= 0),
-    -- The tree edge (V7): NULL = top-level column, else the field_id of
+    -- The tree edge (V9): NULL = top-level column, else the field_id of
     -- the containing list/struct/map. A same-table reference by
     -- (catalog_id, table_id, field_id) IDENTITY and deliberately NOT a
     -- foreign key: these rows are versioned (begin_snapshot is in the
@@ -214,7 +214,7 @@ CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
 -- Writers stamp parquet field order from ordinals: a duplicate live
 -- ordinal is a silent corruption vector, so the DB refuses it.
--- Per-PARENT since V7 — ordinals order siblings, so two struct fields in
+-- Per-PARENT since V9 — ordinals order siblings, so two struct fields in
 -- different structs are both legitimately ordinal 0. NULLS NOT DISTINCT
 -- keeps the guarantee for top-level columns, whose parent_field_id is
 -- NULL: without it Postgres treats every NULL as distinct and the

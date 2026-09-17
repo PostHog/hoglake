@@ -11,12 +11,12 @@ import org.junit.jupiter.api.Test
 import javax.sql.DataSource
 
 /**
- * V7 against a POPULATED catalog, not an empty one — V4's test, one
+ * V9 against a POPULATED catalog, not an empty one — V4's test, one
  * migration on.
  *
  * The schema-equivalence gate only proves fold(migrations) ==
- * schema.sql on a virgin database, which says nothing about what V7
- * does to a catalog that already has columns in it. V7 does three
+ * schema.sql on a virgin database, which says nothing about what V9
+ * does to a catalog that already has columns in it. V9 does three
  * things to a live table, and all three can go wrong on existing rows:
  * it ADDS a nullable column (must not rewrite or default anything), it
  * drops and recreates a CHECK (must not reject rows that were legal
@@ -30,9 +30,9 @@ import javax.sql.DataSource
  * top-level columns, which are exactly the rows it used to cover.
  */
 @Tag("integration")
-class V7NestedTypesMigrationIntegrationTest {
-    /** Everything a pre-V7 catalog can contain (V1 + V4). */
-    private val preV7Types =
+class V9NestedTypesMigrationIntegrationTest {
+    /** Everything a pre-V9 catalog can contain (V1 + V4). */
+    private val preV9Types =
         listOf(
             "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
             "uint32", "uint64", "float", "double", "decimal", "date", "time",
@@ -40,7 +40,7 @@ class V7NestedTypesMigrationIntegrationTest {
             "timestamptz", "string", "json", "uuid", "binary",
         )
 
-    /** The three V7 adds. */
+    /** The three V9 adds. */
     private val v7Types = listOf("list", "struct", "map")
 
     /** Flyway configured exactly as Database.migrate does, optionally stopping at [target]. */
@@ -58,16 +58,16 @@ class V7NestedTypesMigrationIntegrationTest {
     }
 
     @Test
-    fun `V7 widens the vocabulary and adds the tree edge on a populated catalog`(): Unit =
+    fun `V9 widens the vocabulary and adds the tree edge on a populated catalog`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             migrate(db.dataSource, target = "4")
 
-            // A pre-V7 catalog: one table, one column per pre-V7 type.
+            // A pre-V9 catalog: one table, one column per pre-V9 type.
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('pre-v7', 's3://b/')")
                 h.execute("INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (1, 1, 'ns')")
                 h.execute("INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (1, 1, 1)")
-                preV7Types.forEachIndexed { i, type ->
+                preV9Types.forEachIndexed { i, type ->
                     h.execute(
                         """
                         INSERT INTO hog_column
@@ -97,12 +97,12 @@ class V7NestedTypesMigrationIntegrationTest {
                     )
                 }
             }
-                .describedAs("V4 must not already accept the V7 vocabulary")
+                .describedAs("V4 must not already accept the V9 vocabulary")
                 .hasMessageContaining("hog_column_col_type_check")
 
             migrate(db.dataSource)
 
-            // Nothing was lost, rewritten, or defaulted: every pre-V7 row
+            // Nothing was lost, rewritten, or defaulted: every pre-V9 row
             // keeps its type AND comes out a top-level column, which is
             // what a NULL parent_field_id means.
             val surviving =
@@ -115,10 +115,10 @@ class V7NestedTypesMigrationIntegrationTest {
                     ).map { rs, _ -> rs.getString("col_type") to rs.getBoolean("top_level") }.list()
                 }
             assertThat(surviving.map { it.first })
-                .describedAs("pre-V7 rows survive the constraint swap")
-                .isEqualTo(preV7Types)
+                .describedAs("pre-V9 rows survive the constraint swap")
+                .isEqualTo(preV9Types)
             assertThat(surviving.map { it.second })
-                .describedAs("every pre-V7 row is top-level (parent_field_id IS NULL)")
+                .describedAs("every pre-V9 row is top-level (parent_field_id IS NULL)")
                 .allMatch { it }
 
             // The vocabulary actually widened, and a child row links back.
@@ -214,7 +214,7 @@ class V7NestedTypesMigrationIntegrationTest {
     fun `the constraint kept the name V1 gave it, and lists the containers`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // schema.sql declares the CHECK inline, so Postgres names it
-            // hog_column_col_type_check there. V7 must recreate it under
+            // hog_column_col_type_check there. V9 must recreate it under
             // the same name or the schema-equivalence gate compares two
             // differently-named constraints and fails obscurely.
             migrate(db.dataSource)
@@ -227,7 +227,7 @@ class V7NestedTypesMigrationIntegrationTest {
                         """,
                     ).mapTo(String::class.java).findOne().orElse(null)
                 }
-            assertThat(def).describedAs("hog_column_col_type_check exists after V7").isNotNull()
+            assertThat(def).describedAs("hog_column_col_type_check exists after V9").isNotNull()
             for (type in v7Types) {
                 assertThat(def).describedAs("constraint lists %s", type).contains("'$type'")
             }
@@ -240,14 +240,14 @@ class V7NestedTypesMigrationIntegrationTest {
     fun `the migration refuses a catalog whose constraint it does not recognise`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // The loud guard. A hand-patched or doctored catalog gets a
-            // message naming what V7 expected, not "constraint does not
+            // message naming what V9 expected, not "constraint does not
             // exist" from a bare DROP.
             migrate(db.dataSource, target = "4")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
             }
             assertThatThrownBy { migrate(db.dataSource) }
-                .hasMessageContaining("V7 expected the constraint hog_column_col_type_check")
+                .hasMessageContaining("V9 expected the constraint hog_column_col_type_check")
         }
 
     @Test
@@ -255,7 +255,7 @@ class V7NestedTypesMigrationIntegrationTest {
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // The member list is only half the constraint. NOT IN over
             // the same 23 names yields byte-identical found_types: the
-            // list check passed, V7 dropped it, and a catalog that
+            // list check passed, V9 dropped it, and a catalog that
             // permitted EVERYTHING EXCEPT the vocabulary was silently
             // replaced by one that permits it.
             migrate(db.dataSource, target = "4")
@@ -309,7 +309,7 @@ class V7NestedTypesMigrationIntegrationTest {
                 .hasMessageContaining("it is not on hog_column")
         }
 
-    /** V4's vocabulary, in V4's order — what V7's guard expects to find. */
+    /** The vocabulary V9's guard expects to find, in order. */
     private val v4Types =
         listOf(
             "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
@@ -324,13 +324,13 @@ class V7NestedTypesMigrationIntegrationTest {
             migrate(db.dataSource, target = "4")
             db.jdbi.useHandleUnchecked { h -> h.execute("DROP INDEX hog_column_live_ordinal") }
             assertThatThrownBy { migrate(db.dataSource) }
-                .hasMessageContaining("V7 expected the index hog_column_live_ordinal")
+                .hasMessageContaining("V9 expected the index hog_column_live_ordinal")
         }
 
     @Test
     fun `the migration refuses an index that merely shares V1's NAME`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
-            // EXISTENCE was never the check. V7 DROPs this index and
+            // EXISTENCE was never the check. V9 DROPs this index and
             // replaces it, so an index sharing V1's name while guarding
             // something else would be discarded silently — the exact
             // divergence the guard's own comment claims to catch. Here

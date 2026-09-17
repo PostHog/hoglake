@@ -334,7 +334,7 @@ object TableRepo {
     /**
      * The column FOREST visible at [snapshot]: top-level columns in
      * ordinal order, each container carrying its children (also in
-     * ordinal order, which is per-parent since V7).
+     * ordinal order, which is per-parent since V9).
      */
     fun columnsAt(
         handle: Handle,

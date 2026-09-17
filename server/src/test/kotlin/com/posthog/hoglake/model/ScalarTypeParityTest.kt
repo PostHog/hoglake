@@ -57,12 +57,12 @@ class ScalarTypeParityTest {
         fun `the latest migration's CHECK lists exactly the enum, in order`() {
             // The LAST migration that recreates the CHECK is the one that
             // must agree with the enum — the chain is append-only, so V4's
-            // list is history and V7's is the live vocabulary. Adding a
+            // list is history and V9's is the live vocabulary. Adding a
             // type means adding a migration, and this assertion is what
             // makes forgetting one a red test rather than a 500 at insert.
-            val sql = read("src/main/resources/db/migration/V7__nested_types.sql")
+            val sql = read("src/main/resources/db/migration/V9__nested_types.sql")
             assertThat(checkMembers(sql))
-                .describedAs("V7__nested_types.sql col_type CHECK")
+                .describedAs("V9__nested_types.sql col_type CHECK")
                 .isEqualTo(wireNames)
         }
 

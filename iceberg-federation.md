@@ -230,7 +230,7 @@ included**: an Iceberg facade presents these columns without converting
 anything or synthesizing an id.
 
 **The column model is a tree.** `hog_column` gained
-`parent_field_id` (V7) — a same-table reference by
+`parent_field_id` (V9) — a same-table reference by
 `(catalog_id, table_id, field_id)` identity, deliberately **not** a
 foreign key, because these rows are versioned and an FK would have to
 name one *version* of a parent that a rename or a promote immediately

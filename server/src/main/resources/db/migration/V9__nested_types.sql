@@ -80,18 +80,18 @@ BEGIN
 
     IF found_def IS NULL THEN
         RAISE EXCEPTION
-            'V7 expected the constraint hog_column_col_type_check on hog_column (created '
+            'V9 expected the constraint hog_column_col_type_check on hog_column (created '
             'by V1__init.sql and recreated by V4__scalar_types.sql) but it is absent. This '
             'catalog has diverged from the migration chain; reconcile hog_column''s col_type '
             'CHECK with V4 before re-running.';
     END IF;
     IF found_def NOT LIKE '%col_type%' THEN
         RAISE EXCEPTION
-            'V7 found hog_column_col_type_check but it does not constrain col_type (%). '
+            'V9 found hog_column_col_type_check but it does not constrain col_type (%). '
             'Refusing to replace a constraint this migration does not recognise.', found_def;
     END IF;
 
-    -- The DEFINITION, not a substring of it. V7 DROPs this constraint
+    -- The DEFINITION, not a substring of it. V9 DROPs this constraint
     -- and recreates it, so one that merely MENTIONS a V4 type while
     -- permitting a different vocabulary — a hand-patched catalog that
     -- allows 'variant', say — would be discarded silently, which is the
@@ -108,8 +108,8 @@ BEGIN
 
     IF found_types IS DISTINCT FROM expected_types THEN
         RAISE EXCEPTION
-            'V7 expected hog_column_col_type_check to permit exactly V4''s vocabulary, in V4''s '
-            'order. Expected: %. Found: % (from %). V7 replaces this constraint and will not '
+            'V9 expected hog_column_col_type_check to permit exactly V4''s vocabulary, in V4''s '
+            'order. Expected: %. Found: % (from %). V9 replaces this constraint and will not '
             'silently discard a vocabulary it does not recognise; reconcile with V4 before '
             're-running.', expected_types, found_types, found_def;
     END IF;
@@ -120,7 +120,7 @@ BEGIN
     --   the same membership test, OR'd with true -- vacuous
     --   a membership test on a DIFFERENT column, AND'd with a
     --     col_type IS NOT NULL that mentions this one
-    -- all yield identical found_types and all passed. V7 then dropped
+    -- all yield identical found_types and all passed. V9 then dropped
     -- them and installed its own, discarding exactly the divergence this
     -- guard exists to refuse.
     --
@@ -140,16 +140,16 @@ BEGIN
         'CHECK (col_type = ANY (ARRAY[]))'
     ) THEN
         RAISE EXCEPTION
-            'V7 found hog_column_col_type_check listing V4''s vocabulary, but its SHAPE is not '
+            'V9 found hog_column_col_type_check listing V4''s vocabulary, but its SHAPE is not '
             'a plain membership test: expected a skeleton of CHECK ((col_type = ANY (ARRAY[]))), '
             'found % (from %). A NOT IN, an OR, or an extra conjunct permits a different '
-            'vocabulary while listing the same names, and V7 will not silently discard one; '
+            'vocabulary while listing the same names, and V9 will not silently discard one; '
             'reconcile with V4 before re-running.', found_skeleton, found_def;
     END IF;
 END
 $$;
 
--- Same guard for the ordinal index: V7 replaces it, and replacing an
+-- Same guard for the ordinal index: V9 replaces it, and replacing an
 -- index this migration does not recognise would silently drop whatever
 -- guarantee the divergent one was carrying.
 DO $$
@@ -158,7 +158,7 @@ DECLARE
 BEGIN
     IF to_regclass('hog_column_live_ordinal') IS NULL THEN
         RAISE EXCEPTION
-            'V7 expected the index hog_column_live_ordinal on hog_column (created by '
+            'V9 expected the index hog_column_live_ordinal on hog_column (created by '
             'V1__init.sql) but it is absent. This catalog has diverged from the migration '
             'chain; reconcile it with V1 before re-running.';
     END IF;
@@ -182,7 +182,7 @@ BEGIN
     IF (SELECT indrelid FROM pg_index WHERE indexrelid = 'hog_column_live_ordinal'::regclass)
        IS DISTINCT FROM 'hog_column'::regclass THEN
         RAISE EXCEPTION
-            'V7 found an index named hog_column_live_ordinal, but it is not on hog_column. '
+            'V9 found an index named hog_column_live_ordinal, but it is not on hog_column. '
             'This catalog has diverged from the migration chain; reconcile it with V1 before '
             're-running.';
     END IF;
@@ -195,10 +195,10 @@ BEGIN
        OR found_def NOT LIKE '%(catalog_id, table_id, ordinal)%'
        OR found_def NOT LIKE '%WHERE (end_snapshot IS NULL)%' THEN
         RAISE EXCEPTION
-            'V7 found an index named hog_column_live_ordinal whose definition is not the one '
+            'V9 found an index named hog_column_live_ordinal whose definition is not the one '
             'V1__init.sql created. Expected a UNIQUE index on '
             '(catalog_id, table_id, ordinal) WHERE end_snapshot IS NULL; found: %. '
-            'V7 replaces this index with a per-parent one and will not silently discard a '
+            'V9 replaces this index with a per-parent one and will not silently discard a '
             'guarantee it does not recognise; reconcile it with V1 before re-running.', found_def;
     END IF;
 END
