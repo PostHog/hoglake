@@ -430,7 +430,7 @@ class Catalog:
     def commit_prepared(self, payload: dict[str, Any]) -> CommitResult:
         """Publish a durably saved request; retry the EXACT payload on uncertainty.
 
-        Requires a server supporting CommitRequest.idempotency_key (V5 migration).
+        Requires a server supporting CommitRequest.idempotency_key (V7 migration).
         This API does not apply event-level deduplication.
         """
         if not payload.get("idempotency_key"):

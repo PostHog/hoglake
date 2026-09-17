@@ -27,6 +27,14 @@ object Metrics {
     }
 
     /** hoglake_commits_total{catalog, result=committed|conflict|validation|error} */
+    fun tableCreationRecorded(
+        catalog: String,
+        action: String,
+        outcome: String,
+    ) {
+        increment("hoglake_table_creation_total", 1.0, "catalog", catalog, "action", action, "outcome", outcome)
+    }
+
     fun commitRecorded(
         catalog: String,
         result: String,
