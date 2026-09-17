@@ -28,9 +28,16 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
   silently skip); vanished tables/schemas are the SPI's typed
   not-founds; a missing configured catalog is a USER_ERROR; malformed
   responses are coded, never bare exceptions.
-- **DV refusal at planning.** A scan pairing any data file with a live
-  deletion vector is refused in split generation, before any split
-  reaches the engine — no partial results precede the failure.
+- **DVs are applied, not refused.** A scan pairing a data file with a
+  live deletion vector produces a split carrying that vector's path;
+  the page source reads the puffin `deletion-vector-v1` object and
+  drops the positions it marks, so deleted rows reach no result,
+  aggregate, filter, or join. Unfiltered `count(*)` answers from
+  catalog metadata (`record_count` minus `delete_count`) but still
+  reads and validates the vector first. Planning checks only that the
+  scan's data-file/DV pairing is internally consistent. A vector that
+  is missing, corrupt, in another format, or inconsistent with the
+  catalog's `delete_count` fails the query — never "no deleted rows".
 - **Config fails at load.** `hoglake.uri` validated and
   slash-normalized, empty `hoglake.catalog` rejected, request timeout
   configurable (`hoglake.client.request-timeout`, default 2m).

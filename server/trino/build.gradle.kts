@@ -39,8 +39,13 @@ dependencies {
     // Real parquet files for the end-to-end read test (same writer the
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
-    // Bucket creation + parquet upload to MinIO.
+    // Bucket creation + parquet/deletion-vector upload to MinIO.
     testImplementation("software.amazon.awssdk:s3:2.54.13")
+    // Real puffin deletion vectors for the DV read tests: the portable
+    // 64-bit roaring serialization IS the Java library's format, so the
+    // harness writes the same bytes the server and DuckDB client do.
+    // Keep in step with the root project's pin.
+    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.21")
 }
 
 kotlin {

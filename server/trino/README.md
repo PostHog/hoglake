@@ -1,6 +1,6 @@
 # Hoglake / Trino integration tests
 
-The native read-only connector is maintained in
+The native connector is maintained in
 [PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake).
 It builds and ships with the engine, using the same SPI, Parquet reader, and S3
 filesystem versions. Connector unit tests and configuration documentation live
@@ -42,5 +42,37 @@ client remains at 446 independently of the server version so this harness can
 continue using the server project's Java 21 toolchain.
 
 The tests cover schema/table discovery, Parquet reads, aggregates, column
-binding, type promotion, deletion-vector refusal, and read-only enforcement.
-The planned Iceberg REST facade remains a separate server feature.
+binding, type promotion, and deletion-vector application. The planned Iceberg
+REST facade remains a separate server feature.
+
+## Deletion vectors
+
+The connector applies deletion vectors; it does not refuse them. A read of a
+DV-backed table returns the surviving rows, and the harness asserts that as
+correctness, not as a refusal. The fixtures write real puffin
+`deletion-vector-v1` bytes (`TestPuffin`, the byte-level twin of the server
+suite's `PuffinTestFiles`), because the connector opens the object, decodes the
+roaring bitmap, and checks its `referenced-data-file` and cardinality against
+the scan's pairing — a nominal DV path only ever produces a read failure.
+
+The connector counts a DV-backed table on two paths, and the harness covers
+both. An unfiltered `count(*)` needs no columns, so it answers from catalog
+metadata (`record_count` minus the vector's `delete_count`) after reading and
+validating the vector; the Parquet file is never opened. Any read that needs a
+column applies the vector per page inside the connector's page source, over
+file-relative row positions, after row-group pruning.
+
+The one refusal the harness still pins is a vector that disagrees with the
+catalog: the scan's `delete_count` must equal the vector's real cardinality,
+and hoglake never opens DV files, so only the reader can catch a mismatch.
+
+This puts a **floor under the fork image**: these assertions fail against any
+image built before PostHog/trino's "Apply deletion vectors to Hoglake reads"
+(`d4d5fa2`, first published as `r000000046914-6e5fcd`), which refuses
+DV-bearing scans at split planning. There is no harness-side way to satisfy
+both behaviors, and the newest-tag resolution above means normal runs are
+always above the floor.
+
+The connector also supports `CREATE TABLE`, `INSERT`, and CTAS as of
+2026-09-16. The harness does not exercise the write path — the connector's own
+suite does — so nothing here asserts read-only behavior.
