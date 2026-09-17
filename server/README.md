@@ -586,7 +586,7 @@ container attached to the compose network — as the endpoint.
 ## Testing
 
 JUnit 5 + AssertJ; property tests via kotest-property (strategy:
-[../fuzzing.md](../fuzzing.md)). Integration tests use Testcontainers
+[../fuzzing.md](../docs/fuzzing.md)). Integration tests use Testcontainers
 (Postgres 16, MinIO), tagged `integration`, and need Docker
 (`docker-java.properties` in test resources pins the Docker API version
 for recent daemons). The schema-equivalence test and an OCC concurrency

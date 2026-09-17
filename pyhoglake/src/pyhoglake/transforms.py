@@ -1,7 +1,7 @@
 """Client-side Iceberg partition transforms for the writer path.
 
 Implements the server's Transform vocabulary (``identity``, ``bucket``,
-``year``, ``month``, ``day``, ``hour`` — Model.kt, iceberg-federation.md
+``year``, ``month``, ``day``, ``hour`` — Model.kt, docs/iceberg-federation.md
 §3) plus ``truncate`` with Iceberg-spec semantics, ready for the day the
 server vocabulary grows it. Semantics follow the Apache Iceberg Table
 Spec exactly:

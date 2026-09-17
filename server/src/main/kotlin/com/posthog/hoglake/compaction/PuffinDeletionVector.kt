@@ -32,7 +32,7 @@ class DeletionVector internal constructor(
 
 /**
  * Reader for hoglake's one delete encoding: an Iceberg v3 puffin file
- * carrying a single `deletion-vector-v1` blob (iceberg-federation.md §4
+ * carrying a single `deletion-vector-v1` blob (docs/iceberg-federation.md §4
  * — internal readers and the facade share this encoding by design; the
  * hog_delete_file.file_format vocabulary is exactly 'puffin-dv').
  *

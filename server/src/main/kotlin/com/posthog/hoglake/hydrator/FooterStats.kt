@@ -315,7 +315,7 @@ object FooterStats {
             ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
                 if (physical == PrimitiveType.PrimitiveTypeName.INT32) readIntLE(raw) else null
             // uint32 maps to Iceberg long. hoglake's own writers emit INT64
-            // (see iceberg-federation.md §2), but pyarrow/DuckDB emit
+            // (see docs/iceberg-federation.md §2), but pyarrow/DuckDB emit
             // INT32 + INT(32, unsigned) natively, so both are read. The
             // INT32 form REQUIRES the unsigned annotation: without it
             // parquet computed the chunk's min/max in SIGNED order, and

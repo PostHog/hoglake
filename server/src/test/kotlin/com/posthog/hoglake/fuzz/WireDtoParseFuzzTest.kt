@@ -11,7 +11,7 @@ import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
 
 /**
- * Fuzz target (fuzzing.md layer 4, target f): the wire parse path for the
+ * Fuzz target (docs/fuzzing.md layer 4, target f): the wire parse path for the
  * two most structured request bodies — CommitRequestDto and the
  * polymorphic AlterTableRequestDto (`op`-discriminated) — over arbitrary
  * bytes, through the production wire mapper itself (api/WireJson.kt),

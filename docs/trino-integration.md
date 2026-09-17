@@ -5,7 +5,7 @@ important consumer — and eventually a producer. This doc covers what
 the v1 design does to make reads excellent and to keep the write door
 open without reversing the read-only-facade decision.
 
-Companions: [README.md](README.md) (decisions),
+Companions: [README.md](../README.md) (decisions),
 [iceberg-federation.md](iceberg-federation.md) (the facade's design
 obligations — all of which are prerequisites here).
 

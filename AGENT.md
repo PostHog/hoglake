@@ -326,14 +326,14 @@ there would break that gate on every build.
   implementing a rule about row ids, field ids, or column binding, READ
   the ones already stated: this file, the
   [duckdb-client design doc](duckdb-client/DESIGN.md),
-  [iceberg-federation.md](iceberg-federation.md), and the comments in
+  [iceberg-federation.md](docs/iceberg-federation.md), and the comments in
   `server/schema.sql`. Follow the document over an instruction or an
   intuition, and say that you are doing so. Two regressions shipped
   because a rule was invented while the correct one was already on disk.
 - **API changes get the fuzzing treatment.** The Jazzer targets under
   `server/src/test/kotlin/com/posthog/hoglake/fuzz/` have reached
   defects nothing else did, so they are part of the change, not a
-  follow-up (see [fuzzing.md](fuzzing.md)). New or changed wire surface
+  follow-up (see [fuzzing.md](docs/fuzzing.md)). New or changed wire surface
   — DTOs, OpenAPI shapes, validation — extends the wire corpus; new
   parse or validation logic gets a target or joins an existing one.
   Cross-surface machinery (a reader/rewriter pair, a codec's
@@ -443,8 +443,8 @@ there would break that gate on every build.
   (snapshot range + live-file manifest + consumer offsets, consistent
   at head); 501 stub until built (schema-gaps review item B5).
 - **Iceberg REST facade + Trino**: design obligations in
-  [iceberg-federation.md](iceberg-federation.md) /
-  [trino-integration.md](trino-integration.md); v1 schema already
+  [docs/iceberg-federation.md](docs/iceberg-federation.md) /
+  [docs/trino-integration.md](docs/trino-integration.md); v1 schema already
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: out of scope for v1; audit actor is `anonymous` until it
   lands. Decision space in README §AuthN/Z.
@@ -460,26 +460,26 @@ there would break that gate on every build.
 
 ## Doc index
 
-**Design and decisions** — [README.md](README.md) (the design doc) ·
-[metadata-schema.md](metadata-schema.md) (the schema, table by table) ·
-[iceberg-federation.md](iceberg-federation.md) /
-[trino-integration.md](trino-integration.md) (engine surfaces) ·
-[split-validation-commit.md](split-validation-commit.md) (the commit
-tail's escape hatch — designed, not scheduled) ·
-[duckdb-read-extension.md](duckdb-read-extension.md) (DuckDB back as a
-client, sketch).
+Reference docs live in [docs/](docs/); [README.md](README.md) is the
+front door. The predecessor-analysis set (the DuckLake and pyducklake
+API maps, the C++ source inventory, the Paimon comparison, the schema
+review and the language retrospective) was retired in the 2026-09-17
+docs pass: each had done its job informing the as-built system, and git
+history holds them.
 
-**Assessments** — [operational-notes.md](operational-notes.md) (what
-changes, and what honestly doesn't, at 2PB/1T) ·
-[sql-suggestions.md](sql-suggestions.md) (schema review) ·
-[suggestions.md](suggestions.md) (language/stack retrospective) ·
-[paimon-compare.md](paimon-compare.md) (the closest comparable).
+**Design** — [docs/metadata-schema.md](docs/metadata-schema.md) (the
+schema, table by table) ·
+[docs/iceberg-federation.md](docs/iceberg-federation.md) /
+[docs/trino-integration.md](docs/trino-integration.md) (engine
+surfaces).
 
-**Predecessor and process** —
-[ducklake-defect-ledger.md](ducklake-defect-ledger.md) (the bugs this
-architecture answers) · [ducklake-api-map.md](ducklake-api-map.md) /
-[pyducklake-api-map.md](pyducklake-api-map.md) (predecessor surfaces) ·
-[fuzzing.md](fuzzing.md) · [source-inventory.md](source-inventory.md).
+**Operating** — [docs/operational-notes.md](docs/operational-notes.md)
+(what changes, and what honestly doesn't, at 2PB/1T) ·
+[docs/fuzzing.md](docs/fuzzing.md) (property testing and fuzzing).
+
+**Why this architecture** —
+[docs/ducklake-defect-ledger.md](docs/ducklake-defect-ledger.md) (the
+predecessor's production bugs, and where hoglake answers each).
 
 **Per-component** — [server](server/README.md) ·
 [duckdb-client](duckdb-client/README.md)
