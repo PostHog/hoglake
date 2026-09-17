@@ -336,6 +336,29 @@ object NestedFuzz {
         }
 
         val fields = cols.mapNotNull { field(it, Type.Repetition.OPTIONAL) }.toMutableList()
+
+        // DECOYS: an id-less field wearing a real column's NAME, placed
+        // BEFORE the field that carries that column's id.
+        //
+        // Generated deliberately because the mutation machinery above
+        // reaches this shape only by a conjunction of two rare choices
+        // (drop one column's id AND reuse that id on a later column),
+        // and it is the shape that matters most: field ids are the
+        // binding contract, so a name must never outrank one. A
+        // first-match-wins scan made the decoy win, the reader bounded
+        // it and compaction copied its values into the other column's
+        // slot — and no agreement oracle could see it, because both
+        // surfaces were wrong identically. Files that stamp ids on only
+        // SOME columns are real: foreign writers produce them.
+        if (mutRate > 0 && fields.isNotEmpty() && e.int(0, 99) < 25) {
+            val victim = cols[e.int(0, cols.size - 1)]
+            fields.add(
+                0,
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).named(victim.def.name),
+            )
+            muts++
+        }
+
         if (fields.isEmpty()) {
             fields.add(Types.optional(PrimitiveType.PrimitiveTypeName.INT32).id(9999).named("filler"))
         }

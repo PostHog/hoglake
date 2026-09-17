@@ -189,6 +189,45 @@ object FooterStats {
         return if (id != null) useFieldIds && id.intValue().toLong() == fieldId else field.name == name
     }
 
+    /**
+     * The index of the field [fieldId]/[name] binds to among [fields],
+     * or -1.
+     *
+     * The SEARCH, not just the predicate, and the difference is a
+     * correctness bug: [bindsTo] answers "could this field be it", and
+     * scanning with it first-match-wins lets an id-less field that
+     * merely shares the NAME beat a later field that actually CARRIES
+     * the id. Measured, catalog column `fieldId=1 name="b"` against a
+     * file `[b (no id) = 999, x (field_id 1) = 42]`: the reader bounded
+     * 999 and compaction WROTE 999 into output field 1, then
+     * end-snapshotted the input. Silent substitution of one column's
+     * data for another's.
+     *
+     * So: ids across ALL fields first, names second and only among
+     * candidates that declare no id. Field ids are the binding contract;
+     * a name is what is left when a file does not participate in it, and
+     * it can never outrank one. Files that stamp ids on only some
+     * columns — foreign writers, mostly — are the whole affected
+     * population, and they are also the ones least able to notice.
+     *
+     * One function so the two surfaces cannot drift: the reader and the
+     * rewriter both call it. Unifying them behind the PREDICATE alone
+     * was what made both of them wrong in the same way, which is
+     * precisely what an agreement check cannot see.
+     */
+    fun bindIndex(
+        fields: List<Type>,
+        fieldId: Long,
+        name: String,
+        useFieldIds: Boolean,
+    ): Int {
+        if (useFieldIds) {
+            val byId = fields.indexOfFirst { it.id?.intValue()?.toLong() == fieldId }
+            if (byId >= 0) return byId
+        }
+        return fields.indexOfFirst { it.id == null && it.name == name }
+    }
+
     private fun anyBindingNodeWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
             if (field.isPrimitive) {
@@ -581,16 +620,16 @@ object FooterStats {
             annotation is LogicalTypeAnnotation.MapKeyValueTypeAnnotation
 
     /**
-     * The parquet field for [col] among [fields]: by field id when the
-     * candidate carries one, else by name. Per-node rather than
-     * per-file, because a nested file can carry ids on its leaves and
-     * none on a synthesized container group.
+     * The parquet field for [col] among [fields] — [bindIndex]'s search,
+     * ids before names. Per-node rather than per-file, because a nested
+     * file can carry ids on its leaves and none on a synthesized
+     * container group.
      */
     private fun findField(
         fields: List<Type>,
         col: CatalogColumn,
         useFieldIds: Boolean,
-    ): Type? = fields.firstOrNull { bindsTo(it, col.fieldId, col.name, useFieldIds) }
+    ): Type? = bindIndex(fields, col.fieldId, col.name, useFieldIds).takeIf { it >= 0 }?.let { fields[it] }
 
     private fun aggregateColumn(
         blocks: List<BlockMetaData>,

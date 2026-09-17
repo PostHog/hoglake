@@ -875,8 +875,13 @@ object ParquetRewriter {
 
     /**
      * [columnPlan]'s recursion: one step per live column among
-     * [srcFields], bound by [FooterStats.bindsTo] — the reader's rule,
-     * called rather than re-implemented.
+     * [srcFields], bound by [FooterStats.bindIndex] — the reader's
+     * SEARCH, called rather than re-implemented.
+     *
+     * The search, not the predicate. Scanning with the predicate
+     * first-match-wins let an id-less field sharing a column's NAME beat
+     * the field carrying its ID, and this surface then copied the wrong
+     * column's values into the output and end-snapshotted the input.
      *
      * [useFieldIds] is the FILE-level gate the reader applies, and the
      * rewriter now applies it too. Without it the two surfaces answered
@@ -892,8 +897,8 @@ object ParquetRewriter {
     ): List<Step?> =
         liveColumns.map { column ->
             val srcIndex =
-                srcFields
-                    .indexOfFirst { FooterStats.bindsTo(it, column.fieldId, column.def.name, useFieldIds) }
+                FooterStats
+                    .bindIndex(srcFields, column.fieldId, column.def.name, useFieldIds)
                     .takeIf { it >= 0 }
                     ?: return@map null
             planNode(srcFields[srcIndex], srcIndex, column, useFieldIds, inputPath)

@@ -20,6 +20,8 @@ import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.SeekableInputStream
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
+import org.apache.parquet.schema.MessageType
+import org.apache.parquet.schema.Type
 import java.nio.file.Files
 import java.nio.file.Path
 
@@ -115,6 +117,10 @@ object NestedAgreement {
                 sink(Finding("reader-raw-throw", "schema=$schema catalog=$catalog", t))
                 return
             }
+
+        // ---- CORRECTNESS, not agreement ----------------------------------
+        checkBindingGroundTruth(catalog, schema, emptyList(), sink)
+        checkReaderReadTheBoundColumn(catalog, schema, footer, allAggs, sink)
 
         val catalogLeafIds = leafIds(catalog)
         val catalogNodeIds = allNodeIds(catalog)
@@ -300,6 +306,136 @@ object NestedAgreement {
                         )
                     }
                 }
+            }
+        }
+    }
+
+    /**
+     * The binding rule, restated from the SPEC and deliberately not
+     * shared with the subject: field ids across all candidates first,
+     * then an exact name match among candidates that declare no id at
+     * all.
+     *
+     * A second, independent statement of the rule is the whole point.
+     * Every other oracle in this file asks whether the two surfaces
+     * AGREE, and agreement stopped being a correctness signal the moment
+     * they were unified behind one implementation: a bug in the shared
+     * rule makes both of them wrong in the same way, and 1.07M
+     * executions saw nothing while an id-less field that merely shared a
+     * column's NAME outranked the field carrying its ID — the reader
+     * bounding one column and compaction copying it into the slot of
+     * another.
+     */
+    private fun expectedBindIndex(
+        fields: List<Type>,
+        fieldId: Long,
+        name: String,
+        useFieldIds: Boolean,
+    ): Int {
+        if (useFieldIds) {
+            for ((i, f) in fields.withIndex()) {
+                if (f.id?.intValue()?.toLong() == fieldId) return i
+            }
+        }
+        for ((i, f) in fields.withIndex()) {
+            if (f.id == null && f.name == name) return i
+        }
+        return -1
+    }
+
+    /**
+     * Every sibling group of the catalog forest, checked against the
+     * file's corresponding group: the subject's binding decision must
+     * equal [expectedBindIndex]'s, at every level.
+     */
+
+    private fun checkBindingGroundTruth(
+        columns: List<CatalogColumn>,
+        group: GroupType,
+        path: List<String>,
+        sink: (Finding) -> Unit,
+    ) {
+        val useFieldIds = FooterStats.usesFieldIds(group as? MessageType ?: return)
+
+        fun walk(
+            cols: List<CatalogColumn>,
+            fields: List<Type>,
+            where: List<String>,
+        ) {
+            for (col in cols) {
+                val want = expectedBindIndex(fields, col.fieldId, col.name, useFieldIds)
+                val got = FooterStats.bindIndex(fields, col.fieldId, col.name, useFieldIds)
+                if (got != want) {
+                    sink(
+                        Finding(
+                            "binding-ground-truth",
+                            "column '${col.name}' (field ${col.fieldId}) at " +
+                                "${if (where.isEmpty()) "<root>" else where.joinToString(".")} " +
+                                "bound index $got, but the rule says $want " +
+                                "(${fields.map { "${it.name}#${it.id?.intValue()}" }}) schema=$group",
+                        ),
+                    )
+                    continue
+                }
+                if (want < 0 || col.children.isEmpty()) continue
+                val bound = fields[want]
+                if (!bound.isPrimitive) {
+                    walk(col.children, bound.asGroupType().fields, where + col.name)
+                }
+            }
+        }
+        walk(columns, group.fields, path)
+    }
+
+    /**
+     * The end-to-end half: for a top-level SCALAR column, the stats row
+     * the reader produced must describe the column the rule says it
+     * bound to — not merely the one the rewriter also chose.
+     *
+     * Counts identify the physical column without touching bound
+     * encodings: two different leaves almost never share a value/null
+     * count under randomly generated data, and when they do the check is
+     * simply not discriminating rather than wrong.
+     */
+    private fun checkReaderReadTheBoundColumn(
+        catalog: List<CatalogColumn>,
+        schema: MessageType,
+        footer: ParquetMetadata,
+        aggs: List<FooterStats.ColumnAgg>,
+        sink: (Finding) -> Unit,
+    ) {
+        val useFieldIds = FooterStats.usesFieldIds(schema)
+        val byId = aggs.associateBy { it.fieldId }
+        for (col in catalog) {
+            if (col.children.isNotEmpty()) continue
+            val agg = byId[col.fieldId] ?: continue
+            val want = expectedBindIndex(schema.fields, col.fieldId, col.name, useFieldIds)
+            if (want < 0) {
+                sink(
+                    Finding(
+                        "stats-for-unbound-column",
+                        "column '${col.name}' (field ${col.fieldId}) binds to nothing, yet the " +
+                            "reader produced a stats row for it; schema=$schema",
+                    ),
+                )
+                continue
+            }
+            val field = schema.fields[want]
+            if (!field.isPrimitive) continue
+            val expectedValues =
+                footer.blocks.sumOf { b ->
+                    b.columns.filter { it.path.toArray().contentEquals(arrayOf(field.name)) }
+                        .sumOf { it.valueCount }
+                }
+            if (expectedValues != agg.valueCount) {
+                sink(
+                    Finding(
+                        "reader-read-the-wrong-column",
+                        "column '${col.name}' (field ${col.fieldId}) should bind to " +
+                            "'${field.name}#${field.id?.intValue()}' ($expectedValues values) but its " +
+                            "stats row counts ${agg.valueCount}; schema=$schema",
+                    ),
+                )
             }
         }
     }

@@ -1,8 +1,10 @@
 package com.posthog.hoglake.fuzz
 
 import com.posthog.hoglake.compaction.InvalidDataException
+import com.posthog.hoglake.compaction.MixedIdBindingRepro
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
@@ -70,6 +72,45 @@ class NestedCampaignRegressionTest {
         assertThat(still)
             .describedAs("campaign findings that came back")
             .isEmpty()
+    }
+
+    // ---- binding: ids outrank names, at every level ----------------------
+
+    @Test
+    fun `an id-less field sharing a name never outranks the field carrying the id`(
+        @TempDir tmp: Path,
+    ) {
+        // Field ids are the binding contract. A file that stamps ids on
+        // only SOME columns — foreign writers, mostly — can hold an
+        // id-less field whose name matches a catalog column while a
+        // different field carries that column's id. The id must win.
+        //
+        // It did, until both surfaces were unified behind a single-pass
+        // scan of the shared PREDICATE, which is first-match-wins by
+        // position: the reader bounded the wrong column and compaction
+        // copied its values into the output, then end-snapshotted the
+        // input. Silent substitution, and identical on both surfaces —
+        // which is exactly what an agreement oracle cannot see.
+        assertThat(MixedIdBindingRepro.run(tmp)).startsWith("CORRECT")
+    }
+
+    @Test
+    fun `the id-before-name search holds inside a struct too`() {
+        val fields =
+            listOf<Type>(
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).named("b"),
+                Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("x"),
+            )
+        // By id: the SECOND field, whatever the order.
+        assertThat(FooterStats.bindIndex(fields, 1, "b", useFieldIds = true)).isEqualTo(1)
+        // With no id-bearing candidate, the id-less name match stands.
+        assertThat(FooterStats.bindIndex(fields, 7, "b", useFieldIds = true)).isEqualTo(0)
+        // An id-BEARING field never answers to a name — that is what
+        // makes a rename safe on an id-bearing file.
+        assertThat(FooterStats.bindIndex(fields, 7, "x", useFieldIds = true)).isEqualTo(-1)
+        // File-level gate off: names only, and still only id-less ones.
+        assertThat(FooterStats.bindIndex(fields, 1, "b", useFieldIds = false)).isEqualTo(0)
+        assertThat(FooterStats.bindIndex(fields, 1, "x", useFieldIds = false)).isEqualTo(-1)
     }
 
     // ---- the reserved column prefix, at every nesting level --------------
