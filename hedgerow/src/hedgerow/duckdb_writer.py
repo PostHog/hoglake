@@ -40,7 +40,13 @@ class DuckDBWriterOptions:
     target_file_bytes: int = 256 * 1024 * 1024
     memory_bytes: int = 512 * 1024 * 1024
     scratch_bytes: int = 8 * 1024 * 1024 * 1024
-    row_group_rows: int = 8192
+    # DuckDB's own default. The previous 8192 mirrored discovery's Arrow
+    # batch size, which is a per-batch memory concern and not an output
+    # layout one: at 8192 a 2M-row file carries 245 row groups and is ~7%
+    # larger than the same data at 122,880 (17 groups), measured. The
+    # trade is coarser row-group pruning for readers of the destination,
+    # which is why it is DuckDB's default rather than something larger.
+    row_group_rows: int = 122_880
 
     def __post_init__(self):
         if min(self.target_file_bytes, self.memory_bytes, self.scratch_bytes) <= 0:
