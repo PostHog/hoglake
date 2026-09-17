@@ -530,7 +530,14 @@ class NestedTypeRewriteRoundTripTest {
         val second = tmp.resolve("rowid-out2.parquet")
         // rowIdStart 0 on purpose: a rewriter that reassigned positionally
         // would renumber these 0..3 and the assertion would catch it.
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(first, 0)), listOf(listColumn), emptyList(), second)
+        ParquetRewriter.rewrite(
+            // `first` is a compaction output; its ids live in the
+            // carrier, so the catalog bit says so here too.
+            listOf(ParquetRewriter.Input(first, 0, null, explicitRowIds = true)),
+            listOf(listColumn),
+            emptyList(),
+            second,
+        )
         assertThat(readRowIds(second)).containsExactly(100, 101, 102, 103)
     }
 

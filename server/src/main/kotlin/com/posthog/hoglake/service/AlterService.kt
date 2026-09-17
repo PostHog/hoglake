@@ -185,9 +185,13 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val parent = op.parent?.let { requireStructParent(state, it) }
         val siblings = parent?.children ?: state.cols
-        val where = if (parent == null) "" else " of struct '${op.parent}'"
+        // CAPPED: reached before ColumnTrees.validate, so the name has
+        // not met the identifier pattern yet.
+        val where = if (parent == null) "" else " of struct '${Identifiers.cap(op.parent)}'"
         if (siblings.any { it.def.name == op.def.name }) {
-            throw HoglakeException.Validation("column '${op.def.name}'$where already exists")
+            throw HoglakeException.Validation(
+                "column '${Identifiers.cap(op.def.name)}'$where already exists",
+            )
         }
         // existingNodes makes the node cap a cap on the POST-GRAFT
         // total. Capping the addition alone would be no cap at all: the
@@ -231,7 +235,9 @@ class AlterService(private val jdbi: Jdbi) {
         val col = located.column
         val parent = located.parent
         if (parent == null && state.cols.size == 1) {
-            throw HoglakeException.Validation("cannot drop '${op.name}': it is the last column")
+            throw HoglakeException.Validation(
+                "cannot drop '${Identifiers.cap(op.name)}': it is the last column",
+            )
         }
         if (parent != null && parent.children.size == 1) {
             throw HoglakeException.Validation(
@@ -273,9 +279,10 @@ class AlterService(private val jdbi: Jdbi) {
         what: String,
     ): String =
         if (sourceFieldId == dropped.fieldId) {
-            "cannot drop column '$path': it is a source of the live $what"
+            "cannot drop column '${Identifiers.cap(path)}': it is a source of the live $what"
         } else {
-            "cannot drop column '$path': field_id $sourceFieldId inside it is a source of the live $what"
+            "cannot drop column '${Identifiers.cap(path)}': field_id $sourceFieldId inside it " +
+                "is a source of the live $what"
         }
 
     private fun renameColumn(
@@ -720,10 +727,15 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         path: String,
     ): Located {
+        // CAPPED throughout. A column PATH is caller input that never
+        // meets Identifiers.validate — its segments are matched against
+        // stored names, not vetted — so nothing bounds its length before
+        // these messages quote it.
+        val shown = Identifiers.cap(path)
         val segments = path.split('.')
         if (segments.any { it.isEmpty() }) {
             throw HoglakeException.Validation(
-                "invalid column path '$path': a path is dot-separated column names, none empty",
+                "invalid column path '$shown': a path is dot-separated column names, none empty",
             )
         }
         var siblings = state.cols
@@ -732,7 +744,7 @@ class AlterService(private val jdbi: Jdbi) {
         for ((i, segment) in segments.withIndex()) {
             if (i > 0) {
                 val container =
-                    current ?: throw HoglakeException.Validation("column '$path' does not exist")
+                    current ?: throw HoglakeException.Validation("column '$shown' does not exist")
                 assertStructInterior(container, segments.take(i).joinToString("."), path)
                 parent = container
                 siblings = container.children
@@ -747,7 +759,7 @@ class AlterService(private val jdbi: Jdbi) {
             val candidates = siblings.filter { it.def.name == segment }
             if (candidates.size > 1) {
                 throw HoglakeException.Validation(
-                    "column path '$path' is ambiguous: ${candidates.size} live columns are named " +
+                    "column path '$shown' is ambiguous: ${candidates.size} live columns are named " +
                         "'$segment' here (field ids ${candidates.map { it.fieldId }.sorted()}); " +
                         "the catalog is inconsistent and this ALTER will not guess",
                 )
@@ -756,9 +768,9 @@ class AlterService(private val jdbi: Jdbi) {
                 candidates.singleOrNull()
                     ?: throw HoglakeException.Validation(
                         if (i == 0) {
-                            "column '$path' does not exist"
+                            "column '$shown' does not exist"
                         } else {
-                            "column '$path' does not exist: struct " +
+                            "column '$shown' does not exist: struct " +
                                 "'${segments.take(i).joinToString(".")}' has no field '$segment'"
                         },
                     )
@@ -785,13 +797,15 @@ class AlterService(private val jdbi: Jdbi) {
         if (container.def.type == ColType.STRUCT) return
         if (container.def.type.isNested) {
             throw HoglakeException.Validation(
-                "cannot address '$fullPath': '$containerPath' is a '${container.def.type.wire}', " +
+                "cannot address '${Identifiers.cap(fullPath)}': " +
+                    "'${Identifiers.cap(containerPath)}' is a '${container.def.type.wire}', " +
                     "and list/map internals (element, key, value) cannot be added, dropped or " +
                     "renamed — only struct fields can",
             )
         }
         throw HoglakeException.Validation(
-            "cannot address '$fullPath': '$containerPath' is '${container.def.type.wire}', not a struct",
+            "cannot address '${Identifiers.cap(fullPath)}': " +
+                "'${Identifiers.cap(containerPath)}' is '${container.def.type.wire}', not a struct",
         )
     }
 
@@ -816,7 +830,8 @@ class AlterService(private val jdbi: Jdbi) {
         val path = chain.joinToString(".") { it.def.name }
         if (col.def.type.isNested) {
             throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('$path') is a '${col.def.type.wire}': a nested " +
+                "$what source field_id $fieldId ('${Identifiers.cap(path)}') is a " +
+                    "'${col.def.type.wire}': a nested " +
                     "container has no single value per row and cannot be a $what source; use one " +
                     "of its leaf fields",
             )
@@ -824,7 +839,8 @@ class AlterService(private val jdbi: Jdbi) {
         val repeated = chain.dropLast(1).firstOrNull { it.def.type == ColType.LIST || it.def.type == ColType.MAP }
         if (repeated != null) {
             throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('$path') sits under '${repeated.def.name}', a " +
+                "$what source field_id $fieldId ('${Identifiers.cap(path)}') sits under " +
+                    "'${repeated.def.name}', a " +
                     "'${repeated.def.type.wire}': a row has many such values, so it cannot be a " +
                     "$what source; struct leaves are the only nested fields that can",
             )

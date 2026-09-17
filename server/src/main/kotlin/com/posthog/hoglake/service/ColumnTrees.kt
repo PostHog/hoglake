@@ -81,8 +81,16 @@ object ColumnTrees {
     ) {
         val dupes = defs.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
         if (dupes.isNotEmpty()) {
-            val where = if (path.isEmpty()) "" else " in '${path.joinToString(".")}'"
-            throw HoglakeException.Validation("duplicate column names$where: ${dupes.sorted()}")
+            // CAPPED. This message is built before any name has reached
+            // Identifiers.validateColumn, so the pattern's 128-character
+            // bound has not applied to any of them yet — the same
+            // argument the decimal-parameter refusal below makes, in the
+            // function that runs first.
+            val where =
+                if (path.isEmpty()) "" else " in '${Identifiers.cap(path.joinToString("."))}'"
+            throw HoglakeException.Validation(
+                "duplicate column names$where: ${dupes.sorted().map { Identifiers.cap(it) }}",
+            )
         }
         for (def in defs) validateNode(def, path, syntheticallyNamed)
     }
@@ -232,7 +240,7 @@ object ColumnTrees {
                     // whole would put a caller-sized blob in an error
                     // response and in every log line that records one.
                     throw HoglakeException.Validation(
-                        "decimal column '$qualified' has a non-integer '$key' (${capped(raw)})",
+                        "decimal column '$qualified' has a non-integer '$key' (${Identifiers.cap(raw)})",
                     )
             }
         if (asLong !in Int.MIN_VALUE.toLong()..Int.MAX_VALUE.toLong()) {
@@ -241,12 +249,6 @@ object ColumnTrees {
             )
         }
         return asLong.toInt()
-    }
-
-    /** A caller-supplied value, capped for an error message. */
-    private fun capped(value: Any): String {
-        val text = value.toString()
-        return if (text.length > 40) text.take(37) + "..." else text
     }
 
     /** The named arity refusal for a container with the wrong child count. */

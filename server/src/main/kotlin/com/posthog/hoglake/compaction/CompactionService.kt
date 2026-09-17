@@ -131,6 +131,19 @@ data class CompactionCandidate(
     val fileSizeBytes: Long,
     val rowIdStart: Long,
     val statsProvided: Boolean,
+    /**
+     * `hog_data_file.explicit_row_ids` — true when this file is a
+     * COMPACTION OUTPUT and carries its row ids in a physical
+     * `_hog_row_id` column, false when its ids are positional from
+     * [rowIdStart].
+     *
+     * The authoritative answer to a question the rewriter was
+     * previously guessing at from the file's own schema. It decides
+     * whether a malformed `_hog_row_id` field is corruption (in a file
+     * hoglake wrote, where the carrier is the identity) or an ordinary
+     * client column that happens to share the name.
+     */
+    val explicitRowIds: Boolean = false,
     /** The file's live DV as planned; the rewrite APPLIES it. Null = none. */
     val dv: LiveDv? = null,
 )
@@ -367,7 +380,7 @@ class CompactionService(
             h.createQuery(
                 """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
-                   f.row_id_start, f.spec_id, f.stats_state,
+                   f.row_id_start, f.spec_id, f.stats_state, f.explicit_row_ids,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count,
                    (SELECT array_agg(pv.value ORDER BY pv.key_index)
                     FROM hog_file_partition_value pv
@@ -396,6 +409,7 @@ class CompactionService(
                             fileSizeBytes = rs.getLong("file_size_bytes"),
                             rowIdStart = rs.getLong("row_id_start"),
                             statsProvided = rs.getString("stats_state") == "provided",
+                            explicitRowIds = rs.getBoolean("explicit_row_ids"),
                             dv =
                                 rs.getObject("dv_id")?.let {
                                     LiveDv(
@@ -638,7 +652,7 @@ class CompactionService(
                             }
                             decoded
                         }
-                    ParquetRewriter.Input(local, f.rowIdStart, dv)
+                    ParquetRewriter.Input(local, f.rowIdStart, dv, f.explicitRowIds)
                 }
             val outLocal = tmpDir.resolve("out.parquet")
             tmpFiles.add(outLocal)

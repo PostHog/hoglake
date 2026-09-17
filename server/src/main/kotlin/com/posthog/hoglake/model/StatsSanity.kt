@@ -158,7 +158,6 @@ object StatsSanity {
      * value, and zero bytes is not a number — the same rule the
      * compaction rewriter enforces on the data itself.
      */
-
     private fun decodable(
         type: ColType,
         bytes: ByteArray,

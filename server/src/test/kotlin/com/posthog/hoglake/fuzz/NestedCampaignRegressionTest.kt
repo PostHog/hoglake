@@ -169,8 +169,9 @@ class NestedCampaignRegressionTest {
         val byName = NestedTargetedProbe.run(tmp).associate { it.name.substringBefore(" ") to it.verdict }
         assertThat(byName.keys).containsExactlyInAnyOrder("B1", "B2", "B3", "B4", "B5", "B6", "B7")
 
-        // A foreign field wearing the reserved name: refusal, both for
-        // the wrong TYPE and the foreign ID.
+        // A compaction output whose carrier carries a foreign field id:
+        // refusal. (B1's field id is 77, so it drives the foreign-id
+        // branch only; the wrong-TYPE branch has its own named test.)
         assertThat(byName["B1"]).contains("UnconvertibleSchemaException")
         // A null in a real carrier is invalid DATA, not a schema fault.
         assertThat(byName["B2"]).contains("InvalidDataException")
@@ -183,8 +184,11 @@ class NestedCampaignRegressionTest {
         // A map whose key id sits on the group only: no stats, and a
         // typed refusal — the two surfaces agreeing to decline.
         assertThat(byName["B5"]).contains("readerStats=[]").contains("UnconvertibleSchemaException")
-        // And the name one level down is nobody's carrier.
-        assertThat(byName["B7"]).contains("no carrier confusion")
+        // And the name one level down is nobody's carrier. Asserted on
+        // the PREFIX: the verdict's phrase alone was reachable by any
+        // exception with a null message, which is exactly the shape B7
+        // regresses to.
+        assertThat(byName["B7"]).startsWith("ACCEPTED")
     }
 
     // ---- binding: ids outrank names, at every level ----------------------
@@ -394,50 +398,6 @@ class NestedCampaignRegressionTest {
     // ---- the row-id carrier binds by reserved id AND type ----------------
 
     @Test
-    fun `a carrier of the wrong physical type is a typed refusal`(
-        @TempDir tmp: Path,
-    ) {
-        val live = listOf(Column(1, 0, ColumnDef("a", ColType.LONG)))
-        // BOTH ways a field can BE the carrier: by the reserved id, and
-        // by the name while declaring no id of its own. A field wearing
-        // the name with a DIFFERENT id is not a candidate at all — that
-        // is its own test below.
-        val candidates =
-            listOf(
-                "by-id" to
-                    Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
-                        .`as`(LogicalTypeAnnotation.stringType())
-                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
-                        .named(ParquetRewriter.ROW_ID_COLUMN),
-                "by-name" to
-                    Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
-                        .`as`(LogicalTypeAnnotation.stringType())
-                        .named(ParquetRewriter.ROW_ID_COLUMN),
-            )
-        for ((label, carrier) in candidates) {
-            val schema =
-                MessageType(
-                    "m",
-                    listOf<Type>(
-                        Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
-                        carrier,
-                    ),
-                )
-            val src = tmp.resolve("wrong-type-$label.parquet")
-            write(schema, src) { f ->
-                val g = f.newGroup()
-                g.add(0, 5L)
-                g.add(1, Binary.fromString("not-a-row-id"))
-                listOf(g)
-            }
-            assertThatThrownBy { rewrite(src, live, tmp.resolve("o1-$label.parquet")) }
-                .describedAs("carrier %s", label)
-                .isInstanceOf(UnconvertibleSchemaException::class.java)
-                .hasMessageContaining("reserved row-id position")
-        }
-    }
-
-    @Test
     fun `a null row id in the carrier is a typed refusal, never a renumber`(
         @TempDir tmp: Path,
     ) {
@@ -458,7 +418,14 @@ class NestedCampaignRegressionTest {
             g.add(0, 5L) // carrier left null
             listOf(g)
         }
-        assertThatThrownBy { rewrite(src, live, tmp.resolve("o2.parquet")) }
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds = true)),
+                live,
+                emptyList(),
+                tmp.resolve("o2.parquet"),
+            )
+        }
             .isInstanceOf(InvalidDataException::class.java)
             .hasMessageContaining("null ${ParquetRewriter.ROW_ID_COLUMN}")
     }
@@ -492,16 +459,19 @@ class NestedCampaignRegressionTest {
     }
 
     @Test
-    fun `a field wearing the reserved name with a foreign id is a refusal`(
+    fun `a client file's _hog_row_id is just a column, and its ids stay positional`(
         @TempDir tmp: Path,
     ) {
-        // Two wrong answers and no right one, so the only honest move is
-        // to refuse. Taking it as the carrier reads a user column's
-        // values as row IDENTITIES; ignoring it renumbers every row in
-        // the file. An earlier version of this test asserted the second
-        // — it checked that the rows took positional ids — which pinned
-        // the silent renumbering the KDoc two files over forbids in so
-        // many words.
+        // explicit_row_ids = false: this file is a client append, so
+        // `rowIdStart + ordinal` IS its server-assigned identity. A
+        // top-level field that happens to be named _hog_row_id is a
+        // client column with an unfortunate name — the DDL reserves the
+        // prefix now, but the commit path never compares a file's schema
+        // to the catalog, so one can be registered.
+        //
+        // Refusing here (which one commit did) wedged every group
+        // containing such a file forever, with no operator lever — the
+        // README calls that "a backlog that will not clear on its own".
         val schema =
             MessageType(
                 "m",
@@ -511,7 +481,7 @@ class NestedCampaignRegressionTest {
                         .named(ParquetRewriter.ROW_ID_COLUMN),
                 ),
             )
-        val src = tmp.resolve("named-carrier.parquet")
+        val src = tmp.resolve("client-named.parquet")
         write(schema, src) { f ->
             (0 until 3).map { i ->
                 f.newGroup().also {
@@ -520,25 +490,82 @@ class NestedCampaignRegressionTest {
                 }
             }
         }
-        assertThatThrownBy {
+        val out =
             ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 5000L, null)),
+                listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = false)),
                 listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                 emptyList(),
-                tmp.resolve("named-carrier-out.parquet"),
+                tmp.resolve("client-named-out.parquet"),
             )
+        assertThat(out.rowsWritten).isEqualTo(3)
+        assertThat(out.minRowId)
+            .describedAs("positional, which is what this file's ids ARE")
+            .isEqualTo(5000L)
+    }
+
+    @Test
+    fun `a compaction output whose carrier is wrong is corruption, not a renumber`(
+        @TempDir tmp: Path,
+    ) {
+        // explicit_row_ids = true: the catalog says hoglake wrote this
+        // file and its identities live in the carrier. Three ways it can
+        // fail to be what the catalog claims, and all three refuse —
+        // falling back to positional numbering would give every row a
+        // different identity from the one it was committed with.
+        val live = listOf(Column(1, 0, ColumnDef("a", ColType.LONG)))
+        val cases =
+            listOf(
+                "absent" to null,
+                "foreign-id" to
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(77)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+                "wrong-type" to
+                    Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                        .`as`(LogicalTypeAnnotation.stringType())
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+            )
+        for ((label, carrier) in cases) {
+            val fields =
+                listOfNotNull(
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+                    carrier,
+                )
+            val schema = MessageType("m", fields)
+            val src = tmp.resolve("compacted-$label.parquet")
+            write(schema, src) { f ->
+                listOf(
+                    f.newGroup().also {
+                        it.add(0, 5L)
+                        if (carrier != null) {
+                            if (carrier.asPrimitiveType().primitiveTypeName ==
+                                PrimitiveType.PrimitiveTypeName.INT64
+                            ) {
+                                it.add(1, 700L)
+                            } else {
+                                it.add(1, Binary.fromString("not-a-row-id"))
+                            }
+                        }
+                    },
+                )
+            }
+            assertThatThrownBy {
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = true)),
+                    live,
+                    emptyList(),
+                    tmp.resolve("compacted-$label-out.parquet"),
+                )
+            }.describedAs("carrier %s", label).isInstanceOf(UnconvertibleSchemaException::class.java)
         }
-            .isInstanceOf(UnconvertibleSchemaException::class.java)
-            .hasMessageContaining("not the reserved ${ParquetRewriter.ROW_ID_FIELD_ID}")
     }
 
     @Test
     fun `a real carrier still works, by id and by name`(
         @TempDir tmp: Path,
     ) {
-        // The refusal above must not swallow the two legal shapes: the
-        // reserved id (every compaction output this project writes), and
-        // the bare name with no id at all (what the hydrator tolerates).
+        // The two legal shapes for a compaction output: the reserved id
+        // (what this project writes) and the bare name with no id.
         for ((label, carrier) in listOf(
             "by-id" to
                 Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
@@ -567,7 +594,7 @@ class NestedCampaignRegressionTest {
             }
             val out =
                 ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 5000L, null)),
+                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = true)),
                     listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                     emptyList(),
                     tmp.resolve("carrier-$label-out.parquet"),
@@ -839,6 +866,40 @@ class NestedCampaignRegressionTest {
                 .describedAs("message for %s...", blob.take(60))
                 .isLessThan(400)
         }
+    }
+
+    @Test
+    fun `a 422 built before name validation still caps the caller's name`() {
+        // The sibling of the decimal-parameter cap, in the function that
+        // runs FIRST. validateSiblings emits the duplicate-name refusal
+        // before any name has reached Identifiers.validateColumn, so the
+        // pattern's 128-character bound has not applied to a single one
+        // of them yet. Measured before the fix: 5,026 characters for two
+        // top-level columns, 5,033 inside a struct.
+        val huge = "z".repeat(5_000)
+        val top =
+            catchThrowable {
+                ColumnTrees.validate(
+                    listOf(ColumnDef(huge, ColType.LONG), ColumnDef(huge, ColType.LONG)),
+                )
+            }
+        assertThat(top).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(top.message!!.length).describedAs("top level").isLessThan(200)
+
+        val nested =
+            catchThrowable {
+                ColumnTrees.validate(
+                    listOf(
+                        ColumnDef(
+                            huge,
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef(huge, ColType.LONG), ColumnDef(huge, ColType.LONG)),
+                        ),
+                    ),
+                )
+            }
+        assertThat(nested).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(nested.message!!.length).describedAs("inside a struct").isLessThan(200)
     }
 
     @Test

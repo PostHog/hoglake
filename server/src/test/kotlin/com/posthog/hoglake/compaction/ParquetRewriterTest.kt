@@ -729,7 +729,15 @@ class ParquetRewriterTest {
         // Second pass: rowIdStart deliberately WRONG (0) — the ids must come
         // from the file's own _hog_row_id column, not position.
         val out2 = tmp.resolve("second.parquet")
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(out1, 0)), liveColumns, emptyList(), out2)
+        ParquetRewriter.rewrite(
+            // out1 is a compaction OUTPUT: the catalog row for it
+            // carries explicit_row_ids, so the rewriter must be told
+            // the same or it will renumber positionally.
+            listOf(ParquetRewriter.Input(out1, 0, null, explicitRowIds = true)),
+            liveColumns,
+            emptyList(),
+            out2,
+        )
         val (schema, rows) = readOutput(out2)
         assertThat(rows.map { it.rowId }).containsExactly(40L, 41L)
         // And the schema still has exactly one row-id column.
@@ -752,7 +760,7 @@ class ParquetRewriterTest {
         val out2 = tmp.resolve("rd-second.parquet")
         val result =
             ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(out1, 0, dv(0))),
+                listOf(ParquetRewriter.Input(out1, 0, dv(0), explicitRowIds = true)),
                 liveColumns,
                 emptyList(),
                 out2,

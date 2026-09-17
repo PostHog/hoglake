@@ -36,6 +36,23 @@ object Identifiers {
 
     private val regex = Regex(PATTERN)
 
+    /**
+     * A caller-supplied fragment, capped for an error message.
+     *
+     * THE one place this is defined, because it is needed wherever a
+     * message is built BEFORE [validate] has run — and those are exactly
+     * the places that forget. A duplicate-name refusal, an
+     * already-exists refusal and a decimal parameter all quote a name
+     * the identifier policy has not yet vetted, so "names are bounded by
+     * the pattern" is not yet true when the message is assembled.
+     * Measured: two top-level columns named `"z" * 5000` produced a
+     * 5,026-character 422 body, and one inside a struct 5,033.
+     */
+    fun cap(value: Any?): String {
+        val text = value.toString()
+        return if (text.length > 40) text.take(37) + "..." else text
+    }
+
     /** Validate [name] as a [kind] identifier; violation -> Validation (422). */
     fun validate(
         kind: String,

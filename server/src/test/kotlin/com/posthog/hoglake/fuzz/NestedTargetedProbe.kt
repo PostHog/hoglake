@@ -152,9 +152,22 @@ object NestedTargetedProbe {
             listOf(g)
         }
         val t = rewriteCatching(src, live, tmp.resolve("b7-out.parquet"))
+        // The elvis goes on `t`, not on its MESSAGE. Written the other
+        // way, any exception with a null message produced
+        // "<ExceptionName>: no carrier confusion" — and B7's regression
+        // shape is precisely an untyped crash from inside parquet-java,
+        // where NPE, ISE and StackOverflowError all arrive with no
+        // message at all. (That is what `-XX:-OmitStackTraceInFastThrow`
+        // in the fuzz tasks is about.) The assertion downstream keyed on
+        // that phrase, so the one test covering this finding could not
+        // fail.
         say(
             "B7 _hog_row_id as a STRUCT field",
-            "${t?.javaClass?.simpleName ?: "ACCEPTED"}: ${t?.message?.take(160) ?: "no carrier confusion"}",
+            if (t == null) {
+                "ACCEPTED: no carrier confusion"
+            } else {
+                "${t.javaClass.simpleName}: ${t.message?.take(160) ?: "<no message>"}"
+            },
         )
     }
 
@@ -185,7 +198,10 @@ object NestedTargetedProbe {
             g.add(1, Binary.fromString("not-a-row-id"))
             listOf(g)
         }
-        val t = rewriteCatching(src, live, tmp.resolve("b1-out.parquet"))
+        // explicit_row_ids: the catalog says this is a compaction
+        // output, so its carrier is its identity and a malformed one is
+        // corruption rather than an ordinary client column.
+        val t = rewriteCatching(src, live, tmp.resolve("b1-out.parquet"), explicitRowIds = true)
         say(
             "B1 foreign _hog_row_id column of the wrong physical type",
             "${t?.javaClass?.name ?: "ACCEPTED"}: ${t?.message} @ " +
@@ -212,7 +228,7 @@ object NestedTargetedProbe {
             g.add(0, 5L) // _hog_row_id left NULL
             listOf(g)
         }
-        val t = rewriteCatching(src, live, tmp.resolve("b2-out.parquet"))
+        val t = rewriteCatching(src, live, tmp.resolve("b2-out.parquet"), explicitRowIds = true)
         say(
             "B2 NULL _hog_row_id carrier value",
             "${t?.javaClass?.name ?: "ACCEPTED"}: ${t?.message} @ " +
@@ -427,9 +443,15 @@ object NestedTargetedProbe {
         src: Path,
         live: List<Column>,
         out: Path,
+        explicitRowIds: Boolean = false,
     ): Throwable? =
         try {
-            ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds)),
+                live,
+                emptyList(),
+                out,
+            )
             null
         } catch (t: Throwable) {
             t
