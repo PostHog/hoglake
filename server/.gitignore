@@ -4,6 +4,11 @@ build/
 # jazzer's growing generated corpus (the fuzz task); committed seeds live
 # in src/test/resources/com/posthog/hoglake/fuzz instead.
 .cifuzz-corpus/
+# the nestedSoak runner's snapshot of the current campaign — a working
+# artifact of one run, written into the working directory, never a
+# repo file. It was committed once by accident.
+findings.txt
+test-classpath.txt
 *.log
 .flox/run/
 .flox/cache/

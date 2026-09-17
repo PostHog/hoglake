@@ -214,6 +214,29 @@ tasks.register<JavaExec>("nestedSoak") {
     )
 }
 
+// The soak FLEET: `nestedSoak` is one JVM, and one JVM saturates one of
+// twelve cores. A real campaign partitions the seed space across ~9-10
+// detached workers, which needs the test classpath as a plain file so a
+// worker can be launched without Gradle (a Gradle daemon per worker
+// would spend the cores on Gradle).
+//
+//   ./gradlew writeTestClasspath
+//   for w in 0 1 2 ...; do
+//     java -cp "$(cat build/test-classpath.txt)" \
+//       com.posthog.hoglake.fuzz.NestedFuzzSoak agreement $from $to 1400 90 true &
+//   done
+tasks.register("writeTestClasspath") {
+    description = "Write the test runtime classpath to build/test-classpath.txt (soak fleet)"
+    group = "verification"
+    val cp = sourceSets.test.get().runtimeClasspath
+    val out = layout.buildDirectory.file("test-classpath.txt")
+    dependsOn(cp)
+    outputs.file(out)
+    doLast {
+        out.get().asFile.writeText(cp.asPath)
+    }
+}
+
 // One-shot (manual) seed-corpus generator: writes the committed corpus under
 // src/test/resources/com/posthog/hoglake/fuzz from the cross-language vector
 // file plus freshly built parquet footers / puffin DV blobs. Rerun only when
