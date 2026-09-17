@@ -97,6 +97,7 @@ class QeBoundsDecodeVectorsTest {
         decoded: Any,
     ): Boolean =
         when (type) {
+            ColType.VARIANT -> error("VARIANT has no scalar bounds vector")
             ColType.BOOLEAN -> decoded == value.toBooleanStrict()
             ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16,
             ColType.INT, ColType.DATE,

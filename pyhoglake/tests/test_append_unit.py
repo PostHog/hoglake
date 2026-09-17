@@ -525,3 +525,39 @@ def test_prepared_seconds_timestamp_preserves_schema_guards(
         assert request["appends"][0]["files"][0]["record_count"] == 1
         uploaded = pq.read_table(io.BytesIO(next(iter(fake_s3.files.values()))))
         assert uploaded["created_at"].to_pylist() == [datetime(2026, 1, 1)]
+
+
+def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_s3):
+    from pathlib import Path
+
+    from pyhoglake.models import TableInfo
+
+    path = Path(__file__).parent / "data" / "native_variant.parquet"
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            TABLE_WIRE["columns"][0],
+            {
+                "name": "properties",
+                "type": "variant",
+                "field_id": 2,
+                "ordinal": 1,
+                "nullable": False,
+            },
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    request = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    stats = request["appends"][0]["files"][0]["column_stats"]
+    assert [stat["field_id"] for stat in stats] == [1]

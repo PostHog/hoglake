@@ -66,6 +66,7 @@ class IcebergSingleValueCompareFuzzTest {
         data: FuzzedDataProvider,
     ): Any? =
         when (type) {
+            ColType.VARIANT -> null
             ColType.BOOLEAN -> data.consumeBoolean()
             // Every int-mapped type shares the 4-byte encoding, so the
             // generator is the same Int for all of them; the codec does no

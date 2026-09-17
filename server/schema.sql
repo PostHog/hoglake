@@ -175,7 +175,7 @@ CREATE TABLE hog_column (
                        'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
                        'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
                        'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
-                       'timestamptz', 'string', 'json', 'uuid', 'binary')),
+                       'timestamptz', 'string', 'json', 'uuid', 'binary', 'variant')),
     type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
     nullable       boolean NOT NULL DEFAULT true,
     ordinal        int    NOT NULL CHECK (ordinal >= 0),

@@ -8,9 +8,10 @@ converts explicitly named JSON columns to native VARIANT, sorts by
 Parquet with explicit top-level field IDs. UUIDs are preserved, never generated.
 
 This is a standalone library component. It does not upload or publish files and
-is not wired into `BufferedIngestion` or the CLI. The catalog still rejects
-VARIANT. Catalog types, footer validation/statistics, compaction and query-engine
-interoperability must be implemented before native VARIANT publication is enabled.
+is not wired into `BufferedIngestion` or the CLI. The catalog accepts VARIANT and
+pyhoglake can publish these files through `prepare_append_files` without rewriting
+them. VARIANT tables are excluded from scalar compaction; query-engine
+interoperability and coordinator wiring remain separate work.
 The existing coordinator and CLI retain their current behavior.
 
 ```python
@@ -51,8 +52,11 @@ paths = write_duckdb_event_partition(
 - Only explicitly named JSON/VARCHAR columns are converted. Existing VARIANT
   payloads pass through DuckDB, including native nested values. Other projected
   payloads retain their DuckDB types. This is not catalog schema validation.
-- Top-level JSON `null` is rejected: DuckDB's conversion makes it SQL NULL.
-  SQL NULL and nested JSON nulls are supported. Invalid JSON and malformed UUIDs
+- Top-level nulls in VARIANT output are rejected: DuckDB conflates SQL NULL
+  and VARIANT null, and its writer encodes SQL NULL as a non-null VARIANT group
+  containing null. This applies to converted JSON/VARCHAR and existing VARIANT
+  columns. Nested nulls are supported; nulls in other output types are unchanged.
+  Invalid JSON and malformed UUIDs
   fail rather than being replaced with nulls. Conversion follows DuckDB JSON
   numeric semantics; arbitrary-precision JSON numbers are not promised.
 - Row-group selection uses file-row-number ranges. Correct selection is tested;
@@ -72,7 +76,9 @@ compatibility probe failed at 64 MB and completed with disk spilling at 128 MB,
 but reported about 223 MB peak buffer memory. Use process/container limits and
 measure realistic workloads before choosing production concurrency.
 
-Private scratch and unvalidated output are removed on failure. Validated output
+Private scratch and unvalidated output are removed on failure. If moving validated
+files into the output directory fails, already moved files are removed so the
+caller can retry with an empty directory. Validated output
 files are returned in numeric file sequence, which preserves the physical sort
 across file rolling. Consumers must use that order, not a lexical glob order.
 

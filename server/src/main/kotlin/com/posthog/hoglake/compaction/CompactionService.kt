@@ -271,6 +271,10 @@ class CompactionService(
         ctx: TableContext,
         cfg: CompactionConfig,
     ): List<CompactionGroup> {
+        // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
+        // work that could drop payloads or repeatedly fail the maintenance loop.
+        if (ctx.columns.any { it.def.type == ColType.VARIANT }) return emptyList()
+
         data class Bucket(val specId: Long?, val values: List<String?>?)
 
         data class Row(val candidate: CompactionCandidate, val bucket: Bucket)

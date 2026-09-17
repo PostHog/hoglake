@@ -423,6 +423,9 @@ class AlterService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.Validation(
                         "partition source field_id ${f.sourceFieldId} is not a live column",
                     )
+            if (col.def.type == ColType.VARIANT) {
+                throw HoglakeException.Validation("variant columns cannot be partition sources")
+            }
             when (f.transform) {
                 Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -538,6 +541,9 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val seen = HashSet<Long>()
         for (f in op.fields) {
+            if (state.cols.any { it.fieldId == f.sourceFieldId && it.def.type == ColType.VARIANT }) {
+                throw HoglakeException.Validation("variant columns cannot be sort sources")
+            }
             if (state.cols.none { it.fieldId == f.sourceFieldId }) {
                 throw HoglakeException.Validation(
                     "sort source field_id ${f.sourceFieldId} is not a live column",

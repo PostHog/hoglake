@@ -79,16 +79,23 @@ object FooterStats {
 
     /**
      * Whether [aggregate] will map columns by field id for this schema:
-     * true when any top-level primitive leaf carries a `PARQUET:field_id`
+     * true when any top-level primitive leaf or VARIANT group carries a `PARQUET:field_id`
      * (the same signal aggregate keys off). False = the name-fallback
      * path, whose column set the hydrator must resolve at the FILE's
      * begin_snapshot, not live-at-hydration.
      */
-    fun usesFieldIds(schema: MessageType): Boolean = topLevelLeaves(schema).any { it.fieldId != null }
+    fun usesFieldIds(schema: MessageType): Boolean =
+        topLevelLeaves(schema).any { it.fieldId != null } ||
+            schema.fields.any {
+                it.logicalTypeAnnotation is LogicalTypeAnnotation.VariantLogicalTypeAnnotation && it.id != null
+            }
 
     private fun anyLeafWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
-            if (field.isPrimitive) {
+            if (
+                field.isPrimitive ||
+                field.logicalTypeAnnotation is LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+            ) {
                 field.id == null
             } else {
                 anyLeafWithoutId(field.asGroupType().fields)
@@ -100,9 +107,24 @@ object FooterStats {
         columns: List<CatalogColumn>,
         filePath: String,
     ): List<ColumnAgg> {
+        val schema = footer.fileMetaData.schema
+        val useIds = usesFieldIds(schema)
+        for (col in columns) {
+            val field =
+                schema.fields.find {
+                    if (useIds) it.id?.intValue()?.toLong() == col.fieldId else it.name == col.name
+                } ?: continue // column may have been added after this file
+            if (col.type == ColType.VARIANT) {
+                validateVariant(field)
+            } else {
+                require(field.logicalTypeAnnotation !is LogicalTypeAnnotation.VariantLogicalTypeAnnotation) {
+                    "native VARIANT cannot bind to scalar column ${col.name}"
+                }
+            }
+        }
         val leaves = topLevelLeaves(footer.fileMetaData.schema)
         val byName = leaves.associateBy { it.name }
-        val useFieldIds = leaves.any { it.fieldId != null }
+        val useFieldIds = usesFieldIds(schema)
         val byFieldId = leaves.filter { it.fieldId != null }.associateBy { it.fieldId!! }
         if (!useFieldIds && columns.isNotEmpty()) {
             log.warn {
@@ -113,6 +135,7 @@ object FooterStats {
 
         val out = ArrayList<ColumnAgg>(columns.size)
         for (col in columns) {
+            if (col.type == ColType.VARIANT) continue // no trustworthy scalar counts/bounds
             val leaf =
                 if (useFieldIds) {
                     byFieldId[Math.toIntExact(col.fieldId)]
@@ -128,6 +151,28 @@ object FooterStats {
             aggregateColumn(footer.blocks, col, leaf, filePath)?.let(out::add)
         }
         return out
+    }
+
+    private fun validateVariant(field: Type) {
+        val annotation = field.logicalTypeAnnotation as? LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+        require(!field.isPrimitive && annotation != null && annotation.specVersion.toInt() == 1) {
+            "${field.name} must be native Parquet VARIANT version 1"
+        }
+        val children = field.asGroupType().fields
+        val metadata = children.find { it.name == "metadata" }
+        val value = children.find { it.name == "value" }
+
+        fun binary(type: Type?): Boolean =
+            type != null && type.isPrimitive &&
+                type.asPrimitiveType().primitiveTypeName == PrimitiveType.PrimitiveTypeName.BINARY
+        require(
+            !field.isRepetition(Type.Repetition.REPEATED) &&
+                children.map { it.name }.distinct().size == children.size &&
+                children.all { it.name in setOf("metadata", "value", "typed_value") } &&
+                binary(metadata) && metadata!!.isRepetition(Type.Repetition.REQUIRED) &&
+                (value != null || children.any { it.name == "typed_value" }) &&
+                (value == null || (binary(value) && !value.isRepetition(Type.Repetition.REPEATED))),
+        ) { "invalid native VARIANT storage for ${field.name}" }
     }
 
     private fun aggregateColumn(
@@ -253,6 +298,7 @@ object FooterStats {
         }
 
         return when (col.type) {
+            ColType.VARIANT -> null
             ColType.BOOLEAN ->
                 if (physical == PrimitiveType.PrimitiveTypeName.BOOLEAN && raw.size == 1) {
                     raw[0] != 0.toByte()
@@ -507,6 +553,7 @@ object FooterStats {
         v: Any,
     ): ByteArray =
         when (type) {
+            ColType.VARIANT -> error("variant has no scalar bounds")
             // These four decode to raw bytes that ARE the Iceberg encoding.
             ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
             else -> IcebergSingleValue.encode(type, v)
@@ -519,6 +566,7 @@ object FooterStats {
         b: Any,
     ): Int =
         when (type) {
+            ColType.VARIANT -> error("variant has no scalar bounds")
             ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY ->
                 java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
             // uint32 decodes to a non-negative Long and uint64 to a
