@@ -35,6 +35,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.LongStream;
+import java.util.stream.Stream;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -75,6 +76,18 @@ class HoglakeTrinoIntegrationTest
 
     /** A vector over every row of {@code fully_deleted_events}' one file. */
     private static final List<Long> ALL_POSITIONS = LongStream.range(0, ROWS).boxed().toList();
+
+    /** Tables created up front, before the connector is ever queried. */
+    private static final List<String> SEEDED_TABLES = List.of(
+            "events",
+            "deleted_events",
+            "fully_deleted_events",
+            "mismatched_dv_events",
+            "misreferenced_dv_events",
+            "multi_file_events");
+
+    /** Tables the schema-evolution tests create as they run. */
+    private static final List<String> EVOLVED_TABLES = List.of("renamed_events", "int_events");
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
@@ -129,10 +142,13 @@ class HoglakeTrinoIntegrationTest
     {
         try (S3Client s3 = s3Client()) {
             s3.createBucket(b -> b.bucket(BUCKET));
-            for (String table : List.of("events", "deleted_events", "fully_deleted_events", "mismatched_dv_events")) {
+            for (String table : SEEDED_TABLES) {
                 s3.putObject(b -> b.bucket(BUCKET).key(table + "/part-0.parquet"),
                         RequestBody.fromBytes(parquet));
             }
+            // multi_file_events gets a second, byte-identical file.
+            s3.putObject(b -> b.bucket(BUCKET).key("multi_file_events/part-1.parquet"),
+                    RequestBody.fromBytes(parquet));
         }
     }
 
@@ -154,7 +170,7 @@ class HoglakeTrinoIntegrationTest
         }
     }
 
-    /** Catalog + namespace + the four seeded tables; commits with footer stats. */
+    /** Catalog + namespace + the seeded tables; commits with footer stats. */
     private static void seedCatalog(long fileSize)
             throws Exception
     {
@@ -162,18 +178,24 @@ class HoglakeTrinoIntegrationTest
                 "{\"name\": \"lake\", \"data_path\": \"s3://" + BUCKET + "/\"}", 201);
         post("/v1/catalogs/lake/namespaces", "{\"name\": \"analytics\"}", 201);
 
-        createTable("events");
-        createTable("deleted_events");
-        createTable("fully_deleted_events");
-        createTable("mismatched_dv_events");
+        for (String table : SEEDED_TABLES) {
+            createTable(table);
+        }
 
-        commitAppend("events", "s3://" + BUCKET + "/events/part-0.parquet", fileSize);
+        commitAppend("events", s3("events/part-0.parquet"), fileSize);
         seedDeletionVector("deleted_events", fileSize, DELETED_POSITIONS, DELETED_POSITIONS.size());
         seedDeletionVector("fully_deleted_events", fileSize, ALL_POSITIONS, ALL_POSITIONS.size());
         // A vector the catalog misdescribes: the bitmap deletes three rows,
         // the registration claims four. The server never opens DV files, so
         // it accepts the registration and only the reader can catch it.
         seedDeletionVector("mismatched_dv_events", fileSize, List.of(1L, 2L, 3L), 4);
+        seedMisreferencedDeletionVector(fileSize);
+        seedMultiFileTable(fileSize);
+    }
+
+    private static String s3(String key)
+    {
+        return "s3://" + BUCKET + "/" + key;
     }
 
     /**
@@ -191,15 +213,58 @@ class HoglakeTrinoIntegrationTest
             String table, long dataFileSize, List<Long> positions, int declaredDeleteCount)
             throws Exception
     {
-        String dataFilePath = "s3://" + BUCKET + "/" + table + "/part-0.parquet";
+        String dataFilePath = s3(table + "/part-0.parquet");
         long snapshot = commitAppend(table, dataFilePath, dataFileSize);
+        registerDeletionVector(table, snapshot, dataFilePath, table + "/part-0.dv",
+                TestPuffin.deletionVector(dataFilePath, positions), declaredDeleteCount);
+    }
 
-        byte[] vector = TestPuffin.deletionVector(dataFilePath, positions);
-        uploadObject(table + "/part-0.dv", vector);
+    /**
+     * A vector whose blob names a data file it was not registered against —
+     * another table's file entirely. Its cardinality agrees with the
+     * registration, so the pairing is the only thing wrong, and the blob's
+     * {@code referenced-data-file} is the only thing that can catch it.
+     */
+    private static void seedMisreferencedDeletionVector(long fileSize)
+            throws Exception
+    {
+        String table = "misreferenced_dv_events";
+        String dataFilePath = s3(table + "/part-0.parquet");
+        long snapshot = commitAppend(table, dataFilePath, fileSize);
+        registerDeletionVector(table, snapshot, dataFilePath, table + "/part-0.dv",
+                TestPuffin.deletionVector(s3("events/part-0.parquet"), List.of(1L, 2L, 3L)), 3);
+    }
 
-        long dataFileId = JSON.readTree(
-                get("/v1/catalogs/lake/namespaces/analytics/tables/" + table + "/files"))
-                .get(0).get("data_file_id").asLong();
+    /**
+     * Two identical appends of the same 25-row fixture, with a vector over
+     * the SECOND file only. This is the one fixture where file-relative and
+     * table-global row numbering differ: every other table in this suite
+     * holds exactly one file starting at position 0, where the two
+     * numberings are identical and neither can be distinguished from the
+     * other. Production tables are always multi-file.
+     */
+    private static void seedMultiFileTable(long fileSize)
+            throws Exception
+    {
+        String table = "multi_file_events";
+        commitAppend(table, s3(table + "/part-0.parquet"), fileSize);
+        String second = s3(table + "/part-1.parquet");
+        long snapshot = commitAppend(table, second, fileSize);
+        registerDeletionVector(table, snapshot, second, table + "/part-1.dv",
+                TestPuffin.deletionVector(second, DELETED_POSITIONS), DELETED_POSITIONS.size());
+    }
+
+    /** Uploads a vector's bytes and registers it against one data file. */
+    private static void registerDeletionVector(
+            String table,
+            long snapshot,
+            String dataFilePath,
+            String vectorKey,
+            byte[] vector,
+            int declaredDeleteCount)
+            throws Exception
+    {
+        uploadObject(vectorKey, vector);
         post("/v1/catalogs/lake/commit",
                 """
                 {
@@ -208,14 +273,28 @@ class HoglakeTrinoIntegrationTest
                     "namespace": "analytics", "table": "%s",
                     "files": [{
                       "data_file_id": %d,
-                      "path": "s3://%s/%s/part-0.dv",
+                      "path": "%s",
                       "delete_count": %d,
                       "file_size_bytes": %d
                     }]
                   }]
                 }
-                """.formatted(snapshot, table, dataFileId, BUCKET, table, declaredDeleteCount, vector.length),
+                """.formatted(snapshot, table, dataFileId(table, dataFilePath), s3(vectorKey),
+                        declaredDeleteCount, vector.length),
                 200);
+    }
+
+    /** The catalog's id for {@code table}'s registered file at {@code path}. */
+    private static long dataFileId(String table, String path)
+            throws Exception
+    {
+        for (JsonNode file : JSON.readTree(
+                get("/v1/catalogs/lake/namespaces/analytics/tables/" + table + "/files"))) {
+            if (path.equals(file.get("path").asText())) {
+                return file.get("data_file_id").asLong();
+            }
+        }
+        throw new IllegalStateException("no data file " + path + " registered for " + table);
     }
 
     private static void createTable(String name)
@@ -372,11 +451,18 @@ class HoglakeTrinoIntegrationTest
     void showTablesSeesHoglakeTables()
             throws Exception
     {
-        // The seeded set. Two more tables are created by the schema-evolution
-        // tests, so this asserts containment, not the whole schema.
-        assertThat(query("SHOW TABLES FROM hoglake.analytics"))
-                .extracting(row -> row.get("Table"))
-                .contains("events", "deleted_events", "fully_deleted_events", "mismatched_dv_events");
+        List<Object> tables = query("SHOW TABLES FROM hoglake.analytics").stream()
+                .map(row -> row.get("Table"))
+                .toList();
+        // Every seeded table is listed. The schema-evolution tests create two
+        // more as they run, so an exact match here would depend on test
+        // order — but containment alone would not notice the connector
+        // LEAKING a table, which matters now that it can CREATE TABLE. The
+        // subset bound catches that without the order dependency: nothing
+        // may appear here that this harness did not create.
+        assertThat(tables).containsAll(SEEDED_TABLES);
+        assertThat(tables).isSubsetOf(
+                Stream.concat(SEEDED_TABLES.stream(), EVOLVED_TABLES.stream()).toArray());
     }
 
     @Test
@@ -422,9 +508,10 @@ class HoglakeTrinoIntegrationTest
     void filteredProjection()
             throws Exception
     {
-        // The connector pushes the predicate into Parquet row-group pruning
-        // and Trino re-applies it above the scan; either way the answer is
-        // the same, which is what this asserts.
+        // This asserts the result only. Where the predicate is evaluated is
+        // not observable from here: the connector pushes it into Parquet
+        // row-group pruning (PostHog/trino f3bddd3) and Trino re-applies it
+        // above the scan, and the answer is the same either way.
         assertThat(query("SELECT name, score FROM hoglake.analytics.events WHERE id = 7"))
                 .singleElement()
                 .satisfies(row -> {
@@ -638,23 +725,112 @@ class HoglakeTrinoIntegrationTest
     }
 
     /**
-     * The one refusal that is still the connector's behavior, and the wire
-     * contract behind it: {@code delete_count} on the scan's delete file
-     * must equal the vector's real cardinality. The catalog never opens DV
-     * files, so only the reader can catch a disagreement — and it must,
-     * because silently preferring either number would return a row count
-     * no writer ever wrote. This also proves the metadata-count path reads
-     * the vector rather than trusting {@code delete_count} alone.
+     * Deleted positions are ordinals inside their OWN data file, not row
+     * numbers of the table. Every other fixture here holds one file
+     * starting at position 0, where the two numberings coincide and no
+     * assertion can tell them apart; {@code multi_file_events} holds two
+     * byte-identical files with the vector on the second, which is the case
+     * that separates them. Production tables are always multi-file.
+     */
+    @Test
+    void deletionVectorPositionsAreRelativeToTheirOwnFile()
+            throws Exception
+    {
+        // 50 physical rows, 7 deleted from the second file. Read as
+        // table-global ordinals the vector's positions would all land in the
+        // FIRST file's range, delete nothing from the file it is paired
+        // with, and leave 50.
+        long surviving = ROWS + SURVIVING_IDS.size();
+        assertThat(query("SELECT count(id) AS n FROM hoglake.analytics.multi_file_events"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.get("n")).isEqualTo(surviving));
+        // The metadata-count path agrees; it subtracts delete_count and so
+        // cannot distinguish the two numberings on its own.
+        assertThat(query("SELECT count(*) AS n FROM hoglake.analytics.multi_file_events"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.get("n")).isEqualTo(surviving));
+        // Each id appears once per file, so a deleted id drops to a single
+        // copy and an undeleted neighbour keeps both. Table-global numbering
+        // answers 2 for each.
+        assertThat(query("SELECT count(*) AS n FROM hoglake.analytics.multi_file_events WHERE id = 13"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.get("n")).isEqualTo(1L));
+        assertThat(query("SELECT count(*) AS n FROM hoglake.analytics.multi_file_events WHERE id = 12"))
+                .singleElement()
+                .satisfies(row -> assertThat(row.get("n")).isEqualTo(2L));
+    }
+
+    /**
+     * A vector whose blob names a different data file than the one the scan
+     * paired it with fails the query. The catalog never opens DV files, so
+     * the blob's {@code referenced-data-file} is the only thing that can
+     * catch a mispairing before rows are deleted from the wrong file.
+     */
+    @Test
+    void deletionVectorNamingAnotherDataFileFailsTheQuery()
+    {
+        assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.misreferenced_dv_events"))
+                .isInstanceOf(SQLException.class)
+                .satisfies(failure -> {
+                    assertDeletionVectorRejected(failure, "misreferenced_dv_events/part-0.dv");
+                    // Named in full: "events/part-0.parquet" is a suffix of
+                    // this table's own file name too.
+                    assertThat(failure).hasMessageContaining(s3("events/part-0.parquet"));
+                });
+    }
+
+    /**
+     * The other refusal that is still the connector's behavior, and the
+     * wire contract behind it: {@code delete_count} on the scan's delete
+     * file must equal the vector's real cardinality. The catalog never
+     * opens DV files, so only the reader can catch a disagreement — and it
+     * must, because silently preferring either number would return a row
+     * count no writer ever wrote. This is also the only assertion in the
+     * suite that proves the metadata-count path decodes the bitmap instead
+     * of trusting {@code delete_count}: were it trusting, the first query
+     * would happily answer 21.
      */
     @Test
     void deletionVectorDisagreeingWithTheCatalogFailsTheQuery()
     {
         assertThatThrownBy(() -> query("SELECT count(*) AS n FROM hoglake.analytics.mismatched_dv_events"))
                 .isInstanceOf(SQLException.class)
-                .hasMessageContaining("the catalog reports 4 deleted rows but the vector deletes 3");
+                .satisfies(failure -> assertDeletionVectorRejected(
+                        failure, "mismatched_dv_events/part-0.dv", 4, 3));
         assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.mismatched_dv_events"))
                 .isInstanceOf(SQLException.class)
-                .hasMessageContaining("the catalog reports 4 deleted rows but the vector deletes 3");
+                .satisfies(failure -> assertDeletionVectorRejected(
+                        failure, "mismatched_dv_events/part-0.dv", 4, 3));
+    }
+
+    /**
+     * Asserts a query failed because the connector rejected a deletion
+     * vector, without pinning the fork's wording for it.
+     *
+     * <p>Only the load-bearing half is checked: that the failure is about a
+     * deletion vector, that it names the object hoglake registered, and
+     * that it quotes the values it is comparing. The sentence around those
+     * belongs to PostHog/trino, and this harness runs against whatever
+     * image is newest at run time — so an exact-sentence match would turn a
+     * cosmetic reword there into a red build on an unrelated hoglake PR,
+     * with a diff that looks like a regression. That is the same mistake as
+     * the DV-refusal assertion this suite replaced.
+     */
+    private static void assertDeletionVectorRejected(
+            Throwable failure, String vectorKey, long... values)
+    {
+        String message = String.valueOf(failure.getMessage());
+        assertThat(message).containsIgnoringCase("deletion vector").contains(vectorKey);
+        for (long value : values) {
+            // A free-standing number, not a digit embedded in a word. The
+            // letter in the lookbehind matters: without it the "3" of
+            // "s3://" satisfies any assertion looking for a bare 3, which
+            // made this check pass against an image that does not read
+            // vectors at all.
+            assertThat(message)
+                    .as("value %d in: %s", value, message)
+                    .containsPattern("(?<![0-9A-Za-z])" + value + "(?![0-9])");
+        }
     }
 
     private static List<Map<String, Object>> query(String sql)

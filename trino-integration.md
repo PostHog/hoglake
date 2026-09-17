@@ -36,15 +36,27 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
   catalog metadata (`record_count` minus `delete_count`) but still
   reads and validates the vector first. Planning checks only that the
   scan's data-file/DV pairing is internally consistent. A vector that
-  is missing, corrupt, in another format, or inconsistent with the
-  catalog's `delete_count` fails the query — never "no deleted rows".
+  is missing, corrupt, in another format, inconsistent with the
+  catalog's `delete_count`, or naming a different data file fails the
+  query — never "no deleted rows". Of those, `server/trino/` asserts
+  the last two, the ones that depend on hoglake's own wire fields; the
+  rest are the connector's suite to cover.
 - **Config fails at load.** `hoglake.uri` validated and
   slash-normalized, empty `hoglake.catalog` rejected, request timeout
   configurable (`hoglake.client.request-timeout`, default 2m).
-- **Id-authoritative column binding stays.** The
-  rename-vs-id-less-files hazard is closed catalog-side: field ids are
-  a registration contract and the server refuses renames while id-less
-  files are live.
+- **Id-authoritative column binding stays.** The connector binds by
+  PARQUET:field_id and falls back to name only for files that carry no
+  ids; that is settled and does not change.
+- **The rename-vs-id-less-files hazard is still OPEN.** The intended
+  close is catalog-side — field ids become a registration contract and
+  the server refuses a rename while id-less files are live — but that
+  refusal has NOT landed. Today the server accepts the rename with a
+  200 and the renamed column then reads NULL for every row of every
+  id-less file, silently. `renameColumnOnIdlessFilesSilentlyReadsNulls`
+  in the Trino harness pins exactly that, and flips to asserting the
+  refusal when the server-side change ships. Hardwood — the hydrator's
+  writer — emits no field ids, so this is the production read path,
+  not a corner case.
 
 ## 1. Reads: everything rides the Iceberg connector
 

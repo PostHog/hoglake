@@ -55,23 +55,47 @@ suite's `PuffinTestFiles`), because the connector opens the object, decodes the
 roaring bitmap, and checks its `referenced-data-file` and cardinality against
 the scan's pairing — a nominal DV path only ever produces a read failure.
 
-The connector counts a DV-backed table on two paths, and the harness covers
-both. An unfiltered `count(*)` needs no columns, so it answers from catalog
-metadata (`record_count` minus the vector's `delete_count`) after reading and
-validating the vector; the Parquet file is never opened. Any read that needs a
+The connector counts a DV-backed table on two paths, and the harness asserts
+the same answer on both. An unfiltered `count(*)` needs no columns, so it
+answers from catalog metadata (`record_count` minus the vector's
+`delete_count`) after reading and validating the vector. Any read that needs a
 column applies the vector per page inside the connector's page source, over
-file-relative row positions, after row-group pruning.
+row positions relative to each data file, after row-group pruning. (That the
+metadata path skips the Parquet file entirely is the connector's documented
+behavior and is visible in `EXPLAIN ANALYZE` as a TableScan with no physical
+input, but no assertion here observes it.)
 
-The one refusal the harness still pins is a vector that disagrees with the
-catalog: the scan's `delete_count` must equal the vector's real cardinality,
-and hoglake never opens DV files, so only the reader can catch a mismatch.
+Deleted positions are ordinals inside their own data file. A single-file table
+cannot tell that apart from table-global numbering, so `multi_file_events`
+holds two byte-identical files with the vector on the second one — the only
+fixture where the two numberings give different answers.
+
+Two refusals are asserted, both of them cases only the reader can catch
+because hoglake never opens DV files: a vector whose cardinality disagrees
+with the scan's `delete_count`, and a vector whose blob names a different data
+file than the one it was paired with. The connector refuses more than these
+(missing, truncated, bad checksum, wrong format, positions past the row count);
+those are covered by the connector's own suite in PostHog/trino, not here.
+The mismatch case is also the only assertion proving the metadata-count path
+decodes the bitmap rather than trusting `delete_count`.
 
 This puts a **floor under the fork image**: these assertions fail against any
 image built before PostHog/trino's "Apply deletion vectors to Hoglake reads"
 (`d4d5fa2`, first published as `r000000046914-6e5fcd`), which refuses
 DV-bearing scans at split planning. There is no harness-side way to satisfy
-both behaviors, and the newest-tag resolution above means normal runs are
-always above the floor.
+both behaviors.
+
+Note the floor currently has **zero margin**: `r000000046914-6e5fcd` is both
+the floor and the newest published tag, so exactly one image passes. Newest-tag
+resolution keeps normal runs above the floor only while the fork moves forward
+— a revert or a re-tag below the DV commit reds this job, and the fix then is
+to set `HOGLAKE_TRINO_IMAGE` to an image at or above `d4d5fa2` rather than to
+weaken these assertions. This is an assumption, not a guarantee.
+
+Message assertions here deliberately do NOT pin the fork's exact sentences.
+They check the object path hoglake registered and the values being compared,
+because this harness runs against whatever image is newest at run time and a
+cosmetic reword upstream must not red an unrelated hoglake PR.
 
 The connector also supports `CREATE TABLE`, `INSERT`, and CTAS as of
 2026-09-16. The harness does not exercise the write path — the connector's own

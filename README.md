@@ -41,7 +41,7 @@ per-component recipes; `just test-all`):
 
 - [server/](server/README.md) — the control plane (Kotlin/Ktor/PG).
 - [server/trino/](server/trino/README.md) — integration tests for the native
-  read-only connector maintained in [PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake).
+  connector maintained in [PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake).
 - [pyhoglake/](pyhoglake/README.md) — the Python client (the thin-API
   successor to pyducklake; owns the parquet writer path).
 - [webui/](webui/README.md) — the management console.
@@ -106,7 +106,7 @@ depends on it.
 | **Sort orders** | Versioned sort spec (`set_sort_order`), advisory for writers, binding for compaction — applied on rewrite **with row ids preserved** (explicit `_hog_row_id` column) | `SET SORTED BY` applied at insert/flush/compaction — but sorted compaction silently remaps rowids |
 | **Views** | SQL text + dialect, versioned | Yes, incl. macros |
 | **Encryption** | Not yet | Per-file parquet encryption |
-| **Readers** | REST + native Trino connector (read-only) + web console; Iceberg REST facade designed | DuckDB (only) |
+| **Readers** | REST + native Trino connector (reads incl. deletion vectors; CREATE/INSERT/CTAS too) + web console; Iceberg REST facade designed | DuckDB (only) |
 | **Observability** | `/metrics` (per-catalog health, outcome counters, commit-lock-wait histogram) + structured audit log + on-demand invariant scan (`POST /maintenance/verify`) + instance identity (`GET /v1/info`), built in | External scripts/daemons querying the catalog |
 | **Migration story** | Flyway + canonical schema.sql with CI equivalence check | Imperative C++ string migrations; no ledger; partial migration representable |
 | **Integrity** | PKs, FKs+CASCADE, NOT NULL, CHECK vocabularies, partial unique indexes | 5 PKs total; zero FKs/indexes/constraints beyond them |
