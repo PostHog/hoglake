@@ -133,17 +133,29 @@ def test_json_null_policy_and_blob_uuid(tmp_path):
             [uuid.UUID(int=42).bytes],
         )
         c.execute("COPY raw TO ? (FORMAT PARQUET)", [str(path)])
-    with pytest.raises(DataIntegrityError, match="top-level JSON null"):
+    with pytest.raises(DataIntegrityError, match="top-level null"):
         write(path, tmp_path / "out", 1, (0,))
     with duckdb.connect() as c:
         c.execute(
             "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, ?::BLOB uuid, NULL::JSON properties) TO ? (FORMAT PARQUET)",
             [str(path), uuid.UUID(int=42).bytes],
         )
+    # The source's SQL NULL must not become a non-null VARIANT null group.
+    assert pq.read_table(path, columns=["properties"]).to_pylist() == [
+        {"properties": None}
+    ]
+    with pytest.raises(DataIntegrityError, match="top-level null"):
+        write(path, tmp_path / "out", 1, (0,))
+    assert list((tmp_path / "out").iterdir()) == []
+    with duckdb.connect() as c:
+        c.execute(
+            "COPY (SELECT 1::BIGINT team_id, TIMESTAMP '2026-01-01' AS timestamp, 'e' AS event, ?::BLOB uuid, '{\"a\":null}'::JSON properties) TO ? (FORMAT PARQUET)",
+            [str(path), uuid.UUID(int=42).bytes],
+        )
     files = write(path, tmp_path / "out", 1, (0,))
     with duckdb.connect() as c:
         assert c.execute(
-            "SELECT uuid::VARCHAR, properties IS NULL FROM read_parquet(?)",
+            "SELECT uuid::VARCHAR, properties.a IS NULL FROM read_parquet(?)",
             [str(files[0])],
         ).fetchone() == (str(uuid.UUID(int=42)), True)
 
@@ -269,3 +281,51 @@ def test_invalid_projection(tmp_path, field_ids, json_columns):
             field_ids=field_ids,
             json_columns=json_columns,
         )
+
+
+def test_native_variant_top_level_null_is_refused(tmp_path):
+    source = raw_file(tmp_path)
+    path = tmp_path / "native-null.parquet"
+    with duckdb.connect() as c:
+        c.execute(
+            "COPY (SELECT * REPLACE (NULL::VARIANT AS properties) FROM read_parquet($src)) TO $dst (FORMAT PARQUET, ROW_GROUP_SIZE 2048)",
+            {"src": str(source), "dst": str(path)},
+        )
+    with pytest.raises(DataIntegrityError, match="top-level null"):
+        write_duckdb_event_partition(
+            [DuckDBFragment(str(path), (0,), 341)],
+            str(tmp_path / "out"),
+            team_id=1,
+            month=672,
+            field_ids=IDS,
+        )
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_promotion_failure_cleans_partial_output_and_allows_retry(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    source = raw_file(tmp_path, count=60000)
+    original = Path.rename
+    moved = []
+
+    def fail_second(path, destination):
+        if len(moved) == 1:
+            raise OSError("injected promotion failure")
+        result = original(path, destination)
+        moved.append(result)
+        return result
+
+    options = DuckDBWriterOptions(target_file_bytes=16384, row_group_rows=2048)
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rename", fail_second)
+        with pytest.raises(OSError, match="injected"):
+            write(source, tmp_path / "out", 10000, tuple(range(30)), options=options)
+    assert len(moved) == 1
+    assert list((tmp_path / "out").iterdir()) == []
+    assert (
+        len(write(source, tmp_path / "out", 10000, tuple(range(30)), options=options))
+        > 1
+    )

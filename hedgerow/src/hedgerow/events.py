@@ -28,7 +28,7 @@ class EventTransform:
         dest = {c.name: c for c in self.destination.columns}
         if any(c.type == "variant" for c in self.destination.columns):
             raise SchemaMismatchError(
-                "native VARIANT requires a catalog/client/reader codec; JSON is not VARIANT. "
+                "native VARIANT requires the DuckDB writer; JSON is not VARIANT. "
                 "This runtime cannot yet publish native VARIANT event columns."
             )
         required = ("team_id", "timestamp", "event", "uuid")

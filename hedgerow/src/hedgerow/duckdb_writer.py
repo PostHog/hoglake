@@ -67,8 +67,8 @@ def write_duckdb_event_partition(
     Only explicitly selected JSON/VARCHAR columns become VARIANT. Existing native
     VARIANT columns pass through. Source UUID may be native UUID or 16-byte BLOB.
 
-    Top-level JSON null is refused because DuckDB maps it to SQL NULL. SQL NULL
-    and nested JSON nulls are accepted. Source schemas must agree exactly.
+    Top-level nulls in VARIANT output are refused: DuckDB conflates SQL NULL
+    with VARIANT null. Nested nulls are accepted. Source schemas must agree exactly.
     No catalog mutation, upload, source deletion or Arrow payload conversion occurs.
 
     The optional connection initializer configures native DuckDB S3 credentials;
@@ -192,12 +192,19 @@ def write_duckdb_event_partition(
                     raise DataIntegrityError(
                         "flush row count differs from discovered source fragment"
                     )
-                for name in json_columns:
+                for name in source_names:
+                    if name not in json_columns and schema[name] != "VARIANT":
+                        continue
+                    null_check = f"{_identifier(name)} IS NULL"
+                    if name in json_columns:
+                        null_check += (
+                            f" OR json_type(CAST({_identifier(name)} AS JSON)) = 'NULL'"
+                        )
                     if connection.execute(
-                        f"SELECT count(*) FROM ({selected}) WHERE json_type(CAST({_identifier(name)} AS JSON)) = 'NULL'"
+                        f"SELECT count(*) FROM ({selected}) WHERE {null_check}"
                     ).fetchone()[0]:
                         raise DataIntegrityError(
-                            "top-level JSON null cannot be preserved as native VARIANT"
+                            "top-level null cannot be preserved distinctly in native VARIANT"
                         )
                 projection = []
                 for name in field_ids:
@@ -230,4 +237,14 @@ def write_duckdb_event_partition(
             )
             if count != sum(f.rows for f in fragments):
                 raise DataIntegrityError("output row count differs from frozen work")
-        return [path.rename(root / path.name) for path in paths]
+        promoted = []
+        try:
+            for path in paths:
+                promoted.append(path.rename(root / path.name))
+        except BaseException:
+            # A partial promotion must not strand files in a failed attempt's
+            # output directory and prevent retry. Only remove our own files.
+            for path in promoted:
+                path.unlink()
+            raise
+        return promoted

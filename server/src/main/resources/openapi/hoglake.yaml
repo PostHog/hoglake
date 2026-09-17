@@ -1468,11 +1468,14 @@ components:
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
                  uint64, float, double, decimal, date, time, timestamp_s,
                  timestamp_ms, timestamp, timestamp_ns, timestamptz,
-                 string, json, uuid, binary]
+                 string, json, uuid, binary, variant]
           description: >
             The closed column-type vocabulary: every member has a
             defined Iceberg facade mapping (iceberg-federation.md §2),
-            which is the membership rule.
+            which is the membership rule. VARIANT maps to Iceberg v3 variant and
+            requires native Parquet VARIANT(1), with its field ID on the group.
+            VARIANT has no whole-column statistics and cannot be a partition or
+            sort source. Scalar compaction skips tables containing VARIANT.
 
             Stats bounds for a column are stored — and returned — in the
             Iceberg single-value binary serialization of the MAPPED

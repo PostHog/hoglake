@@ -382,6 +382,7 @@ def test_bucketable_is_an_allowlist_so_a_new_type_is_not_bucketable():
             "float",
             "double",
             "json",
+            "variant",
             "uint32",
             "uint64",
             "timestamp_s",

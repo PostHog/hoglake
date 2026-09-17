@@ -6,8 +6,8 @@ provide the requested production raw_events → events CLI mode.** Existing CLI
 configurations continue to run direct replication with their documented
 at-least-once behavior.
 
-Native VARIANT catalog/publication support is still missing. The coordinator
-refuses VARIANT destination schemas. The separate [DuckDB event-file writer](DUCKDB_WRITER.md)
+Native VARIANT catalog and prepared-file publication are supported. The Arrow-based
+coordinator still refuses VARIANT destination schemas. The separate [DuckDB event-file writer](DUCKDB_WRITER.md)
 now reads, transforms, sorts and writes native VARIANT Parquet, but is not yet
 wired into the coordinator or CLI. Do not deploy this library coordinator as the
 finished ingestion service.
@@ -95,9 +95,9 @@ endpoint rather than silently ignoring an unfamiliar request field.
 - Receipts currently retain the complete request indefinitely. A receipt GC
   protocol needs an explicit replay horizon before any deletion is safe.
 - Native VARIANT is not JSON. The standalone DuckDB writer pins stable 1.5.5 and
-  keeps payloads inside DuckDB. Catalog type support, statistics/physical-schema
-  validation, compaction, reader interoperability and coordinator wiring still
-  need implementation. No Arrow payload rewrite may be inserted: ordinary
+  keeps payloads inside DuckDB. Catalog types and prepared-file physical validation are implemented; VARIANT
+  statistics are omitted. VARIANT compaction, reader interoperability and
+  coordinator wiring still need implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
   JSON column mappings must be explicit; no property names are assumed.
 

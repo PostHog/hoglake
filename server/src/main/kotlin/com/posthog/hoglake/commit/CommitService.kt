@@ -934,6 +934,15 @@ class CommitService(
                 .mapTo(Long::class.java)
                 .toSet()
         }
+        val variantFieldIds: Set<Long> by lazy {
+            h.createQuery(
+                """
+                SELECT field_id FROM hog_column
+                WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL AND col_type = 'variant'
+                """,
+            )
+                .bind(0, catalogId).bind(1, append.tableId).mapTo(Long::class.java).toSet()
+        }
         for (file in append.files) {
             if (file.path.isBlank()) {
                 throw HoglakeException.Validation("blank file path in append to $qualified")
@@ -977,6 +986,11 @@ class CommitService(
             val stats = file.columnStats ?: continue
             val seenFieldIds = HashSet<Long>()
             for (stat in stats) {
+                if (stat.fieldId in variantFieldIds) {
+                    throw HoglakeException.Validation(
+                        "variant column statistics are not supported; omit field_id ${stat.fieldId}",
+                    )
+                }
                 if (stat.fieldId !in liveFieldIds) {
                     throw HoglakeException.Validation(
                         "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",

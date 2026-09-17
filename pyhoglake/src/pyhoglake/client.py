@@ -50,6 +50,7 @@ from .models import (
     ViewInfo,
 )
 from .ops import AlterOp
+from .parquet_schema import validate_variant_file
 from .stats import extract_column_stats
 from .transforms import transform_strings
 from .types import columns_to_arrow_schema, schema_to_column_defs
@@ -829,7 +830,10 @@ class Table:
             raise ValidationError(
                 "prepared append destination layout changed", status_code=None
             )
-        schema = columns_to_arrow_schema(info.columns)
+        has_variant = any(c.type == "variant" for c in info.columns)
+        schema = columns_to_arrow_schema(
+            tuple(c for c in info.columns if c.type != "variant")
+        )
         # Parquet has no seconds timestamp unit: our writer stores timestamp_s
         # as milliseconds. Preserve all field IDs/nullability/metadata checks.
         schema = pa.schema(
@@ -844,7 +848,9 @@ class Table:
         registrations = []
         for index, (path, partition) in enumerate(files):
             with pq.ParquetFile(path) as parquet:
-                if not parquet.schema_arrow.equals(schema, check_metadata=True):
+                if has_variant:
+                    validate_variant_file(path, parquet, info.columns)
+                elif not parquet.schema_arrow.equals(schema, check_metadata=True):
                     raise ValidationError(
                         "prepared Parquet schema/field IDs differ from destination",
                         status_code=None,

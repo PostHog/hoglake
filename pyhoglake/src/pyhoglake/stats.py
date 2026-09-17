@@ -299,10 +299,31 @@ def extract_column_stats(
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
         footer_schema = None
 
+    if any(c.type == "variant" for c in columns):
+        if footer_schema is None:
+            return []
+
+        def leaf_count(type_: pa.DataType) -> int:
+            return (
+                sum(leaf_count(type_.field(i).type) for i in range(type_.num_fields))
+                if type_.num_fields
+                else 1
+            )
+
+        # A nested VARIANT leaf can have the same dotted path as a different
+        # top-level scalar (e.g. properties.value). Bind physical leaf positions,
+        # never dotted path spelling, when the file contains nested columns.
+        leaf_names = []
+        for field in footer_schema:
+            leaf_names.extend(
+                [field.name if field.type.num_fields == 0 else ""]
+                * leaf_count(field.type)
+            )
+
     out: list[ColumnStats] = []
     for j, name in enumerate(leaf_names):
         col = by_name.get(name)
-        if col is None:
+        if col is None or col.type == "variant":
             continue  # file column not in the catalog schema; nothing to report
 
         value_count = 0

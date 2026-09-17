@@ -43,6 +43,7 @@ enum class ColType {
     JSON,
     UUID_T,
     BINARY,
+    VARIANT,
     ;
 
     /** Wire/DB name (lowercase; UUID_T stored as "uuid"). */
@@ -165,6 +166,7 @@ enum class IcebergType {
     STRING,
     UUID,
     BINARY,
+    VARIANT,
     ;
 
     val wire: String get() = name.lowercase()
@@ -225,6 +227,7 @@ val ColType.icebergType: IcebergType
             ColType.STRING, ColType.JSON -> IcebergType.STRING
             ColType.UUID_T -> IcebergType.UUID
             ColType.BINARY -> IcebergType.BINARY
+            ColType.VARIANT -> IcebergType.VARIANT
         }
 
 enum class StatsState {
