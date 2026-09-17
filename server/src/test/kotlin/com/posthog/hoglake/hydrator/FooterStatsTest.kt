@@ -885,4 +885,69 @@ class FooterStatsTest {
         val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
         assertThat(out[1L]!!.lowerBound).isEqualTo("[]".toByteArray())
     }
+
+    @Test
+    fun `variant group field id governs renames and child stats are omitted`() {
+        val variant =
+            Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                .named("old_properties")
+        val schema = schema(variant)
+        assertThat(FooterStats.usesFieldIds(schema)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schema)).isFalse()
+        assertThat(agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.VARIANT, null))).isEmpty()
+
+        // DEGRADES, where #77 threw. `aggregate` is documented total and
+        // every other shape disagreement in this object takes the
+        // offending subtree out of the results with a warning; throwing
+        // cost the whole FILE its stats — every other column included —
+        // for a column that produces none either way. The observable
+        // contract is the same where it matters: no stats row.
+        assertThat(agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.STRING, null)))
+            .describedAs("a variant group bound to a scalar column yields nothing")
+            .isEmpty()
+        val plain =
+            Types.optionalGroup().id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("properties")
+        assertThat(agg(meta(schema(plain), 1), CatalogColumn(7, "properties", ColType.VARIANT, null)))
+            .describedAs("a group without the variant annotation is not a variant")
+            .isEmpty()
+    }
+
+    @Test
+    fun `DuckDB native fixture hydrates scalar stats and preserves variant field identity`() {
+        val path = java.nio.file.Path.of(javaClass.getResource("/variant/native_variant.parquet")!!.toURI())
+        org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(path)).use { reader ->
+            assertThat(FooterStats.missingFieldIds(reader.footer.fileMetaData.schema)).isFalse()
+            val stats =
+                agg(
+                    reader.footer,
+                    CatalogColumn(1, "id", ColType.LONG, null),
+                    CatalogColumn(2, "properties", ColType.VARIANT, null),
+                )
+            assertThat(stats.keys).containsExactly(1L)
+        }
+    }
+
+    @Test
+    fun `a nested group's own field id DOES gate the file, now that groups are columns`() {
+        // #77 asserted FALSE here, and that was right in a world where a
+        // parquet group was never a catalog column: an id on one meant
+        // nothing, so ignoring it was free. Containers changed the
+        // premise — a struct/list/map wrapper IS a catalog column with
+        // its own field id — and ignoring it was the round-1 data
+        // substitution: a file with ids on its wrappers and none on its
+        // leaves read as id-less, so the reader produced no stats while
+        // the rewriter copied it by name.
+        val nested =
+            Types.optionalGroup().id(9)
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("child").named("nested")
+        assertThat(FooterStats.usesFieldIds(schema(nested)))
+            .describedAs("a group carrying an id is a binding node")
+            .isTrue()
+        // And the child that carries none still flags the contract.
+        assertThat(FooterStats.missingFieldIds(schema(nested))).isTrue()
+    }
 }

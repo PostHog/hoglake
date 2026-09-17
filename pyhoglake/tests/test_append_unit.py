@@ -471,3 +471,179 @@ def test_list_family_predicate_puts_map_first():
     # answer can change behaviour. If this flips, the ordering already
     # covers it and only this assertion needs updating.
     assert not is_list_family(pa.map_(pa.string(), pa.int64()))
+
+
+def test_prepared_files_upload_then_commit_exact_request(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "sorted.parquet"
+    data = pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema)
+    pq.write_table(data, path)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    key = str(uuid.uuid4())
+    request = table.prepare_append_files([(str(path), None)], idempotency_key=key)
+    assert request["idempotency_key"] == key
+    assert request["read_snapshot"] == 5
+    assert request["appends"][0]["expected_table_uuid"] == TABLE_WIRE["table_uuid"]
+    assert len(fake_s3.files) == 1
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    # Publication has not happened as part of prepare. Persisting this request
+    # is the caller's responsibility; publication uses a capability-safe route.
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit/prepared",
+        json={"snapshot_id": 6, "schema_version": 2},
+        is_reusable=True,
+    )
+    catalog = table._namespace._catalog
+    assert catalog.commit_prepared(request) == catalog.commit_prepared(request)
+    posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    assert len(posts) == 2
+    assert posts[0].content == posts[1].content
+
+
+@pytest.mark.parametrize("defect", [None, "field_id", "nullability", "unit"])
+def test_prepared_seconds_timestamp_preserves_schema_guards(
+    table, httpx_mock, fake_s3, tmp_path, defect
+):
+    from datetime import datetime
+
+    from pyhoglake.models import TableInfo
+    from pyhoglake.types import columns_to_arrow_schema
+
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            *TABLE_WIRE["columns"],
+            {
+                "name": "created_at",
+                "type": "timestamp_s",
+                "field_id": 3,
+                "ordinal": 2,
+                "nullable": False,
+            },
+        ],
+    }
+    schema = columns_to_arrow_schema(TableInfo.from_wire(wire).columns)
+    field = schema.field("created_at")
+    if defect == "field_id":
+        field = field.with_metadata({b"PARQUET:field_id": b"99"})
+    elif defect == "nullability":
+        field = field.with_nullable(True)
+    elif defect == "unit":
+        field = field.with_type(pa.timestamp("us"))
+    schema = schema.set(2, field)
+    path = tmp_path / "seconds.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": 1, "name": "a", "created_at": datetime(2026, 1, 1)}], schema=schema
+        ),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    if defect:
+        with pytest.raises(ValidationError, match="schema/field IDs"):
+            table.prepare_append_files(
+                [(str(path), None)], idempotency_key=str(uuid.uuid4())
+            )
+        assert not fake_s3.files
+    else:
+        request = table.prepare_append_files(
+            [(str(path), None)], idempotency_key=str(uuid.uuid4())
+        )
+        assert request["appends"][0]["files"][0]["record_count"] == 1
+        uploaded = pq.read_table(io.BytesIO(next(iter(fake_s3.files.values()))))
+        assert uploaded["created_at"].to_pylist() == [datetime(2026, 1, 1)]
+
+
+def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_s3):
+    from pathlib import Path
+
+    from pyhoglake.models import TableInfo
+
+    path = Path(__file__).parent / "data" / "native_variant.parquet"
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            TABLE_WIRE["columns"][0],
+            {
+                "name": "properties",
+                "type": "variant",
+                "field_id": 2,
+                "ordinal": 1,
+                "nullable": False,
+            },
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    request = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    stats = request["appends"][0]["files"][0]["column_stats"]
+    assert [stat["field_id"] for stat in stats] == [1]
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_prepared_external_optional_fields_require_zero_nulls(
+    table, httpx_mock, fake_s3, tmp_path, null_id
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    schema = schema.set(0, schema.field(0).with_nullable(True))
+    path = tmp_path / "external.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": None if null_id else 1, "name": "a"}], schema=schema
+        ),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    if null_id:
+        with pytest.raises(ValidationError, match="non-null"):
+            table.prepare_append_files(
+                [(str(path), None)],
+                idempotency_key=str(uuid.uuid4()),
+                allow_optional_fields=True,
+            )
+        assert not fake_s3.files
+    else:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=True,
+        )
+        assert next(iter(fake_s3.files.values())) == path.read_bytes()

@@ -794,17 +794,35 @@ def test_an_ordinary_nested_schema_is_not_flagged_reserved():
 # -- the single-caller premise stats.py leans on -----------------------------
 
 
-def test_extract_column_stats_has_exactly_one_production_caller():
+def test_extract_column_stats_production_callers_are_known():
     """stats.py binds a list's element and a map's key/value by POSITION,
     with none of the field-id identity checking the Kotlin hydrator
-    does. That is safe for exactly one reason, stated in _walk_leaves'
-    docstring: this module only ever sees the footer of the parquet this
-    process just wrote from the catalog's own schema, so position and
-    identity cannot disagree.
+    does.
 
-    A premise nothing checks is a comment. If a second caller appears —
-    one handed someone else's file — the identity check has to come with
-    it, and this failing test is where that conversation starts.
+    This used to assert exactly ONE caller, because position was safe
+    for exactly one reason: the module only ever saw the footer of a
+    parquet this process had just written from the catalog's own schema.
+    ``prepare_append_files`` (#73) is a SECOND caller, and it is handed a
+    file the caller wrote — so that conversation is now due, and here it
+    is.
+
+    What survived the audit: the positional binding inside
+    ``_walk_leaves`` is positional WITHIN one column's own arrow type (a
+    list has exactly one element child, a map exactly two), which is the
+    parquet shape and not the file's column order, so a foreign file
+    cannot move it.
+
+    What did NOT survive: anything counting leaf positions ACROSS
+    columns. ``_resolve_leaves`` excluded a variant's chunks that way
+    during the merge and now excludes them by path prefix instead,
+    precisely because this caller breaks the order premise.
+
+    What remains exposed, deliberately: for a foreign file, catalog
+    columns are still located by NAME (``footer_schema.field(col.name)``)
+    rather than by field id, so a file whose columns are named
+    differently from the catalog gets no stats rather than wrong ones.
+    The server re-derives nothing from these; it validates them
+    (StatsSanity) and refuses what cannot be true.
     """
     src = Path(__file__).resolve().parent.parent / "src" / "pyhoglake"
     callers = []
@@ -816,9 +834,12 @@ def test_extract_column_stats_has_exactly_one_production_caller():
     # File and call text, not line numbers: a line number pins where the
     # call sits, which every edit above moves, and the claim is about
     # WHICH callers exist.
-    assert callers == [
-        "client.py: column_stats = extract_column_stats(metadata, info.columns)",
-    ], f"unexpected caller(s) of extract_column_stats: {callers}"
+    assert sorted(callers) == sorted(
+        [
+            "client.py: column_stats = extract_column_stats(metadata, info.columns)",
+            "client.py: for stat in extract_column_stats(metadata, info.columns)",
+        ]
+    ), f"unexpected caller(s) of extract_column_stats: {callers}"
 
 
 # -- ordinal is the contract; array order is not ------------------------------

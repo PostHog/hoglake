@@ -314,6 +314,14 @@ def _walk_leaves(
     simply gets no bounds.
     """
     here = path + (col.name,)
+    # VARIANT yields NO leaf. It is a catalog scalar whose parquet shape
+    # is a group of metadata/value/typed_value, and #77 established that
+    # a variant has no trustworthy scalar counts or bounds — the server
+    # refuses stats addressed to one. Without this the column would miss
+    # by path anyway (its chunks are `v.metadata`, never `v`), but an
+    # accident is not a rule: say it.
+    if col.type == "variant":
+        return []
     kids = col.children or ()
     if col.type == "struct":
         out: list[tuple[str, Column, pa.DataType | None]] = []
@@ -365,14 +373,34 @@ def _walk_leaves(
 
 def _resolve_leaves(
     metadata: pq.FileMetaData, columns: list[Column] | tuple[Column, ...]
-) -> dict[str, tuple[Column, pa.DataType | None]]:
-    """Catalog LEAF columns keyed by the parquet chunk path they own."""
+) -> tuple[dict[str, tuple[Column, pa.DataType | None]], tuple[str, ...]]:
+    """Catalog LEAF columns by chunk path, plus the path prefixes no
+    catalog leaf may claim.
+
+    The second half exists because path spelling stopped being unique
+    when nesting met variant. A variant ``properties`` stores its payload
+    at ``properties.value``, which is also the ``path_in_schema`` of a
+    top-level scalar literally named ``properties.value`` -- so a pure
+    path map hands that one catalog field TWO chunks and emits two stats
+    rows for one field id, which the server refuses as a duplicate,
+    failing the whole append. #77 solved it by binding positionally;
+    positions alone cannot express schema EVOLUTION (a struct field the
+    file predates has a catalog leaf and no chunk), so the merge keeps
+    the path map and subtracts the positions a variant owns.
+
+    A variant's chunks are identified by PATH PREFIX, not by position:
+    ``prepare_append_files`` (#73) added a second production caller that
+    reads a parquet file the CALLER wrote, so footer column order is no
+    longer guaranteed to match catalog order and anything counting
+    positions across columns would mis-attribute on a foreign file.
+    """
     try:
         footer_schema: pa.Schema | None = metadata.schema.to_arrow_schema()
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
         footer_schema = None
 
     out: dict[str, tuple[Column, pa.DataType | None]] = {}
+    variant_prefixes: list[str] = []
     for col in columns:
         top: pa.DataType | None = None
         if footer_schema is not None:
@@ -380,9 +408,12 @@ def _resolve_leaves(
                 top = footer_schema.field(col.name).type
             except KeyError:
                 top = None
-        for path, leaf, leaf_type in _walk_leaves(col, (), top):
-            out[path] = (leaf, leaf_type)
-    return out
+        if col.type == "variant":
+            variant_prefixes.append(col.name + ".")
+        else:
+            for path, leaf, leaf_type in _walk_leaves(col, (), top):
+                out[path] = (leaf, leaf_type)
+    return out, tuple(variant_prefixes)
 
 
 def extract_column_stats(
@@ -397,7 +428,21 @@ def extract_column_stats(
     that is Iceberg's own rule for nested fields — and a struct leaf
     behaves exactly like a top-level scalar.
     """
-    leaves = _resolve_leaves(metadata, columns)
+    # BY POSITION, not by dotted path. Path spelling is ambiguous the
+    # moment nesting and variant coexist: a variant `properties` stores
+    # its payload at `properties.value`, and a top-level scalar
+    # literally named `properties.value` has the same
+    # `path_in_schema` -- so a path map hands one catalog field TWO
+    # chunks and emits two stats rows for one field id, which the
+    # server then refuses as a duplicate. #77 hit this and bound
+    # positionally; that was right, and it survives the merge.
+    #
+    # Position is safe here for the reason the module docstring gives:
+    # this runs on the footer of a file this process just wrote from
+    # `columns_to_arrow_schema(info.columns)`, so the footer's
+    # depth-first leaf order IS the catalog's leaf order. The Kotlin
+    # side reads FOREIGN footers and binds by field id instead.
+    leaves, variant_prefixes = _resolve_leaves(metadata, columns)
 
     # Map parquet leaf index -> its chunk path. Full path, verbatim: the
     # catalog-side paths above are built the same way, and splitting on
@@ -411,10 +456,17 @@ def extract_column_stats(
             leaf_names.append(rg0.column(j).path_in_schema)
 
     out: list[ColumnStats] = []
+    claimed: set[str] = set()
     for j, name in enumerate(leaf_names):
+        if name.startswith(variant_prefixes):
+            continue  # a variant's own storage; no catalog leaf owns it
         entry = leaves.get(name)
-        if entry is None:
-            continue  # file column not in the catalog schema; nothing to report
+        if entry is None or name in claimed:
+            # Unknown to the catalog, or a second chunk spelling the same
+            # path as one already bound. Emitting a second row for one
+            # field id is what the server refuses as a duplicate.
+            continue
+        claimed.add(name)
         col, leaf_type = entry
 
         value_count = 0

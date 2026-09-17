@@ -14,6 +14,7 @@ import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.StatsSanity
+import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.model.columnDefDepth
 import com.posthog.hoglake.model.nodeCount
 import com.posthog.hoglake.service.ColumnTrees
@@ -191,6 +192,101 @@ class NestedCampaignRegressionTest {
         // exception with a null message, which is exactly the shape B7
         // regresses to.
         assertThat(byName["B7"]).startsWith("ACCEPTED")
+    }
+
+    // ---- variant inside a container (the #77 x phase-2 seam) -------------
+
+    @Test
+    fun `a variant nested in a struct is expressible, statless, and never compacted`(
+        @TempDir tmp: Path,
+    ) {
+        // VARIANT is a catalog SCALAR with no children, so ColumnTrees
+        // accepts `struct{v: variant}` — the shape is expressible the
+        // moment both features exist, without either PR having decided
+        // what it means.
+        val def =
+            ColumnDef(
+                "s",
+                ColType.STRUCT,
+                children = listOf(ColumnDef("v", ColType.VARIANT), ColumnDef("n", ColType.LONG)),
+            )
+        ColumnTrees.validate(listOf(def))
+
+        val live = assignFieldIds(listOf(def), 1L)
+        val variantCol = live.single().children.single { it.def.name == "v" }
+
+        // READER: the variant produces no stats at ANY depth, and its
+        // sibling still does — a variant must not take the subtree with
+        // it.
+        val schema =
+            MessageType(
+                "m",
+                listOf<Type>(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.optionalGroup()
+                                .`as`(LogicalTypeAnnotation.variantType(1.toByte()))
+                                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                                .id(Math.toIntExact(variantCol.fieldId))
+                                .named("v"),
+                        )
+                        .addField(
+                            Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                                .id(Math.toIntExact(live.single().children.single { it.def.name == "n" }.fieldId))
+                                .named("n"),
+                        )
+                        .id(1)
+                        .named("s"),
+                ),
+            )
+        val src = tmp.resolve("nested-variant.parquet")
+        write(schema, src) { f ->
+            listOf(
+                f.newGroup().also {
+                    val g = it.addGroup(0)
+                    g.addGroup(0).also { v ->
+                        v.add(0, Binary.fromConstantByteArray(byteArrayOf(1)))
+                        v.add(1, Binary.fromConstantByteArray(byteArrayOf(2)))
+                    }
+                    g.add(1, 7L)
+                },
+            )
+        }
+        val catalog = NestedFuzz.toCatalogColumns(live)
+        val aggs = FooterStats.aggregate(FooterParse.parse(LocalInputFile(src)), catalog, src.toString())
+        assertThat(aggs.map { it.fieldId })
+            .describedAs("the variant yields nothing; its sibling still does")
+            .containsExactly(live.single().children.single { it.def.name == "n" }.fieldId)
+
+        // REWRITER: refused, typed, whatever the depth — #77's own check
+        // was `liveColumns.none { ... }`, which a nested variant walks
+        // straight past.
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(src, 0L, null)),
+                live,
+                emptyList(),
+                tmp.resolve("nested-variant-out.parquet"),
+            )
+        }
+            .isInstanceOf(UnconvertibleSchemaException::class.java)
+            .hasMessageContaining("variant compaction is not supported")
+    }
+
+    @Test
+    fun `a variant is not a partition or sort source, at any depth`() {
+        val def =
+            ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("v", ColType.VARIANT)))
+        val live = assignFieldIds(listOf(def), 1L)
+        val nested = live.single().children.single()
+        assertThat(nested.def.type).isEqualTo(ColType.VARIANT)
+        // The refusal lives in requireSourceField, which both the
+        // partition and the sort path call — #77 checked at the two call
+        // sites, over top-level columns only.
+        assertThat(nested.def.type.isNested)
+            .describedAs("variant is a SCALAR, so the container refusal never fires for it")
+            .isFalse()
     }
 
     // ---- binding: ids outrank names, at every level ----------------------

@@ -51,6 +51,7 @@ from .models import (
     ViewInfo,
 )
 from .ops import AlterOp
+from .parquet_schema import validate_variant_file
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
@@ -470,11 +471,24 @@ class Catalog:
 
     # -- commit (internal; Table.append is the public writer path) ---------
 
-    def _commit(self, payload: dict[str, Any]) -> CommitResult:
+    def commit_prepared(self, payload: dict[str, Any]) -> CommitResult:
+        """Publish a durably saved request; retry the EXACT payload on uncertainty.
+
+        Requires a server supporting CommitRequest.idempotency_key (V7 migration).
+        This API does not apply event-level deduplication.
+        """
+        if not payload.get("idempotency_key"):
+            raise ValueError("prepared commits require an idempotency_key")
+        _uuid.UUID(payload["idempotency_key"])
+        return self._commit(payload, prepared=True)
+
+    def _commit(
+        self, payload: dict[str, Any], *, prepared: bool = False
+    ) -> CommitResult:
         try:
             body = self._client._request(
                 "POST",
-                self._path("/commit"),
+                self._path("/commit/prepared" if prepared else "/commit"),
                 json=payload,
                 conflict=CommitConflictError,
             )
@@ -825,6 +839,123 @@ class Table:
             schema_version=result.schema_version,
             files=tuple(appended),
         )
+
+    def prepare_append_files(
+        self,
+        files: Sequence[tuple[str, tuple[str | None, ...] | None]],
+        *,
+        idempotency_key: str,
+        expected_table_uuid: str | None = None,
+        expected_table_info: TableInfo | None = None,
+        allow_optional_fields: bool = False,
+    ) -> dict[str, Any]:
+        """Upload already partitioned/sorted local Parquet without loading it in RAM.
+
+        The caller owns row-to-partition correctness and sort order, exactly as
+        other footer-shipping writers do. Field IDs and schema must match the
+        resolved table. Return an immutable commit request; persist it durably
+        BEFORE calling ``Catalog.commit_prepared``. A failed prepare may orphan
+        uploads, but cannot publish rows. Never regenerate files after preparing.
+        With allow_optional_fields, external writers may use optional physical
+        fields for required catalog columns only when footer counts prove no nulls.
+        """
+        _uuid.UUID(idempotency_key)
+        catalog = self._namespace._catalog
+        read_snapshot = catalog.refresh().head_snapshot_id
+        expected = expected_table_uuid or self.table_uuid
+        info = self._check_incarnation(expected)
+        if expected_table_info is not None and (
+            info.columns,
+            info.partition_spec,
+            info.sort_spec,
+        ) != (
+            expected_table_info.columns,
+            expected_table_info.partition_spec,
+            expected_table_info.sort_spec,
+        ):
+            raise ValidationError(
+                "prepared append destination layout changed", status_code=None
+            )
+        has_variant = any(c.type == "variant" for c in info.columns)
+        schema = columns_to_arrow_schema(
+            tuple(c for c in info.columns if c.type != "variant")
+        )
+        # Parquet has no seconds timestamp unit: our writer stores timestamp_s
+        # as milliseconds. Preserve all field IDs/nullability/metadata checks.
+        schema = pa.schema(
+            [
+                field.with_type(pa.timestamp("ms"))
+                if field.type == pa.timestamp("s")
+                else field
+                for field in schema
+            ],
+            metadata=schema.metadata,
+        )
+        registrations = []
+        for index, (path, partition) in enumerate(files):
+            with pq.ParquetFile(path) as parquet:
+                if has_variant or allow_optional_fields:
+                    validate_variant_file(path, parquet, info.columns)
+                elif not parquet.schema_arrow.equals(schema, check_metadata=True):
+                    raise ValidationError(
+                        "prepared Parquet schema/field IDs differ from destination",
+                        status_code=None,
+                    )
+                metadata = parquet.metadata
+            arity = len(info.partition_spec.fields) if info.partition_spec else 0
+            if (arity and (partition is None or len(partition) != arity)) or (
+                not arity and partition is not None
+            ):
+                raise ValidationError(
+                    "prepared file partition arity differs from destination",
+                    status_code=None,
+                )
+            if metadata.num_rows <= 0:
+                raise ValidationError(
+                    "prepared file must contain rows", status_code=None
+                )
+            uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
+            with open(path, "rb") as source:
+                source.seek(0, 2)
+                size = source.tell()
+                source.seek(-8, 2)
+                trailer = source.read(8)
+                footer_size = struct.unpack("<I", trailer[:4])[0]
+                source.seek(0)
+                with catalog._client._filesystem().open_output_stream(
+                    uri.removeprefix("s3://")
+                ) as sink:
+                    while chunk := source.read(8 * 1024 * 1024):
+                        sink.write(chunk)
+            reg: dict[str, Any] = {
+                "path": uri,
+                "record_count": metadata.num_rows,
+                "file_size_bytes": size,
+                "footer_size": footer_size,
+                "column_stats": [
+                    stat.to_wire()
+                    for stat in extract_column_stats(metadata, info.columns)
+                ],
+            }
+            if partition is not None:
+                reg["partition_values"] = list(partition)
+            registrations.append(reg)
+        if not registrations:
+            raise ValidationError(
+                "prepared append must contain files", status_code=None
+            )
+        return {
+            "idempotency_key": idempotency_key,
+            "read_snapshot": read_snapshot,
+            "appends": [
+                {
+                    "namespace": self.namespace,
+                    "table": self.name,
+                    "expected_table_uuid": expected,
+                    "files": registrations,
+                }
+            ],
+        }
 
     def _check_incarnation(self, expected_uuid: str) -> TableInfo:
         """Pre-flight fast-fail: re-resolve this table by name and raise

@@ -838,6 +838,18 @@ class AlterService(private val jdbi: Jdbi) {
                 )
         val col = chain.last()
         val path = chain.joinToString(".") { it.def.name }
+        // VARIANT is a catalog SCALAR, so `isNested` is false for it and
+        // the container refusal below never fires — but a variant has no
+        // single value a transform could read either. #77 refused it at
+        // the two call sites; refusing it HERE covers a variant reached
+        // through a struct, which the call-site checks (top-level only)
+        // did not see.
+        if (col.def.type == ColType.VARIANT) {
+            throw HoglakeException.Validation(
+                "$what source field_id $fieldId ('$path') is a 'variant': a variant has no single " +
+                    "scalar value, so it cannot be a $what source",
+            )
+        }
         if (col.def.type.isNested) {
             throw HoglakeException.Validation(
                 "$what source field_id $fieldId ('$path') is a " +

@@ -273,3 +273,9 @@ Integration tests need a live hoglake server (`HOGLAKE_URL`, default
 `http://localhost:9000`, key `hoglake`/`hoglake123`); they create
 `hedgerow-*`-prefixed catalogs and buckets and skip cleanly when the
 server is unreachable.
+
+## Buffered raw event ingestion work
+
+The experimental library coordinator and its current limitations are documented
+in [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md). It is not yet a CLI ingestion
+mode; existing replication behavior is unchanged.

@@ -296,7 +296,7 @@ class AlterScalarTypeIntegrationTest {
         // vocabulary that is NOT named above must be refused.
         val notBucketable = ColType.entries.toSet() - AlterService.BUCKETABLE_TYPES
         assertThat(notBucketable).containsExactlyInAnyOrder(
-            ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE, ColType.JSON,
+            ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE, ColType.JSON, ColType.VARIANT,
             ColType.UINT32, ColType.UINT64,
             ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP_NS,
             // The containers are not bucketable and never will be: a

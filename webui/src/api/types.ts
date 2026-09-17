@@ -74,9 +74,22 @@ export const SCALAR_COLUMN_TYPES = [
  */
 export const NESTED_COLUMN_TYPES = ["list", "struct", "map"] as const;
 
+/**
+ * Readable, not creatable, and not a container.
+ *
+ * VARIANT is a catalog scalar, but it belongs here rather than in
+ * SCALAR_COLUMN_TYPES for the same reason the containers do: the create
+ * form is a name and a type picker, and there is no useful variant a
+ * form can produce. #77 added the type server-side without touching the
+ * console, so a table holding one had a `type` outside ColumnType
+ * entirely.
+ */
+export const OPAQUE_COLUMN_TYPES = ["variant"] as const;
+
 /** Everything the server's ColumnDef.type enum accepts. */
 export const COLUMN_TYPES = [
   ...SCALAR_COLUMN_TYPES,
+  ...OPAQUE_COLUMN_TYPES,
   ...NESTED_COLUMN_TYPES,
 ] as const;
 

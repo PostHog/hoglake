@@ -57,6 +57,16 @@ enum class ColType {
     UUID_T,
     BINARY,
 
+    /**
+     * Iceberg V3 variant. A catalog SCALAR — no children, no
+     * [ColumnDef.children] — whose PARQUET storage is nonetheless a
+     * group (`metadata`/`value`/`typed_value`). "Scalar" here means one
+     * catalog node, not one parquet node, and every surface that walks
+     * parquet has to know the difference: see FooterStats' variant arm
+     * and the compaction exclusion.
+     */
+    VARIANT,
+
     // ---- containers (phase 2) ----
     LIST,
     STRUCT,
@@ -225,6 +235,14 @@ enum class IcebergType {
     BINARY,
 
     /**
+     * Iceberg V3 variant. [isScalar] is true for it — it is ONE catalog
+     * node with one field id — but it has no single-value encoding
+     * either, so nothing ever writes a variant bound. The bounds paths
+     * reach it through [ColType.VARIANT]'s own arms, which refuse.
+     */
+    VARIANT,
+
+    /**
      * The three Iceberg V2 container types. They exist here so
      * [ColType.icebergType] stays TOTAL — every hoglake type names its
      * facade shape — but they carry neither a single-value encoding nor
@@ -297,6 +315,7 @@ val ColType.icebergType: IcebergType
             ColType.STRING, ColType.JSON -> IcebergType.STRING
             ColType.UUID_T -> IcebergType.UUID
             ColType.BINARY -> IcebergType.BINARY
+            ColType.VARIANT -> IcebergType.VARIANT
             // Native, one for one: an Iceberg list/struct/map with the
             // SAME field ids on element/key/value (iceberg-federation.md
             // §2.8). No conversion, no synthesized ids — which is what
@@ -795,6 +814,7 @@ data class CommitRequest(
     val deletes: List<TableDeletes> = emptyList(),
     val author: String? = null,
     val message: String? = null,
+    val idempotencyKey: UUID? = null,
 )
 
 data class CommitResult(

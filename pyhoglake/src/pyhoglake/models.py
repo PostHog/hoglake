@@ -247,6 +247,34 @@ class PartitionSpec:
 
 
 @dataclass(frozen=True)
+class SortField:
+    source_field_id: int
+    direction: str
+    null_order: str
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SortField:
+        return _wire("SortField", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
+class SortSpec:
+    sort_id: int
+    fields: tuple[SortField, ...]
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SortSpec:
+        return _wire(
+            "SortSpec",
+            d,
+            lambda d: cls(
+                sort_id=d["sort_id"],
+                fields=tuple(SortField.from_wire(f) for f in d["fields"]),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TableInfo:
     name: str
     namespace: str
@@ -256,6 +284,7 @@ class TableInfo:
     file_count: int
     file_size_bytes: int
     partition_spec: PartitionSpec | None = None
+    sort_spec: SortSpec | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -270,6 +299,9 @@ class TableInfo:
                 file_count=d["file_count"],
                 file_size_bytes=d["file_size_bytes"],
                 partition_spec=PartitionSpec.from_wire(spec) if spec else None,
+                sort_spec=SortSpec.from_wire(d["sort_spec"])
+                if d.get("sort_spec")
+                else None,
             )
 
         return _wire("TableInfo", d, build)

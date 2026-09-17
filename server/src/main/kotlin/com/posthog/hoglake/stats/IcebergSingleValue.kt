@@ -188,6 +188,7 @@ object IcebergSingleValue {
         value: Any,
     ): ByteArray =
         when (type) {
+            ColType.VARIANT -> throw IllegalArgumentException("variant has no scalar bounds encoding")
             ColType.BOOLEAN -> encodeBoolean(expect(type, value))
             // Iceberg int: one encoding for five hoglake types.
             ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16, ColType.INT ->
@@ -289,6 +290,7 @@ object IcebergSingleValue {
         data: ByteArray,
     ): Any =
         when (type) {
+            ColType.VARIANT -> throw IllegalArgumentException("variant has no scalar bounds encoding")
             ColType.BOOLEAN -> {
                 expectLength(type, data, 1)
                 data[0] != 0.toByte()
@@ -362,6 +364,7 @@ object IcebergSingleValue {
         b: Any,
     ): Int =
         when (type) {
+            ColType.VARIANT -> throw IllegalArgumentException("variant has no scalar bounds encoding")
             // json decodes to a String too, and must use the same unsigned
             // UTF-8 byte order — not String.compareTo.
             // Either form [decode] can produce — String for UTF-8

@@ -178,7 +178,7 @@ CREATE TABLE hog_column (
                        'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
                        'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
                        'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
-                       'timestamptz', 'string', 'json', 'uuid', 'binary',
+                       'timestamptz', 'string', 'json', 'uuid', 'binary', 'variant',
                        'list', 'struct', 'map')),
     type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
     nullable       boolean NOT NULL DEFAULT true,
@@ -607,4 +607,15 @@ CREATE TABLE hog_table_creation (
     PRIMARY KEY (catalog_id, operation_id),
     UNIQUE (catalog_id, table_uuid),
     CHECK ((state = 'committed') = (snapshot_id IS NOT NULL AND schema_version IS NOT NULL))
+);
+
+-- Publication receipts outlive snapshot expiry: retrying an old request must
+-- never publish it again. Keys are scoped to a catalog and immutable payload.
+CREATE TABLE hog_commit_receipt (
+    catalog_id BIGINT NOT NULL REFERENCES hog_catalog(catalog_id) ON DELETE CASCADE,
+    idempotency_key UUID NOT NULL,
+    request JSONB NOT NULL,
+    snapshot_id BIGINT NOT NULL,
+    schema_version BIGINT NOT NULL,
+    PRIMARY KEY (catalog_id, idempotency_key)
 );

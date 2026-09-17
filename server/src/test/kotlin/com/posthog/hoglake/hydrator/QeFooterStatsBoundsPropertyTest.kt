@@ -492,6 +492,7 @@ class QeFooterStatsBoundsPropertyTest {
     /** The bound width the mapped Iceberg type demands; null = variable. */
     private fun expectedWidth(type: ColType): Int? =
         when (type.icebergType) {
+            IcebergType.VARIANT -> null
             IcebergType.BOOLEAN -> 1
             IcebergType.INT, IcebergType.FLOAT, IcebergType.DATE -> 4
             IcebergType.LONG, IcebergType.DOUBLE, IcebergType.TIME,
@@ -561,7 +562,7 @@ class QeFooterStatsBoundsPropertyTest {
         var produced = 0
         var refused = 0
 
-        for (type in ColType.entries) {
+        for (type in ColType.entries.filter { it != ColType.VARIANT }) {
             for (shape in shapes) {
                 visited += type to shape.name
                 // Pinned to the cell's identity, not to a run: a failure names
@@ -631,7 +632,7 @@ class QeFooterStatsBoundsPropertyTest {
         assertThat(visited)
             .describedAs("the full matrix ran, not a sample of it")
             .isEqualTo(
-                ColType.entries.flatMap { t -> shapes.map { t to it.name } }.toSet(),
+                ColType.entries.filter { it != ColType.VARIANT }.flatMap { t -> shapes.map { t to it.name } }.toSet(),
             )
         assertThat(mustRefuse).describedAs("claim 4 is not vacuous").isNotEmpty()
         assertThat(mustProduce).describedAs("claim 3 is not vacuous").isNotEmpty()

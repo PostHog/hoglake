@@ -120,10 +120,11 @@ object FooterStats {
 
     /**
      * Whether [aggregate] will map columns by field id for this schema:
-     * true when any node that BINDS to a catalog column — a leaf OR a
-     * container wrapper, at any depth — carries a `PARQUET:field_id`.
-     * False = the name-fallback path, whose column set the hydrator must
-     * resolve at the FILE's begin_snapshot, not live-at-hydration.
+     * true when any node that BINDS to a catalog column — a leaf, a
+     * container wrapper, or a VARIANT group, at any depth — carries a
+     * `PARQUET:field_id`. False = the name-fallback path, whose column
+     * set the hydrator must resolve at the FILE's begin_snapshot, not
+     * live-at-hydration.
      *
      * Binding NODES, not primitive leaves, and that distinction is the
      * whole point: a file that stamps ids on its list and struct
@@ -133,6 +134,14 @@ object FooterStats {
      * same one [missingFieldIds] exempts — parquet's synthetic
      * repetition layers — so the two questions are asked about one set
      * of nodes.
+     *
+     * A VARIANT group is such a node and is TERMINAL: it is one catalog
+     * column with one field id, and `metadata`/`value`/`typed_value`
+     * are variant-internal storage carrying no ids of their own, which
+     * must not be mistaken for id-less columns. #77 said this by
+     * special-casing variant beside the top-level leaf scan; saying it
+     * once, inside the definition of "binding node", covers the nested
+     * case the containers make reachable.
      *
      * "Anywhere", not "top level", for the same reason: a file whose
      * only columns are nested has no top-level leaf. A flat schema is
@@ -156,7 +165,15 @@ object FooterStats {
      */
     private fun anyBindingNodeWithId(fields: List<Type>): Boolean =
         fields.any { field ->
-            if (field.isPrimitive) {
+            // A VARIANT group is TERMINAL here, exactly as it is in
+            // [anyBindingNodeWithoutId]: one catalog column, one field
+            // id, and metadata/value/typed_value beneath it carry none.
+            // The two helpers must agree about the node set or the file
+            // gate and the contract flag answer about different files.
+            if (
+                field.isPrimitive ||
+                field.logicalTypeAnnotation is LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+            ) {
                 field.id != null
             } else {
                 val group = field.asGroupType()
@@ -229,7 +246,10 @@ object FooterStats {
 
     private fun anyBindingNodeWithoutId(fields: List<Type>): Boolean =
         fields.any { field ->
-            if (field.isPrimitive) {
+            if (
+                field.isPrimitive ||
+                field.logicalTypeAnnotation is LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+            ) {
                 field.id == null
             } else {
                 val group = field.asGroupType()
@@ -442,6 +462,23 @@ object FooterStats {
                 "column ${col.name} (field ${col.fieldId}) is '${col.type.wire}' but the parquet " +
                     "field at ${path.joinToString(".")} in $filePath $detail; skipping its stats"
             }
+        }
+
+        // VARIANT first, because it is the one catalog SCALAR whose
+        // parquet shape is a GROUP — so every group-shaped rule below
+        // (the container-annotation refusal, the struct shape check, the
+        // repetition guard) would misread it.
+        //
+        // It produces NO stats at any depth: #77 established that a
+        // variant has no trustworthy scalar counts or bounds, and that
+        // is a property of the type, not of where it sits. What this
+        // does add is the shape CHECK, degraded to a warning like every
+        // other disagreement here — thrown, it cost the whole file's
+        // other columns their bounds for a column that was never going
+        // to produce any.
+        if (col.type == ColType.VARIANT) {
+            variantFault(field)?.let { shapeMismatch(it) }
+            return
         }
 
         // REPETITION, before anything else. Every catalog type reachable
@@ -668,6 +705,59 @@ object FooterStats {
         return dupes
     }
 
+    /**
+     * Why [field] is not a legal native VARIANT, or null when it is.
+     *
+     * #77's rule, kept whole — spec version 1, a non-repeated group of
+     * `metadata`/`value`/`typed_value` with a REQUIRED binary
+     * `metadata` and at least one of `value`/`typed_value` — but
+     * REPORTED instead of thrown.
+     *
+     * Thrown, it was the one shape check in this object that could take
+     * a whole file's stats down: `aggregate` is documented total, every
+     * other disagreement degrades the offending subtree with a warning,
+     * and a variant column produces no stats either way. So an invalid
+     * variant cost every OTHER column in the file its bounds, for no
+     * gain.
+     *
+     * BY CHILD NAME, deliberately, where the rest of this object refuses
+     * to trust synthetic names (see [syntheticRepetitionLayer], which
+     * matches the list/map layers by SHAPE precisely because the parquet
+     * spec says their names are insignificant). The asymmetry is the
+     * specs': the variant spec MANDATES these three names as the
+     * addressing scheme, so here the name IS the contract. hoglake#70.
+     */
+    private fun variantFault(field: Type): String? {
+        val annotation = field.logicalTypeAnnotation as? LogicalTypeAnnotation.VariantLogicalTypeAnnotation
+        if (field.isPrimitive || annotation == null || annotation.specVersion.toInt() != 1) {
+            return "is not a native parquet VARIANT of spec version 1"
+        }
+        if (field.isRepetition(Type.Repetition.REPEATED)) return "is a REPEATED variant group"
+        val children = field.asGroupType().fields
+        if (children.map { it.name }.distinct().size != children.size) {
+            return "has duplicate child names ${children.map { it.name }}"
+        }
+        if (children.any { it.name !in setOf("metadata", "value", "typed_value") }) {
+            return "has children ${children.map { it.name }} outside metadata/value/typed_value"
+        }
+
+        fun binary(type: Type?): Boolean =
+            type != null && type.isPrimitive &&
+                type.asPrimitiveType().primitiveTypeName == PrimitiveType.PrimitiveTypeName.BINARY
+        val metadata = children.find { it.name == "metadata" }
+        val value = children.find { it.name == "value" }
+        if (!binary(metadata) || !metadata!!.isRepetition(Type.Repetition.REQUIRED)) {
+            return "has no REQUIRED binary 'metadata'"
+        }
+        if (value == null && children.none { it.name == "typed_value" }) {
+            return "has neither 'value' nor 'typed_value'"
+        }
+        if (value != null && (!binary(value) || value.isRepetition(Type.Repetition.REPEATED))) {
+            return "has a 'value' that is not an optional/required binary"
+        }
+        return null
+    }
+
     private fun aggregateColumn(
         blocks: List<BlockMetaData>,
         col: CatalogColumn,
@@ -793,6 +883,7 @@ object FooterStats {
         }
 
         return when (col.type) {
+            ColType.VARIANT -> null
             ColType.BOOLEAN ->
                 if (physical == PrimitiveType.PrimitiveTypeName.BOOLEAN && raw.size == 1) {
                     raw[0] != 0.toByte()
@@ -1115,6 +1206,7 @@ object FooterStats {
         v: Any,
     ): ByteArray =
         when (type) {
+            ColType.VARIANT -> error("variant has no scalar bounds")
             // These four decode to raw bytes that ARE the Iceberg encoding.
             ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY -> (v as ByteArray).copyOf()
             else -> IcebergSingleValue.encode(type, v)
@@ -1127,6 +1219,7 @@ object FooterStats {
         b: Any,
     ): Int =
         when (type) {
+            ColType.VARIANT -> error("variant has no scalar bounds")
             ColType.STRING, ColType.JSON, ColType.UUID_T, ColType.BINARY ->
                 java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
             // uint32 decodes to a non-negative Long and uint64 to a

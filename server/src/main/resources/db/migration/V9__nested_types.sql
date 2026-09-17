@@ -64,15 +64,15 @@ DECLARE
     found_def      text;
     found_types    text[];
     found_skeleton text;
-    -- V4's vocabulary, in V4's order. The order is load-bearing: the
+    -- V8's vocabulary, in V8's order. The order is load-bearing: the
     -- schema-equivalence gate compares the normalized constraint text,
-    -- so a catalog whose CHECK lists the same 23 names in a different
+    -- so a catalog whose CHECK lists the same 24 names in a different
     -- order is NOT the state this migration appends to.
     expected_types CONSTANT text[] := ARRAY[
         'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
         'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
         'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
-        'timestamptz', 'string', 'json', 'uuid', 'binary'];
+        'timestamptz', 'string', 'json', 'uuid', 'binary', 'variant'];
 BEGIN
     SELECT pg_get_constraintdef(oid) INTO found_def
     FROM pg_constraint
@@ -81,9 +81,9 @@ BEGIN
     IF found_def IS NULL THEN
         RAISE EXCEPTION
             'V9 expected the constraint hog_column_col_type_check on hog_column (created '
-            'by V1__init.sql and recreated by V4__scalar_types.sql) but it is absent. This '
+            'by V1__init.sql and recreated by V4__scalar_types.sql and V8__variant_type.sql) but it is absent. This '
             'catalog has diverged from the migration chain; reconcile hog_column''s col_type '
-            'CHECK with V4 before re-running.';
+            'CHECK with V8 before re-running.';
     END IF;
     IF found_def NOT LIKE '%col_type%' THEN
         RAISE EXCEPTION
@@ -92,7 +92,7 @@ BEGIN
     END IF;
 
     -- The DEFINITION, not a substring of it. V9 DROPs this constraint
-    -- and recreates it, so one that merely MENTIONS a V4 type while
+    -- and recreates it, so one that merely MENTIONS a V8 type while
     -- permitting a different vocabulary — a hand-patched catalog that
     -- allows 'variant', say — would be discarded silently, which is the
     -- divergence this guard claims to catch.
@@ -101,22 +101,22 @@ BEGIN
     -- string: pg_get_constraintdef renders `IN (...)` as
     -- `= ANY (ARRAY['boolean'::text, ...])`, and the casts and spacing
     -- in that rendering are Postgres's business and have changed
-    -- before. The vocabulary and its order are the guarantee V4 made;
+    -- before. The vocabulary and its order are the guarantee V8 made;
     -- pin those and nothing else.
     SELECT array_agg(m[1] ORDER BY ord) INTO found_types
     FROM regexp_matches(found_def, '''([a-z0-9_]+)''', 'g') WITH ORDINALITY AS t(m, ord);
 
     IF found_types IS DISTINCT FROM expected_types THEN
         RAISE EXCEPTION
-            'V9 expected hog_column_col_type_check to permit exactly V4''s vocabulary, in V4''s '
+            'V9 expected hog_column_col_type_check to permit exactly V8''s vocabulary, in V8''s '
             'order. Expected: %. Found: % (from %). V9 replaces this constraint and will not '
-            'silently discard a vocabulary it does not recognise; reconcile with V4 before '
+            'silently discard a vocabulary it does not recognise; reconcile with V8 before '
             're-running.', expected_types, found_types, found_def;
     END IF;
 
     -- The member list is only half the constraint. The other half is
     -- what it DOES with them, and a list comparison cannot see that:
-    --   a NOT IN over the same 23 names        -- inverted
+    --   a NOT IN over the same 24 names        -- inverted
     --   the same membership test, OR'd with true -- vacuous
     --   a membership test on a DIFFERENT column, AND'd with a
     --     col_type IS NOT NULL that mentions this one
@@ -140,11 +140,11 @@ BEGIN
         'CHECK (col_type = ANY (ARRAY[]))'
     ) THEN
         RAISE EXCEPTION
-            'V9 found hog_column_col_type_check listing V4''s vocabulary, but its SHAPE is not '
+            'V9 found hog_column_col_type_check listing V8''s vocabulary, but its SHAPE is not '
             'a plain membership test: expected a skeleton of CHECK ((col_type = ANY (ARRAY[]))), '
             'found % (from %). A NOT IN, an OR, or an extra conjunct permits a different '
             'vocabulary while listing the same names, and V9 will not silently discard one; '
-            'reconcile with V4 before re-running.', found_skeleton, found_def;
+            'reconcile with V8 before re-running.', found_skeleton, found_def;
     END IF;
 END
 $$;
@@ -211,7 +211,7 @@ ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check CHECK (col_type 
     'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
     'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
     'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
-    'timestamptz', 'string', 'json', 'uuid', 'binary',
+    'timestamptz', 'string', 'json', 'uuid', 'binary', 'variant',
     'list', 'struct', 'map'));
 
 -- A column is never its own parent. Cheap, and it is the one cycle a

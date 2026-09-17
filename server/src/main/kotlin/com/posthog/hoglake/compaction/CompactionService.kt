@@ -364,6 +364,14 @@ class CompactionService(
         ctx: TableContext,
         cfg: CompactionConfig,
     ): List<CompactionGroup> {
+        // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
+        // work that could drop payloads or repeatedly fail the maintenance loop.
+        // allNodes, not the top level: a variant nested inside a struct
+        // is still a variant the rewriter cannot write, and `struct{v:
+        // variant}` has no top-level one. #77's check predates
+        // containers, where the two were the same question.
+        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return emptyList()
+
         data class Bucket(val specId: Long?, val values: List<String?>?)
 
         data class Row(val candidate: CompactionCandidate, val bucket: Bucket)

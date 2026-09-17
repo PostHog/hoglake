@@ -340,11 +340,13 @@ class IcebergSingleValueTest {
                 )
             // Exhaustive by assertion, not by hope: a new ColType with no
             // sample here fails LOUDLY instead of going untested. The
-            // containers have no single-value encoding, so they are
-            // covered by the refusal test below rather than by a sample.
-            assertThat(samples.keys + NESTED_TYPES)
+            // containers and VARIANT have no single-value encoding, so
+            // they are covered by the refusal tests rather than by a
+            // sample.
+            assertThat(samples.keys + NESTED_TYPES + ColType.VARIANT)
                 .containsExactlyInAnyOrderElementsOf(ColType.entries)
             assertThat(samples.keys).doesNotContainAnyElementsOf(NESTED_TYPES)
+            assertThat(samples.keys).doesNotContain(ColType.VARIANT)
             for ((type, value) in samples) {
                 assertThat(IcebergSingleValue.encode(type, value))
                     .describedAs(type.wire)

@@ -77,6 +77,7 @@ hoglake type. That is what keeps manifest generation a mechanical copy
 | `timestamptz` | timestamptz | INT64 + TIMESTAMP(MICROS, UTC) | 8-byte LE long, micros |
 | `string` | string | BYTE_ARRAY + STRING | UTF-8 bytes |
 | `json` | string | BYTE_ARRAY + JSON | UTF-8 bytes |
+| `variant` | variant (Iceberg v3) | VARIANT(1) group | none; omit whole-column statistics |
 | `uuid` | uuid | FIXED_LEN_BYTE_ARRAY(16) + UUID | 16 bytes BE |
 | `binary` | binary | BYTE_ARRAY | the bytes |
 
@@ -470,3 +471,14 @@ inlining decision.
 | Typed stats bounds | Lossy/ambiguous manifests | Registration API, v1 |
 | `metadata/` prefix + generator | Facade rework + layout migration | Bucket layout, v1 |
 | Operation-mappable snapshot changes | Facade guesses `operation` | snapshot_change encoding, v1 |
+
+### Native VARIANT publication
+
+The catalog accepts `variant` for append/read metadata. It has no scalar bounds,
+partition transform, sort-key contract, or promotion to/from scalar types.
+Prepared-file validation requires the native Parquet VARIANT(1) group annotation
+and its metadata/value storage shape; an ordinary struct is not equivalent.
+Shredded child statistics are not whole-column statistics and are omitted.
+Compaction planning skips tables with live VARIANT columns, and the scalar
+rewriter rejects them explicitly. Reader support must be verified per engine;
+this does not enable an Iceberg REST facade or the buffered-ingestion CLI.

@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.service.Identifiers
 import org.apache.parquet.column.Dictionary
@@ -395,6 +396,31 @@ object ParquetRewriter {
         maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
+        // VARIANT anywhere in the forest, not just at the top. #77
+        // checked `liveColumns.none {...}`, which was exhaustive in a
+        // world without containers — `struct{v: variant}` has no
+        // top-level variant, so post-merge that check waves it through
+        // and `parquetTypeFor` reaches its `error(...)` arm: an
+        // IllegalStateException into the sweep's catch-all, counted
+        // `failed_groups` and retried every run forever.
+        //
+        // CompactionService excludes such tables from candidates by the
+        // same rule, so in production this is the backstop rather than
+        // the gate.
+        if (liveColumns.allNodes().any { it.def.type == ColType.VARIANT }) {
+            // TYPED, like every other "this shape cannot be rewritten"
+            // in here. #77 used `require`, which is an
+            // IllegalArgumentException: the sweep's catch-all counts
+            // that as `failed_groups` and retries it every run, when the
+            // honest reading is `unconvertible_schema` — a shape this
+            // rewriter cannot produce YET, which clears the day variant
+            // compaction lands rather than blaming a writer.
+            throw UnconvertibleSchemaException(
+                "variant compaction is not supported: no released parquet-java can read a " +
+                    "realistic shredded variant (hoglake#70), so the rewrite would have to drop " +
+                    "or guess the payload",
+            )
+        }
         // A refusal mid-write leaves a truncated parquet file on disk —
         // no footer, unreadable, and (when the caller reuses the path)
         // indistinguishable from a real output. The rewriter owns the
@@ -797,6 +823,7 @@ object ParquetRewriter {
         fun prim(physical: PrimitiveType.PrimitiveTypeName) = Types.primitive(physical, repetition)
 
         return when (column.def.type) {
+            ColType.VARIANT -> error("variant compaction is not supported")
             ColType.BOOLEAN ->
                 prim(PrimitiveType.PrimitiveTypeName.BOOLEAN).id(id).named(name)
             ColType.INT8 -> intColumn(id, name, 8, signed = true, repetition = repetition)
@@ -1261,6 +1288,7 @@ object ParquetRewriter {
         if (unsignedWidth != null && unsignedWidth > live.maxUnsignedParquetWidth) refuse()
 
         return when (live) {
+            ColType.VARIANT -> error("variant compaction is not supported")
             ColType.BOOLEAN ->
                 if (srcName == PrimitiveType.PrimitiveTypeName.BOOLEAN) CopyMode.IDENTITY else refuse()
             // Every width <= 16 (signed or not) rides parquet INT32 and

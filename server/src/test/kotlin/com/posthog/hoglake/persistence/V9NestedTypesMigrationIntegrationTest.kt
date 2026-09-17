@@ -31,17 +31,17 @@ import javax.sql.DataSource
  */
 @Tag("integration")
 class V9NestedTypesMigrationIntegrationTest {
-    /** Everything a pre-V9 catalog can contain (V1 + V4). */
+    /** Everything a pre-V9 catalog can contain (V1 + V4 + V8). */
     private val preV9Types =
         listOf(
             "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
             "uint32", "uint64", "float", "double", "decimal", "date", "time",
             "timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns",
-            "timestamptz", "string", "json", "uuid", "binary",
+            "timestamptz", "string", "json", "uuid", "binary", "variant",
         )
 
-    /** The three V9 adds. */
-    private val v7Types = listOf("list", "struct", "map")
+    /** The three types V9 adds. */
+    private val v9Types = listOf("list", "struct", "map")
 
     /** Flyway configured exactly as Database.migrate does, optionally stopping at [target]. */
     private fun migrate(
@@ -60,11 +60,11 @@ class V9NestedTypesMigrationIntegrationTest {
     @Test
     fun `V9 widens the vocabulary and adds the tree edge on a populated catalog`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
 
             // A pre-V9 catalog: one table, one column per pre-V9 type.
             db.jdbi.useHandleUnchecked { h ->
-                h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('pre-v7', 's3://b/')")
+                h.execute("INSERT INTO hog_catalog (name, data_path) VALUES ('pre-v9', 's3://b/')")
                 h.execute("INSERT INTO hog_namespace (catalog_id, namespace_id, name) VALUES (1, 1, 'ns')")
                 h.execute("INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (1, 1, 1)")
                 preV9Types.forEachIndexed { i, type ->
@@ -134,7 +134,7 @@ class V9NestedTypesMigrationIntegrationTest {
                     ).mapTo(Long::class.java).one()
                 },
             ).isEqualTo(2L)
-            assertThat(v7Types).hasSize(3) // the three names exercised above
+            assertThat(v9Types).hasSize(3) // the three names exercised above
         }
 
     @Test
@@ -228,7 +228,7 @@ class V9NestedTypesMigrationIntegrationTest {
                     ).mapTo(String::class.java).findOne().orElse(null)
                 }
             assertThat(def).describedAs("hog_column_col_type_check exists after V9").isNotNull()
-            for (type in v7Types) {
+            for (type in v9Types) {
                 assertThat(def).describedAs("constraint lists %s", type).contains("'$type'")
             }
             // Order is load-bearing (the equivalence gate compares the
@@ -242,7 +242,7 @@ class V9NestedTypesMigrationIntegrationTest {
             // The loud guard. A hand-patched or doctored catalog gets a
             // message naming what V9 expected, not "constraint does not
             // exist" from a bare DROP.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
             }
@@ -251,19 +251,19 @@ class V9NestedTypesMigrationIntegrationTest {
         }
 
     @Test
-    fun `the migration refuses a constraint with V4's members and inverted semantics`(): Unit =
+    fun `the migration refuses a constraint with V8's members and inverted semantics`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // The member list is only half the constraint. NOT IN over
             // the same 23 names yields byte-identical found_types: the
             // list check passed, V9 dropped it, and a catalog that
             // permitted EVERYTHING EXCEPT the vocabulary was silently
             // replaced by one that permits it.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
                 h.execute(
                     "ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check " +
-                        "CHECK (col_type NOT IN (" + v4Types.joinToString(", ") { "'$it'" } + "))",
+                        "CHECK (col_type NOT IN (" + v8Types.joinToString(", ") { "'$it'" } + "))",
                 )
             }
             assertThatThrownBy { migrate(db.dataSource) }
@@ -271,16 +271,16 @@ class V9NestedTypesMigrationIntegrationTest {
         }
 
     @Test
-    fun `the migration refuses a constraint with V4's members and no force`(): Unit =
+    fun `the migration refuses a constraint with V8's members and no force`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // Same members, same operator, vacuous: `OR true` constrains
             // nothing at all and extracted identically.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("ALTER TABLE hog_column DROP CONSTRAINT hog_column_col_type_check")
                 h.execute(
                     "ALTER TABLE hog_column ADD CONSTRAINT hog_column_col_type_check " +
-                        "CHECK (col_type IN (" + v4Types.joinToString(", ") { "'$it'" } + ") OR true)",
+                        "CHECK (col_type IN (" + v8Types.joinToString(", ") { "'$it'" } + ") OR true)",
                 )
             }
             assertThatThrownBy { migrate(db.dataSource) }
@@ -293,7 +293,7 @@ class V9NestedTypesMigrationIntegrationTest {
             // Index names are unique per SCHEMA, not per table. V1's
             // name on some other relation passed every definition check
             // while guarding nothing on hog_column.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("DROP INDEX hog_column_live_ordinal")
                 h.execute(
@@ -309,19 +309,19 @@ class V9NestedTypesMigrationIntegrationTest {
                 .hasMessageContaining("it is not on hog_column")
         }
 
-    /** The vocabulary V9's guard expects to find, in order. */
-    private val v4Types =
+    /** The vocabulary V9's guard expects to find (V8's), in order. */
+    private val v8Types =
         listOf(
             "boolean", "int8", "int16", "int", "long", "uint8", "uint16",
             "uint32", "uint64", "float", "double", "decimal", "date", "time",
             "timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns",
-            "timestamptz", "string", "json", "uuid", "binary",
+            "timestamptz", "string", "json", "uuid", "binary", "variant",
         )
 
     @Test
     fun `the migration refuses a catalog whose ordinal index it does not recognise`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h -> h.execute("DROP INDEX hog_column_live_ordinal") }
             assertThatThrownBy { migrate(db.dataSource) }
                 .hasMessageContaining("V9 expected the index hog_column_live_ordinal")
@@ -335,7 +335,7 @@ class V9NestedTypesMigrationIntegrationTest {
             // something else would be discarded silently — the exact
             // divergence the guard's own comment claims to catch. Here
             // it guards the wrong KEY.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("DROP INDEX hog_column_live_ordinal")
                 h.execute(
@@ -357,7 +357,7 @@ class V9NestedTypesMigrationIntegrationTest {
             // Same name, same key, no WHERE: a total unique index is a
             // STRICTER guarantee, and replacing it silently would drop a
             // constraint the catalog had been relying on.
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("DROP INDEX hog_column_live_ordinal")
                 h.execute(
@@ -371,7 +371,7 @@ class V9NestedTypesMigrationIntegrationTest {
     @Test
     fun `the migration refuses an index that is no longer UNIQUE`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
-            migrate(db.dataSource, target = "4")
+            migrate(db.dataSource, target = "8")
             db.jdbi.useHandleUnchecked { h ->
                 h.execute("DROP INDEX hog_column_live_ordinal")
                 h.execute(

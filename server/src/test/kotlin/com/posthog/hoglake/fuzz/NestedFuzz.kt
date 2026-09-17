@@ -95,7 +95,19 @@ class FdpEntropy(private val fdp: FuzzedDataProvider) : Entropy {
 }
 
 object NestedFuzz {
-    val SCALARS: List<ColType> = ColType.entries.filter { !it.isNested }
+    /**
+     * The scalar pool this campaign draws from.
+     *
+     * VARIANT is excluded although it IS a catalog scalar. Its parquet
+     * shape is a group of `metadata`/`value`/`typed_value`, and
+     * `deriveSchema` would emit a primitive for it — a file no writer
+     * would produce, exercising the reader's variant arm against
+     * nonsense rather than against variants. Including it properly
+     * means teaching the generator that shape, which is worth doing
+     * when variant compaction exists to test; until then the honest
+     * move is to leave it out and say so.
+     */
+    val SCALARS: List<ColType> = ColType.entries.filter { !it.isNested && it != ColType.VARIANT }
 
     // ---- catalog side ---------------------------------------------------
 
