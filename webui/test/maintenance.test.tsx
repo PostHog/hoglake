@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isLoopDisabled, RunOutcomeBadge, RunsTable } from "../src/components/maintenance";
+import { isLoopDisabled, RunOutcomeBadge, RunsTable, RunSummary } from "../src/components/maintenance";
 import type { MaintenanceRun } from "../src/api/types";
 import { maintenanceRunsFixture } from "./fixtures";
 import { jsonResponse, mockFetch } from "./helpers";
@@ -29,6 +29,31 @@ describe("maintenance outcome and history", () => {
     render(<RunOutcomeBadge run={run} />);
     expect(screen.getByText("issues")).toHaveClass("stats-failed");
     expect(screen.queryByText("ok")).not.toBeInTheDocument();
+  });
+
+  it("renders no skip badge for a pre-upgrade compaction row with no invalid_data", () => {
+    // A ledger row recorded before the counter existed is handed back
+    // as its stored raw JSON. `!== "0"` is true for `undefined`, so the
+    // old guard showed the badge on every historical run — reading
+    // "invalid-data —", which is worse than silence because it looks
+    // like a value nobody could compute.
+    const { invalid_data: _dropped, ...older } = compaction.result!;
+    render(
+      <RunSummary
+        run={{ ...compaction, result: older } as MaintenanceRun}
+      />,
+    );
+    expect(screen.queryByText(/invalid-data/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/—/)).not.toBeInTheDocument();
+  });
+
+  it("renders the skip badge when invalid_data is nonzero", () => {
+    render(
+      <RunSummary
+        run={{ ...compaction, result: { ...compaction.result!, invalid_data: "3" } }}
+      />,
+    );
+    expect(screen.getByText(/invalid-data 3/)).toBeInTheDocument();
   });
 
   it.each(["0", "-1", "-9223372036854775808"])("treats interval %s as disabled", (interval) => {

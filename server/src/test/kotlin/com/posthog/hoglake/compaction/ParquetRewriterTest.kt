@@ -22,6 +22,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
@@ -97,6 +98,134 @@ class ParquetRewriterTest {
     }
 
     /** Arbitrary-schema writer for the heterogeneous/unconvertible cases. */
+    @Test
+    fun `the node budget is spent while the row is DECODED, not after`() {
+        // The property, not a restatement of the refusal: a budget that
+        // only counted the COPY was a report on memory already taken —
+        // `recordReader.read()` had built the whole source row before
+        // anything looked. So the assertion is on the FRAME the refusal
+        // comes from. It must be inside the record materializer.
+        //
+        // The heap consequence is proved for real, in a small-heap JVM,
+        // by BudgetOomRepro: at the production default budget an
+        // eight-million-element row OOMs the old read path at -Xmx512m
+        // and refuses cleanly on this one.
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("budget")
+        val input =
+            writeCustom(
+                "budget-decode.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    repeat(5_000) { i -> list.addGroup(0).add(0, i.toLong()) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+        val thrown =
+            catchThrowable {
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(input, 0)),
+                    live,
+                    emptyList(),
+                    tmp.resolve("budget-decode-out.parquet"),
+                    maxNodesPerRow = 64,
+                )
+            }
+        assertThat(thrown).isInstanceOf(InvalidDataException::class.java)
+        val frames = thrown.stackTrace.map { "${it.className}.${it.methodName}" }
+        assertThat(frames)
+            .describedAs("the refusal must come from inside the decode, not from the copy")
+            .anyMatch { it.contains("CountingGroupConverter") || it.contains("CountingPrimitiveConverter") }
+        assertThat(frames.none { it.endsWith("ParquetRewriter.copyField") })
+            .describedAs("nothing should have been copied yet")
+            .isTrue()
+    }
+
+    @Test
+    fun `a list of nulls is charged per entry group`() {
+        // Entry groups are allocated whether or not the element inside
+        // them is present, so charging only the copied elements made a
+        // million-null list free — the one shape that allocates a
+        // million groups and copies nothing.
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("nulls")
+        val input =
+            writeCustom(
+                "budget-nulls.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    // Entries present, elements absent: nothing to copy.
+                    repeat(500) { list.addGroup(0) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                live,
+                emptyList(),
+                tmp.resolve("budget-nulls-out.parquet"),
+                maxNodesPerRow = 100,
+            )
+        }.isInstanceOf(InvalidDataException::class.java)
+    }
+
+    @Test
+    fun `the budget renews at every row boundary`() {
+        // Per ROW, not per file: a hundred ordinary rows must not add up
+        // to a refusal, or the cap would be a file-size limit wearing a
+        // row-shaped name.
+        val schema =
+            Types.buildMessage()
+                .addField(Types.optional(PrimitiveTypeName.INT64).id(1).named("a"))
+                .named("rows")
+        val input =
+            writeCustom(
+                "budget-renew.parquet",
+                schema,
+                (0 until 100).map { i -> { g: Group -> g.add(0, i.toLong()) } },
+            )
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                emptyList(),
+                tmp.resolve("budget-renew-out.parquet"),
+                maxNodesPerRow = 8,
+            )
+        assertThat(result.rowsWritten).isEqualTo(100)
+    }
+
     private fun writeCustom(
         fileName: String,
         schema: MessageType,

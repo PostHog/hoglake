@@ -120,6 +120,25 @@ class ScalarTypeParityTest {
         }
 
         @Test
+        fun `the OpenAPI ColumnDef name schema carries the reserved prefix rule`() {
+            // The spec is the contract a generated client is built
+            // from. While it described the identifier regex as the
+            // complete policy, a generated client happily submitted
+            // `_hog_row_id` and met a 422 the spec never mentioned.
+            val spec = read("src/main/resources/openapi/hoglake.yaml")
+            val nameSchema = spec.substringAfter("\n    ColumnDef:").substringBefore("\n        type:\n")
+            assertThat(nameSchema)
+                .describedAs("the base identifier pattern is still declared")
+                .contains(com.posthog.hoglake.service.Identifiers.PATTERN)
+            assertThat(nameSchema)
+                .describedAs("and the reserved prefix is machine-readable, not just prose")
+                .contains("not: { pattern: \"^${com.posthog.hoglake.service.Identifiers.RESERVED_COLUMN_PREFIX}\" }")
+            assertThat(nameSchema)
+                .describedAs("and named, so a client author can find the refusal")
+                .contains(com.posthog.hoglake.service.Identifiers.RESERVED_COLUMN_PREFIX)
+        }
+
+        @Test
         fun `no refused name is smuggled into the vocabulary`() {
             assertThat(wireNames).doesNotContainAnyElementsOf(ColType.REFUSALS.keys)
         }

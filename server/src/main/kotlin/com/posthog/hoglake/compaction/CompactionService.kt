@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
@@ -1025,20 +1026,79 @@ class CompactionService(
         for ((fieldId, fieldRows) in rows.groupBy { it.fieldId }) {
             if (fieldRows.size != inputIds.size) continue // not every input covered the field
             val type = columnTypes[fieldId] ?: continue // column dropped since the inputs landed
+            // REPAIR ON READ, before the merge. Every row here was
+            // stored before StatsSanity existed or came through a door
+            // that predates it, so an inverted pair or an impossible
+            // count can already be sitting in the table — and a merge
+            // takes min(lowers) and max(uppers), which carries the
+            // damage into a BRAND NEW file and keeps it live for
+            // another compaction generation. Repairing the inputs as
+            // they are read stops the propagation without a migration;
+            // a backfill of the historical rows is a separate operation
+            // (noted as a follow-up, deliberately not done here — it
+            // rewrites rows for files nothing is compacting).
+            val clean =
+                fieldRows.map { r ->
+                    sane(
+                        ColumnStats(
+                            fieldId = fieldId,
+                            valueCount = r.valueCount,
+                            nullCount = r.nullCount,
+                            nanCount = r.nanCount,
+                            sizeBytes = r.sizeBytes,
+                            lowerBound = r.lower,
+                            upperBound = r.upper,
+                        ),
+                        type,
+                        "input of ${ctx.namespace}.${ctx.table}",
+                    )
+                }
+            // And again on the MERGE: the sum of sound inputs is not
+            // automatically sound (bounds merged from files with
+            // different live types, counts that overflow their
+            // relationship), and this is the row that gets stored.
             out +=
-                ColumnStats(
-                    fieldId = fieldId,
-                    valueCount = fieldRows.sumOf { it.valueCount },
-                    nullCount = fieldRows.sumOf { it.nullCount },
-                    nanCount =
-                        if (fieldRows.any { it.nanCount == null }) null else fieldRows.sumOf { it.nanCount!! },
-                    sizeBytes =
-                        if (fieldRows.any { it.sizeBytes == null }) null else fieldRows.sumOf { it.sizeBytes!! },
-                    lowerBound = mergeBound(type, fieldRows.map { it.lower }, takeUpper = false),
-                    upperBound = mergeBound(type, fieldRows.map { it.upper }, takeUpper = true),
+                sane(
+                    ColumnStats(
+                        fieldId = fieldId,
+                        valueCount = clean.sumOf { it.valueCount },
+                        nullCount = clean.sumOf { it.nullCount },
+                        nanCount =
+                            if (clean.any { it.nanCount == null }) null else clean.sumOf { it.nanCount!! },
+                        sizeBytes =
+                            if (clean.any { it.sizeBytes == null }) null else clean.sumOf { it.sizeBytes!! },
+                        lowerBound = mergeBound(type, clean.map { it.lowerBound }, takeUpper = false),
+                        upperBound = mergeBound(type, clean.map { it.upperBound }, takeUpper = true),
+                    ),
+                    type,
+                    "merged output for ${ctx.namespace}.${ctx.table}",
                 )
         }
         return out.sortedBy { it.fieldId }
+    }
+
+    /**
+     * One stats row through [StatsSanity], warning + counting any
+     * repair under the `compaction` source.
+     *
+     * The THIRD door. The commit path and the hydrator each ran this
+     * rule; compaction wrote `hog_file_column_stats` directly, so a
+     * malformed row could be merged into a new file's metadata and stay
+     * live — and every reader prunes on it.
+     */
+    private fun sane(
+        stats: ColumnStats,
+        type: ColType,
+        where: String,
+    ): ColumnStats {
+        val checked = StatsSanity.check(stats, type)
+        if (checked.repairs.isEmpty()) return stats
+        Metrics.statsRepaired("compaction")
+        log.warn {
+            "column stats for field_id ${stats.fieldId} in the $where are not internally " +
+                "consistent (${checked.repairs.joinToString("; ")}); using the repaired row"
+        }
+        return checked.stats
     }
 
     private fun mergeBound(

@@ -57,9 +57,15 @@ object Metrics {
     }
 
     /**
-     * hoglake_stats_repaired_total{source=commit|hydrator} — stats rows
-     * stored only after StatsSanity had to repair them (an undecodable
-     * or inverted bound dropped, an impossible count clamped).
+     * hoglake_stats_repaired_total{source=commit|hydrator|compaction} —
+     * stats rows stored only after StatsSanity had to repair them (an
+     * undecodable or inverted bound dropped, an impossible count
+     * clamped).
+     *
+     * `compaction` is the one that can fire on HISTORY: it repairs the
+     * input rows it merges, which may predate the rule entirely, so a
+     * standing nonzero count there means old malformed rows are still
+     * being read rather than that something is writing new ones.
      *
      * Nonzero means a WRITER is producing metadata its own data
      * contradicts. Silence here is the normal state; a rising line is a

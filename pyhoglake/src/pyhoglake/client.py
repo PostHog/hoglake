@@ -125,11 +125,18 @@ def _check_reserved_columns(schema: pa.Schema) -> None:
     at too."""
     reserved = _reserved_field_paths(list(schema))
     if reserved:
+        # WORDING MATCHES THE SERVER'S on purpose: "uses the reserved
+        # prefix '_hog'" is the phrase Identifiers.validateColumn raises,
+        # so a user who hits the local check and a user who hits the 422
+        # can search for the same string and find the same answer. The
+        # only deliberate difference is plurality — this one reports
+        # EVERY offending path at once, which is the point of checking
+        # before the request.
         raise ValidationError(
-            f"column names {reserved} use the reserved "
-            f"'{_RESERVED_COLUMN_PREFIX}' prefix (hoglake internal columns, "
-            "e.g. _hog_row_id), which collides with compaction's row-id "
-            "carrier; rename them",
+            f"column name(s) {reserved} use the reserved prefix "
+            f"'{_RESERVED_COLUMN_PREFIX}': names starting with it belong to "
+            "hoglake's own physical columns (compaction's _hog_row_id); "
+            "rename them",
             status_code=None,
         )
 

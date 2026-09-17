@@ -373,7 +373,10 @@ one ROW's materialized object graph, which no group-level budget can:
 both rewrite paths materialize a row whole, so a single row holding a
 hundred-million-element list is an OOM, and an OOM in a background loop
 takes the request path down with it. A row past the budget is refused
-as `invalid_data` — one counted skip instead of a process kill.
+as `invalid_data` — one counted skip instead of a process kill. The
+allowance is spent inside the parquet record materializer as the row is
+decoded, and again by the copy; counting it after `read()` returned
+would only have reported the allocation that already happened.
 
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are

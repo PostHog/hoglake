@@ -1426,11 +1426,32 @@ components:
       properties:
         name:
           type: string
-          pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          allOf:
+            - pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+            - not: { pattern: "^_hog" }
           description: >
             Identifier policy (shared by namespace/table/view/column
             names): letter or underscore start, then letters, digits,
-            underscore, hyphen; max 128 chars. Violations are 422.
+            underscore, hyphen; max 128 chars.
+
+            COLUMN names carry one rule the others do not: the `_hog`
+            prefix is RESERVED, at every nesting level, for hoglake's own
+            physical columns (compaction writes `_hog_row_id` into every
+            output, bound by a reserved field id). A column named
+            `_hog...` collides with it, so create_table, add_column and
+            rename_column all refuse one — including a field inside a
+            struct, a list element or a map value.
+
+            Both violations are 422. The reserved-prefix refusal names
+            the offending DOTTED PATH, so a rejected struct field says
+            where it is: "column name 'addr._hog_x' uses the reserved
+            prefix '_hog'".
+
+            The rule is expressed as `allOf` (base pattern + a `not`)
+            rather than one regex with a negative lookahead: lookahead is
+            legal ECMA-262 but RE2 — which Go clients generate against —
+            cannot compile it, and a client that fails to build is worse
+            than one that checks the prefix a layer up.
         type:
           type: string
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
@@ -1772,8 +1793,9 @@ components:
             top-level column. Naming a list or a map here is a 422.
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
-        # rename_column target (must satisfy the ColumnDef.name identifier
-        # pattern); promote_column target type
+        # rename_column target (must satisfy ColumnDef.name in full: the
+        # identifier pattern AND the reserved `_hog` prefix rule);
+        # promote_column target type
         to: { type: string }
         new_name:                     # rename_table
           type: string

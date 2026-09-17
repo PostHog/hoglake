@@ -287,6 +287,72 @@ class CompactionServiceIntegrationTest {
      * file deleting positions 1 and 3 (row ids 6 and 8) — the group
      * mixes DV-bearing and DV-free inputs.
      */
+    @Test
+    fun `a malformed pre-existing stats row cannot reach the compaction output`() {
+        // The THIRD door. Commit and the hydrator both sanitize; this
+        // path wrote hog_file_column_stats directly, so a row stored
+        // before the sanitizer existed could be merged into a new
+        // file's metadata and stay live for another compaction
+        // generation. Readers prune on these.
+        val fx = fixture(dvOnMiddle = false)
+
+        // Corrupt what a pre-sanitizer commit could have stored: an
+        // inverted bound pair on EVERY input (so the merge inverts too,
+        // rather than being rescued by a sound sibling), and a
+        // null_count above the value_count it is a subset of.
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_file_column_stats s
+                   SET lower_bound = :lo, upper_bound = :hi, null_count = value_count + 7
+                  FROM hog_catalog c
+                 WHERE c.catalog_id = s.catalog_id AND c.name = :cat AND s.field_id = 1
+                """,
+            )
+                .bind("cat", fx.cat)
+                .bind("lo", longLe(500))
+                .bind("hi", longLe(100))
+                .execute()
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single()
+        val row =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT value_count, null_count, lower_bound, upper_bound
+                      FROM hog_file_column_stats s
+                      JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                     WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = 1
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .map { rs, _ ->
+                        listOf(
+                            rs.getLong("value_count"),
+                            rs.getLong("null_count"),
+                        ) to (rs.getBytes("lower_bound") to rs.getBytes("upper_bound"))
+                    }
+                    .one()
+            }
+        val (counts, bounds) = row
+        assertThat(counts[1])
+            .describedAs("null_count must not exceed the value_count it is a subset of")
+            .isLessThanOrEqualTo(counts[0])
+        // The inverted pair is DROPPED, not narrowed: nothing in the row
+        // says which of the two was the wrong one, so keeping either
+        // would be picking at random — and the kept one would prune.
+        assertThat(bounds.first).describedAs("inverted lower bound must not survive").isNull()
+        assertThat(bounds.second).describedAs("inverted upper bound must not survive").isNull()
+    }
+
+    private fun longLe(v: Long): ByteArray =
+        java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(v).array()
+
     private fun fixture(dvOnMiddle: Boolean = true): Fixture {
         val cat = "compact-e2e-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")

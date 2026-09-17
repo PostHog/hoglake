@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
+import org.apache.parquet.column.Dictionary
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
@@ -18,6 +19,10 @@ import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
+import org.apache.parquet.io.api.Converter
+import org.apache.parquet.io.api.GroupConverter
+import org.apache.parquet.io.api.PrimitiveConverter
+import org.apache.parquet.io.api.RecordMaterializer
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
@@ -140,6 +145,16 @@ object ParquetRewriter {
      * a row's element count (the commit path has no such limit), so the
      * bound lives here.
      *
+     * Spent DURING the decode ([budgetedMaterializer]) and then during
+     * the copy, against one allowance per row. That ordering is the
+     * whole guarantee: the first version charged only the copy, which
+     * runs after `recordReader.read()` has already built the source row,
+     * so the budget reported an allocation instead of preventing one and
+     * the OOM happened anyway. `BudgetOomRepro` demonstrates both halves
+     * in a small-heap JVM — at THIS default an eight-million-element row
+     * exhausts a 512 MB heap on the old read path and refuses cleanly on
+     * this one.
+     *
      * A million nodes is ~100 MB of graph — deliberately far above any
      * honest row and far below the heap. The point is to convert a
      * process kill into one counted skip, not to police row shape.
@@ -174,13 +189,26 @@ object ParquetRewriter {
     private class Row(val group: Group, val rowId: Long)
 
     /**
-     * One row's node allowance, spent as the copy descends. Checked
-     * DURING construction, not after: an after-the-fact count would have
-     * to build the graph first, which is the thing that kills the
-     * process.
+     * One row's node allowance, spent as the row is DECODED and then
+     * copied.
+     *
+     * "Decoded" is the load-bearing word and it was missing. The first
+     * version of this charged only the copy, which runs after
+     * `recordReader.read()` has already built the whole source row — so
+     * the budget was a report on an allocation that had already
+     * happened, and a row big enough to exhaust the heap did so before
+     * anything consulted it. The bound is only real if it is spent
+     * inside the record materializer, which is what
+     * [budgetedMaterializer] is for.
+     *
+     * [reset] is called once per row, by the root converter's `start`.
      */
     private class NodeBudget(private val limit: Int, private val source: Path) {
         private var spent = 0
+
+        fun reset() {
+            spent = 0
+        }
 
         fun spend() {
             spent++
@@ -190,6 +218,104 @@ object ParquetRewriter {
                         "rather than risking a process-fatal OOM in the compaction loop",
                 )
             }
+        }
+    }
+
+    /**
+     * [GroupRecordConverter] with [budget] spent as the row is built.
+     *
+     * Parquet hands a `RecordMaterializer` a tree of converters and
+     * drives it from the column pages: every `start()` on a group
+     * converter is one `SimpleGroup` about to be allocated, and every
+     * `addX` on a primitive converter is one value about to be appended.
+     * Counting there is the only place a cap can act BEFORE the memory
+     * is taken — by the time `read()` returns, the row exists.
+     *
+     * The wrapper tree is built ONCE and cached per node, because
+     * parquet navigates it by index while binding columns and expects
+     * the same converter object every time.
+     */
+    private fun budgetedMaterializer(
+        schema: MessageType,
+        budget: NodeBudget,
+    ): RecordMaterializer<Group> {
+        val delegate = GroupRecordConverter(schema)
+        val root = CountingGroupConverter(delegate.rootConverter, budget, isRoot = true)
+        return object : RecordMaterializer<Group>() {
+            override fun getCurrentRecord(): Group = delegate.currentRecord
+
+            override fun getRootConverter(): GroupConverter = root
+
+            override fun skipCurrentRecord() = delegate.skipCurrentRecord()
+        }
+    }
+
+    private class CountingGroupConverter(
+        private val delegate: GroupConverter,
+        private val budget: NodeBudget,
+        private val isRoot: Boolean = false,
+    ) : GroupConverter() {
+        private val children = HashMap<Int, Converter>()
+
+        override fun getConverter(fieldIndex: Int): Converter =
+            children.getOrPut(fieldIndex) {
+                when (val c = delegate.getConverter(fieldIndex)) {
+                    is PrimitiveConverter -> CountingPrimitiveConverter(c, budget)
+                    else -> CountingGroupConverter(c.asGroupConverter(), budget)
+                }
+            }
+
+        override fun start() {
+            // The root's start is the row boundary: the allowance is per
+            // ROW, so it renews here and nowhere else.
+            if (isRoot) budget.reset() else budget.spend()
+            delegate.start()
+        }
+
+        override fun end() = delegate.end()
+    }
+
+    private class CountingPrimitiveConverter(
+        private val delegate: PrimitiveConverter,
+        private val budget: NodeBudget,
+    ) : PrimitiveConverter() {
+        override fun hasDictionarySupport(): Boolean = delegate.hasDictionarySupport()
+
+        override fun setDictionary(dictionary: Dictionary) = delegate.setDictionary(dictionary)
+
+        override fun addValueFromDictionary(dictionaryId: Int) {
+            budget.spend()
+            delegate.addValueFromDictionary(dictionaryId)
+        }
+
+        override fun addBinary(value: Binary) {
+            budget.spend()
+            delegate.addBinary(value)
+        }
+
+        override fun addBoolean(value: Boolean) {
+            budget.spend()
+            delegate.addBoolean(value)
+        }
+
+        override fun addDouble(value: Double) {
+            budget.spend()
+            delegate.addDouble(value)
+        }
+
+        override fun addFloat(value: Float) {
+            budget.spend()
+            delegate.addFloat(value)
+        }
+
+        override fun addInt(value: Int) {
+            budget.spend()
+            delegate.addInt(value)
+        }
+
+        override fun addLong(value: Long) {
+            budget.spend()
+            delegate.addLong(value)
         }
     }
 
@@ -342,13 +468,17 @@ object ParquetRewriter {
         val srcRowIdIndex = rowIdCarrier(schema, input.localPath)
         val plan = columnPlan(schema, liveColumns, input.localPath)
         var applied = 0L
-        readRows(input.localPath, schema) { src, ordinal ->
+        // ONE allowance per row, spent first by the decode and then by
+        // the copy of the same row — so the bound covers both sides of
+        // the pipeline rather than the cheaper half of it. The root
+        // converter renews it at each row boundary.
+        val budget = NodeBudget(maxNodesPerRow, input.localPath)
+        readRows(input.localPath, schema, budget) { src, ordinal ->
             if (input.deletes?.contains(ordinal) == true) {
                 applied++
                 return@readRows
             }
             val dst = factory.newGroup()
-            val budget = NodeBudget(maxNodesPerRow, input.localPath)
             for ((outIdx, step) in plan.withIndex()) {
                 if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
                     copyField(src, step, dst, outIdx, dataFields[outIdx], budget)
@@ -1166,6 +1296,7 @@ object ParquetRewriter {
     private fun readRows(
         path: Path,
         schema: MessageType,
+        budget: NodeBudget,
         consume: (Group, Long) -> Unit,
     ) {
         ParquetFileReader.open(LocalInputFile(path)).use { reader ->
@@ -1173,7 +1304,7 @@ object ParquetRewriter {
             var ordinal = 0L
             var pages = reader.readNextRowGroup()
             while (pages != null) {
-                val recordReader = columnIO.getRecordReader(pages, GroupRecordConverter(schema))
+                val recordReader = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
                 repeat(Math.toIntExact(pages.rowCount)) {
                     consume(recordReader.read(), ordinal++)
                 }
@@ -1219,6 +1350,12 @@ object ParquetRewriter {
                 val n = srcList.getFieldRepetitionCount(0)
                 for (i in 0 until n) {
                     val srcEntry = srcList.getGroup(0, i)
+                    // CHARGED before it is allocated, and whether or not
+                    // the element inside it is present: a list of a
+                    // million nulls is a million entry groups, and
+                    // charging only the copied elements made exactly that
+                    // shape free.
+                    budget.spend()
                     val dstEntry = dstList.addGroup(0)
                     if (srcEntry.getFieldRepetitionCount(step.element.srcIndex) > 0) {
                         copyField(srcEntry, step.element, dstEntry, 0, dstEntryType.getType(0), budget)
@@ -1232,6 +1369,7 @@ object ParquetRewriter {
                 val n = srcMap.getFieldRepetitionCount(0)
                 for (i in 0 until n) {
                     val srcEntry = srcMap.getGroup(0, i)
+                    budget.spend()
                     val dstEntry = dstMap.addGroup(0)
                     // The key is REQUIRED on both sides (planNode refuses
                     // an optional input key), so it is always present.

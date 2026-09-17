@@ -273,11 +273,34 @@ def test_create_table_body_shape_for_nested_columns(client, httpx_mock):
     }
 
 
+def test_reserved_prefix_message_matches_the_server_phrase():
+    """The client's refusal uses the SERVER's phrase.
+
+    Identifiers.validateColumn raises "column name '<path>' uses the
+    reserved prefix '_hog': names starting with it belong to hoglake's
+    own physical columns (compaction's _hog_row_id)". A user who trips
+    the local check and a user who gets the 422 should be able to search
+    for the same string, so the shared span is pinned here — the local
+    one differs only in reporting every path at once.
+    """
+    from pyhoglake.client import _check_reserved_columns
+
+    with pytest.raises(ValidationError) as ei:
+        _check_reserved_columns(pa.schema([pa.field("_hog_row_id", pa.int64())]))
+    msg = str(ei.value)
+    # Plural here, singular on the server ('name(s) ... use' vs
+    # 'name ... uses'); the searchable span is the same.
+    assert "the reserved prefix '_hog':" in msg
+    assert "hoglake's own physical columns (compaction's _hog_row_id)" in msg
+    assert "_hog_row_id" in msg
+
+
 def test_create_table_reserved_hog_column_fast_fails(client, httpx_mock):
     """`_hog*` column names are reserved for hoglake internals
-    (_hog_row_id is compaction's row-id carrier). The server does not
-    enforce the prefix (hoglake#36); the client fast-fails them BEFORE
-    the POST leaves the building."""
+    (_hog_row_id is compaction's row-id carrier). The server enforces
+    the prefix too now, at every nesting level (hoglake#36); this check
+    fast-fails BEFORE the POST leaves the building, and reports every
+    offending path at once instead of one per round trip."""
     cat = _catalog(client, httpx_mock)
     from pyhoglake.client import Namespace
 

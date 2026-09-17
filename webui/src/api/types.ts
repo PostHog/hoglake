@@ -337,8 +337,16 @@ export interface CompactionResult {
    * under the type its own file declares. Unlike unconvertible_schema
    * this never clears on its own — the bytes are durable — so a nonzero
    * count is a writer bug, not a backlog.
+   *
+   * OPTIONAL here although the schema requires it. The server fills it
+   * in for ledger rows recorded before the counter existed, so a
+   * current server always sends it — but a rolling deploy can serve
+   * this page from an older one, and `!== "0"` is TRUE for `undefined`,
+   * which put an "invalid-data —" badge on every historical run. The
+   * type says what the wire can actually carry; the guards use
+   * `positive()`, which is undefined-safe.
    */
-  invalid_data: Int64;
+  invalid_data?: Int64;
   /** Groups that failed outright (logged, retried next run) — red-flag counter. */
   failed_groups: Int64;
 }
