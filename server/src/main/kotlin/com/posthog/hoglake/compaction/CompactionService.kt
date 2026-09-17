@@ -545,9 +545,16 @@ class CompactionService(
             }
             val outputBytes = outLocal.fileSize()
             val footerSize = footerSize(outLocal)
+            // Bare UUID, deliberately indistinguishable from an ingested
+            // file (the pyhoglake writer's shape). A `compacted-` prefix
+            // used to sit here; it told readers nothing the catalog does
+            // not already say — explicit_row_ids is the flag that decides
+            // how a file's row ids are read, and no reader may infer that
+            // from a path — while giving every compaction output in a
+            // table the same 10-character lead-in.
             val outputPath =
                 "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                    "compacted-${UUID.randomUUID()}.parquet"
+                    "${UUID.randomUUID()}.parquet"
 
             // Claim ticket BEFORE the upload (its own committed
             // transaction): if this group never commits — skip, crash,
