@@ -103,6 +103,40 @@ object Metrics {
         }
     }
 
+    /**
+     * hoglake_compaction_skipped_total{catalog, reason} — groups the
+     * sweep declined to compact, by reason.
+     *
+     * `unconvertible_schema` and `invalid_data` had a DTO field, a log
+     * line and a ledger row each, and no counter — so the only way to
+     * see either was to read a run's payload or grep the logs, while
+     * every other compaction outcome was a series. The two are the ones
+     * an operator most needs a LINE for: unconvertible_schema rising
+     * means a table has stopped compacting, invalid_data rising means a
+     * writer is emitting values its own schema forbids. Neither is
+     * visible as a failure, which is exactly why neither gets noticed.
+     *
+     * Skip flavors that already re-plan on their own (conflicts, DV
+     * supersession) stay uncounted here: they are self-healing and a
+     * line for them would be noise.
+     */
+    fun compactionSkipped(
+        catalog: String,
+        reason: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment(
+                "hoglake_compaction_skipped_total",
+                count.toDouble(),
+                "catalog",
+                catalog,
+                "reason",
+                reason,
+            )
+        }
+    }
+
     /** hoglake_background_loop_failures_total{loop} — iterations that threw (loop continued). */
     fun backgroundLoopFailure(loop: String) = increment("hoglake_background_loop_failures_total", 1.0, "loop", loop)
 

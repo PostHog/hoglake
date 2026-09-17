@@ -479,6 +479,8 @@ class CompactionService(
             val result = doRunOnce(catalog, cfg)
             Metrics.compactionGroups(catalog, result.groupsCompacted)
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
+            Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
+            Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
             result
         }
 

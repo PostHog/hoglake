@@ -1418,7 +1418,19 @@ components:
         expires_at: { type: string, format: date-time, description: Prepared operations expire after 24 hours; terminal receipts do not expire }
         snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
-        reason: { type: string, enum: [target_exists, namespace_changed, client_abort, expired] }
+        reason:
+          type: string
+          enum: [target_exists, namespace_changed, client_abort, expired,
+                 definition_invalid]
+          description: >
+            Why a `rejected` receipt cannot be published.
+            `definition_invalid` means the definition was legal when it
+            was PREPARED and is not any more — a rule tightened between
+            prepare and publish. The receipt is terminal: prepare a new
+            one with a definition the current server accepts. (Without
+            this the operation stayed `prepared` forever, since the
+            failing publish rolled itself back and only an explicit
+            abort could end it.)
 
     ColumnDef:
       type: object

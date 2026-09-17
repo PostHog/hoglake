@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.service.CorruptDefinitionException
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
@@ -28,6 +29,9 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
  * - malformed body / unparseable query or path params -> 400
+ * - CorruptDefinitionException -> 500 `corrupt_definition`, NAMING the
+ *   unreadable receipt (a stored row nobody can act on without knowing
+ *   which one it is)
  * - anything else     -> 500 (logged; generic body, no internals)
  */
 fun StatusPagesConfig.installErrorMapping() {
@@ -49,6 +53,19 @@ fun StatusPagesConfig.installErrorMapping() {
                 }
             }
         call.respond(status, ApiErrorDto(error = code, detail = cause.message))
+    }
+    // A receipt this server WROTE and cannot read back. Still a 500 —
+    // the caller did nothing wrong and can do nothing about it — but a
+    // named one carrying which receipt, because the catch-all's generic
+    // internal_error body left an operator with a row they could not
+    // identify. No caller-supplied text reaches this message: every part
+    // of it is the codec's own, plus an operation id.
+    exception<CorruptDefinitionException> { call, cause ->
+        log.error(cause) { "unreadable table creation definition: ${cause.message}" }
+        call.respond(
+            HttpStatusCode.InternalServerError,
+            ApiErrorDto("corrupt_definition", cause.message),
+        )
     }
     // Ktor wraps request-body deserialization failures in BadRequestException;
     // route helpers throw it directly for unparseable query/path parameters.

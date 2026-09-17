@@ -1254,8 +1254,16 @@ object ParquetRewriter {
                 } else {
                     refuse()
                 }
+            // Same annotation gate as string/json/binary, and for the
+            // same reason: sixteen bytes annotated DECIMAL are not a
+            // uuid, and copying them under a `uuid` output column
+            // re-stamps them UUID — laundering the annotation exactly as
+            // the string arm used to.
             ColType.UUID_T ->
-                if (srcName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && src.typeLength == 16) {
+                if (srcName == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY &&
+                    src.typeLength == 16 &&
+                    FooterStats.bytesSortUnsigned(src.logicalTypeAnnotation)
+                ) {
                     CopyMode.IDENTITY
                 } else {
                     refuse()

@@ -33,17 +33,7 @@ data class CatalogColumn(
     /** From type_params for decimal columns; null when absent. */
     val decimalScale: Int?,
     val children: List<CatalogColumn> = emptyList(),
-) {
-    /** This node and every descendant, parents before children. */
-    fun selfAndDescendants(): List<CatalogColumn> =
-        buildList {
-            add(this@CatalogColumn)
-            for (c in children) addAll(c.selfAndDescendants())
-        }
-}
-
-/** Every node of a catalog-column forest, parents before children. */
-fun List<CatalogColumn>.allNodes(): List<CatalogColumn> = flatMap { it.selfAndDescendants() }
+)
 
 /**
  * Pure footer-to-stats aggregation: takes a parquet footer
@@ -130,15 +120,24 @@ object FooterStats {
 
     /**
      * Whether [aggregate] will map columns by field id for this schema:
-     * true when any primitive leaf ANYWHERE in the schema carries a
-     * `PARQUET:field_id`. False = the name-fallback path, whose column
-     * set the hydrator must resolve at the FILE's begin_snapshot, not
-     * live-at-hydration.
+     * true when any node that BINDS to a catalog column — a leaf OR a
+     * container wrapper, at any depth — carries a `PARQUET:field_id`.
+     * False = the name-fallback path, whose column set the hydrator must
+     * resolve at the FILE's begin_snapshot, not live-at-hydration.
      *
-     * "Anywhere", not "top level": a file whose only columns are nested
-     * has no top-level primitive leaf at all, and answering false for it
-     * would send a perfectly id-bearing file down the name-binding path.
-     * For a flat schema every leaf IS top-level, so nothing changes.
+     * Binding NODES, not primitive leaves, and that distinction is the
+     * whole point: a file that stamps ids on its list and struct
+     * wrappers and leaves its leaves bare answers TRUE here and binds by
+     * id, where a leaf-only scan called it id-less and produced no stats
+     * at all while the rewriter copied it happily. The exempt set is the
+     * same one [missingFieldIds] exempts — parquet's synthetic
+     * repetition layers — so the two questions are asked about one set
+     * of nodes.
+     *
+     * "Anywhere", not "top level", for the same reason: a file whose
+     * only columns are nested has no top-level leaf. A flat schema is
+     * unaffected either way — every one of its fields is both a leaf and
+     * a binding node.
      */
     fun usesFieldIds(schema: MessageType): Boolean = anyBindingNodeWithId(schema.fields)
 
@@ -852,8 +851,19 @@ object FooterStats {
                 } else {
                     null
                 }
+            // The annotation gate applies here too, and its absence was
+            // an arm missed rather than a decision: a DECIMAL(38,0)
+            // FLBA(16) under a `uuid` column had parquet's SIGNED
+            // two's-complement ordering taken as an unsigned-byte uuid
+            // bound. The pair only stopped being stored because
+            // StatsSanity caught the inversion afterwards — which also
+            // reported it as a repaired row, blaming the writer for a
+            // rule this surface had not applied.
             ColType.UUID_T ->
-                if (physical == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY && raw.size == 16) {
+                if (physical == PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY &&
+                    raw.size == 16 &&
+                    bytesSortUnsigned(col, leaf)
+                ) {
                     raw
                 } else {
                     null
@@ -1108,24 +1118,5 @@ object FooterStats {
         }
         walk(schema.fields)
         return dupes
-    }
-
-    /** Every primitive leaf of the schema, at any depth, with its full chunk path. */
-    private fun allLeaves(schema: MessageType): List<Leaf> =
-        buildList { collectLeaves(schema.fields, emptyList(), this) }
-
-    private fun collectLeaves(
-        fields: List<Type>,
-        prefix: List<String>,
-        out: MutableList<Leaf>,
-    ) {
-        for (field in fields) {
-            val path = prefix + field.name
-            if (field.isPrimitive) {
-                out.add(Leaf(path, field.id?.intValue(), field.asPrimitiveType()))
-            } else {
-                collectLeaves(field.asGroupType().fields, path, out)
-            }
-        }
     }
 }

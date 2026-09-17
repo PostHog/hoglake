@@ -4,6 +4,8 @@ import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.MixedIdBindingRepro
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.hydrator.CatalogColumn
+import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
@@ -22,6 +24,7 @@ import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.ParquetFileWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
@@ -111,6 +114,51 @@ class NestedCampaignRegressionTest {
         // File-level gate off: names only, and still only id-less ones.
         assertThat(FooterStats.bindIndex(fields, 1, "b", useFieldIds = false)).isEqualTo(0)
         assertThat(FooterStats.bindIndex(fields, 1, "x", useFieldIds = false)).isEqualTo(-1)
+    }
+
+    @Test
+    fun `a decimal-annotated FLBA under a uuid column is refused by both surfaces`(
+        @TempDir tmp: Path,
+    ) {
+        // Sixteen bytes annotated DECIMAL are not a uuid. Parquet
+        // ordered them SIGNED two's-complement; a uuid bound is
+        // unsigned-byte. HIGH-2 gated string/json/binary on that and
+        // left this arm, so the reader took the bytes verbatim (the
+        // inverted pair was only caught afterwards by StatsSanity, which
+        // then reported a repaired row and blamed the writer) and the
+        // rewriter copied them under a UUID stamp.
+        val schema =
+            MessageType(
+                "m",
+                listOf<Type>(
+                    Types.optional(PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY)
+                        .length(16)
+                        .`as`(LogicalTypeAnnotation.decimalType(0, 38))
+                        .id(1)
+                        .named("u"),
+                ),
+            )
+        val src = tmp.resolve("uuid-decimal.parquet")
+        write(schema, src) { f ->
+            listOf(
+                f.newGroup().also { it.add(0, Binary.fromConstantByteArray(ByteArray(16) { 0xFF.toByte() })) },
+                f.newGroup().also { it.add(0, Binary.fromConstantByteArray(ByteArray(16) { 1 })) },
+            )
+        }
+        // Reader: no bounds, and NOT because a later backstop deleted
+        // them — the annotation rule refused them here.
+        val footer = FooterParse.parse(LocalInputFile(src))
+        val agg =
+            FooterStats.aggregate(footer, listOf(CatalogColumn(1, "u", ColType.UUID_T, null)), src.toString())
+                .single()
+        assertThat(agg.lowerBound).isNull()
+        assertThat(agg.upperBound).isNull()
+        assertThat(agg.valueCount).describedAs("counts are unaffected").isEqualTo(2)
+
+        // Rewriter: typed refusal rather than an annotation re-stamp.
+        assertThatThrownBy {
+            rewrite(src, listOf(Column(1, 0, ColumnDef("u", ColType.UUID_T))), tmp.resolve("uuid-out.parquet"))
+        }.isInstanceOf(UnconvertibleSchemaException::class.java)
     }
 
     // ---- the reserved column prefix, at every nesting level --------------
@@ -420,15 +468,25 @@ class NestedCampaignRegressionTest {
                 """{"version":1,"namespace":"n","name":"t","columns":[{"name":"c","type":"nope"}]}""",
                 """{"version":1,"name":"t","columns":[]}""",
                 """{"version":99,"namespace":"n","name":"t","columns":[]}""",
+                // `asInt()` answers 0 for a string — the same 0 that
+                // means "the pre-versioned shape" — so this used to
+                // decode silently with version-0 spellings.
+                """{"version":"2","namespace":"n","name":"t","columns":[]}""",
+                """{"version":true,"namespace":"n","name":"t","columns":[]}""",
+                """{"version":{},"namespace":"n","name":"t","columns":[]}""",
                 """{"version":2,"namespace":"n","name":"t",""" +
                     """"columns":[{"name":"c","type":"long","children":7}]}""",
                 """{"version":1,"namespace":"n","name":"t",""" +
                     """"columns":[{"name":"c","type":"decimal","type_params":"nope"}]}""",
             )
         for (blob in corpus) {
-            assertThatThrownBy { TableCreationDefinitionCodec.decode(blob) }
+            assertThatThrownBy { TableCreationDefinitionCodec.decode(blob, "operation deadbeef") }
                 .describedAs("decoding %s", blob)
                 .isInstanceOf(CorruptDefinitionException::class.java)
+                // The KDoc promises it says WHICH receipt; a stack trace
+                // pointing at an `.asText()` call does not help an
+                // operator find one row among millions.
+                .hasMessageContaining("operation deadbeef")
         }
     }
 

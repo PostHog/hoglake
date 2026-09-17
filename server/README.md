@@ -378,6 +378,15 @@ allowance is spent inside the parquet record materializer as the row is
 decoded, and again by the copy; counting it after `read()` returned
 would only have reported the allocation that already happened.
 
+Both durable skip reasons carry a counter:
+`hoglake_compaction_skipped_total{reason="unconvertible_schema"}` rising
+means a table has stopped compacting, and `{reason="invalid_data"}`
+rising means a writer is emitting values its own schema forbids. Neither
+shows up as a failure — a sweep with either can look perfectly healthy —
+which is exactly why they get a line rather than only a log and a ledger
+row. The self-healing skips (commit conflicts, DV supersession) stay
+uncounted: they re-plan on the next run.
+
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are
 only a promotion estimate: encoding, schema changes and DV removal can

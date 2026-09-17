@@ -49,6 +49,8 @@ class TableCreationService(
     private val commits: CommitService,
     private val lockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
 ) {
+    private val log = io.github.oshai.kotlinlogging.KotlinLogging.logger {}
+
     private val mapper =
         jacksonObjectMapper().findAndRegisterModules().enable(
             SerializationFeature.ORDER_MAP_ENTRIES_BY_KEYS,
@@ -180,15 +182,45 @@ class TableCreationService(
                 } else if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, definition.name) != null) {
                     transition(h, cat.catalogId, operationId, "rejected", "target_exists")
                 } else {
+                    // A receipt PREPARED under an older, laxer rule set
+                    // can hold a definition this server now refuses — a
+                    // reserved `_hog` name, a forest past the node cap, a
+                    // shape a later check tightened. Letting the
+                    // Validation escape rolls the transaction back and
+                    // leaves the operation `prepared` FOREVER: every
+                    // retry re-validates and re-fails, and the only exit
+                    // is an explicit abort the client has no reason to
+                    // send, since from its side publish is just 422-ing.
+                    //
+                    // `rejected` is the terminal state this belongs in.
+                    // It is the same shape as target_exists and
+                    // namespace_changed: the receipt was honestly
+                    // prepared and is no longer publishable, through no
+                    // fault of THIS call.
+                    //
+                    // Scoped to createTable deliberately. The file checks
+                    // below are about the arguments of this call, and a
+                    // client that posts a blank path deserves a 422 it
+                    // can fix by posting again — not a dead receipt.
                     val table =
-                        catalogs.createTable(
-                            h,
-                            catalog,
-                            definition.namespace,
-                            definition.name,
-                            definition.columns,
-                            operation.tableUuid,
-                        )
+                        try {
+                            catalogs.createTable(
+                                h,
+                                catalog,
+                                definition.namespace,
+                                definition.name,
+                                definition.columns,
+                                operation.tableUuid,
+                            )
+                        } catch (e: HoglakeException.Validation) {
+                            log.warn {
+                                "table creation $operationId in $catalog was prepared with a " +
+                                    "definition this server refuses (${e.message}); rejecting the " +
+                                    "receipt rather than leaving it prepared forever"
+                            }
+                            transition(h, cat.catalogId, operationId, "rejected", "definition_invalid")
+                            return@operationTransaction load(h, cat.catalogId, operationId)
+                        }
                     check(table.columns == operation.columns)
                     val published = CatalogRepo.require(h, catalog)
                     commits.registerInitialFiles(
@@ -287,7 +319,10 @@ class TableCreationService(
                 WHERE catalog_id = :catalog AND operation_id = :operation
                 """,
                 ).bind("catalog", catalog).bind("operation", operation).mapTo(String::class.java).one()
-            val normalized = TableCreationDefinitionCodec.encode(TableCreationDefinitionCodec.decode(stored))
+            val normalized =
+                TableCreationDefinitionCodec.encode(
+                    TableCreationDefinitionCodec.decode(stored, "table creation operation $operation"),
+                )
             val same =
                 h.createQuery("SELECT CAST(:stored AS jsonb) = CAST(:requested AS jsonb)")
                     .bind("stored", normalized).bind("requested", encoded).mapTo(Boolean::class.java).one()
@@ -353,7 +388,11 @@ class TableCreationService(
         )
             .bind("catalog", catalog).bind("operation", operation)
             .map { rs, _ ->
-                val definition = TableCreationDefinitionCodec.decode(rs.getString("definition"))
+                val definition =
+                    TableCreationDefinitionCodec.decode(
+                        rs.getString("definition"),
+                        "table creation operation $operation",
+                    )
                 TableCreation(
                     operation, rs.getObject("table_uuid", UUID::class.java), definition,
                     initialColumns(definition.columns),
