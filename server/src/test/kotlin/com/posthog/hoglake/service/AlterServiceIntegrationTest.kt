@@ -77,6 +77,23 @@ class AlterServiceIntegrationTest {
                 ),
             ),
         )
+        // The add_column already-exists message caps the NEW name and
+        // not the parent: `where` is non-empty only when
+        // requireStructParent already resolved every segment against
+        // stored names, so the parent is bounded by construction.
+        // `addr` already has a `zip` from the fixture above.
+        val dup =
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("zip", ColType.LONG), parent = "addr")),
+                )
+            }
+        assertThat(dup).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(dup.message!!).describedAs("the parent survives whole").contains("of struct 'addr'")
+
         val ops =
             listOf<AlterOp>(
                 AlterOp.DropColumn("addr.$huge"),
@@ -100,11 +117,18 @@ class AlterServiceIntegrationTest {
 
     @Test
     fun `an alter 422 keeps a legitimately deep path intact`() {
-        // The other half of the same rule: a path built from STORED
-        // names is already bounded, and clipping it to 37 characters
-        // took away the half an operator needs to find the column. The
-        // cap belongs on unvalidated input only.
+        // The other half of the rule: a path built from STORED names is
+        // already bounded, and clipping it took away the half an
+        // operator needs to find the column.
+        //
+        // LONGER THAN THE CAP, deliberately. A 46-character path against
+        // a 64-character cap proves nothing — re-capping every site
+        // leaves such a test green, so it discriminates the old 40-char
+        // width from no cap at all rather than the un-cap decision. Four
+        // struct levels of ~28 characters each is ~115, comfortably past
+        // 64, and every segment is a stored catalog name.
         val (cat, ns) = fixture()
+        val levels = listOf("outer_container_level_one", "second_container_level_two", "third_container_lvl")
         alter.alterTable(
             cat,
             ns,
@@ -112,15 +136,34 @@ class AlterServiceIntegrationTest {
             listOf(
                 AlterOp.AddColumn(
                     ColumnDef(
-                        "outer_container_column",
+                        levels[0],
                         ColType.STRUCT,
-                        children = listOf(ColumnDef("inner_struct_field_name", ColType.LONG)),
+                        children =
+                            listOf(
+                                ColumnDef(
+                                    levels[1],
+                                    ColType.STRUCT,
+                                    children =
+                                        listOf(
+                                            ColumnDef(
+                                                levels[2],
+                                                ColType.STRUCT,
+                                                children = listOf(ColumnDef("leaf_scalar_field", ColType.LONG)),
+                                            ),
+                                        ),
+                                ),
+                            ),
                     ),
                 ),
             ),
         )
-        val deep = "outer_container_column.inner_struct_field_name"
-        val thrown =
+        val deep = levels.joinToString(".") + ".leaf_scalar_field"
+        assertThat(deep.length).describedAs("the fixture must exceed the cap to prove anything")
+            .isGreaterThan(64)
+
+        // 1. A path that resolves to a SCALAR: the "not a struct"
+        //    refusal quotes the container path, which is stored.
+        val notAStruct =
             catchThrowable {
                 alter.alterTable(
                     cat,
@@ -129,10 +172,59 @@ class AlterServiceIntegrationTest {
                     listOf(AlterOp.AddColumn(ColumnDef("x", ColType.LONG), parent = deep)),
                 )
             }
-        assertThat(thrown).isInstanceOf(HoglakeException.Validation::class.java)
-        assertThat(thrown.message!!)
-            .describedAs("a resolvable path survives whole")
-            .contains(deep)
+        assertThat(notAStruct).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(notAStruct.message!!).describedAs("resolvable path survives whole").contains(deep)
+
+        // 2. The add_column ALREADY-EXISTS refusal, whose `where` is
+        //    non-empty only when requireStructParent already resolved
+        //    every segment — so the parent is bounded by construction
+        //    and capping it is pure loss. A short parent proves nothing
+        //    here; this one is over 64 characters.
+        val deepStruct = levels.joinToString(".")
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(AlterOp.AddColumn(ColumnDef("added_leaf", ColType.LONG), parent = deepStruct)),
+        )
+        val dup =
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("added_leaf", ColType.LONG), parent = deepStruct)),
+                )
+            }
+        assertThat(deepStruct.length).isGreaterThan(64)
+        assertThat(dup).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(dup.message!!)
+            .describedAs("the resolved parent survives whole")
+            .contains("of struct '$deepStruct'")
+
+        // 3. The PARTITION-SOURCE refusal, which the un-capping was
+        //    motivated by and which had no test at all. Its path is
+        //    built by walking catalog names, so it is bounded by
+        //    construction and must arrive whole.
+        val container = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == levels[0] }
+        val nested =
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(
+                        AlterOp.SetPartitionSpec(
+                            listOf(PartitionFieldDef(container.fieldId, Transform.IDENTITY)),
+                        ),
+                    ),
+                )
+            }
+        assertThat(nested).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(nested.message!!)
+            .describedAs("the partition-source refusal names the whole path")
+            .contains(levels[0])
+            .doesNotContain("...")
     }
 
     // ---- happy paths, one op each ----------------------------------------

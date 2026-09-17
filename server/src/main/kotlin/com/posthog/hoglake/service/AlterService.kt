@@ -185,9 +185,13 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val parent = op.parent?.let { requireStructParent(state, it) }
         val siblings = parent?.children ?: state.cols
-        // CAPPED: reached before ColumnTrees.validate, so the name has
-        // not met the identifier pattern yet.
-        val where = if (parent == null) "" else " of struct '${Identifiers.cap(op.parent)}'"
+        // The NEW name is capped — it reaches here before
+        // ColumnTrees.validate, so the identifier pattern has not
+        // applied to it. The PARENT is not: `where` is non-empty only
+        // when requireStructParent above resolved every segment against
+        // stored names, so it is already bounded, and clipping it is the
+        // over-application this sweep exists to remove.
+        val where = if (parent == null) "" else " of struct '${op.parent}'"
         if (siblings.any { it.def.name == op.def.name }) {
             throw HoglakeException.Validation(
                 "column '${Identifiers.cap(op.def.name)}'$where already exists",

@@ -43,6 +43,20 @@ import java.util.UUID
  * begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
 class CatalogService(private val jdbi: Jdbi) {
+    companion object {
+        /**
+         * Ceiling on a catalog's `data_path`.
+         *
+         * S3 keys stop at 1024 bytes and a data_path is only the PREFIX
+         * under which keys are built, so anything near this is already
+         * unusable — the bound exists because nothing else provided one
+         * (the column is `text` with no CHECK, the OpenAPI schema is a
+         * bare string), and an unbounded value registered once is echoed
+         * by every overlap refusal afterwards.
+         */
+        const val MAX_DATA_PATH_LENGTH = 512
+    }
+
     // ---- catalogs --------------------------------------------------------
 
     fun createCatalog(
@@ -72,7 +86,8 @@ class CatalogService(private val jdbi: Jdbi) {
                     if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                         throw HoglakeException.Validation(
                             "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
-                                "'${existing.name}' (data_path '${existing.dataPath}'); " +
+                                "'${existing.name}' (data_path " +
+                                "'${Identifiers.cap(existing.dataPath)}'); " +
                                 "catalog data_paths must be disjoint",
                         )
                     }
@@ -98,6 +113,17 @@ class CatalogService(private val jdbi: Jdbi) {
      */
     private fun validateDataPath(dataPath: String) {
         if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
+        // A LENGTH BOUND, which nothing provided: the column is `text`
+        // with no CHECK, validateDataPath tested shape but never size,
+        // and the OpenAPI schema is a bare string. A 100 KB data_path
+        // registered fine and then rode into every overlap 422 any later
+        // catalog triggered — capping the echo only shortens the
+        // message, it does not stop the value being stored.
+        if (dataPath.length > MAX_DATA_PATH_LENGTH) {
+            throw HoglakeException.Validation(
+                "data_path is ${dataPath.length} characters, over the maximum $MAX_DATA_PATH_LENGTH",
+            )
+        }
         if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
             throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
         }

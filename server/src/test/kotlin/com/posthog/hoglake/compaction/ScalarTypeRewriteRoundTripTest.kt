@@ -301,7 +301,7 @@ class ScalarTypeRewriteRoundTripTest {
         // tier-1 output becomes a tier-2 input, and the bounds must not
         // drift a little further on each pass.
         val second = tmp.resolve("$name-out2.parquet")
-        //  is a compaction output: its ids live in the carrier.
+        // `first` is a compaction output: its ids live in the carrier.
         rewrite(first, type, second, explicitRowIds = true)
         assertBounds(bounds(second, type), pre, "$name after re-compaction")
         return Trip(pre.first, pre.second, inPath, first, second)

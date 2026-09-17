@@ -170,9 +170,11 @@ class NestedCampaignRegressionTest {
         assertThat(byName.keys).containsExactlyInAnyOrder("B1", "B2", "B3", "B4", "B5", "B6", "B7")
 
         // A compaction output whose carrier carries a foreign field id:
-        // refusal. (B1's field id is 77, so it drives the foreign-id
-        // branch only; the wrong-TYPE branch has its own named test.)
-        assertThat(byName["B1"]).contains("UnconvertibleSchemaException")
+        // refusal, typed as invalid_data — the disagreement is durable,
+        // so re-planning will never clear it. (B1's field id is 77, so
+        // it drives the foreign-id branch only; the wrong-TYPE branch
+        // has its own named test.)
+        assertThat(byName["B1"]).contains("InvalidDataException")
         // A null in a real carrier is invalid DATA, not a schema fault.
         assertThat(byName["B2"]).contains("InvalidDataException")
         // A catalog column called _hog_row_id: refused by the DDL, and
@@ -555,7 +557,7 @@ class NestedCampaignRegressionTest {
             // code and in test at once.
             val expected =
                 when (label) {
-                    "absent" -> "carries no ${ParquetRewriter.ROW_ID_COLUMN}"
+                    "absent" -> "carries no column with the reserved field id"
                     "foreign-id" -> "rather than the reserved"
                     else -> "is not a primitive int64"
                 }
@@ -568,33 +570,32 @@ class NestedCampaignRegressionTest {
                 )
             }
                 .describedAs("carrier %s", label)
-                .isInstanceOf(UnconvertibleSchemaException::class.java)
+                .isInstanceOf(InvalidDataException::class.java)
                 .hasMessageContaining(expected)
         }
     }
 
     @Test
-    fun `a real carrier still works, by id and by name`(
+    fun `under explicit_row_ids the reserved id is the only legal carrier`(
         @TempDir tmp: Path,
     ) {
-        // The two legal shapes for a compaction output: the reserved id
-        // (what this project writes) and the bare name with no id.
-        for ((label, carrier) in listOf(
-            "by-id" to
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
-                    .id(ParquetRewriter.ROW_ID_FIELD_ID)
-                    .named(ParquetRewriter.ROW_ID_COLUMN),
-            "by-name" to
-                Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
-                    .named(ParquetRewriter.ROW_ID_COLUMN),
-        )) {
+        // ONE legal shape, not two. The shipped reader binds the carrier
+        // with TryFindColumnByFieldId(HOG_ROW_ID_FIELD_ID) — the name
+        // plays no part — and refuses a flag-true file without that id
+        // outright. Binding an ID-LESS field on its NAME here compacted
+        // a file the reader refuses into one it TRUSTS: a foreign
+        // writer's values promoted to authoritative row ids under the
+        // reserved id, and the input then expired.
+        val live = listOf(Column(1, 0, ColumnDef("a", ColType.LONG)))
+
+        fun fileWith(
+            label: String,
+            carrier: Type,
+        ): Path {
             val schema =
                 MessageType(
                     "m",
-                    listOf<Type>(
-                        Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
-                        carrier,
-                    ),
+                    listOf(Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"), carrier),
                 )
             val src = tmp.resolve("carrier-$label.parquet")
             write(schema, src) { f ->
@@ -605,16 +606,156 @@ class NestedCampaignRegressionTest {
                     }
                 }
             }
-            val out =
+            return src
+        }
+
+        val byId =
+            ParquetRewriter.rewrite(
+                listOf(
+                    ParquetRewriter.Input(
+                        fileWith(
+                            "by-id",
+                            Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                                .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                                .named(ParquetRewriter.ROW_ID_COLUMN),
+                        ),
+                        5000L,
+                        null,
+                        explicitRowIds = true,
+                    ),
+                ),
+                live,
+                emptyList(),
+                tmp.resolve("carrier-by-id-out.parquet"),
+            )
+        assertThat(byId.minRowId).describedAs("the carrier's ids, not positional").isEqualTo(700L)
+
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(
+                    ParquetRewriter.Input(
+                        fileWith(
+                            "by-name",
+                            Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                                .named(ParquetRewriter.ROW_ID_COLUMN),
+                        ),
+                        5000L,
+                        null,
+                        explicitRowIds = true,
+                    ),
+                ),
+                live,
+                emptyList(),
+                tmp.resolve("carrier-by-name-out.parquet"),
+            )
+        }
+            .describedAs("an id-less field wearing the name is not a carrier")
+            .isInstanceOf(InvalidDataException::class.java)
+            .hasMessageContaining("rather than the reserved")
+    }
+
+    @Test
+    fun `two fields sharing the reserved id are refused, not silently picked`(
+        @TempDir tmp: Path,
+    ) {
+        // The id that decides row IDENTITY, duplicated. indexOfFirst
+        // bound the first of them without a word — the same "a duplicate
+        // makes the binding a guess" argument refuseDuplicateNames makes
+        // about names, with more at stake.
+        val schema =
+            MessageType(
+                "m",
+                listOf<Type>(
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"),
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named("other"),
+                ),
+            )
+        val src = tmp.resolve("dup-reserved.parquet")
+        write(schema, src) { f ->
+            listOf(
+                f.newGroup().also {
+                    it.add(0, 1L)
+                    it.add(1, 700L)
+                    it.add(2, 900L)
+                },
+            )
+        }
+        for (flag in listOf(true, false)) {
+            assertThatThrownBy {
                 ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = true)),
+                    listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds = flag)),
                     listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                     emptyList(),
-                    tmp.resolve("carrier-$label-out.parquet"),
+                    tmp.resolve("dup-reserved-out-$flag.parquet"),
                 )
-            assertThat(out.minRowId)
-                .describedAs("%s: the carrier's ids are kept, not the positional ones", label)
-                .isEqualTo(700L)
+            }
+                .describedAs("explicit_row_ids = %s", flag)
+                .isInstanceOf(InvalidDataException::class.java)
+                .hasMessageContaining("2 top-level fields")
+        }
+    }
+
+    @Test
+    fun `a positional file carrying the reserved id is refused in every shape`(
+        @TempDir tmp: Path,
+    ) {
+        // The arm the previous commit existed to add, which nothing
+        // protected: deleting the whole check left 1064 tests green.
+        // Before that commit, fifteen round-trip second passes exercised
+        // it BY ACCIDENT (a real output fed back in with the flag
+        // defaulted false); fixing those helpers — correctly — removed
+        // the only cover the arm had.
+        //
+        // All three shapes, because the refusal must not depend on the
+        // carrier being usable: it is the ID's presence that contradicts
+        // the registration.
+        val shapes =
+            listOf(
+                "int64" to
+                    Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+                "wrong-type" to
+                    Types.optional(PrimitiveType.PrimitiveTypeName.BINARY)
+                        .`as`(LogicalTypeAnnotation.stringType())
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+                "repeated" to
+                    Types.repeated(PrimitiveType.PrimitiveTypeName.INT64)
+                        .id(ParquetRewriter.ROW_ID_FIELD_ID)
+                        .named(ParquetRewriter.ROW_ID_COLUMN),
+            )
+        for ((label, carrier) in shapes) {
+            val schema =
+                MessageType(
+                    "m",
+                    listOf(Types.optional(PrimitiveType.PrimitiveTypeName.INT64).id(1).named("a"), carrier),
+                )
+            val src = tmp.resolve("poison-$label.parquet")
+            write(schema, src) { f ->
+                listOf(
+                    f.newGroup().also {
+                        it.add(0, 5L)
+                        if (label == "wrong-type") it.add(1, Binary.fromString("nope")) else it.add(1, 900L)
+                    },
+                )
+            }
+            assertThatThrownBy {
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = false)),
+                    listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                    emptyList(),
+                    tmp.resolve("poison-$label-out.parquet"),
+                )
+            }
+                .describedAs("reserved id on a %s field", label)
+                .isInstanceOf(InvalidDataException::class.java)
+                .hasMessageContaining("registered WITHOUT explicit_row_ids")
         }
     }
 

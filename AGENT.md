@@ -183,7 +183,7 @@ there would break that gate on every build.
    its registration. The server also enforces the reserved `_hog`
    prefix that protects the carrier now
    (`Identifiers.RESERVED_COLUMN_PREFIX`, at every nesting level), so
-   finding 9 in duckdb-client/DESIGN.md is closed for names created
+   duckdb-client/DESIGN.md finding 9 is closed for names created
    through the DDL; files registered before the reservation, or written
    by a foreign writer, are still what the refusals above are for.
 3. **One live deletion vector per data file** (unique partial index);

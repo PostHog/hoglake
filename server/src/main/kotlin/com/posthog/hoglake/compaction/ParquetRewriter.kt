@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
+import com.posthog.hoglake.service.Identifiers
 import org.apache.parquet.column.Dictionary
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
@@ -56,6 +57,17 @@ class UnconvertibleSchemaException(message: String) : IllegalArgumentException(m
  * separately (CompactionResult.invalidData) because a nonzero count
  * means a WRITER is producing values its own schema forbids, and that
  * is a bug report, not a compaction backlog.
+ *
+ * DURABILITY AND FAULT, not values-versus-schema, is what that axis
+ * measures — which is why a file disagreeing with its
+ * `explicit_row_ids` registration lands here too, even though the
+ * disagreement is in the SCHEMA. A reserved field id burned into a
+ * registered parquet never clears: the group is re-planned and
+ * re-refused every sweep forever. Filing it under
+ * `unconvertible_schema` made it read as a backlog awaiting a schema
+ * change that is never coming, while `invalid_data` — the counter that
+ * exists to say "a writer produced something its own registration
+ * forbids" — stayed at zero.
  *
  * Before this existed these threw raw NumberFormatException out of
  * BigInteger and landed in the catch-all as failed_groups, which retried
@@ -572,98 +584,106 @@ object ParquetRewriter {
      * open it, so it is the one place that can enforce what the docs
      * ask of readers.
      *
-     * Three arms, each its own check:
+     * Arms, each its own check:
      *
-     *  - **flag true, carrier usable** — bind it. The file is a
-     *    compaction output and its identities live in the column.
-     *  - **flag true, carrier absent / wrong type / foreign id** — the
-     *    file cannot produce the ids its registration promises.
-     *    Falling back to positional numbering would give every row an
-     *    identity it was never committed with, which is the
-     *    predecessor's rowid-remap bug.
-     *  - **flag false, reserved field id PRESENT** — the registration
-     *    and the file contradict each other. The reserved id is never
-     *    allocatable to a real column, so a positional file carrying
-     *    one violates the reserved-id invariant and its row ids cannot
-     *    be trusted. `duckdb-client` refuses exactly this
-     *    (`hoglake_wire_hardening.test`); compacting it instead
-     *    LAUNDERS it — the values land under a column the output
-     *    registers as `explicit_row_ids = true` with fabricated
-     *    positional ids, and the evidence is end-snapshotted and
-     *    expired.
-     *  - **flag false, no reserved id** — positional numbering.
-     *    `rowIdStart + ordinal` IS this file's server-assigned
-     *    identity, and a field merely NAMED `_hog_row_id` is an
-     *    ordinary client column with an unlucky name.
+     *  - **flag true, exactly one field with the RESERVED id, primitive
+     *    int64, not repeated** — bind it.
+     *  - **flag true, otherwise** — refuse. The file cannot produce the
+     *    ids its registration promises, and positional numbering would
+     *    give every row an identity it was never committed with, which
+     *    is the predecessor's rowid-remap bug.
+     *  - **flag false, reserved id present anywhere at top level** —
+     *    refuse. The reserved id is never allocatable to a real column,
+     *    so the file and its registration contradict each other.
+     *  - **flag false, otherwise** — positional numbering. A field
+     *    merely NAMED `_hog_row_id` is an ordinary client column with
+     *    an unlucky name.
+     *
+     * BY ID ONLY, with no name fallback, and that matters in the
+     * flag-TRUE direction specifically. The shipped reader binds the
+     * carrier with `TryFindColumnByFieldId(local_columns,
+     * HOG_ROW_ID_FIELD_ID)` — the name plays no part — and refuses a
+     * flag-true file without that id outright. Accepting an id-less
+     * field on its NAME here would compact a file the reader refuses
+     * into one it trusts, promoting a foreign writer's values to
+     * authoritative row ids under the reserved id, and then expiring
+     * the input. `FooterStats.bindIndex`'s id-less-name fallback is
+     * about foreign files binding to CATALOG columns; a flag-true file
+     * was written by compaction, which always stamps the id.
      */
     private fun rowIdCarrier(
         schema: MessageType,
         input: Input,
     ): Int? {
         val source = input.localPath
-        val reserved =
-            schema.fields.indexOfFirst { it.id?.intValue() == ROW_ID_FIELD_ID }.takeIf { it >= 0 }
+        val reservedAt = schema.fields.indices.filter { schema.fields[it].id?.intValue() == ROW_ID_FIELD_ID }
+
+        // ONE carrier or none. Two fields sharing the reserved id is the
+        // duplicate-binding argument `refuseDuplicateNames` makes about
+        // names, with more force: this id decides row IDENTITY, and
+        // `indexOfFirst` would have picked one of them silently.
+        if (reservedAt.size > 1) {
+            throw InvalidDataException(
+                "$source declares the reserved field id $ROW_ID_FIELD_ID on " +
+                    "${reservedAt.size} top-level fields " +
+                    "(${reservedAt.joinToString { Identifiers.cap(schema.fields[it].name) }}); " +
+                    "the id that decides row identity has no correct resolution when duplicated",
+            )
+        }
+        val reserved = reservedAt.singleOrNull()
 
         if (!input.explicitRowIds) {
             // EXPLICIT CHECK, not a fall-through: the doc names this
-            // direction specifically. A positional file may not carry
-            // the reserved id at all.
+            // direction first.
             if (reserved != null) {
-                throw UnconvertibleSchemaException(
+                throw InvalidDataException(
                     "$source is registered WITHOUT explicit_row_ids but its schema carries the " +
-                        "reserved field id $ROW_ID_FIELD_ID on '${schema.fields[reserved].name}'. " +
-                        "The reserved id is never allocatable to a real column, so the file and " +
-                        "its registration contradict each other and its row ids cannot be " +
-                        "trusted (AGENT.md invariant 2)",
+                        "reserved field id $ROW_ID_FIELD_ID on " +
+                        "'${Identifiers.cap(schema.fields[reserved].name)}'. The reserved id is " +
+                        "never allocatable to a real column, so the file and its registration " +
+                        "contradict each other and its row ids cannot be trusted " +
+                        "(AGENT.md invariant 2)",
                 )
             }
-            // A field merely NAMED _hog_row_id, with its own id or with
-            // none, is an ordinary client column. Its identities are
-            // positional either way.
             return null
         }
 
-        // ONLY ID-LESS FIELDS ANSWER TO A NAME — FooterStats.bindIndex's
-        // rule. A field with its own id is its own column.
-        val byName =
-            schema.fields.indexOfFirst { it.id == null && it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
-        val index = reserved ?: byName
-
-        if (index == null) {
-            // Distinguish the two ways this can happen, because they are
-            // different faults: a file with no such column at all, and a
-            // file whose column carries somebody else's id.
+        if (reserved == null) {
+            // Name the two shapes apart: a file with no such column, and
+            // one whose column carries somebody else's id.
             val impostor = schema.fields.firstOrNull { it.name == ROW_ID_COLUMN }
             if (impostor != null) {
-                throw UnconvertibleSchemaException(
-                    "$source is registered with explicit_row_ids and has a '$ROW_ID_COLUMN', but " +
-                        "it carries field id ${impostor.id?.intValue()} rather than the reserved " +
-                        "$ROW_ID_FIELD_ID; the column that should hold this file's identities is " +
-                        "declared to be a different column",
+                throw InvalidDataException(
+                    "$source is registered with explicit_row_ids and has a " +
+                        "'${Identifiers.cap(impostor.name)}', but it carries field id " +
+                        "${impostor.id?.intValue()} rather than the reserved $ROW_ID_FIELD_ID; " +
+                        "the carrier binds by id, so this file cannot produce the ids its " +
+                        "registration promises",
                 )
             }
-            throw UnconvertibleSchemaException(
-                "$source is registered with explicit_row_ids but carries no $ROW_ID_COLUMN " +
-                    "(field id $ROW_ID_FIELD_ID); its rows have no identity to preserve, and " +
-                    "numbering them positionally would give every one a different id from the " +
-                    "one it was committed with",
+            throw InvalidDataException(
+                "$source is registered with explicit_row_ids but carries no column with the " +
+                    "reserved field id $ROW_ID_FIELD_ID ($ROW_ID_COLUMN); its rows have no " +
+                    "identity to preserve, and numbering them positionally would give every one " +
+                    "a different id from the one it was committed with",
             )
         }
-        val field = schema.fields[index]
+        val field = schema.fields[reserved]
         val primitive = if (field.isPrimitive) field.asPrimitiveType() else null
         if (primitive?.primitiveTypeName != PrimitiveType.PrimitiveTypeName.INT64) {
-            throw UnconvertibleSchemaException(
-                "$source is registered with explicit_row_ids but its '${field.name}' is not a " +
-                    "primitive int64; refusing rather than renumbering the file's rows",
+            throw InvalidDataException(
+                "$source is registered with explicit_row_ids but its " +
+                    "'${Identifiers.cap(field.name)}' is not a primitive int64; refusing rather " +
+                    "than renumbering the file's rows",
             )
         }
         if (field.isRepetition(Type.Repetition.REPEATED)) {
-            throw UnconvertibleSchemaException(
-                "$source carries a REPEATED row-id column '${field.name}'; the row id is one " +
-                    "value per row",
+            throw InvalidDataException(
+                "$source carries a REPEATED row-id column '${Identifiers.cap(field.name)}'; the " +
+                    "row id is one value per row",
             )
         }
-        return index
+        return reserved
     }
 
     /**
