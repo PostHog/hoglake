@@ -338,10 +338,13 @@ export interface CompactionResult {
   dv_superseded: Int64;
   unconvertible_schema: Int64;
   /**
-   * Groups skipped because an input holds a value that cannot exist
-   * under the type its own file declares. Unlike unconvertible_schema
-   * this never clears on its own — the bytes are durable — so a nonzero
-   * count is a writer bug, not a backlog.
+   * Groups skipped for a fault that is DURABLE and the writer's: a
+   * value that cannot exist under the type its own file declares, or a
+   * file whose schema contradicts its own explicit_row_ids
+   * registration. Unlike unconvertible_schema it never clears on its
+   * own, so the group is re-planned and re-refused every sweep. The axis
+   * is durability and fault, not values-versus-schema; a nonzero count
+   * is a writer bug, not a backlog.
    *
    * OPTIONAL here although the schema requires it. The server fills it
    * in for ledger rows recorded before the counter existed, so a

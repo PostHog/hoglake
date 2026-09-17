@@ -868,13 +868,19 @@ data class CompactionResult(
      */
     val unconvertibleSchema: Long = 0,
     /**
-     * Groups skipped because an input holds a value that cannot exist
-     * under the type its own file declares (an empty byte array under a
-     * decimal, an unscaled value wider than the destination precision),
-     * or a row large enough to threaten the heap. Skip-with-reason, like
-     * [unconvertibleSchema] — but where a schema skip clears when the
-     * schema or the file set moves, bad bytes are durable, so this one
-     * never self-heals. Nonzero means a WRITER is at fault.
+     * Groups skipped for a fault that is DURABLE and the writer's:
+     * a value that cannot exist under the type its own file declares (an
+     * empty byte array under a decimal, an unscaled value wider than the
+     * destination precision), a row large enough to threaten the heap,
+     * or a file whose schema contradicts its own registration (the
+     * reserved row-id field id present or absent against
+     * `explicit_row_ids`).
+     *
+     * Skip-with-reason, like [unconvertibleSchema] — but that one clears
+     * when the schema or the file set moves, and this one never does, so
+     * the group is re-planned and re-refused every sweep. Durability and
+     * fault are the axis, not values-versus-schema: nonzero means a
+     * WRITER produced something its own registration or schema forbids.
      */
     val invalidData: Long = 0,
     /**

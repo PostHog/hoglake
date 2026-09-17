@@ -162,10 +162,10 @@ object NestedAgreement {
                     null
                 } catch (t: InvalidDataException) {
                     dataRefused = true
-                    // The rewriter's SECOND typed refusal: the schema
-                    // pairing is fine but a VALUE is not (an empty blob
-                    // under a decimal, an over-precision unscaled value,
-                    // a row past the node budget). Typed is the contract;
+                    // The rewriter's SECOND typed refusal: a DURABLE
+                    // writer fault (a bad value, or a file contradicting
+                    // its own registration) rather than a schema pairing
+                    // this plan could resolve. Typed is the contract;
                     // which of the two it is, is not.
                     null
                 } catch (t: Throwable) {

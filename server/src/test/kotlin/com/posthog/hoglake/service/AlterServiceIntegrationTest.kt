@@ -36,6 +36,7 @@ class AlterServiceIntegrationTest {
     private val scoreCol = ColumnDef("score", ColType.FLOAT)
     private val countCol = ColumnDef("count", ColType.INT)
     private val tsCol = ColumnDef("ts", ColType.TIMESTAMPTZ)
+    private val leafCol = ColumnDef("leaf_scalar_field", ColType.LONG)
 
     @AfterAll
     fun tearDown() = db.close()
@@ -206,7 +207,15 @@ class AlterServiceIntegrationTest {
         //    motivated by and which had no test at all. Its path is
         //    built by walking catalog names, so it is bounded by
         //    construction and must arrive whole.
-        val container = catalogs.getTable(cat, ns, "t").columns.single { it.def.name == levels[0] }
+        //
+        //    Pointed at the INNERMOST struct, not the outer one: the
+        //    outer container's path is its own 25-character name, which
+        //    a 64-character cap leaves untouched, so the assertion would
+        //    have been vacuous — verbatim the defect this test's own
+        //    step 1 comment warns about.
+        val innermost = leafOf(cat, ns, deepStruct)
+        assertThat(deepStruct.length).describedAs("the quoted path must exceed the cap")
+            .isGreaterThan(64)
         val nested =
             catchThrowable {
                 alter.alterTable(
@@ -215,7 +224,7 @@ class AlterServiceIntegrationTest {
                     "t",
                     listOf(
                         AlterOp.SetPartitionSpec(
-                            listOf(PartitionFieldDef(container.fieldId, Transform.IDENTITY)),
+                            listOf(PartitionFieldDef(innermost.fieldId, Transform.IDENTITY)),
                         ),
                     ),
                 )
@@ -223,8 +232,154 @@ class AlterServiceIntegrationTest {
         assertThat(nested).isInstanceOf(HoglakeException.Validation::class.java)
         assertThat(nested.message!!)
             .describedAs("the partition-source refusal names the whole path")
-            .contains(levels[0])
-            .doesNotContain("...")
+            .contains(deepStruct)
+    }
+
+    /** The column [path] names, resolved by walking the live tree. */
+    private fun leafOf(
+        cat: String,
+        ns: String,
+        path: String,
+    ): com.posthog.hoglake.model.Column {
+        var cols = catalogs.getTable(cat, ns, "t").columns
+        var found: com.posthog.hoglake.model.Column? = null
+        for (segment in path.split('.')) {
+            found = cols.single { it.def.name == segment }
+            cols = found.children
+        }
+        return found!!
+    }
+
+    @Test
+    fun `every refusal quoting a stored path quotes it whole`() {
+        // The remaining un-capped sites, each with a path well over the
+        // 64-character cap. Every one of them is built by walking
+        // CATALOG names, so it is bounded by construction — and a silent
+        // re-cap would clip exactly the half an operator needs. A
+        // re-cap on any of these passed the whole suite before this
+        // test existed.
+        val (cat, ns) = fixture()
+        val a = "outer_container_level_one"
+        val b = "second_container_level_two"
+        val c = "third_container_lvl"
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.AddColumn(
+                    ColumnDef(
+                        a,
+                        ColType.STRUCT,
+                        children =
+                            listOf(
+                                ColumnDef(
+                                    b,
+                                    ColType.STRUCT,
+                                    children =
+                                        listOf(
+                                            ColumnDef(
+                                                c,
+                                                ColType.STRUCT,
+                                                // TWO fields: dropping one must
+                                                // not be refused as "the last
+                                                // field of struct", which fires
+                                                // before the source check and
+                                                // would mask it.
+                                                children = listOf(leafCol, ColumnDef("sibling", ColType.LONG)),
+                                            ),
+                                            ColumnDef(
+                                                "list_container_under_struct",
+                                                ColType.LIST,
+                                                children =
+                                                    listOf(
+                                                        ColumnDef(
+                                                            "element",
+                                                            ColType.STRUCT,
+                                                            children = listOf(leafCol),
+                                                        ),
+                                                    ),
+                                            ),
+                                        ),
+                                ),
+                            ),
+                    ),
+                ),
+            ),
+        )
+        val structPath = "$a.$b.$c"
+        val listPath = "$a.$b.list_container_under_struct"
+        val underList = "$listPath.element.leaf_scalar_field"
+        for (p in listOf(structPath, listPath, underList)) {
+            assertThat(p.length).describedAs("%s must exceed the cap", p).isGreaterThan(64)
+        }
+
+        // assertStructInterior's LIST/MAP branch.
+        assertThat(
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("x", ColType.LONG), parent = listPath)),
+                )
+            }.message,
+        ).describedAs("list/map interior refusal").contains(listPath)
+
+        // requireSourceField's "sits under" branch.
+        val underListCol = leafOf(cat, ns, underList)
+        assertThat(
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(
+                        AlterOp.SetPartitionSpec(
+                            listOf(PartitionFieldDef(underListCol.fieldId, Transform.IDENTITY)),
+                        ),
+                    ),
+                )
+            }.message,
+        ).describedAs("sits-under-a-list refusal").contains(underList)
+
+        // Both dropBlockedMessage arms: the source ITSELF, and a
+        // container holding one.
+        val leaf = leafOf(cat, ns, "$structPath.leaf_scalar_field")
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.SetPartitionSpec(listOf(PartitionFieldDef(leaf.fieldId, Transform.IDENTITY))),
+            ),
+        )
+        assertThat(
+            catchThrowable {
+                alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn("$structPath.leaf_scalar_field")))
+            }.message,
+        ).describedAs("drop the source itself")
+            .contains("$structPath.leaf_scalar_field")
+            .contains("it is a source")
+
+        // And the LAST-FIELD refusal, found while fixing the above: it
+        // quotes the same resolved path and fires before the source
+        // check, so it needs the same guarantee. (Reached through a
+        // STRUCT chain — a list interior is refused earlier, by the
+        // branch tested above.)
+        assertThat(
+            catchThrowable {
+                alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn("$structPath.sibling")))
+            },
+        ).describedAs("dropping a non-source sibling is allowed").isNull()
+        assertThat(
+            catchThrowable {
+                alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn("$structPath.leaf_scalar_field")))
+            }.message,
+        ).describedAs("last field of a struct").contains("$structPath.leaf_scalar_field")
+        assertThat(
+            catchThrowable { alter.alterTable(cat, ns, "t", listOf(AlterOp.DropColumn(structPath))) }.message,
+        ).describedAs("drop a container holding the source").contains(structPath)
     }
 
     // ---- happy paths, one op each ----------------------------------------

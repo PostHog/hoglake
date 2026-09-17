@@ -545,15 +545,17 @@ class CompactionService(
                     unconvertible++
                 } catch (e: InvalidDataException) {
                     // Skip-with-reason as well, but a DIFFERENT reason:
-                    // the bytes are bad and durable, so unlike a schema
-                    // skip this will not clear on its own. Counted apart
-                    // so a nonzero value reads as "some writer emitted
-                    // values its own schema forbids", and logged at warn
-                    // with the offending detail for exactly that hunt.
+                    // DURABLE and the writer's fault. Unlike a schema
+                    // skip this will not clear on its own, so re-planning
+                    // it every sweep is a permanent loop. Counted apart
+                    // so a nonzero value reads as "a writer produced
+                    // something its own registration or schema forbids",
+                    // and logged at warn with the offending detail for
+                    // exactly that hunt.
                     log.warn {
                         "compaction group of ${group.files.size} files for " +
-                            "$catalog/$namespace.$table holds data that is invalid under its own " +
-                            "schema (${e.message}); skipping"
+                            "$catalog/$namespace.$table cannot be rewritten as registered " +
+                            "(${e.message}); skipping"
                     }
                     invalidData++
                 } catch (e: Exception) {

@@ -1061,6 +1061,40 @@ class NestedCampaignRegressionTest {
             .contains("duplicate column names")
         assertThat(nested.message!!.length).describedAs("inside a struct").isLessThan(200)
 
+        // The duplicate-name refusal's `where` is built from ancestors
+        // that HAVE been validated, so it must arrive whole — and the
+        // short parent above cannot show that. A path over the cap can.
+        val deep =
+            ColumnDef(
+                "outer_container_level_one",
+                ColType.STRUCT,
+                children =
+                    listOf(
+                        ColumnDef(
+                            "second_container_level_two",
+                            ColType.STRUCT,
+                            children =
+                                listOf(
+                                    ColumnDef(
+                                        "third_container_level_three",
+                                        ColType.STRUCT,
+                                        children =
+                                            listOf(
+                                                ColumnDef("dup", ColType.LONG),
+                                                ColumnDef("dup", ColType.LONG),
+                                            ),
+                                    ),
+                                ),
+                        ),
+                    ),
+            )
+        val deepWhere =
+            "outer_container_level_one.second_container_level_two.third_container_level_three"
+        assertThat(deepWhere.length).describedAs("must exceed the cap").isGreaterThan(64)
+        assertThat(catchThrowable { ColumnTrees.validate(listOf(deep)) }.message)
+            .describedAs("the validated ancestor path arrives whole")
+            .contains(deepWhere)
+
         // The synthetic-child refusal quotes a name ColumnTrees
         // deliberately never validates (syntheticallyNamed = true), so
         // it is unvalidated by construction.

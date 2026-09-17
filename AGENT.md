@@ -334,13 +334,17 @@ there would break that gate on every build.
   list/struct/map are copied through recursively (the plan is a tree of
   steps; parquet-java's Group API already is one), so a nested table is
   compactable like any other; an input whose nested SHAPE disagrees with
-  the live column is `unconvertible_schema`, never a guess. A value that
+  the live column is `unconvertible_schema`, never a guess. A fault that is DURABLE and
+  the WRITER's is the OTHER typed skip, `invalid_data`: a value that
   cannot exist under the type its own file declares (an empty blob under
   a decimal, an unscaled value past the destination precision, a row
-  past `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW`) is the OTHER typed skip,
-  `invalid_data` — separated because bad bytes are durable, so unlike a
-  schema skip it never clears on its own and a nonzero count is a writer
-  bug rather than a backlog. Remaining
+  past `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW`), or a file whose schema
+  contradicts its own `explicit_row_ids` registration (invariant 2's
+  reserved field id present or absent). Durability and fault are the
+  axis, not values-versus-schema — a schema skip clears when the schema
+  or the file set moves, and this one never does, so it is re-planned
+  and re-refused every sweep and a nonzero count is a writer bug rather
+  than a backlog. Remaining
   rewrite deferrals (all surface as `unconvertible_schema` skips, never
   wrong bytes): INT96, decimal-scale changes, and non-native
   time(stamp) units — each timestamp type accepts only the unit its own

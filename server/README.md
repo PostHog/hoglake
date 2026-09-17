@@ -394,9 +394,10 @@ measured, not assumed — a 999,999-node row rewrites under `-Xmx192m`.
 Three non-success outcomes carry a counter, all under
 `hoglake_compaction_skipped_total{catalog, reason}`:
 `unconvertible_schema` rising means a table has stopped compacting,
-`invalid_data` rising means a writer is emitting values its own schema
-forbids, and `failed` is the outright failure that gets retried next
-run. The first two never show up as failures — a sweep with either can
+`invalid_data` rising means a writer produced something its own
+registration or schema forbids — bad values, or a file whose schema
+contradicts its `explicit_row_ids` registration — and `failed` is the
+outright failure that gets retried next run. The first two never show up as failures — a sweep with either can
 look perfectly healthy — which is why they get a line rather than only a
 log and a ledger row. The self-healing skips (commit conflicts, DV
 supersession) stay uncounted: they re-plan on the next run.
@@ -409,7 +410,9 @@ so an alert written against the two-reason version has silently changed
 meaning. Alert on the label: `{reason="failed"}` is the page-worthy one,
 `{reason="unconvertible_schema"}` is a backlog that will not clear on
 its own, and `{reason="invalid_data"}` is a bug report against whoever
-wrote the file.
+wrote the file. The axis separating the last two is DURABILITY AND
+FAULT, not values-versus-schema: an `invalid_data` group is re-planned
+and re-refused every sweep, because nothing about it will change.
 
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are

@@ -340,14 +340,17 @@ so the reader records null bounds and the rewriter refuses, rather than
 one inventing an inverted pair and the other re-stamping the bytes
 `STRING`.
 
-A value that cannot exist under the type its own file declares — an
-empty byte array under a decimal, an unscaled value past the
-destination precision, a row past the node budget — is the second typed
-skip, `invalid_data`. It is counted apart from `unconvertible_schema`
-because a schema skip clears when the schema or the file set moves,
-while bad bytes are durable: retrying one hot is a permanent loop over
-the same rows, and a nonzero count is a writer bug rather than a
-backlog. Column stats are checked the same way wherever they enter (the
+A fault that is DURABLE and the writer's is the second typed skip,
+`invalid_data`: a value that cannot exist under the type its own file
+declares (an empty byte array under a decimal, an unscaled value past
+the destination precision, a row past the node budget), or a file whose
+schema contradicts its own `explicit_row_ids` registration — the
+reserved row-id field id present on a positional file, or absent from an
+explicit-id one. It is counted apart from `unconvertible_schema` because
+a schema skip clears when the schema or the file set moves, and this one
+never does: retrying it is a permanent loop, and a nonzero count is a
+writer bug rather than a backlog. Durability and fault are the axis, not
+values-versus-schema. Column stats are checked the same way wherever they enter (the
 commit path's client-supplied `column_stats` and the hydrator's footer
 read, one rule): a bound the catalog type cannot decode, or one that
 sorts above its partner IN THAT TYPE'S ORDER, is dropped rather than
