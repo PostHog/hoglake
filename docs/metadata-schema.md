@@ -1,11 +1,10 @@
 # DuckLake metadata schema — reference for a Postgres-first rebuild
 
 Survey of the catalog schema as defined in the fork source, for the
-hoglake design. Companion to [ducklake-api-map.md](ducklake-api-map.md),
-[pyducklake-api-map.md](pyducklake-api-map.md), [README.md](README.md).
+hoglake design. Companion to [README.md](../README.md).
 Sections 1–5 describe the *predecessor* (`ducklake_*`) schema; §6 is
 the inventory of the hoglake schema as built (`hog_*`), kept in sync
-with [`server/schema.sql`](server/schema.sql) — which, not this doc, is
+with [`server/schema.sql`](../server/schema.sql) — which, not this doc, is
 the authoritative artifact.
 
 Source of truth: [`src/storage/ducklake_metadata_manager.cpp`](https://github.com/PostHog/ducklake/blob/eee193b7cb18fc4954df4664c3468d75f2d26ceb/src/storage/ducklake_metadata_manager.cpp)
@@ -290,7 +289,7 @@ drains the deletion queue (`:5017`, `:5158`).
 - The dynamic per-schema-version inlined-data tables are the schema's
   biggest wart (the 112K-table registry incident). DECIDED 2026-09-04:
   inlining is dropped from hoglake entirely; migration flushes any
-  residual inlined rows to parquet at cutover (see [README.md](README.md)
+  residual inlined rows to parquet at cutover (see [README.md](../README.md)
   Decisions).
 
 ---
@@ -298,7 +297,7 @@ drains the deletion queue (`:5017`, `:5158`).
 ## 6. The hoglake schema as built (`hog_*`)
 
 The rebuild the notes above argue for exists. Canonical DDL:
-[`server/schema.sql`](server/schema.sql) (complete desired state; a CI
+[`server/schema.sql`](../server/schema.sql) (complete desired state; a CI
 gate asserts fold(migrations) == that file, and a mapper-coverage gate
 keeps the Kotlin row mappers in lockstep with the live column set).
 Inventory as of 2026-09-06 — every versioned table carries the

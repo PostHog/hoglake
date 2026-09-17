@@ -83,7 +83,7 @@ dependencies {
     testImplementation("org.awaitility:awaitility:4.3.0")
     testImplementation("io.kotest:kotest-property:5.9.1")
 
-    // Coverage-guided fuzzing (fuzzing.md layer 4): jazzer-junit @FuzzTest
+    // Coverage-guided fuzzing (docs/fuzzing.md layer 4): jazzer-junit @FuzzTest
     // targets in src/test/kotlin/com/posthog/hoglake/fuzz. Inside the normal
     // :test run they replay the committed corpus deterministically
     // (regression mode); the `fuzz` task reruns the same targets under
@@ -119,7 +119,7 @@ tasks.test {
     }
 }
 
-// ---- fuzzing (fuzzing.md layer 4) -----------------------------------------
+// ---- fuzzing (docs/fuzzing.md layer 4) -----------------------------------------
 //
 // `./gradlew fuzz -PfuzzSeconds=300` runs every @FuzzTest target under
 // libFuzzer for the given per-target budget (default 60s). jazzer-junit

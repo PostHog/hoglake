@@ -11,7 +11,7 @@ import java.nio.ByteBuffer
 
 /**
  * Pinned regressions for the footer-parse contract, on the EXACT fuzzer
- * inputs that found each defect (fuzzing.md's promotion rule: a finding
+ * inputs that found each defect (docs/fuzzing.md's promotion rule: a finding
  * becomes a corpus entry AND a pinned test, not just a corpus replay).
  *
  * Both crashing inputs make parquet-java escape with a raw

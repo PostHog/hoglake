@@ -11,7 +11,7 @@ import java.util.UUID
  *
  * [ColType] below is the closed flat column-type vocabulary. Every
  * member has a defined Iceberg facade mapping ([ColType.icebergType],
- * iceberg-federation.md §2) — that is the membership rule, not a
+ * docs/iceberg-federation.md §2) — that is the membership rule, not a
  * nice-to-have: a type whose facade story is undefined may not be used
  * in a hoglake table. Extending the set is a migration (the
  * hog_column.col_type CHECK) plus an §2 table row, never an ad-hoc enum
@@ -67,7 +67,7 @@ enum class ColType {
          * DuckLake type names hoglake refuses PERMANENTLY, mapped to the
          * 422 detail that names the type and the reason. These are not
          * "not yet": each is unmappable to Iceberg, so no facade story
-         * exists to write (iceberg-federation.md §2).
+         * exists to write (docs/iceberg-federation.md §2).
          */
         val REFUSALS: Map<String, String> =
             buildMap {
@@ -139,7 +139,7 @@ enum class ColType {
 
 /**
  * The Iceberg type a [ColType] presents as through the read-only facade
- * (iceberg-federation.md §2). Two invariants ride on this mapping:
+ * (docs/iceberg-federation.md §2). Two invariants ride on this mapping:
  *
  *  1. `hog_file_column_stats.lower_bound`/`upper_bound` hold the Iceberg
  *     single-value serialization of the MAPPED type, so manifest
@@ -264,7 +264,7 @@ enum class ChangeKind {
     }
 }
 
-/** Iceberg-semantics partition transforms (iceberg-federation.md §3). */
+/** Iceberg-semantics partition transforms (docs/iceberg-federation.md §3). */
 enum class Transform {
     IDENTITY,
     BUCKET,

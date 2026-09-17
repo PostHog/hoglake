@@ -474,7 +474,7 @@ class CommitService(
      * flows into the removal queue at expiry/drop time, where the
      * cleanup drain would HEAD+DELETE an object that was never ours
      * (the drain's liveness check verifies non-reference, not
-     * provenance — sql-suggestions.md #6). Prefix comparison is on the
+     * provenance). Prefix comparison is on the
      * raw URI with a normalized trailing slash, so `data_path
      * s3://b/demo` does not admit `s3://b/demo-other/...`.
      */

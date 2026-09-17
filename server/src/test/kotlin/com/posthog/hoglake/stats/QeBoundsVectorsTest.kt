@@ -14,7 +14,7 @@ import java.util.Base64
 import java.util.UUID
 
 /**
- * Cross-language differential vectors (fuzzing.md layer 2): the Python
+ * Cross-language differential vectors (docs/fuzzing.md layer 2): the Python
  * codec (pyhoglake/bounds.py) emits canonical (type, type_params,
  * value, hex) vectors to pyhoglake/tests/vectors/bounds_vectors.json;
  * this test asserts the Kotlin encoder produces the same bytes for

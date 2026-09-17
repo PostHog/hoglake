@@ -9,7 +9,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
 /**
- * Fuzz target (fuzzing.md layer 4, target a): [IcebergSingleValue.decode]
+ * Fuzz target (docs/fuzzing.md layer 4, target a): [IcebergSingleValue.decode]
  * over arbitrary bytes for every [ColType].
  *
  * Contract under test:

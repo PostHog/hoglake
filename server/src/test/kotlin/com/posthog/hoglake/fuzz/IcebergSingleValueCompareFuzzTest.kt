@@ -8,7 +8,7 @@ import java.math.BigInteger
 import java.util.UUID
 
 /**
- * Fuzz target (fuzzing.md layer 4, target b): property-style consistency
+ * Fuzz target (docs/fuzzing.md layer 4, target b): property-style consistency
  * of [IcebergSingleValue.encode] / [IcebergSingleValue.compareValues]
  * over generated typed values.
  *

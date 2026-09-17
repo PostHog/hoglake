@@ -19,7 +19,8 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 
 /**
- * Pins the namespace FK semantics decided from sql-suggestions.md #3.
+ * Pins the namespace FK semantics: a namespace row is the parent, and
+ * dropping it must cascade rather than orphan its tables.
 
  * hog_table_version and hog_view reference hog_namespace with a
  * DEFERRABLE INITIALLY DEFERRED no-action FK (not CASCADE): a direct

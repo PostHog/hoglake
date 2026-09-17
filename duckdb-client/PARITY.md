@@ -1,7 +1,6 @@
 # DuckLake-extension parity checklist
 
-Status of every DuckLake SQL-surface capability (per
-[ducklake-api-map.md](../ducklake-api-map.md)) in the hoglake DuckDB
+Status of every DuckLake SQL-surface capability in the hoglake DuckDB
 client. **DONE** = implemented and tested against the live dev stack;
 **PARTIAL** = implemented with named limits; **WIRE GAP** = blocked on
 the hoglake REST contract (see DESIGN.md server findings); **N/A** =
