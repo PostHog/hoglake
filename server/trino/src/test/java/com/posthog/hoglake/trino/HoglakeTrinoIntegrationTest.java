@@ -89,6 +89,14 @@ class HoglakeTrinoIntegrationTest
     /** Tables the schema-evolution tests create as they run. */
     private static final List<String> EVOLVED_TABLES = List.of("renamed_events", "int_events");
 
+    /**
+     * The data file {@code misreferenced_dv_events}' vector wrongly claims
+     * to belong to. Nothing registers it and no object exists at it, so the
+     * only place this string can come from is the vector's own bytes.
+     */
+    private static final String MISREFERENCED_TARGET =
+            "s3://" + BUCKET + "/nonexistent/never-registered.parquet";
+
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
 
@@ -220,10 +228,14 @@ class HoglakeTrinoIntegrationTest
     }
 
     /**
-     * A vector whose blob names a data file it was not registered against —
-     * another table's file entirely. Its cardinality agrees with the
-     * registration, so the pairing is the only thing wrong, and the blob's
-     * {@code referenced-data-file} is the only thing that can catch it.
+     * A vector whose blob names a data file it was not registered against.
+     * Its cardinality agrees with the registration, so the pairing is the
+     * only thing wrong and the blob's {@code referenced-data-file} is the
+     * only thing that can catch it.
+     *
+     * <p>The name it carries is deliberately a path no table registered and
+     * no object exists at: pointing it at another table's live file would
+     * put a second table inside this test's blast radius for nothing.
      */
     private static void seedMisreferencedDeletionVector(long fileSize)
             throws Exception
@@ -232,7 +244,7 @@ class HoglakeTrinoIntegrationTest
         String dataFilePath = s3(table + "/part-0.parquet");
         long snapshot = commitAppend(table, dataFilePath, fileSize);
         registerDeletionVector(table, snapshot, dataFilePath, table + "/part-0.dv",
-                TestPuffin.deletionVector(s3("events/part-0.parquet"), List.of(1L, 2L, 3L)), 3);
+                TestPuffin.deletionVector(MISREFERENCED_TARGET, List.of(1L, 2L, 3L)), 3);
     }
 
     /**
@@ -242,6 +254,14 @@ class HoglakeTrinoIntegrationTest
      * holds exactly one file starting at position 0, where the two
      * numberings are identical and neither can be distinguished from the
      * other. Production tables are always multi-file.
+     *
+     * <p>Limitation: the two files are byte-identical, which is what makes
+     * the numbering axis clean to read but also means applying the vector
+     * to part-0 instead of part-1 produces the same answers. This fixture
+     * separates file-relative from table-global numbering; it does NOT
+     * detect a split-to-vector mis-assignment. That is covered instead by
+     * the connector's {@code referenced-data-file} check, which
+     * {@code deletionVectorNamingAnotherDataFileFailsTheQuery} asserts.
      */
     private static void seedMultiFileTable(long fileSize)
             throws Exception
@@ -524,13 +544,27 @@ class HoglakeTrinoIntegrationTest
     }
 
     /**
-     * Schema evolution against id-less files, end to end. Every file the
-     * hydrator (Hardwood) writes carries no PARQUET:field_id, so the
-     * connector's name-fallback binding is what production reads use —
-     * and a RENAME COLUMN breaks it silently.
+     * The field-id guard's inline-stats blind spot, end to end.
+     *
+     * <p>The guard itself SHIPPED: {@code AlterService} refuses
+     * {@code rename_column} with 409 {@code idless_files_present} while any
+     * live file is flagged {@code missing_field_ids} or is still
+     * {@code pending}. This test is not evidence against it — it is the
+     * documented hole in it (README "The field-id contract's blind spot"):
+     * {@code missing_field_ids} is written only by the hydrator's footer
+     * read, and the hydrator only sweeps {@code pending} files. A commit
+     * that ships inline {@code column_stats} lands {@code provided}, never
+     * reaches the hydrator, and so is invisible to the guard no matter what
+     * its parquet schema actually contains.
+     *
+     * <p>That is this table: Hardwood writes no {@code PARQUET:field_id},
+     * {@code commitAppend} ships inline stats, the rename is allowed, and
+     * the connector's name-fallback binding then misses — every row of the
+     * renamed column reads NULL. Closing the blind spot (the open work) is
+     * what changes this test; the guard landing already happened.
      */
     @Test
-    void renameColumnOnIdlessFilesSilentlyReadsNulls()
+    void renameColumnEvadesTheFieldIdGuardViaInlineStats()
             throws Exception
     {
         createTable("renamed_events");
@@ -538,22 +572,27 @@ class HoglakeTrinoIntegrationTest
         uploadObject("renamed_events/part-0.parquet", parquet);
         commitAppend("renamed_events",
                 "s3://" + BUCKET + "/renamed_events/part-0.parquet", parquet.length);
+
+        // The premise, asserted rather than assumed: inline stats mean this
+        // file is 'provided', so the hydrator never reads its footer and the
+        // guard never learns it has no field ids. A future change that
+        // hydrates provided files, or that checks ids at registration, turns
+        // the rename below into a 409 and reds this line first.
+        assertThat(JSON.readTree(
+                get("/v1/catalogs/lake/namespaces/analytics/tables/renamed_events/files"))
+                .get(0).get("stats_state").asText())
+                .isEqualTo("provided");
+
         post("/v1/catalogs/lake/namespaces/analytics/tables/renamed_events/alter",
                 "{\"ops\": [{\"op\": \"rename_column\", \"from\": \"name\", \"to\": \"title\"}]}",
                 200);
 
+        // S2, the agreed connector behavior (see TestHoglakeParquetBinding in
+        // PostHog/trino for the unit-level matrix): the data is still in the
+        // file under the old name, the file has no field ids, the name
+        // fallback misses, and the column reads NULL for every row.
         List<Map<String, Object>> rows = query(
                 "SELECT id, title FROM hoglake.analytics.renamed_events ORDER BY id");
-
-        // S2 (agreed connector behavior; see TestHoglakeParquetBinding in PostHog/trino for
-        // the unit-level matrix): the data exists in the file under the old
-        // name "name", but the file has no field ids, the name fallback
-        // misses, and every row of the renamed column reads NULL. The fix
-        // is catalog-side — field ids become a registration contract and
-        // the server will refuse renames while id-less files are live —
-        // the connector's id-authoritative binding stays as-is. Once the
-        // server-side refusal lands, this rename will 4xx and this test
-        // changes to assert that refusal.
         assertThat(rows).hasSize(ROWS);
         assertThat(rows).allSatisfy(row -> assertThat(row.get("title")).isNull());
     }
@@ -769,14 +808,13 @@ class HoglakeTrinoIntegrationTest
     @Test
     void deletionVectorNamingAnotherDataFileFailsTheQuery()
     {
+        // The referenced path is the evidence: it exists only inside the
+        // blob's bytes, so no connector can print it without decoding the
+        // vector, and the pre-DV refusal never mentions it.
         assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.misreferenced_dv_events"))
                 .isInstanceOf(SQLException.class)
-                .satisfies(failure -> {
-                    assertDeletionVectorRejected(failure, "misreferenced_dv_events/part-0.dv");
-                    // Named in full: "events/part-0.parquet" is a suffix of
-                    // this table's own file name too.
-                    assertThat(failure).hasMessageContaining(s3("events/part-0.parquet"));
-                });
+                .satisfies(failure -> assertDeletionVectorRejected(
+                        failure, "misreferenced_dv_events/part-0.dv", List.of(MISREFERENCED_TARGET)));
     }
 
     /**
@@ -793,42 +831,69 @@ class HoglakeTrinoIntegrationTest
     @Test
     void deletionVectorDisagreeingWithTheCatalogFailsTheQuery()
     {
+        // The decoded cardinality, 3, is the evidence: the catalog's 4 is
+        // echoed by the pre-DV refusal too, but only a connector that read
+        // the bitmap can report what is actually in it.
         assertThatThrownBy(() -> query("SELECT count(*) AS n FROM hoglake.analytics.mismatched_dv_events"))
                 .isInstanceOf(SQLException.class)
                 .satisfies(failure -> assertDeletionVectorRejected(
-                        failure, "mismatched_dv_events/part-0.dv", 4, 3));
+                        failure, "mismatched_dv_events/part-0.dv", List.of(), 4, 3));
         assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.mismatched_dv_events"))
                 .isInstanceOf(SQLException.class)
                 .satisfies(failure -> assertDeletionVectorRejected(
-                        failure, "mismatched_dv_events/part-0.dv", 4, 3));
+                        failure, "mismatched_dv_events/part-0.dv", List.of(), 4, 3));
     }
 
     /**
-     * Asserts a query failed because the connector rejected a deletion
-     * vector, without pinning the fork's wording for it.
+     * Asserts a query failed because the connector DECODED a deletion
+     * vector and rejected it — without pinning the fork's wording.
      *
-     * <p>Only the load-bearing half is checked: that the failure is about a
-     * deletion vector, that it names the object hoglake registered, and
-     * that it quotes the values it is comparing. The sentence around those
-     * belongs to PostHog/trino, and this harness runs against whatever
-     * image is newest at run time — so an exact-sentence match would turn a
-     * cosmetic reword there into a red build on an unrelated hoglake PR,
-     * with a diff that looks like a regression. That is the same mistake as
-     * the DV-refusal assertion this suite replaced.
+     * <p>The bar this has to clear is not "some query failed". The pre-DV
+     * connector refused every DV-bearing scan while reading nothing, and
+     * its refusal names the deletion vector, quotes the vector's object
+     * path, and echoes the catalog's declared {@code delete_count} — so
+     * every generic check here passes against it. Each caller must
+     * therefore supply {@code evidence} or {@code values} that only a
+     * connector which actually opened and decoded the file can print, and
+     * the dead refusal string is excluded outright.
+     *
+     * <p>What is deliberately NOT checked is the sentence around those
+     * facts. It belongs to PostHog/trino, and this harness runs against
+     * whatever image is newest at run time, so an exact-sentence match
+     * would turn a cosmetic reword upstream into a red build on an
+     * unrelated hoglake PR — the mistake this suite was written to undo.
      */
     private static void assertDeletionVectorRejected(
-            Throwable failure, String vectorKey, long... values)
+            Throwable failure, String vectorKey, List<String> evidence, long... values)
     {
-        String message = String.valueOf(failure.getMessage());
-        assertThat(message).containsIgnoringCase("deletion vector").contains(vectorKey);
+        assertThat(evidence.isEmpty() && values.length == 0)
+                .as("caller must supply evidence that the vector was decoded")
+                .isFalse();
+
+        // Strip the JDBC preamble — "Query failed (#20260917_045958_00029_y2vns): ".
+        // Its trailing coordinator id is five characters of Trino base32
+        // (a-z and 2-7) regenerated on every container start, so roughly
+        // one start in forty contains a free-standing digit that satisfies
+        // a value check by luck. Matching against the whole message let
+        // this assertion pass on a broken image ~2.5% of the time, green
+        // and silent — the same fail-open shape as the "s3://" bug, one
+        // layer out. The body is the only part the connector wrote.
+        String body = String.valueOf(failure.getMessage())
+                .replaceFirst("^Query failed \\(#[^)]*\\): ", "");
+
+        assertThat(body).containsIgnoringCase("deletion vector").contains(vectorKey);
+        // The pre-DV refusal, frozen: this string can only ever appear
+        // again by regression, so excluding it is safe and load-bearing.
+        assertThat(body).doesNotContain("not yet implemented");
+        if (!evidence.isEmpty()) {
+            assertThat(body).contains(evidence);
+        }
         for (long value : values) {
-            // A free-standing number, not a digit embedded in a word. The
-            // letter in the lookbehind matters: without it the "3" of
-            // "s3://" satisfies any assertion looking for a bare 3, which
-            // made this check pass against an image that does not read
-            // vectors at all.
-            assertThat(message)
-                    .as("value %d in: %s", value, message)
+            // A free-standing number, not a digit inside a word. The letter
+            // in the lookbehind matters: without it the "3" of "s3://"
+            // satisfies any check looking for a bare 3.
+            assertThat(body)
+                    .as("value %d in: %s", value, body)
                     .containsPattern("(?<![0-9A-Za-z])" + value + "(?![0-9])");
         }
     }
