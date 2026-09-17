@@ -212,15 +212,21 @@ class NestedCampaignRegressionTest {
                         .named("u"),
                 ),
             )
+        // Values chosen so the pair is ASCENDING under unsigned byte
+        // order: 0x01.. below 0x02... A mutation test showed the obvious
+        // choice (0xFF vs 0x01) proves nothing here — that pair is
+        // INVERTED unsigned, so StatsSanity's backstop deletes it
+        // whether or not this arm has the annotation gate, and the
+        // assertion passed with the gate removed. Only a pair the
+        // backstop would happily keep can show that the ANNOTATION rule
+        // is what refused it.
         val src = tmp.resolve("uuid-decimal.parquet")
         write(schema, src) { f ->
             listOf(
-                f.newGroup().also { it.add(0, Binary.fromConstantByteArray(ByteArray(16) { 0xFF.toByte() })) },
                 f.newGroup().also { it.add(0, Binary.fromConstantByteArray(ByteArray(16) { 1 })) },
+                f.newGroup().also { it.add(0, Binary.fromConstantByteArray(ByteArray(16) { 2 })) },
             )
         }
-        // Reader: no bounds, and NOT because a later backstop deleted
-        // them — the annotation rule refused them here.
         val footer = FooterParse.parse(LocalInputFile(src))
         val agg =
             FooterStats.aggregate(footer, listOf(CatalogColumn(1, "u", ColType.UUID_T, null)), src.toString())
@@ -609,6 +615,12 @@ class NestedCampaignRegressionTest {
         // The node cap fires first on this shape, which is the point:
         // both walks are iterative, so neither dies on the way to the
         // refusal.
+        // The cap is an EARLY BAIL, not a correctness guard: the walk is
+        // iterative either way, so raising it changes only the work
+        // done. Mutation testing confirmed as much — replacing
+        // ColumnTrees' cap with Int.MAX_VALUE kills nothing, and that is
+        // an equivalent mutant rather than a missing assertion. What is
+        // asserted is the bail itself.
         assertThat(columnDefDepth(listOf(def), cap = 12)).isEqualTo(12)
         assertThat(nodeCount(listOf(def))).isEqualTo(20_001)
     }

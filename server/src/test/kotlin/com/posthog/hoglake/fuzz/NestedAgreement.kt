@@ -201,8 +201,7 @@ object NestedAgreement {
                 // its fields, and parquet-java addresses a group's fields
                 // by name — so the same file is a coin flip on the write
                 // side. Refusing it there is the fix, not a disagreement.
-                if (!dataRefused && duplicateNames.isEmpty() && !unitDeferral(col, schema) &&
-                    !decimalDeferral(col, schema) &&
+                if (!dataRefused && duplicateNames.isEmpty() && !documentedDeferral(col, schema) &&
                     wanted.isNotEmpty() && bounded.containsAll(wanted)
                 ) {
                     sink(
@@ -215,7 +214,7 @@ object NestedAgreement {
                     )
                 }
                 if (canonical && !dataRefused && duplicates.isEmpty() && duplicateNames.isEmpty() &&
-                    !unitDeferral(col, schema) && !decimalDeferral(col, schema)
+                    !documentedDeferral(col, schema)
                 ) {
                     sink(
                         Finding(
@@ -476,85 +475,83 @@ object NestedAgreement {
         }
 
     /**
-     * Whether the rewriter's refusal of [col] is the DOCUMENTED
-     * non-native-unit deferral (AGENT.md, iceberg-federation.md §2.8)
-     * rather than a disagreement with the reader.
+     * Whether the rewriter's refusal of [col] is one of the DOCUMENTED
+     * deferrals (AGENT.md, iceberg-federation.md §2.8) rather than a
+     * disagreement with the reader.
      *
-     * The two surfaces really do differ here, and on purpose. A bound is
-     * eight bytes of metadata, so the reader converts a millis or nanos
-     * footer bound into the micros an Iceberg `timestamp` bound is
-     * defined to be — exact, and the only way a bound can be correct at
-     * all. A REWRITE would have to convert every value of every row,
-     * which is a data rewrite the compactor deliberately does not do:
-     * no legal promotion produces a unit mismatch (PROMOTIONS has no
-     * timestamp rungs), so the only way to reach one is a writer
-     * disagreeing with its own DDL, and refusing that is the job.
+     * The two surfaces really do differ on these, and on purpose. A
+     * bound is eight bytes of metadata, so the reader converts a millis
+     * or nanos footer bound into the micros an Iceberg `timestamp` bound
+     * is defined to be, and encodes a decimal bound from whatever
+     * precision the file declares — both exact, and the only way a bound
+     * can be correct at all. A REWRITE would have to convert every value
+     * of every row, which is a data rewrite the compactor deliberately
+     * does not do.
+     *
+     * PAIRED STRUCTURALLY, catalog node against the file leaf it
+     * actually binds to. An earlier version collected the units the
+     * catalog subtree wanted into a SET and asked whether each file leaf
+     * was in it — which called a map with a `timestamp_s` key and a
+     * `timestamp_ns` value satisfied by a file whose KEY was nanos,
+     * because nanos was in the set. One hit in 1.1M executions, and the
+     * set was the reason.
      */
-    private fun unitDeferral(
+    private fun documentedDeferral(
         col: Column,
-        schema: GroupType,
+        schema: MessageType,
     ): Boolean {
-        // Over the whole catalog SUBTREE, not just the top-level column:
-        // the mismatch is as likely to sit on a map key four levels down
-        // as on the column itself, and a list's own type has no unit at
-        // all.
-        val want = col.selfAndDescendants().mapNotNull { nativeUnit(it.def.type) }.toSet()
-        if (want.isEmpty()) return false
-
-        fun walk(g: GroupType): Boolean {
-            for (f in g.fields) {
-                if (f.isPrimitive) {
-                    val unit =
-                        when (val a = f.logicalTypeAnnotation) {
-                            is LogicalTypeAnnotation.TimestampLogicalTypeAnnotation -> a.unit
-                            is LogicalTypeAnnotation.TimeLogicalTypeAnnotation -> a.unit
-                            else -> null
-                        }
-                    if (unit != null && unit !in want) return true
-                } else if (walk(f.asGroupType())) {
-                    return true
-                }
-            }
-            return false
-        }
-        return walk(schema)
+        val useFieldIds = FooterStats.usesFieldIds(schema)
+        val index = FooterStats.bindIndex(schema.fields, col.fieldId, col.def.name, useFieldIds)
+        if (index < 0) return false
+        return deferred(col, schema.fields[index], useFieldIds)
     }
 
-    /**
-     * Whether the rewriter's refusal of [col] is the DOCUMENTED decimal
-     * deferral: a source annotation whose scale differs from the live
-     * column's, or whose declared precision exceeds it.
-     *
-     * The surfaces differ here for the same reason as the unit case. A
-     * decimal BOUND is the unscaled value, so it depends on the scale
-     * and not on the precision — the reader can encode one correctly
-     * from a wider-precision file. A REWRITE would be writing values
-     * from a domain the destination column does not have, so it refuses
-     * the shape instead. Only a writer disagreeing with its own DDL
-     * produces the pairing.
-     */
-    private fun decimalDeferral(
+    /** [col] against the file field it bound to, recursively. */
+    private fun deferred(
         col: Column,
-        schema: GroupType,
+        field: Type,
+        useFieldIds: Boolean,
     ): Boolean {
-        val decimals = col.selfAndDescendants().filter { it.def.type == ColType.DECIMAL }
-        if (decimals.isEmpty()) return false
-        val scales = decimals.map { (it.def.typeParams?.get("scale") as? Number)?.toInt() ?: 0 }.toSet()
-        val maxPrecision =
-            decimals.maxOf { (it.def.typeParams?.get("precision") as? Number)?.toInt() ?: 0 }
-
-        fun walk(g: GroupType): Boolean {
-            for (f in g.fields) {
-                if (f.isPrimitive) {
-                    val a = f.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
-                    if (a != null && (a.scale !in scales || a.precision > maxPrecision)) return true
-                } else if (walk(f.asGroupType())) {
-                    return true
+        if (field.isPrimitive) {
+            val p = field.asPrimitiveType()
+            val unit =
+                when (val a = p.logicalTypeAnnotation) {
+                    is LogicalTypeAnnotation.TimestampLogicalTypeAnnotation -> a.unit
+                    is LogicalTypeAnnotation.TimeLogicalTypeAnnotation -> a.unit
+                    else -> null
                 }
+            val want = nativeUnit(col.def.type)
+            if (unit != null && want != null && unit != want) return true
+            val decimal = p.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
+            if (decimal != null && col.def.type == ColType.DECIMAL) {
+                val scale = (col.def.typeParams?.get("scale") as? Number)?.toInt() ?: 0
+                val precision = (col.def.typeParams?.get("precision") as? Number)?.toInt() ?: 38
+                if (decimal.scale != scale || decimal.precision > precision) return true
             }
             return false
         }
-        return walk(schema)
+        val group = field.asGroupType()
+        return when (col.def.type) {
+            // Struct children bind by the ordinary rule, one level down.
+            ColType.STRUCT ->
+                col.children.any { child ->
+                    val i = FooterStats.bindIndex(group.fields, child.fieldId, child.def.name, useFieldIds)
+                    i >= 0 && deferred(child, group.fields[i], useFieldIds)
+                }
+            // List and map children bind POSITIONALLY, through
+            // parquet's synthetic repetition layer — which is what the
+            // rewriter's planSynthetic does, and what a name/id lookup
+            // here would get wrong.
+            ColType.LIST, ColType.MAP -> {
+                val entry =
+                    group.fields.singleOrNull()?.takeIf { !it.isPrimitive }?.asGroupType()
+                        ?: return false
+                col.children.withIndex().any { (i, child) ->
+                    i < entry.fieldCount && deferred(child, entry.getType(i), useFieldIds)
+                }
+            }
+            else -> false
+        }
     }
 
     /**
