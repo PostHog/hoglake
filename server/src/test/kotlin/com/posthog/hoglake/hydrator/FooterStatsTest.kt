@@ -917,6 +917,193 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `a CONTAINER column bound to a variant group fabricates nothing`(
+        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
+    ) {
+        // #77's aggregate prologue had a second check — "native VARIANT
+        // cannot bind to scalar column" — and the merge dropped it,
+        // because for a SCALAR the group-vs-primitive fallthrough covers
+        // it. It does not cover a CONTAINER: isContainerAnnotation knows
+        // only LIST/MAP/MAP_KEY_VALUE, so a catalog struct descended
+        // into metadata/value/typed_value, and the name fallback (those
+        // children carry no ids, so it applies even under useFieldIds)
+        // bound a struct field literally named `value` to the variant's
+        // binary payload. Measured before the fix: bounds AAA..zzz for a
+        // column that has no such values.
+        //
+        // A REAL file with real chunk statistics: a synthesized footer
+        // with no chunks produces no stats whatever the binding does, so
+        // the assertion would have held with the guard deleted.
+        fun fileWith(id: Int?): java.nio.file.Path {
+            val b =
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte()))
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+            val schema = MessageType("m", listOf<Type>(if (id != null) b.id(id).named("p") else b.named("p")))
+            val path = tmp.resolve("variant-${id ?: "noid"}.parquet")
+            val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+            org.apache.parquet.hadoop.example.ExampleParquetWriter
+                .builder(org.apache.parquet.io.LocalOutputFile(path))
+                .withType(schema)
+                .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
+                .build()
+                .use { w ->
+                    for (v in listOf("AAA", "mmm", "zzz")) {
+                        val g = factory.newGroup()
+                        g.addGroup(0).also {
+                            it.add(0, org.apache.parquet.io.api.Binary.fromString("meta"))
+                            it.add(1, org.apache.parquet.io.api.Binary.fromString(v))
+                        }
+                        w.write(g)
+                    }
+                }
+            return path
+        }
+
+        fun statsFor(
+            path: java.nio.file.Path,
+            col: CatalogColumn,
+        ) = FooterStats.aggregate(
+            FooterParse.parse(org.apache.parquet.io.LocalInputFile(path)),
+            listOf(col),
+            path.toString(),
+        )
+
+        val struct =
+            CatalogColumn(
+                1,
+                "p",
+                ColType.STRUCT,
+                null,
+                children = listOf(CatalogColumn(2, "value", ColType.STRING, null)),
+            )
+        // The sanity check the vacuous version lacked: this file really
+        // does carry bounds, so an empty result means the BINDING
+        // refused, not that there was nothing to find.
+        assertThat(statsFor(fileWith(1), CatalogColumn(1, "p", ColType.VARIANT, null)))
+            .describedAs("a variant column yields no stats either, by design")
+            .isEmpty()
+        assertThat(statsFor(fileWith(1), struct)).describedAs("id-bearing file").isEmpty()
+        assertThat(statsFor(fileWith(null), struct)).describedAs("name-fallback file").isEmpty()
+        assertThat(
+            statsFor(
+                fileWith(1),
+                CatalogColumn(
+                    1,
+                    "p",
+                    ColType.LIST,
+                    null,
+                    children = listOf(CatalogColumn(2, "element", ColType.STRING, null)),
+                ),
+            ),
+        ).describedAs("list column").isEmpty()
+    }
+
+    @Test
+    fun `an invalid variant is reported, with the fault named`(
+        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
+    ) {
+        // The merge turned #77's throw into a degrade, which is right —
+        // `aggregate` is total — but a degrade nobody can see is a
+        // silent drop. #77's test asserted the THROW's message; the
+        // rewrite asserted only `.isEmpty()`, which the generic
+        // shape-mismatch arm satisfies, so `variantFault`'s six messages
+        // became unreachable-by-test. Assert the warn.
+        val events = java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>()
+        val appender =
+            object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+                override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = org.slf4j.LoggerFactory.getILoggerFactory() as ch.qos.logback.classic.LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(FooterStats::class.java.name) as ch.qos.logback.classic.Logger
+        logger.addAppender(appender)
+        try {
+            fun faultOf(
+                label: String,
+                group: Type,
+            ): String {
+                events.clear()
+                val schema = MessageType("m", listOf(group))
+                val path = tmp.resolve("$label.parquet")
+                val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+                org.apache.parquet.hadoop.example.ExampleParquetWriter
+                    .builder(org.apache.parquet.io.LocalOutputFile(path))
+                    .withType(schema)
+                    .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                    .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
+                    .build()
+                    .use { w -> w.write(factory.newGroup()) }
+                FooterStats.aggregate(
+                    FooterParse.parse(org.apache.parquet.io.LocalInputFile(path)),
+                    listOf(CatalogColumn(1, "p", ColType.VARIANT, null)),
+                    path.toString(),
+                )
+                return events.filter { it.level == ch.qos.logback.classic.Level.WARN }
+                    .joinToString(" | ") { it.formattedMessage }
+            }
+
+            // No variant annotation at all.
+            assertThat(
+                faultOf(
+                    "plain",
+                    Types.optionalGroup().id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).contains("is not a native parquet VARIANT of spec version 1")
+
+            // Annotated, but `metadata` is optional where the spec says required.
+            assertThat(
+                faultOf(
+                    "optional-metadata",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).contains("has no REQUIRED binary 'metadata'")
+
+            // A child the variant spec does not define.
+            assertThat(
+                faultOf(
+                    "stray-child",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("stray").named("p"),
+                ),
+            ).contains("outside metadata/value/typed_value")
+
+            // Neither payload child.
+            assertThat(
+                faultOf(
+                    "no-payload",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata").named("p"),
+                ),
+            ).contains("has neither 'value' nor 'typed_value'")
+
+            // And a WELL-FORMED variant logs nothing: the degrade must
+            // not fire on the shape it is meant to accept.
+            assertThat(
+                faultOf(
+                    "good",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).describedAs("a valid variant is silent").isEmpty()
+        } finally {
+            logger.detachAppender(appender)
+        }
+    }
+
+    @Test
     fun `DuckDB native fixture hydrates scalar stats and preserves variant field identity`() {
         val path = java.nio.file.Path.of(javaClass.getResource("/variant/native_variant.parquet")!!.toURI())
         org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(path)).use { reader ->

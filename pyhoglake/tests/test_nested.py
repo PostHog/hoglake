@@ -20,6 +20,7 @@ container encodes exactly as the same scalar would at top level.
 import io
 import re
 import struct
+import tempfile
 from pathlib import Path
 
 import pyarrow as pa
@@ -920,3 +921,72 @@ def test_the_stats_walk_pairs_children_by_ordinal_not_array_order():
     assert scrambled[3].lower_bound == struct.pack("<q", 10)
     assert scrambled[2].lower_bound == correct[2].lower_bound
     assert scrambled[3].lower_bound == correct[3].lower_bound
+
+
+def test_legacy_nested_spelling_still_yields_stats():
+    """A foreign file spelling a list's element `item` must still produce
+    nested stats.
+
+    The synthetic group and element names are PREDICTED from the
+    canonical spelling, and the parquet spec calls them insignificant --
+    pyarrow itself writes `l.list.item` under
+    ``use_compliant_nested_type=False``. That was harmless while this
+    module only saw footers it had just written; ``prepare_append_files``
+    (#73) hands it files the CALLER wrote, and before the reconciliation
+    pass a legacy spelling lost EVERY nested leaf's stats silently.
+    """
+    import pyarrow.parquet as pq
+
+    from pyhoglake.models import Column
+    from pyhoglake.stats import extract_column_stats
+
+    element = Column("element", "long", 2, 0, True)
+    col = Column("l", "list", 1, 0, True, children=(element,))
+
+    table = pa.table({"l": pa.array([[1, 2], [3]], pa.list_(pa.int64()))})
+    out = {}
+    for compliant in (True, False):
+        path = tempfile.mkdtemp() + f"/{compliant}.parquet"
+        pq.write_table(table, path, use_compliant_nested_type=compliant)
+        stats = extract_column_stats(pq.read_metadata(path), (col,))
+        out[compliant] = [s.field_id for s in stats]
+
+    assert out[True] == [2], "canonical spelling"
+    assert out[False] == [2], "legacy spelling (l.list.item)"
+
+
+def test_an_ambiguous_nested_spelling_yields_nothing_rather_than_a_guess():
+    """Reconciliation binds only when exactly ONE footer leaf answers.
+
+    Two struct leaves under one column share a prefix and a segment
+    count, so a renamed group leaves both candidates open -- and a guess
+    between them is the wrong-column binding this package refuses
+    everywhere else.
+    """
+    import pyarrow.parquet as pq
+
+    from pyhoglake.models import Column
+    from pyhoglake.stats import extract_column_stats
+
+    # The catalog says `s` is a struct of two longs; the file spells the
+    # fields differently, so neither predicted path is present and both
+    # remaining footer leaves match prefix+arity.
+    col = Column(
+        "s",
+        "struct",
+        1,
+        0,
+        True,
+        children=(Column("a", "long", 2, 0, True), Column("b", "long", 3, 1, True)),
+    )
+    table = pa.table(
+        {
+            "s": pa.array(
+                [{"x": 1, "y": 2}],
+                pa.struct([pa.field("x", pa.int64()), pa.field("y", pa.int64())]),
+            )
+        }
+    )
+    path = tempfile.mkdtemp() + "/ambiguous.parquet"
+    pq.write_table(table, path)
+    assert extract_column_stats(pq.read_metadata(path), (col,)) == []

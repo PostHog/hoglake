@@ -77,9 +77,9 @@ hoglake type. That is what keeps manifest generation a mechanical copy
 | `timestamptz` | timestamptz | INT64 + TIMESTAMP(MICROS, UTC) | 8-byte LE long, micros |
 | `string` | string | BYTE_ARRAY + STRING | UTF-8 bytes |
 | `json` | string | BYTE_ARRAY + JSON | UTF-8 bytes |
-| `variant` | variant (Iceberg v3) | VARIANT(1) group | none; omit whole-column statistics |
 | `uuid` | uuid | FIXED_LEN_BYTE_ARRAY(16) + UUID | 16 bytes BE |
 | `binary` | binary | BYTE_ARRAY | the bytes |
+| `variant` | variant (Iceberg v3) | VARIANT(1) group | none; omit whole-column statistics |
 
 Three rows carry consequences worth stating out loud.
 

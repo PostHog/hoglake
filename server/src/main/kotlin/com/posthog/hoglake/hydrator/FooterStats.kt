@@ -481,6 +481,23 @@ object FooterStats {
             return
         }
 
+        // And the converse, which is #77's second prologue check —
+        // deleted in the merge because the group-vs-primitive fallthrough
+        // appeared to cover it. It covers a SCALAR column. It does not
+        // cover a CONTAINER one: `isContainerAnnotation` knows only
+        // LIST/MAP/MAP_KEY_VALUE, so a catalog STRUCT bound to a variant
+        // group walked straight into `metadata`/`value`/`typed_value` —
+        // and since those carry no field ids, the name fallback bound a
+        // struct field literally named `value` (a legal identifier) to
+        // the variant's binary payload. Measured: bounds AAA..zzz stored
+        // for a column that has no such values, with and without file
+        // ids. Fabricated bounds are what pruners act on, and this
+        // object's rule is absent-never-guessed.
+        if (field.logicalTypeAnnotation is LogicalTypeAnnotation.VariantLogicalTypeAnnotation) {
+            shapeMismatch("is a native VARIANT group, which only a 'variant' column can bind to")
+            return
+        }
+
         // REPETITION, before anything else. Every catalog type reachable
         // here holds AT MOST ONE value per row: a scalar, a struct, or a
         // container whose repetition lives in its own synthetic layer

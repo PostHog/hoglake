@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.model.columnDefDepth
 import com.posthog.hoglake.model.nodeCount
+import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.CorruptDefinitionException
 import com.posthog.hoglake.service.Identifiers
@@ -276,17 +277,54 @@ class NestedCampaignRegressionTest {
 
     @Test
     fun `a variant is not a partition or sort source, at any depth`() {
-        val def =
-            ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("v", ColType.VARIANT)))
-        val live = assignFieldIds(listOf(def), 1L)
-        val nested = live.single().children.single()
-        assertThat(nested.def.type).isEqualTo(ColType.VARIANT)
-        // The refusal lives in requireSourceField, which both the
-        // partition and the sort path call — #77 checked at the two call
-        // sites, over top-level columns only.
-        assertThat(nested.def.type.isNested)
-            .describedAs("variant is a SCALAR, so the container refusal never fires for it")
-            .isFalse()
+        // Asserted through requireSourceField, which is what both the
+        // partition and the sort path call. The first version of this
+        // test only checked `isNested == false` — an enum property true
+        // whatever the refusal does — so the depth arm had no coverage
+        // at all.
+        val state =
+            listOf(
+                Column(1, 0, ColumnDef("id", ColType.LONG)),
+                Column(
+                    2,
+                    1,
+                    ColumnDef("s", ColType.STRUCT),
+                    children = listOf(Column(3, 0, ColumnDef("v", ColType.VARIANT))),
+                ),
+                Column(4, 2, ColumnDef("v", ColType.VARIANT)),
+            )
+        // TOP-LEVEL (#77 covered this) and NESTED (it did not: its checks
+        // looked at state.cols only).
+        for ((label, fieldId) in listOf("top-level" to 4L, "nested" to 3L)) {
+            for (what in listOf("partition", "sort")) {
+                assertThatThrownBy {
+                    AlterService(
+                        org.jdbi.v3.core.Jdbi.create { error("unused") },
+                    ).requireSourceField(state, fieldId, what)
+                }
+                    .describedAs("%s variant as a %s source", label, what)
+                    .isInstanceOf(HoglakeException.Validation::class.java)
+                    .hasMessageContaining("is a 'variant'")
+            }
+        }
+        // A scalar leaf under the same struct is still a legal source,
+        // so the refusal is scoped to variant and not to depth.
+        val ok =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("s", ColType.STRUCT),
+                    children = listOf(Column(2, 0, ColumnDef("n", ColType.LONG))),
+                ),
+            )
+        assertThat(
+            AlterService(
+                org.jdbi.v3.core.Jdbi.create {
+                    error("unused")
+                },
+            ).requireSourceField(ok, 2L, "partition").def.name,
+        ).isEqualTo("n")
     }
 
     // ---- binding: ids outrank names, at every level ----------------------

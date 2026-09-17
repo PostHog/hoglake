@@ -94,7 +94,7 @@ BEGIN
     -- The DEFINITION, not a substring of it. V9 DROPs this constraint
     -- and recreates it, so one that merely MENTIONS a V8 type while
     -- permitting a different vocabulary — a hand-patched catalog that
-    -- allows 'variant', say — would be discarded silently, which is the
+    -- also allows 'decimal', say — would be discarded silently, which is the
     -- divergence this guard claims to catch.
     --
     -- Compared as the extracted MEMBER LIST rather than as one exact

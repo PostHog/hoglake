@@ -1,10 +1,16 @@
 """Per-column stats extraction from an in-memory parquet footer.
 
-Operates on the ``pyarrow.parquet.FileMetaData`` the writer already holds
-(never re-reads the file from object storage): value/null counts summed
-across row groups; min/max only when every row group carries min/max
-statistics for the column; bounds encoded to Iceberg single-value binary
-by the catalog column type.
+Operates on a ``pyarrow.parquet.FileMetaData`` already in hand (never
+re-reads the file from object storage): value/null counts summed across
+row groups; min/max only when every row group carries min/max statistics
+for the column; bounds encoded to Iceberg single-value binary by the
+catalog column type.
+
+The footer is not always one this process wrote. ``_write_one_file``
+hands over a footer built from ``columns_to_arrow_schema``, but
+``prepare_append_files`` (#73) hands over a footer the CALLER wrote, so
+nothing here may assume that footer order, synthetic group names, or
+leaf count follow from the catalog schema.
 """
 
 from __future__ import annotations
@@ -274,12 +280,14 @@ def _float_total_order_key(v: float) -> int:
 
 #: The synthetic repetition groups parquet inserts between a container
 #: and its children. pyarrow writes exactly these (verified against
-#: pyarrow 25), and this module only ever reads footers the pyhoglake
-#: writer itself just produced — so predicting the leaf paths from the
-#: catalog tree is exact here. A foreign footer using other names (the
-#: spec permits any) yields NO stats for those leaves rather than wrong
-#: ones, which is the same "absent, never guessed" rule the rest of this
-#: module holds to.
+#: pyarrow 25), so predicting the leaf paths from the catalog tree is
+#: exact for files this writer produced. It is NOT exact for files the
+#: caller wrote — the spec calls these names insignificant, and pyarrow
+#: itself spells the element `item` under
+#: ``use_compliant_nested_type=False`` — so `_resolve_leaves` reconciles
+#: a predicted path against the footer's real ones when exactly one
+#: answers. Two candidates is a guess, and the "absent, never guessed"
+#: rule wins.
 _LIST_GROUP = "list"
 _MAP_GROUP = "key_value"
 
@@ -292,18 +300,20 @@ def _walk_leaves(
     """Every LEAF under ``col`` as (parquet path, column, arrow type).
 
     Synthetic children (a list's element, a map's key and value) are
-    reached by POSITION, without the field-id identity check the Kotlin
-    hydrator applies. That is safe HERE and only here, because of a
-    premise worth stating: this module is reached from exactly one call
-    site, :func:`pyhoglake.client._write_one_file`, on the footer of the
-    parquet this process just wrote from
-    ``columns_to_arrow_schema(info.columns)``. The ids in that footer
-    came from the catalog by construction, so position and identity
-    cannot disagree. The Kotlin side reads FOREIGN footers, where they
-    very much can, and checks accordingly.
+    reached by POSITION within the CATALOG column, not within the file:
+    this function walks the catalog tree, and the arrow type it carries
+    alongside is only ever used to interpret a statistic, never to decide
+    which catalog field a chunk belongs to. Binding to the file happens
+    one level up, in :func:`_resolve_leaves`, by path.
 
-    If this ever grows a second caller that hands it someone else's
-    file, the identity check has to come with it.
+    That distinction matters because the premise this module was written
+    under is gone. It used to be reached from one call site,
+    :func:`pyhoglake.client._write_one_file`, on the footer of a parquet
+    this process had just written from
+    ``columns_to_arrow_schema(info.columns)`` -- so footer order was
+    catalog order by construction. #73 added
+    :meth:`pyhoglake.client.Table.prepare_append_files`, which reads a
+    footer the CALLER wrote. Nothing here may assume the two agree.
 
     The parquet path and the arrow leaf type are resolved TOGETHER,
     walking the catalog tree and the footer's arrow schema in step: the
@@ -343,17 +353,14 @@ def _walk_leaves(
         if not kids:
             return []
         sub = None
-        # The list FAMILY, defensively. Unlike the client-side check in
-        # `_align_table` — where recognising only the canonical member
-        # was a live bug — this one cannot currently be reached with a
-        # non-canonical type: `_walk_leaves` has a single caller, on a
-        # footer this process just wrote, and the write path casts
-        # through `_align_table` first, so `large_list` and
-        # `fixed_size_list` have already become `list<element: ...>` by
-        # the time a footer exists. (Measured on pyarrow 25.0.1.) Kept
-        # because the predicate is the canonical answer and a second
-        # caller should not have to rediscover the mapping — NOT because
-        # a bug was observed here.
+        # The list FAMILY, and no longer only defensively. On the write
+        # path the table casts through `_align_table` first, so
+        # `large_list` and `fixed_size_list` are already
+        # `list<element: ...>` by the time a footer exists (measured on
+        # pyarrow 25.0.1). `prepare_append_files` reads a footer the
+        # CALLER wrote, which went through no such cast, so a
+        # non-canonical member reaches here — and a narrower predicate
+        # would silently drop that leaf's bounds.
         if arrow_type is not None and is_list_family(arrow_type):
             sub = arrow_type.value_field.type
         return _walk_leaves(kids[0], here + (_LIST_GROUP,), sub)
@@ -401,6 +408,7 @@ def _resolve_leaves(
 
     out: dict[str, tuple[Column, pa.DataType | None]] = {}
     variant_prefixes: list[str] = []
+    predicted: list[tuple[str, Column, pa.DataType | None]] = []
     for col in columns:
         top: pa.DataType | None = None
         if footer_schema is not None:
@@ -413,7 +421,45 @@ def _resolve_leaves(
         else:
             for path, leaf, leaf_type in _walk_leaves(col, (), top):
                 out[path] = (leaf, leaf_type)
+                predicted.append((path, leaf, leaf_type))
+
+    # RECONCILE against the footer's real paths. The synthetic group and
+    # element names are PREDICTED above from the canonical spelling, and
+    # the spec says they are insignificant: pyarrow writes `l.list.item`
+    # with `use_compliant_nested_type=False`, other writers use `bag` or
+    # `array`. That was harmless while this module only saw footers it
+    # had just written; `prepare_append_files` (#73) hands it files the
+    # CALLER wrote, and a legacy spelling silently lost every nested
+    # leaf's stats.
+    #
+    # Matched on the parts that are NOT insignificant -- the leading
+    # user-named segment and the segment count -- and only when exactly
+    # one footer leaf answers. Two candidates is a guess, and this module
+    # does not guess.
+    actual = _footer_leaf_paths(metadata)
+    unmatched = [p for p in actual if p not in out]
+    for path, leaf, leaf_type in predicted:
+        if path in actual:
+            continue
+        head, arity = path.split(".", 1)[0], path.count(".")
+        hits = [
+            p
+            for p in unmatched
+            if p.split(".", 1)[0] == head
+            and p.count(".") == arity
+            and not p.startswith(tuple(variant_prefixes))
+        ]
+        if len(hits) == 1:
+            out[hits[0]] = (leaf, leaf_type)
     return out, tuple(variant_prefixes)
+
+
+def _footer_leaf_paths(metadata: pq.FileMetaData) -> list[str]:
+    """The footer's own leaf chunk paths, in order."""
+    if metadata.num_row_groups <= 0:
+        return []
+    rg0 = metadata.row_group(0)
+    return [rg0.column(j).path_in_schema for j in range(metadata.num_columns)]
 
 
 def extract_column_stats(
@@ -428,32 +474,30 @@ def extract_column_stats(
     that is Iceberg's own rule for nested fields — and a struct leaf
     behaves exactly like a top-level scalar.
     """
-    # BY POSITION, not by dotted path. Path spelling is ambiguous the
-    # moment nesting and variant coexist: a variant `properties` stores
-    # its payload at `properties.value`, and a top-level scalar
-    # literally named `properties.value` has the same
-    # `path_in_schema` -- so a path map hands one catalog field TWO
-    # chunks and emits two stats rows for one field id, which the
-    # server then refuses as a duplicate. #77 hit this and bound
-    # positionally; that was right, and it survives the merge.
+    # BY PATH, with two ambiguities removed rather than tolerated.
     #
-    # Position is safe here for the reason the module docstring gives:
-    # this runs on the footer of a file this process just wrote from
-    # `columns_to_arrow_schema(info.columns)`, so the footer's
-    # depth-first leaf order IS the catalog's leaf order. The Kotlin
-    # side reads FOREIGN footers and binds by field id instead.
+    # Path spelling stops being unique the moment nesting and variant
+    # coexist: a variant `properties` stores its payload at
+    # `properties.value`, and a top-level scalar literally named
+    # `properties.value` has the same `path_in_schema`. #77 answered that
+    # by dropping paths entirely and binding leaves POSITIONALLY, blanking
+    # every nested top-level column so its leaves bound to nothing. That
+    # was correct while variant was the only nested shape in the catalog.
+    # It cannot survive Phase 2, where struct/list/map leaves are exactly
+    # the leaves that must produce stats.
+    #
+    # So: variant storage is excluded by path PREFIX below, and a chunk is
+    # bound once (`claimed`) to a catalog leaf that names it. A path two
+    # catalog fields could claim yields stats for neither. The Kotlin side
+    # reads the same footers and binds by field id, which has no ambiguity
+    # to remove.
     leaves, variant_prefixes = _resolve_leaves(metadata, columns)
 
     # Map parquet leaf index -> its chunk path. Full path, verbatim: the
     # catalog-side paths above are built the same way, and splitting on
     # "." misattributed a top-level column literally named "a.b" (QE
     # find, 2026-09-05) before nesting was even in the picture.
-    n_cols = metadata.num_columns
-    leaf_names: list[str] = []
-    if metadata.num_row_groups > 0:
-        rg0 = metadata.row_group(0)
-        for j in range(n_cols):
-            leaf_names.append(rg0.column(j).path_in_schema)
+    leaf_names = _footer_leaf_paths(metadata)
 
     out: list[ColumnStats] = []
     claimed: set[str] = set()

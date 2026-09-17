@@ -15,9 +15,14 @@ from thrift.protocol.TCompactProtocol import TCompactProtocol
 from thrift.Thrift import TType
 from thrift.transport.TTransport import TMemoryBuffer
 
-from .errors import ValidationError
+from .errors import UnsupportedTypeError, ValidationError
 from .models import Column
-from .types import PARQUET_FIELD_ID_KEY, coltype_to_arrow
+from .types import (
+    NESTED_TYPES,
+    PARQUET_FIELD_ID_KEY,
+    coltype_to_arrow,
+    column_to_arrow_field,
+)
 
 
 def _struct(protocol: Any, depth: int = 0) -> dict[int, Any]:
@@ -69,11 +74,21 @@ def _schema_elements(path: str) -> list[dict[int, Any]]:
         protocol.readFieldEnd()
 
 
-def _top_level(elements: list[dict[int, Any]]) -> list[dict[int, Any]]:
+def _top_level(elements: list[dict[int, Any]]) -> list[tuple[dict[int, Any], range]]:
+    """Each top-level schema element with the leaf-column range it owns.
+
+    A row group's column chunks are its leaves, in schema order, so the
+    range indexes ``row_group.column(...)`` directly. That is how a
+    container's own leaves are found: by position in the tree, never by
+    parsing a dotted ``path_in_schema``, whose synthetic level names
+    (``list``/``element``/``item``) differ between writers and whose
+    separator a column name may itself contain.
+    """
     cursor = 1
+    leaves = 0
     result = []
     for _ in range(elements[0].get(5, 0)):
-        start = cursor
+        start, first_leaf = cursor, leaves
         pending = 1
         while pending:
             if cursor >= len(elements):
@@ -81,12 +96,65 @@ def _top_level(elements: list[dict[int, Any]]) -> list[dict[int, Any]]:
             children = elements[cursor].get(5, 0)
             if children < 0:
                 raise ValueError("negative schema child count")
+            if children == 0:
+                leaves += 1
             pending += children - 1
             cursor += 1
-        result.append(elements[start])
+        result.append((elements[start], range(first_leaf, leaves)))
     if cursor != len(elements):
         raise ValueError("invalid Parquet schema tree")
     return result
+
+
+def _arrow_children(kind: pa.DataType) -> list[pa.Field]:
+    if pa.types.is_struct(kind):
+        return list(kind)
+    if pa.types.is_map(kind):
+        return [kind.key_field, kind.item_field]
+    if pa.types.is_list(kind) or pa.types.is_large_list(kind):
+        return [kind.value_field]
+    return []
+
+
+def _leaf_count(kind: pa.DataType) -> int:
+    children = _arrow_children(kind)
+    return sum(_leaf_count(child.type) for child in children) if children else 1
+
+
+def _field_id_fault(expected: pa.Field, actual: pa.Field, path: str) -> str | None:
+    """Compare parquet field ids below the top level.
+
+    Arrow type equality ignores field metadata and the synthetic element
+    name, so it proves the shape and nothing about identity. hoglake binds
+    a file to a schema by field id at every level, so the ids are checked
+    here, against the same recursion the writer used.
+    """
+    children = zip(
+        _arrow_children(expected.type), _arrow_children(actual.type), strict=True
+    )
+    for want, got in children:
+        here = f"{path}.{want.name}"
+        if (got.metadata or {}).get(PARQUET_FIELD_ID_KEY) != (want.metadata or {}).get(
+            PARQUET_FIELD_ID_KEY
+        ):
+            return f"prepared field ID differs for {here}"
+        deeper = _field_id_fault(want, got, here)
+        if deeper is not None:
+            return deeper
+    return None
+
+
+def _container_fault(column: Column, field: pa.Field) -> str | None:
+    try:
+        expected = column_to_arrow_field(column)
+    except UnsupportedTypeError as error:
+        # An unbuildable catalog container is the destination's problem,
+        # not the prepared file's, but the caller still sees a refusal
+        # rather than a stack trace about the wrong API.
+        return f"cannot describe destination column {column.name}: {error}"
+    if field.type != expected.type:
+        return f"prepared Parquet type differs for {column.name}"
+    return _field_id_fault(expected, field, column.name)
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
@@ -103,7 +171,7 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
     arrow = parquet.schema_arrow
     if arrow.names != [c.name for c in columns] or len(physical) != len(columns):
         fail("prepared Parquet columns differ from destination")
-    for column, field, element in zip(columns, arrow, physical, strict=True):
+    for column, field, (element, leaves) in zip(columns, arrow, physical, strict=True):
         if (
             element.get(9) != column.field_id
             or field.metadata is None
@@ -134,7 +202,26 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
                 or (value is not None and value.type != pa.binary())
             ):
                 fail(f"invalid native VARIANT storage for {column.name}")
-            null_path = column.name + ".metadata"
+            # metadata is the variant's one REQUIRED leaf, so it stands for
+            # the column: it is null exactly when the variant is. The
+            # variant spec addresses these children by name, not position
+            # (hoglake#70), so find it by name and convert to a leaf index
+            # -- the shape check above does not pin the child order.
+            offset = 0
+            for child in field.type:
+                if child.name == "metadata":
+                    break
+                offset += _leaf_count(child.type)
+            proof, all_of = leaves[offset : offset + 1], True
+        elif column.type in NESTED_TYPES:
+            fault = _container_fault(column, field)
+            if fault is not None:
+                fail(fault)
+            # Any one clean leaf proves the container: a leaf at full
+            # definition level has every ancestor present. The converse
+            # does not hold, so all the leaves are offered and one
+            # suffices.
+            proof, all_of = leaves, False
         else:
             expected = coltype_to_arrow(column.type, column.type_params)
             if expected == pa.timestamp("s"):
@@ -152,23 +239,21 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
                 expected = pa.timestamp(expected.unit, "UTC")
             if 5 in element or actual != expected:
                 fail(f"prepared Parquet type differs for {column.name}")
-            null_path = column.name
+            proof, all_of = leaves, True
         if not column.nullable and field.nullable:
-            # DuckDB writes optional fields. Accept them for NOT NULL only when
-            # every row group's required metadata/scalar leaf proves zero nulls.
+            # DuckDB writes optional fields. Accept them for NOT NULL only
+            # when every row group's leaves prove zero nulls.
             for group in range(parquet.metadata.num_row_groups):
                 row_group = parquet.metadata.row_group(group)
-                chunks = [
-                    row_group.column(i)
-                    for i in range(row_group.num_columns)
-                    if row_group.column(i).path_in_schema == null_path
+                if not proof or max(proof) >= row_group.num_columns:
+                    fail(f"prepared file has no columns for {column.name}")
+                clean = [
+                    chunk.statistics is not None
+                    and chunk.statistics.has_null_count
+                    and chunk.statistics.null_count == 0
+                    for chunk in (row_group.column(i) for i in proof)
                 ]
-                if (
-                    len(chunks) != 1
-                    or chunks[0].statistics is None
-                    or not chunks[0].statistics.has_null_count
-                    or chunks[0].statistics.null_count != 0
-                ):
+                if not (all(clean) if all_of else any(clean)):
                     fail(
                         f"prepared file cannot prove non-null values for {column.name}"
                     )

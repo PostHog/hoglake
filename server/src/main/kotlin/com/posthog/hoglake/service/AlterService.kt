@@ -541,7 +541,7 @@ class AlterService(private val jdbi: Jdbi) {
         op: AlterOp.SetPartitionSpec,
     ) {
         for (f in op.fields) {
-            val col = requireSourceField(state, f.sourceFieldId, "partition")
+            val col = requireSourceField(state.cols, f.sourceFieldId, "partition")
             when (f.transform) {
                 Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -657,7 +657,7 @@ class AlterService(private val jdbi: Jdbi) {
     ) {
         val seen = HashSet<Long>()
         for (f in op.fields) {
-            requireSourceField(state, f.sourceFieldId, "sort")
+            requireSourceField(state.cols, f.sourceFieldId, "sort")
             if (!seen.add(f.sourceFieldId)) {
                 throw HoglakeException.Validation(
                     "duplicate sort source field_id ${f.sourceFieldId}",
@@ -820,19 +820,26 @@ class AlterService(private val jdbi: Jdbi) {
     }
 
     /**
-     * A partition or sort source must be a LEAF that no list or map
-     * sits above. Iceberg's `source-id` may point at a struct leaf, so
-     * `addr.zip` is a legal partition source — but nothing under a
-     * repeated element is, because a row has many of those values and a
-     * partition/sort key is one value per row.
+     * The one place a partition or sort source is resolved and refused.
+     *
+     * The source must be a LEAF that no list or map sits above.
+     * Iceberg's `source-id` may point at a struct leaf, so `addr.zip` is
+     * a legal partition source — but nothing under a repeated element
+     * is, because a row has many of those values and a partition/sort
+     * key is one value per row.
+     *
+     * Takes the live COLUMNS rather than the whole TableState, which is
+     * all it ever used — and which lets its refusals (nested container,
+     * list/map interior, variant) be asserted directly instead of
+     * through a live catalog.
      */
-    private fun requireSourceField(
-        state: TableState,
+    internal fun requireSourceField(
+        cols: List<Column>,
         fieldId: Long,
         what: String,
     ): Column {
         val chain =
-            findChain(state.cols, fieldId, emptyList())
+            findChain(cols, fieldId, emptyList())
                 ?: throw HoglakeException.Validation(
                     "$what source field_id $fieldId is not a live column",
                 )

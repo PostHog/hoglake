@@ -1,7 +1,12 @@
 import { screen, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { Column, Table } from "../src/api/types";
-import { formatColumnType } from "../src/api/types";
+import {
+  COLUMN_TYPES,
+  NESTED_COLUMN_TYPES,
+  SCALAR_COLUMN_TYPES,
+  formatColumnType,
+} from "../src/api/types";
 import { formatPartitionField } from "../src/lib/format";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
@@ -57,6 +62,45 @@ const nestedTable: Table = {
 };
 
 describe("formatColumnType", () => {
+  it("knows every type the server's ColumnDef enum accepts", () => {
+    // The console's vocabulary must be the server's, or a table holding
+    // a type it has never heard of renders with a `type` outside
+    // ColumnType. #77 added `variant` server-side and did not touch the
+    // console; nothing here noticed, because no webui test referenced
+    // variant at all.
+    //
+    // Kept as a LIST rather than a count so the failure names the
+    // missing member. The server-side half of this pairing is
+    // ScalarTypeParityTest, which checks the enum against the migration
+    // and the OpenAPI schema.
+    expect([...COLUMN_TYPES]).toEqual([
+      "boolean", "int8", "int16", "int", "long",
+      "uint8", "uint16", "uint32", "uint64",
+      "float", "double", "decimal", "date", "time",
+      "timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz",
+      "string", "json", "uuid", "binary",
+      "variant",
+      "list", "struct", "map",
+    ]);
+    // Creatable is a strict subset: containers need children and a
+    // variant has no value a form can produce.
+    expect(SCALAR_COLUMN_TYPES).not.toContain("variant");
+    for (const t of NESTED_COLUMN_TYPES) {
+      expect(SCALAR_COLUMN_TYPES).not.toContain(t);
+    }
+  });
+
+  it("renders a variant column by name", () => {
+    const col: Column = {
+      field_id: "1",
+      ordinal: 0,
+      name: "props",
+      type: "variant",
+      nullable: true,
+    };
+    expect(formatColumnType(col)).toBe("variant");
+  });
+
   it("says <?> for every container whose children are missing", () => {
     // `struct<>` reads as a valid empty struct. It is not one: the
     // server refuses a childless struct, so an empty children list can

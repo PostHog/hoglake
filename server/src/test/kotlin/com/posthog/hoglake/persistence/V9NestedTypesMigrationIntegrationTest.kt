@@ -97,7 +97,7 @@ class V9NestedTypesMigrationIntegrationTest {
                     )
                 }
             }
-                .describedAs("V4 must not already accept the V9 vocabulary")
+                .describedAs("V8 must not already accept the V9 vocabulary")
                 .hasMessageContaining("hog_column_col_type_check")
 
             migrate(db.dataSource)
@@ -254,7 +254,7 @@ class V9NestedTypesMigrationIntegrationTest {
     fun `the migration refuses a constraint with V8's members and inverted semantics`(): Unit =
         PgTestSupport.freshDatabaseRaw("").use { db ->
             // The member list is only half the constraint. NOT IN over
-            // the same 23 names yields byte-identical found_types: the
+            // the same 24 names yields byte-identical found_types: the
             // list check passed, V9 dropped it, and a catalog that
             // permitted EVERYTHING EXCEPT the vocabulary was silently
             // replaced by one that permits it.

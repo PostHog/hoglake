@@ -935,6 +935,93 @@ class CompactionServiceIntegrationTest {
         assertThat(tail.deleteFiles).isEmpty()
     }
 
+    @Test
+    fun `a table holding a variant at ANY depth produces no candidates`() {
+        // THE GATE, which had no test: the rewriter's refusal is only
+        // the backstop, and reverting the planner to #77's top-level
+        // check left the whole suite green. A nested variant would then
+        // be enqueued, reach the rewriter, and come back a skip on every
+        // sweep forever — work the planner is supposed to never
+        // schedule.
+        //
+        // UNSORTED, and self-validating. Two earlier attempts passed
+        // against the bug: the first used files too small to group at
+        // all, the second used the sorted fixture, where ANY nested
+        // column triggers the heap derate and empties the plan on its
+        // own. Here the same catalog is planned before and after the
+        // variant arrives, with the struct already present, so the only
+        // thing that changes is the variant.
+        for (nested in listOf(false, true)) {
+            val label = if (nested) "nested" else "top-level"
+            val cat = "compact-variant-$label-${counter.incrementAndGet()}"
+            catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+            catalogs.createNamespace(cat, "ns")
+            catalogs.createTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    ColumnDef("id", ColType.LONG, nullable = false),
+                    ColumnDef("name", ColType.STRING),
+                    ColumnDef("score", ColType.DOUBLE),
+                ),
+            )
+            if (nested) {
+                alter.alterTable(
+                    cat,
+                    "ns",
+                    "t",
+                    listOf(
+                        AlterOp.AddColumn(
+                            ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("n", ColType.LONG))),
+                        ),
+                    ),
+                )
+            }
+            repeat(3) { i ->
+                val rows = (0 until 3).map { r -> TestRow((i * 3 + r).toLong(), "name-$i-$r", r.toDouble()) }
+                val bytes = parquetBytes(rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/f$i.parquet"
+                store.put(path, bytes)
+                commits.commit(
+                    cat,
+                    CommitRequest(
+                        appends =
+                            listOf(
+                                TableAppend(
+                                    "ns",
+                                    "t",
+                                    listOf(FileRegistration(path, rows.size.toLong(), bytes.size.toLong())),
+                                ),
+                            ),
+                    ),
+                )
+            }
+            assertThat(svc.planTable(cat, "ns", "t", cfg).groups)
+                .describedAs("%s: the file set IS groupable before the variant exists", label)
+                .isNotEmpty()
+
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    if (nested) {
+                        AlterOp.AddColumn(ColumnDef("v", ColType.VARIANT), parent = "s")
+                    } else {
+                        AlterOp.AddColumn(ColumnDef("v", ColType.VARIANT))
+                    },
+                ),
+            )
+            assertThat(svc.planTable(cat, "ns", "t", cfg).groups)
+                .describedAs("%s variant: nothing is enqueued", label)
+                .isEmpty()
+            assertThat(svc.runOnce(cat, cfg).groupsCompacted)
+                .describedAs("%s variant: and nothing is compacted", label)
+                .isZero()
+        }
+    }
+
     // ---- plan-to-commit races ----------------------------------------------
 
     @Test

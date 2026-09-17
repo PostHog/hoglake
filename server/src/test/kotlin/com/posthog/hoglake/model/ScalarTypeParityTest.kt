@@ -19,7 +19,8 @@ import java.nio.file.Path
  * webui's COLUMN_TYPES. The first four are asserted equal here from
  * their actual files, because "someone added a type to the enum and not
  * the migration" is a 500 at insert time, not a compile error. (The
- * webui list is TypeScript and is covered by its own suite.)
+ * webui list is TypeScript and is checked by nested.test.tsx,
+ * which pins COLUMN_TYPES against this same vocabulary.)
  *
  * The promotion matrix is pinned twice: once literally, and once
  * against the RULE it is supposed to obey — a promotion is legal only
