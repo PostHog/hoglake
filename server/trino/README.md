@@ -42,5 +42,5 @@ client remains at 446 independently of the server version so this harness can
 continue using the server project's Java 21 toolchain.
 
 The tests cover schema/table discovery, Parquet reads, aggregates, column
-binding, type promotion, deletion-vector refusal, and read-only enforcement.
+binding, type promotion, and read-only enforcement.
 The planned Iceberg REST facade remains a separate server feature.
