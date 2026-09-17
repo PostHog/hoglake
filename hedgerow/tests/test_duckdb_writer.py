@@ -329,3 +329,67 @@ def test_promotion_failure_cleans_partial_output_and_allows_retry(
         len(write(source, tmp_path / "out", 10000, tuple(range(30)), options=options))
         > 1
     )
+
+
+def test_source_fragments_are_scanned_exactly_once(tmp_path, monkeypatch):
+    """#89: the flush used to decode each fragment's payload three times.
+
+    A row count, a VARIANT null pre-flight and the COPY each re-read the
+    selected row groups over S3. The count and the null proof now come
+    from the written output instead, so the source is scanned once.
+
+    Asserted by counting the statements that actually scan the source —
+    DESCRIBE and parquet_metadata read footers only and are not scans —
+    because the cost this guards is S3 read amplification, which no
+    functional assertion in this file can see.
+    """
+    path = raw_file(tmp_path, count=4096)
+    statements = []
+    real_connect = duckdb.connect
+
+    class Recording:
+        def __init__(self, connection):
+            self._connection = connection
+
+        def execute(self, sql, *args, **kwargs):
+            statements.append(sql)
+            return self._connection.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def __enter__(self):
+            self._connection.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self._connection.__exit__(*exc)
+
+    monkeypatch.setattr(
+        duckdb, "connect", lambda *a, **k: Recording(real_connect(*a, **k))
+    )
+    # 341 = rows in group 0 that are team 1 AND land in month 672; the
+    # fixture's routing columns cycle, so this is not the group size.
+    write(path, tmp_path / "output", 341, groups=(0,))
+    monkeypatch.undo()
+
+    scans = [
+        sql
+        for sql in statements
+        if f"read_parquet('{path}'" in sql
+        and not sql.lstrip().upper().startswith("DESCRIBE")
+    ]
+    assert len(scans) == 1, f"source scanned {len(scans)}x:\n" + "\n".join(scans)
+    assert scans[0].lstrip().upper().startswith("COPY")
+
+
+def test_output_row_count_is_verified_against_frozen_work(tmp_path):
+    """The count check survived the move from pre-flight to post-write.
+
+    It is now a TOTAL over the output rather than per fragment, so this
+    pins that a wrong frozen count is still refused — the granularity
+    changed, the guarantee did not disappear.
+    """
+    path = raw_file(tmp_path, count=4096)
+    with pytest.raises(DataIntegrityError, match="output row count differs"):
+        write(path, tmp_path / "output", 341 + 1, groups=(0,))
