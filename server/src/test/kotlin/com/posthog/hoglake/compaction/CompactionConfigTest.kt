@@ -69,7 +69,7 @@ class CompactionConfigTest {
         // the top of the measured band, not the bottom.
         // EXACTLY 64, not "at least". The number is documented — in
         // CompactionConfig's KDoc, in Config's, and in
-        // iceberg-federation.md §2.8 — and a `>=` assertion lets the code
+        // docs/iceberg-federation.md §2.8 — and a `>=` assertion lets the code
         // drift upward while all three keep saying 64. If the value
         // should change, the docs change with it in the same commit.
         assertThat(CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION)
@@ -161,7 +161,7 @@ class CompactionConfigTest {
         // failure as one that drifts from App: the operator sizing a
         // heap reads the number in the docs, not the constant.
         val documented = "1,000,000"
-        for (doc in listOf("README.md", "../iceberg-federation.md")) {
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
             assertThat(Files.readString(Path.of(doc)))
                 .describedAs("%s must document HOGLAKE_COMPACTION_MAX_NODES_PER_ROW's real default", doc)
                 .contains("HOGLAKE_COMPACTION_MAX_NODES_PER_ROW")

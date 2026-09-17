@@ -196,7 +196,7 @@ class ScalarTypeParityTest {
                     ColType.UUID_T to IcebergType.UUID,
                     ColType.BINARY to IcebergType.BINARY,
                     ColType.VARIANT to IcebergType.VARIANT,
-                    // Native, one for one (iceberg-federation.md §2.8).
+                    // Native, one for one (docs/iceberg-federation.md §2.8).
                     ColType.LIST to IcebergType.LIST,
                     ColType.STRUCT to IcebergType.STRUCT,
                     ColType.MAP to IcebergType.MAP,

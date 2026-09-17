@@ -168,7 +168,7 @@ object StatsSanity {
      * a reader skips the file for `x = 0.0`: data that is there, pruned
      * away. Iceberg removes the arbitrariness by fixing the sign per
      * ROLE — a lower bound stores -0.0, an upper bound stores +0.0 —
-     * and iceberg-federation.md §2.1 requires the stored bound to BE the
+     * and docs/iceberg-federation.md §2.1 requires the stored bound to BE the
      * Iceberg single-value serialization, because manifest generation
      * copies it mechanically. Rewriting one zero as the other widens
      * nothing: they are the same number.
@@ -223,7 +223,7 @@ object StatsSanity {
 
     /**
      * Whether [bytes] can be read back as a single value of [type],
-     * under Iceberg's single-value serialization (iceberg-federation.md
+     * under Iceberg's single-value serialization (docs/iceberg-federation.md
      * §2.1) — which is a pure LENGTH question for every fixed-width
      * type and an emptiness question for the variable-width ones.
      *

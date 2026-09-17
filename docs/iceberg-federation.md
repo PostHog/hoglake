@@ -1,12 +1,12 @@
 # Iceberg federation — design obligations for v1
 
 What the initial hoglake design must get right so the read-only Iceberg
-REST facade ([README.md](README.md), Decisions) works — and keeps
+REST facade ([README.md](../README.md), Decisions) works — and keeps
 working — as a federation participant. The theme: *mappability is a
 property of the data model and the files, not of the facade code*, and
 several pieces are unretrofittable once a lake exists.
 
-Companions: [README.md](README.md) (architecture + decisions),
+Companions: [README.md](../README.md) (architecture + decisions),
 [trino-integration.md](trino-integration.md) (the first consumer of
 this facade), [metadata-schema.md](metadata-schema.md) (what today's
 model looks like).
@@ -21,9 +21,8 @@ them can only be served by name-mapping shims, and fixing it later
 means rewriting every file.
 
 This also formally kills the pyducklake field-ID fiction (sequential
-IDs synthesized client-side from `ordinal_position` — see
-[pyducklake-api-map.md](pyducklake-api-map.md)): the catalog's column
-IDs are the one identity, in the metadata and in the files.
+IDs synthesized client-side from `ordinal_position`): the catalog's
+column IDs are the one identity, in the metadata and in the files.
 
 Registration-time enforcement is cheap: the footer the writer ships
 already contains the schema; the commit endpoint verifies field IDs are
@@ -380,8 +379,7 @@ Still open: VARIANT, and `list`/`map` internals as partition sources
 Facade pruning works only if partition specs translate exactly.
 
 - `bucket(n)`: our `murmur3_32` is already bit-compatible with
-  Iceberg's hash by design ([ducklake-api-map.md](ducklake-api-map.md)
-  §1.2) — keep it that way, and fix the nested-type
+  Iceberg's hash by design — keep it that way, and fix the nested-type
   string-representation fallback rather than inheriting it.
 - Date/time transforms: Iceberg defines `year/month/day/hour` as
   epoch-relative integers. DuckLake grew both calendar-flavored and

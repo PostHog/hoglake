@@ -524,7 +524,7 @@ class FooterStatsTest {
     // ---- the DuckLake scalar-parity types ----------------------------------
     //
     // Bounds are always the MAPPED Iceberg type's encoding, so the
-    // assertions below are really assertions about iceberg-federation.md
+    // assertions below are really assertions about docs/iceberg-federation.md
     // §2's table: 4-byte ints for everything int-mapped, 8-byte longs for
     // uint32, decimal bytes for uint64, micros for the timestamp
     // precisions and nanos for timestamp_ns.

@@ -56,10 +56,10 @@ the liability, and the incident generator.
 1. **One Postgres per service; one advisory-lock tail per catalog.**
    Commit throughput per catalog is capped at 1/tail-latency. At the
    observed ~1.6 mints/s average (bursts higher), fine. If a single
-   catalog ever needs sustained >100 commits/s, that's the wall —
-   [split-validation-commit.md](split-validation-commit.md) is the
-   escape hatch (validation in front of the serialization point rather
-   than inside it). Designed, not scheduled.
+   catalog ever needs sustained >100 commits/s, that's the wall. The
+   escape hatch is to move validation in front of the serialization
+   point rather than inside it: designed once, never scheduled, and no
+   longer written down anywhere but here.
 2. **Read scaling.** Facade/Trino planning reads hit the service →
    one PG. Snapshot-pinned reads are replica-able (lag-tolerant by
    construction), but that's not built yet.

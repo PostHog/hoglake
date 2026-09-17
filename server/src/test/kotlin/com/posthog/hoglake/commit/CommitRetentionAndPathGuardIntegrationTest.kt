@@ -227,7 +227,7 @@ class CommitRetentionAndPathGuardIntegrationTest {
         assertThat(dataFileCount(cat)).isEqualTo(2)
     }
 
-    // ---- data_path prefix guard (sql-suggestions #6) ---------------------
+    // ---- data_path prefix guard ------------------------------------------
 
     @Test
     fun `a data path outside the catalog data_path is a 422 with zero writes`() {

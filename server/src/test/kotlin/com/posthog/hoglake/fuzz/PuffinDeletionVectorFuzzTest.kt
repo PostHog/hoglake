@@ -5,7 +5,7 @@ import com.posthog.hoglake.compaction.PuffinDeletionVector
 import java.io.IOException
 
 /**
- * Fuzz target (fuzzing.md layer 4, target d — highest value: fresh code
+ * Fuzz target (docs/fuzzing.md layer 4, target d — highest value: fresh code
  * decoding writer-supplied bytes): [PuffinDeletionVector.read] over
  * arbitrary puffin bytes.
  *

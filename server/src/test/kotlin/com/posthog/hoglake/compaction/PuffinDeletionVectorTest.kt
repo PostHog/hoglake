@@ -31,6 +31,30 @@ class PuffinDeletionVectorTest {
     }
 
     @Test
+    fun `a hostile roaring container count is a typed refusal, not a raw throw`() {
+        // #83, from the nightly fuzzer. Every length field this reader
+        // owns passes on this input — footer payload size, blob offset
+        // and length, the blob's own length prefix, the bucket count,
+        // even the CRC. The bad field belongs to the roaring bitmap's
+        // serialized format (container count -50331647, at file offset
+        // 28) and is read inside the library, which threw
+        // NegativeArraySizeException straight through compaction's DV
+        // path. Pinned on the exact bytes the fuzzer produced.
+        val crafted =
+            checkNotNull(
+                javaClass.classLoader.getResourceAsStream(
+                    "com/posthog/hoglake/fuzz/PuffinDeletionVectorFuzzTestInputs/" +
+                        "readRefusesLoudlyOrDecodesDeterministically/crash-1c1d87ae",
+                ),
+            ) { "the #83 fuzz corpus entry is missing" }.use { it.readBytes() }
+
+        assertThatThrownBy { PuffinDeletionVector.read(crafted) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("corrupt deletion-vector-v1 roaring bitmap")
+            .hasRootCauseInstanceOf(NegativeArraySizeException::class.java)
+    }
+
+    @Test
     fun `a corrupted vector byte fails the CRC check`() {
         val bytes = PuffinTestFiles.deletionVector(listOf(1L, 2L, 3L))
         // Flip a byte inside the blob's vector region (offset 4 = length

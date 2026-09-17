@@ -80,6 +80,16 @@ class CompactionServiceIntegrationTest {
     private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
 
     private companion object {
+        /**
+         * An object name carrying nothing but identity: the pyhoglake
+         * writer's shape, and now compaction's too. A compaction output
+         * that announces itself in its name tells a reader something the
+         * catalog already owns (explicit_row_ids) and gives every output
+         * in a table the same lead-in — see #23.
+         */
+        private const val BARE_UUID_PARQUET =
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.parquet"
+
         const val BUCKET = "hoglake-compaction-test"
 
         val minio: MinIOContainer by lazy {
@@ -211,6 +221,20 @@ class CompactionServiceIntegrationTest {
         readGroups(bytes) { s, g -> ids += g.getLong(s.getFieldIndex(ParquetRewriter.ROW_ID_COLUMN), 0) }
         return ids
     }
+
+    /**
+     * #83's fuzz-found puffin DV: every field this reader owns is sound,
+     * and the roaring payload's container count is not. Read from the
+     * corpus entry so the bytes here and the ones the fuzz target
+     * replays cannot drift apart.
+     */
+    private fun corruptDvBytes(): ByteArray =
+        checkNotNull(
+            javaClass.classLoader.getResourceAsStream(
+                "com/posthog/hoglake/fuzz/PuffinDeletionVectorFuzzTestInputs/" +
+                    "readRefusesLoudlyOrDecodesDeterministically/crash-1c1d87ae",
+            ),
+        ) { "the #83 fuzz corpus entry is missing" }.use { it.readBytes() }
 
     /** Upload a real puffin DV and register it against [dataFileId]. */
     private fun registerDv(
@@ -525,7 +549,15 @@ class CompactionServiceIntegrationTest {
         assertThat(filesAtHead).hasSize(1)
         val output = filesAtHead.single()
         assertThat(output.explicitRowIds).isTrue()
-        assertThat(output.path).contains("/data/ns/t/compacted-")
+        // A FRESH object in the table's data directory, named exactly as
+        // an ingested file is: a bare UUID (#23). Pinned positively
+        // rather than as "does not start with compacted-", so the
+        // convention itself is enforced and not just one former
+        // violation of it. explicit_row_ids above is what marks a
+        // compaction output; nothing may infer that from the path.
+        assertThat(output.path).contains("/data/ns/t/")
+        assertThat(output.path).isNotIn(fx.paths)
+        assertThat(output.path.substringAfterLast('/')).matches(BARE_UUID_PARQUET)
         assertThat(output.recordCount).isEqualTo(13) // 15 gross - 2 deleted
         assertThat(output.rowIdStart).isEqualTo(0) // min surviving id; positional meaning void
         assertThat(output.beginSnapshot).isEqualTo(compactionSnap)
@@ -1185,6 +1217,59 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a corrupt DV object is invalid_data, not a group retried every sweep`() {
+        // #83's crafted bitmap, now a typed refusal at the reader (#84).
+        // The refusal has to reach the loop's DURABLE channel: the bytes
+        // of a registered .dv object never change, so re-planning the
+        // group every sweep is the permanent loop `invalid_data` exists
+        // to name. Before this it landed in the catch-all as a failed
+        // group — the same misfiling the reserved-id and decimal cases
+        // had, one layer out.
+        val cat = "compact-corrupt-dv-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            ),
+        )
+        val regs =
+            listOf(
+                listOf(TestRow(1, "a", 1.0), TestRow(2, "b", 2.0)),
+                listOf(TestRow(3, "c", 3.0)),
+            ).mapIndexed { i, rows ->
+                val bytes = parquetBytes(rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/c$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        val fileIds =
+            catalogs.listFiles(cat, "ns", "t").sortedBy { it.rowIdStart }.map { it.dataFileId }
+        val dvPath = "s3://$BUCKET/$cat/dv/c0.puffin"
+        registerDv(cat, fileIds[0], dvPath, listOf(0L))
+        // Registered sound, then the OBJECT rots — a hostile or corrupt
+        // .dv under valid catalog metadata, which is the only shape that
+        // reaches the decoder at all.
+        store.put(dvPath, corruptDvBytes())
+
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        assertThat(result.invalidData).describedAs("durable, counted once").isEqualTo(1)
+        assertThat(result.failedGroups).describedAs("not a retryable failure").isZero()
+        assertThat(result.groupsCompacted).isZero()
+        // Nothing was rewritten, and the sweep stays green enough to run
+        // again: the group is simply never worth re-attempting.
+        assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+            .containsExactlyInAnyOrderElementsOf(regs.map { it.path })
+        assertVerifyPasses(cat)
+    }
+
+    @Test
     fun `an unreadable input fails its group in the open - failed_groups counts it, other groups compact`() {
         // The "silently chokes on S3" regression guard: a group whose
         // input object is missing (NoSuchKey, hiccup, never uploaded)
@@ -1750,10 +1835,11 @@ class CompactionServiceIntegrationTest {
             .containsExactlyInAnyOrderElementsOf(fx.paths)
         assertThat(queued.filter { it.second == "delete" }.map { it.first })
             .containsExactly(fx.dvPath)
-        // Only the compacted output survives.
+        // Only the compaction output survives — identified as "none of
+        // the inputs" rather than by a name shape (#23).
         assertThat(catalogs.listFiles(fx.cat, "ns", "t").map { it.path })
             .singleElement()
-            .matches { it.contains("compacted-") }
+            .matches({ it !in fx.paths && it != fx.dvPath }, "a fresh path, not an input")
     }
 
     @Test

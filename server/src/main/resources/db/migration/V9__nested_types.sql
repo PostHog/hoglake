@@ -4,7 +4,7 @@
 --
 -- Each of the three maps natively to the Iceberg V2 type of the same
 -- name, with the element/key/value field ids round-tripping unchanged
--- (iceberg-federation.md §2.8) — which is the membership rule for this
+-- (docs/iceberg-federation.md §2.8) — which is the membership rule for this
 -- set, exactly as it was for phase 1's scalars.
 --
 -- Three changes, one lock window:

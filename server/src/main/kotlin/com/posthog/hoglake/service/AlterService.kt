@@ -1088,7 +1088,7 @@ class AlterService(private val jdbi: Jdbi) {
          * ColType added in future became bucketable by default, and the
          * only thing standing between a new type and an unverified hash
          * contract was someone remembering to add a line. The policy is
-         * admit-deliberately (iceberg-federation.md §3), so the code has
+         * admit-deliberately (docs/iceberg-federation.md §3), so the code has
          * to fail closed: a new member is NOT bucketable until it is
          * named here, and naming it means having decided how it hashes.
          * pyhoglake's `_BUCKETABLE` is already a positive list, and the

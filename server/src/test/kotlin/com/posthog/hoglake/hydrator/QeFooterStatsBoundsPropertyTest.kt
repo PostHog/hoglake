@@ -47,7 +47,7 @@ import kotlin.random.Random
  * Three claims, per cell:
  *
  *  1. A produced bound is encoded at the MAPPED Iceberg type's width
- *     (ColType.icebergType, iceberg-federation.md §2) — a 4-byte bound
+ *     (ColType.icebergType, docs/iceberg-federation.md §2) — a 4-byte bound
  *     under a long column is the stale-width poison that wedges
  *     compaction's bound-merge.
  *  2. lower <= upper, compared under the catalog type.

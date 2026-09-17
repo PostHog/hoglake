@@ -476,7 +476,7 @@ object NestedAgreement {
 
     /**
      * Whether the rewriter's refusal of [col] is one of the DOCUMENTED
-     * deferrals (AGENT.md, iceberg-federation.md §2.8) rather than a
+     * deferrals (AGENT.md, docs/iceberg-federation.md §2.8) rather than a
      * disagreement with the reader.
      *
      * The two surfaces really do differ on these, and on purpose. A

@@ -5,7 +5,7 @@ important consumer — and eventually a producer. This doc covers what
 the v1 design does to make reads excellent and to keep the write door
 open without reversing the read-only-facade decision.
 
-Companions: [README.md](README.md) (decisions),
+Companions: [README.md](../README.md) (decisions),
 [iceberg-federation.md](iceberg-federation.md) (the facade's design
 obligations — all of which are prerequisites here).
 
@@ -28,16 +28,38 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
   silently skip); vanished tables/schemas are the SPI's typed
   not-founds; a missing configured catalog is a USER_ERROR; malformed
   responses are coded, never bare exceptions.
-- **DV refusal at planning.** A scan pairing any data file with a live
-  deletion vector is refused in split generation, before any split
-  reaches the engine — no partial results precede the failure.
+- **DVs are applied, not refused.** A scan pairing a data file with a
+  live deletion vector produces a split carrying that vector's path;
+  the page source reads the puffin `deletion-vector-v1` object and
+  drops the positions it marks, so deleted rows reach no result,
+  aggregate, filter, or join. Unfiltered `count(*)` answers from
+  catalog metadata (`record_count` minus `delete_count`) but still
+  reads and validates the vector first. Planning checks only that the
+  scan's data-file/DV pairing is internally consistent. A vector that
+  is missing, corrupt, in another format, inconsistent with the
+  catalog's `delete_count`, or naming a different data file fails the
+  query — never "no deleted rows". Of those, `server/trino/` asserts
+  the last two, the ones that depend on hoglake's own wire fields; the
+  rest are the connector's suite to cover.
 - **Config fails at load.** `hoglake.uri` validated and
   slash-normalized, empty `hoglake.catalog` rejected, request timeout
   configurable (`hoglake.client.request-timeout`, default 2m).
-- **Id-authoritative column binding stays.** The
-  rename-vs-id-less-files hazard is closed catalog-side: field ids are
-  a registration contract and the server refuses renames while id-less
+- **Id-authoritative column binding stays.** The connector binds by
+  `PARQUET:field_id`, falling back to name only for files that carry no
+  ids; catalog columns absent from the file read as nulls. (The
+  fallback is "exact, then case-insensitive" per the class javadoc on
+  `HoglakePageSourceProvider` in PostHog/trino — read there, not
+  verified here; this harness only exercises the exact-name path.) The
+  rename-vs-id-less-files
+  hazard that binding creates is closed catalog-side: field ids are a
+  registration contract and the server refuses renames while id-less
   files are live.
+- **That guard's blind spot is the open work**, not the guard itself.
+  `missing_field_ids` is written only by the hydrator's footer read,
+  and files registered with inline stats never reach the hydrator, so
+  a rename over them is allowed and the renamed column then reads
+  NULL. `renameColumnEvadesTheFieldIdGuardViaInlineStats` in the Trino
+  harness is that blind spot end to end.
 
 ## 1. Reads: everything rides the Iceberg connector
 

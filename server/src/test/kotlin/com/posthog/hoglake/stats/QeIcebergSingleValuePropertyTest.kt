@@ -25,7 +25,7 @@ import java.time.LocalDate
 import java.util.UUID
 
 /**
- * QE property assault on IcebergSingleValue (fuzzing.md layer 1, JVM
+ * QE property assault on IcebergSingleValue (docs/fuzzing.md layer 1, JVM
  * side): encode determinism, fixed-width invariants per type over the
  * full value domains, and the codec's edge policies pinned as
  * assertions so a change in behavior is a test failure, not a silent

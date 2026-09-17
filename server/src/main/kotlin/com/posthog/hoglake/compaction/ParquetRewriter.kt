@@ -843,7 +843,7 @@ object ParquetRewriter {
             // uint64 keeps its native physical form. Its facade mapping is
             // decimal(20,0), which parquet cannot express as an INT64, so
             // uint64 is the one type whose FILES are not facade-readable in
-            // place even though its BOUNDS already are (iceberg-federation.md §2).
+            // place even though its BOUNDS already are (docs/iceberg-federation.md §2).
             ColType.UINT64 -> intColumn(id, name, 64, signed = false, repetition = repetition)
             ColType.LONG ->
                 prim(PrimitiveType.PrimitiveTypeName.INT64).id(id).named(name)

@@ -20,7 +20,7 @@ import com.posthog.hoglake.model.nodeCount
  * a bare `{"type":"list"}` must be told the one thing missing.
  *
  * Shape rules (Iceberg's, not invented here — see
- * iceberg-federation.md §2.8):
+ * docs/iceberg-federation.md §2.8):
  *
  *  - `list` has exactly one child, named `element`. Its nullability is
  *    declarable (Iceberg's `element-required`).

@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 
 /**
- * Concurrency torture (fuzzing.md layer 3): storms of mixed
+ * Concurrency torture (docs/fuzzing.md layer 3): storms of mixed
  * DDL/commit/DV-delete/offset traffic against one catalog, plus expiry
  * and cleanup running CONCURRENTLY with commits. Individual operations
  * may fail with catalog semantics (conflict/not-found/validation — the

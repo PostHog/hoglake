@@ -6,7 +6,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 
 /**
- * Fuzz target (fuzzing.md layer 4, phase-2 nested): the reader/rewriter
+ * Fuzz target (docs/fuzzing.md layer 4, phase-2 nested): the reader/rewriter
  * AGREEMENT surface.
  *
  * One execution generates a random VALID catalog column tree, derives a

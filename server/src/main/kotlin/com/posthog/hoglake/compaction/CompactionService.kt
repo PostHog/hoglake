@@ -654,11 +654,30 @@ class CompactionService(
                     tmpFiles.add(local)
                     val dv =
                         f.dv?.let { planned ->
-                            val decoded = PuffinDeletionVector.read(store.get(planned.path))
-                            check(decoded.cardinality == planned.deleteCount) {
-                                "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
-                                    "but is registered with delete_count ${planned.deleteCount} — " +
-                                    "refusing to compact on inconsistent metadata"
+                            // The FETCH stays outside: an object-store error is
+                            // transient and belongs in the retryable channel.
+                            // What the decoder says about bytes it already has
+                            // is durable — a registered .dv never changes — so
+                            // a refusal from it (PuffinDeletionVector's own
+                            // requires, and the containment around the roaring
+                            // library) is invalid_data, not a group re-planned
+                            // and re-refused every sweep forever.
+                            val raw = store.get(planned.path)
+                            val decoded =
+                                try {
+                                    PuffinDeletionVector.read(raw)
+                                } catch (e: IllegalArgumentException) {
+                                    if (e is InvalidDataException) throw e
+                                    throw InvalidDataException(
+                                        "DV ${planned.path} does not decode: ${e.message}",
+                                    )
+                                }
+                            if (decoded.cardinality != planned.deleteCount) {
+                                throw InvalidDataException(
+                                    "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
+                                        "but is registered with delete_count ${planned.deleteCount} — " +
+                                        "refusing to compact on inconsistent metadata",
+                                )
                             }
                             decoded
                         }
@@ -680,9 +699,16 @@ class CompactionService(
             }
             val outputBytes = outLocal.fileSize()
             val footerSize = footerSize(outLocal)
+            // Bare UUID, deliberately indistinguishable from an ingested
+            // file (the pyhoglake writer's shape). A `compacted-` prefix
+            // used to sit here; it told readers nothing the catalog does
+            // not already say — explicit_row_ids is the flag that decides
+            // how a file's row ids are read, and no reader may infer that
+            // from a path — while giving every compaction output in a
+            // table the same 10-character lead-in.
             val outputPath =
                 "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                    "compacted-${UUID.randomUUID()}.parquet"
+                    "${UUID.randomUUID()}.parquet"
 
             // Claim ticket BEFORE the upload (its own committed
             // transaction): if this group never commits — skip, crash,

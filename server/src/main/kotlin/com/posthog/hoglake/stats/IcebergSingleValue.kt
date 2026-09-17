@@ -20,7 +20,7 @@ import java.util.UUID
  * so manifest generation for the Iceberg facade is a mechanical copy.
  *
  * The encoding is always that of the column type's MAPPED Iceberg type
- * (ColType.icebergType, iceberg-federation.md §2), never of the hoglake
+ * (ColType.icebergType, docs/iceberg-federation.md §2), never of the hoglake
  * type name — that is what keeps manifest generation a copy, and it is
  * why several hoglake types share one encoding.
  *

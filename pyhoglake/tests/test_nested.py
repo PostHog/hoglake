@@ -266,9 +266,9 @@ def test_depth_cap_matches_the_server_and_both_docs():
     assert f"capped at {MAX_COLUMN_NESTING_DEPTH}" in spec, (
         "the OpenAPI description states a different cap"
     )
-    federation = _server_file(Path("iceberg-federation.md")).read_text()
+    federation = _server_file(Path("docs/iceberg-federation.md")).read_text()
     assert f"**{MAX_COLUMN_NESTING_DEPTH}**" in federation, (
-        "iceberg-federation.md §2.8 states a different cap"
+        "docs/iceberg-federation.md §2.8 states a different cap"
     )
 
 
