@@ -176,9 +176,16 @@ there would break that gate on every build.
    disagrees with its registration in EITHER direction, because the
    server cannot detect the disagreement (registration never opens the
    parquet; `/verify` is metadata-only). Both refusals are implemented
-   and tested in `duckdb-client/`; the server does not yet enforce the
-   reserved `_hog` prefix that protects the carrier (finding 9 in
-   duckdb-client/DESIGN.md).
+   and tested in `duckdb-client/`, and COMPACTION enforces them
+   server-side as well — it is the one server surface that does open
+   the parquet, so `ParquetRewriter.rowIdCarrier` refuses both
+   directions before a rewrite can launder a file that disagrees with
+   its registration. The server also enforces the reserved `_hog`
+   prefix that protects the carrier now
+   (`Identifiers.RESERVED_COLUMN_PREFIX`, at every nesting level), so
+   finding 9 in duckdb-client/DESIGN.md is closed for names created
+   through the DDL; files registered before the reservation, or written
+   by a foreign writer, are still what the refusals above are for.
 3. **One live deletion vector per data file** (unique partial index);
    supersessions only grow (`delete_count` monotone); a DV newer than
    your `read_snapshot` is a 409, never a lost update.

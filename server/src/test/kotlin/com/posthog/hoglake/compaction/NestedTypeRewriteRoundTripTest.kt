@@ -476,7 +476,7 @@ class NestedTypeRewriteRoundTripTest {
             // ...and re-compacting it keeps the property, which is what
             // makes the run idempotent rather than one-shot-clean.
             val out2 = tmp.resolve("$name-out2.parquet")
-            rewrite(out, listOf(live), out2)
+            rewrite(out, listOf(live), out2, explicitRowIds = true)
             assertThat(FooterStats.missingFieldIds(schemaOf(out2)))
                 .describedAs("%s re-compacted output flags itself", name)
                 .isFalse()
@@ -1264,16 +1264,29 @@ class NestedTypeRewriteRoundTripTest {
         val first = tmp.resolve("$name-out1.parquet")
         rewrite(input, live, first)
         val second = tmp.resolve("$name-out2.parquet")
-        rewrite(first, live, second)
+        // The second pass reads a compaction OUTPUT.
+        rewrite(first, live, second, explicitRowIds = true)
         return listOf(first, second)
     }
 
+    /**
+     * [explicitRowIds] mirrors `hog_data_file.explicit_row_ids`: false
+     * for a client append, true when the input is itself a compaction
+     * OUTPUT. The rewriter refuses a file that disagrees with its
+     * registration in either direction, so a second pass has to say so.
+     */
     private fun rewrite(
         input: Path,
         live: List<Column>,
         out: Path,
+        explicitRowIds: Boolean = false,
     ) {
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(input, 0)), live, emptyList(), out)
+        ParquetRewriter.rewrite(
+            listOf(ParquetRewriter.Input(input, 0, null, explicitRowIds)),
+            live,
+            emptyList(),
+            out,
+        )
     }
 
     /** Per-leaf (lower, upper) the hydrator would store for this file. */

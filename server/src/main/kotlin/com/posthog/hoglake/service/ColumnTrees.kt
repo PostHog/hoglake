@@ -81,13 +81,12 @@ object ColumnTrees {
     ) {
         val dupes = defs.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
         if (dupes.isNotEmpty()) {
-            // CAPPED. This message is built before any name has reached
-            // Identifiers.validateColumn, so the pattern's 128-character
-            // bound has not applied to any of them yet — the same
-            // argument the decimal-parameter refusal below makes, in the
-            // function that runs first.
-            val where =
-                if (path.isEmpty()) "" else " in '${Identifiers.cap(path.joinToString("."))}'"
+            // The NAMES are capped; the path is not. A duplicate name
+            // has not reached Identifiers.validateColumn yet, so the
+            // pattern's bound has not applied to it — but every ancestor
+            // in `path` was validated on the way down, so capping it
+            // would only take away the location the operator needs.
+            val where = if (path.isEmpty()) "" else " in '${path.joinToString(".")}'"
             throw HoglakeException.Validation(
                 "duplicate column names$where: ${dupes.sorted().map { Identifiers.cap(it) }}",
             )
@@ -193,9 +192,16 @@ object ColumnTrees {
         if (synthetic != null) {
             children.forEachIndexed { i, child ->
                 if (child.name != synthetic[i]) {
+                    // CAPPED. A synthetic child's name is the one this
+                    // function deliberately never sends to
+                    // Identifiers.validateColumn — `syntheticallyNamed`
+                    // is true for exactly these — so it is unvalidated
+                    // caller input by construction. Measured 5,085
+                    // characters for `list{element: "z"*5000}`.
                     throw HoglakeException.Validation(
                         "child ${i + 1} of ${def.type.wire} column '$qualified' must be named " +
-                            "'${synthetic[i]}' (Iceberg's synthetic name), not '${child.name}'",
+                            "'${synthetic[i]}' (Iceberg's synthetic name), " +
+                            "not '${Identifiers.cap(child.name)}'",
                     )
                 }
             }

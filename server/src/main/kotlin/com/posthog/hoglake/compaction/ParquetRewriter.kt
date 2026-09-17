@@ -561,60 +561,87 @@ object ParquetRewriter {
      * The index of this input's row-id carrier, or null when its ids are
      * POSITIONAL.
      *
-     * Which of those applies is the catalog's answer, not the file's:
-     * `hog_data_file.explicit_row_ids` ([Input.explicitRowIds]) says
-     * whether hoglake wrote this file as a compaction output. The rule
-     * then has one shape per population, and they are genuinely
-     * different situations rather than one situation with an exception:
+     * THE FLAG DECIDES, NEVER THE FILE'S OWN FIELD IDS. That is
+     * AGENT.md invariant 2 and duckdb-client/DESIGN.md's read path,
+     * both of which also require the reader to REFUSE a file that
+     * disagrees with its registration IN EITHER DIRECTION — "each by
+     * its own explicit check (never a fall-through)" — because the
+     * server cannot detect the disagreement at registration time
+     * (registration never opens the parquet, and `/verify` is
+     * metadata-only). Compaction is the one server surface that does
+     * open it, so it is the one place that can enforce what the docs
+     * ask of readers.
      *
-     *  - **explicit ids** — the file is a compaction output and its
-     *    identities live in a physical [ROW_ID_COLUMN]. Losing that
-     *    column, or finding it with the wrong type or somebody else's
-     *    field id, means the file is not what the catalog says it is.
-     *    Falling back to positional numbering would hand every row a
-     *    DIFFERENT identity from the one it was committed with, so this
-     *    is corruption and it refuses. That is the case the KDoc's old
-     *    "silently renumber every row in a previously-compacted file"
-     *    was really about.
+     * Three arms, each its own check:
      *
-     *  - **positional ids** — the file is a client append, and
-     *    `rowIdStart + ordinal` IS its server-assigned identity. A
-     *    top-level field named `_hog_row_id` in such a file is just a
-     *    client column with an unfortunate name (the DDL reserves the
-     *    prefix now, but `CommitService` never compares a file's schema
-     *    to the catalog, so one can be registered). Positional numbering
-     *    is the CORRECT outcome, not a harm to be avoided — and refusing
-     *    instead wedged every group containing that file, permanently,
-     *    with no operator lever.
-     *
-     * An earlier version inferred the population from the file and got
-     * both halves of that backwards: it justified refusing a foreign-id
-     * carrier by a renumbering harm that only exists for files hoglake
-     * wrote, while naming the affected population as files hoglake did
-     * not write. Those cannot both be true; the catalog bit is what
-     * tells them apart.
+     *  - **flag true, carrier usable** — bind it. The file is a
+     *    compaction output and its identities live in the column.
+     *  - **flag true, carrier absent / wrong type / foreign id** — the
+     *    file cannot produce the ids its registration promises.
+     *    Falling back to positional numbering would give every row an
+     *    identity it was never committed with, which is the
+     *    predecessor's rowid-remap bug.
+     *  - **flag false, reserved field id PRESENT** — the registration
+     *    and the file contradict each other. The reserved id is never
+     *    allocatable to a real column, so a positional file carrying
+     *    one violates the reserved-id invariant and its row ids cannot
+     *    be trusted. `duckdb-client` refuses exactly this
+     *    (`hoglake_wire_hardening.test`); compacting it instead
+     *    LAUNDERS it — the values land under a column the output
+     *    registers as `explicit_row_ids = true` with fabricated
+     *    positional ids, and the evidence is end-snapshotted and
+     *    expired.
+     *  - **flag false, no reserved id** — positional numbering.
+     *    `rowIdStart + ordinal` IS this file's server-assigned
+     *    identity, and a field merely NAMED `_hog_row_id` is an
+     *    ordinary client column with an unlucky name.
      */
     private fun rowIdCarrier(
         schema: MessageType,
         input: Input,
     ): Int? {
         val source = input.localPath
-        val byId =
+        val reserved =
             schema.fields.indexOfFirst { it.id?.intValue() == ROW_ID_FIELD_ID }.takeIf { it >= 0 }
+
+        if (!input.explicitRowIds) {
+            // EXPLICIT CHECK, not a fall-through: the doc names this
+            // direction specifically. A positional file may not carry
+            // the reserved id at all.
+            if (reserved != null) {
+                throw UnconvertibleSchemaException(
+                    "$source is registered WITHOUT explicit_row_ids but its schema carries the " +
+                        "reserved field id $ROW_ID_FIELD_ID on '${schema.fields[reserved].name}'. " +
+                        "The reserved id is never allocatable to a real column, so the file and " +
+                        "its registration contradict each other and its row ids cannot be " +
+                        "trusted (AGENT.md invariant 2)",
+                )
+            }
+            // A field merely NAMED _hog_row_id, with its own id or with
+            // none, is an ordinary client column. Its identities are
+            // positional either way.
+            return null
+        }
+
         // ONLY ID-LESS FIELDS ANSWER TO A NAME — FooterStats.bindIndex's
         // rule. A field with its own id is its own column.
         val byName =
             schema.fields.indexOfFirst { it.id == null && it.name == ROW_ID_COLUMN }.takeIf { it >= 0 }
-        val index = byId ?: byName
-
-        if (!input.explicitRowIds) {
-            // A client append. Whatever this file calls its columns, its
-            // identities are positional -- there is nothing here to bind
-            // and nothing to refuse.
-            return null
-        }
+        val index = reserved ?: byName
 
         if (index == null) {
+            // Distinguish the two ways this can happen, because they are
+            // different faults: a file with no such column at all, and a
+            // file whose column carries somebody else's id.
+            val impostor = schema.fields.firstOrNull { it.name == ROW_ID_COLUMN }
+            if (impostor != null) {
+                throw UnconvertibleSchemaException(
+                    "$source is registered with explicit_row_ids and has a '$ROW_ID_COLUMN', but " +
+                        "it carries field id ${impostor.id?.intValue()} rather than the reserved " +
+                        "$ROW_ID_FIELD_ID; the column that should hold this file's identities is " +
+                        "declared to be a different column",
+                )
+            }
             throw UnconvertibleSchemaException(
                 "$source is registered with explicit_row_ids but carries no $ROW_ID_COLUMN " +
                     "(field id $ROW_ID_FIELD_ID); its rows have no identity to preserve, and " +

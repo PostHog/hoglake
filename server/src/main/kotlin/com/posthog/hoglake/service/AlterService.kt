@@ -236,7 +236,7 @@ class AlterService(private val jdbi: Jdbi) {
         val parent = located.parent
         if (parent == null && state.cols.size == 1) {
             throw HoglakeException.Validation(
-                "cannot drop '${Identifiers.cap(op.name)}': it is the last column",
+                "cannot drop '${op.name}': it is the last column",
             )
         }
         if (parent != null && parent.children.size == 1) {
@@ -279,9 +279,9 @@ class AlterService(private val jdbi: Jdbi) {
         what: String,
     ): String =
         if (sourceFieldId == dropped.fieldId) {
-            "cannot drop column '${Identifiers.cap(path)}': it is a source of the live $what"
+            "cannot drop column '$path': it is a source of the live $what"
         } else {
-            "cannot drop column '${Identifiers.cap(path)}': field_id $sourceFieldId inside it " +
+            "cannot drop column '$path': field_id $sourceFieldId inside it " +
                 "is a source of the live $what"
         }
 
@@ -770,8 +770,14 @@ class AlterService(private val jdbi: Jdbi) {
                         if (i == 0) {
                             "column '$shown' does not exist"
                         } else {
+                            // The SEGMENT is capped, the resolved prefix
+                            // is not: `segment` is by definition the
+                            // part that matched nothing, so it is
+                            // unvalidated caller input, while the prefix
+                            // names columns that exist.
                             "column '$shown' does not exist: struct " +
-                                "'${segments.take(i).joinToString(".")}' has no field '$segment'"
+                                "'${segments.take(i).joinToString(".")}' has no field " +
+                                "'${Identifiers.cap(segment)}'"
                         },
                     )
         }
@@ -798,14 +804,14 @@ class AlterService(private val jdbi: Jdbi) {
         if (container.def.type.isNested) {
             throw HoglakeException.Validation(
                 "cannot address '${Identifiers.cap(fullPath)}': " +
-                    "'${Identifiers.cap(containerPath)}' is a '${container.def.type.wire}', " +
+                    "'$containerPath' is a '${container.def.type.wire}', " +
                     "and list/map internals (element, key, value) cannot be added, dropped or " +
                     "renamed — only struct fields can",
             )
         }
         throw HoglakeException.Validation(
             "cannot address '${Identifiers.cap(fullPath)}': " +
-                "'${Identifiers.cap(containerPath)}' is '${container.def.type.wire}', not a struct",
+                "'$containerPath' is '${container.def.type.wire}', not a struct",
         )
     }
 
@@ -830,7 +836,7 @@ class AlterService(private val jdbi: Jdbi) {
         val path = chain.joinToString(".") { it.def.name }
         if (col.def.type.isNested) {
             throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('${Identifiers.cap(path)}') is a " +
+                "$what source field_id $fieldId ('$path') is a " +
                     "'${col.def.type.wire}': a nested " +
                     "container has no single value per row and cannot be a $what source; use one " +
                     "of its leaf fields",
@@ -839,7 +845,7 @@ class AlterService(private val jdbi: Jdbi) {
         val repeated = chain.dropLast(1).firstOrNull { it.def.type == ColType.LIST || it.def.type == ColType.MAP }
         if (repeated != null) {
             throw HoglakeException.Validation(
-                "$what source field_id $fieldId ('${Identifiers.cap(path)}') sits under " +
+                "$what source field_id $fieldId ('$path') sits under " +
                     "'${repeated.def.name}', a " +
                     "'${repeated.def.type.wire}': a row has many such values, so it cannot be a " +
                     "$what source; struct leaves are the only nested fields that can",

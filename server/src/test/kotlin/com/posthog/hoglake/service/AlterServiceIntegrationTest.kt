@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
@@ -51,6 +52,88 @@ class AlterServiceIntegrationTest {
     private fun head(cat: String) = catalogs.getCatalog(cat).headSnapshotId
 
     private fun catId(cat: String): Long = catalogs.getCatalog(cat).catalogId
+
+    @Test
+    fun `an alter 422 never echoes an unbounded caller path or segment`() {
+        // The failing SEGMENT is by definition the part that matched
+        // nothing, so it is unvalidated caller input — the path around
+        // it was already capped, which is what made this easy to miss.
+        // Measured before the fix: 5,092 characters across four op
+        // kinds.
+        val (cat, ns) = fixture()
+        val huge = "q".repeat(5_000)
+        // A real STRUCT parent, so the failing segment reaches the
+        // "struct ... has no field" branch. Pointed at a SCALAR the walk
+        // stops earlier, at "is not a struct", and the segment is never
+        // quoted — which is how a first attempt at this test let the
+        // mutation survive.
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.AddColumn(
+                    ColumnDef("addr", ColType.STRUCT, children = listOf(ColumnDef("zip", ColType.LONG))),
+                ),
+            ),
+        )
+        val ops =
+            listOf<AlterOp>(
+                AlterOp.DropColumn("addr.$huge"),
+                AlterOp.RenameColumn("addr.$huge", "other"),
+                AlterOp.PromoteColumn("addr.$huge", ColType.STRING),
+                AlterOp.AddColumn(ColumnDef("x", ColType.LONG), parent = "addr.$huge"),
+                // And the path itself, unresolvable from its first
+                // segment.
+                AlterOp.DropColumn(huge),
+            )
+        for (op in ops) {
+            val thrown = catchThrowable { alter.alterTable(cat, ns, "t", listOf(op)) }
+            assertThat(thrown)
+                .describedAs("%s", op::class.simpleName)
+                .isInstanceOf(HoglakeException::class.java)
+            assertThat(thrown.message!!.length)
+                .describedAs("%s message length", op::class.simpleName)
+                .isLessThan(300)
+        }
+    }
+
+    @Test
+    fun `an alter 422 keeps a legitimately deep path intact`() {
+        // The other half of the same rule: a path built from STORED
+        // names is already bounded, and clipping it to 37 characters
+        // took away the half an operator needs to find the column. The
+        // cap belongs on unvalidated input only.
+        val (cat, ns) = fixture()
+        alter.alterTable(
+            cat,
+            ns,
+            "t",
+            listOf(
+                AlterOp.AddColumn(
+                    ColumnDef(
+                        "outer_container_column",
+                        ColType.STRUCT,
+                        children = listOf(ColumnDef("inner_struct_field_name", ColType.LONG)),
+                    ),
+                ),
+            ),
+        )
+        val deep = "outer_container_column.inner_struct_field_name"
+        val thrown =
+            catchThrowable {
+                alter.alterTable(
+                    cat,
+                    ns,
+                    "t",
+                    listOf(AlterOp.AddColumn(ColumnDef("x", ColType.LONG), parent = deep)),
+                )
+            }
+        assertThat(thrown).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(thrown.message!!)
+            .describedAs("a resolvable path survives whole")
+            .contains(deep)
+    }
 
     // ---- happy paths, one op each ----------------------------------------
 

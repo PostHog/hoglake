@@ -37,20 +37,30 @@ object Identifiers {
     private val regex = Regex(PATTERN)
 
     /**
-     * A caller-supplied fragment, capped for an error message.
+     * An UNVALIDATED caller fragment, capped for an error message.
      *
      * THE one place this is defined, because it is needed wherever a
      * message is built BEFORE [validate] has run — and those are exactly
      * the places that forget. A duplicate-name refusal, an
-     * already-exists refusal and a decimal parameter all quote a name
-     * the identifier policy has not yet vetted, so "names are bounded by
-     * the pattern" is not yet true when the message is assembled.
-     * Measured: two top-level columns named `"z" * 5000` produced a
-     * 5,026-character 422 body, and one inside a struct 5,033.
+     * already-exists refusal, a synthetic child's name and a decimal
+     * parameter all quote something the identifier policy has not vetted,
+     * so "names are bounded by the pattern" is not yet true when the
+     * message is assembled. Measured: two top-level columns named
+     * `"z" * 5000` produced a 5,026-character 422 body, and a list whose
+     * element was named the same produced 5,085.
+     *
+     * 64, matching [validate]'s own truncation — the two do the same job
+     * and an operator should not get a different amount of their input
+     * back depending on which refusal they hit. An earlier 40/37 split
+     * was also applied to values that are NOT unvalidated (paths built
+     * from stored catalog names, names already resolved against the live
+     * schema), where it removed the half of a legitimately deep path the
+     * operator actually needed. Apply this only to input the identifier
+     * policy has not yet seen.
      */
     fun cap(value: Any?): String {
         val text = value.toString()
-        return if (text.length > 40) text.take(37) + "..." else text
+        return if (text.length > 64) text.take(61) + "..." else text
     }
 
     /** Validate [name] as a [kind] identifier; violation -> Validation (422). */

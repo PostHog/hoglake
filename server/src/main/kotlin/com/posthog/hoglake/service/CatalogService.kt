@@ -71,8 +71,9 @@ class CatalogService(private val jdbi: Jdbi) {
                     val theirPrefix = existing.dataPath.trimEnd('/') + "/"
                     if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                         throw HoglakeException.Validation(
-                            "data_path '$dataPath' overlaps catalog '${existing.name}' " +
-                                "(data_path '${existing.dataPath}'); catalog data_paths must be disjoint",
+                            "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
+                                "'${existing.name}' (data_path '${existing.dataPath}'); " +
+                                "catalog data_paths must be disjoint",
                         )
                     }
                 }
@@ -106,7 +107,8 @@ class CatalogService(private val jdbi: Jdbi) {
         val bucket = rest.substringBefore('/')
         if (bucket.isEmpty()) {
             throw HoglakeException.Validation(
-                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, got '$dataPath'",
+                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, " +
+                    "got '${Identifiers.cap(dataPath)}'",
             )
         }
         if (rest.split('/').any { it == "." || it == ".." }) {

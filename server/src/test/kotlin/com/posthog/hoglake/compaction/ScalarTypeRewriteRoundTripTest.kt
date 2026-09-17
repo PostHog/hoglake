@@ -301,7 +301,8 @@ class ScalarTypeRewriteRoundTripTest {
         // tier-1 output becomes a tier-2 input, and the bounds must not
         // drift a little further on each pass.
         val second = tmp.resolve("$name-out2.parquet")
-        rewrite(first, type, second)
+        //  is a compaction output: its ids live in the carrier.
+        rewrite(first, type, second, explicitRowIds = true)
         assertBounds(bounds(second, type), pre, "$name after re-compaction")
         return Trip(pre.first, pre.second, inPath, first, second)
     }
@@ -348,14 +349,24 @@ class ScalarTypeRewriteRoundTripTest {
         data: ByteArray,
     ): Any = IcebergSingleValue.decode(type, data)
 
-    /** Compaction of one input under a one-column live schema of [type]. */
+    /**
+     * Compaction of one input under a one-column live schema of [type].
+     *
+     * [explicitRowIds] mirrors `hog_data_file.explicit_row_ids`: false
+     * for a client append, true when the input is itself a compaction
+     * OUTPUT — which is what the second pass of every round-trip here
+     * feeds back in. The rewriter refuses a file that disagrees with its
+     * registration in either direction, so the flag is not optional
+     * decoration.
+     */
     private fun rewrite(
         input: Path,
         type: ColType,
         out: Path,
+        explicitRowIds: Boolean = false,
     ) {
         ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(input, 0)),
+            listOf(ParquetRewriter.Input(input, 0, null, explicitRowIds)),
             listOf(Column(1, 0, ColumnDef("v", type))),
             emptyList(),
             out,

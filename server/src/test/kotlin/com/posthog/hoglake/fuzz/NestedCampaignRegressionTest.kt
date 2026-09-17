@@ -549,6 +549,16 @@ class NestedCampaignRegressionTest {
                     },
                 )
             }
+            // The MESSAGE, not only the type: "absent" and "foreign-id"
+            // are different faults and the operator needs to know which.
+            // Asserting the type alone made them indistinguishable in
+            // code and in test at once.
+            val expected =
+                when (label) {
+                    "absent" -> "carries no ${ParquetRewriter.ROW_ID_COLUMN}"
+                    "foreign-id" -> "rather than the reserved"
+                    else -> "is not a primitive int64"
+                }
             assertThatThrownBy {
                 ParquetRewriter.rewrite(
                     listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = true)),
@@ -556,7 +566,10 @@ class NestedCampaignRegressionTest {
                     emptyList(),
                     tmp.resolve("compacted-$label-out.parquet"),
                 )
-            }.describedAs("carrier %s", label).isInstanceOf(UnconvertibleSchemaException::class.java)
+            }
+                .describedAs("carrier %s", label)
+                .isInstanceOf(UnconvertibleSchemaException::class.java)
+                .hasMessageContaining(expected)
         }
     }
 
@@ -886,12 +899,16 @@ class NestedCampaignRegressionTest {
         assertThat(top).isInstanceOf(HoglakeException.Validation::class.java)
         assertThat(top.message!!.length).describedAs("top level").isLessThan(200)
 
+        // A VALID parent name, so the refusal is the nested duplicate
+        // one. With a huge parent the name check fires first and the
+        // assertion measures Identifiers.validate's own 64-cap instead —
+        // it passed with the nested cap removed.
         val nested =
             catchThrowable {
                 ColumnTrees.validate(
                     listOf(
                         ColumnDef(
-                            huge,
+                            "s",
                             ColType.STRUCT,
                             children = listOf(ColumnDef(huge, ColType.LONG), ColumnDef(huge, ColType.LONG)),
                         ),
@@ -899,7 +916,21 @@ class NestedCampaignRegressionTest {
                 )
             }
         assertThat(nested).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(nested.message!!).describedAs("the nested refusal, not the name check")
+            .contains("duplicate column names")
         assertThat(nested.message!!.length).describedAs("inside a struct").isLessThan(200)
+
+        // The synthetic-child refusal quotes a name ColumnTrees
+        // deliberately never validates (syntheticallyNamed = true), so
+        // it is unvalidated by construction.
+        val synthetic =
+            catchThrowable {
+                ColumnTrees.validate(
+                    listOf(ColumnDef("l", ColType.LIST, children = listOf(ColumnDef(huge, ColType.LONG)))),
+                )
+            }
+        assertThat(synthetic).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(synthetic.message!!.length).describedAs("synthetic child name").isLessThan(200)
     }
 
     @Test

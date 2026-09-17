@@ -1281,15 +1281,28 @@ class CompactionServiceIntegrationTest {
         appendRows("b", paddedRows(200, 2, 5000)) // row ids 3..4
         val ladder = cfg.copy(targetBytes = 65536, tierTarget = 2)
 
+        // A DV on `a` BEFORE the first compaction, so the first output's
+        // ids come out NON-CONTIGUOUS. That is what makes the second
+        // compaction's assertion discriminating: with ids 0..4 and
+        // row_id_start 0, positional numbering produces exactly the same
+        // answer as reading the carrier, so the test passed with the
+        // explicit_row_ids plumbing neutered — it asserted a property it
+        // could not distinguish.
+        val fileA = catalogs.listFiles(cat, "ns", "t").single { it.rowIdStart == 0L }
+        registerDv(cat, fileA.dataFileId, "s3://$BUCKET/$cat/dv/a.puffin", listOf(1L))
+
         // First compaction: unsorted table -> physical order = row-id order.
         assertThat(svc.runOnce(cat, ladder).groupsCompacted).isEqualTo(1)
         val first = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(first.explicitRowIds).isTrue()
-        assertThat(readRowIds(store.get(first.path))).containsExactly(0L, 1L, 2L, 3L, 4L)
+        assertThat(first.rowIdStart).isEqualTo(0)
+        // Id 1 is GONE, so the carrier no longer equals row_id_start +
+        // ordinal for any row past the first.
+        assertThat(readRowIds(store.get(first.path))).containsExactly(0L, 2L, 3L, 4L)
 
-        // A DV lands on the compacted output: physical positions 0 and 4,
-        // i.e. row ids 0 and 4 die. Then more data arrives.
-        registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 4L))
+        // A DV lands on the compacted output: physical positions 0 and
+        // 3, i.e. row ids 0 and 4 die. Then more data arrives.
+        registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 3L))
         // c is a peer of the first output, not a fresh lower-tier file.
         appendRows("c", paddedRows(300, 2, 10000)) // row ids 5..6
         val peers = catalogs.listFiles(cat, "ns", "t")
@@ -1301,9 +1314,11 @@ class CompactionServiceIntegrationTest {
         val second = svc.runOnce(cat, ladder)
         assertThat(second.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
-        assertThat(output.recordCount).isEqualTo(5)
-        assertThat(output.rowIdStart).isEqualTo(1) // 0 died; min survivor is 1
-        assertThat(readRowIds(store.get(output.path))).containsExactly(1L, 2L, 3L, 5L, 6L)
+        assertThat(output.recordCount).isEqualTo(4)
+        assertThat(output.rowIdStart).isEqualTo(2) // 0 and 4 died; min survivor is 2
+        // [2, 3] from the carrier, NOT [1, 2] — which is what positional
+        // numbering of the surviving ordinals {1, 2} would have produced.
+        assertThat(readRowIds(store.get(output.path))).containsExactly(2L, 3L, 5L, 6L)
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
         assertVerifyPasses(cat)
     }
