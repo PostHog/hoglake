@@ -34,6 +34,8 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
@@ -96,6 +98,9 @@ class HoglakeTrinoIntegrationTest
      */
     private static final String MISREFERENCED_TARGET =
             "s3://" + BUCKET + "/nonexistent/never-registered.parquet";
+
+    /** The JDBC driver's own prefix on every failure message. */
+    private static final Pattern JDBC_PREAMBLE = Pattern.compile("^Query failed \\(#[^)]*\\): ");
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final HttpClient HTTP = HttpClient.newHttpClient();
@@ -573,11 +578,18 @@ class HoglakeTrinoIntegrationTest
         commitAppend("renamed_events",
                 "s3://" + BUCKET + "/renamed_events/part-0.parquet", parquet.length);
 
-        // The premise, asserted rather than assumed: inline stats mean this
-        // file is 'provided', so the hydrator never reads its footer and the
-        // guard never learns it has no field ids. A future change that
-        // hydrates provided files, or that checks ids at registration, turns
-        // the rename below into a 409 and reds this line first.
+        // Half the premise, asserted rather than assumed. The guard refuses
+        // when missing_field_ids OR stats_state = 'pending'; this pins the
+        // second disjunct only — inline stats land 'provided', so the
+        // pending branch cannot fire and the hydrator never reads this
+        // file's footer. A change that made these commits defer their stats
+        // reds HERE.
+        //
+        // The first disjunct is not observable from the wire at all:
+        // DataFileDto carries no missing_field_ids. So a change that flips
+        // it — hydrating provided files, or checking ids at registration —
+        // leaves this assertion passing and reds the alter POST below on
+        // its status check instead.
         assertThat(JSON.readTree(
                 get("/v1/catalogs/lake/namespaces/analytics/tables/renamed_events/files"))
                 .get(0).get("stats_state").asText())
@@ -808,13 +820,25 @@ class HoglakeTrinoIntegrationTest
     @Test
     void deletionVectorNamingAnotherDataFileFailsTheQuery()
     {
-        // The referenced path is the evidence: it exists only inside the
-        // blob's bytes, so no connector can print it without decoding the
-        // vector, and the pre-DV refusal never mentions it.
         assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.misreferenced_dv_events"))
                 .isInstanceOf(SQLException.class)
-                .satisfies(failure -> assertDeletionVectorRejected(
-                        failure, "misreferenced_dv_events/part-0.dv", List.of(MISREFERENCED_TARGET)));
+                .satisfies(failure -> {
+                    // Requiring the PAIRED file as well means only a message
+                    // about the pairing satisfies this. The referenced path
+                    // alone would also be satisfied by a failure to OPEN it,
+                    // which pointing the blob at an unreachable path made
+                    // structurally possible.
+                    String body = deletionVectorFailureBody(
+                            failure,
+                            "misreferenced_dv_events/part-0.dv",
+                            s3("misreferenced_dv_events/part-0.parquet"));
+                    // The discriminator, asserted here rather than by the
+                    // helper: this path exists only inside the blob's bytes,
+                    // so nothing that has not decoded the vector can print
+                    // it. Everything above is printed by the pre-DV
+                    // connector too.
+                    assertThat(body).contains(MISREFERENCED_TARGET);
+                });
     }
 
     /**
@@ -831,71 +855,99 @@ class HoglakeTrinoIntegrationTest
     @Test
     void deletionVectorDisagreeingWithTheCatalogFailsTheQuery()
     {
-        // The decoded cardinality, 3, is the evidence: the catalog's 4 is
-        // echoed by the pre-DV refusal too, but only a connector that read
-        // the bitmap can report what is actually in it.
-        assertThatThrownBy(() -> query("SELECT count(*) AS n FROM hoglake.analytics.mismatched_dv_events"))
-                .isInstanceOf(SQLException.class)
-                .satisfies(failure -> assertDeletionVectorRejected(
-                        failure, "mismatched_dv_events/part-0.dv", List.of(), 4, 3));
-        assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.mismatched_dv_events"))
-                .isInstanceOf(SQLException.class)
-                .satisfies(failure -> assertDeletionVectorRejected(
-                        failure, "mismatched_dv_events/part-0.dv", List.of(), 4, 3));
+        for (String sql : List.of(
+                "SELECT count(*) AS n FROM hoglake.analytics.mismatched_dv_events",
+                "SELECT id FROM hoglake.analytics.mismatched_dv_events")) {
+            assertThatThrownBy(() -> query(sql))
+                    .isInstanceOf(SQLException.class)
+                    .satisfies(failure -> assertReportsDecodedCardinality(
+                            deletionVectorFailureBody(failure, "mismatched_dv_events/part-0.dv"),
+                            4,
+                            3));
+        }
     }
 
     /**
-     * Asserts a query failed because the connector DECODED a deletion
-     * vector and rejected it — without pinning the fork's wording.
+     * The connector's own words for a rejected deletion vector, with the
+     * JDBC preamble removed.
      *
-     * <p>The bar this has to clear is not "some query failed". The pre-DV
-     * connector refused every DV-bearing scan while reading nothing, and
-     * its refusal names the deletion vector, quotes the vector's object
-     * path, and echoes the catalog's declared {@code delete_count} — so
-     * every generic check here passes against it. Each caller must
-     * therefore supply {@code evidence} or {@code values} that only a
-     * connector which actually opened and decoded the file can print, and
-     * the dead refusal string is excluded outright.
+     * <p>This checks only what hoglake owns: that the failure is about a
+     * deletion vector, that it names the object the catalog registered, and
+     * that it names any other path the caller requires. NONE of that
+     * discriminates — the pre-DV connector refused every DV-bearing scan
+     * while reading nothing, and its refusal still named the deletion
+     * vector, the vector's path, the paired data file, and the catalog's
+     * declared {@code delete_count}. The caller asserts the discriminator
+     * on the returned body, at the call site, where the reason it
+     * discriminates can be written down next to it.
      *
-     * <p>What is deliberately NOT checked is the sentence around those
-     * facts. It belongs to PostHog/trino, and this harness runs against
-     * whatever image is newest at run time, so an exact-sentence match
-     * would turn a cosmetic reword upstream into a red build on an
-     * unrelated hoglake PR — the mistake this suite was written to undo.
+     * <p>Nothing here pins a fork sentence, in either direction. An earlier
+     * version excluded the pre-DV connector's exact refusal string, which
+     * was the same practice this harness exists to undo, one sign flipped:
+     * it would have evaporated silently against any reword of that sentence
+     * and fired wrongly if the current message ever quoted the phrase.
      */
-    private static void assertDeletionVectorRejected(
-            Throwable failure, String vectorKey, List<String> evidence, long... values)
+    private static String deletionVectorFailureBody(
+            Throwable failure, String vectorKey, String... alsoNames)
     {
-        assertThat(evidence.isEmpty() && values.length == 0)
-                .as("caller must supply evidence that the vector was decoded")
-                .isFalse();
-
-        // Strip the JDBC preamble — "Query failed (#20260917_045958_00029_y2vns): ".
-        // Its trailing coordinator id is five characters of Trino base32
-        // (a-z and 2-7) regenerated on every container start, so roughly
-        // one start in forty contains a free-standing digit that satisfies
-        // a value check by luck. Matching against the whole message let
-        // this assertion pass on a broken image ~2.5% of the time, green
-        // and silent — the same fail-open shape as the "s3://" bug, one
-        // layer out. The body is the only part the connector wrote.
-        String body = String.valueOf(failure.getMessage())
-                .replaceFirst("^Query failed \\(#[^)]*\\): ", "");
+        String raw = String.valueOf(failure.getMessage());
+        // "Query failed (#20260917_045958_00029_y2vns): ". The trailing
+        // coordinator id is five characters of Trino base32 (a-z and 2-7)
+        // regenerated on every container start, so a digit matched inside
+        // it is luck, not an assertion — about one start in forty would
+        // satisfy a value check by itself. Asserted rather than
+        // best-effort: a silent no-op here restores that hazard, and the
+        // format belongs to trino-jdbc, which is pinned in build.gradle.kts
+        // and does get bumped.
+        Matcher preamble = JDBC_PREAMBLE.matcher(raw);
+        assertThat(preamble.find()).as("JDBC preamble in: %s", raw).isTrue();
+        String body = raw.substring(preamble.end());
 
         assertThat(body).containsIgnoringCase("deletion vector").contains(vectorKey);
-        // The pre-DV refusal, frozen: this string can only ever appear
-        // again by regression, so excluding it is safe and load-bearing.
-        assertThat(body).doesNotContain("not yet implemented");
-        if (!evidence.isEmpty()) {
-            assertThat(body).contains(evidence);
+        if (alsoNames.length > 0) {
+            assertThat(body).contains(alsoNames);
         }
-        for (long value : values) {
-            // A free-standing number, not a digit inside a word. The letter
-            // in the lookbehind matters: without it the "3" of "s3://"
-            // satisfies any check looking for a bare 3.
-            assertThat(body)
-                    .as("value %d in: %s", value, body)
-                    .containsPattern("(?<![0-9A-Za-z])" + value + "(?![0-9])");
-        }
+        return body;
+    }
+
+    /**
+     * Asserts the connector reported a cardinality it could only have
+     * counted in the bitmap.
+     *
+     * <p>{@code declared} is the catalog's {@code delete_count}, which the
+     * pre-DV connector echoed without opening anything — matching it proves
+     * nothing, and it is required only so that a message quoting one number
+     * and not the other is caught. {@code actual} is the discriminator, and
+     * must differ from {@code declared}: a fixture whose vector really does
+     * hold the declared count gives this assertion nothing a connector that
+     * never read the file could not also produce.
+     */
+    private static void assertReportsDecodedCardinality(String body, long declared, long actual)
+    {
+        assertThat(actual)
+                .as("a decoded cardinality equal to the declared count discriminates nothing")
+                .isNotEqualTo(declared);
+        assertStandaloneNumber(body, declared);
+        assertStandaloneNumber(body, actual);
+    }
+
+    /**
+     * Asserts a number appears on its own, rather than as digits inside
+     * some longer token.
+     *
+     * <p>The excluded neighbours are the whole class of token characters,
+     * not a list of the instances that have bitten so far. Two narrower
+     * versions of this check were wrong: one matched the {@code 3} of
+     * {@code s3://}, and its replacement — which only demanded a
+     * non-alphanumeric predecessor — was satisfied for 0 and 1 by this
+     * suite's own {@code part-0.dv} and {@code part-1.parquet}.
+     */
+    private static void assertStandaloneNumber(String body, long value)
+    {
+        String tokenChar = "[0-9A-Za-z._/-]";
+        assertThat(body)
+                .as("%d standing alone in: %s", value, body)
+                .containsPattern("(?<!" + tokenChar + ")" + value + "(?!" + tokenChar + ")");
     }
 
     private static List<Map<String, Object>> query(String sql)

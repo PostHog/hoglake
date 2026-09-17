@@ -44,15 +44,19 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
 - **Config fails at load.** `hoglake.uri` validated and
   slash-normalized, empty `hoglake.catalog` rejected, request timeout
   configurable (`hoglake.client.request-timeout`, default 2m).
-- **Id-authoritative column binding stays.** The
-  rename-vs-id-less-files hazard is closed catalog-side: field ids are
-  a registration contract and the server refuses renames while id-less
-  files are live. The open work is that guard's known blind spot, not
-  the guard: `missing_field_ids` is written only by the hydrator's
-  footer read, and files registered with inline stats never reach the
-  hydrator, so a rename over them is allowed and the renamed column
-  then reads NULL. `renameColumnEvadesTheFieldIdGuardViaInlineStats`
-  in the Trino harness is that blind spot end to end.
+- **Id-authoritative column binding stays.** The connector binds by
+  `PARQUET:field_id`, falling back to name (exact, then
+  case-insensitive) only for files that carry no ids; catalog columns
+  absent from the file read as nulls. The rename-vs-id-less-files
+  hazard that binding creates is closed catalog-side: field ids are a
+  registration contract and the server refuses renames while id-less
+  files are live.
+- **That guard's blind spot is the open work**, not the guard itself.
+  `missing_field_ids` is written only by the hydrator's footer read,
+  and files registered with inline stats never reach the hydrator, so
+  a rename over them is allowed and the renamed column then reads
+  NULL. `renameColumnEvadesTheFieldIdGuardViaInlineStats` in the Trino
+  harness is that blind spot end to end.
 
 ## 1. Reads: everything rides the Iceberg connector
 

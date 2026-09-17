@@ -38,8 +38,11 @@ override). The job is deliberately not required and not in `deploy`'s `needs`.
 There is deliberately no default Trino image and no local plugin mount: the tests
 exercise the connector shipped in the selected engine image. The old Gradle
 `:trino:trinoPlugin` assembly task and Trino 446 SPI pin have been removed. The JDBC
-client remains at 446 independently of the server version so this harness can
-continue using the server project's Java 21 toolchain.
+client is pinned in `build.gradle.kts` (currently 483) and moves independently of
+the server version, so this harness can continue using the server project's Java 21
+toolchain. Its failure-message format is load-bearing: the assertions strip the
+driver's `Query failed (#...)` preamble before matching, and assert that the
+strip matched rather than trusting it.
 
 The tests cover schema/table discovery, Parquet reads, aggregates, column
 binding, type promotion, and deletion-vector application. The planned Iceberg
@@ -92,10 +95,18 @@ resolution keeps normal runs above the floor only while the fork moves forward
 to set `HOGLAKE_TRINO_IMAGE` to an image at or above `d4d5fa2` rather than to
 weaken these assertions. This is an assumption, not a guarantee.
 
-Message assertions here deliberately do NOT pin the fork's exact sentences.
-They check the object path hoglake registered and the values being compared,
-because this harness runs against whatever image is newest at run time and a
-cosmetic reword upstream must not red an unrelated hoglake PR.
+Message assertions here pin no fork sentence, in either direction — neither a
+required phrase nor an excluded one, since an exclusion evaporates silently the
+moment upstream rewords the string it names. `deletionVectorFailureBody` checks
+only what hoglake owns (the topic, and the object paths the catalog
+registered), and each test then asserts its own discriminator on the returned
+body, next to a note saying why that fact requires a decoded vector. The two in
+use are the cardinality read out of the bitmap, which must differ from the
+`delete_count` the catalog declared, and the `referenced-data-file` path, which
+exists only inside the blob's bytes. The pre-DV connector printed everything
+else — the topic, the vector's path, the paired data file, and the declared
+count — so nothing weaker separates a connector that validates vectors from one
+that refuses them unread.
 
 The connector also supports `CREATE TABLE`, `INSERT`, and CTAS as of
 2026-09-16. The harness does not exercise the write path — the connector's own
