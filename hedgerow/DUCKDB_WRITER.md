@@ -7,12 +7,12 @@ converts explicitly named JSON columns to native VARIANT, sorts by
 `(event_date, event, timestamp, uuid)` ascending/nulls-first, and writes Zstandard
 Parquet with explicit top-level field IDs. UUIDs are preserved, never generated.
 
-This is a standalone library component. It does not upload or publish files and
-is not wired into `BufferedIngestion` or the CLI. The catalog accepts VARIANT and
+This writer is called by `BufferedIngestion` for each frozen team/month batch.
+The coordinator uploads and publishes its output; the writer itself only writes
+local files. CLI wiring remains separate. The catalog accepts VARIANT and
 pyhoglake can publish these files through `prepare_append_files` without rewriting
 them. VARIANT tables are excluded from scalar compaction; query-engine
-interoperability and coordinator wiring remain separate work.
-The existing coordinator and CLI retain their current behavior.
+interoperability remains separate work. The CLI continues to use direct replication.
 
 ```python
 from hedgerow.duckdb_writer import (

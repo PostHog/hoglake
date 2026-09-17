@@ -3,18 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pyarrow as pa
-import pyarrow.compute as pc
 from pyhoglake import Column
 from pyhoglake.models import TableInfo
 from pyhoglake.transforms import transform_strings
-from pyhoglake.types import columns_to_arrow_schema
 
-from .halts import DataIntegrityError, SchemaMismatchError
+from .halts import SchemaMismatchError
 from .projection import validate_projection
-from .sorted_writer import EVENT_SORT
+
+EVENT_SORT = ("event_date", "event", "timestamp", "uuid")
 
 
 @dataclass(frozen=True)
@@ -22,14 +21,20 @@ class EventTransform:
     source_columns: tuple[Column, ...]
     destination: TableInfo
     sort_columns: tuple[str, ...] = EVENT_SORT
+    json_columns: tuple[str, ...] = ()
 
     def __post_init__(self):
         source = {c.name: c for c in self.source_columns}
         dest = {c.name: c for c in self.destination.columns}
-        if any(c.type == "variant" for c in self.destination.columns):
+        if len(set(self.json_columns)) != len(self.json_columns) or any(
+            name not in source
+            or name not in dest
+            or source[name].type not in ("json", "string")
+            or dest[name].type != "variant"
+            for name in self.json_columns
+        ):
             raise SchemaMismatchError(
-                "native VARIANT requires the DuckDB writer; JSON is not VARIANT. "
-                "This runtime cannot yet publish native VARIANT event columns."
+                "JSON mapping must name unique JSON/string sources and VARIANT destinations"
             )
         required = ("team_id", "timestamp", "event", "uuid")
         if any(name not in source or name not in dest for name in required):
@@ -64,7 +69,14 @@ class EventTransform:
             nullable=False,
         )
         validate_projection(
-            [c for c in self.source_columns if c.name != "event_date"] + [derived],
+            [
+                replace(c, type="variant", type_params=None)
+                if c.name in self.json_columns
+                else c
+                for c in self.source_columns
+                if c.name != "event_date"
+            ]
+            + [derived],
             self.destination.columns,
         )
         spec = self.destination.partition_spec
@@ -72,19 +84,28 @@ class EventTransform:
             raise SchemaMismatchError(
                 "events requires a destination partition specification"
             )
-        team_field = dest["team_id"].field_id
-        if not any(
-            p.source_field_id == team_field and p.transform == "identity"
+        routes = [
+            (
+                next(
+                    (c.name for c in dest.values() if c.field_id == p.source_field_id),
+                    None,
+                ),
+                p.transform,
+                p.transform_param,
+            )
             for p in spec.fields
+        ]
+        if (
+            len(routes) != 2
+            or ("team_id", "identity", None) not in routes
+            or not any(
+                route in (("timestamp", "month", None), ("event_date", "month", None))
+                for route in routes
+            )
         ):
             raise SchemaMismatchError(
-                "events partition specification must include identity(team_id)"
+                "DuckDB events requires identity(team_id) and month(timestamp or event_date)"
             )
-        for p in spec.fields:
-            if p.source_field_id not in {c.field_id for c in dest.values()}:
-                raise SchemaMismatchError(
-                    "destination partition references an absent column"
-                )
 
         self.validate_sort(self.sort_columns)
         sort = self.destination.sort_spec
@@ -100,39 +121,13 @@ class EventTransform:
                 "destination sort spec must match the physical ascending event sort, uuid last"
             )
 
-    @property
-    def schema(self) -> pa.Schema:
-        return columns_to_arrow_schema(self.destination.columns)
-
-    @property
-    def read_columns(self) -> tuple[str, ...]:
-        return tuple(c.name for c in self.destination.columns if c.name != "event_date")
-
-    def apply(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        table = pa.Table.from_batches([batch])
-        for name in ("team_id", "timestamp"):
-            if table[name].null_count:
-                raise DataIntegrityError(f"raw {name} contains nulls")
-        timestamp = table["timestamp"]
-        # Timestamp instant -> UTC calendar date; a non-UTC Arrow timezone must
-        # not make a local midnight change the destination month/date.
-        if timestamp.type.tz:
-            timestamp = timestamp.cast(pa.timestamp("us", "UTC"))
-        event_date = pc.cast(timestamp, pa.date32())
-        if "event_date" in table.column_names:
-            table = table.drop(["event_date"])
-        table = table.append_column("event_date", event_date)
-        table = table.select(self.schema.names).cast(self.schema)
-        return table.combine_chunks().to_batches()[0]
-
     def partition_arrays(self, batch: pa.RecordBatch) -> list[pa.Array]:
         by_id = {c.field_id: c for c in self.destination.columns}
         arrays = []
         for field in self.destination.partition_spec.fields:
             column = by_id[field.source_field_id]
             array = batch.column(batch.schema.get_field_index(column.name))
-            # Discovery sees physical source arrays; flushing sees schema-cast
-            # arrays. Normalize both paths before calendar/identity transforms.
+            # Normalize routing timestamps before calendar transforms.
             if column.type == "timestamptz":
                 array = array.cast(pa.timestamp("us", "UTC"))
             arrays.append(
@@ -150,7 +145,8 @@ class EventTransform:
         if (
             not columns
             or columns[-1] != "uuid"
-            or any(c not in self.schema.names for c in columns)
+            or tuple(columns) != EVENT_SORT
+            or any(c not in {d.name for d in self.destination.columns} for c in columns)
         ):
             raise SchemaMismatchError(
                 "event sort must reference physical columns with uuid last"

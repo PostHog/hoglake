@@ -65,24 +65,13 @@ def raw():
     )
 
 
-def test_utc_transform_preserves_event_identity_and_epoch_month():
+def test_routing_preserves_utc_epoch_month():
     transform = layout()
-    batch = raw().to_batches()[0]
-    output = transform.apply(batch)
-    assert output.column("uuid").equals(batch.column("uuid"))
-    assert output.column("event_date").to_pylist()[0].isoformat() == "2000-01-01"
-    assert transform.partition_arrays(output)[1].to_pylist() == ["360", "672", "361"]
-    # Instant belongs to January in UTC even when rendered in a negative timezone.
-    table = raw().set_column(
-        1, "timestamp", raw()["timestamp"].cast(pa.timestamp("us", "America/Toronto"))
-    )
-    assert (
-        transform.apply(table.to_batches()[0])
-        .column("event_date")
-        .to_pylist()[1]
-        .isoformat()
-        == "2026-01-01"
-    )
+    assert transform.partition_arrays(raw().to_batches()[0])[1].to_pylist() == [
+        "360",
+        "672",
+        "361",
+    ]
 
 
 def test_discovery_shared_file_late_old_events_and_integrity(tmp_path):
@@ -143,7 +132,7 @@ def test_sort_spec_required_for_compaction():
         EventTransform(
             transform.source_columns, replace(transform.destination, sort_spec=None)
         )
-    with pytest.raises(SchemaMismatchError, match="native VARIANT"):
+    with pytest.raises(SchemaMismatchError, match="missing from source"):
         EventTransform(
             transform.source_columns,
             replace(
@@ -156,7 +145,7 @@ def test_sort_spec_required_for_compaction():
 
 @pytest.mark.parametrize(
     "partition_column, transform_name",
-    [("timestamp", "month"), ("timestamp", "identity"), ("event_date", "identity")],
+    [("timestamp", "month"), ("event_date", "month")],
 )
 def test_discovery_and_flush_share_utc_partition_keys(
     tmp_path, partition_column, transform_name
@@ -201,7 +190,12 @@ def test_discovery_and_flush_share_utc_partition_keys(
             tuple(json.loads(row[0]))
             for row in store.db.execute("SELECT partition_key FROM pending")
         }
-        output = transform.apply(table.to_batches()[0])
+        import pyarrow.compute as pc
+
+        output = table.append_column(
+            "event_date",
+            pc.cast(table["timestamp"].cast(pa.timestamp("us", "UTC")), pa.date32()),
+        ).to_batches()[0]
         flushed = set(
             zip(
                 *(a.to_pylist() for a in transform.partition_arrays(output)),
@@ -211,3 +205,37 @@ def test_discovery_and_flush_share_utc_partition_keys(
         assert discovered == flushed
     finally:
         store.close()
+
+
+@pytest.mark.parametrize("kind", ["identity", "year"])
+def test_unsupported_partition_layout_fails_at_startup(kind):
+    from dataclasses import replace
+
+    transform = layout()
+    with pytest.raises(SchemaMismatchError, match="requires identity"):
+        replace(
+            transform,
+            destination=replace(
+                transform.destination,
+                partition_spec=PartitionSpec(
+                    1, (PartitionField(1, "identity"), PartitionField(2, kind))
+                ),
+            ),
+        )
+
+
+def test_json_conversion_must_be_explicit_and_type_checked():
+    from dataclasses import replace
+
+    transform = layout()
+    source = transform.source_columns + (Column("properties", "string", 6, 5, False),)
+    dest = replace(
+        transform.destination,
+        columns=transform.destination.columns
+        + (Column("properties", "variant", 6, 5, False),),
+    )
+    with pytest.raises(SchemaMismatchError, match="type mismatch"):
+        EventTransform(source, dest)
+    EventTransform(source, dest, json_columns=("properties",))
+    with pytest.raises(SchemaMismatchError, match="JSON mapping"):
+        EventTransform(source, dest, json_columns=("event",))

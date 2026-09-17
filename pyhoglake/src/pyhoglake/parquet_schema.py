@@ -90,7 +90,7 @@ def _top_level(elements: list[dict[int, Any]]) -> list[dict[int, Any]]:
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
-    """Validate VARIANT files; the existing strict scalar-only path is unchanged."""
+    """Validate native VARIANT or opt-in external files using physical schema and counts."""
 
     def fail(message: str) -> None:
         raise ValidationError(message, status_code=None)

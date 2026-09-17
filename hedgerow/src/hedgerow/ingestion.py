@@ -1,26 +1,29 @@
-"""Buffered ingestion coordinator, exposed as a library while VARIANT is pending.
+"""Buffered discovery and durable publication using the native DuckDB writer.
 
-The CLI deliberately continues to run direct replication. This coordinator is
-not a production raw_events mode yet: the native VARIANT writer must be
-wired into this Arrow-based coordinator before enabling it there. Raw files remain as backups.
+Discovery reads routing columns with Arrow. Flush payloads stay in DuckDB.
+The CLI remains separate; immutable raw files remain as backups.
 """
 
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, replace
 from tempfile import TemporaryDirectory
 
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from .buffering import BufferPolicy
 from .discovery import discover_window
+from .duckdb_writer import (
+    DuckDBFragment,
+    DuckDBWriterOptions,
+    write_duckdb_event_partition,
+)
 from .events import EventTransform
 from .halts import DataIntegrityError, IncarnationChangedError, SplitBrainError
 from .pending import PendingStore, Work
 from .scheduler import FlushScheduler
-from .sorted_writer import write_sorted_partition
 from .window import plan_window
 
 
@@ -39,6 +42,9 @@ class BufferedIngestion:
         policy: BufferPolicy | None = None,
         start_snapshot: int = 0,
         max_snapshot_window: int = 1000,
+        json_columns: Sequence[str] = (),
+        writer_options: DuckDBWriterOptions | None = None,
+        configure_duckdb: Callable | None = None,
     ):
         policy = policy or BufferPolicy()
         self.source = source
@@ -52,7 +58,16 @@ class BufferedIngestion:
         self.max_snapshot_window = max_snapshot_window
         self.source_info = source.info()
         self.destination_info = destination.info()
-        self.transform = EventTransform(self.source_info.columns, self.destination_info)
+        self.transform = EventTransform(
+            self.source_info.columns,
+            self.destination_info,
+            json_columns=tuple(json_columns),
+        )
+        self.writer_options = replace(
+            writer_options or DuckDBWriterOptions(),
+            target_file_bytes=policy.target_file_bytes,
+        )
+        self.configure_duckdb = configure_duckdb
         if not source_catalog.options().consumer_floor:
             raise DataIntegrityError(
                 "buffered ingestion requires source consumer_floor retention protection"
@@ -61,6 +76,8 @@ class BufferedIngestion:
             "source": asdict(self.source_info),
             "destination": asdict(self.destination_info),
             "consumer": consumer_id,
+            "writer": "duckdb-v1",
+            "json_columns": sorted(self.transform.json_columns),
         }
         # Aggregate counts change on every append and are not part of identity.
         for side in ("source", "destination"):
@@ -142,53 +159,44 @@ class BufferedIngestion:
         self._offset()
         return result
 
-    def _batches(self, work: Work):
-        for fragment in work.fragments:
-            matched = 0
-            with self._open_parquet(fragment["path"]) as parquet:
-                for batch in parquet.iter_batches(
-                    batch_size=8192,
-                    row_groups=fragment["row_groups"],
-                    columns=list(self.transform.read_columns),
-                ):
-                    output = self.transform.apply(batch)
-                    mask = pc.equal(output.column("team_id"), work.team_id)
-                    for array, value in zip(
-                        self.transform.partition_arrays(output),
-                        work.partition,
-                        strict=True,
-                    ):
-                        comparison = (
-                            pc.is_null(array)
-                            if value is None
-                            else pc.equal(array, value)
-                        )
-                        mask = pc.and_kleene(mask, comparison)
-                    selected = output.filter(mask)
-                    matched += selected.num_rows
-                    if selected.num_rows:
-                        yield selected
-            if matched != fragment["rows"]:
-                raise DataIntegrityError(
-                    "flush row count differs from discovered source fragment"
-                )
-
     def _prepare(self, work: Work):
         with TemporaryDirectory(
             prefix=f"flush-{work.work_id}-", dir=self.spill_directory
         ) as directory:
-            paths = write_sorted_partition(
-                self._batches(work),
-                self.transform.schema,
+            by_id = {c.field_id: c.name for c in self.destination_info.columns}
+            month_index = next(
+                i
+                for i, field in enumerate(self.destination_info.partition_spec.fields)
+                if field.transform == "month"
+            )
+            team_index = next(
+                i
+                for i, field in enumerate(self.destination_info.partition_spec.fields)
+                if by_id[field.source_field_id] == "team_id"
+            )
+            if work.partition[team_index] != str(work.team_id):
+                raise DataIntegrityError(
+                    "frozen partition disagrees with team identity"
+                )
+            paths = write_duckdb_event_partition(
+                [
+                    DuckDBFragment(f["path"], tuple(f["row_groups"]), f["rows"])
+                    for f in work.fragments
+                ],
                 directory,
-                target_bytes=self.policy.target_file_bytes,
-                sort_columns=self.transform.sort_columns,
+                team_id=work.team_id,
+                month=int(work.partition[month_index]),
+                field_ids={c.name: c.field_id for c in self.destination_info.columns},
+                json_columns=self.transform.json_columns,
+                options=self.writer_options,
+                configure_connection=self.configure_duckdb,
             )
             return self.destination.prepare_append_files(
                 [(str(path), work.partition) for path in paths],
                 idempotency_key=work.work_id,
                 expected_table_uuid=self.destination_info.table_uuid,
                 expected_table_info=self.destination_info,
+                allow_optional_fields=True,
             )
 
     def close(self):
