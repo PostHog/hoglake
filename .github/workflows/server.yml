@@ -278,6 +278,21 @@ jobs:
           app_id: ${{ secrets.GH_APP_CHARTS_DEPLOYER_APP_ID }}
           private_key: ${{ secrets.GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY }}
 
+      # The dispatch payload must stay under repository_dispatch's
+      # ~64KB client_payload limit, and a squash-merge commit message
+      # is the PR title PLUS its whole body — #69's was 74KB and the
+      # dispatch was rejected, failing deploy. Ship a trimmed commit:
+      # first message line (capped), identity fields only. The message
+      # reaches the run's env, never template-interpolation into run:.
+      - name: Trim dispatch commit
+        id: dispatch_commit
+        env:
+          HEAD_COMMIT: ${{ toJson(github.event.head_commit) }}
+        run: |
+          trimmed=$(printf '%s' "$HEAD_COMMIT" | jq -c \
+            '{id, timestamp, author, committer, message: (.message | split("\n")[0] | .[0:200])}')
+          printf 'json=%s\n' "$trimmed" >> "$GITHUB_OUTPUT"
+
       # Deploy target: gigahog-server (state/gigahog-server.yaml in
       # PostHog/charts). Dev auto-promotes; prod waits on the
       # prod-promote-managed-warehouse approval gate.
@@ -295,7 +310,7 @@ jobs:
                 }
               },
               "release": "gigahog-server",
-              "commit": ${{ toJson(github.event.head_commit) }},
+              "commit": ${{ steps.dispatch_commit.outputs.json }},
               "repository": ${{ toJson(github.repository) }},
               "labels": [],
               "timestamp": "${{ github.event.head_commit.timestamp }}"
