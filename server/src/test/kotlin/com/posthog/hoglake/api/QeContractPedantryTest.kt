@@ -50,6 +50,30 @@ class QeContractPedantryTest {
             block(client)
         }
 
+    @Test
+    fun `prepared commit route preserves receipt key across DTO conversion`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name":"receipts","data_path":"s3://qe/receipts"}""")
+            client.postJson("/v1/catalogs/receipts/namespaces", """{"name":"ns"}""")
+            client.postJson(
+                "/v1/catalogs/receipts/namespaces/ns/tables",
+                """{"name":"events","columns":[{"name":"id","type":"long"}]}""",
+            )
+            val payload = """{
+            "idempotency_key":"8b12597b-39c9-4b64-89b1-802038b8502e",
+            "appends":[{"namespace":"ns","table":"events","files":[{
+                "path":"s3://qe/receipts/data/a.parquet","record_count":7,"file_size_bytes":700
+            }]}]
+        }"""
+            val first = client.postJson("/v1/catalogs/receipts/commit/prepared", payload)
+            assertThat(first.status).isEqualTo(HttpStatusCode.OK)
+            val second = client.postJson("/v1/catalogs/receipts/commit/prepared", payload)
+            assertThat(second.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(first)).isEqualTo(body(second))
+            assertThat(client.postJson("/v1/catalogs/receipts/commit/prepared", "{}").status)
+                .isEqualTo(HttpStatusCode.UnprocessableEntity)
+        }
+
     private suspend fun HttpClient.postJson(
         url: String,
         body: String,

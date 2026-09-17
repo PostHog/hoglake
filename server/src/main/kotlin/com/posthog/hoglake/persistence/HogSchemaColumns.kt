@@ -17,6 +17,9 @@ package com.posthog.hoglake.persistence
 object HogSchemaColumns {
     val TABLES: Map<String, Set<String>> =
         mapOf(
+            // CommitService: immutable publication receipts, independent of snapshot retention.
+            "hog_commit_receipt" to
+                setOf("catalog_id", "idempotency_key", "request", "snapshot_id", "schema_version"),
             // MaintenanceSummarySampler: published samples + durable scan checkpoints.
             "hog_maintenance_summary" to
                 setOf(

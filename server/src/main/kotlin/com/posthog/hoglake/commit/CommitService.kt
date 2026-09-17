@@ -10,6 +10,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.wireObjectMapper
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import java.util.UUID
@@ -214,6 +215,26 @@ class CommitService(
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
         validatePathsUnderDataPath(dataPath, req)
         Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
+
+        // Under the same catalog lock as publication, so concurrent retries
+        // cannot both allocate rows. A receipt is not tied to snapshot expiry.
+        val requestJson = req.idempotencyKey?.let { wireObjectMapper().writeValueAsString(req) }
+        req.idempotencyKey?.let { key ->
+            val receipt =
+                h.createQuery(
+                    """
+                    SELECT snapshot_id, schema_version, request = CAST(:request AS jsonb) AS matches
+                    FROM hog_commit_receipt WHERE catalog_id = :catalog AND idempotency_key = :key
+                    """,
+                ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+                    .map { rs, _ ->
+                        if (!rs.getBoolean("matches")) {
+                            throw HoglakeException.Validation("idempotency_key reused with a different request")
+                        }
+                        CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version"))
+                    }.findOne().orElse(null)
+            if (receipt != null) return receipt
+        }
 
         val catalogHead =
             h.createQuery(
@@ -431,6 +452,15 @@ class CommitService(
         nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, resolvedAppends)
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
+        req.idempotencyKey?.let { key ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_commit_receipt (catalog_id, idempotency_key, request, snapshot_id, schema_version)
+                VALUES (:catalog, :key, CAST(:request AS jsonb), :snapshot, :schema)
+                """,
+            ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+                .bind("snapshot", snapshotId).bind("schema", schemaVersion).execute()
+        }
         return CommitResult(snapshotId, schemaVersion)
     }
 

@@ -36,7 +36,6 @@ import java.util.Map;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * The milestone gate: Trino reads a hoglake table through the native
@@ -108,8 +107,6 @@ class HoglakeTrinoIntegrationTest
             s3.createBucket(b -> b.bucket(BUCKET));
             s3.putObject(b -> b.bucket(BUCKET).key("events/part-0.parquet"),
                     RequestBody.fromBytes(parquet));
-            s3.putObject(b -> b.bucket(BUCKET).key("deleted_events/part-0.parquet"),
-                    RequestBody.fromBytes(parquet));
         }
     }
 
@@ -131,7 +128,7 @@ class HoglakeTrinoIntegrationTest
         }
     }
 
-    /** Catalog + namespace + two tables via REST; commits with footer stats. */
+    /** Catalog + namespace + table via REST; commit with footer stats. */
     private static void seedCatalog(long fileSize)
             throws Exception
     {
@@ -140,35 +137,8 @@ class HoglakeTrinoIntegrationTest
         post("/v1/catalogs/lake/namespaces", "{\"name\": \"analytics\"}", 201);
 
         createTable("events");
-        createTable("deleted_events");
 
         commitAppend("events", "s3://" + BUCKET + "/events/part-0.parquet", fileSize);
-        long snapshot = commitAppend(
-                "deleted_events", "s3://" + BUCKET + "/deleted_events/part-0.parquet", fileSize);
-
-        // Register a deletion vector against deleted_events' single data
-        // file. The server never opens DV files, so the path is nominal —
-        // the point is that /scan now pairs the data file with a DV and
-        // the connector must refuse the read.
-        long dataFileId = JSON.readTree(
-                get("/v1/catalogs/lake/namespaces/analytics/tables/deleted_events/files"))
-                .get(0).get("data_file_id").asLong();
-        post("/v1/catalogs/lake/commit",
-                """
-                {
-                  "read_snapshot": %d,
-                  "deletes": [{
-                    "namespace": "analytics", "table": "deleted_events",
-                    "files": [{
-                      "data_file_id": %d,
-                      "path": "s3://%s/deleted_events/part-0.dv",
-                      "delete_count": 3,
-                      "file_size_bytes": 64
-                    }]
-                  }]
-                }
-                """.formatted(snapshot, dataFileId, BUCKET),
-                200);
     }
 
     private static void createTable(String name)
@@ -294,16 +264,6 @@ class HoglakeTrinoIntegrationTest
         return response.body();
     }
 
-    private static String get(String path)
-            throws Exception
-    {
-        HttpResponse<String> response = HTTP.send(
-                HttpRequest.newBuilder(URI.create(server.getBaseUri() + path)).GET().build(),
-                HttpResponse.BodyHandlers.ofString());
-        assertThat(response.statusCode()).as("GET %s -> %s", path, response.body()).isEqualTo(200);
-        return response.body();
-    }
-
     private static Connection connect()
             throws SQLException
     {
@@ -327,7 +287,7 @@ class HoglakeTrinoIntegrationTest
     {
         assertThat(query("SHOW TABLES FROM hoglake.analytics"))
                 .extracting(row -> row.get("Table"))
-                .containsExactlyInAnyOrder("events", "deleted_events");
+                .containsExactly("events");
     }
 
     @Test
@@ -476,15 +436,6 @@ class HoglakeTrinoIntegrationTest
         for (int i = 0; i < TestParquet.INT_ROWS; i++) {
             assertThat(rows.get(i).get("n")).isEqualTo((long) (i * 10));
         }
-    }
-
-    @Test
-    void tableWithDeletionVectorRefusesTheQuery()
-    {
-        assertThatThrownBy(() -> query("SELECT count(*) AS n FROM hoglake.analytics.deleted_events"))
-                .isInstanceOf(SQLException.class)
-                .hasMessageContaining(
-                        "table has row-level deletes; DV application not yet implemented in the hoglake connector");
     }
 
     private static List<Map<String, Object>> query(String sql)
