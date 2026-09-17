@@ -95,18 +95,29 @@ resolution keeps normal runs above the floor only while the fork moves forward
 to set `HOGLAKE_TRINO_IMAGE` to an image at or above `d4d5fa2` rather than to
 weaken these assertions. This is an assumption, not a guarantee.
 
-Message assertions here pin no fork sentence, in either direction — neither a
-required phrase nor an excluded one, since an exclusion evaporates silently the
-moment upstream rewords the string it names. `deletionVectorFailureBody` checks
-only what hoglake owns (the topic, and the object paths the catalog
-registered), and each test then asserts its own discriminator on the returned
-body, next to a note saying why that fact requires a decoded vector. The two in
-use are the cardinality read out of the bitmap, which must differ from the
-`delete_count` the catalog declared, and the `referenced-data-file` path, which
-exists only inside the blob's bytes. The pre-DV connector printed everything
-else — the topic, the vector's path, the paired data file, and the declared
-count — so nothing weaker separates a connector that validates vectors from one
-that refuses them unread.
+Message assertions here match no fork prose at all — no required phrase, no
+excluded one. An exclusion evaporates silently the moment upstream rewords the
+string it names; a required phrase reds a correct image the moment upstream
+rewords it the other way, and even `deletion vector` is a live example, since
+hoglake's own blob type is spelled `deletion-vector-v1`.
+`deletionVectorFailureBody` therefore matches only object paths hoglake itself
+registered, and discriminates nothing on its own.
+
+Each test asserts its own discriminator on the returned body, with the reason
+written beside it. The two in use are the `referenced-data-file` path, which
+exists only inside the blob's bytes, and the pair of delete counts — declared
+and decoded — which must differ, since the pre-DV refusal prints exactly one
+number. That refusal also printed the topic, the vector's path, the paired data
+file, and the declared count, so nothing weaker than these separates a
+connector that validates vectors from one that refuses them unread.
+
+Two known limits, both accepted rather than fixed. A path discriminator is
+stronger than a numeric one: `assertStandaloneNumber` cannot tell the number it
+wants from a coincidental one elsewhere in a sentence, and the cardinality
+check is role-blind — a connector reporting the two counts the wrong way round
+would pass. And nothing structural stops the next refusal test from calling
+`deletionVectorFailureBody` and asserting nothing further, which would pass on
+a pre-DV image; the javadoc says so in those words, and that is the only guard.
 
 The connector also supports `CREATE TABLE`, `INSERT`, and CTAS as of
 2026-09-16. The harness does not exercise the write path — the connector's own

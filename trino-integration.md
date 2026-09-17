@@ -45,9 +45,12 @@ The native connector lives in `PostHog/trino` (`plugin/trino-hoglake`);
   slash-normalized, empty `hoglake.catalog` rejected, request timeout
   configurable (`hoglake.client.request-timeout`, default 2m).
 - **Id-authoritative column binding stays.** The connector binds by
-  `PARQUET:field_id`, falling back to name (exact, then
-  case-insensitive) only for files that carry no ids; catalog columns
-  absent from the file read as nulls. The rename-vs-id-less-files
+  `PARQUET:field_id`, falling back to name only for files that carry no
+  ids; catalog columns absent from the file read as nulls. (The
+  fallback is "exact, then case-insensitive" per the class javadoc on
+  `HoglakePageSourceProvider` in PostHog/trino — read there, not
+  verified here; this harness only exercises the exact-name path.) The
+  rename-vs-id-less-files
   hazard that binding creates is closed catalog-side: field ids are a
   registration contract and the server refuses renames while id-less
   files are live.

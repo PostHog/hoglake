@@ -823,11 +823,13 @@ class HoglakeTrinoIntegrationTest
         assertThatThrownBy(() -> query("SELECT id FROM hoglake.analytics.misreferenced_dv_events"))
                 .isInstanceOf(SQLException.class)
                 .satisfies(failure -> {
-                    // Requiring the PAIRED file as well means only a message
-                    // about the pairing satisfies this. The referenced path
-                    // alone would also be satisfied by a failure to OPEN it,
-                    // which pointing the blob at an unreachable path made
-                    // structurally possible.
+                    // Requiring the PAIRED file as well narrows this to
+                    // messages naming both sides. The referenced path alone
+                    // would also be satisfied by a failure to OPEN it, which
+                    // pointing the blob at an unreachable path made
+                    // structurally possible. It does not prove the failure
+                    // was the pairing check: a message naming both paths
+                    // while failing for some other reason still passes.
                     String body = deletionVectorFailureBody(
                             failure,
                             "misreferenced_dv_events/part-0.dv",
@@ -871,21 +873,34 @@ class HoglakeTrinoIntegrationTest
      * The connector's own words for a rejected deletion vector, with the
      * JDBC preamble removed.
      *
-     * <p>This checks only what hoglake owns: that the failure is about a
-     * deletion vector, that it names the object the catalog registered, and
-     * that it names any other path the caller requires. NONE of that
-     * discriminates — the pre-DV connector refused every DV-bearing scan
-     * while reading nothing, and its refusal still named the deletion
-     * vector, the vector's path, the paired data file, and the catalog's
-     * declared {@code delete_count}. The caller asserts the discriminator
-     * on the returned body, at the call site, where the reason it
-     * discriminates can be written down next to it.
+     * <p>This checks only paths hoglake itself registered: the vector's
+     * object key, and any other path the caller requires. No fork prose is
+     * matched, in either direction — not a required phrase, not an excluded
+     * one. Two earlier versions did both and both were wrong: an exclusion
+     * of the pre-DV refusal string, which would have evaporated silently on
+     * any reword of it, and a required {@code "deletion vector"}, which
+     * reds a correct image the day upstream writes {@code deletion-vector}
+     * — the spelling hoglake's own puffin blob type uses.
      *
-     * <p>Nothing here pins a fork sentence, in either direction. An earlier
-     * version excluded the pre-DV connector's exact refusal string, which
-     * was the same practice this harness exists to undo, one sign flipped:
-     * it would have evaporated silently against any reword of that sentence
-     * and fired wrongly if the current message ever quoted the phrase.
+     * <p>NOTHING here discriminates. The pre-DV connector refused every
+     * DV-bearing scan while reading nothing, and its refusal still named
+     * the deletion vector, the vector's path, the paired data file, and the
+     * catalog's declared {@code delete_count}. This method cannot tell that
+     * connector from one that validates.
+     *
+     * <p><b>So if you are adding a refusal test: this call is not enough.</b>
+     * The connector refuses more than the two cases asserted here (missing,
+     * truncated, bad checksum, wrong format, position past the row count),
+     * and a test written as a bare {@code deletionVectorFailureBody(failure,
+     * key)} with no further assertion passes on a pre-DV image — green,
+     * silent, and worthless. Assert, at your call site, some fact that only
+     * a connector which opened and decoded the file could state, and write
+     * down why it qualifies. A path carried inside the blob is the
+     * strongest kind available; a number is weaker (see
+     * {@link #assertStandaloneNumber}). An earlier structural guard here
+     * required callers to pass "evidence" but could only check the list was
+     * non-empty, which was theatre; this paragraph replaces it, and relies
+     * on you.
      */
     private static String deletionVectorFailureBody(
             Throwable failure, String vectorKey, String... alsoNames)
@@ -903,7 +918,7 @@ class HoglakeTrinoIntegrationTest
         assertThat(preamble.find()).as("JDBC preamble in: %s", raw).isTrue();
         String body = raw.substring(preamble.end());
 
-        assertThat(body).containsIgnoringCase("deletion vector").contains(vectorKey);
+        assertThat(body).contains(vectorKey);
         if (alsoNames.length > 0) {
             assertThat(body).contains(alsoNames);
         }
@@ -911,21 +926,27 @@ class HoglakeTrinoIntegrationTest
     }
 
     /**
-     * Asserts the connector reported a cardinality it could only have
-     * counted in the bitmap.
+     * Asserts the message quotes BOTH the count the catalog declared and
+     * the different count the connector found in the bitmap.
      *
-     * <p>{@code declared} is the catalog's {@code delete_count}, which the
-     * pre-DV connector echoed without opening anything — matching it proves
-     * nothing, and it is required only so that a message quoting one number
-     * and not the other is caught. {@code actual} is the discriminator, and
-     * must differ from {@code declared}: a fixture whose vector really does
-     * hold the declared count gives this assertion nothing a connector that
-     * never read the file could not also produce.
+     * <p>What carries the discrimination is the pair, not either number:
+     * the pre-DV refusal prints exactly one number, the declared count it
+     * echoed without opening anything, so requiring two distinct numbers is
+     * what it cannot satisfy. That makes {@code declared != actual} the
+     * load-bearing precondition rather than a tidiness check — drop it and
+     * the two assertions collapse onto the one number the pre-DV connector
+     * already prints, and this test goes green against it.
+     *
+     * <p>This is role-BLIND: the parameters are named for the reader, but
+     * {@code (body, 4, 3)} and {@code (body, 3, 4)} are the same predicate,
+     * so a connector that reported the two counts the wrong way round would
+     * pass. Checking roles would mean matching the words around the numbers
+     * — upstream prose, which this harness does not pin.
      */
     private static void assertReportsDecodedCardinality(String body, long declared, long actual)
     {
         assertThat(actual)
-                .as("a decoded cardinality equal to the declared count discriminates nothing")
+                .as("two equal counts collapse to the one number a pre-DV refusal prints")
                 .isNotEqualTo(declared);
         assertStandaloneNumber(body, declared);
         assertStandaloneNumber(body, actual);
@@ -935,19 +956,38 @@ class HoglakeTrinoIntegrationTest
      * Asserts a number appears on its own, rather than as digits inside
      * some longer token.
      *
-     * <p>The excluded neighbours are the whole class of token characters,
-     * not a list of the instances that have bitten so far. Two narrower
-     * versions of this check were wrong: one matched the {@code 3} of
-     * {@code s3://}, and its replacement — which only demanded a
-     * non-alphanumeric predecessor — was satisfied for 0 and 1 by this
-     * suite's own {@code part-0.dv} and {@code part-1.parquet}.
+     * <p>The two sides are deliberately NOT symmetric, because they guard
+     * against opposite failures.
+     *
+     * <p>The lookbehind is wide — the whole class of token characters —
+     * because that is where every false ACCEPT has lived: the {@code 3} of
+     * {@code s3://} under one version, then 0 and 1 inside this suite's own
+     * {@code part-0.dv} and {@code part-1.parquet} under its replacement,
+     * which demanded only a non-alphanumeric predecessor.
+     *
+     * <p>The lookahead is narrow, because a wide one causes false REJECTS
+     * instead. Excluding {@code .} and {@code -} after the digit makes the
+     * assertion depend on the number being the last byte of an upstream
+     * sentence: a trailing full stop, or {@code 3/25}, would red a correct
+     * image — the brittleness this harness exists to avoid. It excludes
+     * letters and digits, so {@code 30} and {@code 3rd} still fail, plus a
+     * following {@code .} only when a digit follows it, so the {@code 3} of
+     * {@code 3.5} does not match while {@code deletes 3.} does.
+     *
+     * <p>Residual, accepted: this cannot tell the number it wants from a
+     * coincidental one elsewhere in the sentence ({@code offset=0},
+     * {@code split 3 of 4}, {@code format version 3}). It is unreachable
+     * against the frozen pre-DV messages, but it does make a number a
+     * weaker discriminator than a path — see
+     * {@link #assertReportsDecodedCardinality}.
      */
     private static void assertStandaloneNumber(String body, long value)
     {
         String tokenChar = "[0-9A-Za-z._/-]";
         assertThat(body)
                 .as("%d standing alone in: %s", value, body)
-                .containsPattern("(?<!" + tokenChar + ")" + value + "(?!" + tokenChar + ")");
+                .containsPattern(
+                        "(?<!" + tokenChar + ")" + value + "(?![0-9A-Za-z])(?!\\.[0-9])");
     }
 
     private static List<Map<String, Object>> query(String sql)
