@@ -93,6 +93,7 @@ path-scoped per component, posthog-monorepo style:
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. All unit/mocked layer — live integration is local, per the pre-push checklist |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
+| `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
 
@@ -277,10 +278,82 @@ there would break that gate on every build.
   through the integrating session; agents report needed changes rather
   than making them. Concurrent gradle runs contend on the build dir —
   EOFException in `:test` results is contention, rerun.
-- **Cross-language codec vectors**:
-  `pyhoglake/tests/vectors/bounds_vectors.json` keeps the Kotlin and
-  Python Iceberg single-value codecs bit-identical. A fuzzer-found
-  nasty value gets promoted into it. See [fuzzing.md](fuzzing.md).
+- **Every feature and its tests consider ALL consumers.** The wire
+  contract has more implementations than the server suite runs, and the
+  ones that drift are the ones nothing reds. A type-system,
+  wire, or file-format change states its effect on each consumer —
+  implemented, refused with a named error, or an issue filed — and never
+  leaves one silent.
+  - **pyhoglake** is the reference client. It shares the Iceberg
+    single-value codec through
+    `pyhoglake/tests/vectors/bounds_vectors.json` (107 vectors, count
+    pinned on both sides — `qe_vectors.test_vector_file_header_contract`
+    and `BoundsVectorFile.EXPECTED_COUNT` — so a silently shrunken file
+    cannot pass), and it mirrors the server's type mapping and
+    validation gates, which therefore move with the server. A parity
+    test must PARSE the other side's artifact or share a fixture:
+    `test_transforms.py` regexes `ColType` out of `Model.kt` and
+    `BUCKETABLE_TYPES` out of `AlterService.kt`, and
+    `ScalarTypeParityTest` reads the migration, `schema.sql`, and the
+    OpenAPI enum off disk, for exactly this reason. A test that restates
+    the constant it claims to mirror asserts only that the file
+    compiles, and one that reconstructs its own expectation cannot fail
+    at all — both shapes are in the tree today.
+  - **duckdb-client** is NOT in server CI, so nothing reds when the
+    server outgrows it: the ten scalar types of #66 shipped with the
+    extension unable to read them (`Unknown hoglake column type` at
+    bind — a clean refusal, tracked separately, but nobody chose it),
+    and the same is true of `variant` (#77). Its
+    [DESIGN.md](duckdb-client/DESIGN.md) carries invariants the server
+    has contradicted when nobody looked — the reserved row-id field id,
+    the two `explicit_row_ids` disagreement refusals — as well as the
+    numbered findings listed under Known deferrals.
+  - **The Trino connector** lives in the PostHog/trino fork; the in-repo
+    harness (`server/trino/`) resolves the newest fork image at run time
+    and is the cross-repo drift alarm. A server feature that changes
+    what files or scans look like adds a harness case where feasible —
+    "to the extent possible" is the standard, since the connector code
+    is not here. Harness assertions must never pin fork prose;
+    discriminate on object paths hoglake registered and on values only a
+    correct implementation can know. Replay every new predicate offline
+    against inputs it MUST reject before believing a green container
+    run: five successive generations of one fail-open matcher were each
+    invisible in a green suite and visible in seconds of replay (#75).
+  - **hedgerow** and the **webui** consume the same wire and restate the
+    same vocabularies, and neither is exercised by the server suite
+    either — `webui/src/api/types.ts` still has no `variant`.
+- **Look the invariant up before you write it down.** Before
+  implementing a rule about row ids, field ids, or column binding, READ
+  the ones already stated: this file, the
+  [duckdb-client design doc](duckdb-client/DESIGN.md),
+  [iceberg-federation.md](iceberg-federation.md), and the comments in
+  `server/schema.sql`. Follow the document over an instruction or an
+  intuition, and say that you are doing so. Two regressions shipped
+  because a rule was invented while the correct one was already on disk.
+- **API changes get the fuzzing treatment.** The Jazzer targets under
+  `server/src/test/kotlin/com/posthog/hoglake/fuzz/` have reached
+  defects nothing else did, so they are part of the change, not a
+  follow-up (see [fuzzing.md](fuzzing.md)). New or changed wire surface
+  — DTOs, OpenAPI shapes, validation — extends the wire corpus; new
+  parse or validation logic gets a target or joins an existing one.
+  Cross-surface machinery (a reader/rewriter pair, a codec's
+  encode/decode) gets an agreement- or round-trip-style fuzzer whose
+  oracle checks GROUND TRUTH, never mutual agreement: an agreement
+  oracle went blind to a real bug for more than a million executions
+  because unifying the two surfaces had correlated their errors. Every
+  campaign finding becomes a deterministic regression test in `:test` —
+  a corpus seed is NOT regression cover, because `fuzz` and `:test` are
+  different Gradle tasks and PR CI replays only `:test`. Verify the red
+  before the green by reading the `<testcase name=...>` entries in
+  `server/build/test-results/test/TEST-*.xml`, never an exit code: a
+  `--tests` filter that matches nothing FAILS the build, and that
+  failure has been misread as a failing assertion. And `ColType`
+  ordinals are baked into the corpora — the decode target reads its
+  first byte as a type index modulo the vocabulary size — so the enum is
+  append-only, and any membership change means rerunning
+  `./gradlew generateFuzzSeeds` and recommitting the seeds — otherwise
+  the seeds silently start exercising different types than their names
+  claim.
 - **QE culture**: substantive changes get an adversarial review or QE
   agent pass before merge; bugs found by tests/fuzzing become pinned
   regression tests + (design-class ones) defect-ledger entries.
