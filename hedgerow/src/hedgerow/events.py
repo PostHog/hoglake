@@ -127,18 +127,24 @@ class EventTransform:
 
     def partition_arrays(self, batch: pa.RecordBatch) -> list[pa.Array]:
         by_id = {c.field_id: c for c in self.destination.columns}
-        return [
-            transform_strings(
-                p.transform,
-                p.transform_param,
-                batch.column(
-                    batch.schema.get_field_index(by_id[p.source_field_id].name)
-                ),
-                by_id[p.source_field_id].type,
-                by_id[p.source_field_id].type_params,
+        arrays = []
+        for field in self.destination.partition_spec.fields:
+            column = by_id[field.source_field_id]
+            array = batch.column(batch.schema.get_field_index(column.name))
+            # Discovery sees physical source arrays; flushing sees schema-cast
+            # arrays. Normalize both paths before calendar/identity transforms.
+            if column.type == "timestamptz":
+                array = array.cast(pa.timestamp("us", "UTC"))
+            arrays.append(
+                transform_strings(
+                    field.transform,
+                    field.transform_param,
+                    array,
+                    column.type,
+                    column.type_params,
+                )
             )
-            for p in self.destination.partition_spec.fields
-        ]
+        return arrays
 
     def validate_sort(self, columns: Sequence[str] = EVENT_SORT) -> None:
         if (

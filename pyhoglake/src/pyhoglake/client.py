@@ -830,6 +830,17 @@ class Table:
                 "prepared append destination layout changed", status_code=None
             )
         schema = columns_to_arrow_schema(info.columns)
+        # Parquet has no seconds timestamp unit: our writer stores timestamp_s
+        # as milliseconds. Preserve all field IDs/nullability/metadata checks.
+        schema = pa.schema(
+            [
+                field.with_type(pa.timestamp("ms"))
+                if field.type == pa.timestamp("s")
+                else field
+                for field in schema
+            ],
+            metadata=schema.metadata,
+        )
         registrations = []
         for index, (path, partition) in enumerate(files):
             with pq.ParquetFile(path) as parquet:

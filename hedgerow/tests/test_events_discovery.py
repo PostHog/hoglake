@@ -152,3 +152,62 @@ def test_sort_spec_required_for_compaction():
                 + (Column("properties", "variant", 9, 6),),
             ),
         )
+
+
+@pytest.mark.parametrize(
+    "partition_column, transform_name",
+    [("timestamp", "month"), ("timestamp", "identity"), ("event_date", "identity")],
+)
+def test_discovery_and_flush_share_utc_partition_keys(
+    tmp_path, partition_column, transform_name
+):
+    import json
+    from dataclasses import replace
+
+    transform = layout()
+    info = transform.destination
+    field_id = next(c.field_id for c in info.columns if c.name == partition_column)
+    transform = EventTransform(
+        transform.source_columns,
+        replace(
+            info,
+            partition_spec=PartitionSpec(
+                1,
+                (
+                    PartitionField(1, "identity"),
+                    PartitionField(field_id, transform_name),
+                ),
+            ),
+        ),
+    )
+    table = raw()
+    table = table.set_column(
+        1, "timestamp", table["timestamp"].cast(pa.timestamp("us", "America/Toronto"))
+    )
+    path = tmp_path / "non-utc.parquet"
+    pq.write_table(table, path)
+    file = DataFile(1, str(path), "parquet", 3, path.stat().st_size, 0, "ready", 1)
+    store = PendingStore(str(tmp_path / "pending.sqlite"), {})
+    try:
+        discover_window(
+            store,
+            ChangesPlan("source", 0, 1, (file,)),
+            "source",
+            {1: datetime.now(UTC)},
+            transform,
+            pq.ParquetFile,
+        )
+        discovered = {
+            tuple(json.loads(row[0]))
+            for row in store.db.execute("SELECT partition_key FROM pending")
+        }
+        output = transform.apply(table.to_batches()[0])
+        flushed = set(
+            zip(
+                *(a.to_pylist() for a in transform.partition_arrays(output)),
+                strict=True,
+            )
+        )
+        assert discovered == flushed
+    finally:
+        store.close()
