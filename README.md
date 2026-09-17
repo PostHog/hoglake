@@ -445,6 +445,127 @@ Details in [metadata-schema.md](metadata-schema.md); the position:
   hoglake; the converter escapes ducklake. Keeping them separate means
   the migration chain never carries ducklake compatibility shims.
 
+## The type system
+
+The column vocabulary is closed: **27 wire names**, enforced identically
+by the `ColType` enum, the `hog_column.col_type` CHECK, and the OpenAPI
+`ColumnDef.type` enum — `ScalarTypeParityTest` asserts the three against
+each other from their actual files. Bounds are stored in the Iceberg
+single-value serialization of the **mapped Iceberg type**, never of the
+hoglake type, which is what keeps manifest generation a mechanical copy.
+Full depth in [iceberg-federation.md](iceberg-federation.md) §2; this is
+the card.
+
+In vocabulary order, which is `ColType`'s order — adjacent names sharing
+a mapping share a row:
+
+| `col_type` | Iceberg | bounds |
+|---|---|---|
+| `boolean` | boolean | 1 byte |
+| `int8` `int16` `int` | int | 4-byte LE int |
+| `long` | long | 8-byte LE long |
+| `uint8` `uint16` | int | 4-byte LE int |
+| `uint32` | long | 8-byte LE long |
+| `uint64` | decimal(20,0) | minimal two's-complement BE unscaled |
+| `float` | float | 4-byte LE IEEE-754 |
+| `double` | double | 8-byte LE IEEE-754 |
+| `decimal` | decimal(p,s) | minimal two's-complement BE unscaled |
+| `date` | date | 4-byte LE epoch days |
+| `time` | time | 8-byte LE micros since midnight |
+| `timestamp_s` `timestamp_ms` `timestamp` | timestamp | 8-byte LE micros |
+| `timestamp_ns` | timestamp_ns (V3) | 8-byte LE nanos |
+| `timestamptz` | timestamptz | 8-byte LE micros |
+| `string` `json` | string | UTF-8 bytes |
+| `uuid` | uuid | 16 bytes BE |
+| `binary` | binary | the bytes |
+| `variant` | variant (V3) | none |
+| `list` `struct` `map` | list / struct / map | none — per leaf, below |
+
+Per-type facts worth carrying:
+
+- **`uint64` maps to decimal(20,0)** — the narrowest Iceberg type holding
+  [0, 2^64). Its bounds are therefore facade-shaped already, but its
+  *files* are the one kind a facade cannot serve: parquet cannot express
+  an INT64 column as an Iceberg decimal(20,0).
+- **`timestamp_s`/`timestamp_ms` are declarations, not file units.**
+  Parquet has no seconds unit, so those files hold millis; the parquet
+  annotation is authoritative for what a file's int64s mean, and bounds
+  are micros for all three precisions.
+- **`json` is string bytes** — same encoding, same comparison — and takes
+  identity partitioning only.
+- **Signed zeros are canonical**: a `float`/`double` lower bound stores
+  `-0.0` and an upper bound `+0.0`. The two are IEEE-equal, but Iceberg's
+  evaluators compare in natural order, where `-0.0 < 0.0`, so the pair
+  (lower `+0.0`, upper `-0.0`) would read as an empty range and prune away
+  a file that holds `0.0`. Every door that stores a bound canonicalizes;
+  the cases are pinned cross-language in
+  `pyhoglake/tests/vectors/bounds_vectors.json`.
+
+**`variant`** is a catalog SCALAR — one node, one field id, no children —
+whose parquet storage is nonetheless a group:
+`metadata` (required) plus `value` and/or `typed_value`, addressed **by
+name**, as the variant spec mandates. The field id sits on the group and
+nothing below it needs one. It has no single-value encoding, so no scalar
+bounds, no partition transform, no sort-key contract, and no promotion in
+either direction; shredded child statistics are not whole-column
+statistics and are omitted. Compaction skips a table holding one **at any
+depth**, and the rewriter refuses it explicitly. A variant inside a
+`list`, `struct` or `map` is expressible and means exactly what a
+top-level one means.
+
+**Containers** are native and one-for-one with Iceberg, element/key/value
+field ids included. A `list` has exactly one child named `element`; a
+`map` has exactly two, `key` then `value`, and the key is **required**; a
+`struct` has one or more children keeping the user's names. Nesting depth
+is capped at **8** with a top-level column counting as 1, measured from
+the **graft point** — adding a 3-deep struct into a 6-deep one is refused
+exactly like declaring a 9-deep column — and every DDL path also caps a
+table at **10,000** column nodes. Stats are **per leaf**: a container
+carries no values and gets no stats row (a commit shipping one for a
+container field id is refused by name), while a list's `element`, a map's
+`key`/`value` and a struct leaf all get counts and bounds like any scalar.
+A struct leaf is a legal partition or sort source; the container itself
+and anything beneath a `list` or `map` are refused, each naming which of
+the two applies.
+
+**Permanent refusals**, each a named 422 rather than "unknown type":
+`int128`/`uint128` need 39 decimal digits and exceed Iceberg's widest
+exact numeric, decimal(38); `timetz` and `interval` have no Iceberg
+mapping; the DuckLake geometry family (`point`, `linestring`, `polygon`,
+`multipoint`, `multilinestring`, `multipolygon`, `linestring_z`,
+`geometrycollection`) is out of scope. None is a "not yet" — there is no
+facade story to write.
+
+**Promotion** is the intersection of two sets hoglake does not own:
+DuckLake's documented promotion table, and Iceberg schema-evolution
+legality of the induced facade change. That leaves the signed ladder
+(`int8`→`int16`/`int`/`long`, `int16`→`int`/`long`, `int`→`long`), the
+unsigned ladder up to `uint32`, and `float`→`double`. Two exclusions are
+deliberate and cut in opposite directions: anything→`uint64` is
+DuckLake-legal but `uint64` maps to decimal(20,0), and int/long→decimal is
+not an Iceberg evolution; while `uint8`→`int` and
+`timestamp_s`→`timestamp_ms` lose nothing at all but are absent from
+DuckLake's table, and a hoglake catalog must never accept DDL a DuckLake
+client would reject. Containers never promote, in either direction; a
+struct leaf promotes by the ordinary matrix, since promotion is keyed on
+field id.
+
+**Transforms** are `identity`, `bucket(n)` (Murmur3, bit-compatible
+with Iceberg), and `year`/`month`/`day`/`hour`. Bucket sources are a
+positive **allowlist** — `int8`, `int16`, `int`, `long`, `uint8`,
+`uint16`, `decimal`, `date`, `time`, `timestamp`, `timestamptz`,
+`string`, `uuid`, `binary` — so a new column type is not bucketable until
+someone decides how it hashes. `boolean`/`float`/`double` are outside the
+spec's Appendix-B hash domain; `json` has no canonical byte form, so equal
+documents with different bytes would scatter across partitions; and
+`uint32`, `uint64`, `timestamp_s`, `timestamp_ms`, `timestamp_ns` are a
+hash-domain mismatch — Appendix B hashes the *mapped* type's
+representation, the client computes bucket values and the server only
+accepts the strings it is sent, so admitting these needs a client hashing
+contract and cross-language vectors first. The temporal transforms take
+`date` and every timestamp precision. pyhoglake's allowlist is pinned
+set-equal to the server's by a test that parses the Kotlin.
+
 ## Implementation language
 
 Not decided; criteria that matter, given the above:
