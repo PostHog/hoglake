@@ -368,6 +368,52 @@ The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
 executed attempts per catalog, including failures and skips. There is
 no separate minimum-file-count knob.
 
+`HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
+one ROW's materialized object graph, which no group-level budget can:
+both rewrite paths materialize a row whole, so a single row holding a
+hundred-million-element list is an OOM, and an OOM in a background loop
+takes the request path down with it. A row past the budget is refused
+as `invalid_data` — one counted skip instead of a process kill. The
+allowance is spent inside the parquet record materializer as the row is
+decoded, and again — from a FRESH allowance — by the copy; counting it
+after `read()` returned would only have reported the allocation that
+already happened, and sharing one allowance across both phases charged
+the same graph twice and silently halved the ceiling.
+
+Calibrate in NODES, not elements: a scalar column costs 1 per row, a
+list element costs 2 (its synthetic entry group plus the value), a map
+entry 3. The default therefore admits roughly half a million list
+elements in a single row — far above any honest row, and far below what
+a heap holds at ~50-100 bytes a node.
+
+Per-phase allowances mean peak live heap is up to **2x** the budget: the
+decoded row is still reachable while the copy builds its own. That is
+the price of the advertised ceiling being the real one, and it is
+measured, not assumed — a 999,999-node row rewrites under `-Xmx192m`.
+
+Three non-success outcomes carry a counter, all under
+`hoglake_compaction_skipped_total{catalog, reason}`:
+`unconvertible_schema` rising means a table has stopped compacting,
+`invalid_data` rising means a writer produced something its own
+registration or schema forbids — bad values, or a file whose schema
+contradicts its `explicit_row_ids` registration — and `failed` is the
+outright failure that gets retried next run. The first two never show up as failures — a sweep with either can
+look perfectly healthy — which is why they get a line rather than only a
+log and a ledger row. The self-healing skips (commit conflicts, DV
+supersession) stay uncounted: they re-plan on the next run.
+
+**`reason="failed"` is a FAILURE filed under a metric named
+`skipped`.** That is deliberate — one series for "groups that did not
+compact, by reason" beats three — but it means
+`sum(rate(hoglake_compaction_skipped_total[5m]))` now includes failures,
+so an alert written against the two-reason version has silently changed
+meaning. Alert on the label: `{reason="failed"}` is the page-worthy one,
+`{reason="unconvertible_schema"}` is a backlog that will not clear on
+its own, and `{reason="invalid_data"}` is a bug report against whoever
+wrote the file. The axis separating the last two is DURABILITY AND
+FAULT, not values-versus-schema: an `invalid_data` group is re-planned
+and re-refused every sweep, because nothing about it will change.
+
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are
 only a promotion estimate: encoding, schema changes and DV removal can

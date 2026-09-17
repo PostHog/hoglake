@@ -139,6 +139,7 @@ val fuzzTargets =
         "PuffinDeletionVectorFuzzTest",
         "IdentifiersFuzzTest",
         "WireDtoParseFuzzTest",
+        "NestedAgreementFuzzTest",
     )
 
 val fuzzSeconds = (project.findProperty("fuzzSeconds") as String?)?.toLongOrNull() ?: 60L
@@ -184,6 +185,56 @@ tasks.register("fuzz") {
     description = "Run every Jazzer fuzz target for -PfuzzSeconds seconds each (default 60)"
     group = "verification"
     dependsOn(fuzzTasks)
+}
+
+// Deterministic seed-loop soak runner for the nested campaigns
+// (NestedFuzzSoak): the same oracles the jazzer target uses, driven by a
+// seeded RNG instead of libFuzzer, so every finding replays exactly with
+// -Pseeds=<seed>..<seed>. Complements `fuzz` rather than replacing it —
+// libFuzzer brings coverage feedback, this brings reproducibility and a
+// per-iteration hang timeout.
+//
+//   ./gradlew nestedSoak -Pcampaign=agreement -Pseeds=0..100000 -PtimeBudget=1200
+//
+// campaigns: agreement | footer | data | trees | codec
+tasks.register<JavaExec>("nestedSoak") {
+    description = "Deterministic nested fuzz soak (manual; -Pcampaign, -Pseeds, -PtimeBudget)"
+    group = "verification"
+    mainClass.set("com.posthog.hoglake.fuzz.NestedFuzzSoak")
+    classpath = sourceSets.test.get().runtimeClasspath
+    val seeds = (project.findProperty("seeds") as String?) ?: "0..10000"
+    val range = seeds.split("..")
+    args(
+        (project.findProperty("campaign") as String?) ?: "agreement",
+        range.first(),
+        range.getOrElse(1) { range.first() },
+        (project.findProperty("timeBudget") as String?) ?: "600",
+        (project.findProperty("iterationTimeout") as String?) ?: "30",
+        (project.findProperty("strictDomains") as String?) ?: "true",
+    )
+}
+
+// The soak FLEET: `nestedSoak` is one JVM, and one JVM saturates one of
+// twelve cores. A real campaign partitions the seed space across ~9-10
+// detached workers, which needs the test classpath as a plain file so a
+// worker can be launched without Gradle (a Gradle daemon per worker
+// would spend the cores on Gradle).
+//
+//   ./gradlew writeTestClasspath
+//   for w in 0 1 2 ...; do
+//     java -cp "$(cat build/test-classpath.txt)" \
+//       com.posthog.hoglake.fuzz.NestedFuzzSoak agreement $from $to 1400 90 true &
+//   done
+tasks.register("writeTestClasspath") {
+    description = "Write the test runtime classpath to build/test-classpath.txt (soak fleet)"
+    group = "verification"
+    val cp = sourceSets.test.get().runtimeClasspath
+    val out = layout.buildDirectory.file("test-classpath.txt")
+    dependsOn(cp)
+    outputs.file(out)
+    doLast {
+        out.get().asFile.writeText(cp.asPath)
+    }
 }
 
 // One-shot (manual) seed-corpus generator: writes the committed corpus under
@@ -260,3 +311,5 @@ tasks.register("checkOpenapiVersion") {
     }
 }
 tasks.named("check") { dependsOn("checkOpenapiVersion") }
+
+// Scratch runner for the imported fuzz repro mains (temporary).

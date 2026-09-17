@@ -13,6 +13,8 @@ Claims under test:
   AttributeError, or TypeError depending on the model's parse style).
 """
 
+import dataclasses
+
 import httpx
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -278,8 +280,17 @@ model_case = st.sampled_from(range(len(MODEL_CASES))).flatmap(
 @given(model_case)
 def test_models_parse_with_extra_unknown_fields(case):
     cls, wire, extras = case
-    # extras must not shadow real fields
-    extras = {k: v for k, v in extras.items() if k not in wire}
+    # Extras must not shadow real fields -- and "real" means the MODEL's
+    # fields, not the keys this particular `wire` happens to carry.
+    # Filtering against `wire` let an OPTIONAL field's name through
+    # whenever hypothesis omitted it: `partition_spec` is optional on
+    # TableInfo, so an extras key by that literal name survived, shadowed
+    # the real field with junk, and `from_wire` correctly raised. Rare
+    # but reachable -- hypothesis harvests the literal from this source
+    # -- and it is the test's premise that was wrong, not the model's
+    # refusal.
+    known = {f.name for f in dataclasses.fields(cls)} | set(wire)
+    extras = {k: v for k, v in extras.items() if k not in known}
     polluted = {**wire, **extras}
     obj = cls.from_wire(polluted)
     clean = cls.from_wire(dict(wire))

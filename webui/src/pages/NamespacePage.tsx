@@ -2,7 +2,7 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createTable, listTables } from "../api/client";
-import { COLUMN_TYPES, type ColumnType } from "../api/types";
+import { SCALAR_COLUMN_TYPES, type ColumnType } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { columnNameError, identifierError } from "../lib/names";
@@ -106,7 +106,7 @@ function CreateTableForm({
                 }
                 aria-label={`column ${i + 1} type`}
               >
-                {COLUMN_TYPES.map((t) => (
+                {SCALAR_COLUMN_TYPES.map((t) => (
                   <option key={t} value={t}>
                     {t}
                   </option>

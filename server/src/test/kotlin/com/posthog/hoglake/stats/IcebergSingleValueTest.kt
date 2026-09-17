@@ -20,6 +20,11 @@ import java.util.UUID
  * "Binary single-value serialization" section.
  */
 class IcebergSingleValueTest {
+    private companion object {
+        /** The three container types — no single-value encoding, by design. */
+        val NESTED_TYPES = setOf(ColType.LIST, ColType.STRUCT, ColType.MAP)
+    }
+
     private fun bytes(vararg b: Int): ByteArray = ByteArray(b.size) { b[it].toByte() }
 
     @Nested
@@ -334,14 +339,42 @@ class IcebergSingleValueTest {
                     ColType.BINARY to byteArrayOf(1),
                 )
             // Exhaustive by assertion, not by hope: a new ColType with no
-            // sample here fails LOUDLY instead of going untested.
-            assertThat(
-                samples.keys,
-            ).containsExactlyInAnyOrderElementsOf(ColType.entries.filter { it != ColType.VARIANT })
+            // sample here fails LOUDLY instead of going untested. The
+            // containers and VARIANT have no single-value encoding, so
+            // they are covered by the refusal tests rather than by a
+            // sample.
+            assertThat(samples.keys + NESTED_TYPES + ColType.VARIANT)
+                .containsExactlyInAnyOrderElementsOf(ColType.entries)
+            assertThat(samples.keys).doesNotContainAnyElementsOf(NESTED_TYPES)
+            assertThat(samples.keys).doesNotContain(ColType.VARIANT)
             for ((type, value) in samples) {
                 assertThat(IcebergSingleValue.encode(type, value))
                     .describedAs(type.wire)
                     .isNotNull()
+            }
+        }
+
+        @Test
+        fun `the container types refuse encode, decode and compare by name`() {
+            // A list is a shape, not a value. The refusal has to be
+            // IllegalArgumentException specifically: that is the codec's
+            // documented refusal, and the decode fuzz target treats
+            // anything else as a finding.
+            for (type in NESTED_TYPES) {
+                assertThatThrownBy { IcebergSingleValue.encode(type, 1) }
+                    .describedAs("encode(%s)", type.wire)
+                    .isInstanceOf(IllegalArgumentException::class.java)
+                    .hasMessageContaining("'${type.wire}'")
+                    .hasMessageContaining("nested container")
+                    .hasMessageContaining("per LEAF field")
+                assertThatThrownBy { IcebergSingleValue.decode(type, byteArrayOf(1, 2, 3, 4)) }
+                    .describedAs("decode(%s)", type.wire)
+                    .isInstanceOf(IllegalArgumentException::class.java)
+                    .hasMessageContaining("'${type.wire}'")
+                assertThatThrownBy { IcebergSingleValue.compareValues(type, 1, 2) }
+                    .describedAs("compareValues(%s)", type.wire)
+                    .isInstanceOf(IllegalArgumentException::class.java)
+                    .hasMessageContaining("'${type.wire}'")
             }
         }
     }

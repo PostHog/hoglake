@@ -97,6 +97,8 @@ class App private constructor(
                 targetBytes = cfg.compactionTargetBytes,
                 tierTarget = cfg.compactionTierTarget,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
+                nestedSortExpansion = cfg.compactionNestedSortExpansion,
+                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
             ),
         )
 

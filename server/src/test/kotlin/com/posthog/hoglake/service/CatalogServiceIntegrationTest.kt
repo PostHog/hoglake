@@ -4,9 +4,11 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.service.CatalogService.Companion.MAX_DATA_PATH_LENGTH
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
@@ -333,6 +335,37 @@ class CatalogServiceIntegrationTest {
                 .`as`("data_path %s", bad)
                 .isInstanceOf(HoglakeException.Validation::class.java)
         }
+    }
+
+    @Test
+    fun `a data_path is length-bounded, and its refusals do not echo one whole`() {
+        // Nothing bounded data_path: `text` with no CHECK, a shape-only
+        // validator, a bare string in the schema. So a 100 KB path
+        // registered fine — and then rode into every overlap 422 any
+        // later catalog triggered, because the message quotes BOTH
+        // sides. Capping the echo alone would have left the value in the
+        // table and in the audit log.
+        val huge = "s3://ovl-huge/" + "p".repeat(100_000)
+        assertThatThrownBy { svc.createCatalog("dp-huge", huge) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("over the maximum")
+        // The refusal itself does not quote the 100 KB back.
+        val thrown = catchThrowable { svc.createCatalog("dp-huge", huge) }
+        assertThat(thrown.message!!.length).describedAs("length refusal").isLessThan(200)
+
+        // Both sides of the OVERLAP message are capped too: the incoming
+        // path and the stored one it collides with.
+        // Just under the bound, so the overlap check is what fires.
+        val long = "s3://ovl-long/" + "q".repeat(MAX_DATA_PATH_LENGTH - 30)
+        svc.createCatalog("dp-long", long)
+        val overlap = catchThrowable { svc.createCatalog("dp-long-2", "$long/deeper") }
+        assertThat(overlap).isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(overlap.message!!)
+            .describedAs("names the catalog it collided with")
+            .contains("overlaps catalog 'dp-long'")
+        assertThat(overlap.message!!.length)
+            .describedAs("overlap refusal quotes neither path whole")
+            .isLessThan(300)
     }
 
     @Test

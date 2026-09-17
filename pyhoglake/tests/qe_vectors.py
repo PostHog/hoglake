@@ -283,3 +283,50 @@ def test_fixed_width_vectors_have_fixed_width_hex():
         w = widths.get(vec["type"])
         if w is not None:
             assert len(vec["hex"]) == 2 * w, vec
+
+
+# -- bound normalization (semantic, not codec) -------------------------------
+#
+# The vectors above pin encode/decode. These pin what gets STORED: two
+# encodings of zero are IEEE-equal but not total-order-equal, and Iceberg
+# resolves that by fixing which one each ROLE stores. Both languages read
+# this section, so a divergence is a test failure in whichever one drifted
+# rather than a file that prunes differently depending on who wrote it.
+
+NORMALIZATION = DOC["bound_normalization"]["cases"]
+
+
+def test_every_normalization_case_holds():
+    from pyhoglake.bounds import normalize_bound
+
+    assert NORMALIZATION, "the shared file carries no normalization cases"
+    for case in NORMALIZATION:
+        raw = bytes.fromhex(case["raw_hex"])
+        want = bytes.fromhex(case["stored_hex"])
+        got = normalize_bound(case["type"], raw, lower=case["role"] == "lower")
+        assert got == want, f"{case} got {got.hex()}"
+
+
+def test_normalization_cases_cover_both_roles_and_both_float_types():
+    """A section that only ever normalized lower bounds, or only doubles,
+    would pass its own vectors and still store an inverted pair."""
+    moved = {
+        (c["type"], c["role"]) for c in NORMALIZATION if c["raw_hex"] != c["stored_hex"]
+    }
+    assert moved == {
+        ("float", "lower"),
+        ("float", "upper"),
+        ("double", "lower"),
+        ("double", "upper"),
+    }
+
+
+def test_normalization_leaves_absent_bounds_absent():
+    from pyhoglake.bounds import normalize_bound
+
+    assert normalize_bound("double", None, lower=True) is None
+    assert normalize_bound("double", None, lower=False) is None
+    # A bound of the wrong width is not a zero to normalize; it is the
+    # server's to drop, and rewriting it here would hide that.
+    short = b"\x00\x00"
+    assert normalize_bound("double", short, lower=True) == short

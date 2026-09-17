@@ -1,5 +1,6 @@
 package com.posthog.hoglake.model
 
+import com.posthog.hoglake.service.Identifiers
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Nested
@@ -18,7 +19,8 @@ import java.nio.file.Path
  * webui's COLUMN_TYPES. The first four are asserted equal here from
  * their actual files, because "someone added a type to the enum and not
  * the migration" is a 500 at insert time, not a compile error. (The
- * webui list is TypeScript and is covered by its own suite.)
+ * webui list is TypeScript and is checked by nested.test.tsx,
+ * which pins COLUMN_TYPES against this same vocabulary.)
  *
  * The promotion matrix is pinned twice: once literally, and once
  * against the RULE it is supposed to obey — a promotion is legal only
@@ -54,10 +56,48 @@ class ScalarTypeParityTest {
 
         @Test
         fun `the latest migration's CHECK lists exactly the enum, in order`() {
-            val sql = read("src/main/resources/db/migration/V8__variant_type.sql")
+            // The LAST migration that recreates the CHECK is the one
+            // that must agree with the enum — the chain is append-only,
+            // so V4's and V8's lists are history and V9's is the live
+            // vocabulary. Adding a type means adding a migration, and
+            // this assertion is what makes forgetting one a red test
+            // rather than a 500 at insert.
+            val sql = read("src/main/resources/db/migration/V9__nested_types.sql")
             assertThat(checkMembers(sql))
-                .describedAs("V8__variant_type.sql col_type CHECK")
+                .describedAs("V9__nested_types.sql col_type CHECK")
                 .isEqualTo(wireNames)
+        }
+
+        @Test
+        fun `the three container types are present and classified`() {
+            assertThat(wireNames).containsSubsequence("list", "struct", "map")
+            for (t in listOf(ColType.LIST, ColType.STRUCT, ColType.MAP)) {
+                assertThat(t.isNested).describedAs("%s.isNested", t.wire).isTrue()
+            }
+            assertThat(ColType.entries.filter { it.isNested })
+                .containsExactly(ColType.LIST, ColType.STRUCT, ColType.MAP)
+            // Appended, never inserted: the fuzz seed corpus encodes
+            // ColType.ordinal as its first byte, so inserting a member
+            // silently re-points every committed seed at another type.
+            assertThat(ColType.entries.takeLast(3))
+                .describedAs("containers are the LAST three members")
+                .containsExactly(ColType.LIST, ColType.STRUCT, ColType.MAP)
+        }
+
+        @Test
+        fun `container child arity is fixed for list and map, open for struct`() {
+            assertThat(ColType.LIST.requiredChildCount).isEqualTo(1)
+            assertThat(ColType.MAP.requiredChildCount).isEqualTo(2)
+            assertThat(ColType.STRUCT.requiredChildCount).isNull()
+            assertThat(ColType.syntheticChildNames(ColType.LIST)).containsExactly("element")
+            assertThat(ColType.syntheticChildNames(ColType.MAP)).containsExactly("key", "value")
+            // struct children keep the user's names, so there is nothing
+            // synthetic to impose.
+            assertThat(ColType.syntheticChildNames(ColType.STRUCT)).isNull()
+            for (t in ColType.entries.filter { !it.isNested }) {
+                assertThat(t.requiredChildCount).describedAs("%s", t.wire).isNull()
+                assertThat(ColType.syntheticChildNames(t)).describedAs("%s", t.wire).isNull()
+            }
         }
 
         @Test
@@ -80,6 +120,34 @@ class ScalarTypeParityTest {
                     ?.get(1)
                     ?: error("ColumnDef.type enum not found in the OpenAPI spec")
             assertThat(listed.split(",").map { it.trim() }).isEqualTo(wireNames)
+        }
+
+        @Test
+        fun `the OpenAPI ColumnDef name schema carries the reserved prefix rule`() {
+            // The spec is the contract a generated client is built
+            // from. While it described the identifier regex as the
+            // complete policy, a generated client happily submitted
+            // `_hog_row_id` and met a 422 the spec never mentioned.
+            val spec = read("src/main/resources/openapi/hoglake.yaml")
+            val nameSchema = spec.substringAfter("\n    ColumnDef:").substringBefore("\n        type:\n")
+            // In its SIBLING position, where a generator reading
+            // `schema.pattern` finds it — the same place every other
+            // identifier in the spec declares one. Nesting it inside an
+            // allOf hid it from codegen entirely, which is why the
+            // assertion pins the LINE, not just the string.
+            val patternLine = "          pattern: \"" + Identifiers.PATTERN + "\""
+            assertThat(nameSchema.lines())
+                .describedAs("the base identifier pattern is a direct property of name")
+                .contains(patternLine)
+            assertThat(nameSchema)
+                .describedAs("and not buried in a composition keyword generators ignore")
+                .doesNotContain("allOf")
+            assertThat(nameSchema)
+                .describedAs("and the reserved prefix is machine-readable, not just prose")
+                .contains("not: { pattern: \"^${Identifiers.RESERVED_COLUMN_PREFIX}\" }")
+            assertThat(nameSchema)
+                .describedAs("and named, so a client author can find the refusal")
+                .contains(Identifiers.RESERVED_COLUMN_PREFIX)
         }
 
         @Test
@@ -128,10 +196,27 @@ class ScalarTypeParityTest {
                     ColType.UUID_T to IcebergType.UUID,
                     ColType.BINARY to IcebergType.BINARY,
                     ColType.VARIANT to IcebergType.VARIANT,
+                    // Native, one for one (docs/iceberg-federation.md §2.8).
+                    ColType.LIST to IcebergType.LIST,
+                    ColType.STRUCT to IcebergType.STRUCT,
+                    ColType.MAP to IcebergType.MAP,
                 )
             assertThat(expected.keys).containsExactlyInAnyOrderElementsOf(ColType.entries)
             for ((type, iceberg) in expected) {
                 assertThat(type.icebergType).describedAs(type.wire).isEqualTo(iceberg)
+            }
+        }
+
+        @Test
+        fun `isScalar splits the Iceberg types exactly where isNested splits ours`() {
+            // The two predicates must agree, because every bounds and
+            // promotion decision keys on the MAPPED type: an Iceberg
+            // container reachable from a scalar ColType (or the reverse)
+            // would put a single-value encoding where there is none.
+            for (t in ColType.entries) {
+                assertThat(t.icebergType.isScalar)
+                    .describedAs("%s -> %s", t.wire, t.icebergType.wire)
+                    .isEqualTo(!t.isNested)
             }
         }
     }

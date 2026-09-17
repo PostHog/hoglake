@@ -161,16 +161,50 @@ class TableSummary:
 
 @dataclass(frozen=True)
 class Column:
+    """One catalog column.
+
+    Recursive: a container type (``list``/``struct``/``map``) carries its
+    ``children``, each with its own server-assigned ``field_id``.
+    ``ordinal`` orders a column among its SIBLINGS — top-level columns
+    share one sequence, and each container's children have their own —
+    so it is not a table-wide position.
+    """
+
     name: str
     type: str
     field_id: int
     ordinal: int
     nullable: bool = True
     type_params: dict[str, Any] | None = None
+    #: Present only for list/struct/map.
+    children: tuple[Column, ...] | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> Column:
-        return _wire("Column", d, lambda d: cls(**_pick(cls, d)))
+        def build(d: Mapping[str, Any]) -> Column:
+            kw = dict(_pick(cls, d))
+            kids = kw.get("children")
+            if kids is not None:
+                if not isinstance(kids, (list, tuple)):
+                    raise MalformedResponseError(
+                        "Column: children must be an array or null, got "
+                        f"{type(kids).__name__}"
+                    )
+                # Sorted by ordinal HERE, once, at the wire boundary.
+                # The server returns children in ordinal order today, but
+                # ordinal is the contract and array order is not — and
+                # every consumer downstream (the Arrow schema builder,
+                # the stats walk, the console) reads position. One sort
+                # at the edge beats three that can disagree.
+                kw["children"] = tuple(
+                    sorted(
+                        (Column.from_wire(c) for c in kids),
+                        key=lambda c: c.ordinal,
+                    )
+                )
+            return cls(**kw)
+
+        return _wire("Column", d, build)
 
 
 @dataclass(frozen=True)

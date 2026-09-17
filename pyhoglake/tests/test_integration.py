@@ -206,6 +206,138 @@ def test_deferred_append_hydrates_with_exact_footer_size(catalog, ns, s3config):
     assert f.stats_state == "provided"
 
 
+def _nested_schema() -> pa.Schema:
+    """One of every container shape, plus a three-level combination."""
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("tags", pa.list_(pa.string())),
+            pa.field("addr", pa.struct([("city", pa.string()), ("zip", pa.int32())])),
+            pa.field("props", pa.map_(pa.string(), pa.int64())),
+            pa.field(
+                "deep",
+                pa.struct([("runs", pa.list_(pa.struct([("score", pa.float64())])))]),
+            ),
+        ]
+    )
+
+
+def test_nested_lifecycle_roundtrip(catalog, ns, s3config):
+    """Nested columns end to end against a live server: DDL, an append
+    whose parquet the client writes, the catalog's own view of the shape,
+    and per-LEAF bounds byte for byte.
+
+    The bounds are the point. They are field-id-keyed and a container has
+    none, so what has to come back is exactly the leaf set with exactly
+    the encodings a top-level scalar of the same type would carry — a
+    struct field's `int` bound is a 4-byte LE int, a map value's `long`
+    bound is 8, and a list element's `string` bound is its UTF-8 bytes.
+    """
+    table = ns.create_table("nested_t", _nested_schema())
+    info = table.info()
+
+    # The server assigned ids depth-first and kept Iceberg's synthetic
+    # child names; the bounds below are keyed on both.
+    by_path = {}
+
+    def walk(col, prefix=""):
+        path = f"{prefix}.{col.name}" if prefix else col.name
+        by_path[path] = col
+        for child in col.children or ():
+            walk(child, path)
+
+    for col in info.columns:
+        walk(col)
+    assert [c.name for c in by_path["tags"].children] == ["element"]
+    assert [c.name for c in by_path["props"].children] == ["key", "value"]
+    assert by_path["props"].children[0].nullable is False
+    assert by_path["deep.runs.element.score"].type == "double"
+    # Depth-first ids: a parent is always below its descendants.
+    assert by_path["addr"].field_id < by_path["addr.city"].field_id
+
+    data = pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], pa.int64()),
+            "tags": pa.array(
+                [["alpha", "mike"], None, ["zulu"], []], pa.list_(pa.string())
+            ),
+            "addr": pa.array(
+                [
+                    {"city": "amsterdam", "zip": 99999},
+                    None,
+                    {"city": "zagreb", "zip": -1},
+                    {"city": "berlin", "zip": 10115},
+                ],
+                pa.struct([("city", pa.string()), ("zip", pa.int32())]),
+            ),
+            "props": pa.array(
+                [[("a", 1_000_000)], [], [("z", -7)], [("m", 0), ("n", 42)]],
+                pa.map_(pa.string(), pa.int64()),
+            ),
+            "deep": pa.array(
+                [
+                    {"runs": [{"score": 1.5}, {"score": -2.5}]},
+                    {"runs": []},
+                    None,
+                    {"runs": [{"score": 0.0}]},
+                ],
+                pa.struct([("runs", pa.list_(pa.struct([("score", pa.float64())])))]),
+            ),
+        }
+    )
+    result = table.append(data)
+    assert result.snapshot_id > 0
+
+    (f,) = table.files()
+    assert f.record_count == 4
+    assert f.stats_state == "provided"  # inline stats, computed per leaf
+
+    # Bounds are read back off the file the CLIENT actually wrote and
+    # uploaded — the server exposes no per-file stats endpoint, so this
+    # is the honest end-to-end check: the same footer the commit shipped
+    # stats from, re-read from object storage.
+    stats = {s.field_id: s for s in _leaf_stats(f, info, s3config)}
+    leaves = {
+        p: c.field_id
+        for p, c in by_path.items()
+        if c.type not in ("list", "struct", "map")
+    }
+    assert set(stats) == set(leaves.values()), (
+        "stats rows must cover exactly the leaves: a container has no "
+        "values, and the server refuses a row addressed to one"
+    )
+
+    def bound(path, which):
+        return getattr(stats[leaves[path]], which)
+
+    assert bound("id", "lower_bound") == struct.pack("<q", 1)
+    assert bound("id", "upper_bound") == struct.pack("<q", 4)
+    assert bound("tags.element", "lower_bound") == b"alpha"
+    assert bound("tags.element", "upper_bound") == b"zulu"
+    assert bound("addr.city", "lower_bound") == b"amsterdam"
+    assert bound("addr.city", "upper_bound") == b"zagreb"
+    assert bound("addr.zip", "lower_bound") == struct.pack("<i", -1)
+    assert bound("addr.zip", "upper_bound") == struct.pack("<i", 99999)
+    assert bound("props.key", "lower_bound") == b"a"
+    assert bound("props.key", "upper_bound") == b"z"
+    assert bound("props.value", "lower_bound") == struct.pack("<q", -7)
+    assert bound("props.value", "upper_bound") == struct.pack("<q", 1_000_000)
+    assert bound("deep.runs.element.score", "lower_bound") == struct.pack("<d", -2.5)
+    assert bound("deep.runs.element.score", "upper_bound") == struct.pack("<d", 1.5)
+
+
+def _leaf_stats(data_file, info, s3config):
+    """Per-leaf stats from the uploaded file's own footer — exactly what
+    the commit shipped, re-derived from object storage."""
+    import io
+
+    fs = s3config.filesystem()
+    raw = fs.open_input_file(data_file.path[len("s3://") :]).read()
+    from pyhoglake.stats import extract_column_stats
+
+    return extract_column_stats(pq.read_metadata(io.BytesIO(raw)), info.columns)
+
+
 def test_changes_correctness(catalog, ns):
     table = ns.create_table("changes_t", _events_schema())
     s0 = catalog.refresh().head_snapshot_id

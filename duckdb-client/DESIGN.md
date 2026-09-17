@@ -468,12 +468,18 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    own DDL commit's snapshot and papers over it with a racy
    GET /catalogs — return CommitResult-style snapshot info on
    create/alter for a deterministic post-DDL read pin.
-9. The server does NOT enforce the `_hog` reserved column prefix
-   (name validation is pattern-only), despite both clients' comments
-   assuming it — a non-hoglake client can commit a user `_hog_row_id`
-   column that collides with compaction's reserved carrier and breaks
-   name-based readers. The extension and pyhoglake enforce it
-   client-side; the server should too.
+9. ~~The server does NOT enforce the `_hog` reserved column prefix~~
+   **CLOSED.** `Identifiers.validateColumn` reserves the prefix at
+   every nesting level, on create, add_column and rename_column, and
+   `ParquetRewriter.outputSchema` refuses a live column of that name
+   for tables that predate the reservation. Compaction also enforces
+   both directions of the reserved-FIELD-ID contract that the carrier
+   depends on (§ "Virtual columns"): it is the one server surface that
+   opens a registered parquet, so it can check what registration
+   cannot. What remains outside the server's reach is a file whose
+   SCHEMA carries the reserved id without the catalog saying so —
+   caught at compaction, and by this client at read time, but never at
+   registration.
 10. No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
    attach can never produce a client-side snapshot id (reads stay
    consistent because the server re-resolves the same timestamp to the

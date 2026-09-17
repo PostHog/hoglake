@@ -1450,7 +1450,19 @@ components:
         expires_at: { type: string, format: date-time, description: Prepared operations expire after 24 hours; terminal receipts do not expire }
         snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
-        reason: { type: string, enum: [target_exists, namespace_changed, client_abort, expired] }
+        reason:
+          type: string
+          enum: [target_exists, namespace_changed, client_abort, expired,
+                 definition_invalid]
+          description: >
+            Why a `rejected` receipt cannot be published.
+            `definition_invalid` means the definition was legal when it
+            was PREPARED and is not any more — a rule tightened between
+            prepare and publish. The receipt is terminal: prepare a new
+            one with a definition the current server accepts. (Without
+            this the operation stayed `prepared` forever, since the
+            failing publish rolled itself back and only an explicit
+            abort could end it.)
 
     ColumnDef:
       type: object
@@ -1458,17 +1470,48 @@ components:
       properties:
         name:
           type: string
+          # PATTERN STAYS IN ITS SIBLING POSITION. Every other identifier
+          # in this spec declares it here, and a generator reads
+          # `schema.pattern`: moving it inside a composition keyword
+          # made column names the one field with NO pattern as far as
+          # codegen is concerned,
+          # which is strictly worse than the gap it was fixing. The
+          # `not` below carries the prefix rule for validators that
+          # implement it; generators that ignore it are no worse off
+          # than before, and the description states the rule for the
+          # humans writing the client.
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          not: { pattern: "^_hog" }
           description: >
             Identifier policy (shared by namespace/table/view/column
             names): letter or underscore start, then letters, digits,
-            underscore, hyphen; max 128 chars. Violations are 422.
+            underscore, hyphen; max 128 chars.
+
+            COLUMN names carry one rule the others do not: the `_hog`
+            prefix is RESERVED, at every nesting level, for hoglake's own
+            physical columns (compaction writes `_hog_row_id` into every
+            output, bound by a reserved field id). A column named
+            `_hog...` collides with it, so create_table, add_column and
+            rename_column all refuse one — including a field inside a
+            struct, a list element or a map value.
+
+            Both violations are 422. The reserved-prefix refusal names
+            the offending DOTTED PATH, so a rejected struct field says
+            where it is: "column name 'addr._hog_x' uses the reserved
+            prefix '_hog'".
+
+            The prefix rule is a sibling `not`, not a negative
+            lookahead inside `pattern`: lookahead is legal ECMA-262 but
+            RE2 — which Go clients generate against — cannot compile it,
+            and a client that fails to build is worse than one that
+            checks the prefix a layer up.
         type:
           type: string
           enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
                  uint64, float, double, decimal, date, time, timestamp_s,
                  timestamp_ms, timestamp, timestamp_ns, timestamptz,
-                 string, json, uuid, binary, variant]
+                 string, json, uuid, binary, variant,
+                 list, struct, map]
           description: >
             The closed column-type vocabulary: every member has a
             defined Iceberg facade mapping (iceberg-federation.md §2),
@@ -1489,6 +1532,22 @@ components:
             timestamp_ns bounds are NANOSECONDS; json bounds are UTF-8
             bytes, like string.
 
+            list, struct and map are CONTAINERS: they carry no values of
+            their own, they require `children`, and they NEVER carry
+            stats. Bounds and counts are per LEAF field — the element of
+            a list, the key and value of a map, the scalar fields of a
+            struct — so a commit shipping column_stats for a container's
+            field_id is refused with a 422. They map natively to the
+            Iceberg V2 list/struct/map, element/key/value field ids
+            included.
+
+            Shape rules, each its own named 422: a list has exactly one
+            child, named `element`; a map has exactly two, `key` then
+            `value`, and the key must have nullable=false (Iceberg map
+            keys are non-nullable); a struct has one or more children,
+            which keep their own names; a scalar type has none. Nesting
+            depth is capped at 8, counting a top-level column as 1.
+
             These DuckLake type names are permanently unsupported and
             are refused with a 422 naming the type and the reason, never
             an unknown-type error: int128 and uint128 (39 decimal
@@ -1501,6 +1560,12 @@ components:
           type: object
           additionalProperties: true
         nullable: { type: boolean, default: true }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/ColumnDef" }
+          description: >
+            Required for list/struct/map, forbidden for every scalar
+            type. Recursive, bounded by the depth cap above.
 
     Column:
       allOf:
@@ -1509,7 +1574,19 @@ components:
           required: [field_id, ordinal]
           properties:
             field_id: { type: integer, format: int64 }
-            ordinal: { type: integer }
+            ordinal:
+              type: integer
+              description: >
+                0-based position among the column's SIBLINGS — top-level
+                columns share one sequence, and each container's children
+                have their own. Not a table-wide position.
+            children:
+              type: array
+              items: { $ref: "#/components/schemas/Column" }
+              description: >
+                Present only for list/struct/map, with the field ids the
+                server assigned. Ids are allocated depth-first, so a
+                container's id is always below its descendants'.
 
     CreateTableRequest:
       type: object
@@ -1689,7 +1766,15 @@ components:
       type: object
       required: [source_field_id, transform]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         transform:
           type: string
           enum: [identity, bucket, year, month, day, hour]
@@ -1710,7 +1795,15 @@ components:
       type: object
       required: [source_field_id, direction, null_order]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         direction:
           type: string
           enum: [asc, desc]
@@ -1736,18 +1829,47 @@ components:
     AlterOp:
       type: object
       required: [op]
-      description: Discriminated by `op`.
+      description: >
+        Discriminated by `op`.
+
+        Column-addressing ops (`drop_column`, `rename_column`,
+        `promote_column`, and `add_column`'s `parent`) name their target
+        by a DOTTED PATH of column names — `addr` for a top-level column,
+        `addr.zip` for a field of the struct `addr`. Names cannot contain
+        `.` (the identifier pattern), so the path is unambiguous.
+
+        Only STRUCT interiors are addressable. A path stepping through a
+        list or a map is a 422: Iceberg has no add/drop/rename for an
+        element, a key or a value, and the container's shape is part of
+        its type. Nested containers are also not promotable — promote a
+        struct's LEAF field, which follows the ordinary scalar matrix.
       properties:
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        parent:                       # add_column, optional
+          type: string
+          description: >
+            Dotted path of an existing STRUCT to append the new field
+            to (new field id, ordinal = max sibling + 1). Absent = a new
+            top-level column. Naming a list or a map here is a 422.
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
-        # rename_column target (must satisfy the ColumnDef.name identifier
-        # pattern); promote_column target type
-        to: { type: string }
+        to:
+          type: string
+          description: >
+            Dual-use: the new NAME for rename_column, the target TYPE
+            for promote_column. It therefore carries no `pattern` of its
+            own — a schema that constrained it to the identifier regex
+            would reject every promote_column, whose values are type
+            names from the ColumnDef.type vocabulary.
+
+            For rename_column the value must satisfy ColumnDef.name in
+            full: the identifier pattern AND the reserved `_hog` prefix
+            rule. Both are 422s, with the same messages ColumnDef.name
+            documents.
         new_name:                     # rename_table
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
@@ -1945,7 +2067,7 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema, failed_groups]
+                 unconvertible_schema, invalid_data, failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -1976,6 +2098,22 @@ components:
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions).
+        invalid_data:
+          type: integer
+          format: int64
+          description: >
+            Groups skipped for a fault that is DURABLE and the writer's:
+            a value that cannot exist under the type its own file
+            declares (an empty byte array under a decimal, an unscaled
+            value wider than the destination precision), a row large
+            enough to threaten the heap, or a file whose schema
+            contradicts its own registration (the reserved row-id field
+            id present or absent against explicit_row_ids).
+
+            Unlike unconvertible_schema this never clears on its own, so
+            the group is re-planned and re-refused every sweep. The axis
+            is durability and fault, not values-versus-schema: a nonzero
+            count is a writer bug, not a backlog.
         failed_groups:
           type: integer
           format: int64

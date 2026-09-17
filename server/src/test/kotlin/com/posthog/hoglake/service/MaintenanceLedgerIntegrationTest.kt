@@ -1,13 +1,17 @@
 package com.posthog.hoglake.service
 
+import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.posthog.hoglake.api.toDto
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceBacklog
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
+import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.wireObjectMapper
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -126,6 +130,56 @@ class MaintenanceLedgerIntegrationTest {
     )
 
     /** Ledger rows for [catalog], newest first. */
+    @Test
+    fun `a pre-upgrade compaction row is returned with the counters it predates`() {
+        // The stored payload is the raw JSON the API returned at the
+        // time, handed back verbatim — so a row written before
+        // invalid_data existed has no such field, while the schema
+        // lists it as required. Generated clients go out of contract on
+        // it and the webui's `!== "0"` guard is TRUE for `undefined`.
+        val catalogId = seedCatalog("led-preupgrade")
+        val stored =
+            """
+            {"groups_compacted":2,"files_in":6,"files_out":2,"bytes_in":100,"bytes_out":90,
+             "skipped_conflicts":0,"dv_superseded":0,"unconvertible_schema":0,"failed_groups":0}
+            """.trimIndent()
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_maintenance_run
+                    (catalog_id, task, run_trigger, started_at, finished_at, status, result)
+                VALUES (:catalogId, 'compaction', 'loop', now(), now(), 'ok', CAST(:result AS jsonb))
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("result", stored)
+                .execute()
+        }
+        // It really is absent on the way in — otherwise this test would
+        // pass for the wrong reason.
+        assertThat(json.readTree(ledgerRows("led-preupgrade").single().result).has("invalid_data"))
+            .isFalse()
+
+        val run =
+            jdbi.withHandleUnchecked { h ->
+                MaintenanceRunStore(jdbi).history(h, catalogId, null, null, 10)
+            }.single()
+        val wire = wireObjectMapper().valueToTree<JsonNode>(run.toDto())
+        val result = wire["result"]
+        assertThat(result["invalid_data"].asLong())
+            .describedAs("normalized on READ; the counter did not exist, so nothing it counts happened")
+            .isZero()
+        // Every other field survives untouched, and the row is complete
+        // against the schema's required list.
+        assertThat(result["groups_compacted"].asLong()).isEqualTo(2)
+        assertThat(result.fieldNames().asSequence().toList())
+            .containsExactlyInAnyOrder(
+                "groups_compacted", "files_in", "files_out", "bytes_in", "bytes_out",
+                "skipped_conflicts", "dv_superseded", "unconvertible_schema",
+                "invalid_data", "failed_groups",
+            )
+    }
+
     private fun ledgerRows(catalog: String): List<LedgerRow> =
         jdbi.withHandleUnchecked { h ->
             h.createQuery(

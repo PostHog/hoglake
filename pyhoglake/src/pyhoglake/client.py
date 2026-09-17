@@ -38,6 +38,7 @@ from .models import (
     CatalogOptions,
     ChangesPlan,
     CleanupResult,
+    Column,
     CommitResult,
     ConsumerOffset,
     DataFile,
@@ -52,8 +53,8 @@ from .models import (
 from .ops import AlterOp
 from .parquet_schema import validate_variant_file
 from .stats import extract_column_stats
-from .transforms import transform_strings
-from .types import columns_to_arrow_schema, schema_to_column_defs
+from .transforms import partition_source_array, transform_strings
+from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
 
 DEFAULT_TIMEOUT = 30.0
 
@@ -69,28 +70,70 @@ UNGUARDED = object()
 _RECREATED_MARKER = "the table was recreated"
 
 # COLUMN names starting with this prefix are reserved for hoglake internals
-# (``_hog_row_id`` is compaction's row-id carrier). The SERVER DOES NOT
-# enforce this: its column-name check is the identifier pattern only
-# (Identifiers.validate), which a leading underscore satisfies, so a
-# `_hog_row_id` column is accepted at create/add/rename. This client-side
-# check is the only barrier on the pyhoglake path (hoglake#36).
+# (``_hog_row_id`` is compaction's row-id carrier). The SERVER enforces
+# this too, at every nesting level (Identifiers.validateColumn, reached
+# from ColumnTrees for create/add and directly for rename) — it did not
+# when this check was written, which is what hoglake#36 was about. The
+# client check stays as a FAST FAIL: it refuses before the parquet upload
+# and the request, and the message names every offending path at once
+# instead of the first one the server trips on.
 # Namespace/table/view names are NOT affected.
 _RESERVED_COLUMN_PREFIX = "_hog"
 
 
+def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
+    """Dotted paths of every field — at ANY nesting level — whose name
+    uses the reserved prefix.
+
+    Recursive because the reserved name is reserved everywhere: a
+    ``_hog_row_id`` field inside a struct reaches parquet exactly like a
+    top-level one, and compaction writes its own ``_hog_row_id`` at the
+    top level of the OUTPUT, so a nested collision is a name clash in
+    waiting rather than a present one. Refusing both is cheaper than
+    explaining the difference.
+    """
+    out: list[str] = []
+    for f in fields:  # type: ignore[attr-defined]
+        path = f"{prefix}.{f.name}" if prefix else f.name
+        if f.name.startswith(_RESERVED_COLUMN_PREFIX):
+            out.append(path)
+        t = f.type
+        if pa.types.is_struct(t):
+            out += _reserved_field_paths(
+                [t.field(i) for i in range(t.num_fields)], path
+            )
+        elif pa.types.is_map(t):
+            out += _reserved_field_paths([t.key_field, t.item_field], path)
+        elif is_list_family(t):
+            out += _reserved_field_paths([t.value_field], path)
+    return out
+
+
 def _check_reserved_columns(schema: pa.Schema) -> None:
     """Fast-fail schema field names using the reserved ``_hog`` column
-    prefix BEFORE any request or parquet upload. The server accepts such
-    names (see [_RESERVED_COLUMN_PREFIX]), so this is enforcement, not an
-    optimisation: without it the column lands in the catalog and collides
-    with compaction's row-id carrier."""
-    reserved = [n for n in schema.names if n.startswith(_RESERVED_COLUMN_PREFIX)]
+    prefix BEFORE any request or parquet upload.
+
+    The server refuses these as well (see [_RESERVED_COLUMN_PREFIX]), so
+    this is an optimisation rather than the only barrier it once was — it
+    saves an upload, and reports every offending path together instead of
+    one per round trip.
+
+    Checked at every nesting level, which is the level the server checks
+    at too."""
+    reserved = _reserved_field_paths(list(schema))
     if reserved:
+        # WORDING MATCHES THE SERVER'S on purpose: "uses the reserved
+        # prefix '_hog'" is the phrase Identifiers.validateColumn raises,
+        # so a user who hits the local check and a user who hits the 422
+        # can search for the same string and find the same answer. The
+        # only deliberate difference is plurality — this one reports
+        # EVERY offending path at once, which is the point of checking
+        # before the request.
         raise ValidationError(
-            f"column names {reserved} use the reserved "
-            f"'{_RESERVED_COLUMN_PREFIX}' prefix (hoglake internal columns, "
-            "e.g. _hog_row_id), which collides with compaction's row-id "
-            "carrier; rename them",
+            f"column name(s) {reserved} use the reserved prefix "
+            f"'{_RESERVED_COLUMN_PREFIX}': names starting with it belong to "
+            "hoglake's own physical columns (compaction's _hog_row_id); "
+            "rename them",
             status_code=None,
         )
 
@@ -937,9 +980,60 @@ class Table:
         return info
 
 
+def _nested_field_mismatch(
+    have: pa.DataType, want: pa.DataType, path: str
+) -> tuple[list[str], list[str]]:
+    """(missing, extra) dotted paths comparing a caller's nested type
+    against the catalog's, recursively."""
+    missing: list[str] = []
+    extra: list[str] = []
+    if pa.types.is_struct(want) and pa.types.is_struct(have):
+        want_names = [want.field(i).name for i in range(want.num_fields)]
+        have_names = [have.field(i).name for i in range(have.num_fields)]
+        missing += [f"{path}.{n}" for n in want_names if n not in have_names]
+        extra += [f"{path}.{n}" for n in have_names if n not in want_names]
+        for name in want_names:
+            if name in have_names:
+                m, e = _nested_field_mismatch(
+                    have.field(name).type, want.field(name).type, f"{path}.{name}"
+                )
+                missing += m
+                extra += e
+    elif pa.types.is_map(want) and pa.types.is_map(have):
+        for label, h, w in (
+            ("key", have.key_field.type, want.key_field.type),
+            ("value", have.item_field.type, want.item_field.type),
+        ):
+            m, e = _nested_field_mismatch(h, w, f"{path}.{label}")
+            missing += m
+            extra += e
+    elif is_list_family(want) and is_list_family(have):
+        # The FAMILY, not the canonical member. large_list and
+        # fixed_size_list both normalize to catalog `list`, so a caller
+        # appending either walked into an `is_list`-only branch that
+        # answered "no mismatch" without looking — and the typo'd inner
+        # field the recursion exists to catch reached the cast and
+        # appended as an all-NULL column.
+        m, e = _nested_field_mismatch(
+            have.value_field.type, want.value_field.type, f"{path}.element"
+        )
+        missing += m
+        extra += e
+    return missing, extra
+
+
 def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
     """Reorder ``data`` to the catalog column order and cast to the target
-    schema (which carries the field-id metadata)."""
+    schema (which carries the field-id metadata).
+
+    The name comparison is RECURSIVE. At top level a missing or unknown
+    column has always been a refusal; below it, ``cast`` quietly
+    null-filled what the caller had not supplied and dropped what the
+    catalog did not know — so a typo'd struct field appended as an
+    all-NULL column whose own stats said ``null_count == record_count``,
+    and the only evidence was that the data was not there. The same
+    mistake deserves the same answer at every level.
+    """
     have = set(data.schema.names)
     want = list(target.names)
     missing = [n for n in want if n not in have]
@@ -951,6 +1045,24 @@ def _align_table(data: pa.Table, target: pa.Schema) -> pa.Table:
     if extra:
         raise ValidationError(
             f"data has columns not in the table schema: {extra}",
+            status_code=None,
+        )
+    nested_missing: list[str] = []
+    nested_extra: list[str] = []
+    for name in want:
+        m, e = _nested_field_mismatch(
+            data.schema.field(name).type, target.field(name).type, name
+        )
+        nested_missing += m
+        nested_extra += e
+    if nested_missing:
+        raise ValidationError(
+            f"data is missing nested table fields: {nested_missing}",
+            status_code=None,
+        )
+    if nested_extra:
+        raise ValidationError(
+            f"data has nested fields not in the table schema: {nested_extra}",
             status_code=None,
         )
     data = data.select(want)
@@ -1003,6 +1115,26 @@ def _write_one_file(
     return file_reg
 
 
+def _field_id_chains(
+    columns: tuple[Column, ...] | list[Column],
+    prefix: tuple[Column, ...] = (),
+) -> dict[int, list[Column]]:
+    """Every column NODE by field id, mapped to its root-to-node chain.
+
+    Containers are included: the partition path needs to see them to
+    refuse a spec that points at one (or at something under a list or a
+    map), and a "not a live column" error would be the wrong answer for a
+    field that plainly exists.
+    """
+    out: dict[int, list[Column]] = {}
+    for c in columns:
+        chain = (*prefix, c)
+        out[c.field_id] = list(chain)
+        if c.children:
+            out.update(_field_id_chains(c.children, chain))
+    return out
+
+
 def _partition_groups(
     data: pa.Table, info: TableInfo, spec: PartitionSpec
 ) -> list[tuple[tuple[str | None, ...], pa.Table]]:
@@ -1016,23 +1148,27 @@ def _partition_groups(
     a null source value yields a null partition value forming its own
     group, per Iceberg.
     """
-    by_field_id = {c.field_id: c for c in info.columns}
+    # Chains, not a flat map: a partition source may be a struct LEAF, so
+    # reaching it needs the whole root-to-leaf path (and the path is what
+    # tells us whether a list or a map sits in the way).
+    chains = _field_id_chains(info.columns)
     key_names = [f"__hog_pk_{i}" for i in range(len(spec.fields))]
     key_arrays: list[pa.Array] = []
     for pf in spec.fields:
-        col = by_field_id.get(pf.source_field_id)
-        if col is None:
+        chain = chains.get(pf.source_field_id)
+        if chain is None:
             raise ValidationError(
                 f"partition spec (spec_id={spec.spec_id}) references "
                 f"field_id {pf.source_field_id}, which is not a live column "
                 f"of {info.namespace}.{info.name}",
                 status_code=None,
             )
+        col = chain[-1]
         key_arrays.append(
             transform_strings(
                 pf.transform,
                 pf.transform_param,
-                data.column(col.name),
+                partition_source_array(data, chain),
                 col.type,
                 col.type_params,
             )

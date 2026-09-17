@@ -9,8 +9,8 @@ import java.util.UUID
  * (src/main/resources/openapi/hoglake.yaml) and the tables in
  * db/migration/V1__init.sql.
  *
- * [ColType] below is the closed flat column-type vocabulary. Every
- * member has a defined Iceberg facade mapping ([ColType.icebergType],
+ * [ColType] below is the closed column-type vocabulary. Every member has
+ * a defined Iceberg facade mapping ([ColType.icebergType],
  * docs/iceberg-federation.md §2) — that is the membership rule, not a
  * nice-to-have: a type whose facade story is undefined may not be used
  * in a hoglake table. Extending the set is a migration (the
@@ -18,6 +18,19 @@ import java.util.UUID
  * entry. Type names DuckLake has and hoglake permanently refuses live
  * in [ColType.REFUSALS], each with the reason, because "we will never
  * support this, and here is why" is a different answer from "typo".
+ *
+ * The last three members — [ColType.LIST], [ColType.STRUCT],
+ * [ColType.MAP] — are CONTAINERS: they carry no values of their own,
+ * they have children ([ColumnDef.children]), and they never carry
+ * stats bounds. [ColType.isNested] is the one predicate every surface
+ * asks; see docs/iceberg-federation.md §2.8.
+ *
+ * Member ORDER is load-bearing twice over: the migration CHECK and the
+ * OpenAPI enum must list the same names in the same order
+ * (`ScalarTypeParityTest`), and the fuzz seed corpus encodes
+ * `ColType.ordinal` as its first byte — which is why new members are
+ * APPENDED, never inserted (phase 1 inserted, and re-pointed every
+ * committed seed at a different type).
  */
 enum class ColType {
     BOOLEAN,
@@ -43,11 +56,47 @@ enum class ColType {
     JSON,
     UUID_T,
     BINARY,
+
+    /**
+     * Iceberg V3 variant. A catalog SCALAR — no children, no
+     * [ColumnDef.children] — whose PARQUET storage is nonetheless a
+     * group (`metadata`/`value`/`typed_value`). "Scalar" here means one
+     * catalog node, not one parquet node, and every surface that walks
+     * parquet has to know the difference: see FooterStats' variant arm
+     * and the compaction exclusion.
+     */
     VARIANT,
+
+    // ---- containers (phase 2) ----
+    LIST,
+    STRUCT,
+    MAP,
     ;
 
     /** Wire/DB name (lowercase; UUID_T stored as "uuid"). */
     val wire: String get() = if (this == UUID_T) "uuid" else name.lowercase()
+
+    /**
+     * True for the three container types. A nested column holds no
+     * values, so it gets no parquet leaf, no stats row and no bounds;
+     * its scalar descendants are what data and statistics live on.
+     */
+    val isNested: Boolean get() = this == LIST || this == STRUCT || this == MAP
+
+    /**
+     * How many children this type requires, or null when the count is
+     * not fixed (struct: one or more). `list` is exactly one (the
+     * element); `map` is exactly two (key, value) — the parquet and
+     * Iceberg shapes both say so, and a bare `list`/`map` with the wrong
+     * child count is a named 422, never a 500 further down.
+     */
+    val requiredChildCount: Int?
+        get() =
+            when (this) {
+                LIST -> 1
+                MAP -> 2
+                else -> null
+            }
 
     companion object {
         /** The DuckLake geometry family — one refusal reason, many names. */
@@ -62,6 +111,24 @@ enum class ColType {
                 "linestring_z",
                 "geometrycollection",
             )
+
+        /** The synthetic child name Iceberg (and parquet) give a list's element. */
+        const val LIST_ELEMENT = "element"
+
+        /** The synthetic child names Iceberg (and parquet) give a map's entries. */
+        const val MAP_KEY = "key"
+        const val MAP_VALUE = "value"
+
+        /**
+         * The canonical child names for a container, by ordinal. Struct
+         * children keep the user's names, so struct is absent.
+         */
+        fun syntheticChildNames(type: ColType): List<String>? =
+            when (type) {
+                LIST -> listOf(LIST_ELEMENT)
+                MAP -> listOf(MAP_KEY, MAP_VALUE)
+                else -> null
+            }
 
         /**
          * DuckLake type names hoglake refuses PERMANENTLY, mapped to the
@@ -166,10 +233,31 @@ enum class IcebergType {
     STRING,
     UUID,
     BINARY,
+
+    /**
+     * Iceberg V3 variant. [isScalar] is true for it — it is ONE catalog
+     * node with one field id — but it has no single-value encoding
+     * either, so nothing ever writes a variant bound. The bounds paths
+     * reach it through [ColType.VARIANT]'s own arms, which refuse.
+     */
     VARIANT,
+
+    /**
+     * The three Iceberg V2 container types. They exist here so
+     * [ColType.icebergType] stays TOTAL — every hoglake type names its
+     * facade shape — but they carry neither a single-value encoding nor
+     * a promotion: [isScalar] is the predicate the bounds and promotion
+     * paths ask.
+     */
+    LIST,
+    STRUCT,
+    MAP,
     ;
 
     val wire: String get() = name.lowercase()
+
+    /** False for the three containers, which have no single-value encoding. */
+    val isScalar: Boolean get() = this != LIST && this != STRUCT && this != MAP
 }
 
 /**
@@ -228,6 +316,13 @@ val ColType.icebergType: IcebergType
             ColType.UUID_T -> IcebergType.UUID
             ColType.BINARY -> IcebergType.BINARY
             ColType.VARIANT -> IcebergType.VARIANT
+            // Native, one for one: an Iceberg list/struct/map with the
+            // SAME field ids on element/key/value (docs/iceberg-federation.md
+            // §2.8). No conversion, no synthesized ids — which is what
+            // makes the round trip through the facade an identity.
+            ColType.LIST -> IcebergType.LIST
+            ColType.STRUCT -> IcebergType.STRUCT
+            ColType.MAP -> IcebergType.MAP
         }
 
 enum class StatsState {
@@ -420,9 +515,23 @@ fun boundReencodeFor(
         else -> BoundReencode.NONE
     }
 
-/** One typed ALTER TABLE operation. */
+/**
+ * One typed ALTER TABLE operation.
+ *
+ * Column-addressing ops name their target by a DOTTED PATH of column
+ * names — `addr` for a top-level column, `addr.zip` for a field of the
+ * struct `addr`. The identifier policy forbids `.` in a name, so the
+ * path is unambiguous. Only STRUCT interiors are addressable: a path
+ * that steps through a `list` or a `map` is a named 422, because Iceberg
+ * has no rename/drop/add for an element, a key or a value.
+ */
 sealed class AlterOp {
-    data class AddColumn(val def: ColumnDef) : AlterOp()
+    /**
+     * Add a column. [parent] null appends a top-level column; a dotted
+     * path names an existing STRUCT to append a field to (new field id,
+     * ordinal = max sibling + 1).
+     */
+    data class AddColumn(val def: ColumnDef, val parent: String? = null) : AlterOp()
 
     data class DropColumn(val name: String) : AlterOp()
 
@@ -468,18 +577,100 @@ data class NamespaceInfo(
     val name: String,
 )
 
+/**
+ * A requested column shape. Recursive: a container type
+ * ([ColType.isNested]) carries its [children], which are themselves
+ * [ColumnDef]s, and the server assigns their field ids at create/alter
+ * time. Scalars carry `children = null`.
+ *
+ * Child naming follows Iceberg: a `list`'s single child is `element`, a
+ * `map`'s two children are `key` and `value` (and the key is required),
+ * while `struct` children keep the user's names. The server NORMALISES
+ * nothing silently — a synthetic child sent under a different name is a
+ * named 422, because a client that thinks it named the element
+ * something else would then read a schema that disagrees with its own
+ * DDL.
+ */
 data class ColumnDef(
     val name: String,
     val type: ColType,
     val typeParams: Map<String, Any?>? = null,
     val nullable: Boolean = true,
+    val children: List<ColumnDef>? = null,
 )
 
+/**
+ * A materialized catalog column: the assigned [fieldId], the [ordinal]
+ * that orders it AMONG ITS SIBLINGS (top-level columns share the null
+ * parent), and, for containers, the materialized [children].
+ *
+ * [def]`.children` is deliberately NOT populated on a materialized
+ * column — [children] is the one source of truth for the subtree, so
+ * that "which field id is this child" has exactly one answer.
+ */
 data class Column(
     val fieldId: Long,
     val ordinal: Int,
     val def: ColumnDef,
-)
+    val children: List<Column> = emptyList(),
+) {
+    /** This node and every descendant, parents before children (depth-first). */
+    fun selfAndDescendants(): List<Column> = buildList { collectInto(this) }
+
+    private fun collectInto(out: MutableList<Column>) {
+        out.add(this)
+        for (c in children) c.collectInto(out)
+    }
+}
+
+/**
+ * Every node of a column FOREST, parents before children.
+ *
+ * The one thing callers reach for when "the table's columns" has to mean
+ * every field id rather than every top-level column — which is what
+ * hog_file_column_stats is keyed on, since bounds are per LEAF.
+ */
+fun List<Column>.allNodes(): List<Column> = flatMap { it.selfAndDescendants() }
+
+/**
+ * Depth of the deepest node in [defs], counting a top-level column as
+ * depth 1, stopping at [cap]. Used by the create/alter depth cap.
+ *
+ * ITERATIVE, level by level, and that is the whole point: this function
+ * is the depth CHECK, so it is the one place that must survive input the
+ * check exists to refuse. The recursive version overflowed the stack at
+ * roughly twenty thousand levels — a StackOverflowError out of the
+ * validator, before the named 422 the caller was owed, from the code
+ * whose documented job was preventing exactly that.
+ *
+ * [cap] bails early: past it the exact depth stops mattering, since
+ * every answer means the same refusal. The return is therefore
+ * `min(depth, cap)`, and a caller that needs to know whether it bailed
+ * compares against [cap].
+ */
+fun columnDefDepth(
+    defs: List<ColumnDef>,
+    cap: Int = Int.MAX_VALUE,
+): Int {
+    var depth = 0
+    var level = defs
+    while (level.isNotEmpty() && depth < cap) {
+        depth++
+        level = level.flatMap { it.children ?: emptyList() }
+    }
+    return depth
+}
+
+/**
+ * The maximum nesting depth a hoglake column may have, top-level
+ * counting as 1. Eight is not a physical limit — parquet and Iceberg
+ * have none — it is a blast-radius limit: every level multiplies the
+ * field ids allocated, the parquet definition/repetition levels, and
+ * the recursion every surface (DDL, footer stats, the compaction
+ * rewriter, the client) performs per row. A request past it is a named
+ * 422, refused BEFORE any field id is allocated.
+ */
+const val MAX_COLUMN_NESTING_DEPTH: Int = 8
 
 data class TableInfo(
     val tableId: Long,
@@ -696,6 +887,22 @@ data class CompactionResult(
      * schema or the file set changes; skip-with-reason, not a failure.
      */
     val unconvertibleSchema: Long = 0,
+    /**
+     * Groups skipped for a fault that is DURABLE and the writer's:
+     * a value that cannot exist under the type its own file declares (an
+     * empty byte array under a decimal, an unscaled value wider than the
+     * destination precision), a row large enough to threaten the heap,
+     * or a file whose schema contradicts its own registration (the
+     * reserved row-id field id present or absent against
+     * `explicit_row_ids`).
+     *
+     * Skip-with-reason, like [unconvertibleSchema] — but that one clears
+     * when the schema or the file set moves, and this one never does, so
+     * the group is re-planned and re-refused every sweep. Durability and
+     * fault are the axis, not values-versus-schema: nonzero means a
+     * WRITER produced something its own registration or schema forbids.
+     */
+    val invalidData: Long = 0,
     /**
      * Groups that FAILED outright (unreadable input, S3 error, corrupt
      * DV): the group is retried next run, and unlike the skip flavors

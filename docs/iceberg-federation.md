@@ -53,6 +53,20 @@ single-value serialization of the **mapped Iceberg type**, never of the
 hoglake type. That is what keeps manifest generation a mechanical copy
 (§5), and it is why several hoglake types share one encoding.
 
+**The signed zeros**: a `float`/`double` LOWER bound is stored as
+`-0.0` and an UPPER bound as `+0.0`. The two are IEEE-equal, so a
+writer may report either — DuckDB reports `+0.0` for both bounds of an
+all-zero column, pyarrow normalizes — but Iceberg's evaluators compare
+these bounds in NATURAL order, where `-0.0 < 0.0`, so a stored pair of
+(lower `+0.0`, upper `-0.0`) is an EMPTY range and prunes away a file
+that holds `0.0`. Every door that stores a bound canonicalizes by role
+(`StatsSanity.normalizeBound`, `pyhoglake.bounds.normalize_bound`);
+rewriting one zero as the other widens nothing. The cases are pinned
+cross-language under `bound_normalization` in
+`pyhoglake/tests/vectors/bounds_vectors.json`. No other value has two
+encodings a total order would separate: NaN is refused from bounds
+outright, and every remaining type has one encoding per value.
+
 | col_type | Iceberg | parquet physical | bounds |
 |---|---|---|---|
 | `boolean` | boolean | BOOLEAN | 1 byte |
@@ -76,9 +90,9 @@ hoglake type. That is what keeps manifest generation a mechanical copy
 | `timestamptz` | timestamptz | INT64 + TIMESTAMP(MICROS, UTC) | 8-byte LE long, micros |
 | `string` | string | BYTE_ARRAY + STRING | UTF-8 bytes |
 | `json` | string | BYTE_ARRAY + JSON | UTF-8 bytes |
-| `variant` | variant (Iceberg v3) | VARIANT(1) group | none; omit whole-column statistics |
 | `uuid` | uuid | FIXED_LEN_BYTE_ARRAY(16) + UUID | 16 bytes BE |
 | `binary` | binary | BYTE_ARRAY | the bytes |
+| `variant` | variant (Iceberg v3) | VARIANT(1) group | none; omit whole-column statistics |
 
 Three rows carry consequences worth stating out loud.
 
@@ -215,8 +229,150 @@ reason** — never a generic unknown-type error, because "stop trying" and
 | `point`, `linestring`, `polygon`, `multipoint`, `multilinestring`, `multipolygon`, `linestring_z`, `geometrycollection` | DuckLake geometry; out of scope |
 
 Still open from the DuckLake type system: VARIANT (Iceberg V3 has
-`variant` — tracking V3 for `timestamp_ns` does not commit us to it),
-and nested types generally, which the flat model does not admit yet.
+`variant` — tracking V3 for `timestamp_ns` does not commit us to it).
+
+### 2.8 Nested types: `list`, `struct`, `map`
+
+| col_type | Iceberg | parquet | bounds |
+|---|---|---|---|
+| `list` | list | `optional group x (LIST) { repeated group list { <t> element } }` | **none** |
+| `struct` | struct | `optional group x { <fields> }` | **none** |
+| `map` | map | `optional group x (MAP) { repeated group key_value { required <k> key; <v> value } }` | **none** |
+
+The mapping is native and one for one, element/key/value **field ids
+included**: an Iceberg facade presents these columns without converting
+anything or synthesizing an id.
+
+**The column model is a tree.** `hog_column` gained
+`parent_field_id` (V9) — a same-table reference by
+`(catalog_id, table_id, field_id)` identity, deliberately **not** a
+foreign key, because these rows are versioned and an FK would have to
+name one *version* of a parent that a rename or a promote immediately
+retires. Field ids are stable across versions; versions are not.
+`ordinal` orders **siblings**, so the live-ordinal unique index is
+per-parent (`NULLS NOT DISTINCT`, so top-level columns — whose parent is
+NULL — keep the guarantee they always had). Ids are assigned
+**depth-first**, parent before children, which keeps a subtree's ids
+contiguous.
+
+**Shape rules are Iceberg's, and each has its own named 422.** A `list`
+has exactly one child, named `element`, whose nullability is declarable
+(Iceberg's `element-required`). A `map` has exactly two, `key` then
+`value`, and the key is **required** — Iceberg map keys are
+non-nullable and the parquet MAP shape says so too. A `struct` has one
+or more children, which keep the user's names. A scalar has none.
+Nesting depth is capped at **8**, counting a top-level column as 1 — not
+a physical limit (parquet and Iceberg have none) but a blast-radius one:
+every level multiplies field ids, definition/repetition levels, and the
+recursion every surface performs per row.
+
+**Bounds are per LEAF.** A container carries no values, so it gets no
+`hog_file_column_stats` row at all, and a commit shipping
+`column_stats` for a container's field id is refused by name (the server
+never sees the file, so this is the only place it can be caught). A
+list's `element` and a map's `key`/`value` DO get counts and bounds —
+that is Iceberg's own rule for nested fields — and a struct leaf behaves
+exactly like a top-level scalar, same encoding, same width. `value_count`
+for a repeated leaf is the number of VALUES, not of rows.
+
+**Partition and sort sources must be leaves with no repeated ancestor.**
+Iceberg's `source-id` may point at a struct's leaf field, so `addr.zip`
+is a legal source and a struct leaf of a bucketable scalar type is
+bucketable — that is a property of the leaf, and §2.6's allowlist is
+untouched. A container itself is refused (no single value per row), and
+so is anything under a `list` or a `map` (many values per row). Both
+refusals name which of the two applies.
+
+**Promotion: containers never, struct leaves by the ordinary matrix.**
+Promotion is keyed on field id, so a struct leaf promotes and re-encodes
+its bounds exactly like a top-level column; §2.5's intersection applies
+unchanged. A container has no promotion at all, in either direction, and
+says so rather than reporting that this particular target was wrong.
+
+**The alter matrix for nested columns**, by dotted path (`addr.zip`;
+names cannot contain `.`, so the path is unambiguous):
+
+| op | struct interior | list / map interior |
+|---|---|---|
+| `add_column` (with `parent`) | ✅ new field id, appended ordinal | ❌ 422 |
+| `drop_column` | ✅ (not the last field; takes its subtree) | ❌ 422 |
+| `rename_column` | ✅ | ❌ 422 |
+| `promote_column` | ✅ scalar matrix on the leaf | ❌ 422 |
+| anything on the container itself | drop/rename ✅, promote ❌ | drop/rename ✅, promote ❌ |
+
+There is no op for a list's element or a map's key/value because Iceberg
+has none: the container's shape is part of its type, and changing it
+would be a type change, not a column op.
+
+**Compaction rewrites nested columns; it does not refuse them.**
+parquet-java's Group API is already a tree, so the existing
+plan-and-copy pipeline extends one level at a time (the plan becomes a
+tree of steps; the copy recurses through `addGroup`/`getGroup`). The
+alternative — making a nested schema `unconvertible_schema` — was
+cheaper and permanently wrong: a table with one `map` column could then
+never be compacted, and its small-file debt would grow forever with no
+operator lever. The costs are worth stating precisely, because one of them is much
+larger than it looks. The **unsorted** path holds exactly one record at
+a time, so its heap is one row's object graph — bounded by the widest
+row, which `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default 1,000,000
+nodes) is what bounds: a row past it is an `invalid_data` skip rather
+than a process-fatal OOM in a background loop. The allowance is spent
+inside the record materializer as the row is DECODED, and again from a
+fresh allowance by the copy — not counted afterwards, which would be a
+report on memory already taken rather than a bound, and not shared
+across the two phases, which charged the same graph twice and halved the
+ceiling the docs advertised. The unit is NODES: a list element costs two
+of them (entry group plus value), a map entry three, and peak live heap
+is up to twice the budget because both graphs are reachable at once
+(measured: a 999,999-node row rewrites under `-Xmx192m`). The **sorted** path materializes the whole
+group to sort it, and a nested group's object graph is **not** its byte
+size: a measured `list<long>` table with five elements per row peaked at
+343 MiB of heap from a 4.6 MiB compressed input — 70x — because every
+element carries an object header, a field array and a boxed value, none
+of which compression touches. `compaction_target_bytes` is therefore not
+a heap bound for such a table, and the planner derates instead: a table
+with BOTH nested columns and a live sort order is planned under
+`target / HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near
+the top of the measured 30-70x range), which puts the materialized graph
+back under roughly the target. That is a bounded mitigation per GROUP,
+not spilling; the per-ROW bound is the node budget above.
+Inputs are matched by SHAPE, not by the synthetic group names (the
+parquet spec says those are insignificant), but a shape that disagrees
+with the live column — a struct over a primitive, a 2-level legacy list,
+an optional map key — is `unconvertible_schema`, never a guess.
+
+The reader and the rewriter share ONE binding rule (`FooterStats.bindsTo`
+and one file-level "does this file use field ids" gate), because they
+had two and disagreed: a file carrying ids on its container wrappers and
+none on its leaves read as id-less to the reader (zero stats) and
+id-bearing to the rewriter (everything copied). They also share one rule
+about which byte-array bounds may be taken verbatim: only when the
+source leaf's annotation sorts in unsigned-byte order (none, `STRING`,
+`JSON`, `BSON`, `ENUM`, `UUID`). A `DECIMAL`-annotated `BINARY` leaf
+under a `string` column does not — parquet ordered those bytes signed —
+so the reader records null bounds and the rewriter refuses, rather than
+one inventing an inverted pair and the other re-stamping the bytes
+`STRING`.
+
+A fault that is DURABLE and the writer's is the second typed skip,
+`invalid_data`: a value that cannot exist under the type its own file
+declares (an empty byte array under a decimal, an unscaled value past
+the destination precision, a row past the node budget), or a file whose
+schema contradicts its own `explicit_row_ids` registration — the
+reserved row-id field id present on a positional file, or absent from an
+explicit-id one. It is counted apart from `unconvertible_schema` because
+a schema skip clears when the schema or the file set moves, and this one
+never does: retrying it is a permanent loop, and a nonzero count is a
+writer bug rather than a backlog. Durability and fault are the axis, not
+values-versus-schema. Column stats are checked the same way wherever they enter (the
+commit path's client-supplied `column_stats` and the hydrator's footer
+read, one rule): a bound the catalog type cannot decode, or one that
+sorts above its partner IN THAT TYPE'S ORDER, is dropped rather than
+stored — readers prune on these, so a missing bound costs a scan and a
+wrong one costs a wrong answer.
+
+Still open: VARIANT, and `list`/`map` internals as partition sources
+(Iceberg does not define them either).
 
 ## 3. Iceberg-identical partition transforms only
 
@@ -256,6 +412,27 @@ mechanical re-encode. Same rule for `value_counts`/`null_value_counts`
 the registration API's stats shape should be Iceberg-`Metrics`-shaped
 from day one (see [trino-integration.md](trino-integration.md) §2 for
 why this pays twice).
+
+**Bytes in, bytes out.** A `string`/`json` bound IS bytes, and both
+codecs (Kotlin `IcebergSingleValue`, pyhoglake `bounds`) return the raw
+bytes for a bound that is not valid UTF-8 instead of decoding it with
+replacement characters. Decoding `fe 02` lossily gives
+`ef bf bd 02` — four bytes where there were two, sorting somewhere
+else — and compaction's bounds merge is decode → compare → encode, so
+the lossy step silently rewrote a file's bound during a rewrite. A
+non-UTF-8 bound under a `string` column means the FILE is mislabelled;
+the bytes say so.
+
+**Stats are checked where they enter.** Both doors — the commit path's
+client-supplied `column_stats` and the hydrator's footer read — run one
+rule: a bound the catalog type cannot decode (wrong length for a fixed
+-width type, empty for a decimal), or a pair whose `lower` sorts above
+its `upper` IN THAT TYPE'S ORDER, is DROPPED, and a `null_count` above
+its `value_count` is clamped. Every repair warns and increments
+`hoglake_stats_repaired_total{source}`, because it means a writer is
+shipping metadata its own data contradicts. The comparison is typed, not
+bytewise: little-endian `-1` byte-compares ABOVE `1`, so a bytewise
+check would have deleted good pairs and kept bad ones.
 
 ## 6. Metadata-artifact generation and bucket layout
 

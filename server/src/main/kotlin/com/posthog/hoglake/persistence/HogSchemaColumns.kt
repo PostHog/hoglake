@@ -70,6 +70,8 @@ object HogSchemaColumns {
                 setOf(
                     "catalog_id", "table_id", "field_id", "begin_snapshot", "end_snapshot",
                     "name", "col_type", "type_params", "nullable", "ordinal",
+                    // V9: the tree edge; NULL = top-level column.
+                    "parent_field_id",
                 ),
             // CommitService.writeAppends (rollup + row-id allocator).
             "hog_table_stats" to

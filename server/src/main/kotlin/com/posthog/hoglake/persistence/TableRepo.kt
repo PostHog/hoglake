@@ -42,10 +42,19 @@ object TableRepo {
             )
         }
 
-    private val columnMapper =
+    /** One hog_column row, flat: the tree is assembled from these. */
+    private data class ColumnRow(
+        val fieldId: Long,
+        val parentFieldId: Long?,
+        val ordinal: Int,
+        val def: ColumnDef,
+    )
+
+    private val columnRowMapper =
         RowMapper { rs, _ ->
-            Column(
+            ColumnRow(
                 fieldId = rs.getLong("field_id"),
+                parentFieldId = rs.getObject("parent_field_id", java.lang.Long::class.java)?.toLong(),
                 ordinal = rs.getInt("ordinal"),
                 def =
                     ColumnDef(
@@ -56,6 +65,45 @@ object TableRepo {
                     ),
             )
         }
+
+    /**
+     * Assemble flat rows into the column FOREST: top-level columns
+     * (parent_field_id IS NULL) ordered by ordinal, each container's
+     * children likewise.
+     *
+     * A row whose parent is not in the visible set is DROPPED rather
+     * than promoted to top level: the two cannot legitimately disagree
+     * (a subtree is end-snapshotted whole), and silently re-rooting an
+     * orphan would show a `key` or an `element` as a table column.
+     */
+    private fun assemble(rows: List<ColumnRow>): List<Column> {
+        val byParent = rows.groupBy { it.parentFieldId }
+
+        fun build(parent: Long?): List<Column> =
+            (byParent[parent] ?: emptyList())
+                .sortedBy { it.ordinal }
+                .map { row ->
+                    Column(
+                        fieldId = row.fieldId,
+                        ordinal = row.ordinal,
+                        def = row.def,
+                        children = if (row.def.type.isNested) build(row.fieldId) else emptyList(),
+                    )
+                }
+        return build(null)
+    }
+
+    /** Flatten a forest into insertable rows, parents before children. */
+    private fun flatten(
+        columns: List<Column>,
+        parentFieldId: Long?,
+        out: MutableList<Pair<Column, Long?>>,
+    ) {
+        for (c in columns) {
+            out.add(c to parentFieldId)
+            flatten(c.children, c.fieldId, out)
+        }
+    }
 
     /** Insert the identity row; returns the generated table_uuid. */
     fun insertTable(
@@ -137,24 +185,34 @@ object TableRepo {
         }
     }
 
+    /**
+     * Insert a column FOREST at [beginSnapshot], parents before their
+     * children. [parentFieldId] is the parent of the roots of [columns]
+     * — null for top-level columns, the containing struct's field id
+     * when an alter grafts a field into one.
+     */
     fun insertColumns(
         handle: Handle,
         catalogId: Long,
         tableId: Long,
         beginSnapshot: Long,
         columns: List<Column>,
+        parentFieldId: Long? = null,
     ) {
+        val rows = mutableListOf<Pair<Column, Long?>>()
+        flatten(columns, parentFieldId, rows)
+        if (rows.isEmpty()) return
         val batch =
             handle.prepareBatch(
                 """
             INSERT INTO hog_column
                 (catalog_id, table_id, field_id, begin_snapshot, name, col_type,
-                 type_params, nullable, ordinal)
+                 type_params, nullable, ordinal, parent_field_id)
             VALUES (:catalogId, :tableId, :fieldId, :beginSnapshot, :name, :colType,
-                    :typeParams::jsonb, :nullable, :ordinal)
+                    :typeParams::jsonb, :nullable, :ordinal, :parentFieldId)
             """,
             )
-        for (c in columns) {
+        for ((c, parent) in rows) {
             batch
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
@@ -165,6 +223,14 @@ object TableRepo {
                 .bind("typeParams", Pg.toJson(c.def.typeParams))
                 .bind("nullable", c.def.nullable)
                 .bind("ordinal", c.ordinal)
+                // bindByType, NOT bind + bindNull: a prepared BATCH binds
+                // one argument factory per name, and a null bound with
+                // bindNull registers a NullArgument that the next row's
+                // real Long cannot reuse ("No argument factory registered
+                // for '1' of qualified type NullArgument"). A nested
+                // create-table is exactly a batch with both — a top-level
+                // column's NULL parent followed by a child's real one.
+                .bindByType("parentFieldId", parent, Long::class.javaObjectType)
                 .add()
         }
         batch.execute()
@@ -265,28 +331,33 @@ object TableRepo {
             .map(tableRowMapper)
             .list()
 
-    /** Column definitions visible at [snapshot], ordered by ordinal. */
+    /**
+     * The column FOREST visible at [snapshot]: top-level columns in
+     * ordinal order, each container carrying its children (also in
+     * ordinal order, which is per-parent since V9).
+     */
     fun columnsAt(
         handle: Handle,
         catalogId: Long,
         tableId: Long,
         snapshot: Long,
     ): List<Column> =
-        handle.createQuery(
-            """
-            SELECT field_id, name, col_type, type_params, nullable, ordinal
-            FROM hog_column
-            WHERE catalog_id = :catalogId AND table_id = :tableId
-              AND begin_snapshot <= :snapshot
-              AND (end_snapshot IS NULL OR :snapshot < end_snapshot)
-            ORDER BY ordinal
-            """,
+        assemble(
+            handle.createQuery(
+                """
+                SELECT field_id, parent_field_id, name, col_type, type_params, nullable, ordinal
+                FROM hog_column
+                WHERE catalog_id = :catalogId AND table_id = :tableId
+                  AND begin_snapshot <= :snapshot
+                  AND (end_snapshot IS NULL OR :snapshot < end_snapshot)
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+                .map(columnRowMapper)
+                .list(),
         )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("snapshot", snapshot)
-            .map(columnMapper)
-            .list()
 
     fun stats(
         handle: Handle,

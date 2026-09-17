@@ -388,6 +388,14 @@ def test_bucketable_is_an_allowlist_so_a_new_type_is_not_bucketable():
             "timestamp_s",
             "timestamp_ms",
             "timestamp_ns",
+            # The containers, and permanently: a bucket transform needs
+            # one value per row to hash and a container has none of its
+            # own. A struct LEAF of a bucketable scalar type IS
+            # bucketable — that is a property of the leaf, not of the
+            # struct, so nothing here changes for it.
+            "list",
+            "struct",
+            "map",
         }
     )
 

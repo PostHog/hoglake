@@ -11,10 +11,14 @@ Two totality claims under test:
    settles on "long" — see test_uint32_converges_to_long_in_one_hop.
 2. Rejection completeness: every generated exotic arrow type (float16,
    date64, the time32/time64(ns) widths, tz-aware non-micros
-   timestamps, durations, decimal256, and ANY nested or parameterized
-   combinator, even over supported inner types) raises
+   timestamps, durations, decimal256, dictionaries) raises
    UnsupportedTypeError — never a silent wrong mapping, never a
-   different exception type.
+   different exception type — AND so does any nesting that contains
+   one, however deep. list/struct/map over supported inner types are
+   themselves supported since phase 2, so the exotic generator is
+   rooted at unsupported LEAVES: every type it builds carries at least
+   one, which is what keeps the property about rejection rather than
+   about nesting.
 """
 
 import pyarrow as pa
@@ -138,31 +142,37 @@ unsupported_scalar = st.one_of(
     st.sampled_from(_unsupported_scalars),
     # fixed_size_binary of any width except the uuid-blessed 16
     st.integers(1, 64).filter(lambda w: w != 16).map(pa.binary),
+    # dictionary-encoded: even dictionary<string> must be rejected. A
+    # LEAF, not a nesting — hoglake has no dictionary column type, so
+    # there is nothing to descend into.
+    st.sampled_from([pa.string(), pa.int64()]).map(
+        lambda v: pa.dictionary(pa.int32(), v)
+    ),
 )
-
-any_inner = st.one_of(canonical_arrow, unsupported_scalar)
 
 
 def _nest(inner: st.SearchStrategy) -> st.SearchStrategy:
+    """Wrap a strategy in every container spelling arrow offers."""
     return st.one_of(
         inner.map(pa.list_),
         inner.map(pa.large_list),
         st.tuples(inner, st.integers(1, 4)).map(lambda t: pa.list_(t[0], t[1])),
         inner.map(lambda t: pa.struct([("a", t)])),
         st.tuples(inner, inner).map(lambda t: pa.struct([("a", t[0]), ("b", t[1])])),
-        st.tuples(canonical_arrow, inner).map(lambda t: pa.map_(pa.string(), t[1])),
-        # dictionary-encoded: even dictionary<string> must be rejected
-        st.sampled_from([pa.string(), pa.int64()]).map(
-            lambda v: pa.dictionary(pa.int32(), v)
-        ),
+        inner.map(lambda t: pa.map_(pa.string(), t)),
     )
 
 
-exotic_arrow = st.recursive(
-    st.one_of(unsupported_scalar, _nest(any_inner)),
-    _nest,
-    max_leaves=6,
-)
+#: Rooted at UNSUPPORTED leaves, so every generated type contains one
+#: however deeply it is wrapped. Nesting over supported leaves is the
+#: other property below (test_nested_over_supported_inner_is_supported).
+exotic_arrow = st.recursive(unsupported_scalar, _nest, max_leaves=6)
+
+#: The mirror: containers over supported inner types, which ARE
+#: supported. Without this the change that made list/struct/map real
+#: would have been invisible to this module — every assertion here is
+#: about refusal, and refusal got easier, not harder.
+supported_nested = st.recursive(canonical_arrow, _nest, max_leaves=4)
 
 
 # -- round-trip properties --------------------------------------------------
@@ -234,6 +244,37 @@ def test_exotic_types_always_raise_unsupported(t):
 def test_exotic_types_rejected_at_schema_level_too(schema):
     with pytest.raises(UnsupportedTypeError):
         schema_to_column_defs(schema)
+
+
+@given(supported_nested)
+def test_nested_over_supported_inner_is_supported(t):
+    """A container over supported leaves maps, and maps to a container.
+
+    The shape rules ride along: a list's child is always named `element`,
+    a map's are `key` (non-nullable) then `value`, and a struct's keep
+    their own names — the server enforces exactly this, so a client that
+    emitted anything else would be shipping a guaranteed 422.
+    """
+    coltype, params = arrow_type_to_coltype(t)
+    assert params is None or coltype == "decimal"
+    defs = schema_to_column_defs(pa.schema([pa.field("x", t)]))
+    assert len(defs) == 1
+    _assert_nested_shape(defs[0])
+
+
+def _assert_nested_shape(col):
+    kids = col.get("children")
+    if col["type"] not in ("list", "struct", "map"):
+        assert kids is None
+        return
+    assert kids, f"{col['type']} must have children"
+    if col["type"] == "list":
+        assert [k["name"] for k in kids] == ["element"]
+    elif col["type"] == "map":
+        assert [k["name"] for k in kids] == ["key", "value"]
+        assert kids[0]["nullable"] is False
+    for k in kids:
+        _assert_nested_shape(k)
 
 
 def test_unsupported_type_error_is_typeerror_and_hoglake_error():

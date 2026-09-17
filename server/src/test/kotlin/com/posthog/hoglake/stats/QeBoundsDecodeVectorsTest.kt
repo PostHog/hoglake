@@ -125,6 +125,11 @@ class QeBoundsDecodeVectorsTest {
             ColType.UUID_T -> decoded == UUID.fromString(value)
             ColType.BINARY -> (decoded as ByteArray).contentEquals(Base64.getDecoder().decode(value))
             ColType.UINT64, ColType.DECIMAL -> decoded == BigInteger(value)
+            // Containers never appear in the bounds vector file — they
+            // have no single-value encoding — so reaching this arm means
+            // someone put one there.
+            ColType.LIST, ColType.STRUCT, ColType.MAP ->
+                error("nested container '${type.wire}' has no bounds vector")
         }
 
     private companion object {

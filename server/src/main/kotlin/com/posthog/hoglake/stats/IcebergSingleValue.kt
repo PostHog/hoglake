@@ -240,7 +240,15 @@ object IcebergSingleValue {
                     else -> mismatch(type, value)
                 }
             // json maps to Iceberg string: same bytes, no canonicalization.
-            ColType.STRING, ColType.JSON -> encodeString(expect(type, value))
+            // BYTES IN, BYTES OUT: a string bound is bytes on the wire,
+            // and [decode] hands back the raw ByteArray for bytes that
+            // are not valid UTF-8, so this must take one back.
+            ColType.STRING, ColType.JSON ->
+                when (value) {
+                    is String -> encodeString(value)
+                    is ByteArray -> value.copyOf()
+                    else -> mismatch(type, value)
+                }
             ColType.UUID_T -> encodeUuid(expect(type, value))
             ColType.BINARY -> encodeBinary(expect(type, value))
             ColType.DECIMAL ->
@@ -249,7 +257,22 @@ object IcebergSingleValue {
                     is BigInteger -> encodeDecimalUnscaled(value)
                     else -> mismatch(type, value)
                 }
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
         }
+
+    /**
+     * Containers have no Iceberg single-value serialization — a list is
+     * not a value, it is a shape — so encode/decode/compare refuse them
+     * outright rather than inventing bytes. [IllegalArgumentException]
+     * is the codec's documented refusal, so the fuzz target's contract
+     * ("decode never throws anything but IllegalArgumentException")
+     * holds unchanged for the three new members.
+     */
+    private fun noSingleValue(type: ColType): Nothing =
+        throw IllegalArgumentException(
+            "column type '${type.wire}' is a nested container and has no Iceberg single-value " +
+                "encoding; bounds are per LEAF field",
+        )
 
     /**
      * Inverse of [encode] — mirrors pyhoglake's `decode_bound` (the two
@@ -293,7 +316,23 @@ object IcebergSingleValue {
                 expectLength(type, data, 8)
                 Double.fromBits(ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN).long)
             }
-            ColType.STRING, ColType.JSON -> String(data, Charsets.UTF_8)
+            // A String when the bound really is UTF-8 — every honest
+            // string bound — and the RAW BYTES when it is not.
+            //
+            // `String(data, UTF_8)` substitutes U+FFFD for every
+            // ill-formed sequence, so re-encoding the result returns
+            // DIFFERENT BYTES: fe 02 decodes to "\uFFFD\u0002" and
+            // encodes back to ef bf bd 02 — four bytes where there were
+            // two, sorting somewhere else entirely. Compaction's
+            // bounds merge is decode -> compare -> encode, so that lossy
+            // step silently rewrote a file's bound during a rewrite.
+            //
+            // A non-UTF-8 bound under a string column means the FILE is
+            // mislabelled. Returning its bytes says so and keeps
+            // encode(decode(b)) == b total; pyhoglake's decode_bound
+            // makes the same choice, for the same reason.
+            ColType.STRING, ColType.JSON ->
+                if (isValidUtf8(data)) String(data, Charsets.UTF_8) else data.copyOf()
             ColType.UUID_T -> {
                 expectLength(type, data, 16)
                 val buf = ByteBuffer.wrap(data)
@@ -306,6 +345,7 @@ object IcebergSingleValue {
                 require(data.isNotEmpty()) { "empty ${type.wire} encoding" }
                 BigInteger(data)
             }
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
         }
 
     /**
@@ -327,16 +367,47 @@ object IcebergSingleValue {
             ColType.VARIANT -> throw IllegalArgumentException("variant has no scalar bounds encoding")
             // json decodes to a String too, and must use the same unsigned
             // UTF-8 byte order — not String.compareTo.
+            // Either form [decode] can produce — String for UTF-8
+            // bounds, ByteArray for the mislabelled ones — compared as
+            // the bytes they both stand for.
             ColType.STRING, ColType.JSON ->
-                java.util.Arrays.compareUnsigned(
-                    (a as String).toByteArray(Charsets.UTF_8),
-                    (b as String).toByteArray(Charsets.UTF_8),
-                )
+                java.util.Arrays.compareUnsigned(stringBytes(type, a), stringBytes(type, b))
             ColType.BINARY ->
                 java.util.Arrays.compareUnsigned(a as ByteArray, b as ByteArray)
             ColType.UUID_T ->
                 java.util.Arrays.compareUnsigned(encodeUuid(a as UUID), encodeUuid(b as UUID))
+            // Unreachable through decode (it refuses containers first),
+            // but a caller holding two values and a container type is
+            // asking a question with no answer — say so.
+            ColType.LIST, ColType.STRUCT, ColType.MAP -> noSingleValue(type)
             else -> (a as Comparable<Any>).compareTo(b)
+        }
+
+    /** The wire bytes behind a decoded string/json bound, either form. */
+    private fun stringBytes(
+        type: ColType,
+        value: Any,
+    ): ByteArray =
+        when (value) {
+            is String -> value.toByteArray(Charsets.UTF_8)
+            is ByteArray -> value
+            else -> mismatch(type, value)
+        }
+
+    /**
+     * Strict UTF-8 validation — CharsetDecoder with REPORT on both
+     * malformed input and unmappable characters, which is the only
+     * setting that does not silently substitute U+FFFD.
+     */
+    private fun isValidUtf8(data: ByteArray): Boolean =
+        try {
+            Charsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(data))
+            true
+        } catch (_: java.nio.charset.CharacterCodingException) {
+            false
         }
 
     private fun expectLength(

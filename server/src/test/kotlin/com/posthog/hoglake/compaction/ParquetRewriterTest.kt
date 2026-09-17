@@ -22,6 +22,7 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
@@ -97,6 +98,193 @@ class ParquetRewriterTest {
     }
 
     /** Arbitrary-schema writer for the heterogeneous/unconvertible cases. */
+    @Test
+    fun `the node budget is spent while the row is DECODED, not after`() {
+        // The property, not a restatement of the refusal: a budget that
+        // only counted the COPY was a report on memory already taken —
+        // `recordReader.read()` had built the whole source row before
+        // anything looked. So the assertion is on the FRAME the refusal
+        // comes from. It must be inside the record materializer.
+        //
+        // The heap consequence is proved for real, in a small-heap JVM,
+        // by BudgetOomRepro: at the production default budget an
+        // eight-million-element row OOMs the old read path at -Xmx512m
+        // and refuses cleanly on this one.
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("budget")
+        val input =
+            writeCustom(
+                "budget-decode.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    repeat(5_000) { i -> list.addGroup(0).add(0, i.toLong()) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+        val thrown =
+            catchThrowable {
+                ParquetRewriter.rewrite(
+                    listOf(ParquetRewriter.Input(input, 0)),
+                    live,
+                    emptyList(),
+                    tmp.resolve("budget-decode-out.parquet"),
+                    maxNodesPerRow = 64,
+                )
+            }
+        assertThat(thrown).isInstanceOf(InvalidDataException::class.java)
+        val frames = thrown.stackTrace.map { "${it.className}.${it.methodName}" }
+        assertThat(frames)
+            .describedAs("the refusal must come from inside the decode, not from the copy")
+            .anyMatch { it.contains("CountingGroupConverter") || it.contains("CountingPrimitiveConverter") }
+        assertThat(frames.none { it.endsWith("ParquetRewriter.copyField") })
+            .describedAs("nothing should have been copied yet")
+            .isTrue()
+    }
+
+    @Test
+    fun `a list of nulls is charged per entry group`() {
+        // Entry groups are allocated whether or not the element inside
+        // them is present, so charging only the copied elements made a
+        // million-null list free — the one shape that allocates a
+        // million groups and copies nothing.
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("nulls")
+        val input =
+            writeCustom(
+                "budget-nulls.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    // Entries present, elements absent: nothing to copy.
+                    repeat(500) { list.addGroup(0) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                live,
+                emptyList(),
+                tmp.resolve("budget-nulls-out.parquet"),
+                maxNodesPerRow = 100,
+            )
+        }.isInstanceOf(InvalidDataException::class.java)
+    }
+
+    @Test
+    fun `the advertised per-row ceiling is the real one`() {
+        // THE missing test. One allowance shared by the decode and the
+        // copy charges the same graph twice, so the effective ceiling
+        // was HALF the configured value — a table whose widest row sat
+        // between N/2 and N compacted fine before the budget existed and
+        // was refused on every sweep after it, counted `invalid_data`,
+        // a signal documented as "a writer bug, not a backlog". The
+        // server tightened a limit and the telemetry blamed the client.
+        //
+        // The cost model, pinned so the calibration prose stays true: a
+        // list element is TWO nodes (its synthetic entry group plus the
+        // value), and the wrapper is one more.
+        val elements = 500
+        val cost = 2 * elements + 1
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optionalList()
+                        .setElementType(Types.optional(PrimitiveTypeName.INT64).id(2).named("element"))
+                        .id(1)
+                        .named("l"),
+                ).named("ceiling")
+        val input =
+            writeCustom(
+                "budget-ceiling.parquet",
+                schema,
+                listOf({ g: Group ->
+                    val list = g.addGroup(0)
+                    repeat(elements) { i -> list.addGroup(0).add(0, i.toLong()) }
+                }),
+            )
+        val live =
+            listOf(
+                Column(
+                    1,
+                    0,
+                    ColumnDef("l", ColType.LIST, children = listOf(ColumnDef("element", ColType.LONG))),
+                    children = listOf(Column(2, 0, ColumnDef("element", ColType.LONG))),
+                ),
+            )
+
+        fun rewriteAt(budget: Int) =
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                live,
+                emptyList(),
+                tmp.resolve("budget-ceiling-out-$budget.parquet"),
+                maxNodesPerRow = budget,
+            )
+
+        // AT the row's own cost: accepted. Not at twice it.
+        assertThat(rewriteAt(cost).rowsWritten).isEqualTo(1)
+        // One below: refused, so the boundary is where it is claimed and
+        // the test cannot pass by the budget being loose.
+        assertThatThrownBy { rewriteAt(cost - 1) }
+            .isInstanceOf(InvalidDataException::class.java)
+    }
+
+    @Test
+    fun `the budget renews at every row boundary`() {
+        // Per ROW, not per file: a hundred ordinary rows must not add up
+        // to a refusal, or the cap would be a file-size limit wearing a
+        // row-shaped name.
+        val schema =
+            Types.buildMessage()
+                .addField(Types.optional(PrimitiveTypeName.INT64).id(1).named("a"))
+                .named("rows")
+        val input =
+            writeCustom(
+                "budget-renew.parquet",
+                schema,
+                (0 until 100).map { i -> { g: Group -> g.add(0, i.toLong()) } },
+            )
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(ParquetRewriter.Input(input, 0)),
+                listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                emptyList(),
+                tmp.resolve("budget-renew-out.parquet"),
+                maxNodesPerRow = 8,
+            )
+        assertThat(result.rowsWritten).isEqualTo(100)
+    }
+
     private fun writeCustom(
         fileName: String,
         schema: MessageType,
@@ -141,15 +329,22 @@ class ParquetRewriterTest {
                 )
             }.isInstanceOf(UnconvertibleSchemaException::class.java)
         }
+        // The overflow is a DATA refusal, not a schema one: the same two
+        // schemas rewrite fine with in-range values, so re-planning the
+        // group can never help and the counter must say so.
         val overflow = writeCustom("decimal-overflow.parquet", schema, listOf({ it.add(0, 10000000000L) }))
+        val out = tmp.resolve("decimal-overflow-output.parquet")
         assertThatThrownBy {
             ParquetRewriter.rewrite(
                 listOf(ParquetRewriter.Input(overflow, 0)),
                 listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 2)))),
                 emptyList(),
-                tmp.resolve("decimal-overflow-output.parquet"),
+                out,
             )
-        }.isInstanceOf(UnconvertibleSchemaException::class.java).hasMessageContaining("precision")
+        }.isInstanceOf(InvalidDataException::class.java).hasMessageContaining("precision")
+        // And nothing truncated is left behind: a refusal mid-write used
+        // to leave a footer-less file on the path it was handed.
+        assertThat(out).doesNotExist()
     }
 
     @Test
@@ -534,7 +729,15 @@ class ParquetRewriterTest {
         // Second pass: rowIdStart deliberately WRONG (0) — the ids must come
         // from the file's own _hog_row_id column, not position.
         val out2 = tmp.resolve("second.parquet")
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(out1, 0)), liveColumns, emptyList(), out2)
+        ParquetRewriter.rewrite(
+            // out1 is a compaction OUTPUT: the catalog row for it
+            // carries explicit_row_ids, so the rewriter must be told
+            // the same or it will renumber positionally.
+            listOf(ParquetRewriter.Input(out1, 0, null, explicitRowIds = true)),
+            liveColumns,
+            emptyList(),
+            out2,
+        )
         val (schema, rows) = readOutput(out2)
         assertThat(rows.map { it.rowId }).containsExactly(40L, 41L)
         // And the schema still has exactly one row-id column.
@@ -557,7 +760,7 @@ class ParquetRewriterTest {
         val out2 = tmp.resolve("rd-second.parquet")
         val result =
             ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(out1, 0, dv(0))),
+                listOf(ParquetRewriter.Input(out1, 0, dv(0), explicitRowIds = true)),
                 liveColumns,
                 emptyList(),
                 out2,

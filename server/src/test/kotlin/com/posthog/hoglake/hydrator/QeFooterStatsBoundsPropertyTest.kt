@@ -1,5 +1,10 @@
 package com.posthog.hoglake.hydrator
 
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.LoggerContext
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.AppenderBase
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.IcebergType
 import com.posthog.hoglake.model.icebergType
@@ -19,8 +24,10 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
+import org.slf4j.LoggerFactory
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.concurrent.CopyOnWriteArrayList
 import kotlin.random.Random
 
 /**
@@ -494,6 +501,9 @@ class QeFooterStatsBoundsPropertyTest {
             IcebergType.UUID -> 16
             // decimal/string/binary are legitimately variable-length.
             IcebergType.DECIMAL, IcebergType.STRING, IcebergType.BINARY -> null
+            // Containers have no bound at all; no catalog column in this
+            // matrix is one (the shapes are scalar leaves).
+            IcebergType.LIST, IcebergType.STRUCT, IcebergType.MAP -> null
         }
 
     private fun footerFor(
@@ -563,12 +573,27 @@ class QeFooterStatsBoundsPropertyTest {
                 val forbidden = (type to shape.name) in mustRefuse
 
                 for ((min, max) in pairs) {
-                    val agg =
+                    val aggs =
                         FooterStats.aggregate(
                             footerFor(shape, min, max),
                             listOf(columnOf(type)),
                             "s3://qe/f.parquet",
-                        ).singleOrNull()
+                        )
+                    if (type.isNested) {
+                        // A container column over a SCALAR leaf is a shape
+                        // disagreement, and the whole subtree drops — no
+                        // stats row for the container (it has no values)
+                        // and none for a child that is not in the file.
+                        // This is the mustRefuse claim for the three
+                        // container types, over every leaf shape at once.
+                        if (aggs.isNotEmpty()) {
+                            failures +=
+                                "${type.wire} on ${shape.name}: produced ${aggs.size} stats row(s); " +
+                                "a nested container over a scalar leaf must produce none"
+                        }
+                        continue
+                    }
+                    val agg = aggs.singleOrNull()
                     if (agg == null) {
                         // Counts are unconditional: dropping the whole stats row
                         // loses null_count too, not just the bounds.
@@ -619,6 +644,1178 @@ class QeFooterStatsBoundsPropertyTest {
             .describedAs("cell values that produced a bound (refused %d)", refused)
             .isGreaterThan(600)
     }
+
+    // ---- the nested half of the matrix ------------------------------------
+
+    /**
+     * One nested cell: a catalog column tree, the parquet schema a
+     * writer produced for it, and which LEAF field ids must come back
+     * with a bound.
+     *
+     * The mustProduce/mustRefuse split is the same discipline as the
+     * scalar matrix above, and it exists for the same reason: every
+     * structural refusal here is a SAFE answer, so a walk that only
+     * asserted "no wrong bounds" would pass just as happily against a
+     * FooterStats that had stopped descending into nested schemas at
+     * all. Naming the ids that must appear is what keeps it honest.
+     */
+    private class NestedCell(
+        val name: String,
+        val column: CatalogColumn,
+        val schema: MessageType,
+        /** (chunk path, leaf type, min, max) per parquet leaf with statistics. */
+        val leaves: List<NestedLeaf>,
+        /** Field ids that must come back WITH bounds. */
+        val mustProduce: Set<Long>,
+        /** Field ids that must not appear in the results at all. */
+        val mustRefuse: Set<Long>,
+    )
+
+    private class NestedLeaf(
+        val path: List<String>,
+        val type: PrimitiveType,
+        val min: ByteArray,
+        val max: ByteArray,
+    )
+
+    private fun nestedFooter(cell: NestedCell): ParquetMetadata {
+        val block =
+            BlockMetaData().apply {
+                rowCount = 10
+                totalByteSize = 100
+            }
+        for (leaf in cell.leaves) {
+            val st =
+                Statistics.getBuilderForReading(leaf.type)
+                    .withMin(leaf.min)
+                    .withMax(leaf.max)
+                    .withNumNulls(0L)
+                    .build()
+            block.addColumn(
+                ColumnChunkMetaData.get(
+                    ColumnPath.get(*leaf.path.toTypedArray()),
+                    leaf.type,
+                    CompressionCodecName.UNCOMPRESSED,
+                    null,
+                    setOf(Encoding.PLAIN),
+                    st,
+                    4L,
+                    0L,
+                    10L,
+                    100L,
+                    200L,
+                ),
+            )
+        }
+        return ParquetMetadata(FileMetaData(cell.schema, emptyMap(), "qe"), listOf(block))
+    }
+
+    private fun scalarChild(
+        fieldId: Long,
+        name: String,
+        type: ColType,
+    ) = CatalogColumn(fieldId = fieldId, name = name, type = type, decimalScale = null)
+
+    private fun container(
+        fieldId: Long,
+        name: String,
+        type: ColType,
+        vararg children: CatalogColumn,
+    ) = CatalogColumn(fieldId, name, type, null, children.toList())
+
+    private fun optInt(
+        id: Int,
+        name: String,
+    ): PrimitiveType = Types.optional(PrimitiveTypeName.INT32).id(id).named(name)
+
+    private fun optLong(
+        id: Int,
+        name: String,
+    ): PrimitiveType = Types.optional(PrimitiveTypeName.INT64).id(id).named(name)
+
+    private fun reqString(
+        id: Int,
+        name: String,
+    ): PrimitiveType =
+        Types.required(PrimitiveTypeName.BINARY)
+            .`as`(LogicalTypeAnnotation.stringType()).id(id).named(name)
+
+    private fun listGroup(
+        id: Int,
+        name: String,
+        element: org.apache.parquet.schema.Type,
+    ) = Types.optionalGroup()
+        .addField(Types.repeatedGroup().addField(element).named("list"))
+        .`as`(LogicalTypeAnnotation.listType())
+        .id(id).named(name)
+
+    private fun mapGroup(
+        id: Int,
+        name: String,
+        vararg entryFields: org.apache.parquet.schema.Type,
+    ) = Types.optionalGroup()
+        .addField(Types.repeatedGroup().addFields(*entryFields).named("key_value"))
+        .`as`(LogicalTypeAnnotation.mapType())
+        .id(id).named(name)
+
+    private val nestedCells: List<NestedCell> by lazy {
+        buildList {
+            add(
+                NestedCell(
+                    name = "list<int> in the 3-level encoding",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    schema = MessageType("root", listOf(listGroup(1, "l", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(-7), le(9)),
+                        ),
+                    // Iceberg records value_counts and bounds for list
+                    // ELEMENTS; only the container itself gets none.
+                    mustProduce = setOf(2L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map<string,long>",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(2, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                reqString(2, "key"),
+                                bytes(0x41),
+                                bytes(0x7A),
+                            ),
+                            NestedLeaf(
+                                listOf("m", "key_value", "value"),
+                                optLong(3, "value"),
+                                le(-1L),
+                                le(1L shl 40),
+                            ),
+                        ),
+                    mustProduce = setOf(2L, 3L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct{a:int, b:string}",
+                    column =
+                        container(
+                            1,
+                            "s",
+                            ColType.STRUCT,
+                            scalarChild(2, "a", ColType.INT),
+                            scalarChild(3, "b", ColType.STRING),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addFields(optInt(2, "a"), reqString(3, "b"))
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(3), le(300)),
+                            NestedLeaf(listOf("s", "b"), reqString(3, "b"), bytes(0x00), bytes(0xFF)),
+                        ),
+                    mustProduce = setOf(2L, 3L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct{l: list<struct{x: long}>} (three levels)",
+                    column =
+                        container(
+                            1,
+                            "s",
+                            ColType.STRUCT,
+                            container(
+                                2,
+                                "l",
+                                ColType.LIST,
+                                container(3, "element", ColType.STRUCT, scalarChild(4, "x", ColType.LONG)),
+                            ),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(
+                                        listGroup(
+                                            2,
+                                            "l",
+                                            Types.optionalGroup().addField(optLong(4, "x")).id(3).named("element"),
+                                        ),
+                                    )
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("s", "l", "list", "element", "x"),
+                                optLong(4, "x"),
+                                le(Long.MIN_VALUE),
+                                le(Long.MAX_VALUE),
+                            ),
+                        ),
+                    mustProduce = setOf(4L),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list<int> over the LEGACY 2-level encoding",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // repeated PRIMITIVE, not repeated group: the pre-2.x
+                    // shape. Refused rather than guessed — the element's
+                    // field id is not where the 3-level rule says it is.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(Types.repeated(PrimitiveTypeName.INT32).id(2).named("element"))
+                                    .`as`(LogicalTypeAnnotation.listType())
+                                    .id(1).named("l"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "element"),
+                                Types.repeated(PrimitiveTypeName.INT32).id(2).named("element"),
+                                le(1),
+                                le(2),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list whose middle group is OPTIONAL, not repeated",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // The repetition layer is what makes a LIST a list.
+                    // A wrapper group holding a non-repeated group is not
+                    // the 3-level encoding, whatever its annotation says,
+                    // and reading its leaf as the element would report
+                    // one value per row for a column that has many.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(
+                                        Types.optionalGroup()
+                                            .addField(optInt(2, "element"))
+                                            .named("list"),
+                                    )
+                                    .`as`(LogicalTypeAnnotation.listType())
+                                    .id(1).named("l"),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose key_value group has three fields",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                mapGroup(
+                                    1,
+                                    "m",
+                                    reqString(2, "key"),
+                                    optLong(3, "value"),
+                                    optInt(9, "extra"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                reqString(2, "key"),
+                                bytes(0x41),
+                                bytes(0x7A),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct declared over a primitive leaf",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema = MessageType("root", listOf(optInt(1, "s"))),
+                    leaves = listOf(NestedLeaf(listOf("s"), optInt(1, "s"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list whose element carries NO field id (positional fallback)",
+                    column = container(2, "l", ColType.LIST, scalarChild(3, "element", ColType.INT)),
+                    // The identity check must not become "ids required".
+                    // An id-less child keeps the positional binding —
+                    // the same exemption missingFieldIds grants the
+                    // repetition layer — and such a file is already
+                    // flagged, so renames on its table are blocked and
+                    // position cannot drift out from under it. Tighten
+                    // this to "must have an id" and every element in a
+                    // partially-id'd file loses its bounds.
+                    //
+                    // The sibling `k` is what makes the file id-BEARING
+                    // (usesFieldIds walks leaves): without it the whole
+                    // file would take the name-binding path and this
+                    // cell would be testing something else entirely.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                optInt(1, "k"),
+                                listGroup(
+                                    2,
+                                    "l",
+                                    Types.optional(PrimitiveTypeName.INT32).named("element"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "list", "element"),
+                                Types.optional(PrimitiveTypeName.INT32).named("element"),
+                                le(5),
+                                le(9),
+                            ),
+                        ),
+                    mustProduce = setOf(3L),
+                    mustRefuse = setOf(2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list whose element carries a DIFFERENT field id",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    // The wrapper matches by id; the element does not.
+                    // Bound by POSITION alone, the file's leaf 99 would
+                    // have its counts and bounds recorded under catalog
+                    // field 2 — a range describing other data, on a field
+                    // id this file never claimed, which is what a pruner
+                    // then skips files on.
+                    schema = MessageType("root", listOf(listGroup(1, "l", optInt(99, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("l", "list", "element"), optInt(99, "element"), le(1000), le(1002)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 99L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose value carries an id the catalog does not know",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(2, "key"), optLong(99, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("m", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                            NestedLeaf(listOf("m", "key_value", "value"), optLong(99, "value"), le(500L), le(501L)),
+                        ),
+                    // The KEY matches and the VALUE does not, and the
+                    // whole entry is refused rather than half-recorded:
+                    // a map whose members disagree with the catalog is
+                    // not a map the catalog can describe.
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L, 99L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose key is OPTIONAL",
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    // The rewriter refuses this file outright (the output
+                    // key is REQUIRED, so a row with none would fail the
+                    // write mid-group). The reader used to accept it, so
+                    // the two surfaces disagreed about which files they
+                    // handle — the drift maxUnsignedParquetWidth is
+                    // shared to prevent. A file compaction will never
+                    // rewrite should not accumulate stats as though it
+                    // will.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                mapGroup(
+                                    1,
+                                    "m",
+                                    Types.optional(PrimitiveTypeName.BINARY)
+                                        .`as`(LogicalTypeAnnotation.stringType()).id(2).named("key"),
+                                    optLong(3, "value"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("m", "key_value", "key"),
+                                Types.optional(PrimitiveTypeName.BINARY)
+                                    .`as`(LogicalTypeAnnotation.stringType()).id(2).named("key"),
+                                bytes(0x61),
+                                bytes(0x7A),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct declared over a LIST-annotated group with its field id",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    // The reader's half of the rewriter's refusal. A
+                    // container wearing a struct's id is a type mismatch,
+                    // and saying so beats every child quietly missing.
+                    schema = MessageType("root", listOf(listGroup(1, "s", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct over a REPEATED plain group",
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    // "many per row" where the catalog says "one". This
+                    // side counted every repetition as a value (vc=6 for
+                    // 3 rows) while the rewriter copied repetition 0 and
+                    // dropped the rest — two wrong answers to one file.
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(Types.repeatedGroup().addField(optInt(2, "a")).id(1).named("s")),
+                        ),
+                    leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "scalar over a REPEATED primitive",
+                    column = scalarChild(1, "x", ColType.INT),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(Types.repeated(PrimitiveTypeName.INT32).id(1).named("x")),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("x"),
+                                Types.repeated(PrimitiveTypeName.INT32).id(1).named("x"),
+                                le(1),
+                                le(9),
+                            ),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct over a MAP-annotated group",
+                    // The reader's half of the rewriter's refusal, for
+                    // MAP as well as LIST — the LIST cell alone left the
+                    // map door untested.
+                    column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "s", reqString(2, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "map whose KEY carries a different field id",
+                    // The key twin of the value cell above: an id
+                    // mismatch on either member is a map the catalog
+                    // cannot describe, and only one of the two was pinned.
+                    column =
+                        container(
+                            1,
+                            "m",
+                            ColType.MAP,
+                            scalarChild(2, "key", ColType.STRING),
+                            scalarChild(3, "value", ColType.LONG),
+                        ),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(mapGroup(1, "m", reqString(98, "key"), optLong(3, "value"))),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("m", "key_value", "key"), reqString(98, "key"), bytes(0x61), bytes(0x7A)),
+                            NestedLeaf(listOf("m", "key_value", "value"), optLong(3, "value"), le(1L), le(2L)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L, 3L, 98L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "struct-shaped group with a NON-container annotation",
+                    // The overreach control. ENUM says nothing about
+                    // shape, so this must still bound — refusing it made
+                    // the table uncompactable AND unbounded at once.
+                    column =
+                        container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                Types.optionalGroup()
+                                    .addField(optInt(2, "a"))
+                                    .`as`(LogicalTypeAnnotation.enumType())
+                                    .id(1).named("s"),
+                            ),
+                        ),
+                    leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(3), le(300))),
+                    mustProduce = setOf(2L),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+            add(
+                NestedCell(
+                    name = "list<int> whose element leaf is physically BOOLEAN",
+                    column = container(1, "l", ColType.LIST, scalarChild(2, "element", ColType.INT)),
+                    schema =
+                        MessageType(
+                            "root",
+                            listOf(
+                                listGroup(
+                                    1,
+                                    "l",
+                                    Types.optional(PrimitiveTypeName.BOOLEAN).id(2).named("element"),
+                                ),
+                            ),
+                        ),
+                    leaves =
+                        listOf(
+                            NestedLeaf(
+                                listOf("l", "list", "element"),
+                                Types.optional(PrimitiveTypeName.BOOLEAN).id(2).named("element"),
+                                bytes(0),
+                                bytes(1),
+                            ),
+                        ),
+                    // The element MATCHES structurally, so its counts are
+                    // honest; only the per-arm decode refuses, leaving the
+                    // bounds NULL. This is the phase-1 discipline reaching
+                    // one level down, and the reason mustRefuse is checked
+                    // separately from "no row at all".
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L),
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun `nested shapes produce leaf bounds and refuse container and shape-mismatched ones`() {
+        val failures = mutableListOf<String>()
+        for (cell in nestedCells) {
+            val aggs =
+                FooterStats.aggregate(
+                    nestedFooter(cell),
+                    listOf(cell.column),
+                    "s3://qe/nested.parquet",
+                )
+            val byField = aggs.associateBy { it.fieldId }
+            for (id in cell.mustProduce) {
+                val agg = byField[id]
+                when {
+                    agg == null -> failures += "${cell.name}: field $id produced no stats row"
+                    agg.lowerBound == null || agg.upperBound == null ->
+                        failures += "${cell.name}: field $id produced a stats row with NULL bounds"
+                }
+            }
+            for (id in cell.mustRefuse) {
+                if (byField.containsKey(id)) {
+                    failures += "${cell.name}: field $id produced a stats row and must not have"
+                }
+            }
+            // Nothing outside the declared tree may appear at all.
+            val declared = declaredFieldIds(cell.column)
+            for (agg in aggs) {
+                if (agg.fieldId !in declared) {
+                    failures += "${cell.name}: stats row for field ${agg.fieldId}, which is not in the column tree"
+                }
+            }
+        }
+        assertThat(failures).describedAs("nested decode-matrix violations").isEmpty()
+        // Non-vacuity, both directions: the cells above must actually
+        // exercise production AND refusal.
+        assertThat(nestedCells.flatMap { it.mustProduce }).isNotEmpty()
+        assertThat(nestedCells.flatMap { it.mustRefuse }).isNotEmpty()
+    }
+
+    @Test
+    fun `a file declaring one field id twice produces NO stats at all`() {
+        // Every lookup elects the FIRST match, so one id on two fields
+        // had whichever came first silently elected — measured, bounds
+        // from `first` recorded for a column the file also declares as
+        // `second`. There is no rule saying which is right, so there is
+        // no binding to make: the file keeps whatever stats it already
+        // had rather than gaining something invented.
+        val cell =
+            NestedCell(
+                name = "duplicate ids",
+                column = scalarChild(1, "x", ColType.INT),
+                schema =
+                    MessageType(
+                        "root",
+                        listOf(optInt(1, "first"), optInt(1, "second")),
+                    ),
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("first"), optInt(1, "first"), le(0), le(2)),
+                        NestedLeaf(listOf("second"), optInt(1, "second"), le(1000), le(1002)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/dup.parquet"))
+            .isEmpty()
+
+        // Deep, too: a duplicate inside a struct is the same hazard, and
+        // a sweep that only looked at the top level would miss it.
+        val deep =
+            NestedCell(
+                name = "duplicate ids inside a struct",
+                column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                schema =
+                    MessageType(
+                        "root",
+                        listOf(
+                            optInt(2, "top"),
+                            Types.optionalGroup().addField(optInt(2, "a")).id(1).named("s"),
+                        ),
+                    ),
+                leaves = listOf(NestedLeaf(listOf("s", "a"), optInt(2, "a"), le(1), le(2))),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(deep), listOf(deep.column), "s3://qe/dupdeep.parquet"))
+            .isEmpty()
+    }
+
+    @Test
+    fun `a container CATALOG row with the wrong child count degrades, never throws`() {
+        // A corrupt or hand-edited catalog: a map column with three
+        // children indexed past the end and threw IndexOutOfBounds
+        // straight out of the hydrator sweep, which fails the file AND
+        // burns a retry every pass.
+        val cell =
+            NestedCell(
+                name = "3-child map",
+                column =
+                    container(
+                        1,
+                        "m",
+                        ColType.MAP,
+                        scalarChild(2, "key", ColType.STRING),
+                        scalarChild(3, "value", ColType.LONG),
+                        scalarChild(4, "extra", ColType.INT),
+                    ),
+                schema =
+                    MessageType("root", listOf(mapGroup(1, "m", reqString(2, "key"), optLong(3, "value")))),
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("m", "key_value", "key"), reqString(2, "key"), bytes(0x61), bytes(0x7A)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L, 3L, 4L),
+            )
+        assertThat(FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/arity.parquet"))
+            .isEmpty()
+
+        val listCell =
+            NestedCell(
+                name = "childless list",
+                column = container(1, "l", ColType.LIST),
+                schema = MessageType("root", listOf(listGroup(1, "l", optInt(2, "element")))),
+                leaves =
+                    listOf(NestedLeaf(listOf("l", "list", "element"), optInt(2, "element"), le(1), le(2))),
+                mustProduce = emptySet(),
+                mustRefuse = setOf(1L, 2L),
+            )
+        assertThat(
+            FooterStats.aggregate(nestedFooter(listCell), listOf(listCell.column), "s3://qe/arity2.parquet"),
+        ).isEmpty()
+    }
+
+    @Test
+    fun `two structs with a same-named leaf do not pool their chunks`() {
+        // Leaves are matched on the FULL chunk path. A name-only match
+        // sums `a.id` and `b.id` into one row whose bounds describe
+        // neither column — and both still look perfectly well-formed.
+        val columns =
+            listOf(
+                container(1, "a", ColType.STRUCT, scalarChild(2, "id", ColType.INT)),
+                container(3, "b", ColType.STRUCT, scalarChild(4, "id", ColType.INT)),
+            )
+        val schema =
+            MessageType(
+                "root",
+                listOf(
+                    Types.optionalGroup().addField(optInt(2, "id")).id(1).named("a"),
+                    Types.optionalGroup().addField(optInt(4, "id")).id(3).named("b"),
+                ),
+            )
+        val cell =
+            NestedCell(
+                name = "two structs, one leaf name",
+                column = columns[0],
+                schema = schema,
+                leaves =
+                    listOf(
+                        NestedLeaf(listOf("a", "id"), optInt(2, "id"), le(1), le(2)),
+                        NestedLeaf(listOf("b", "id"), optInt(4, "id"), le(100), le(200)),
+                    ),
+                mustProduce = emptySet(),
+                mustRefuse = emptySet(),
+            )
+        val aggs = FooterStats.aggregate(nestedFooter(cell), columns, "s3://qe/two.parquet")
+        val byField = aggs.associateBy { it.fieldId }
+        assertThat(byField.keys).containsExactlyInAnyOrder(2L, 4L)
+        assertThat(byField.getValue(2L).upperBound).isEqualTo(IcebergSingleValue.encodeInt(2))
+        assertThat(byField.getValue(4L).lowerBound).isEqualTo(IcebergSingleValue.encodeInt(100))
+    }
+
+    // ---- the field-id contract over nested schemas -------------------------
+
+    /**
+     * A foreign file with ids on every LEAF but none on the struct group
+     * holding them. Iceberg puts an id on the struct too; a writer that
+     * does not has produced a file whose struct binds by NAME.
+     */
+    private fun leafIdsOnlySchema(structName: String): MessageType =
+        MessageType(
+            "foreign",
+            listOf(
+                optInt(1, "k"),
+                Types.optionalGroup()
+                    .addFields(optInt(4, "a"), reqString(5, "b"))
+                    // deliberately NO .id(...) on the group
+                    .named(structName),
+            ),
+        )
+
+    @Test
+    fun `a container group without a field id is flagged, so the rename guard fires`() {
+        // THE data-loss scenario, at its first link. Unflagged, the
+        // rename guard does not fire; after `rename_column addr ->
+        // location` the compaction rewriter can match the subtree
+        // neither by id (the group has none) nor by name (it changed),
+        // null-fills it, and end-snapshots the input — which expiry then
+        // deletes. Silent, permanent, uncounted.
+        assertThat(FooterStats.missingFieldIds(leafIdsOnlySchema("addr")))
+            .describedAs("a struct group with no field id binds by NAME and must be flagged")
+            .isTrue()
+        // The same file still USES field ids for its leaves, so stats
+        // still bind by id — the two questions are different, and only
+        // one of them is about renames.
+        assertThat(FooterStats.usesFieldIds(leafIdsOnlySchema("addr"))).isTrue()
+    }
+
+    @Test
+    fun `a fully id-bearing nested schema is not flagged`() {
+        // The control. Every binding node — leaves AND container
+        // wrappers — carries an id, which is what pyarrow and hoglake's
+        // own writer both emit.
+        val schema =
+            MessageType(
+                "ok",
+                listOf(
+                    optInt(1, "k"),
+                    Types.optionalGroup()
+                        .addFields(optInt(4, "a"), reqString(5, "b"))
+                        .id(3).named("addr"),
+                    listGroup(6, "tags", reqString(7, "element")),
+                    mapGroup(8, "props", reqString(9, "key"), optLong(10, "value")),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isFalse()
+    }
+
+    @Test
+    fun `the synthetic repetition groups are exempt, or every rewrite would self-flag`() {
+        // THE trap. parquet inserts `repeated group list` inside a LIST
+        // and `repeated group key_value` inside a MAP; neither is a
+        // column, Iceberg has no id to match against one, and neither
+        // pyarrow nor hoglake's own compaction output writes one.
+        // Flagging them would make every rewrite produce a file that
+        // instantly fails its own contract check and blocks renames on
+        // its own table forever.
+        val listSchema = MessageType("l", listOf(listGroup(1, "tags", reqString(2, "element"))))
+        val mapSchema =
+            MessageType("m", listOf(mapGroup(1, "props", reqString(2, "key"), optLong(3, "value"))))
+        for (schema in listOf(listSchema, mapSchema)) {
+            assertThat(schema.getFields()[0].asGroupType().getType(0).id)
+                .describedAs("the fixture really does omit the repetition layer's id")
+                .isNull()
+            assertThat(FooterStats.missingFieldIds(schema))
+                .describedAs("%s", schema.getFields()[0].name)
+                .isFalse()
+        }
+    }
+
+    @Test
+    fun `the exemption is by SHAPE, so a foreign-named repetition layer is still exempt`() {
+        // The name-regression fence. `list` and `key_value` are parquet's
+        // CONVENTIONS, not its rules — the spec says the repetition
+        // layer's name is insignificant, and writers in the wild use
+        // `bag`, `array`, `map`, `entries`. An exemption that matched
+        // those two literals would pass every other test in this file
+        // (they all use the canonical names) and then flag every
+        // foreign-written nested file as id-less, blocking renames on
+        // its table for a reason that is not true.
+        //
+        // Every binding node below HAS its id; only the repetition
+        // layer's name is exotic. The answer must be false.
+        val exoticMap =
+            MessageType(
+                "m",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addFields(reqString(2, "k"), optLong(3, "v"))
+                                .named("zzz_entries"),
+                        )
+                        .`as`(LogicalTypeAnnotation.mapType())
+                        .id(1).named("m"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticMap))
+            .describedAs("a MAP repetition layer named 'zzz_entries' is exempt by shape")
+            .isFalse()
+
+        val exoticList =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(Types.repeatedGroup().addField(optInt(2, "el")).named("bag"))
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticList))
+            .describedAs("a LIST repetition layer named 'bag' is exempt by shape")
+            .isFalse()
+
+        // ...and the exemption does not become a blanket one: the same
+        // exotic shapes with an id-less ELEMENT are still flagged, so
+        // "by shape" is not "by wishful thinking".
+        val exoticListIdlessElement =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(Types.optional(PrimitiveTypeName.INT32).named("el"))
+                                .named("bag"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(exoticListIdlessElement)).isTrue()
+    }
+
+    @Test
+    fun `a LIST wrapper without its own field id is still flagged`() {
+        // The wrapper binds; only the repetition layer under it is
+        // exempt. An exemption written per-annotation rather than
+        // per-shape would have swallowed this one too.
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    // .named without .id: the wrapper carries no field id.
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup().addField(reqString(2, "element")).named("list"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isTrue()
+    }
+
+    @Test
+    fun `a LIST wrapper holding a non-repeated group exempts nothing`() {
+        // The exemption's SHAPE clause, isolated. `repeated` is what
+        // makes a group the repetition layer; a LIST-annotated wrapper
+        // whose single child is an OPTIONAL group is a foreign shape
+        // (FooterStats.matchInto refuses it for stats too), and that
+        // inner group binds like any other — id or flag. Dropping the
+        // repetition clause would exempt it and let an id-less group
+        // through under a LIST annotation.
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            // OPTIONAL, not repeated — and no id.
+                            Types.optionalGroup().addField(reqString(3, "element")).named("inner"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema))
+            .describedAs("an id-less non-repeated group under a LIST wrapper still binds")
+            .isTrue()
+    }
+
+    @Test
+    fun `an unmatched CONTAINER logs at warn, an unmatched scalar does not`() {
+        // The level is the finding. A scalar the file predates is
+        // ordinary schema evolution and belongs at debug; a container
+        // that cannot be matched silently drops every leaf beneath it —
+        // the same unmatchability that made the compaction rewriter
+        // null-fill a whole subtree — and has to be findable in a log.
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(FooterStats::class.java.name) as Logger
+        logger.addAppender(appender)
+        try {
+            // A file holding only `k`; the catalog also knows a struct
+            // and a scalar the file has never seen.
+            val cell =
+                NestedCell(
+                    name = "absent",
+                    column = scalarChild(1, "k", ColType.INT),
+                    schema = MessageType("root", listOf(optInt(1, "k"))),
+                    leaves = listOf(NestedLeaf(listOf("k"), optInt(1, "k"), le(1), le(2))),
+                    mustProduce = emptySet(),
+                    mustRefuse = emptySet(),
+                )
+            FooterStats.aggregate(
+                nestedFooter(cell),
+                listOf(
+                    cell.column,
+                    scalarChild(7, "added_later", ColType.STRING),
+                    container(8, "addr", ColType.STRUCT, scalarChild(9, "city", ColType.STRING)),
+                ),
+                "s3://qe/absent.parquet",
+            )
+            val warns = events.filter { it.level == Level.WARN }.map { it.formattedMessage }
+            // Anchored on the FACTS an operator greps for — the file and
+            // the column — not on the wording. A prose edit that left the
+            // guard intact used to kill this test, which trains people
+            // to loosen the assertion rather than read it.
+            assertThat(warns)
+                .describedAs("the missing container names its file and column")
+                .anySatisfy({ m ->
+                    assertThat(m).contains("s3://qe/absent.parquet")
+                    assertThat(m).contains("addr")
+                    assertThat(m).contains("8") // its field id
+                })
+            assertThat(warns)
+                .describedAs("the missing scalar is not loud")
+                .noneSatisfy({ m -> assertThat(m).contains("added_later") })
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
+    fun `a struct over a LIST-annotated group SAYS SO rather than going quiet`() {
+        // The reader's half of the rewriter's refusal, and the only
+        // thing that half can be asserted on. findField would never have
+        // matched the struct's children inside a LIST wrapper anyway —
+        // its one child is the unnamed, id-less repetition layer — so
+        // the outcome was already "no stats". The guard's whole value is
+        // that the outcome stops being SILENT: the rewriter refuses this
+        // file outright, and an operator whose table quietly lost its
+        // struct bounds needs the two surfaces saying the same thing.
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(FooterStats::class.java.name) as Logger
+        logger.addAppender(appender)
+        try {
+            val cell =
+                NestedCell(
+                    name = "struct over a list",
+                    column = container(1, "s", ColType.STRUCT, scalarChild(2, "a", ColType.INT)),
+                    schema = MessageType("root", listOf(listGroup(1, "s", optInt(2, "element")))),
+                    leaves =
+                        listOf(
+                            NestedLeaf(listOf("s", "list", "element"), optInt(2, "element"), le(1), le(2)),
+                        ),
+                    mustProduce = emptySet(),
+                    mustRefuse = setOf(1L, 2L),
+                )
+            val aggs = FooterStats.aggregate(nestedFooter(cell), listOf(cell.column), "s3://qe/sol.parquet")
+            assertThat(aggs).describedAs("no stats, with or without the guard").isEmpty()
+            assertThat(events.filter { it.level == Level.WARN }.map { it.formattedMessage })
+                .describedAs("...but the file, the column and the reason are in the log")
+                .anySatisfy({ m ->
+                    assertThat(m).contains("s3://qe/sol.parquet")
+                    assertThat(m).contains("field 1")
+                    assertThat(m).contains("not a struct")
+                })
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+    }
+
+    @Test
+    fun `a legacy 2-level list's repeated element is NOT exempt`() {
+        // In the 2-level encoding the repeated node IS the element — a
+        // real column that needs its id. The exemption is by SHAPE (a
+        // repeated GROUP under the wrapper), never by "it sits under a
+        // LIST annotation".
+        val schema =
+            MessageType(
+                "l",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(Types.repeated(PrimitiveTypeName.INT32).named("element"))
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("tags"),
+                ),
+            )
+        assertThat(FooterStats.missingFieldIds(schema)).isTrue()
+    }
+
+    @Test
+    fun `a schema whose only columns are nested still binds by field id`() {
+        // usesFieldIds decides whether the hydrator binds by id (the LIVE
+        // column set) or by NAME (the set at the file's begin_snapshot).
+        // A nested-only file has no top-level primitive leaf at all, so a
+        // top-level-only check answers FALSE for a perfectly id-bearing
+        // file and sends it down the name-binding path — where a
+        // synthetic `element` or `key` matches nothing and every bound
+        // disappears.
+        val schema =
+            MessageType(
+                "root",
+                listOf(
+                    Types.optionalGroup()
+                        .addField(
+                            Types.repeatedGroup()
+                                .addField(optInt(2, "element"))
+                                .named("list"),
+                        )
+                        .`as`(LogicalTypeAnnotation.listType())
+                        .id(1).named("l"),
+                ),
+            )
+        assertThat(FooterStats.usesFieldIds(schema)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schema))
+            .describedAs("the synthetic repetition group carries no id, and that is not a gap")
+            .isFalse()
+    }
+
+    private fun declaredFieldIds(col: CatalogColumn): Set<Long> =
+        setOf(col.fieldId) + col.children.flatMap { declaredFieldIds(it) }
 
     /** Claims 1 and 2 for one produced bound pair. */
     private fun violations(

@@ -12,6 +12,7 @@ import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.initialColumns
+import com.posthog.hoglake.model.nodeCount
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.DeleteFileReadRepo
@@ -42,6 +43,20 @@ import java.util.UUID
  * begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
 class CatalogService(private val jdbi: Jdbi) {
+    companion object {
+        /**
+         * Ceiling on a catalog's `data_path`.
+         *
+         * S3 keys stop at 1024 bytes and a data_path is only the PREFIX
+         * under which keys are built, so anything near this is already
+         * unusable — the bound exists because nothing else provided one
+         * (the column is `text` with no CHECK, the OpenAPI schema is a
+         * bare string), and an unbounded value registered once is echoed
+         * by every overlap refusal afterwards.
+         */
+        const val MAX_DATA_PATH_LENGTH = 512
+    }
+
     // ---- catalogs --------------------------------------------------------
 
     fun createCatalog(
@@ -70,8 +85,10 @@ class CatalogService(private val jdbi: Jdbi) {
                     val theirPrefix = existing.dataPath.trimEnd('/') + "/"
                     if (newPrefix.startsWith(theirPrefix) || theirPrefix.startsWith(newPrefix)) {
                         throw HoglakeException.Validation(
-                            "data_path '$dataPath' overlaps catalog '${existing.name}' " +
-                                "(data_path '${existing.dataPath}'); catalog data_paths must be disjoint",
+                            "data_path '${Identifiers.cap(dataPath)}' overlaps catalog " +
+                                "'${existing.name}' (data_path " +
+                                "'${Identifiers.cap(existing.dataPath)}'); " +
+                                "catalog data_paths must be disjoint",
                         )
                     }
                 }
@@ -96,6 +113,17 @@ class CatalogService(private val jdbi: Jdbi) {
      */
     private fun validateDataPath(dataPath: String) {
         if (dataPath.isBlank()) throw HoglakeException.Validation("data_path must not be blank")
+        // A LENGTH BOUND, which nothing provided: the column is `text`
+        // with no CHECK, validateDataPath tested shape but never size,
+        // and the OpenAPI schema is a bare string. A 100 KB data_path
+        // registered fine and then rode into every overlap 422 any later
+        // catalog triggered — capping the echo only shortens the
+        // message, it does not stop the value being stored.
+        if (dataPath.length > MAX_DATA_PATH_LENGTH) {
+            throw HoglakeException.Validation(
+                "data_path is ${dataPath.length} characters, over the maximum $MAX_DATA_PATH_LENGTH",
+            )
+        }
         if (dataPath.any { it.isWhitespace() || it.isISOControl() }) {
             throw HoglakeException.Validation("data_path must not contain whitespace or control characters")
         }
@@ -105,7 +133,8 @@ class CatalogService(private val jdbi: Jdbi) {
         val bucket = rest.substringBefore('/')
         if (bucket.isEmpty()) {
             throw HoglakeException.Validation(
-                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, got '$dataPath'",
+                "data_path must be s3://<bucket>[/<prefix>] with a non-empty bucket, " +
+                    "got '${Identifiers.cap(dataPath)}'",
             )
         }
         if (rest.split('/').any { it == "." || it == ".." }) {
@@ -210,7 +239,12 @@ class CatalogService(private val jdbi: Jdbi) {
             tableId,
         )
         val createdUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid)
-        val firstFieldId = TableRepo.allocateFieldIds(h, cat.catalogId, tableId, columns.size)
+        // nodeCount, not columns.size: a nested column needs one id per
+        // NODE, not one per top-level column. Allocating by size would
+        // hand back a range too short and every subtree after the first
+        // container would collide with the next table's ids.
+        val firstFieldId =
+            TableRepo.allocateFieldIds(h, cat.catalogId, tableId, nodeCount(columns))
         val cols = initialColumns(columns)
         check(firstFieldId == cols.first().fieldId) { "new table field allocation must start at one" }
         TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
@@ -236,11 +270,17 @@ class CatalogService(private val jdbi: Jdbi) {
         if (columns.isEmpty()) {
             throw HoglakeException.Validation("table '$name' must have at least one column")
         }
-        columns.forEach { Identifiers.validate("column", it.name) }
-        val dupes = columns.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
-        if (dupes.isNotEmpty()) {
-            throw HoglakeException.Validation("duplicate column names: ${dupes.sorted()}")
-        }
+        // Column NAMES are validated by ColumnTrees too, at every
+        // nesting level rather than only this top one.
+        // Nesting shape, node cap, depth cap, synthetic child names, map-key
+        // requiredness, per-parent duplicate names — all of it BEFORE a
+        // field id is allocated for any part of the request, and here
+        // rather than in createTable so the PREPARE side of an atomic
+        // creation refuses a malformed nested definition at prepare
+        // time instead of at publish, when the receipt already exists.
+        // (ColumnTrees subsumes the flat duplicate-name check: it
+        // applies the same rule per sibling group.)
+        ColumnTrees.validate(columns)
     }
 
     fun dropTable(

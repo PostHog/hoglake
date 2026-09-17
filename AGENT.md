@@ -177,9 +177,16 @@ there would break that gate on every build.
    disagrees with its registration in EITHER direction, because the
    server cannot detect the disagreement (registration never opens the
    parquet; `/verify` is metadata-only). Both refusals are implemented
-   and tested in `duckdb-client/`; the server does not yet enforce the
-   reserved `_hog` prefix that protects the carrier (finding 9 in
-   duckdb-client/DESIGN.md).
+   and tested in `duckdb-client/`, and COMPACTION enforces them
+   server-side as well — it is the one server surface that does open
+   the parquet, so `ParquetRewriter.rowIdCarrier` refuses both
+   directions before a rewrite can launder a file that disagrees with
+   its registration. The server also enforces the reserved `_hog`
+   prefix that protects the carrier now
+   (`Identifiers.RESERVED_COLUMN_PREFIX`, at every nesting level), so
+   duckdb-client/DESIGN.md finding 9 is closed for names created
+   through the DDL; files registered before the reservation, or written
+   by a foreign writer, are still what the refusals above are for.
 3. **One live deletion vector per data file** (unique partial index);
    supersessions only grow (`delete_count` monotone); a DV newer than
    your `read_snapshot` is a 409, never a lost update.
@@ -396,9 +403,26 @@ there would break that gate on every build.
   to reclaim, and the commit re-claims the ticket first so a drain that
   won the race just aborts the group. Still deliberate: the background
   loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
-  on is an ops decision, not a code gap. Remaining rewrite deferrals
-  (all surface as `unconvertible_schema` skips, never wrong bytes):
-  nested schemas, INT96, decimal-scale changes, and non-native
+  on is an ops decision, not a code gap. **Nested schemas rewrite** —
+  list/struct/map are copied through recursively (the plan is a tree of
+  steps; parquet-java's Group API already is one), so a nested table is
+  compactable like any other; an input whose nested SHAPE disagrees with
+  the live column is `unconvertible_schema`, never a guess. A fault that is DURABLE and
+  the WRITER's is the OTHER typed skip, `invalid_data`: a value that
+  cannot exist under the type its own file declares (an empty blob under
+  a decimal, an unscaled value past the destination precision, a row
+  past `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW`), a file whose schema
+  contradicts its own `explicit_row_ids` registration (invariant 2's
+  reserved field id present or absent), or a registered `.dv` object
+  whose bytes do not decode — the decoder's refusals, including the
+  containment around the roaring library, about bytes it already holds;
+  the object-store FETCH stays retryable. Durability and fault are the
+  axis, not values-versus-schema — a schema skip clears when the schema
+  or the file set moves, and this one never does, so it is re-planned
+  and re-refused every sweep and a nonzero count is a writer bug rather
+  than a backlog. Remaining
+  rewrite deferrals (all surface as `unconvertible_schema` skips, never
+  wrong bytes): INT96, decimal-scale changes, and non-native
   time(stamp) units — each timestamp type accepts only the unit its own
   files carry (millis for `timestamp_s`/`timestamp_ms`, micros for
   `timestamp`/`timestamptz`, nanos for `timestamp_ns`), and `time`

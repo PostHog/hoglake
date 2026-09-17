@@ -299,6 +299,12 @@ class AlterScalarTypeIntegrationTest {
             ColType.BOOLEAN, ColType.FLOAT, ColType.DOUBLE, ColType.JSON, ColType.VARIANT,
             ColType.UINT32, ColType.UINT64,
             ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS, ColType.TIMESTAMP_NS,
+            // The containers are not bucketable and never will be: a
+            // bucket transform needs one value per row to hash, and a
+            // container has none of its own. A struct LEAF of a
+            // bucketable scalar type is bucketable, which is a property
+            // of the leaf, not of the struct.
+            ColType.LIST, ColType.STRUCT, ColType.MAP,
         )
         assertThat(AlterService.BUCKETABLE_TYPES + notBucketable)
             .describedAs("every type is classified exactly once")

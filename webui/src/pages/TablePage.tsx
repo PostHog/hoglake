@@ -3,7 +3,8 @@ import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import { getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
-import type { Int64, Table } from "../api/types";
+import { formatColumnType } from "../api/types";
+import type { Column, Int64, Table } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
@@ -109,8 +110,30 @@ function SnapshotSelector({
   );
 }
 
+/**
+ * One row per column NODE, containers included: dotted name, depth for
+ * indentation, and the node itself. A nested schema is otherwise
+ * unreadable here — the field ids of a struct's fields are exactly what
+ * an operator comes to this page for.
+ */
+function flattenColumns(
+  columns: Column[],
+  prefix = "",
+  depth = 0,
+): { path: string; depth: number; column: Column }[] {
+  return [...columns]
+    .sort((a, b) => a.ordinal - b.ordinal)
+    .flatMap((c) => {
+      const path = prefix ? `${prefix}.${c.name}` : c.name;
+      return [
+        { path, depth, column: c },
+        ...flattenColumns(c.children ?? [], path, depth + 1),
+      ];
+    });
+}
+
 function SchemaTab({ table }: { table: Table }) {
-  const columns = [...table.columns].sort((a, b) => a.ordinal - b.ordinal);
+  const columns = flattenColumns(table.columns);
   return (
     <div>
       <table className="data-table">
@@ -124,11 +147,13 @@ function SchemaTab({ table }: { table: Table }) {
           </tr>
         </thead>
         <tbody>
-          {columns.map((c) => (
+          {columns.map(({ path, depth, column: c }) => (
             <tr key={c.field_id}>
               <td className="num mono">{c.field_id}</td>
-              <td>{c.name}</td>
-              <td className="mono">{c.type}</td>
+              <td style={{ paddingLeft: `${depth * 1.25}rem` }}>{c.name}</td>
+              <td className="mono" title={path}>
+                {formatColumnType(c)}
+              </td>
               <td
                 className="nullable-mark"
                 title={c.nullable === false ? "not null" : "nullable"}

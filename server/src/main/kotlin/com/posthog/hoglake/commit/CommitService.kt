@@ -1,16 +1,19 @@
 package com.posthog.hoglake.commit
 
+import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.wireObjectMapper
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import java.util.UUID
@@ -147,8 +150,7 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
-        val append = ResolvedAppend(namespace, table, tableId, files, null)
-        validateFiles(h, catalogId, append)
+        val append = validateFiles(h, catalogId, ResolvedAppend(namespace, table, tableId, files, null))
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =
@@ -178,6 +180,8 @@ class CommitService(
         /** ", reached at <time>" suffix for 410 messages (TimeTravelRepo's convention). */
         fun reachedAtSuffix(): String = earliestSnapshotTime?.let { ", reached at $it" } ?: ""
     }
+
+    private val log = KotlinLogging.logger {}
 
     /** Live partition spec header: id + field arity. */
     private data class LiveSpec(val specId: Long, val fieldCount: Int)
@@ -328,10 +332,10 @@ class CommitService(
                 ResolvedDeletes(namespace, table, tableId, files)
             }
 
-        // 3. Structural validation. Nothing is written unless all of it passes.
-        for (append in resolvedAppends) {
-            validateFiles(h, catalogId, append)
-        }
+        // 3. Structural validation. Nothing is written unless all of it
+        // passes. The RESULT is what gets written: validateFiles also
+        // sanitizes each file's stats (StatsSanity).
+        val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
         validateDeleteRegistrations(resolvedDeletes)
 
         // 3b. Removal-queue collision check (under the commit lock, so it
@@ -449,7 +453,7 @@ class CommitService(
         changeBatch.execute()
 
         var nextFileId = firstFileId
-        nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, resolvedAppends)
+        nextFileId = writeAppends(h, catalogId, snapshotId, nextFileId, validatedAppends)
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
         req.idempotencyKey?.let { key ->
@@ -916,32 +920,38 @@ class CommitService(
             .orElse(null)
             ?.takeIf { it.fieldCount > 0 }
 
+    /**
+     * Structural checks on one append's files, returning the append with
+     * its stats SANITIZED (StatsSanity): a bound that cannot be decoded
+     * as its column's type, or that sorts above its partner, is dropped
+     * rather than stored, and impossible counts are clamped. The return
+     * value is what gets written — using the argument instead would
+     * store exactly the rows this pass exists to repair.
+     */
     private fun validateFiles(
         h: Handle,
         catalogId: Long,
         append: ResolvedAppend,
-    ) {
+    ): ResolvedAppend {
         val qualified = "${append.namespace}.${append.table}"
-        val liveFieldIds: Set<Long> by lazy {
+        // field_id -> col_type. The TYPE is carried because a stats row
+        // is only meaningful for a LEAF: hog_file_column_stats holds
+        // counts and bounds, and a list/struct/map has neither. A client
+        // shipping stats for a container id is confused about the shape
+        // of its own file, and a silent accept would put a bound on a
+        // column no reader can decode it for.
+        val liveColumnTypes: Map<Long, String> by lazy {
             h.createQuery(
                 """
-                SELECT field_id FROM hog_column
+                SELECT field_id, col_type FROM hog_column
                  WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL
                 """,
             )
                 .bind(0, catalogId)
                 .bind(1, append.tableId)
-                .mapTo(Long::class.java)
-                .toSet()
-        }
-        val variantFieldIds: Set<Long> by lazy {
-            h.createQuery(
-                """
-                SELECT field_id FROM hog_column
-                WHERE catalog_id = ? AND table_id = ? AND end_snapshot IS NULL AND col_type = 'variant'
-                """,
-            )
-                .bind(0, catalogId).bind(1, append.tableId).mapTo(Long::class.java).toSet()
+                .map { rs, _ -> rs.getLong("field_id") to rs.getString("col_type") }
+                .toList()
+                .toMap()
         }
         for (file in append.files) {
             if (file.path.isBlank()) {
@@ -986,14 +996,27 @@ class CommitService(
             val stats = file.columnStats ?: continue
             val seenFieldIds = HashSet<Long>()
             for (stat in stats) {
-                if (stat.fieldId in variantFieldIds) {
+                val colType =
+                    liveColumnTypes[stat.fieldId]
+                        ?: throw HoglakeException.Validation(
+                            "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",
+                        )
+                // #77's refusal, kept, read off the SAME live type map
+                // the container check below uses rather than a second
+                // per-table query. (Its own query was already depth
+                // -agnostic — every hog_column row, not just the
+                // top-level ones — so this is one query fewer, not a
+                // behaviour change.)
+                if (ColType.fromWire(colType) == ColType.VARIANT) {
                     throw HoglakeException.Validation(
                         "variant column statistics are not supported; omit field_id ${stat.fieldId}",
                     )
                 }
-                if (stat.fieldId !in liveFieldIds) {
+                if (ColType.fromWire(colType).isNested) {
                     throw HoglakeException.Validation(
-                        "unknown field_id ${stat.fieldId} in stats for ${file.path} in $qualified",
+                        "field_id ${stat.fieldId} in stats for ${file.path} in $qualified is a " +
+                            "'$colType' column; nested containers carry no values, so stats are " +
+                            "per LEAF field — ship the element/key/value/struct-field ids instead",
                     )
                 }
                 if (!seenFieldIds.add(stat.fieldId)) {
@@ -1009,6 +1032,48 @@ class CommitService(
                 }
             }
         }
+        return sanitizeStats(append, liveColumnTypes)
+    }
+
+    /**
+     * Drop the bounds a client cannot have meant and clamp the counts it
+     * cannot have measured, per file, warning once per repaired row.
+     *
+     * The commit is NOT refused: the file's data is fine, its metadata
+     * is not, and a 422 here would reject a correct append over a
+     * cosmetic field the writer can fix later. Readers prune on these
+     * bounds, though, so storing a wrong one is a wrong answer — hence
+     * drop rather than keep, counted so the writer's bug is visible.
+     */
+    private fun sanitizeStats(
+        append: ResolvedAppend,
+        liveColumnTypes: Map<Long, String>,
+    ): ResolvedAppend {
+        val qualified = "${append.namespace}.${append.table}"
+        val files =
+            append.files.map { file ->
+                val stats = file.columnStats ?: return@map file
+                val checked =
+                    stats.map { stat ->
+                        val type = liveColumnTypes[stat.fieldId]?.let { ColType.fromWire(it) }
+                        val result = StatsSanity.check(stat, type)
+                        if (result.repairs.isNotEmpty()) {
+                            Metrics.statsRepaired("commit")
+                            log.warn {
+                                "column_stats for field_id ${stat.fieldId} of ${file.path} in " +
+                                    "$qualified are not internally consistent " +
+                                    "(${result.repairs.joinToString("; ")}); storing the repaired row"
+                            }
+                        }
+                        result.stats
+                    }
+                // The sanitizer's output is what gets stored, whether or
+                // not it reported anything. Taking it only when a repair
+                // was REPORTED dropped the signed-zero canonicalization
+                // on the floor, which is silent and not a repair.
+                file.copy(columnStats = checked)
+            }
+        return append.copy(files = files)
     }
 
     /** DB-independent DV registration checks: shapes, ranges, duplicate targets. */

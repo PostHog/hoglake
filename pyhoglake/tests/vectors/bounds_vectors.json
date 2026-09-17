@@ -809,5 +809,102 @@
       "hex": "0000000000000080",
       "note": "int64 min nanos"
     }
-  ]
+  ],
+  "bound_normalization": {
+    "description": "Iceberg's single-value rule for the signed zeros: a float/double LOWER bound is stored as -0.0 and an UPPER bound as +0.0. The two are IEEE-equal, so normalizing widens nothing, but a total-order evaluator (Iceberg compares float/double bounds in natural order, where -0.0 < 0.0) reads a stored pair of (lower=+0.0, upper=-0.0) as an EMPTY range and skips a file that holds 0.0. Every door that stores a bound applies this; the bytes are the contract, so each case gives the raw encoding a writer may hand over and the encoding that must be stored for that role.",
+    "case_fields": "type: hoglake column type. role: 'lower' | 'upper'. raw_hex: the bound as produced. stored_hex: what normalization must store. Cases where raw_hex == stored_hex are the fixed points and must not be skipped -- normalizing the wrong role is the error they catch.",
+    "cases": [
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "00000000",
+        "stored_hex": "00000080",
+        "note": "+0.0 lower becomes -0.0"
+      },
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "00000080",
+        "stored_hex": "00000080",
+        "note": "-0.0 lower is already canonical"
+      },
+      {
+        "type": "float",
+        "role": "upper",
+        "raw_hex": "00000080",
+        "stored_hex": "00000000",
+        "note": "-0.0 upper becomes +0.0"
+      },
+      {
+        "type": "float",
+        "role": "upper",
+        "raw_hex": "00000000",
+        "stored_hex": "00000000",
+        "note": "+0.0 upper is already canonical"
+      },
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "0000803f",
+        "stored_hex": "0000803f",
+        "note": "a non-zero float is untouched"
+      },
+      {
+        "type": "double",
+        "role": "lower",
+        "raw_hex": "0000000000000000",
+        "stored_hex": "0000000000000080",
+        "note": "+0.0 lower becomes -0.0"
+      },
+      {
+        "type": "double",
+        "role": "lower",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000080",
+        "note": "-0.0 lower is already canonical"
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000000",
+        "note": "-0.0 upper becomes +0.0"
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "0000000000000000",
+        "stored_hex": "0000000000000000",
+        "note": "+0.0 upper is already canonical"
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "000000000000f03f",
+        "stored_hex": "000000000000f03f",
+        "note": "a non-zero double is untouched"
+      },
+      {
+        "type": "int",
+        "role": "lower",
+        "raw_hex": "00000000",
+        "stored_hex": "00000000",
+        "note": "integer zero has one representation; no type but float and double normalizes"
+      },
+      {
+        "type": "long",
+        "role": "upper",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000080",
+        "note": "the double -0.0 bytes read as a long bound are the value -2^63 and must survive untouched"
+      },
+      {
+        "type": "decimal",
+        "role": "lower",
+        "raw_hex": "00",
+        "stored_hex": "00",
+        "note": "decimal zero is one minimal two's-complement byte; nothing to normalize"
+      }
+    ]
+  }
 }
