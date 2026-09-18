@@ -364,7 +364,11 @@ class TestE2EThroughputAccounting:
             ensure_bucket=lambda: None, new_catalog=lambda slug: catalog
         )
         args = argparse.Namespace(
-            rows=20_000, batch_rows=5_000, duration=None, url="http://x"
+            rows=20_000,
+            batch_rows=5_000,
+            duration=None,
+            url="http://x",
+            table_schema="simple",
         )
         report = end_to_end.run(bench, args)
         m = next(m for m in report.metrics if m.name == "append.real_parquet")
