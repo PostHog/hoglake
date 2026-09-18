@@ -39,7 +39,11 @@ def test_all_quick_smoke(live_server_url, tmp_path):
         "expiry-throughput",
         "ddl-churn",
         "end-to-end-writer",
+        "analytics-lifecycle",
     }
     for line in lines:
         rec = json.loads(line)
         assert rec["metrics"], f"{rec['scenario']} recorded no metrics"
+        assert rec["io_mode"] in ("metadata-only", "mixed", "end-to-end"), (
+            f"{rec['scenario']} journaled no io_mode"
+        )
