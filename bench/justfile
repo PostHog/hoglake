@@ -11,6 +11,11 @@ default:
 sync:
     {{_uv}} sync
 
+# Build the runnable bench image; the context is the REPO ROOT (unlike server's and webui's recipes) because bench installs pyhoglake from the sibling tree
+[group('development')]
+docker-build tag="hoglake-bench:dev":
+    docker build -f {{source_directory()}}/Dockerfile -t {{tag}} {{source_directory()}}/..
+
 # All scenarios, including metadata-only benchmarks (~2-3 min; live server required)
 [group('suites')]
 quick:
