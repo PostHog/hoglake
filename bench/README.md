@@ -172,6 +172,47 @@ wrote 101.0 MB in 43 files across 6 tables in 4.6s (target 100.0 MB, +1.0% — o
 `seed` is deliberately **not** a scenario: `all` never runs it, it
 journals no metrics, and it flags no regressions.
 
+## Running in-cluster
+
+Seeding a deployed environment means running bench *next to* the server
+rather than from a laptop: the harness is a writer — it uploads the parquet
+and the server only registers the paths — so it needs the bucket, and the
+bucket is reachable from inside the cluster with no key material at all.
+
+`bench/deploy/bench-pod.yaml` is a shell for that. It runs as the
+`gigahog-server` ServiceAccount, one of the two identities the IRSA role
+trusts, so AWS credentials arrive through the projected web-identity token.
+The three `HOGLAKE_S3_*` settings are deliberately **empty**: an empty
+endpoint means real AWS instead of the local MinIO default, and empty keys
+mean the SDK's credential chain rather than the local stack's `hoglake` /
+`hoglake123`.
+
+```sh
+kubectl apply -f bench/deploy/bench-pod.yaml
+kubectl -n gigahog cp bench bench-shell:/work/bench       # the harness itself
+kubectl -n gigahog exec -it bench-shell -- bash
+
+# inside the pod
+pip install --quiet uv && cd /work/bench && uv sync --quiet
+uv run hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
+```
+
+`--bucket` is the environment's own bucket; bench writes under a per-run
+prefix and never asks AWS to create it (the role carries no
+`s3:CreateBucket`, and the bucket is terraform's). Catalogs are named
+`bench-<scenario>-<run-id>-<n>`, so a run cannot collide with anything else
+in the catalog and is obvious to find later.
+
+Nothing in the pod starts on its own — it sleeps until you drive it. It is a
+bare Pod rather than a Deployment, so deleting it is the whole cleanup:
+
+```sh
+kubectl -n gigahog delete pod bench-shell
+```
+
+The data it wrote is not cleaned up by that, which is the point; drop the
+`bench-*` catalogs when you no longer want them.
+
 ## Reading the output
 
 One line per metric:
