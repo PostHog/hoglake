@@ -155,7 +155,17 @@ describe("TablePage", () => {
       `"lower_bound":"aardvark","upper_bound":"🦔"},` +
       `{"field_id":14,"name":"note","path":"note","type":"string",` +
       `"value_count":500000,"null_count":500000,"lower_bound":null,` +
-      `"upper_bound":null}]}`;
+      `"upper_bound":null},` +
+      `{"field_id":15,"name":"active","path":"active","type":"boolean",` +
+      `"value_count":500000,"null_count":0,"lower_bound":false,` +
+      `"upper_bound":true},` +
+      `{"field_id":16,"name":"score","path":"score","type":"double",` +
+      `"value_count":500000,"null_count":0,"lower_bound":-0.0,` +
+      `"upper_bound":"Infinity"},` +
+      `{"field_id":17,"name":"seen_at","path":"seen_at","type":"timestamptz",` +
+      `"value_count":500000,"null_count":0,` +
+      `"lower_bound":"1970-01-01T00:00:00Z",` +
+      `"upper_bound":"2026-09-05T12:00:00Z"}]}`;
     mockFetch((url) => {
       const [path] = url.split("?");
       if (path === `${base}/files/101/stats`)
@@ -185,6 +195,16 @@ describe("TablePage", () => {
     expect(screen.getByText("tags.element")).toBeInTheDocument();
     // All-null column: explicit null bounds, flagged as "no bound".
     expect(screen.getAllByTitle(/no bound stored/)).toHaveLength(2);
+    // Boolean bounds render their JSON tokens, never a placeholder.
+    expect(screen.getByText("false")).toBeInTheDocument();
+    expect(screen.getByText("true")).toBeInTheDocument();
+    // The Infinity sentinel STRING reaches the cell verbatim.
+    expect(screen.getByText("Infinity")).toBeInTheDocument();
+    // -0.0 keeps its sign: the raw token is the value (String(-0) in a
+    // double round-trip would render "0").
+    expect(screen.getByText("-0.0")).toBeInTheDocument();
+    // Temporal bounds are the server's ISO strings, verbatim.
+    expect(screen.getByText("2026-09-05T12:00:00Z")).toBeInTheDocument();
 
     // Collapse hides the panel again.
     await user.click(
