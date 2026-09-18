@@ -54,8 +54,35 @@ dependencies {
     implementation("org.flywaydb:flyway-core:$flywayVersion")
     implementation("org.flywaydb:flyway-database-postgresql:$flywayVersion")
 
-    // Object store
+    // Object store. Both S3 clients (ObjectStore, RemovalStore) leave the
+    // credentials provider unset when HOGLAKE_S3_ACCESS_KEY/_SECRET_KEY are
+    // blank, which is the in-cluster case: the SDK then walks
+    // DefaultCredentialsProvider, whose third link is
+    // WebIdentityTokenFileCredentialsProvider — IRSA.
+    //
+    // `sts` is a RUNTIME requirement of that link, not an optional extra, and
+    // nothing in the code imports it. WebIdentityTokenFileCredentialsProvider's
+    // constructor calls WebIdentityCredentialsUtils.factory(), which
+    // reflectively loads
+    // software.amazon.awssdk.services.sts.internal.StsWebIdentityCredentialsProviderFactory
+    // (that string is a literal in the auth module's bytecode) to build the
+    // StsClient that calls AssumeRoleWithWebIdentity. Without this artifact the
+    // load fails, the SDK logs "To use web identity tokens, the 'sts' service
+    // module must be on the class path", the constructor SWALLOWS the
+    // IllegalStateException into a `loadException` field, and the failure only
+    // reappears at resolveCredentials() — so the server simply has no
+    // credentials in EKS while looking healthy. Observed in gigahog dev.
+    // AwsCredentialsClasspathTest is the regression.
+    //
+    // Pinned to awsSdkVersion deliberately: the v2 SDK ships every module from
+    // one release train (s3 and sts have identical version lists on Maven
+    // Central) and the modules share internal APIs, so they move in lockstep.
+    // No BOM is used anywhere in this build; the shared `val` is the pin.
+    // No HTTP client module is implied: the factory builds a SYNCHRONOUS
+    // StsClient, and the `services` parent pom already gives both s3 and sts a
+    // runtime apache5-client, so this adds a jar, not a transport.
     implementation("software.amazon.awssdk:s3:$awsSdkVersion")
+    runtimeOnly("software.amazon.awssdk:sts:$awsSdkVersion")
 
     // parquet-java is THE parquet library (decision 2026-09-05: Hardwood is
     // out entirely — field ids are a contract, and parquet-java reads AND
