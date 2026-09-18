@@ -1,0 +1,33 @@
+# Context filter for the one image built from the REPO ROOT:
+# bench/Dockerfile, which needs bench/ and pyhoglake/ together (bench
+# installs the client from the sibling tree). server/ and webui/ build
+# from their own directories and carry their own .dockerignore files.
+#
+# The first block is the one that has actually bitten: a host .venv is
+# macOS-built binaries, and a copy of it into a linux image either
+# fails at import or, worse, shadows the image's own install. Keep it
+# out of the context entirely rather than relying on the Dockerfile not
+# to COPY it.
+**/.venv/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.flox/
+
+.git/
+.github/
+
+# Trees the bench image does not install. Excluded by name so the
+# context stays small and a change over there cannot invalidate a
+# layer here; add a line if a new top-level tree appears.
+server/
+webui/
+duckdb-client/
+hedgerow/
+docs/
+
+# Local run artifacts.
+**/bench-results.jsonl
+**/*.log

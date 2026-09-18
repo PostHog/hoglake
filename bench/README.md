@@ -187,15 +187,27 @@ endpoint means real AWS instead of the local MinIO default, and empty keys
 mean the SDK's credential chain rather than the local stack's `hoglake` /
 `hoglake123`.
 
+The pod runs `ghcr.io/posthog/hoglake-bench`, which already contains the
+harness and its dependencies (`bench/Dockerfile`, published per commit by
+`.github/workflows/bench-image.yml`). Nothing to copy in, nothing to
+install: apply, exec, run.
+
 ```sh
 kubectl apply -f bench/deploy/bench-pod.yaml
-kubectl -n gigahog cp bench bench-shell:/work/bench       # the harness itself
-kubectl -n gigahog exec -it bench-shell -- bash
-
-# inside the pod
-pip install --quiet uv && cd /work/bench && uv sync --quiet
-uv run hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
+kubectl -n gigahog exec -it bench-shell -- \
+  hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
 ```
+
+`kubectl -n gigahog exec -it bench-shell -- bash` for a shell instead, if you
+want to run several scenarios without waiting on a pull each time.
+
+The image is tagged `latest` and by commit sha, and the publish job's summary
+prints the multi-arch manifest digest; pin the pod to a sha tag or a digest
+when a run has to be reproducible. It carries the `pyhoglake` from the same
+commit as the harness — the pair the repo tests — rather than the newest
+release on PyPI, which is a different client (main carries a `.dev0` version
+PyPI has never seen). `uv sync --no-sources` is the escape hatch if you ever
+need the published client instead; nothing in the image uses it.
 
 `--bucket` is the environment's own bucket; bench writes under a per-run
 prefix and never asks AWS to create it (the role carries no
@@ -212,6 +224,33 @@ kubectl -n gigahog delete pod bench-shell
 
 The data it wrote is not cleaned up by that, which is the point; drop the
 `bench-*` catalogs when you no longer want them.
+
+### Iterating on an unmerged branch
+
+The image only ever holds merged code. To run a branch that has not been
+published yet, ship the working tree into `/work` and put it ahead of the
+image's own install on `PYTHONPATH`:
+
+```sh
+git archive HEAD bench pyhoglake |
+  kubectl -n gigahog exec -i bench-shell -- tar x -C /work
+kubectl -n gigahog exec -it bench-shell -- env \
+  PYTHONPATH=/work/bench/src:/work/pyhoglake/src \
+  hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
+```
+
+Both trees, not just `bench` — bench installs the client from
+`../pyhoglake`, so a `bench`-only archive leaves the two halves from
+different commits. The image installs both packages **non-editable**
+precisely so `PYTHONPATH` wins; an editable install's import hook would
+outrank it and silently keep running the baked-in harness.
+
+`git archive` and not `kubectl cp`. `cp` tars the directory as it is on
+disk, which means your `.venv` — macOS-built binaries, headed into a linux
+container — plus a wall of tar ownership errors on the way. If a `.venv`
+does land in there, uv warns about a non-existent interpreter and rebuilds
+the environment: alarming, harmless, and entirely avoided by archiving from
+the index instead of the working directory.
 
 ## Reading the output
 

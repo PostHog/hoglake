@@ -1,17 +1,21 @@
 # A shell with the synthetic-data tools, next to a gigahog server.
 #
+# The image already contains bench and its dependencies (bench/Dockerfile,
+# published by .github/workflows/bench-image.yml), so there is nothing to
+# copy in and nothing to install: apply, exec, run. Nothing deploys this
+# image — you pull it by hand, here.
+#
 # It runs as the gigahog-server ServiceAccount because that is one of the two
 # identities the IRSA role trusts — which is how the pod reaches S3 without
 # any key material. Bench is a WRITER in hoglake's footer-shipping model: it
 # uploads the parquet itself and the server only registers the paths, so the
 # pod needs the bucket, not just the API.
 #
-# Nothing runs on its own. The container sleeps; you copy bench in and drive
-# it by hand (see bench/README.md, "Running in-cluster").
+# Nothing runs on its own. The container sleeps; you drive it by hand (see
+# bench/README.md, "Running in-cluster").
 #
 #   kubectl apply -f bench/deploy/bench-pod.yaml
-#   kubectl -n gigahog cp bench bench-shell:/work/bench
-#   kubectl -n gigahog exec -it bench-shell -- bash
+#   kubectl -n gigahog exec -it bench-shell -- hoglake-bench seed --gb 0.5 --bucket <bucket>
 #
 # Delete it when you are done: it is a pod, not a Deployment, so nothing
 # brings it back.
@@ -28,9 +32,24 @@ spec:
   # node evicts the server it is writing to.
   priorityClassName: null
   restartPolicy: Never
+  # The image runs as uid 10001. fsGroup is the load-bearing line: without
+  # it the emptyDirs below are root-owned and a non-root container cannot
+  # write its results journal or spill to /tmp.
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 10001
+    runAsGroup: 10001
+    fsGroup: 10001
   containers:
     - name: shell
-      image: python:3.13-slim
+      # Pin for a run that has to be reproducible: swap `latest` for a
+      # commit sha tag, or for `@sha256:<multi-arch manifest digest>` as
+      # printed by the publish job's summary. `latest` plus Always is the
+      # default so a re-apply after a merge actually gets the new harness.
+      image: ghcr.io/posthog/hoglake-bench:latest
+      imagePullPolicy: Always
+      # The image's entrypoint is the CLI. Override it: the pod is a place
+      # to run from, not a job — nothing starts until you exec in.
       command: ["sleep", "infinity"]
       workingDir: /work
       env:
@@ -48,8 +67,6 @@ spec:
           value: ""
         - name: HOGLAKE_S3_REGION
           value: us-east-1
-        - name: UV_LINK_MODE
-          value: copy
       resources:
         requests:
           cpu: "1"

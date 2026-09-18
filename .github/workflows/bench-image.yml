@@ -1,0 +1,165 @@
+name: Bench image
+
+# Publishes ghcr.io/posthog/hoglake-bench: the stress/benchmark harness
+# as a runnable image, so seeding or benchmarking a deployed
+# environment is a pod and an exec instead of copying a tree into a
+# sleeping python:slim.
+#
+# NOT part of CD. Unlike server.yml and webui.yml this workflow
+# dispatches nothing to PostHog/charts and no chart references the
+# image: it is pulled by hand, by an operator, into the bare Pod in
+# bench/deploy/bench-pod.yaml.
+#
+# pyhoglake/** is a trigger path as much as bench/** is. bench installs
+# the client from the sibling tree, so a pyhoglake change IS a bench
+# image change, and a workflow scoped to bench/** alone would leave the
+# published image quietly shipping a stale client.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "bench/**"
+      - "pyhoglake/**"
+      - ".github/workflows/bench-image.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "bench/**"
+      - "pyhoglake/**"
+      - ".github/workflows/bench-image.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  # Build and exercise the image on every PR and every main push. The
+  # unit layer for bench and pyhoglake is ci-python.yml (same trigger
+  # paths); this job's job is the IMAGE — that it assembles, that the
+  # CLI runs, and that the client inside it is the repo's, not PyPI's.
+  image:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: bench-image-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # Single-arch and loaded, because a multi-arch build cannot be
+      # loaded into the local daemon and an image nothing ran is not
+      # evidence. cache-from only: PRs read main's cache (scope=bench),
+      # never write it — no poisoning surface.
+      #
+      # Context is the repo root and the Dockerfile is named
+      # explicitly: bench needs pyhoglake/ beside it in the context
+      # (see bench/Dockerfile).
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: bench/Dockerfile
+          load: true
+          tags: hoglake-bench:ci
+          cache-from: type=gha,scope=bench
+
+      # The CLI must run with no server, no credentials and no network.
+      - name: Smoke - the CLI runs
+        run: docker run --rm hoglake-bench:ci --help
+
+      # The image must not be root, and it must not carry a .venv built
+      # on somebody's host — the failure mode this image exists to
+      # retire (macOS-built binaries landing in a linux container).
+      - name: Smoke - non-root, no host virtualenv
+        run: |
+          uid=$(docker run --rm --entrypoint id hoglake-bench:ci -u)
+          echo "uid=$uid"
+          [ "$uid" != "0" ]
+          if docker run --rm --entrypoint find hoglake-bench:ci / -name .venv -maxdepth 6 | grep .; then
+            echo "::error::image contains a .venv"
+            exit 1
+          fi
+
+      # The client in the image must be the sibling tree's, built from
+      # THIS commit — not a PyPI release that merely shares a name.
+      # main carries a .dev0 version PyPI has never seen, so a silent
+      # fallback to the registry shows up here as a version mismatch.
+      - name: Smoke - pyhoglake comes from this commit
+        run: |
+          want=$(grep -m1 '^version = ' pyhoglake/pyproject.toml | cut -d'"' -f2)
+          got=$(docker run --rm --entrypoint python hoglake-bench:ci -c 'import pyhoglake; print(pyhoglake.__version__)')
+          origin=$(docker run --rm --entrypoint python hoglake-bench:ci -c \
+            'import importlib.metadata as m; print(m.distribution("pyhoglake").read_text("direct_url.json"))')
+          echo "pyproject=$want image=$got origin=$origin"
+          [ "$want" = "$got" ]
+          case "$origin" in *file:///src/pyhoglake*) : ;; *) echo "::error::pyhoglake was not installed from the sibling tree"; exit 1 ;; esac
+
+  publish:
+    # Gated on the image smoke above, the same shape as server.yml's
+    # deploy job: a red main push never publishes.
+    needs: [image]
+    # Forks must not push images.
+    if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    concurrency:
+      group: bench-image-publish
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Multi-arch: the mw fleet runs Graviton. Unlike server/ and
+      # webui/, the build stage here is NOT pinned to $BUILDPLATFORM —
+      # a Python virtualenv holds native wheels, so each arch installs
+      # its own (bench/Dockerfile says why). Hence QEMU above.
+      - name: Build and push image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: bench/Dockerfile
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/posthog/hoglake-bench:${{ github.sha }}
+            ghcr.io/posthog/hoglake-bench:latest
+          cache-from: type=gha,scope=bench
+          cache-to: type=gha,scope=bench,mode=max
+
+      # No charts dispatch: nothing deploys this image. Print the
+      # multi-arch MANIFEST digest instead — it is what an operator
+      # pins bench/deploy/bench-pod.yaml to when a run must be
+      # reproducible.
+      - name: Report the pinnable ref
+        run: |
+          digest=$(docker buildx imagetools inspect --raw ghcr.io/posthog/hoglake-bench:${{ github.sha }} | sha256sum | awk '{print "sha256:"$1}')
+          {
+            echo "### Bench image published"
+            echo
+            echo '```'
+            echo "ghcr.io/posthog/hoglake-bench:${{ github.sha }}"
+            echo "ghcr.io/posthog/hoglake-bench@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
