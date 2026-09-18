@@ -356,6 +356,23 @@ tr.has-deletes {
   color: var(--bad);
 }
 
+/* Runs-table controls: the .form-row idiom, but these filter a table in
+   place rather than submit anything, so they get no boxed .inline-form
+   surround. Centred, because the checkbox and the select have different
+   heights and the row has no input labels below the baseline. */
+.runs-filters {
+  align-items: center;
+  margin: 0 0 10px;
+}
+/* label.check pads its bottom to sit level with a labelled input; this row
+   centres instead, so drop it. */
+.runs-filters label.check {
+  padding-bottom: 0;
+}
+.runs-hidden-count {
+  margin-left: 4px;
+}
+
 /* Central maintenance matrix: one row per catalog, one cell per task. */
 .task-matrix .task-cell {
   white-space: nowrap;

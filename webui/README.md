@@ -26,7 +26,12 @@ Notable surfaces beyond the catalog browser:
   page has per-task panels — loop cadence (or disabled / manual-only), the
   sampled backlog with freshness timestamps (pending+failed files, removal-queue depth, snapshot floor,
   small-file debt), and the most recent recorded run — plus the paged run
-  ledger. Backed by `GET /maintenance/status` + `/maintenance/runs` and
+  ledger. The ledger's two filters (both remembered across visits, both
+  client-side over the pages already fetched) narrow it to one task, and
+  hide runs that succeeded and changed nothing — never a failure, and never
+  a run carrying a warning counter, with a "N quiet runs hidden" readout so
+  a short table cannot read as "the loops stopped".
+  Backed by `GET /maintenance/status` + `/maintenance/runs` and
   their per-catalog twins over the `hog_maintenance_run` table every
   background sweep and manual trigger records into. Read-only: no trigger
   buttons.
