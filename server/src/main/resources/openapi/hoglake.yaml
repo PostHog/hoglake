@@ -1259,7 +1259,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DecodeBoundResponse" }
         "400":
-          description: Malformed body.
+          description: >
+            Malformed body — unparseable JSON, a missing required
+            field, a JSON null body, or a body sent under a
+            Content-Type this API does not read (bare curl -d posts
+            x-www-form-urlencoded).
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }

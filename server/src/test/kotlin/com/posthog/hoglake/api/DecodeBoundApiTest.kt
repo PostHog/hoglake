@@ -274,4 +274,36 @@ class DecodeBoundApiTest {
             assertThat(response.status).isEqualTo(HttpStatusCode.BadRequest)
             assertThat(body(response)["error"].asText()).isEqualTo("bad_request")
         }
+
+    @Test
+    fun `a wrong content type is a named 400, never a 500`() =
+        api { client ->
+            // The bare-curl case: curl -d defaults the Content-Type to
+            // x-www-form-urlencoded, and a hand-set text/plain is the
+            // next most common slip. Neither has a registered converter,
+            // and both must land in the malformed-body 400 like every
+            // other body this server cannot read — not the 500 catch-all.
+            for (contentType in listOf(ContentType.Text.Plain, ContentType.Application.FormUrlEncoded)) {
+                val response =
+                    client.post("/v1/debug/decode-bound") {
+                        contentType(contentType)
+                        setBody("""{"type": "long", "value": "AAAAAAAAAAA="}""")
+                    }
+                assertThat(response.status)
+                    .describedAs(contentType.toString())
+                    .isEqualTo(HttpStatusCode.BadRequest)
+                assertThat(body(response)["error"].asText()).isEqualTo("bad_request")
+            }
+        }
+
+    @Test
+    fun `a null JSON body is a named 400, never a 500`() =
+        api { client ->
+            // `null` IS valid JSON, but it is not a request body; binding
+            // it to the request DTO must answer the same malformed-body
+            // 400 as a missing field, not escape as an unmapped 500.
+            val response = client.decode("null")
+            assertThat(response.status).isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(body(response)["error"].asText()).isEqualTo("bad_request")
+        }
 }
