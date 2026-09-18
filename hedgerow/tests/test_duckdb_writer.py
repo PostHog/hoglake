@@ -342,21 +342,48 @@ def test_source_fragments_are_scanned_exactly_once(tmp_path, monkeypatch):
     DESCRIBE and parquet_metadata read footers only and are not scans —
     because the cost this guards is S3 read amplification, which no
     functional assertion in this file can see.
+
+    An unrecorded scan is the failure mode to design against: the count
+    stays at 1 and the test goes green while the amplification is back.
+    Recording only `execute` would allow exactly that — a pre-flight
+    added through `sql()` was verified to pass an execute-only wrapper
+    while this one reports two scans. So [Recording] wraps every
+    statement path DuckDB offers, cursors included, and the landmarks
+    below assert the recording is not trivially empty in case a future
+    version adds a path we did not think to wrap.
     """
     path = raw_file(tmp_path, count=4096)
     statements = []
     real_connect = duckdb.connect
 
     class Recording:
+        """Records every way DuckDB will run a statement, not just execute().
+
+        Wrapping execute() alone would leave a scan issued through sql(),
+        query() or a cursor invisible, and an invisible scan is exactly
+        the regression this test exists to catch: the count would stay at
+        1 while the amplification came back.
+        """
+
+        RECORDED = ("execute", "executemany", "sql", "query", "from_query")
+
         def __init__(self, connection):
             self._connection = connection
 
-        def execute(self, sql, *args, **kwargs):
-            statements.append(sql)
-            return self._connection.execute(sql, *args, **kwargs)
-
         def __getattr__(self, name):
-            return getattr(self._connection, name)
+            attribute = getattr(self._connection, name)
+            if name not in self.RECORDED:
+                return attribute
+
+            def recording(sql, *args, **kwargs):
+                statements.append(sql)
+                return attribute(sql, *args, **kwargs)
+
+            return recording
+
+        def cursor(self, *args, **kwargs):
+            # A cursor is another statement path; it gets the same wrapper.
+            return Recording(self._connection.cursor(*args, **kwargs))
 
         def __enter__(self):
             self._connection.__enter__()
@@ -372,6 +399,24 @@ def test_source_fragments_are_scanned_exactly_once(tmp_path, monkeypatch):
     # fixture's routing columns cycle, so this is not the group size.
     write(path, tmp_path / "output", 341, groups=(0,))
     monkeypatch.undo()
+
+    # The recording is complete: each landmark is something the writer
+    # must issue to function, so a missing one means statements are
+    # bypassing the wrapper and the scan count below is not trustworthy.
+    landmarks = {
+        "connection configuration": lambda q: q.lstrip().upper().startswith("SET "),
+        "source schema probe": lambda q: q.lstrip().upper().startswith("DESCRIBE"),
+        "row group probe": lambda q: "parquet_metadata(" in q,
+        "the write itself": lambda q: q.lstrip().upper().startswith("COPY"),
+    }
+    missing = [
+        name for name, matches in landmarks.items() if not any(map(matches, statements))
+    ]
+    assert not missing, (
+        f"recorded {len(statements)} statements but none matching {missing}; "
+        "the writer is issuing statements outside connection.execute, so the "
+        "scan count below cannot be trusted"
+    )
 
     scans = [
         sql
