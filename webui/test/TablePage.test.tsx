@@ -139,6 +139,39 @@ describe("TablePage", () => {
     expect(written[0]).toContain("s3://");
   });
 
+  it("offers copy buttons on the scan tab, for data AND delete file paths", async () => {
+    const user = userEvent.setup();
+    const written: string[] = [];
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: (t: string) => {
+          written.push(t);
+          return Promise.resolve();
+        },
+      },
+    });
+    mockFetch(happyHandler);
+    renderApp(route);
+    await user.click(screen.getByRole("tab", { name: "scan" }));
+    await screen.findByText("1,250");
+
+    // The delete-file path gets its own button and its own label, so the
+    // two are distinguishable to a screen reader and in the tooltip.
+    // No table in the dev stack carries a deletion vector, so this is the
+    // only coverage the delete-file path has.
+    const dataCopies = screen.getAllByRole("button", { name: "Copy path" });
+    const dvCopies = screen.getAllByRole("button", { name: "Copy delete file path" });
+    expect(dataCopies.length).toBe(scanFixture.length);
+    expect(dvCopies.length).toBe(
+      scanFixture.filter((sf) => sf.delete_file).length,
+    );
+
+    await user.click(dvCopies[0]);
+    expect(written).toEqual([scanFixture[0].delete_file?.path]);
+    expect(written[0]).toContain(".puffin");
+  });
+
   it("renders int64 file values above 2^53 exactly on the Files tab", async () => {
     mockFetch((url) => {
       const [path] = url.split("?");
