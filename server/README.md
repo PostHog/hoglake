@@ -590,7 +590,7 @@ just test       # full suite (Docker required)
 just unit       # no Docker
 just one 'com.posthog.hoglake.commit.*'
 just schema-check
-just compose-up # Postgres 16 + MinIO (ports overridable via HOGLAKE_*_PORT)
+just compose-up # Postgres 18 + MinIO (ports overridable via HOGLAKE_*_PORT)
 just run        # server on :8080
 just docs       # OpenAPI spec in Swagger UI on :8090 (HOGLAKE_SWAGGER_PORT)
 ```
@@ -633,7 +633,7 @@ container attached to the compose network — as the endpoint.
 
 JUnit 5 + AssertJ; property tests via kotest-property (strategy:
 [../fuzzing.md](../docs/fuzzing.md)). Integration tests use Testcontainers
-(Postgres 16, MinIO), tagged `integration`, and need Docker
+(Postgres 18, MinIO), tagged `integration`, and need Docker
 (`docker-java.properties` in test resources pins the Docker API version
 for recent daemons). The schema-equivalence test and an OCC concurrency
 torture suite run with everything else in `just test`.

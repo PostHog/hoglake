@@ -95,7 +95,7 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      # Docker required (Testcontainers: postgres:16 + minio — both
+      # Docker required (Testcontainers: postgres:18 + minio — both
       # unauthenticated Docker Hub pulls, the usual rate-limit flake
       # source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
@@ -164,7 +164,11 @@ jobs:
     timeout-minutes: 30
     services:
       postgres:
-        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
+        # Same major the Testcontainers suite and the dev compose stack
+        # run, so the smoke boot is not the one place a version differs.
+        # Digest is the multi-arch MANIFEST (index) digest, never a
+        # per-arch one — `docker buildx imagetools inspect postgres:18`.
+        image: postgres:18@sha256:4ef4dbc939d61acea57712655ddb4b4ab27419c913f94cca0cd57cb3ea3c2280
         env:
           POSTGRES_DB: hoglake
           POSTGRES_USER: hoglake

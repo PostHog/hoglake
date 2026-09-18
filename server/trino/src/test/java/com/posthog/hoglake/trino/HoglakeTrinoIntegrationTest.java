@@ -114,7 +114,10 @@ class HoglakeTrinoIntegrationTest
     static void setUpStack()
             throws Exception
     {
-        postgres = new PostgreSQLContainer<>("postgres:16")
+        // Same major as PgTestSupport's default: this harness backs the
+        // server with its own container, so leaving it behind would make
+        // the connector job the one place hoglake runs on an old Postgres.
+        postgres = new PostgreSQLContainer<>("postgres:18")
                 .withUsername("hoglake")
                 .withPassword("hoglake");
         // quay.io: Docker Hub stopped serving minio/minio anonymously.

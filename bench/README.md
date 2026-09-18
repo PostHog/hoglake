@@ -50,7 +50,7 @@ Two options:
    `http://localhost:8080`, MinIO at `:9000`
    (`hoglake`/`hoglake123`, path-style). Overridable via `--url`,
    `--s3-endpoint`, … or `HOGLAKE_URL` / `HOGLAKE_S3_*` env vars.
-2. **Bring your own**: `just up` at the repo root (Postgres 16 + MinIO
+2. **Bring your own**: `just up` at the repo root (Postgres 18 + MinIO
    + the server + the webui, all containerized), or in `../server`,
    `docker compose up -d && flox activate -- gradle run` (ports
    overridable via `HOGLAKE_*_PORT`).
