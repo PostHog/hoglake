@@ -189,13 +189,22 @@ mean the SDK's credential chain rather than the local stack's `hoglake` /
 
 ```sh
 kubectl apply -f bench/deploy/bench-pod.yaml
-kubectl -n gigahog cp bench bench-shell:/work/bench       # the harness itself
+
+# Tracked files only. `kubectl cp` would sweep up .venv and __pycache__ —
+# macOS-built binaries and wrong-platform wheels that confuse uv inside a
+# linux container, plus a wall of "Cannot change ownership" from tar.
+git archive HEAD bench | kubectl -n gigahog exec -i bench-shell -- tar x -C /work
+
 kubectl -n gigahog exec -it bench-shell -- bash
 
 # inside the pod
 pip install --quiet uv && cd /work/bench && uv sync --quiet
 uv run hoglake-bench seed --gb 0.5 --bucket posthog-gigahog-mw-dev
 ```
+
+If you are running an unmerged branch, `git archive` takes any ref —
+`git archive jakob/my-branch bench | ...`. To iterate on a change without
+recreating the pod, re-run the same line; `tar x` overwrites in place.
 
 `--bucket` is the environment's own bucket; bench writes under a per-run
 prefix and never asks AWS to create it (the role carries no

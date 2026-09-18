@@ -10,8 +10,11 @@
 # it by hand (see bench/README.md, "Running in-cluster").
 #
 #   kubectl apply -f bench/deploy/bench-pod.yaml
-#   kubectl -n gigahog cp bench bench-shell:/work/bench
+#   git archive HEAD bench | kubectl -n gigahog exec -i bench-shell -- tar x -C /work
 #   kubectl -n gigahog exec -it bench-shell -- bash
+#
+# git archive rather than `kubectl cp`: tracked files only, so no .venv full
+# of macOS-built binaries lands in a linux container.
 #
 # Delete it when you are done: it is a pod, not a Deployment, so nothing
 # brings it back.
