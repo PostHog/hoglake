@@ -67,8 +67,21 @@ describe("TablePage", () => {
     expect(failed).toHaveClass("stats-failed");
 
     // partition_values render when present, em-dash when absent.
-    expect(screen.getByText("[2026-09-01, 7]")).toBeInTheDocument();
-    expect(screen.getByText("[2026-09-02, null]")).toBeInTheDocument();
+    // Decoded against the spec rather than shown as a raw tuple: the day
+    // ordinal 20697 is a date, and 7 is a bucket index, not a value.
+    expect(screen.getByText("2026-09-01")).toBeInTheDocument();
+    expect(screen.getByText("bucket 7/16")).toBeInTheDocument();
+    expect(screen.getByText("2026-09-02")).toBeInTheDocument();
+    // A null element stays visible rather than collapsing the tuple.
+    expect(screen.getByText("null")).toBeInTheDocument();
+    // Field names come from the spec, carrying the transform: "ts_day",
+    // not a bare "ts" that would suggest the column holds a date.
+    expect(screen.getAllByText("ts_day").length).toBeGreaterThan(0);
+    // The WHOLE cell, separator included. Asserting the parts
+    // individually is what let a missing separator ship: every value was
+    // present and the rendering still read "team_id=42ts_day=…".
+    const cell = screen.getAllByText("ts_day")[0].closest("td");
+    expect(cell?.textContent).toBe("ts_day=2026-09-01 / url_bucket=bucket 7/16");
   });
 
   it("pairs data files with deletion vectors on the Scan tab", async () => {

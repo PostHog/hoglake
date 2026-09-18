@@ -941,3 +941,30 @@ button.expand-toggle:hover {
 .db-blind-spots li {
   margin-bottom: 4px;
 }
+
+/* -- decoded partition cell ----------------------------------------------- */
+
+.partition-cell {
+  white-space: nowrap;
+}
+/* " / " matches formatPartition on the partitions page, and evokes the
+   hive-style nesting these keys describe: team_id=42 / month=2026-04.
+   Rendered as an element rather than generated content so the tests can
+   see it. */
+.partition-sep {
+  color: var(--text-dim);
+  white-space: pre;
+}
+/* The field name is context; the value is the answer. Dimming the name
+   lets the eye land on what differs between rows. */
+.partition-field {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.partition-eq {
+  color: var(--text-dim);
+  margin: 0 1px;
+}
+.partition-value {
+  font-size: 12px;
+}

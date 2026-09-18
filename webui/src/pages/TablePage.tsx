@@ -4,11 +4,12 @@ import { useQuery } from "@tanstack/react-query";
 import { getFileStats, getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
-import type { Column, DecodedBound, Int64, Table } from "../api/types";
+import type { Column, DecodedBound, Int64, PartitionSpec, Table } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
 import { CopyButton } from "../components/CopyButton";
+import { decodePartition, type PartitionDecode } from "../lib/partitions";
 import {
   formatBytes,
   formatCount,
@@ -291,16 +292,80 @@ function FileStatsPanel({
   );
 }
 
+/**
+ * A file's partition, decoded and labelled.
+ *
+ * `team_id=42 / month=2026-04` instead of `[42, 675]`: the tuple is the
+ * pruning key and worth showing, but reading it raw costs three lookups
+ * (which column, in what order, under which transform) that the page can
+ * do for the reader.
+ *
+ * The raw tuple stays on the tooltip. Whoever is debugging spec
+ * evolution needs the exact stored values, and they are the one audience
+ * for whom the decoded form is the wrong answer.
+ */
+function PartitionCell({ decoded }: { decoded: PartitionDecode }) {
+  if (decoded.kind === "unpartitioned") {
+    return <td className="subtle">—</td>;
+  }
+  if (decoded.kind === "foreign-spec") {
+    // Deliberately undecoded: see decodePartition. The badge says why,
+    // so this does not read as the decoder having failed.
+    return (
+      <td className="mono partition-cell" title={`Stored tuple ${decoded.raw}`}>
+        {decoded.raw}{" "}
+        <span className="badge badge-warn" title="Written under an older partition spec; the page only holds the current one, so its fields are not labelled.">
+          spec {String(decoded.specId)}
+        </span>
+      </td>
+    );
+  }
+  if (decoded.kind === "mismatched") {
+    return (
+      <td className="mono partition-cell" title="Tuple does not match the current spec">
+        {decoded.raw}
+      </td>
+    );
+  }
+  const raw = `[${decoded.values.map((v) => v.raw ?? "null").join(", ")}]`;
+  return (
+    <td
+      className="partition-cell"
+      title={decoded.values
+        .map((v) => `${v.field}: ${v.transform}(${v.raw ?? "null"})`)
+        .concat(`stored ${raw}`)
+        .join("\n")}
+    >
+      {decoded.values.map((v, i) => (
+        <span key={i} className="partition-part">
+          {/* A real element, not a ::before. Generated content is
+              invisible to the DOM and therefore to the tests — this
+              separator shipped missing once behind a rule that looked
+              right in isolation, and nothing failed. */}
+          {i > 0 && <span className="partition-sep"> / </span>}
+          <span className="partition-field">{v.field}</span>
+          <span className="partition-eq">=</span>
+          <span className="mono partition-value">{v.display}</span>
+        </span>
+      ))}
+    </td>
+  );
+}
+
 function FilesTab({
   catalog,
   namespace,
   table,
   snapshot,
+  spec,
+  columns,
 }: {
   catalog: string;
   namespace: string;
   table: string;
   snapshot?: Int64;
+  spec?: PartitionSpec;
+  columns?: Column[];
 }) {
   const { data, isPending, isError, error } = useQuery({
     queryKey: ["files", catalog, namespace, table, snapshot ?? "head"],
@@ -308,28 +373,36 @@ function FilesTab({
   });
   const [expanded, setExpanded] = useState<Int64 | null>(null);
   if (isError) return <ErrorBox error={error} />;
+  // The column appears only for a partitioned table: on an unpartitioned
+  // one it would be a column of dashes.
+  const partitioned = (spec?.fields.length ?? 0) > 0;
+  // Fixed columns: expand toggle, id, path, record_count, size,
+  // row_id_start, stats, begin_snapshot — plus partition when there is
+  // one. Drives the skeleton and the empty-state colSpan, so a wrong
+  // count shows as a short row rather than an error.
+  const cols = partitioned ? 9 : 8;
   return (
     <table className="data-table">
       <thead>
         <tr>
           <th />
           <th className="num">id</th>
+          {partitioned && <th>partition</th>}
           <th>path</th>
           <th className="num">record_count</th>
           <th className="num">size</th>
           <th className="num">row_id_start</th>
           <th>stats</th>
           <th className="num">begin_snapshot</th>
-          <th>partition_values</th>
         </tr>
       </thead>
       {isPending ? (
-        <SkeletonRows rows={5} cols={9} />
+        <SkeletonRows rows={5} cols={cols} />
       ) : (
         <tbody>
           {data.length === 0 && (
             <tr>
-              <td colSpan={9} className="empty">
+              <td colSpan={cols} className="empty">
                 No data files at this snapshot.
               </td>
             </tr>
@@ -353,6 +426,9 @@ function FilesTab({
                   </button>
                 </td>
                 <td className="num mono">{f.data_file_id}</td>
+                {partitioned && (
+                  <PartitionCell decoded={decodePartition(f, spec, columns)} />
+                )}
                 <PathCell path={f.path} />
                 <td className="num mono">{formatCount(f.record_count)}</td>
                 <td className="num mono" title={`${f.file_size_bytes}`}>
@@ -363,15 +439,10 @@ function FilesTab({
                   <StatsStateBadge state={f.stats_state} />
                 </td>
                 <td className="num mono">{f.begin_snapshot}</td>
-                <td className="mono">
-                  {f.partition_values
-                    ? `[${f.partition_values.map((v) => v ?? "null").join(", ")}]`
-                    : "—"}
-                </td>
               </tr>
               {expanded === f.data_file_id && (
                 <tr className="detail-row">
-                  <td colSpan={9}>
+                  <td colSpan={cols}>
                     <FileStatsPanel
                       catalog={catalog}
                       namespace={namespace}
@@ -535,6 +606,12 @@ export function TablePage() {
           namespace={namespace}
           table={table}
           snapshot={snapshot}
+          /* The spec the tuples decode against. Already fetched for the
+             schema tab, so this is a prop rather than a second request;
+             undefined while it loads, which reads as "not yet decodable"
+             rather than as "unpartitioned". */
+          spec={tableQuery.data?.partition_spec}
+          columns={tableQuery.data?.columns}
         />
       )}
       {tab === "scan" && (
