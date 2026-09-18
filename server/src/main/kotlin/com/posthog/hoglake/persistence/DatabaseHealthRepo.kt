@@ -1,9 +1,13 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.CommitLockHolder
 import com.posthog.hoglake.model.DatabaseActivity
 import com.posthog.hoglake.model.DatabaseIndex
+import com.posthog.hoglake.model.DatabaseIndexHealth
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
+import com.posthog.hoglake.model.ReplicationSlot
+import com.posthog.hoglake.persistence.Locks.CATALOG_COMMIT_LOCK_CLASS
 import org.jdbi.v3.core.Handle
 import java.time.Instant
 
@@ -23,11 +27,22 @@ import java.time.Instant
  * flattering cache-hit ratio over four minutes of uptime means nothing.
  */
 object DatabaseHealthRepo {
-    /** `hog_*` only: the catalog's own tables, not whatever else shares the database. */
+    /**
+     * `hog_*` only: the catalog's own tables, not whatever else shares
+     * the database.
+     *
+     * The underscore is LIKE's single-character wildcard, so it must be
+     * escaped or this matches `hogX...` too. Mind the string form: this
+     * is a normal Kotlin string, where `\\` yields the one backslash SQL
+     * needs. In a RAW string (`"""`) the same two characters reach SQL
+     * unprocessed, and `hog\\_%` matches nothing at all — silently, since
+     * an empty result reads exactly like a healthy instance.
+     */
     private const val HOG_TABLES = "s.relname LIKE 'hog\\_%'"
 
-    fun server(handle: Handle): DatabaseServer =
-        handle.createQuery(
+    fun server(handle: Handle): DatabaseServer {
+        val checkpoints = checkpoints(handle)
+        return handle.createQuery(
             """
             SELECT current_setting('server_version') AS version,
                    current_database() AS database,
@@ -39,7 +54,8 @@ object DatabaseHealthRepo {
                    d.blks_hit, d.blks_read, d.deadlocks, d.xact_commit, d.xact_rollback,
                    age(pd.datfrozenxid) AS xid_age,
                    current_setting('autovacuum_freeze_max_age')::bigint AS xid_freeze_max_age,
-                   current_setting('autovacuum') = 'on' AS autovacuum_enabled
+                   current_setting('autovacuum') = 'on' AS autovacuum_enabled,
+                   d.temp_files, d.temp_bytes
               FROM pg_stat_database d
               JOIN pg_database pd ON pd.datname = d.datname
              WHERE d.datname = current_database()
@@ -64,8 +80,41 @@ object DatabaseHealthRepo {
                 xidAge = rs.getLong("xid_age"),
                 xidFreezeMaxAge = rs.getLong("xid_freeze_max_age"),
                 autovacuumEnabled = rs.getBoolean("autovacuum_enabled"),
+                tempFiles = rs.getLong("temp_files"),
+                tempBytes = rs.getLong("temp_bytes"),
+                checkpointsTimed = checkpoints?.first,
+                checkpointsRequested = checkpoints?.second,
             )
         }.one()
+    }
+
+    /**
+     * Checkpoint counters, whose home moved: PG 16 and earlier keep them
+     * on `pg_stat_bgwriter` as checkpoints_timed/checkpoints_req, PG 17
+     * removed those columns and put num_timed/num_requested on
+     * `pg_stat_checkpointer`. Querying either blindly breaks the whole
+     * page on the other, so the view is chosen at run time and a version
+     * this does not recognise reports null rather than failing — a
+     * missing tile beats a 500 on the page you opened because something
+     * was already wrong.
+     */
+    private fun checkpoints(handle: Handle): Pair<Long, Long>? {
+        val view =
+            handle.createQuery(
+                "SELECT to_regclass('pg_stat_checkpointer') IS NOT NULL AS modern",
+            ).map { rs, _ -> rs.getBoolean("modern") }.one()
+        val sql =
+            if (view) {
+                "SELECT num_timed AS timed, num_requested AS requested FROM pg_stat_checkpointer"
+            } else {
+                "SELECT checkpoints_timed AS timed, checkpoints_req AS requested FROM pg_stat_bgwriter"
+            }
+        return runCatching {
+            handle.createQuery(sql)
+                .map { rs, _ -> rs.getLong("timed") to rs.getLong("requested") }
+                .one()
+        }.getOrNull()
+    }
 
     /**
      * Session counts and the ages that matter, with NO query text: see
@@ -161,6 +210,110 @@ object DatabaseHealthRepo {
                 sizeBytes = rs.getLong("size_bytes"),
                 scans = rs.getLong("idx_scan"),
                 constraintBacking = rs.getBoolean("constraint_backing"),
+            )
+        }.list()
+
+    /**
+     * Holders of and waiters for hoglake's per-catalog commit locks.
+     *
+     * Postgres splits the single-bigint advisory key into classid (the
+     * lock class) and objid (the low 32 bits — the catalog id), so
+     * filtering on the class isolates OUR locks from any other advisory
+     * use, and the catalog can be named without touching a hog_* row
+     * beyond the one-row catalog lookup that gives it a name.
+     */
+    fun commitLocks(handle: Handle): List<CommitLockHolder> =
+        handle.createQuery(
+            """
+            SELECT l.objid::bigint AS catalog_id,
+                   c.name AS catalog,
+                   l.pid,
+                   l.granted,
+                   extract(epoch FROM now() - a.xact_start) AS held_seconds,
+                   (SELECT count(*) FROM pg_locks w
+                     WHERE w.locktype = 'advisory'
+                       AND w.classid = l.classid AND w.objid = l.objid
+                       AND NOT w.granted) AS waiters
+              FROM pg_locks l
+              LEFT JOIN pg_stat_activity a ON a.pid = l.pid
+              LEFT JOIN hog_catalog c ON c.catalog_id = l.objid::bigint
+             WHERE l.locktype = 'advisory'
+               AND l.classid = $CATALOG_COMMIT_LOCK_CLASS
+             ORDER BY l.granted DESC, held_seconds DESC NULLS LAST
+            """.trimIndent(),
+        ).map { rs, _ ->
+            CommitLockHolder(
+                catalogId = rs.getLong("catalog_id"),
+                catalog = rs.getString("catalog"),
+                pid = rs.getInt("pid"),
+                granted = rs.getBoolean("granted"),
+                heldSeconds = rs.getDouble("held_seconds").takeUnless { rs.wasNull() },
+                waiters = rs.getInt("waiters"),
+            )
+        }.list()
+
+    /**
+     * Replication slots and the WAL each pins. Every slot on the
+     * instance, not only hoglake's: a slot left behind by someone else's
+     * Blue/Green upgrade fills the same volume.
+     */
+    fun replicationSlots(handle: Handle): List<ReplicationSlot> =
+        handle.createQuery(
+            """
+            SELECT slot_name, slot_type, active,
+                   pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)::bigint AS retained_bytes
+              FROM pg_replication_slots
+             ORDER BY active, retained_bytes DESC NULLS LAST
+            """.trimIndent(),
+        ).map { rs, _ ->
+            ReplicationSlot(
+                name = rs.getString("slot_name"),
+                slotType = rs.getString("slot_type"),
+                active = rs.getBoolean("active"),
+                // Null for a slot that has never reserved WAL.
+                retainedWalBytes = rs.getLong("retained_bytes").takeUnless { rs.wasNull() },
+            )
+        }.list()
+
+    /** Count and age of orphaned two-phase transactions; they pin the xid horizon. */
+    fun preparedTransactions(handle: Handle): Pair<Int, Double?> =
+        handle.createQuery(
+            """
+            SELECT count(*) AS n,
+                   max(extract(epoch FROM now() - prepared)) AS oldest_seconds
+              FROM pg_prepared_xacts
+            """.trimIndent(),
+        ).map { rs, _ ->
+            rs.getInt("n") to rs.getDouble("oldest_seconds").takeUnless { rs.wasNull() }
+        }.one()
+
+    /**
+     * Indexes Postgres will not use: `indisvalid = false` is what a
+     * failed or interrupted CREATE INDEX CONCURRENTLY leaves behind.
+     * Read from pg_index rather than the statistics views, because a
+     * never-used invalid index looks identical to a never-used valid one
+     * in pg_stat_user_indexes.
+     */
+    fun invalidIndexes(handle: Handle): List<DatabaseIndexHealth> =
+        handle.createQuery(
+            """
+            SELECT t.relname AS table_name, c.relname AS index_name,
+                   i.indisvalid, i.indisready
+              FROM pg_index i
+              JOIN pg_class c ON c.oid = i.indexrelid
+              JOIN pg_class t ON t.oid = i.indrelid
+              JOIN pg_namespace n ON n.oid = t.relnamespace
+             WHERE t.relname LIKE 'hog\_%'
+               AND n.nspname = current_schema()
+               AND (NOT i.indisvalid OR NOT i.indisready)
+             ORDER BY t.relname, c.relname
+            """.trimIndent(),
+        ).map { rs, _ ->
+            DatabaseIndexHealth(
+                table = rs.getString("table_name"),
+                name = rs.getString("index_name"),
+                valid = rs.getBoolean("indisvalid"),
+                ready = rs.getBoolean("indisready"),
             )
         }.list()
 

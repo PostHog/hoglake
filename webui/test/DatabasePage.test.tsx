@@ -23,6 +23,10 @@ const server = {
   xid_age: "1000000",
   xid_freeze_max_age: "200000000",
   autovacuum_enabled: true,
+  temp_files: "0",
+  temp_bytes: "0",
+  checkpoints_timed: "100",
+  checkpoints_requested: "2",
 };
 
 const activity = {
@@ -72,6 +76,12 @@ function health(overrides: Record<string, unknown> = {}) {
     tables: [table],
     indexes,
     findings: [],
+    commit_locks: [],
+    replication_slots: [],
+    blind_spots: [
+      "Disk fullness is invisible from SQL on a managed instance (RDS).",
+      "Orphaned catalog rows are not counted here; maintenance owns that check.",
+    ],
     ...overrides,
   };
 }
@@ -144,6 +154,62 @@ describe("database page", () => {
     const label = await screen.findByText("cache hit");
     expect(label.parentElement?.textContent).toContain("—");
     expect(label.parentElement?.textContent).not.toContain("0%");
+  });
+
+  it("shows a held commit lock with its catalog and queue depth", async () => {
+    mount(
+      health({
+        commit_locks: [
+          {
+            catalog_id: "42",
+            catalog: "gigahog-ev",
+            pid: 4711,
+            granted: true,
+            held_seconds: 31.5,
+            waiters: 7,
+          },
+        ],
+      }),
+    );
+    // The catalog is what makes this actionable — "some advisory lock" is
+    // not something an operator can chase.
+    expect(await screen.findByText("gigahog-ev")).toBeInTheDocument();
+    expect(screen.getByText("4711")).toBeInTheDocument();
+    expect(screen.getByText("7")).toBeInTheDocument();
+  });
+
+  it("flags an inactive replication slot and the WAL it pins", async () => {
+    mount(
+      health({
+        replication_slots: [
+          {
+            name: "bg_upgrade_slot",
+            slot_type: "logical",
+            active: false,
+            retained_wal_bytes: "8589934592",
+          },
+        ],
+      }),
+    );
+    expect(await screen.findByText("bg_upgrade_slot")).toBeInTheDocument();
+    expect(screen.getByText("inactive")).toBeInTheDocument();
+    expect(screen.getByText("8.0 GiB")).toBeInTheDocument();
+  });
+
+  it("always states what it cannot see", async () => {
+    // Present even when every finding is clear, so a green page is never
+    // read as "the volume is fine".
+    mount(health());
+    expect(await screen.findByText(/Disk fullness is invisible/)).toBeInTheDocument();
+    expect(screen.getByText(/Orphaned catalog rows/)).toBeInTheDocument();
+  });
+
+  it("renders absent checkpoint counters as unknown", async () => {
+    // PG 17 moved the columns; the tile must degrade, not show zeros.
+    const { checkpoints_timed: _t, checkpoints_requested: _r, ...older } = server;
+    mount(health({ server: older }));
+    const label = await screen.findByText("checkpoints (req/timed)");
+    expect(label.parentElement?.textContent).toContain("—");
   });
 
   it("surfaces a failing endpoint rather than rendering an empty page", async () => {

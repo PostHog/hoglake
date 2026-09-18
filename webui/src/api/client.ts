@@ -330,6 +330,28 @@ export interface DatabaseServer {
   xid_age: Int64;
   xid_freeze_max_age: Int64;
   autovacuum_enabled: boolean;
+  temp_files: Int64;
+  temp_bytes: Int64;
+  // Absent where the statistics view is unreadable: the columns moved
+  // from pg_stat_bgwriter to pg_stat_checkpointer in PG 17.
+  checkpoints_timed?: Int64;
+  checkpoints_requested?: Int64;
+}
+
+export interface CommitLockHolder {
+  catalog_id: Int64;
+  catalog?: string;
+  pid: number;
+  granted: boolean;
+  held_seconds?: number;
+  waiters: number;
+}
+
+export interface ReplicationSlot {
+  name: string;
+  slot_type: string;
+  active: boolean;
+  retained_wal_bytes?: Int64;
 }
 
 export interface DatabaseActivity {
@@ -381,9 +403,12 @@ export interface DatabaseFinding {
 export interface DatabaseHealth {
   server: DatabaseServer;
   activity: DatabaseActivity;
+  commit_locks: CommitLockHolder[];
+  replication_slots: ReplicationSlot[];
   tables: DatabaseTable[];
   indexes: DatabaseIndex[];
   findings: DatabaseFinding[];
+  blind_spots: string[];
 }
 
 export function getDatabaseHealth(): Promise<DatabaseHealth> {

@@ -1,11 +1,13 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.model.CommitLockHolder
 import com.posthog.hoglake.model.DatabaseActivity
 import com.posthog.hoglake.model.DatabaseFinding
 import com.posthog.hoglake.model.DatabaseHealth
 import com.posthog.hoglake.model.DatabaseIndex
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
+import com.posthog.hoglake.model.ReplicationSlot
 import java.time.Instant
 
 /**
@@ -20,9 +22,28 @@ import java.time.Instant
 data class DatabaseHealthDto(
     val server: DatabaseServerDto,
     val activity: DatabaseActivityDto,
+    val commitLocks: List<CommitLockHolderDto>,
+    val replicationSlots: List<ReplicationSlotDto>,
     val tables: List<DatabaseTableDto>,
     val indexes: List<DatabaseIndexDto>,
     val findings: List<DatabaseFindingDto>,
+    val blindSpots: List<String>,
+)
+
+data class CommitLockHolderDto(
+    val catalogId: Long,
+    val catalog: String?,
+    val pid: Int,
+    val granted: Boolean,
+    val heldSeconds: Double?,
+    val waiters: Int,
+)
+
+data class ReplicationSlotDto(
+    val name: String,
+    val slotType: String,
+    val active: Boolean,
+    val retainedWalBytes: Long?,
 )
 
 data class DatabaseServerDto(
@@ -39,6 +60,10 @@ data class DatabaseServerDto(
     val xidAge: Long,
     val xidFreezeMaxAge: Long,
     val autovacuumEnabled: Boolean,
+    val tempFiles: Long,
+    val tempBytes: Long,
+    val checkpointsTimed: Long?,
+    val checkpointsRequested: Long?,
 )
 
 data class DatabaseActivityDto(
@@ -89,9 +114,30 @@ fun DatabaseHealth.toDto() =
     DatabaseHealthDto(
         server = server.toDto(),
         activity = activity.toDto(),
+        commitLocks = commitLocks.map { it.toDto() },
+        replicationSlots = replicationSlots.map { it.toDto() },
         tables = tables.map { it.toDto() },
         indexes = indexes.map { it.toDto() },
         findings = findings.map { it.toDto() },
+        blindSpots = blindSpots,
+    )
+
+fun CommitLockHolder.toDto() =
+    CommitLockHolderDto(
+        catalogId = catalogId,
+        catalog = catalog,
+        pid = pid,
+        granted = granted,
+        heldSeconds = heldSeconds,
+        waiters = waiters,
+    )
+
+fun ReplicationSlot.toDto() =
+    ReplicationSlotDto(
+        name = name,
+        slotType = slotType,
+        active = active,
+        retainedWalBytes = retainedWalBytes,
     )
 
 fun DatabaseServer.toDto() =
@@ -109,6 +155,10 @@ fun DatabaseServer.toDto() =
         xidAge = xidAge,
         xidFreezeMaxAge = xidFreezeMaxAge,
         autovacuumEnabled = autovacuumEnabled,
+        tempFiles = tempFiles,
+        tempBytes = tempBytes,
+        checkpointsTimed = checkpointsTimed,
+        checkpointsRequested = checkpointsRequested,
     )
 
 fun DatabaseActivity.toDto() =

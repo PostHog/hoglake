@@ -2230,10 +2230,25 @@ components:
 
     DatabaseHealth:
       type: object
-      required: [server, activity, tables, indexes, findings]
+      required: [server, activity, commit_locks, replication_slots, tables,
+                 indexes, findings, blind_spots]
       properties:
         server: { $ref: "#/components/schemas/DatabaseServer" }
         activity: { $ref: "#/components/schemas/DatabaseActivity" }
+        commit_locks:
+          type: array
+          items: { $ref: "#/components/schemas/CommitLockHolder" }
+        replication_slots:
+          type: array
+          items: { $ref: "#/components/schemas/ReplicationSlot" }
+        blind_spots:
+          type: array
+          items: { type: string }
+          description: >
+            What this page cannot see, stated so a clean report is not
+            read as "the database is fine" — disk fullness is invisible
+            from SQL on a managed instance, and orphaned catalog rows are
+            excluded by the no-hog_*-tables rule.
         tables:
           type: array
           items: { $ref: "#/components/schemas/DatabaseTable" }
@@ -2270,6 +2285,61 @@ components:
           description: age(datfrozenxid) for this database.
         xid_freeze_max_age: { type: integer, format: int64 }
         autovacuum_enabled: { type: boolean }
+        temp_files:
+          type: integer
+          format: int64
+          description: Queries that spilled to disk (work_mem pressure).
+        temp_bytes: { type: integer, format: int64 }
+        checkpoints_timed:
+          type: integer
+          format: int64
+          description: >
+            Scheduled checkpoints. Omitted when the statistics view is
+            unreadable — the columns moved from pg_stat_bgwriter to
+            pg_stat_checkpointer in PG 17, so this is version-dependent.
+        checkpoints_requested:
+          type: integer
+          format: int64
+          description: Checkpoints forced by WAL reaching max_wal_size.
+
+    CommitLockHolder:
+      type: object
+      required: [catalog_id, pid, granted, waiters]
+      properties:
+        catalog_id:
+          type: integer
+          format: int64
+          description: >
+            The low 32 bits of the advisory key, which is the catalog id
+            by construction (see Locks.kt).
+        catalog:
+          type: string
+          description: Null if the catalog row is gone.
+        pid: { type: integer }
+        granted:
+          type: boolean
+          description: False for a session queued behind the lock.
+        held_seconds:
+          type: number
+          description: Age of the holder's transaction.
+        waiters:
+          type: integer
+          description: Sessions queued behind this lock.
+
+    ReplicationSlot:
+      type: object
+      required: [name, slot_type, active]
+      properties:
+        name: { type: string }
+        slot_type: { type: string }
+        active: { type: boolean }
+        retained_wal_bytes:
+          type: integer
+          format: int64
+          description: >
+            WAL pinned by this slot. An inactive slot retains it until
+            the volume fills, which is invisible from SQL on a managed
+            instance.
 
     DatabaseActivity:
       type: object

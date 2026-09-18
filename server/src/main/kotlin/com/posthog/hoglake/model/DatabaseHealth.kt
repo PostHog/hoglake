@@ -21,9 +21,55 @@ import java.time.Instant
 data class DatabaseHealth(
     val server: DatabaseServer,
     val activity: DatabaseActivity,
+    val commitLocks: List<CommitLockHolder>,
+    val replicationSlots: List<ReplicationSlot>,
     val tables: List<DatabaseTable>,
     val indexes: List<DatabaseIndex>,
     val findings: List<DatabaseFinding>,
+    /**
+     * What this page cannot see, stated rather than left to inference.
+     * A green page must never be read as "everything is fine" when the
+     * most common way to lose a Postgres — a full volume — is invisible
+     * from SQL on a managed instance.
+     */
+    val blindSpots: List<String>,
+)
+
+/**
+ * One holder of, or waiter for, a hoglake per-catalog commit lock.
+ *
+ * The page's whole thesis is that this schema serializes writers on
+ * these locks, so measuring them directly beats inferring trouble from
+ * generic long-transaction thresholds — those only fire once starvation
+ * is already severe. Postgres splits the single-bigint key into
+ * classid (the lock class) and objid (the catalog id), so a holder can
+ * be named by catalog without any query text.
+ */
+data class CommitLockHolder(
+    val catalogId: Long,
+    val catalog: String?,
+    val pid: Int,
+    val granted: Boolean,
+    /** How long the holder's transaction has been open. */
+    val heldSeconds: Double?,
+    /** Sessions queued behind this lock. */
+    val waiters: Int,
+)
+
+/**
+ * A replication slot and the WAL it is pinning.
+ *
+ * An inactive slot retains WAL until the volume fills, and on a managed
+ * instance that volume is not visible from SQL — so this row is the only
+ * warning available. Relevant twice over: RDS Blue/Green upgrades work
+ * by logical replication and have left slots behind, and the specced CDC
+ * WAL tap will create slots deliberately.
+ */
+data class ReplicationSlot(
+    val name: String,
+    val slotType: String,
+    val active: Boolean,
+    val retainedWalBytes: Long?,
 )
 
 data class DatabaseServer(
@@ -53,6 +99,18 @@ data class DatabaseServer(
     val xidAge: Long,
     val xidFreezeMaxAge: Long,
     val autovacuumEnabled: Boolean,
+    /** Sorts spilled to disk: work_mem pressure, since the last reset. */
+    val tempFiles: Long,
+    val tempBytes: Long,
+    /**
+     * Checkpoints requested because WAL filled max_wal_size, against
+     * those on the scheduled timer. A commit-heavy catalog on a default
+     * max_wal_size checkpoints on volume rather than on time, which is
+     * the expensive way round. Null where the statistics view is not
+     * readable (the columns moved views in PG 17).
+     */
+    val checkpointsTimed: Long?,
+    val checkpointsRequested: Long?,
 )
 
 data class DatabaseActivity(
@@ -71,6 +129,18 @@ data class DatabaseActivity(
     val longestIdleInTransactionSeconds: Double?,
     /** Age of the oldest session blocked waiting for a lock. */
     val longestWaitSeconds: Double?,
+)
+
+data class DatabaseIndexHealth(
+    val table: String,
+    val name: String,
+    /**
+     * False for an index left behind by a failed or interrupted CREATE
+     * INDEX CONCURRENTLY. It is maintained on every write and used by no
+     * query — pure write amplification, and silent forever.
+     */
+    val valid: Boolean,
+    val ready: Boolean,
 )
 
 data class DatabaseTable(

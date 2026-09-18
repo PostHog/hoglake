@@ -1,9 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import {
   getDatabaseHealth,
+  type CommitLockHolder,
   type DatabaseFinding,
   type DatabaseIndex,
   type DatabaseTable,
+  type ReplicationSlot,
 } from "../api/client";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock } from "../components/Skeleton";
@@ -67,6 +69,91 @@ function Findings({ findings }: { findings: DatabaseFinding[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+/**
+ * The commit locks, which are the page's most schema-specific view: this
+ * IS the serialization point every writer to a catalog queues on, so
+ * showing it directly beats inferring trouble from generic transaction
+ * thresholds that only fire once starvation is severe.
+ */
+function CommitLocks({ locks }: { locks: CommitLockHolder[] }) {
+  if (locks.length === 0) {
+    return (
+      <p className="empty">
+        No commit locks held. Writers queue here only while a catalog is
+        being committed to, so an empty list is the common case.
+      </p>
+    );
+  }
+  return (
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th>catalog</th>
+          <th className="num">pid</th>
+          <th>state</th>
+          <th className="num">held</th>
+          <th className="num">waiters</th>
+        </tr>
+      </thead>
+      <tbody>
+        {locks.map((l) => (
+          <tr key={`${l.catalog_id}.${l.pid}`}>
+            <td className="mono">{l.catalog ?? `catalog ${l.catalog_id}`}</td>
+            <td className="num">{l.pid}</td>
+            <td>
+              {l.granted ? (
+                "holding"
+              ) : (
+                <span className="badge badge-warn">waiting</span>
+              )}
+            </td>
+            <td className="num">{duration(l.held_seconds)}</td>
+            <td className={`num${l.waiters > 0 ? " db-cell-warn" : ""}`}>
+              {l.waiters}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function Slots({ slots }: { slots: ReplicationSlot[] }) {
+  if (slots.length === 0) return <p className="empty">No replication slots.</p>;
+  return (
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th>slot</th>
+          <th>type</th>
+          <th>state</th>
+          <th className="num">WAL retained</th>
+        </tr>
+      </thead>
+      <tbody>
+        {slots.map((s) => (
+          <tr key={s.name}>
+            <td className="mono">{s.name}</td>
+            <td>{s.slot_type}</td>
+            <td>
+              {s.active ? (
+                "active"
+              ) : (
+                <span className="badge badge-warn">inactive</span>
+              )}
+            </td>
+            <td className={`num${s.active ? "" : " db-cell-warn"}`}>
+              {s.retained_wal_bytes === undefined
+                ? "—"
+                : formatBytes(s.retained_wal_bytes)}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 
@@ -163,7 +250,16 @@ export function DatabasePage() {
   if (error) return <ErrorBox error={error} />;
   if (isPending) return <SkeletonBlock />;
 
-  const { server, activity, tables, indexes, findings } = data;
+  const {
+    server,
+    activity,
+    tables,
+    indexes,
+    findings,
+    commit_locks: commitLocks,
+    replication_slots: slots,
+    blind_spots: blindSpots,
+  } = data;
   const xidUsed = Number(server.xid_age) / Number(server.xid_freeze_max_age);
   const connectionUse = server.connections_used / server.connections_max;
 
@@ -223,6 +319,22 @@ export function DatabasePage() {
           <Stat label="committed" value={formatCount(server.committed)} />
           <Stat label="rolled back" value={formatCount(server.rolled_back)} />
           <Stat
+            label="temp files"
+            value={`${formatCount(server.temp_files)} · ${formatBytes(server.temp_bytes)}`}
+            hint="Queries that exceeded work_mem and spilled to disk."
+          />
+          <Stat
+            label="checkpoints (req/timed)"
+            value={
+              server.checkpoints_requested === undefined
+                ? "—"
+                : `${formatCount(server.checkpoints_requested)} / ${formatCount(
+                    server.checkpoints_timed ?? 0,
+                  )}`
+            }
+            hint="Requested checkpoints mean WAL hit max_wal_size before the timer. Unavailable on some Postgres versions."
+          />
+          <Stat
             label="deadlocks"
             value={formatCount(server.deadlocks)}
             tone={String(server.deadlocks) === "0" ? undefined : "warn"}
@@ -262,6 +374,16 @@ export function DatabasePage() {
       </section>
 
       <section>
+        <h3>Commit locks</h3>
+        <CommitLocks locks={commitLocks} />
+      </section>
+
+      <section>
+        <h3>Replication slots</h3>
+        <Slots slots={slots} />
+      </section>
+
+      <section>
         <h3>Tables</h3>
         <Tables tables={tables} />
       </section>
@@ -269,6 +391,18 @@ export function DatabasePage() {
       <section>
         <h3>Indexes</h3>
         <Indexes indexes={indexes} />
+      </section>
+
+      {/* Last, and deliberately present even when everything above is
+          green: the most common way to lose a Postgres is not visible
+          from any statistics view. */}
+      <section>
+        <h3>Not measured here</h3>
+        <ul className="db-blind-spots">
+          {blindSpots.map((spot) => (
+            <li key={spot}>{spot}</li>
+          ))}
+        </ul>
       </section>
     </section>
   );

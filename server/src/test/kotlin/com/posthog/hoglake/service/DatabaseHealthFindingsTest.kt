@@ -1,10 +1,13 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.CommitLockHolder
 import com.posthog.hoglake.model.DatabaseActivity
 import com.posthog.hoglake.model.DatabaseIndex
+import com.posthog.hoglake.model.DatabaseIndexHealth
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
 import com.posthog.hoglake.model.FindingSeverity
+import com.posthog.hoglake.model.ReplicationSlot
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.time.Instant
@@ -45,6 +48,10 @@ class DatabaseHealthFindingsTest {
         xidAge = xidAge,
         xidFreezeMaxAge = 200_000_000,
         autovacuumEnabled = autovacuum,
+        tempFiles = 0,
+        tempBytes = 0,
+        checkpointsTimed = 100,
+        checkpointsRequested = 1,
     )
 
     private fun activity(
@@ -100,7 +107,12 @@ class DatabaseHealthFindingsTest {
         activity: DatabaseActivity = activity(),
         tables: List<DatabaseTable> = listOf(table()),
         indexes: List<DatabaseIndex> = listOf(index()),
-    ) = service.findings(server, activity, tables, indexes).map { it.code }
+        commitLocks: List<CommitLockHolder> = emptyList(),
+        slots: List<ReplicationSlot> = emptyList(),
+        prepared: Pair<Int, Double?> = 0 to null,
+        invalidIndexes: List<DatabaseIndexHealth> = emptyList(),
+    ) = service.findings(server, activity, tables, indexes, commitLocks, slots, prepared, invalidIndexes)
+        .map { it.code }
 
     @Test
     fun `a healthy instance produces no findings`() {
@@ -230,6 +242,150 @@ class DatabaseHealthFindingsTest {
         // IS the system working, and flagging it would be noise.
         assertThat(codes(activity = activity(waiting = 3, longestWait = 0.05))).doesNotContain("lock_wait")
         assertThat(codes(activity = activity(waiting = 3, longestWait = 45.0))).contains("lock_wait")
+    }
+
+    @Test
+    fun `an invalid index is reported`() {
+        // What a failed CREATE INDEX CONCURRENTLY leaves: maintained on
+        // every write, used by nothing, and invisible as a slow query.
+        assertThat(
+            codes(
+                invalidIndexes =
+                    listOf(
+                        DatabaseIndexHealth("hog_data_file", "hog_df_partial", valid = false, ready = true),
+                    ),
+            ),
+        ).contains("invalid_indexes")
+        assertThat(codes()).doesNotContain("invalid_indexes")
+    }
+
+    @Test
+    fun `an inactive replication slot escalates with the WAL it pins`() {
+        val small =
+            service.findings(
+                server(),
+                activity(),
+                listOf(table()),
+                listOf(index()),
+                slots = listOf(ReplicationSlot("bg_upgrade", "logical", active = false, retainedWalBytes = 1024)),
+            )
+        assertThat(small.single { it.code == "inactive_replication_slot" }.severity)
+            .isEqualTo(FindingSeverity.WARN)
+
+        val huge =
+            service.findings(
+                server(),
+                activity(),
+                listOf(table()),
+                listOf(index()),
+                slots =
+                    listOf(
+                        ReplicationSlot(
+                            "bg_upgrade",
+                            "logical",
+                            active = false,
+                            retainedWalBytes = 32L * 1024 * 1024 * 1024,
+                        ),
+                    ),
+            )
+        assertThat(huge.single { it.code == "inactive_replication_slot" }.severity)
+            .isEqualTo(FindingSeverity.CRITICAL)
+
+        // An ACTIVE slot is a consumer doing its job, not a finding.
+        assertThat(
+            codes(
+                slots =
+                    listOf(
+                        ReplicationSlot("cdc", "logical", active = true, retainedWalBytes = 64L * 1024 * 1024 * 1024),
+                    ),
+            ),
+        ).doesNotContain("inactive_replication_slot")
+    }
+
+    @Test
+    fun `an orphaned prepared transaction is critical`() {
+        // hoglake never uses two-phase commit, so any row is an orphan -
+        // and it pins the vacuum horizon while appearing in no session count.
+        assertThat(codes(prepared = 1 to 3600.0)).contains("prepared_transactions")
+        assertThat(
+            service.findings(server(), activity(), listOf(table()), listOf(index()), preparedTransactions = 2 to 60.0)
+                .single { it.code == "prepared_transactions" }.severity,
+        ).isEqualTo(FindingSeverity.CRITICAL)
+        assertThat(codes()).doesNotContain("prepared_transactions")
+    }
+
+    @Test
+    fun `a commit lock is flagged on duration or on queue depth`() {
+        fun lock(
+            held: Double,
+            waiters: Int,
+            granted: Boolean = true,
+        ) = CommitLockHolder(42, "gigahog", 1234, granted, held, waiters)
+
+        // The common case: held briefly, nobody waiting. That IS the
+        // commit tail working, and flagging it would make the page noise.
+        assertThat(codes(commitLocks = listOf(lock(0.02, 0)))).doesNotContain("commit_lock_held")
+        // Long hold.
+        assertThat(codes(commitLocks = listOf(lock(30.0, 0)))).contains("commit_lock_held")
+        // Short hold but a real queue: starvation is about the waiters.
+        assertThat(codes(commitLocks = listOf(lock(1.0, 12)))).contains("commit_lock_held")
+        assertThat(
+            service.findings(
+                server(),
+                activity(),
+                listOf(table()),
+                listOf(index()),
+                commitLocks = listOf(lock(120.0, 3)),
+            )
+                .single { it.code == "commit_lock_held" }.severity,
+        ).isEqualTo(FindingSeverity.CRITICAL)
+        // A waiter is not a holder; it must not be reported as one.
+        assertThat(codes(commitLocks = listOf(lock(900.0, 0, granted = false))))
+            .doesNotContain("commit_lock_held")
+    }
+
+    @Test
+    fun `a commit lock finding names the catalog, and copes when it cannot`() {
+        val named =
+            service.findings(
+                server(),
+                activity(),
+                listOf(table()),
+                listOf(index()),
+                commitLocks = listOf(CommitLockHolder(42, "gigahog-ev", 99, true, 30.0, 4)),
+            ).single { it.code == "commit_lock_held" }
+        assertThat(named.title).contains("gigahog-ev")
+
+        // A dropped catalog still has an id; the finding must not say "null".
+        val unnamed =
+            service.findings(
+                server(),
+                activity(),
+                listOf(table()),
+                listOf(index()),
+                commitLocks = listOf(CommitLockHolder(42, null, 99, true, 30.0, 4)),
+            ).single { it.code == "commit_lock_held" }
+        assertThat(unnamed.title).contains("catalog 42").doesNotContain("null")
+    }
+
+    @Test
+    fun `checkpoint pressure is reported, and absent counters are not`() {
+        assertThat(codes()).doesNotContain("checkpoints_requested")
+        val pressured = server().copy(checkpointsTimed = 10, checkpointsRequested = 90)
+        assertThat(codes(server = pressured)).contains("checkpoints_requested")
+        // PG 17 moved the columns; a null must be silence, not a finding.
+        val unknown = server().copy(checkpointsTimed = null, checkpointsRequested = null)
+        assertThat(codes(server = unknown)).doesNotContain("checkpoints_requested")
+    }
+
+    @Test
+    fun `temp file spill is informational`() {
+        val spilling = server().copy(tempFiles = 5_000, tempBytes = 40L * 1024 * 1024 * 1024)
+        val finding =
+            service.findings(spilling, activity(), listOf(table()), listOf(index()))
+                .single { it.code == "temp_files" }
+        assertThat(finding.severity).isEqualTo(FindingSeverity.INFO)
+        assertThat(codes()).doesNotContain("temp_files")
     }
 
     @Test
