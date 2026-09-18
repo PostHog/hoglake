@@ -244,8 +244,19 @@ td.nullable-mark {
 .data-table tbody tr:hover {
   background: var(--bg-hover);
 }
+/* The cell lays out left-to-right so the copy button sits AFTER the
+   path; the rtl truncation lives on the text alone (.path-text). */
 .path-cell {
   max-width: 340px;
+}
+.path-cell > * {
+  vertical-align: middle;
+}
+/* Truncate from the left: the end of an object path is what
+   distinguishes it, so that is the part worth keeping on screen. */
+.path-text {
+  display: inline-block;
+  max-width: calc(100% - 22px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -504,17 +515,34 @@ button.ghost:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--text-dim);
 }
+/* Icon-only, and quiet: it appears on every row of the files table, so
+   it must not compete with the data it sits beside. */
+/* Icon-only, and quiet: it appears on every row of the files table, so
+   it must not compete with the data beside it. Dimming is done with
+   colour ALONE — stacking opacity on an already-dim token made it hard
+   to see at rest, which for a control you have to find is the wrong
+   trade. */
 .copy-btn {
   background: transparent;
-  border: 1px solid var(--border);
+  border: none;
   color: var(--text-dim);
-  font-size: 10px;
-  padding: 0 6px;
+  padding: 0 2px;
+  margin-left: 4px;
   border-radius: 3px;
-  vertical-align: 1px;
+  line-height: 1;
+  cursor: pointer;
 }
 .copy-btn:hover {
   color: var(--text);
+}
+/* Keyboard users get the same affordance as the mouse; without this the
+   button takes focus invisibly. */
+.copy-btn:focus-visible {
+  color: var(--text);
+  outline: 1px solid var(--accent);
+}
+.copy-btn-done {
+  color: var(--ok);
 }
 .load-more {
   background: transparent;
