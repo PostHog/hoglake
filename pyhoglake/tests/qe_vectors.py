@@ -21,7 +21,7 @@ Regeneration (only when the codec intentionally changes): feed the
 exact value through pyhoglake.bounds.encode_bound and paste .hex() —
 never hand-compute a byte. The file carried a "generated_by" provenance
 string until it was dropped: nothing could falsify it, because every
-run re-derives all 107 encodings from the INSTALLED codec anyway, and
+run re-derives all 109 encodings from the INSTALLED codec anyway, and
 pinning it to a version number would only have added a seventh string
 to the release bump for a claim no regeneration backed.
 """
@@ -201,7 +201,7 @@ def test_vector_file_header_contract():
     # Exact, not >=: a vector deleted by a bad merge is otherwise a silent
     # loss of coverage. Bump deliberately when adding vectors, and keep
     # BoundsVectorFile.EXPECTED_COUNT on the Kotlin side in step.
-    assert len(VECTORS) == 107
+    assert len(VECTORS) == 109
     for vec in VECTORS:
         assert set(vec) >= {"type", "type_params", "value", "hex", "note"}
         # hex must be lowercase and byte-aligned

@@ -2025,7 +2025,11 @@ components:
           these fields exactly (BigInt / raw-token parsing), the way
           the hoglake webui does. Decimal renders at the COLUMN's
           scale (unscaled x 10^-scale, e.g. "1.50" for a scale-2
-          column); uint64 is decimal(20,0), an integer.
+          column) and ALWAYS in plain notation — never
+          scientific/exponent form, so a decimal(38,38) lower bound
+          of unscaled 1 is the 38-fraction-digit token
+          0.00000000000000000000000000000000000001, not 1E-38;
+          uint64 is decimal(20,0), an integer.
 
         * float/double -> JSON numbers. The infinities cannot be JSON
           numbers and render as the STRING sentinels "Infinity" and

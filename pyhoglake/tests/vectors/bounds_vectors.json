@@ -525,6 +525,28 @@
       "wire": -99999999999999999999999999999999999999
     },
     {
+      "type": "decimal",
+      "type_params": {
+        "precision": 38,
+        "scale": 38
+      },
+      "value": "1",
+      "hex": "01",
+      "note": "unscaled 1 at the widest scale: the wire token stays PLAIN notation (never 1E-38)",
+      "wire": 0.00000000000000000000000000000000000001
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 7
+      },
+      "value": "1",
+      "hex": "01",
+      "note": "unscaled 1 at scale 7, just past BigDecimal.toString's plain-notation window: wire stays plain (never 1E-7)",
+      "wire": 0.0000001
+    },
+    {
       "type": "date",
       "type_params": null,
       "value": "0",

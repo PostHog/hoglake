@@ -34,7 +34,7 @@ import java.nio.file.Files
  * encodings of the signed zeros must render as the tokens their bits
  * say — a stored -0.0 lower bound reaches the wire with its sign.
  *
- * Counts are pinned (107 vectors, 13 cases) like every other reader of
+ * Counts are pinned (109 vectors, 13 cases) like every other reader of
  * this file, so a silently shrunken file cannot pass.
  */
 class QeBoundsWireVectorsTest {

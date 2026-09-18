@@ -93,6 +93,22 @@ class BoundWireTest {
     }
 
     @Test
+    fun `decimal renders plain notation at every scale, never scientific`() {
+        // BigDecimal.toString switches to scientific notation once the
+        // adjusted exponent drops below -6 ("1E-38"), but the spec's
+        // convention is "unscaled x 10^-scale, e.g. '1.50'" — a plain
+        // JSON number token at every legal scale. The wire mapper
+        // serializes BigDecimal as toPlainString
+        // (WRITE_BIGDECIMAL_AS_PLAIN), still a JSON number.
+        assertThat(wire(ColType.DECIMAL, BigInteger.ONE, scale = 38))
+            .isEqualTo("0.00000000000000000000000000000000000001")
+        assertThat(wire(ColType.DECIMAL, BigInteger.ONE, scale = 7)).isEqualTo("0.0000001")
+        // A scale-7 value already inside toString's plain window keeps
+        // its trailing scale digits too.
+        assertThat(wire(ColType.DECIMAL, BigInteger("15000000"), scale = 7)).isEqualTo("1.5000000")
+    }
+
+    @Test
     fun `decimal precision 38 renders every digit`() {
         val digits38 = "9".repeat(38)
         assertThat(wire(ColType.DECIMAL, BigInteger(digits38))).isEqualTo(digits38)

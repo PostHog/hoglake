@@ -293,7 +293,7 @@ there would break that gate on every build.
   leaves one silent.
   - **pyhoglake** is the reference client. It shares the Iceberg
     single-value codec through
-    `pyhoglake/tests/vectors/bounds_vectors.json` (107 vectors, count
+    `pyhoglake/tests/vectors/bounds_vectors.json` (109 vectors, count
     pinned on both sides — `qe_vectors.test_vector_file_header_contract`
     and `BoundsVectorFile.EXPECTED_COUNT` — so a silently shrunken file
     cannot pass), and it mirrors the server's type mapping and
