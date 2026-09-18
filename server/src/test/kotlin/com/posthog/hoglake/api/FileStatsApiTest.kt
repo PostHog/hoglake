@@ -467,9 +467,15 @@ class FileStatsApiTest {
             assertThat(node.column(ids.getValue("m.key"))["path"].asText()).isEqualTo("m.key")
             assertThat(node.column(ids.getValue("m.value"))["path"].asText()).isEqualTo("m.value")
 
-            // The containers themselves never carry rows.
+            // The containers themselves never carry rows, and the leaves
+            // arrive in ASCENDING field-id order — the spec's promise on
+            // FileStats.columns ("field-id order"), pinned as a sequence
+            // so a reversed or shuffled ORDER BY cannot pass.
             val returnedIds = node["columns"].map { it["field_id"].asLong() }
             assertThat(returnedIds).doesNotContain(ids.getValue("s"), ids.getValue("l"), ids.getValue("m"))
+            val expectedOrder =
+                listOf("s.a", "l.element", "m.key", "m.value").map { ids.getValue(it) }.sorted()
+            assertThat(returnedIds).containsExactlyElementsOf(expectedOrder)
         }
 
     // ---- undecodable stored bound: null, never a 500 -----------------------
@@ -506,6 +512,40 @@ class FileStatsApiTest {
             // treated as absent, and absent means do not prune.
             assertThat(c["lower_bound"].isNull).isTrue()
             assertThat(c["upper_bound"].asLong()).isEqualTo(3)
+        }
+
+    // ---- failed hydration: the OTHER no-stats arm --------------------------
+
+    @Test
+    fun `a failed-stats file answers the exact failed shape`() =
+        api { client ->
+            createTable(client, "failedstats", """{"name": "id", "type": "long"}""")
+            val path = "s3://b/$catalog/failedstats/f1.parquet"
+            commitFile(client, "failedstats", path, 5, statsJson = null)
+            val id = fileId(client, "failedstats", path)
+            // Stage the hydrator's structural-failure outcome directly
+            // (the same behind-the-door technique as the poisoned-bound
+            // test): a deferred-stats file whose footer read failed.
+            db.jdbi.withHandleUnchecked { h ->
+                h.createUpdate(
+                    "UPDATE hog_data_file SET stats_state = 'failed' WHERE data_file_id = :f",
+                )
+                    .bind("f", id)
+                    .execute()
+            }
+
+            val response = client.get("$tablesUrl/failedstats/files/$id/stats")
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            val node = body(response)
+            assertThat(node["stats_state"].asText()).isEqualTo("failed")
+            assertThat(node["columns"]).isEmpty()
+            // The exact reason string is the contract: it names the
+            // state, the recovery door, and the no-pruning rule.
+            assertThat(node["no_stats_reason"].asText()).isEqualTo(
+                "stats_state is 'failed': stats hydration failed structurally " +
+                    "(see POST .../maintenance/rehydrate), so no per-column rows exist; " +
+                    "with no bounds, callers must not prune this file",
+            )
         }
 
     // ---- resolution and 404s -----------------------------------------------
@@ -571,5 +611,63 @@ class FileStatsApiTest {
             val before = body(client.get("$tablesUrl/dropped/files/$id/stats?snapshot=$preDrop"))
             assertThat(before["columns"].map { it["field_id"].asLong() })
                 .containsExactlyInAnyOrder(ids.getValue("keep"), ids.getValue("gone"))
+        }
+
+    @Test
+    fun `at_timestamp resolves stats to the pre-drop snapshot`() =
+        api { client ->
+            val ids =
+                createTable(
+                    client,
+                    "tstravel",
+                    """{"name": "keep", "type": "long"}, {"name": "gone", "type": "long"}""",
+                )
+            val path = "s3://b/$catalog/tstravel/f1.parquet"
+            val rows =
+                listOf(
+                    statsRow(ids.getValue("keep"), 2, 0, enc(ColType.LONG, 1L), enc(ColType.LONG, 2L)),
+                    statsRow(ids.getValue("gone"), 2, 0, enc(ColType.LONG, 5L), enc(ColType.LONG, 6L)),
+                ).joinToString(",")
+            commitFile(client, "tstravel", path, 2, rows)
+            val id = fileId(client, "tstravel", path)
+            val preDrop = body(client.get("/v1/catalogs/$catalog"))["head_snapshot_id"].asLong()
+
+            val altered =
+                client.postJson(
+                    "$tablesUrl/tstravel/alter",
+                    """{"ops": [{"op": "drop_column", "name": "gone"}]}""",
+                )
+            assertThat(altered.status).isEqualTo(HttpStatusCode.OK)
+
+            // Deterministic snapshot times (base + snapshot_id minutes),
+            // rewritten directly like TimestampTravelIntegrationTest:
+            // adjacent test commits can share a wall-clock microsecond,
+            // and this test is about resolution, not clocks.
+            val base = java.time.Instant.parse("2026-03-01T00:00:00Z")
+            db.jdbi.withHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    UPDATE hog_snapshot
+                    SET snapshot_time = :base + make_interval(mins => snapshot_id::int)
+                    WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                    """,
+                )
+                    .bind("base", base.atOffset(java.time.ZoneOffset.UTC))
+                    .bind("cat", catalog)
+                    .execute()
+            }
+
+            // At the pre-drop instant the dropped column's stats row is
+            // still visible — a resolution head cannot produce, so a
+            // handler that ignores at_timestamp fails here.
+            val atPreDrop = base.plusSeconds(preDrop * 60)
+            val travelled =
+                body(client.get("$tablesUrl/tstravel/files/$id/stats?at_timestamp=$atPreDrop"))
+            assertThat(travelled["columns"].map { it["field_id"].asLong() })
+                .containsExactlyInAnyOrder(ids.getValue("keep"), ids.getValue("gone"))
+
+            val atHead = body(client.get("$tablesUrl/tstravel/files/$id/stats"))
+            assertThat(atHead["columns"].map { it["field_id"].asLong() })
+                .containsExactly(ids.getValue("keep"))
         }
 }
