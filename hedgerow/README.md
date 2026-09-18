@@ -274,55 +274,32 @@ Integration tests need a live hoglake server (`HOGLAKE_URL`, default
 `hedgerow-*`-prefixed catalogs and buckets and skip cleanly when the
 server is unreachable.
 
-## Buffered raw event ingestion work
-
-The experimental library coordinator and its current limitations are documented
-in [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md). It is not yet a CLI ingestion
-mode; existing replication behavior is unchanged.
-
 ## Buffered event ingestion
 
-Run `hedgerow --config buffered.example.yaml` with `mode: buffered` to use the
-DuckDB-backed coordinator. Existing configs default to `mode: direct` and retain
-their replication semantics. See [buffered.example.yaml](buffered.example.yaml)
-for a complete configuration and [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md)
-for the durability model and remaining limitations.
+Run `hedgerow --config buffered.example.yaml` with `mode: buffered`. Existing
+configs default to direct replication. [buffered.example.yaml](buffered.example.yaml)
+is the complete configuration; [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md)
+covers table prerequisites, durable state, resource limits and raw-file retention.
 
-Both tables must already exist. Enable the source catalog's `consumer_floor`;
-the destination must have identity(team_id) plus month(timestamp) or
-month(event_date), and ascending/nulls-first sort `(event_date, event, timestamp,
-uuid)`. Raw files remain indefinitely as backups.
+Omitting `buffered.json_columns` converts only `properties`, only for a JSON/string
+source and VARIANT destination. Native VARIANT passes through. An explicit list
+overrides selection; `[]` disables conversion. Effective mappings are pinned in
+state, so changes require reconciliation.
 
-When `buffered.json_columns` is omitted, only `properties` is converted, and
-only for a JSON/string source and VARIANT destination. Native VARIANT passes
-through. Set a list to override this selection or `[]` to disable conversion.
-The effective conversion list is pinned in durable state; incompatible changes
-require reconciliation. Do not delete pending state to bypass a mismatch.
+`--once` discovers one bounded source window and settles ready work without
+forcing young buffers to flush. Normal mode polls; `buffered.max_failures` bounds
+retries per work item, separately from consecutive polling failures. Idle worker
+polls do not clear a failed work item's budget. Exit 9 retains pending work for
+retry/reconciliation. SIGTERM stops polling and joins workers before releasing
+the state lock. Use the same durable state file on restart.
 
-State and scratch paths must be absolute. Put the SQLite state on a durable,
-locally mounted volume; scratch is disposable. Memory and scratch budgets apply
-per worker, and DuckDB's memory setting is not a process RSS cap. One process
-owns each state file. SIGTERM stops polling and waits for active workers before
-releasing the state lock; unfinished work remains recoverable on restart.
+`source.s3` configures Arrow discovery and DuckDB reads; `destination.s3` controls
+uploads. `s3.region` applies to both engines. Omit keys to use ambient credentials,
+or supply them through `HEDGEROW__SOURCE__S3__ACCESS_KEY` / `SECRET_KEY` and the
+equivalent destination overrides. Provision DuckDB's `httpfs` extension (and
+`aws` for ambient credentials) for offline deployments. Startup checks secret
+setup; credentials are connection-local and redacted from error diagnostics.
 
-`--once` discovers one bounded source window and waits for ready work to settle.
-It does **not** force young buffers to flush. Normal service mode polls and
-retries transient failures up to `buffered.max_failures`; idle worker polls do
-not reset that budget. Catalog expiry, schema/incarnation changes and offset
-regressions halt with the existing exit codes. An exhausted retry budget exits
-9 with pending work intact; `--once` exits 9 on a transient failure for the
-operator to retry. Prepared commit requests are never regenerated after an
-ambiguous publication.
-
-Use the existing `source.s3` settings for both Arrow discovery and DuckDB reads;
-`destination.s3` controls uploads. Optional `s3.region` applies to both engines.
-Without explicit keys, each engine uses its ambient credential chain. DuckDB
-needs `httpfs` (and `aws` for the credential chain); provision these extensions
-for restricted/offline deployments. Startup validates DuckDB secret setup.
-Secrets are connection-local, never persisted in SQLite or printed as SQL.
-For example, supply credentials with `HEDGEROW__SOURCE__S3__ACCESS_KEY` and
-`HEDGEROW__SOURCE__S3__SECRET_KEY`, and equivalent destination overrides.
-
-Buffered mode currently reports structured logs. It rejects `filter`, nonzero
-`metrics.port`, and direct-only replication knobs (`max_rows_per_append`,
-`max_window_replays`, `max_append_retries`) rather than silently ignoring them.
+Buffered mode reports structured logs. It rejects `filter`, nonzero `metrics.port`,
+and direct-only replication knobs (`max_rows_per_append`, `max_window_replays`,
+`max_append_retries`) rather than ignoring them.

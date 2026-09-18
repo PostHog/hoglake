@@ -68,7 +68,9 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         if config.mode != "buffered":
             raise
-        log.critical("buffered failure: %s; pending work retained", type(e).__name__)
+        log.critical(
+            "buffered failure: %s; pending work retained", daemon.describe_error(e)
+        )
         return 9
     except KeyboardInterrupt:
         log.info("interrupted; exiting")

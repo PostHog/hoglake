@@ -111,6 +111,7 @@ class BufferedService:
         self.clients = []
         self.coordinator = None
         self.failures = 0
+        self.work_failures: dict[str, int] = {}
 
     def start(self):
         if self.coordinator is not None:
@@ -156,6 +157,7 @@ class BufferedService:
         )
 
     def _cycle(self, discover=True):
+        self.coordinator.scheduler.failed_work = None
         try:
             if discover:
                 result = self.coordinator.run_once()
@@ -181,11 +183,13 @@ class BufferedService:
             # change the receipt payload, so even a generic retryable conflict
             # requires reconciliation here.
             raise PersistentFailureError(
-                "prepared commit conflict requires reconciliation; request retained"
+                "prepared commit conflict requires reconciliation; request retained: "
+                + self.describe_error(error)
             ) from error
         except (ValidationError, NotFoundError, AlreadyExistsError) as error:
             raise PersistentFailureError(
-                "permanent catalog/schema error; pending work retained"
+                "permanent catalog/schema error; pending work retained: "
+                + self.describe_error(error)
             ) from error
         except HoglakeError as error:
             if (
@@ -194,7 +198,8 @@ class BufferedService:
                 and error.status_code not in (408, 429)
             ):
                 raise PersistentFailureError(
-                    "permanent catalog error; pending work retained"
+                    "permanent catalog error; pending work retained: "
+                    + self.describe_error(error)
                 ) from error
             raise
 
@@ -213,22 +218,48 @@ class BufferedService:
             except (HaltError, ConfigError):
                 raise
             except Exception as error:
-                self.failures += 1
-                if self.failures > self.config.buffered.max_failures:
+                failed = self.coordinator.scheduler.failed_work
+                if failed is None:
+                    self.failures += 1
+                    attempts = self.failures
+                else:
+                    work_id, _ = failed
+                    attempts = self.work_failures.get(work_id, 0) + 1
+                    self.work_failures[work_id] = attempts
+                if attempts > self.config.buffered.max_failures:
                     raise PersistentFailureError(
-                        "buffered retry budget exhausted; pending work retained"
+                        "buffered retry budget exhausted; pending work retained: "
+                        + self.describe_error(error)
                     ) from error
                 log.warning(
-                    "buffered_retry attempt=%d error_type=%s",
-                    self.failures,
-                    type(error).__name__,
+                    "buffered_retry attempt=%d %s", attempts, self.describe_error(error)
                 )
             else:
-                # Idle worker polls aren't successful retries. Keep the budget
-                # until the failed durable work has actually been completed.
-                if not self.coordinator.store.recover():
-                    self.failures = 0
+                self.failures = 0  # successful polling only clears polling failures
+                # A scheduler tick may publish one work item and immediately
+                # claim another. Clear only completed items, never idle attempts.
+                pending = {w.work_id for w in self.coordinator.store.recover()}
+                self.work_failures = {
+                    k: v for k, v in self.work_failures.items() if k in pending
+                }
             self.stop.wait(self.config.replication.poll_interval_s)
+
+    def describe_error(self, error):
+        failed = (
+            self.coordinator.scheduler.failed_work
+            if self.coordinator is not None
+            else None
+        )
+        context = f"work_id={failed[0]} stage={failed[1]}" if failed else "poll/startup"
+        detail = str(error)
+        # Preserve useful diagnostics without exposing configured credentials,
+        # including DuckDB's SQL-escaped representation of a quoted secret.
+        for side in (self.config.source, self.config.destination):
+            for value in (side.s3.access_key, side.s3.secret_key):
+                if value:
+                    for representation in (value.replace("'", "''"), value):
+                        detail = detail.replace(representation, "[redacted]")
+        return f"{context} {type(error).__name__}: {detail}"
 
     def close(self):
         try:

@@ -134,18 +134,52 @@ def test_cli_selects_buffered_and_closes_on_halt(tmp_path, monkeypatch):
     assert events == ["start", "close"]
 
 
-def test_async_idle_polls_do_not_reset_retry_budget(tmp_path, monkeypatch):
-    config = HedgerowConfig.parse(raw_config(tmp_path))
-    service = BufferedService(config)
+@pytest.mark.parametrize("new_work_after_success", [False, True])
+def test_retry_budget_tracks_work_not_global_idleness(
+    tmp_path, monkeypatch, new_work_after_success
+):
+    service = BufferedService(HedgerowConfig.parse(raw_config(tmp_path)))
+    scheduler = SimpleNamespace(failed_work=None)
+    current = SimpleNamespace(work_id="work-0")
     service.coordinator = SimpleNamespace(
-        store=SimpleNamespace(recover=lambda: ["frozen work"])
+        store=SimpleNamespace(recover=lambda: [current]), scheduler=scheduler
     )
-    outcomes = iter([TimeoutError(), None] * 4)
+    ticks = 0
 
     def cycle():
-        outcome = next(outcomes)
-        if outcome:
-            raise outcome
+        nonlocal ticks, current
+        ticks += 1
+        scheduler.failed_work = None
+        if ticks % 2:
+            scheduler.failed_work = (current.work_id, "publish")
+            raise TimeoutError("lost response")
+        if new_work_after_success:
+            # Recovery succeeds and the scheduler immediately claims more work;
+            # there is never a globally idle tick.
+            current = SimpleNamespace(work_id=f"work-{ticks // 2}")
+        if ticks == 10:
+            service.stop.set()
+
+    monkeypatch.setattr(service, "_cycle", cycle)
+    monkeypatch.setattr(service.stop, "wait", lambda _: False)
+    if new_work_after_success:
+        service.run_forever()
+        assert ticks == 10
+        assert service.work_failures == {}
+    else:
+        with pytest.raises(
+            PersistentFailureError, match="work_id=work-0 stage=publish"
+        ):
+            service.run_forever()
+        assert service.work_failures == {"work-0": 4}
+
+
+def test_poll_failures_have_their_own_bounded_budget(tmp_path, monkeypatch):
+    service = BufferedService(HedgerowConfig.parse(raw_config(tmp_path)))
+    service.coordinator = SimpleNamespace(scheduler=SimpleNamespace(failed_work=None))
+
+    def cycle():
+        raise TimeoutError("catalog unavailable")
 
     monkeypatch.setattr(service, "_cycle", cycle)
     monkeypatch.setattr(service.stop, "wait", lambda _: False)
@@ -167,7 +201,9 @@ def test_client_halts_are_translated(tmp_path, error, expected):
     def cycle():
         raise error
 
-    service.coordinator = SimpleNamespace(run_once=cycle)
+    service.coordinator = SimpleNamespace(
+        run_once=cycle, scheduler=SimpleNamespace(failed_work=None)
+    )
     with pytest.raises(expected):
         service._cycle()
 
@@ -200,8 +236,10 @@ def test_immutable_commit_conflicts_and_local_validation_halt(tmp_path, error):
     def fail():
         raise error
 
-    service.coordinator = SimpleNamespace(run_once=fail)
-    with pytest.raises(PersistentFailureError):
+    service.coordinator = SimpleNamespace(
+        run_once=fail, scheduler=SimpleNamespace(failed_work=None)
+    )
+    with pytest.raises(PersistentFailureError, match=str(error)):
         service._cycle()
     assert service.failures == 0
 
@@ -239,3 +277,33 @@ def test_region_is_shared_between_arrow_and_duckdb():
     statements = []
     configure_s3(settings)(SimpleNamespace(execute=statements.append))
     assert "REGION 'eu-west-1'" in statements[0]
+
+
+def test_diagnostics_retain_work_and_error_but_redact_credentials(
+    tmp_path, caplog, monkeypatch
+):
+    raw = raw_config(tmp_path)
+    raw["source"]["s3"].update(access_key="access-token", secret_key="private'value")
+    raw["destination"]["s3"].update(
+        access_key="destination-key", secret_key="destination-secret"
+    )
+    path = tmp_path / "config.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    service = BufferedService(HedgerowConfig.parse(raw))
+    scheduler = SimpleNamespace(failed_work=None)
+
+    def fail():
+        scheduler.failed_work = ("work-42", "prepare")
+        raise ValidationError(
+            "cannot prove non-null values for uuid; private'value private''value destination-secret"
+        )
+
+    service.coordinator = SimpleNamespace(
+        run_once=fail, scheduler=scheduler, close=lambda: None
+    )
+    monkeypatch.setattr(cli, "BufferedService", lambda _: service)
+    assert cli.main(["--config", str(path), "--once"]) == 9
+    assert "cannot prove non-null values for uuid" in caplog.text
+    assert "work_id=work-42 stage=prepare" in caplog.text
+    assert "private" not in caplog.text
+    assert "destination-secret" not in caplog.text
