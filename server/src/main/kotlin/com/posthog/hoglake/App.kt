@@ -214,6 +214,7 @@ class App private constructor(
             commitService,
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
+            catalogTotals = { catalogMetrics.latestByCatalog },
         )
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),

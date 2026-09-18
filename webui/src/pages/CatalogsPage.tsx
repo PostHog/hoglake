@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createCatalog, listCatalogs } from "../api/client";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
+import { formatBytes, formatCount } from "../lib/format";
 
 function CreateCatalogForm() {
   const queryClient = useQueryClient();
@@ -72,17 +73,20 @@ export function CatalogsPage() {
             <tr>
               <th>name</th>
               <th>data_path</th>
+              <th className="num">tables</th>
+              <th className="num">rows</th>
+              <th className="num">size</th>
               <th className="num">head_snapshot_id</th>
               <th className="num">schema_version</th>
             </tr>
           </thead>
           {isPending ? (
-            <SkeletonRows rows={4} cols={4} />
+            <SkeletonRows rows={4} cols={7} />
           ) : (
             <tbody>
               {data.length === 0 && (
                 <tr>
-                  <td colSpan={4} className="empty">
+                  <td colSpan={7} className="empty">
                     No catalogs yet.
                   </td>
                 </tr>
@@ -95,6 +99,20 @@ export function CatalogsPage() {
                     </Link>
                   </td>
                   <td className="mono">{c.data_path}</td>
+                  {/* An em dash where the sampler has not reached this
+                      catalog yet: zero would claim it is empty. */}
+                  <td className="num mono">
+                    {c.table_count === undefined ? "—" : formatCount(c.table_count)}
+                  </td>
+                  <td className="num mono">
+                    {c.live_rows === undefined ? "—" : formatCount(c.live_rows)}
+                  </td>
+                  <td
+                    className="num mono"
+                    title={c.live_size_bytes === undefined ? undefined : `${c.live_size_bytes} bytes`}
+                  >
+                    {c.live_size_bytes === undefined ? "—" : formatBytes(c.live_size_bytes)}
+                  </td>
                   <td className="num mono">{c.head_snapshot_id}</td>
                   <td className="num mono">{c.schema_version}</td>
                 </tr>

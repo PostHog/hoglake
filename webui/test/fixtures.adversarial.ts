@@ -88,3 +88,21 @@ export const bigIntSnapshotsPage1WireBody =
   '{"snapshot_id":9007199254740995,' +
   '"snapshot_time":"2026-09-05T00:00:01Z","schema_version":3}' +
   '],"has_more":true}';
+
+/**
+ * Raw catalog-listing wire body whose live_rows exceeds 2^53, as an
+ * UNQUOTED JSON number — the form the server actually sends.
+ *
+ * A fixture that already holds the string would prove nothing: the
+ * precision is lost (or not) in the JSON parse, so the test has to go
+ * through it. 9007199254740993 is odd, so any trip through a JS number
+ * flips it to ...92 and the assertion fails.
+ */
+export const bigIntCatalogsWireBody =
+  '[{"name":"analytics",' +
+  '"data_path":"s3://hog-lake/analytics",' +
+  '"head_snapshot_id":4211,' +
+  '"schema_version":7,' +
+  '"table_count":42,' +
+  '"live_rows":9007199254740993,' +
+  '"live_size_bytes":5368709120}]';

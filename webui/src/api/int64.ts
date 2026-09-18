@@ -27,6 +27,11 @@ const INT64_FIELDS = new Set([
   "record_count",
   "file_count",
   "file_size_bytes",
+  // Catalog listing totals: live_rows can exceed 2^53 at fleet scale, so
+  // it must arrive as its exact decimal string like every other count.
+  "live_rows",
+  "live_size_bytes",
+  "table_count",
   "footer_size",
   "row_id_start",
   "delete_count",
