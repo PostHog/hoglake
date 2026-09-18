@@ -1,0 +1,74 @@
+# A shell with the synthetic-data tools, next to a gigahog server.
+#
+# It runs as the gigahog-server ServiceAccount because that is one of the two
+# identities the IRSA role trusts — which is how the pod reaches S3 without
+# any key material. Bench is a WRITER in hoglake's footer-shipping model: it
+# uploads the parquet itself and the server only registers the paths, so the
+# pod needs the bucket, not just the API.
+#
+# Nothing runs on its own. The container sleeps; you copy bench in and drive
+# it by hand (see bench/README.md, "Running in-cluster").
+#
+#   kubectl apply -f bench/deploy/bench-pod.yaml
+#   kubectl -n gigahog cp bench bench-shell:/work/bench
+#   kubectl -n gigahog exec -it bench-shell -- bash
+#
+# Delete it when you are done: it is a pod, not a Deployment, so nothing
+# brings it back.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: bench-shell
+  namespace: gigahog
+  labels:
+    app: bench-shell
+spec:
+  serviceAccountName: gigahog-server
+  # A bench run is a burst of parquet writes; do not let it be the reason a
+  # node evicts the server it is writing to.
+  priorityClassName: null
+  restartPolicy: Never
+  containers:
+    - name: shell
+      image: python:3.13-slim
+      command: ["sleep", "infinity"]
+      workingDir: /work
+      env:
+        # In-cluster service DNS: same namespace, so the short name resolves.
+        - name: HOGLAKE_URL
+          value: http://gigahog-server:8080
+        # Empty on purpose. Empty endpoint means real AWS rather than the
+        # local MinIO default; empty keys mean the SDK's credential chain,
+        # which IRSA populates from the projected web-identity token.
+        - name: HOGLAKE_S3_ENDPOINT
+          value: ""
+        - name: HOGLAKE_S3_ACCESS_KEY
+          value: ""
+        - name: HOGLAKE_S3_SECRET_KEY
+          value: ""
+        - name: HOGLAKE_S3_REGION
+          value: us-east-1
+        - name: UV_LINK_MODE
+          value: copy
+      resources:
+        requests:
+          cpu: "1"
+          memory: 2Gi
+        limits:
+          # Generating wide nested rows is memory-hungry; the generator holds
+          # a batch in Arrow before writing it.
+          memory: 8Gi
+      volumeMounts:
+        - name: work
+          mountPath: /work
+        - name: tmp
+          mountPath: /tmp
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+  volumes:
+    - name: work
+      emptyDir: {}
+    - name: tmp
+      emptyDir: {}

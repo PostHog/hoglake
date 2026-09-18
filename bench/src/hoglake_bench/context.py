@@ -14,9 +14,13 @@ from pyhoglake import Catalog, HoglakeClient, S3Config
 @dataclass
 class BenchConfig:
     url: str = "http://localhost:8080"
-    s3_endpoint: str = "http://localhost:9000"
-    s3_access_key: str = "hoglake"
-    s3_secret_key: str = "hoglake123"
+    # Empty means "not configured here": the endpoint falls back to real AWS
+    # and the keys fall back to the ambient credential chain, which is how a
+    # pod running under IRSA gets them. The defaults stay pointed at the local
+    # MinIO stack, so nothing about a laptop run changes.
+    s3_endpoint: str | None = "http://localhost:9000"
+    s3_access_key: str | None = "hoglake"
+    s3_secret_key: str | None = "hoglake123"
     s3_region: str = "us-east-1"
     bucket: str = "hoglake-bench"
     results_path: str = "bench-results.jsonl"
@@ -37,11 +41,13 @@ class Bench:
         self.client = HoglakeClient(
             cfg.url,
             s3=S3Config(
-                access_key=cfg.s3_access_key,
-                secret_key=cfg.s3_secret_key,
-                endpoint_override=cfg.s3_endpoint,
+                access_key=cfg.s3_access_key or None,
+                secret_key=cfg.s3_secret_key or None,
+                endpoint_override=cfg.s3_endpoint or None,
                 region=cfg.s3_region,
-                allow_bucket_creation=True,
+                # In-cluster the bucket is terraform's; only the local stack
+                # needs bench to make one.
+                allow_bucket_creation=bool(cfg.s3_endpoint),
             ),
             timeout=cfg.timeout,
         )
@@ -61,8 +67,13 @@ class Bench:
     def ensure_bucket(self) -> None:
         if self._bucket_ready:
             return
-        fs = self.client._filesystem()
-        fs.create_dir(self.cfg.bucket)  # idempotent
+        # Only the local stack's bucket is bench's to make. Against real AWS
+        # the bucket is terraform's and the run's credentials deliberately
+        # carry no s3:CreateBucket, so asking would fail the run on a bucket
+        # that already exists.
+        if self.cfg.s3_endpoint:
+            fs = self.client._filesystem()
+            fs.create_dir(self.cfg.bucket)  # idempotent
         self._bucket_ready = True
 
     def put_object(self, uri: str, payload: bytes) -> None:
