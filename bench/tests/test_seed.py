@@ -103,9 +103,9 @@ class TestBudgetSplit:
         keys = ["events.pageviews", "warehouse.fact_orders", "warehouse.fact_sessions"]
         out = rebalance(950_000_000, keys)
         assert sum(out.values()) == 950_000_000
-        # shares stay in 65:18:12 proportion after renormalizing
+        # shares stay in 60:15:10 proportion after renormalizing
         assert out["events.pageviews"] / out["warehouse.fact_orders"] == pytest.approx(
-            0.65 / 0.18, rel=1e-3
+            0.60 / 0.15, rel=1e-3
         )
 
     def test_rebalance_clamps_an_overspent_budget(self):

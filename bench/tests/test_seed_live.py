@@ -100,6 +100,22 @@ def test_dims_are_single_small_files(seeded):
         assert info.file_size_bytes < 20_000_000, key
 
 
+def test_typed_tables_carry_the_full_matrix(seeded):
+    """The telemetry pair really lands with 1.1.0 types: every writable
+    scalar on device_metrics, the container kinds on app_events, and the
+    footer-shipped stats registered as provided."""
+    dm = seeded.namespace("telemetry").table("device_metrics")
+    dm_types = {c.type for c in dm.columns}
+    from hoglake_bench.datagen import WRITABLE_SCALARS
+
+    assert set(WRITABLE_SCALARS) <= dm_types
+    ae = seeded.namespace("telemetry").table("app_events")
+    ae_types = {c.type for c in ae.columns}
+    assert {"list", "struct", "map"} <= ae_types
+    for table in (dm, ae):
+        assert all(f.stats_state == "provided" for f in table.files())
+
+
 def test_row_ids_tile_every_table(seeded):
     """Seeded data must satisfy the row-lineage contract like any other
     writer: contiguous ranges tiling [0, total)."""
