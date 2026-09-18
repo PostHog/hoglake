@@ -88,6 +88,19 @@ class DatabaseHealthIntegrationTest {
     }
 
     @Test
+    fun `the report works on whatever major version the suite is run against`() {
+        // Run the whole suite against a candidate before a version move:
+        //   ./gradlew :test -PpgImage=postgres:18
+        // This test is the one that would notice a statistics view that
+        // moved, which is how a major version breaks an observability
+        // page — never in application code. Verified green on 16.13 and
+        // 18.6; the checkpoint counters below are the known moving part.
+        val server = service.report().server
+        assertThat(server.version).matches("""\d+(\.\d+)*""")
+        assertThat(service.report().tables.map { it.name }).contains("hog_data_file")
+    }
+
+    @Test
     fun `checkpoint counters resolve on whichever view this server has`() {
         // PG 16 keeps them on pg_stat_bgwriter; PG 17 moved them to
         // pg_stat_checkpointer and REMOVED the old columns. The version

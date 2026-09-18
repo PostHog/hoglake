@@ -497,6 +497,13 @@ schema, table by table) ·
 [docs/trino-integration.md](docs/trino-integration.md) (engine
 surfaces).
 
+Rehearsing a Postgres major-version move: the integration harness pins
+the version production runs, overridable for a dry run of the whole
+suite — `./gradlew :test -PpgImage=postgres:18` (or
+`HOGLAKE_TEST_PG_IMAGE`). A version move rarely breaks application code;
+it breaks statistics views that moved columns, which only an integration
+run can see. 1121 tests verified green on 18.6 as of 2026-09-17.
+
 **Operating** — [docs/operational-notes.md](docs/operational-notes.md)
 (what changes, and what honestly doesn't, at 2PB/1T) ·
 [docs/fuzzing.md](docs/fuzzing.md) (property testing and fuzzing).
