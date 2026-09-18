@@ -19,8 +19,18 @@ data class Config(
     val s3AccessKey: String = env("HOGLAKE_S3_ACCESS_KEY", ""),
     val s3SecretKey: String = env("HOGLAKE_S3_SECRET_KEY", ""),
     val s3PathStyle: Boolean = env("HOGLAKE_S3_PATH_STYLE", "true").toBoolean(),
-    /** Hydrator poll interval; 0 disables the background loop (tests drive it directly). */
-    val hydratorIntervalMs: Long = env("HOGLAKE_HYDRATOR_INTERVAL_MS", "5000").toLong(),
+    /**
+     * Hydrator poll interval; 0 disables the background loop (tests drive
+     * it directly).
+     *
+     * Fifteen minutes, not seconds: hydration is a backfill for files
+     * registered WITHOUT stats, and every writer in the fleet ships its
+     * own footer, so the queue is empty in the steady state and a fast
+     * poll only records that it was empty. The cost of the interval is
+     * the delay before a stats-less file becomes prunable, which is a
+     * backfill's latency rather than a reader's.
+     */
+    val hydratorIntervalMs: Long = env("HOGLAKE_HYDRATOR_INTERVAL_MS", "900000").toLong(),
     /**
      * Cap on the hydrator's whole-object fallback fetch (used when a
      * registration has no usable footer_size): a larger file is marked
@@ -29,12 +39,25 @@ data class Config(
      */
     val hydratorMaxWholeObjectBytes: Long =
         env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
-    /** Expiry sweep interval; 0 disables. Sweeps are incremental (bounded per run). */
-    val expiryIntervalMs: Long = env("HOGLAKE_EXPIRY_INTERVAL_MS", "60000").toLong(),
+    /**
+     * Expiry sweep interval; 0 disables. Sweeps are incremental (bounded
+     * per run).
+     *
+     * Hourly: retention is expressed in hours and days, so nothing
+     * becomes expirable on a minute's notice, and a sweep that finds
+     * nothing is the only thing a faster cadence buys.
+     */
+    val expiryIntervalMs: Long = env("HOGLAKE_EXPIRY_INTERVAL_MS", "3600000").toLong(),
     /** Max snapshots expired per sweep per catalog (incremental expiry). */
     val expiryBatchSize: Int = env("HOGLAKE_EXPIRY_BATCH", "10000").toInt(),
-    /** Cleanup drain interval; 0 disables. */
-    val cleanupIntervalMs: Long = env("HOGLAKE_CLEANUP_INTERVAL_MS", "60000").toLong(),
+    /**
+     * Cleanup drain interval; 0 disables.
+     *
+     * Half-hourly: the queue is fed by expiry and compaction, which are
+     * themselves paced, and a queued object costs only storage until it
+     * drains. Draining sooner buys nothing a reader can observe.
+     */
+    val cleanupIntervalMs: Long = env("HOGLAKE_CLEANUP_INTERVAL_MS", "1800000").toLong(),
     /** Queue entries drained per cleanup run; S3 deletes sub-batch at 500. */
     val cleanupBatchSize: Int = env("HOGLAKE_CLEANUP_BATCH", "2000").toInt(),
     /**
