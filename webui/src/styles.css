@@ -948,10 +948,12 @@ button.expand-toggle:hover {
   white-space: nowrap;
 }
 /* " / " matches formatPartition on the partitions page, and evokes the
-   hive-style nesting these keys describe: team_id=42 / month=2026-04. */
-.partition-part + .partition-part::before {
-  content: " / ";
+   hive-style nesting these keys describe: team_id=42 / month=2026-04.
+   Rendered as an element rather than generated content so the tests can
+   see it. */
+.partition-sep {
   color: var(--text-dim);
+  white-space: pre;
 }
 /* The field name is context; the value is the answer. Dimming the name
    lets the eye land on what differs between rows. */

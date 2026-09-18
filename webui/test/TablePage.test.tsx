@@ -77,6 +77,11 @@ describe("TablePage", () => {
     // Field names come from the spec, carrying the transform: "ts_day",
     // not a bare "ts" that would suggest the column holds a date.
     expect(screen.getAllByText("ts_day").length).toBeGreaterThan(0);
+    // The WHOLE cell, separator included. Asserting the parts
+    // individually is what let a missing separator ship: every value was
+    // present and the rendering still read "team_id=42ts_day=…".
+    const cell = screen.getAllByText("ts_day")[0].closest("td");
+    expect(cell?.textContent).toBe("ts_day=2026-09-01 / url_bucket=bucket 7/16");
   });
 
   it("pairs data files with deletion vectors on the Scan tab", async () => {

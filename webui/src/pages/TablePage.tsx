@@ -338,6 +338,11 @@ function PartitionCell({ decoded }: { decoded: PartitionDecode }) {
     >
       {decoded.values.map((v, i) => (
         <span key={i} className="partition-part">
+          {/* A real element, not a ::before. Generated content is
+              invisible to the DOM and therefore to the tests — this
+              separator shipped missing once behind a rule that looked
+              right in isolation, and nothing failed. */}
+          {i > 0 && <span className="partition-sep"> / </span>}
           <span className="partition-field">{v.field}</span>
           <span className="partition-eq">=</span>
           <span className="mono partition-value">{v.display}</span>
