@@ -53,28 +53,47 @@ TABLE_WIRE = {
 
 
 class _FakeStream(io.BytesIO):
-    def __init__(self, store: dict, key: str):
+    def __init__(self, store: dict, key: str, *, fail_on_close: bool = False):
         super().__init__()
         self._store = store
         self._key = key
+        self._fail_on_close = fail_on_close
 
     def close(self):
         if not self.closed:
+            # A close that fails still leaves whatever bytes landed: the
+            # truncated-object case the caller cannot distinguish.
             self._store[self._key] = self.getvalue()
+            if self._fail_on_close:
+                super().close()
+                raise OSError(f"object store lost the tail of {self._key}")
         super().close()
 
 
 class FakeS3:
-    """Duck-typed stand-in for S3Config + pyarrow S3FileSystem."""
+    """Duck-typed stand-in for S3Config + pyarrow S3FileSystem.
+
+    ``fail_at`` injects an object-store fault on the Nth (0-based)
+    ``open_output_stream`` call — on the open itself, or on the stream's
+    close with ``fail_on_close``, which is the case where a truncated
+    object exists.
+    """
 
     def __init__(self):
         self.files: dict[str, bytes] = {}
+        self.opened: list[str] = []
+        self.fail_at: int | None = None
+        self.fail_on_close: bool = False
 
     def filesystem(self):
         return self
 
     def open_output_stream(self, key: str):
-        return _FakeStream(self.files, key)
+        failing = self.fail_at == len(self.opened)
+        self.opened.append(key)
+        if failing and not self.fail_on_close:
+            raise OSError(f"object store refused {key}")
+        return _FakeStream(self.files, key, fail_on_close=failing)
 
 
 @pytest.fixture
@@ -647,3 +666,224 @@ def test_prepared_external_optional_fields_require_zero_nulls(
             allow_optional_fields=True,
         )
         assert next(iter(fake_s3.files.values())) == path.read_bytes()
+
+
+# --- orphan accounting on a failed prepare -------------------------------
+#
+# `prepare_append_files` fans out uploads before it returns anything, so a
+# mid-fanout object-store fault used to leave the caller unable to say how
+# many objects it had orphaned. Every exception out of the call now carries
+# `uploaded_files` / `uploaded_uris`, counting only uploads whose output
+# stream CLOSED successfully.
+
+
+def _prepare_mocks(httpx_mock, table_wire=TABLE_WIRE):
+    # prepare refreshes the catalog (read_snapshot) then re-resolves the
+    # table once (the incarnation pre-flight).
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=table_wire,
+    )
+
+
+def _prepared_file(table, tmp_path, name, *, rows=1):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / name
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": i, "name": "a"} for i in range(rows)], schema=schema
+        ),
+        path,
+    )
+    return str(path)
+
+
+def _assert_nothing_uploaded(error, fake_s3):
+    assert error.uploaded_files == 0
+    assert error.uploaded_uris == ()
+    # The consumer-side read of the same facts.
+    assert getattr(error, "uploaded_files", 0) == 0
+    assert getattr(error, "uploaded_uris", ()) == ()
+    assert not fake_s3.files
+
+
+@pytest.mark.parametrize("defect", ["schema", "arity", "empty", "no_files"])
+def test_prepare_per_file_refusals_report_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path, defect
+):
+    """A refusal raised BEFORE any upload orphans nothing, and says so."""
+    if defect == "schema":
+        # No field ids, so the destination-schema comparison refuses it.
+        path = str(tmp_path / "idless.parquet")
+        pq.write_table(pa.table({"id": [1], "name": ["a"]}), path)
+        files = [(path, None)]
+        expected = "schema/field IDs"
+    elif defect == "arity":
+        files = [(_prepared_file(table, tmp_path, "a.parquet"), ("2026-01",))]
+        expected = "partition arity"
+    elif defect == "empty":
+        files = [(_prepared_file(table, tmp_path, "empty.parquet", rows=0), None)]
+        expected = "must contain rows"
+    else:
+        files = []
+        expected = "must contain files"
+    _prepare_mocks(httpx_mock)
+    with pytest.raises(ValidationError, match=expected) as excinfo:
+        table.prepare_append_files(files, idempotency_key=str(uuid.uuid4()))
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_bad_idempotency_key_reports_zero_uploads(table, fake_s3):
+    """Not a HoglakeError at all — the uniform attribute is on whatever
+    leaves the call, so a caller never needs to know the type."""
+    with pytest.raises(ValueError) as excinfo:
+        table.prepare_append_files([], idempotency_key="not-a-uuid")
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_incarnation_refusal_reports_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    files = [(_prepared_file(table, tmp_path, "a.parquet"), None)]
+    _prepare_mocks(
+        httpx_mock,
+        table_wire={**TABLE_WIRE, "table_uuid": "11111111-2222-3333-4444-555555555555"},
+    )
+    with pytest.raises(IncarnationChangedError) as excinfo:
+        table.prepare_append_files(files, idempotency_key=str(uuid.uuid4()))
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_layout_change_refusal_reports_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    from pyhoglake.models import TableInfo
+
+    files = [(_prepared_file(table, tmp_path, "a.parquet"), None)]
+    stale = TableInfo.from_wire(
+        {
+            **TABLE_WIRE,
+            "columns": [
+                *TABLE_WIRE["columns"],
+                {
+                    "name": "extra",
+                    "type": "long",
+                    "field_id": 3,
+                    "ordinal": 2,
+                    "nullable": True,
+                },
+            ],
+        }
+    )
+    _prepare_mocks(httpx_mock)
+    with pytest.raises(ValidationError, match="layout changed") as excinfo:
+        table.prepare_append_files(
+            files, idempotency_key=str(uuid.uuid4()), expected_table_info=stale
+        )
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+@pytest.mark.parametrize("fail_on_close", [False, True])
+@pytest.mark.parametrize("completed", [0, 1, 3])
+def test_prepare_counts_completed_uploads_on_object_store_failure(
+    table, httpx_mock, fake_s3, tmp_path, completed, fail_on_close
+):
+    """Failing while uploading the (k+1)-th of n files reports exactly k.
+
+    The failing file is NOT completed in either flavour: an open that
+    never succeeded wrote nothing, and a close that failed may have left
+    a truncated object the caller cannot tell apart from a whole one.
+    """
+    total = 4
+    files = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None)
+        for i in range(total)
+    ]
+    fake_s3.fail_at = completed
+    fake_s3.fail_on_close = fail_on_close
+    key = str(uuid.uuid4())
+    _prepare_mocks(httpx_mock)
+    # The object store's own OSError, unwrapped: an existing
+    # `except OSError` in a published consumer must keep catching it.
+    with pytest.raises(OSError) as excinfo:
+        table.prepare_append_files(files, idempotency_key=key)
+    error = excinfo.value
+    assert error.uploaded_files == completed
+    assert len(error.uploaded_uris) == completed
+    # The uris name the objects that exist, not the ones that were tried.
+    assert [u.removeprefix("s3://") for u in error.uploaded_uris] == fake_s3.opened[
+        :completed
+    ]
+    for uri in error.uploaded_uris:
+        assert uri.startswith(f"{CATALOG_WIRE['data_path']}/data/ns1/events/{key}/")
+        assert uri.endswith(".parquet")
+    if fail_on_close:
+        # The truncated object landed in the store and is deliberately
+        # NOT counted; the prefix alone cannot tell the caller that.
+        assert len(fake_s3.files) == completed + 1
+        assert fake_s3.opened[completed].removeprefix("s3://") not in [
+            u.removeprefix("s3://") for u in error.uploaded_uris
+        ]
+    else:
+        assert len(fake_s3.files) == completed
+
+
+def test_prepare_success_is_unaffected(table, httpx_mock, fake_s3, tmp_path):
+    total = 3
+    files = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None)
+        for i in range(total)
+    ]
+    key = str(uuid.uuid4())
+    _prepare_mocks(httpx_mock)
+    request = table.prepare_append_files(files, idempotency_key=key)
+    assert len(request["appends"][0]["files"]) == total
+    assert len(fake_s3.files) == total
+    assert request["idempotency_key"] == key
+    assert [reg["record_count"] for reg in request["appends"][0]["files"]] == [
+        1
+    ] * total
+
+
+def test_prepare_consumer_style_getattr_reads_every_case(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    """How a downstream sink actually reads this: one getattr, no
+    knowledge of pyhoglake's exception hierarchy, correct in all three
+    shapes (refusal, mid-fanout fault, success)."""
+
+    def sweep(files, **kwargs):
+        try:
+            table.prepare_append_files(files, **kwargs)
+        except Exception as error:  # the consumer shape: one catch-all
+            return (
+                getattr(error, "uploaded_files", 0),
+                tuple(getattr(error, "uploaded_uris", ())),
+            )
+        return None
+
+    good = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None) for i in range(3)
+    ]
+    empty = [(_prepared_file(table, tmp_path, "empty.parquet", rows=0), None)]
+
+    _prepare_mocks(httpx_mock)
+    assert sweep(empty, idempotency_key=str(uuid.uuid4())) == (0, ())
+
+    fake_s3.fail_at = 2
+    _prepare_mocks(httpx_mock)
+    orphans = sweep(good, idempotency_key=str(uuid.uuid4()))
+    assert orphans is not None
+    assert orphans[0] == 2
+    assert len(orphans[1]) == 2
+
+    fake_s3.fail_at = None
+    fake_s3.files.clear()
+    _prepare_mocks(httpx_mock)
+    assert sweep(good, idempotency_key=str(uuid.uuid4())) is None
