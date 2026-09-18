@@ -23,6 +23,7 @@ import com.posthog.hoglake.observability.requestId
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
+import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
@@ -226,6 +227,7 @@ class App private constructor(
             verifyService,
             hydrator,
             maintenanceStatusService,
+            DatabaseHealthService(jdbi),
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPublicationRoutes()

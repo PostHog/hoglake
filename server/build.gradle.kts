@@ -101,6 +101,10 @@ application {
 
 tasks.test {
     useJUnitPlatform()
+    // Rehearse a Postgres major-version move against the whole suite:
+    // `./gradlew :test -PpgImage=postgres:18`. Unset, the harness pins
+    // the version production runs.
+    (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
     // Integration tests need Docker (Testcontainers); tag-gated so `gradle
     // test -PunitOnly` stays runnable without it.
     if (project.hasProperty("unitOnly")) {

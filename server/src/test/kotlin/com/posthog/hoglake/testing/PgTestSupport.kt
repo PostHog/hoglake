@@ -19,8 +19,27 @@ import org.testcontainers.containers.PostgreSQLContainer
  *   }
  */
 object PgTestSupport {
+    /**
+     * The Postgres the suite runs against. Pinned to what production
+     * runs, and overridable so a major-version move can be rehearsed
+     * against the WHOLE suite before it happens:
+     *
+     *   ./gradlew :test -PpgImage=postgres:18
+     *   HOGLAKE_TEST_PG_IMAGE=postgres:18 ./gradlew :test
+     *
+     * The default is unchanged, so this costs nothing until someone asks
+     * for it. Worth having because the failures a version move produces
+     * are rarely in application code: they are statistics views that
+     * moved columns, catalog shapes, and planner changes — none of which
+     * a unit test can see.
+     */
+    private val image: String =
+        System.getProperty("pgImage")
+            ?: System.getenv("HOGLAKE_TEST_PG_IMAGE")
+            ?: "postgres:16"
+
     private val container: PostgreSQLContainer<*> by lazy {
-        PostgreSQLContainer("postgres:16")
+        PostgreSQLContainer(image)
             .withUsername("hoglake")
             .withPassword("hoglake")
             .also { it.start() }

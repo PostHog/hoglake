@@ -18,6 +18,25 @@ import {
 const TABS = ["schema", "files", "scan"] as const;
 type Tab = (typeof TABS)[number];
 
+/**
+ * A file path, truncated from the LEFT so the distinguishing end stays
+ * visible, with an icon button that copies the whole thing.
+ *
+ * The truncation is `direction: rtl` on the text alone, never on the
+ * cell: applying it to the cell would flip the button to the wrong side,
+ * and the button has to sit after the path to be found.
+ */
+function PathCell({ path, label }: { path: string; label?: string }) {
+  return (
+    <td className="path-cell">
+      <span className="mono path-text" title={path}>
+        {path}
+      </span>
+      <CopyButton text={path} label={label ?? "path"} />
+    </td>
+  );
+}
+
 function StatsHeader({ table }: { table: Table }) {
   return (
     <dl className="stats-header">
@@ -334,9 +353,7 @@ function FilesTab({
                   </button>
                 </td>
                 <td className="num mono">{f.data_file_id}</td>
-                <td className="mono path-cell" title={f.path}>
-                  {f.path}
-                </td>
+                <PathCell path={f.path} />
                 <td className="num mono">{formatCount(f.record_count)}</td>
                 <td className="num mono" title={`${f.file_size_bytes}`}>
                   {formatBytes(f.file_size_bytes)}
@@ -418,20 +435,18 @@ function ScanTab({
               className={sf.delete_file ? "has-deletes" : undefined}
             >
               <td className="num mono">{sf.data_file.data_file_id}</td>
-              <td className="mono path-cell" title={sf.data_file.path}>
-                {sf.data_file.path}
-              </td>
+              <PathCell path={sf.data_file.path} />
               <td className="num mono">{formatCount(sf.data_file.record_count)}</td>
               <td>
                 <StatsStateBadge state={sf.data_file.stats_state} />
               </td>
-              <td className="mono path-cell">
-                {sf.delete_file ? (
-                  <span title={sf.delete_file.path}>{sf.delete_file.path}</span>
-                ) : (
+              {sf.delete_file ? (
+                <PathCell path={sf.delete_file.path} label="delete file path" />
+              ) : (
+                <td className="mono path-cell">
                   <span className="subtle">none</span>
-                )}
-              </td>
+                </td>
+              )}
               <td className="num mono">
                 {sf.delete_file ? formatCount(sf.delete_file.delete_count) : "—"}
               </td>

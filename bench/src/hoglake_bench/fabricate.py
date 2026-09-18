@@ -6,6 +6,14 @@ control plane can be driven at full speed with parquet that does not
 exist — paths are unique URIs under the catalog's data_path, stats are
 well-formed so the file registers as ``provided`` (never ``pending``,
 which would send the hydrator chasing ghosts in S3).
+
+Fabrication is a deliberate instrument, never a shortcut: every scenario
+that uses this module declares ``IO_MODE = "metadata-only"`` and the CLI
+prints and journals that label, so a fabricated-registration number can
+never be mistaken for an end-to-end one. A scenario whose measurement is
+supposed to include object IO must write real parquet (see
+``realfiles.py`` and the ``end-to-end-writer`` scenario) instead of
+using these helpers.
 """
 
 from __future__ import annotations

@@ -1,7 +1,8 @@
 """``hoglake-bench seed``: fill a catalog with a realistic fake warehouse.
 
-Star schema (three dims, two facts) plus a partitioned event stream,
-sized by a total byte budget rather than a row count. Sizing works
+Star schema (three dims, two facts) plus a partitioned event stream and
+the typed telemetry pair (the full 1.1.0 type matrix — see
+typed_tables.py), sized by a total byte budget rather than a row count. Sizing works
 because the writer measures itself against the **server's own** file
 accounting after every commit: the per-table byte budget is re-divided
 across the work that is left, so a bad bytes-per-row estimate corrects
@@ -28,6 +29,7 @@ from pyhoglake import AlreadyExistsError, Catalog, Namespace, Table, ops
 from ..context import Bench
 from ..runner import BenchAbort
 from . import tables as T
+from . import typed_tables as TT
 from .budget import (
     MIN_GB,
     TOLERANCE,
@@ -440,6 +442,7 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
     catalog = _ensure_catalog(bench, args.catalog)
     events_ns = _ensure_namespace(catalog, "events")
     warehouse_ns = _ensure_namespace(catalog, "warehouse")
+    telemetry_ns = _ensure_namespace(catalog, "telemetry")
 
     pageviews = _ensure_table(
         events_ns,
@@ -452,6 +455,10 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
     dim_users = _ensure_table(warehouse_ns, "dim_users", T.DIM_USERS_SCHEMA)
     fact_orders = _ensure_table(warehouse_ns, "fact_orders", T.FACT_ORDERS_SCHEMA)
     fact_sessions = _ensure_table(warehouse_ns, "fact_sessions", T.FACT_SESSIONS_SCHEMA)
+    device_metrics = _ensure_table(
+        telemetry_ns, "device_metrics", TT.DEVICE_METRICS_SCHEMA
+    )
+    app_events = _ensure_table(telemetry_ns, "app_events", TT.APP_EVENTS_SCHEMA)
 
     t0 = time.monotonic()
     print("\nwriting:", flush=True)
@@ -543,6 +550,22 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
             user_count=ctx.user_count,
             lo_us=lo_us,
             hi_us=hi_us,
+        ),
+        ctx,
+    )
+    results["telemetry.device_metrics"] = _seed_flat(
+        "telemetry.device_metrics",
+        device_metrics,
+        budgets["telemetry.device_metrics"],
+        lambda n, offset: TT.device_metrics(ctx.rng, n, id_offset=offset),
+        ctx,
+    )
+    results["telemetry.app_events"] = _seed_flat(
+        "telemetry.app_events",
+        app_events,
+        budgets["telemetry.app_events"],
+        lambda n, _offset: TT.app_events(
+            ctx.rng, n, team_ids=T.TEAM_IDS, lo_us=lo_us, hi_us=hi_us
         ),
         ctx,
     )

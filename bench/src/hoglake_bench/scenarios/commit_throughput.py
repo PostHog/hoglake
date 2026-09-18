@@ -26,6 +26,11 @@ import argparse
 
 from ..context import Bench
 from ..fabricate import BENCH_SCHEMA, append_payload
+
+#: Deliberately metadata-only: fabricated registrations isolate the
+#: commit tail from object-store IO. These numbers are control-plane
+#: cost, never end-to-end write cost.
+IO_MODE = "metadata-only"
 from ..runner import FailureGuard, InsufficientSamples, run_loop
 from ..stats import Metric
 from .common import (
