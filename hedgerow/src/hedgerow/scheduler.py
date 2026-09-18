@@ -32,23 +32,31 @@ class FlushScheduler:
             max_workers=policy.workers, thread_name_prefix="flush"
         )
         self.active: dict[str, tuple[str, Future]] = {}
+        self.failed_work: tuple[str, str] | None = None
 
     def tick(self, now: float) -> None:
+        self.failed_work = None
         # Harvest completions first. Any exception leaves its durable work for
         # retry; never release ownership or advance publication on an error.
         for key, (stage, future) in list(self.active.items()):
             if not future.done():
                 continue
             del self.active[key]
-            result = future.result()
-            if stage == "prepare":
-                work = self.store.prepare(key, result)
-                self.active[key] = (
-                    "publish",
-                    self.pool.submit(self.publish, work.request),
-                )
-            else:
-                self.store.published(key)
+            try:
+                result = future.result()
+                if stage == "prepare":
+                    work = self.store.prepare(key, result)
+                    self.active[key] = (
+                        "publish",
+                        self.pool.submit(self.publish, work.request),
+                    )
+                else:
+                    self.store.published(key)
+            except Exception:
+                # Keep the original exception contract for library callers while
+                # identifying the durable work whose attempt failed.
+                self.failed_work = (key, stage)
+                raise
         for work in self.store.recover():
             if len(self.active) >= self.policy.workers:
                 break

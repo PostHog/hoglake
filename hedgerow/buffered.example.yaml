@@ -1,0 +1,41 @@
+# Existing configs default to direct replication. This mode buffers raw events.
+mode: buffered
+source:
+  url: http://localhost:8080
+  catalog: raw
+  namespace: public
+  table: raw_events
+  consumer_id: events-buffered
+  start_snapshot: 0
+  s3:
+    region: us-east-1
+    # AWS credentials use the ambient chain when omitted. For MinIO, set
+    # endpoint: http://localhost:9000 and supply credentials via env overrides.
+destination:
+  url: http://localhost:8080
+  catalog: analytics
+  namespace: public
+  table: events
+  s3:
+    region: us-east-1
+replication:
+  poll_interval_s: 1
+  max_snapshot_window: 1000
+buffered:
+  # Durable local volume, never an ephemeral container filesystem or NFS.
+  state_path: /var/lib/hedgerow/events/state.sqlite
+  spill_directory: /var/tmp/hedgerow/events
+  # Omitted: convert properties only when JSON/string -> VARIANT is needed.
+  # Native VARIANT passes through. [] disables conversion; a list overrides it.
+  # json_columns: [properties, person_properties]
+  max_failures: 3
+  policy:
+    target_file_bytes: 268435456
+    max_age_s: 86400
+    workers: 4
+    max_fragments_per_window: 1000000
+    team_max_age_s: {}
+  writer:
+    memory_bytes: 536870912
+    scratch_bytes: 8589934592
+    row_group_rows: 8192

@@ -9,10 +9,10 @@ Parquet with explicit top-level field IDs. UUIDs are preserved, never generated.
 
 This writer is called by `BufferedIngestion` for each frozen team/month batch.
 The coordinator uploads and publishes its output; the writer itself only writes
-local files. CLI wiring remains separate. The catalog accepts VARIANT and
+local files. The CLI selects this coordinator with `mode: buffered`. The catalog accepts VARIANT and
 pyhoglake can publish these files through `prepare_append_files` without rewriting
 them. VARIANT tables are excluded from scalar compaction; query-engine
-interoperability remains separate work. The CLI continues to use direct replication.
+interoperability remains separate work. Existing CLI configs default to direct replication.
 
 ```python
 from hedgerow.duckdb_writer import (

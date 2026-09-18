@@ -1,15 +1,13 @@
 # Buffered raw event ingestion: implementation status
 
-This branch adds the buffering/publication building blocks and an assembled
-`hedgerow.ingestion.BufferedIngestion` library coordinator. **It does not yet
-provide the requested production raw_events → events CLI mode.** Existing CLI
-configurations continue to run direct replication with their documented
-at-least-once behavior.
+`hedgerow --config buffered.example.yaml` runs the coordinator with
+`mode: buffered`. Existing configurations default to direct replication.
+See [README.md](README.md#buffered-event-ingestion) for configuration, credential
+setup, `--once`, and shutdown behavior.
 
-The coordinator uses the [DuckDB event-file writer](DUCKDB_WRITER.md) for every
-flush: source payload reads, transformation, sorting and Parquet output all stay
-in DuckDB. PyArrow still reads routing columns during discovery and footer
-metadata during publication. The CLI has not yet been wired to this coordinator.
+Every flush uses the [DuckDB event-file writer](DUCKDB_WRITER.md): source payload
+reads, transformation, sorting and Parquet output stay in DuckDB. PyArrow reads
+routing columns during discovery and footer metadata during publication.
 
 Raw files remain indefinitely as data backups. Raw-file retirement is out of scope
 and is not a prerequisite for enabling ingestion.
@@ -24,17 +22,7 @@ FULL synchronous durability. Discovery and publication checkpoints are separate.
 The single registered source consumer stays behind the oldest unpublished source
 snapshot and requires `consumer_floor`; there are no per-team consumers.
 
-`BufferPolicy.parse` accepts this policy mapping (this is **not** a new CLI YAML
-section yet):
-
-```yaml
-target_file_bytes: 268435456
-max_age_s: 86400
-team_max_age_s:
-  42: 3600
-workers: 4
-max_fragments_per_window: 1000000
-```
+Configure `buffered.policy` using [buffered.example.yaml](buffered.example.yaml).
 
 Readiness uses the bytes allocated to an individual destination partition and
 the oldest pending source **commit time**. Arrivals never reset that time. The
@@ -116,7 +104,8 @@ endpoint rather than silently ignoring an unfamiliar request field.
   keeps payloads inside DuckDB. Catalog types and prepared-file physical validation are implemented; VARIANT
   statistics are omitted. VARIANT compaction, reader interoperability still need implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
-  JSON column mappings must be explicit; no property names are assumed.
+  JSON column mappings are explicit at the library boundary; the CLI defaults
+  only `properties` as described in the README.
 
 ## Verification
 
@@ -126,6 +115,8 @@ restart, frozen work ownership, ambiguous publication retries, retention floors,
 late-arriving old events, UTC partition values, physical sorting with UUID last,
 compressed-size rolling, routing caps and schema/type refusal. The assembled
 coordinator test uses real local Parquet plus fake catalogs; it is not a live
-S3/Hoglake end-to-end test. Server tests exercise concurrent receipt creation,
+S3/Hoglake end-to-end test. `test_buffered_integration.py` separately exercises
+the CLI against a live catalog and S3, including process restarts, a lost commit
+response, exact VARIANT readback, and raw-file retention. Server tests exercise concurrent receipt creation,
 REST DTO propagation, request mismatch and receipt survival after snapshot
 history removal, in addition to migration/mapper consistency gates.

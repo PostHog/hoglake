@@ -274,8 +274,32 @@ Integration tests need a live hoglake server (`HOGLAKE_URL`, default
 `hedgerow-*`-prefixed catalogs and buckets and skip cleanly when the
 server is unreachable.
 
-## Buffered raw event ingestion work
+## Buffered event ingestion
 
-The experimental library coordinator and its current limitations are documented
-in [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md). It is not yet a CLI ingestion
-mode; existing replication behavior is unchanged.
+Run `hedgerow --config buffered.example.yaml` with `mode: buffered`. Existing
+configs default to direct replication. [buffered.example.yaml](buffered.example.yaml)
+is the complete configuration; [BUFFERED_INGESTION.md](BUFFERED_INGESTION.md)
+covers table prerequisites, durable state, resource limits and raw-file retention.
+
+Omitting `buffered.json_columns` converts only `properties`, only for a JSON/string
+source and VARIANT destination. Native VARIANT passes through. An explicit list
+overrides selection; `[]` disables conversion. Effective mappings are pinned in
+state, so changes require reconciliation.
+
+`--once` discovers one bounded source window and settles ready work without
+forcing young buffers to flush. Normal mode polls; `buffered.max_failures` bounds
+retries per work item, separately from consecutive polling failures. Idle worker
+polls do not clear a failed work item's budget. Exit 9 retains pending work for
+retry/reconciliation. SIGTERM stops polling and joins workers before releasing
+the state lock. Use the same durable state file on restart.
+
+`source.s3` configures Arrow discovery and DuckDB reads; `destination.s3` controls
+uploads. `s3.region` applies to both engines. Omit keys to use ambient credentials,
+or supply them through `HEDGEROW__SOURCE__S3__ACCESS_KEY` / `SECRET_KEY` and the
+equivalent destination overrides. Provision DuckDB's `httpfs` extension (and
+`aws` for ambient credentials) for offline deployments. Startup checks secret
+setup; credentials are connection-local and redacted from error diagnostics.
+
+Buffered mode reports structured logs. It rejects `filter`, nonzero `metrics.port`,
+and direct-only replication knobs (`max_rows_per_append`, `max_window_replays`,
+`max_append_retries`) rather than ignoring them.

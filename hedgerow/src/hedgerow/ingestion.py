@@ -1,7 +1,7 @@
 """Buffered discovery and durable publication using the native DuckDB writer.
 
 Discovery reads routing columns with Arrow. Flush payloads stay in DuckDB.
-The CLI remains separate; immutable raw files remain as backups.
+The buffered CLI owns service lifecycle; immutable raw files remain as backups.
 """
 
 from __future__ import annotations

@@ -166,8 +166,12 @@ def test_scheduler_ambiguous_commit_replays_exact_request(store):
             try:
                 scheduler.tick(86500)
             except TimeoutError:
-                pass
+                work_id, stage = scheduler.failed_work
+                assert stage == "publish"
+                assert work_id in published
+                assert work_id in {w.work_id for w in store.recover()}
             time.sleep(0.001)
+        assert scheduler.failed_work is None
         assert len(prepared) == len(published) == 2
         assert len(calls) == 4
         assert all(calls.count(request) == 2 for request in calls)
