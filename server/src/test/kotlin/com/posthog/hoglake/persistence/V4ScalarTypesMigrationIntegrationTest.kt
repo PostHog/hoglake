@@ -1,9 +1,9 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.Database
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
-import org.flywaydb.core.Flyway
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.Tag
@@ -37,15 +37,16 @@ class V4ScalarTypesMigrationIntegrationTest {
             "timestamp_s", "timestamp_ms", "timestamp_ns", "json",
         )
 
-    /** Flyway configured exactly as Database.migrate does, optionally stopping at [target]. */
+    /**
+     * Production's own Flyway configuration, optionally stopping at
+     * [target] — Database.flywayConfig, not a copy of it, so this cannot
+     * pass against settings production has stopped using.
+     */
     private fun migrate(
         ds: DataSource,
         target: String? = null,
     ) {
-        Flyway.configure()
-            .dataSource(ds)
-            .configuration(mapOf("flyway.postgresql.transactional.lock" to "false"))
-            .locations("classpath:db/migration")
+        Database.flywayConfig(ds)
             .apply { if (target != null) target(org.flywaydb.core.api.MigrationVersion.fromVersion(target)) }
             .load()
             .migrate()

@@ -6,17 +6,28 @@
 # containerized server and webui to these deps — the whole console in
 # docker, images built from the working tree. State persists across
 # up/down cycles in named volumes (wipe with: just down-volumes).
+#
+# One-time, on the move to postgres:18: an existing `pgdata` volume holds
+# a version-16 cluster, which 18 refuses to start on. Run `just
+# down-volumes` once (the dev stack is disposable — catalogs are recreated
+# by the test/QE runs) before the first `just up` on this file.
 services:
   postgres:
-    image: postgres:16
+    image: postgres:18
     environment:
       POSTGRES_DB: hoglake
       POSTGRES_USER: hoglake
       POSTGRES_PASSWORD: hoglake
     ports:
       - "${HOGLAKE_PG_PORT:-5432}:5432"
+    # postgres:18 MOVED the data directory: PGDATA is
+    # /var/lib/postgresql/18/docker and the declared VOLUME is the parent
+    # /var/lib/postgresql (it was /var/lib/postgresql/data through 17).
+    # Mounting the old path under 18 puts the volume somewhere the server
+    # does not write, so the cluster silently lives in the container layer
+    # and every `just down` loses the dev stack's state. Mount the parent.
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U hoglake"]
       interval: 2s

@@ -35,7 +35,7 @@ one pattern:
 schema-check:
     {{_gradle}} test --tests 'com.posthog.hoglake.SchemaEquivalenceIntegrationTest' --rerun --console=plain
 
-# Local dev stack (Postgres 16 + MinIO). Ports overridable:
+# Local dev stack (Postgres 18 + MinIO). Ports overridable:
 # HOGLAKE_PG_PORT / HOGLAKE_MINIO_PORT / HOGLAKE_MINIO_CONSOLE_PORT
 compose-up:
     docker compose up -d

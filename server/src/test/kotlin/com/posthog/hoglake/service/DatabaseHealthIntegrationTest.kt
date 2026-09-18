@@ -90,10 +90,10 @@ class DatabaseHealthIntegrationTest {
     @Test
     fun `the report works on whatever major version the suite is run against`() {
         // Run the whole suite against a candidate before a version move:
-        //   ./gradlew :test -PpgImage=postgres:18
+        //   ./gradlew :test -PpgImage=postgres:19
         // This test is the one that would notice a statistics view that
         // moved, which is how a major version breaks an observability
-        // page — never in application code. Verified green on 16.13 and
+        // page — never in application code. Verified green on 16.15 and
         // 18.6; the checkpoint counters below are the known moving part.
         val server = service.report().server
         assertThat(server.version).matches("""\d+(\.\d+)*""")

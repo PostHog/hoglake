@@ -70,7 +70,7 @@ React console, Python replication daemon:
 
 | Component | What | Stack | Tests |
 |---|---|---|---|
-| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG16, MinIO) + kotest-property |
+| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG18, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
@@ -499,10 +499,20 @@ surfaces).
 
 Rehearsing a Postgres major-version move: the integration harness pins
 the version production runs, overridable for a dry run of the whole
-suite — `./gradlew :test -PpgImage=postgres:18` (or
+suite — `./gradlew :test -PpgImage=postgres:19` (or
 `HOGLAKE_TEST_PG_IMAGE`). A version move rarely breaks application code;
 it breaks statistics views that moved columns, which only an integration
-run can see. 1121 tests verified green on 18.6 as of 2026-09-17.
+run can see. The suite, the dev compose stack and the CI image-smoke
+service all run **Postgres 18** as of 2026-09-18 (moved from 16); the
+override runs backwards too (`-PpgImage=postgres:16`), which is how a
+failure gets attributed to the version rather than to the environment.
+Two things the test suite cannot see, and a future move must check by
+hand: the docker-library image's PGDATA path (18 moved it to
+`/var/lib/postgresql/18/docker` and the VOLUME to the parent, so a
+compose mount of the old `/var/lib/postgresql/data` silently stops
+persisting), and Flyway's supported-version table — a Flyway that
+predates the server warns "support has not been tested" on every
+migration and is the thing to bump first.
 
 **Operating** — [docs/operational-notes.md](docs/operational-notes.md)
 (what changes, and what honestly doesn't, at 2PB/1T) ·

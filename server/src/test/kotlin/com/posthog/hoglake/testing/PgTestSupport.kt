@@ -24,19 +24,20 @@ object PgTestSupport {
      * runs, and overridable so a major-version move can be rehearsed
      * against the WHOLE suite before it happens:
      *
-     *   ./gradlew :test -PpgImage=postgres:18
-     *   HOGLAKE_TEST_PG_IMAGE=postgres:18 ./gradlew :test
+     *   ./gradlew :test -PpgImage=postgres:19
+     *   HOGLAKE_TEST_PG_IMAGE=postgres:16 ./gradlew :test
      *
-     * The default is unchanged, so this costs nothing until someone asks
-     * for it. Worth having because the failures a version move produces
-     * are rarely in application code: they are statistics views that
-     * moved columns, catalog shapes, and planner changes — none of which
-     * a unit test can see.
+     * The override also runs the suite BACKWARDS against the version
+     * being left behind, which is how a failure gets attributed to the
+     * version rather than to the environment. Worth having because the
+     * failures a version move produces are rarely in application code:
+     * they are statistics views that moved columns, catalog shapes, and
+     * planner changes — none of which a unit test can see.
      */
     private val image: String =
         System.getProperty("pgImage")
             ?: System.getenv("HOGLAKE_TEST_PG_IMAGE")
-            ?: "postgres:16"
+            ?: "postgres:18"
 
     private val container: PostgreSQLContainer<*> by lazy {
         PostgreSQLContainer(image)
