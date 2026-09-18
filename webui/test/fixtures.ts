@@ -86,7 +86,10 @@ export const filesFixture: DataFile[] = [
     stats_state: "provided",
     begin_snapshot: "4001",
     spec_id: "1",
-    partition_values: ["2026-09-01", "7"],
+    // day ordinal (days since the epoch), as transforms.wire_string
+    // emits it — 20697 is 2026-09-01. A date string here was not a
+    // value the writer can produce.
+    partition_values: ["20697", "7"],
   },
   {
     data_file_id: "102",
@@ -98,7 +101,7 @@ export const filesFixture: DataFile[] = [
     stats_state: "pending",
     begin_snapshot: "4100",
     spec_id: "1",
-    partition_values: ["2026-09-02", null],
+    partition_values: ["20698", null],
   },
   {
     data_file_id: "103",
