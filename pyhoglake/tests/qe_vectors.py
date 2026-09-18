@@ -36,6 +36,7 @@ from decimal import Decimal, localcontext
 from pathlib import Path
 
 import pytest
+import wire_oracle
 
 from pyhoglake import decode_bound, encode_bound
 
@@ -198,15 +199,33 @@ def test_vector_file_header_contract():
     assert DOC["format"] == "hoglake-bounds-vectors"
     assert DOC["version"] == 1
     assert set(DOC["value_conventions"]) >= ALL_COLTYPES
+    # The wire fields are part of the file's contract and must be
+    # self-described (QeBoundsWireVectorsTest reads this header too).
+    assert "wire_conventions" in DOC
     # Exact, not >=: a vector deleted by a bad merge is otherwise a silent
     # loss of coverage. Bump deliberately when adding vectors, and keep
     # BoundsVectorFile.EXPECTED_COUNT on the Kotlin side in step.
     assert len(VECTORS) == 109
     for vec in VECTORS:
         assert set(vec) >= {"type", "type_params", "value", "hex", "note"}
+        # Every vector answers the wire layer one way or the other.
+        assert ("wire" in vec) != ("wire_refused" in vec)
         # hex must be lowercase and byte-aligned
         assert vec["hex"] == vec["hex"].lower()
         assert len(vec["hex"]) % 2 == 0
+
+
+def test_wire_tokens_match_the_python_oracle():
+    """Every `wire`/`wire_refused`/`raw_wire`/`stored_wire` cell must
+    agree with tests/wire_oracle.py — the Python-side rendering of the
+    read-time JSON conventions, computed from `value`/`hex` without
+    java.time or Jackson. The JVM renderer replays the same cells
+    (QeBoundsWireVectorsTest), so agreement here means the two
+    implementations meet at the file rather than one transcribing the
+    other. Comparison is exact raw-token equality for numbers (the
+    tokens ARE the wire — sign of -0.0, decimal scale digits included).
+    """
+    assert wire_oracle.check() == []
 
 
 @pytest.mark.parametrize("vec", VECTORS, ids=_vector_id)

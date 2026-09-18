@@ -22,9 +22,11 @@ import java.nio.file.Files
  *  - float/double compare by VALUE, against the vector's own `value`
  *    string (bit-exact through Float/Double.parse — including the sign
  *    of zero, which a BigDecimal comparison would erase);
- *  - decimal compares numerically (compareTo) — the exact-scale token
- *    is pinned separately in [BoundWireTest], and the generated `wire`
- *    for a scaled decimal travels as a JSON double token;
+ *  - decimal compares numerically (compareTo) — the exact-scale plain
+ *    token is pinned in [BoundWireTest] and, token-exactly, by the
+ *    Python oracle (pyhoglake/tests/wire_oracle.py, which generates and
+ *    checks every wire cell); this reader parses the file's number
+ *    tokens through doubles, so it compares values;
  *  - every integer family compares as exact BigIntegers AND must render
  *    as an integral JSON number;
  *  - everything else (strings, booleans, temporal strings, sentinels)

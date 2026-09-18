@@ -1,7 +1,7 @@
 {
   "format": "hoglake-bounds-vectors",
   "version": 1,
-  "description": "Cross-language differential vectors for the Iceberg single-value binary bounds codec. Each vector is (type, type_params, value, hex): hex is the lowercase hex of the exact encoding. Any implementation (Python, JVM, ...) must satisfy encode(value) == unhex(hex) and, unless verify == 'encode_only', decode(unhex(hex)) == value and encode(decode(unhex(hex))) == unhex(hex).",
+  "description": "Cross-language differential vectors for the Iceberg single-value binary bounds codec. Each vector is (type, type_params, value, hex): hex is the lowercase hex of the exact encoding. Any implementation (Python, JVM, ...) must satisfy encode(value) == unhex(hex) and, unless verify == 'encode_only', decode(unhex(hex)) == value and encode(decode(unhex(hex))) == unhex(hex). Vectors additionally carry `wire` or `wire_refused` - the read-time JSON rendering contract - per wire_conventions below.",
   "value_conventions": {
     "boolean": "'true' | 'false'",
     "int8": "decimal integer string",
@@ -27,6 +27,7 @@
     "uuid": "canonical 8-4-4-4-12 lowercase form",
     "binary": "standard base64 of the raw bytes"
   },
+  "wire_conventions": "Additive JSON-wire pinning for the read-time decode surface (GET .../files/{fileId}/stats and POST /v1/debug/decode-bound; conventions documented in openapi/hoglake.yaml FileColumnStats). `wire` is the decoded bound as it appears in a JSON response: booleans as booleans; every integer type as an exact JSON number; decimal as an exact JSON number at the column's scale in PLAIN notation (unscaled x 10^-scale with exactly `scale` fraction digits - '1.50', never 1E-38); float/double as shortest-round-trip JSON numbers with the string sentinels \"Infinity\"/\"-Infinity\" (JVM-side tests compare these by VALUE - exponent spelling differs per language; the stored tokens are the Python oracle's); date/time/timestamps as ISO-8601 strings whose trailing zero units are ELIDED ('00:00', '1970-01-01T00:00' - seconds omitted when seconds and fraction are both zero; nonzero fractions print in groups of 3 digits; years above 9999 use the expanded '+YYYYY' form), timestamptz as a UTC instant with a trailing Z and seconds never elided; string/json/uuid as strings; binary as base64. `wire_refused` marks a value the JSON layer refuses instead of rendering (NaN bounds - the store never holds one, and the decode endpoint answers a named 422). bound_normalization cases additionally carry raw_wire/stored_wire: the rendering of raw_hex and stored_hex, pinning that a stored -0.0 renders with its sign. Every wire cell is generated and checked by tests/wire_oracle.py (independent of the JVM implementation); regenerate with `uv run python tests/wire_oracle.py --write`, and treat any --check disagreement as a cross-language finding, not a cell to edit.",
   "vectors": [
     {
       "type": "boolean",
@@ -421,7 +422,7 @@
       "value": "0",
       "hex": "00",
       "note": "zero is one 0x00 byte",
-      "wire": 0.0
+      "wire": 0.00
     },
     {
       "type": "decimal",
@@ -671,7 +672,7 @@
       "type_params": null,
       "value": "1788609600000500",
       "hex": "f491d91fbb5a0600",
-      "note": "2026-09-04T12:00:00.000500",
+      "note": "2026-09-05T12:00:00.000500",
       "wire": "2026-09-05T12:00:00.000500"
     },
     {
@@ -719,7 +720,7 @@
       "type_params": null,
       "value": "1788609600000000",
       "hex": "0090d91fbb5a0600",
-      "note": "2026-09-04T12:00:00Z; tz encodes identically to timestamp",
+      "note": "2026-09-05T12:00:00Z; tz encodes identically to timestamp",
       "wire": "2026-09-05T12:00:00Z"
     },
     {
@@ -1061,6 +1062,5 @@
         "stored_wire": 0
       }
     ]
-  },
-  "wire_conventions": "Additive JSON-wire pinning for the read-time decode surface (GET .../files/{fileId}/stats and POST /v1/debug/decode-bound; conventions documented in openapi/hoglake.yaml FileColumnStats). `wire` is the decoded bound as it appears in a JSON response: booleans as booleans; every integer and decimal type as an exact JSON number; float/double as JSON numbers with the string sentinels \"Infinity\"/\"-Infinity\" (compared by VALUE, not by token text - shortest-round-trip printing differs per language); date/time/timestamps as ISO-8601 strings (timestamptz with a trailing Z); string/json/uuid as strings; binary as base64. `wire_refused` marks a value the JSON layer refuses instead of rendering (NaN bounds - the store never holds one, and the decode endpoint answers a named 422). bound_normalization cases additionally carry raw_wire/stored_wire: the rendering of raw_hex and stored_hex, pinning that a stored -0.0 renders with its sign."
+  }
 }
