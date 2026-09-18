@@ -212,7 +212,15 @@ def _run_scenario(
 ) -> tuple[int, list[str]]:
     """Run one scenario; journal a JSONL line whether it completed or
     failed (always with a ``status`` field); return (exit code, flags)."""
-    print(f"=== {name} (run {bench.cfg.run_id}) ===", flush=True)
+    io_mode = SCENARIOS[name].IO_MODE
+    print(f"=== {name} [{io_mode}] (run {bench.cfg.run_id}) ===", flush=True)
+    if io_mode == "metadata-only":
+        print(
+            "    metadata-only: registrations are fabricated (no parquet "
+            "bytes in the object store); these are control-plane numbers, "
+            "not end-to-end numbers",
+            flush=True,
+        )
     t0 = time.monotonic()
     try:
         report: ScenarioReport = SCENARIOS[name].run(bench, args)
@@ -224,6 +232,7 @@ def _run_scenario(
             status="invariant_violation",
             error=str(exc),
             config=config,
+            io_mode=io_mode,
         )
         print(
             f"\nINVARIANT VIOLATION in {name}: {exc}\n"
@@ -240,6 +249,7 @@ def _run_scenario(
             status="aborted",
             error=str(exc),
             config=config,
+            io_mode=io_mode,
         )
         print(f"\nABORT in {name}: {exc}", file=sys.stderr)
         return EXIT_ABORT, []
@@ -251,6 +261,7 @@ def _run_scenario(
             status="error",
             error=f"{type(exc).__name__}: {exc}",
             config=config,
+            io_mode=io_mode,
         )
         traceback.print_exc()
         print(
@@ -267,6 +278,7 @@ def _run_scenario(
         status=status,
         flags=report.flags,
         config=config,
+        io_mode=io_mode,
     )
     print(f"=== {name} done in {time.monotonic() - t0:.1f}s ===\n", flush=True)
     return (EXIT_REGRESSION if report.flags else EXIT_OK), report.flags

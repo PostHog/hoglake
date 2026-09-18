@@ -33,6 +33,10 @@ from ..runner import (
 from ..stats import Metric, Recorder
 from .common import ScenarioReport, check, notice
 
+#: Deliberately metadata-only: the data files and the .puffin DV paths
+#: are fabricated — this measures DV registration OCC, not object IO.
+IO_MODE = "metadata-only"
+
 FILE_RECORD_COUNT = 1_000_000  # headroom: delete_count may never exceed it
 
 # hotfile: retries per op before the attempt is abandoned (counted

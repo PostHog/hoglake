@@ -24,6 +24,12 @@ from ..runner import FailureGuard
 from ..stats import Metric, Recorder
 from .common import ScenarioReport, check, notice, seed_snapshots
 
+#: Mixed: the expiry drain works on fabricated registrations (expiry is
+#: metadata work by nature); the cleanup drain deletes REAL parquet
+#: objects for the `removed` count, while `missing` counts the
+#: fabricated paths (metadata-only drain).
+IO_MODE = "mixed"
+
 REAL_OBJECT_BYTES = b"hoglake-bench cleanup probe\n" * 4
 FILES_PER_REAL_COMMIT = 50
 

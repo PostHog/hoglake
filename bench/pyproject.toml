@@ -20,6 +20,9 @@ hoglake-bench = "hoglake_bench.cli:main"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    # Pinned: see pyhoglake's note — an unpinned ruff resolves a
+    # different rule set per machine. Same pin as the sibling trees.
+    "ruff==0.16.6",
 ]
 
 [tool.uv.sources]

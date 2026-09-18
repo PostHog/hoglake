@@ -16,6 +16,10 @@ from ..runner import FailureGuard, run_loop
 from ..stats import Metric
 from .common import ScenarioReport, assert_row_tiling, check
 
+#: End-to-end: every append encodes real parquet, uploads it to the
+#: object store, and ships stats extracted from the writer's own footer.
+IO_MODE = "end-to-end"
+
 E2E_SCHEMA = pa.schema(
     [
         pa.field("id", pa.int64(), nullable=False),

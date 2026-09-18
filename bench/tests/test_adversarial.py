@@ -471,10 +471,16 @@ class TestExitCodeMasking:
             raise BenchAbort("10 consecutive failures")
 
         mod_a = SimpleNamespace(
-            __doc__="fake scenario a", add_args=lambda p: None, run=_flagging_run
+            __doc__="fake scenario a",
+            add_args=lambda p: None,
+            run=_flagging_run,
+            IO_MODE="metadata-only",
         )
         mod_b = SimpleNamespace(
-            __doc__="fake scenario b", add_args=lambda p: None, run=_aborting_run
+            __doc__="fake scenario b",
+            add_args=lambda p: None,
+            run=_aborting_run,
+            IO_MODE="metadata-only",
         )
         monkeypatch.setattr(cli, "SCENARIOS", {"a": mod_a, "b": mod_b})
         monkeypatch.setattr(cli, "QUICK_PROFILE", {"a": {}, "b": {}})
@@ -505,10 +511,16 @@ class TestExitCodeMasking:
             raise InvariantViolation("rows lost")
 
         mod_a = SimpleNamespace(
-            __doc__="fake a", add_args=lambda p: None, run=_flagging_run
+            __doc__="fake a",
+            add_args=lambda p: None,
+            run=_flagging_run,
+            IO_MODE="metadata-only",
         )
         mod_b = SimpleNamespace(
-            __doc__="fake b", add_args=lambda p: None, run=_violating_run
+            __doc__="fake b",
+            add_args=lambda p: None,
+            run=_violating_run,
+            IO_MODE="metadata-only",
         )
         monkeypatch.setattr(cli, "SCENARIOS", {"a": mod_a, "b": mod_b})
         monkeypatch.setattr(cli, "QUICK_PROFILE", {"a": {}, "b": {}})
@@ -524,7 +536,10 @@ class TestExitCodeMasking:
             raise KeyError("harness bug")
 
         mod = SimpleNamespace(
-            __doc__="fake", add_args=lambda p: None, run=_crashing_run
+            __doc__="fake",
+            add_args=lambda p: None,
+            run=_crashing_run,
+            IO_MODE="metadata-only",
         )
         monkeypatch.setattr(cli, "SCENARIOS", {"a": mod})
         monkeypatch.setattr(cli, "QUICK_PROFILE", {"a": {}})
