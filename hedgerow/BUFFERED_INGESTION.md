@@ -1,15 +1,13 @@
 # Buffered raw event ingestion: implementation status
 
-This branch adds the buffering/publication building blocks and an assembled
-`hedgerow.ingestion.BufferedIngestion` library coordinator. **It does not yet
-provide the requested production raw_events → events CLI mode.** Existing CLI
-configurations continue to run direct replication with their documented
-at-least-once behavior.
+`hedgerow --config buffered.example.yaml` runs the coordinator with
+`mode: buffered`. Existing configurations default to direct replication.
+See [README.md](README.md#buffered-event-ingestion) for configuration, credential
+setup, `--once`, and shutdown behavior.
 
-The coordinator uses the [DuckDB event-file writer](DUCKDB_WRITER.md) for every
-flush: source payload reads, transformation, sorting and Parquet output all stay
-in DuckDB. PyArrow still reads routing columns during discovery and footer
-metadata during publication. The CLI has not yet been wired to this coordinator.
+Every flush uses the [DuckDB event-file writer](DUCKDB_WRITER.md): source payload
+reads, transformation, sorting and Parquet output stay in DuckDB. PyArrow reads
+routing columns during discovery and footer metadata during publication.
 
 Raw files remain indefinitely as data backups. Raw-file retirement is out of scope
 and is not a prerequisite for enabling ingestion.
