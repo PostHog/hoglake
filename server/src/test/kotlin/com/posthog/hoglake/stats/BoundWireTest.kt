@@ -99,6 +99,26 @@ class BoundWireTest {
     }
 
     @Test
+    fun `an over-wide decimal or uint64 encoding is refused, not rendered`() {
+        // Campaign finding (BoundWireFuzzTest, crash-8074a66b): a 504-byte
+        // unscaled value renders a ~1200-digit number token that Jackson's
+        // own default StreamReadConstraints (and most JSON parsers) refuse
+        // to re-parse — a crash deferred to the client. No legal hoglake
+        // decimal can be wider than decimal(38)'s 16 unscaled bytes, so
+        // the renderer refuses wider encodings by name.
+        val wide = ByteArray(17) { 0x7F }
+        assertThatThrownBy { render(ColType.DECIMAL, wide) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("16 bytes")
+        assertThatThrownBy { render(ColType.UINT64, wide) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        // The widest legal value still renders.
+        val digits38 = BigInteger("9".repeat(38))
+        assertThat(digits38.toByteArray().size).isEqualTo(16)
+        assertThat(wire(ColType.DECIMAL, digits38)).isEqualTo("9".repeat(38))
+    }
+
+    @Test
     fun `empty decimal bytes are refused by the codec, not rendered`() {
         assertThatThrownBy { render(ColType.DECIMAL, ByteArray(0)) }
             .isInstanceOf(IllegalArgumentException::class.java)

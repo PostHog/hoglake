@@ -80,7 +80,27 @@ object BoundWire {
         type: ColType,
         scale: Int,
         bytes: ByteArray,
-    ): JsonNode = renderDecoded(type, scale, IcebergSingleValue.decode(type, bytes))
+    ): JsonNode {
+        // Campaign finding (BoundWireFuzzTest, crash-8074a66b): the codec
+        // is deliberately total over any unscaled width, but a 500-byte
+        // "decimal" renders a number token past the default number-length
+        // limit of Jackson (and most JSON parsers) — a crash deferred to
+        // every consumer. No legal hoglake decimal exceeds decimal(38),
+        // whose unscaled value fits 16 bytes (uint64 is decimal(20,0),
+        // 9), so anything wider cannot be a bound and is refused by name.
+        if ((type == ColType.DECIMAL || type == ColType.UINT64) &&
+            bytes.size > MAX_DECIMAL_UNSCALED_BYTES
+        ) {
+            throw IllegalArgumentException(
+                "${type.wire} bound is ${bytes.size} bytes, wider than any decimal(38) " +
+                    "unscaled value (max $MAX_DECIMAL_UNSCALED_BYTES bytes)",
+            )
+        }
+        return renderDecoded(type, scale, IcebergSingleValue.decode(type, bytes))
+    }
+
+    /** decimal(38)'s widest minimal two's-complement unscaled value. */
+    private const val MAX_DECIMAL_UNSCALED_BYTES = 16
 
     private fun renderDecoded(
         type: ColType,
