@@ -28,7 +28,7 @@ val jdbiVersion = "3.54.0"
 val flywayVersion = "13.7.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.54.13"
+val awsSdkVersion = "2.54.17"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -99,7 +99,7 @@ dependencies {
     // Compaction applies DVs at rewrite time (PuffinDeletionVector.kt), and
     // the Java RoaringBitmap serialize/deserialize format IS the portable
     // interoperable format the spec requires.
-    implementation("org.roaringbitmap:RoaringBitmap:1.6.21")
+    implementation("org.roaringbitmap:RoaringBitmap:1.6.23")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.3")

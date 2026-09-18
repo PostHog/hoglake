@@ -40,12 +40,12 @@ dependencies {
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
     // Bucket creation + parquet/deletion-vector upload to MinIO.
-    testImplementation("software.amazon.awssdk:s3:2.54.13")
+    testImplementation("software.amazon.awssdk:s3:2.54.17")
     // Real puffin deletion vectors for the DV read tests: the portable
     // 64-bit roaring serialization IS the Java library's format, so the
     // harness writes the same bytes the server and DuckDB client do.
     // Keep in step with the root project's pin.
-    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.21")
+    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.23")
 }
 
 kotlin {
