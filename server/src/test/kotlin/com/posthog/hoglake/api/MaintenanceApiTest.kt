@@ -9,6 +9,7 @@ import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.service.CleanupService
+import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
@@ -104,6 +105,7 @@ class MaintenanceApiTest {
                         compactionIntervalMs = 0,
                         smallFileThresholdBytes = 512L * 1024 * 1024,
                     ),
+                    DatabaseHealthService(db.jdbi),
                 )
             }
             block(client)

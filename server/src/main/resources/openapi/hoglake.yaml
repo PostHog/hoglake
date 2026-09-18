@@ -539,6 +539,26 @@ paths:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /database/health:
+    get:
+      operationId: getDatabaseHealth
+      summary: >
+        Health of the Postgres instance backing the catalog, read from
+        the statistics views, plus findings interpreting those numbers
+        for this schema. Instance-level: the manifest tables, the vacuum
+        horizon and the connection budget are shared by every catalog in
+        the database. Reads catalog and pg_stat_* relations only — never
+        a hog_* table — so the cost does not scale with the manifest.
+        Carries NO query text: pg_stat_activity.query holds literal
+        values (object paths, identifiers, author strings), so only
+        durations and counts cross the wire.
+      responses:
+        "200":
+          description: Database health
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatabaseHealth" }
+
   /maintenance/status:
     get:
       operationId: getInstanceMaintenanceStatus
@@ -2207,6 +2227,120 @@ components:
             (absent on an empty queue); compaction -> small_files
             (files selected into complete geometric-tier prefix groups,
             excluding incomplete suffixes), target_bytes; verify -> none.
+
+    DatabaseHealth:
+      type: object
+      required: [server, activity, tables, indexes, findings]
+      properties:
+        server: { $ref: "#/components/schemas/DatabaseServer" }
+        activity: { $ref: "#/components/schemas/DatabaseActivity" }
+        tables:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseTable" }
+        indexes:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseIndex" }
+        findings:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseFinding" }
+
+    DatabaseServer:
+      type: object
+      required: [version, database, size_bytes, connections_used, connections_max,
+                 deadlocks, committed, rolled_back, xid_age, xid_freeze_max_age,
+                 autovacuum_enabled]
+      properties:
+        version: { type: string, description: "Release only, build flags stripped." }
+        database: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        started_at: { type: string, format: date-time }
+        connections_used: { type: integer }
+        connections_max: { type: integer }
+        cache_hit_ratio:
+          type: number
+          description: >
+            Fraction of block reads served from cache since the last
+            statistics reset. Omitted before anything has been read.
+        deadlocks: { type: integer, format: int64 }
+        committed: { type: integer, format: int64 }
+        rolled_back: { type: integer, format: int64 }
+        xid_age:
+          type: integer
+          format: int64
+          description: age(datfrozenxid) for this database.
+        xid_freeze_max_age: { type: integer, format: int64 }
+        autovacuum_enabled: { type: boolean }
+
+    DatabaseActivity:
+      type: object
+      required: [active, idle, idle_in_transaction, waiting]
+      properties:
+        active: { type: integer }
+        idle: { type: integer }
+        idle_in_transaction: { type: integer }
+        waiting:
+          type: integer
+          description: Sessions blocked on a lock.
+        longest_transaction_seconds: { type: number }
+        longest_idle_in_transaction_seconds:
+          type: number
+          description: >
+            Age of the oldest open-but-idle transaction. This pins the
+            vacuum horizon for the whole database.
+        longest_wait_seconds: { type: number }
+
+    DatabaseTable:
+      type: object
+      required: [name, live_tuples, dead_tuples, table_bytes, index_bytes,
+                 toast_bytes, total_bytes, seq_scans, index_scans, autovacuum_count]
+      properties:
+        name: { type: string }
+        live_tuples: { type: integer, format: int64 }
+        dead_tuples: { type: integer, format: int64 }
+        dead_ratio:
+          type: number
+          description: Omitted for an empty table rather than reported as zero.
+        table_bytes: { type: integer, format: int64 }
+        index_bytes: { type: integer, format: int64 }
+        toast_bytes: { type: integer, format: int64 }
+        total_bytes: { type: integer, format: int64 }
+        seq_scans: { type: integer, format: int64 }
+        index_scans: { type: integer, format: int64 }
+        last_vacuum: { type: string, format: date-time }
+        last_autovacuum: { type: string, format: date-time }
+        last_analyze: { type: string, format: date-time }
+        last_autoanalyze: { type: string, format: date-time }
+        autovacuum_count: { type: integer, format: int64 }
+
+    DatabaseIndex:
+      type: object
+      required: [table, name, size_bytes, scans, constraint_backing]
+      properties:
+        table: { type: string }
+        name: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        scans:
+          type: integer
+          format: int64
+          description: Cumulative since the last statistics reset.
+        constraint_backing:
+          type: boolean
+          description: >
+            Backs a unique or primary-key constraint, so it is doing a
+            job whether or not it is ever scanned and must not be
+            reported as droppable.
+
+    DatabaseFinding:
+      type: object
+      required: [severity, code, title, detail, hoglake_impact]
+      properties:
+        severity: { type: string, enum: [info, warn, critical] }
+        code: { type: string }
+        title: { type: string }
+        detail: { type: string, description: What was measured. }
+        hoglake_impact:
+          type: string
+          description: What it means for this schema and its commit path.
 
     MaintenanceStatus:
       type: object

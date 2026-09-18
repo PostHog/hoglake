@@ -782,3 +782,100 @@ button.ghost:hover:not(:disabled) {
   border-radius: 4px;
   background: var(--warn);
 }
+
+/* -- database health page ------------------------------------------------- */
+
+/* Findings lead the page: an operator should be able to act without
+   reading the statistics tables below them. */
+.db-findings {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.db-finding {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+.db-finding-info {
+  border-left-color: var(--text-dim);
+}
+.db-finding-warn {
+  border-left-color: var(--warn);
+}
+.db-finding-critical {
+  border-left-color: var(--bad);
+}
+.db-finding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.db-finding-title {
+  font-weight: 600;
+}
+.db-finding-detail {
+  margin: 0;
+  font-size: 13px;
+}
+/* The hoglake reading of the number, set apart from the measurement so
+   the two are not mistaken for each other. */
+.db-finding-impact {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  border-top: 1px dotted var(--border);
+  padding-top: 6px;
+}
+.severity-info {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
+}
+.severity-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.severity-critical {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.db-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.db-stat {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  min-width: 120px;
+}
+.db-stat-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.db-stat-value {
+  display: block;
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.db-stat-warn .db-stat-value {
+  color: var(--warn);
+}
+.db-stat-critical .db-stat-value {
+  color: var(--bad);
+}
+.db-cell-warn {
+  color: var(--warn);
+}
