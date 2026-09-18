@@ -138,6 +138,7 @@ tasks.test {
 val fuzzTargets =
     listOf(
         "IcebergSingleValueDecodeFuzzTest",
+        "BoundWireFuzzTest",
         "IcebergSingleValueCompareFuzzTest",
         "ParquetFooterFuzzTest",
         "PuffinDeletionVectorFuzzTest",

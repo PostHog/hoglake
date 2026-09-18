@@ -200,6 +200,109 @@ describe("TablePage", () => {
     expect(sizeCell.textContent).not.toContain("NaN");
   });
 
+  it("expands a file row into decoded per-column stats", async () => {
+    // RAW wire body: the decoded bounds are JSON numbers on the wire, and
+    // long/uint64/decimal must reach the screen digit-for-digit (never
+    // through a double) — same raw-token discipline as the int64 fields.
+    const statsWireBody =
+      `{"data_file_id":101,"stats_state":"provided","columns":[` +
+      `{"field_id":11,"name":"user_id","path":"user_id","type":"long",` +
+      `"value_count":500000,"null_count":0,"lower_bound":9007199254740993,` +
+      `"upper_bound":9223372036854775807},` +
+      `{"field_id":12,"name":"amount","path":"amount","type":"decimal",` +
+      `"type_params":{"precision":10,"scale":2},"value_count":500000,` +
+      `"null_count":3,"lower_bound":1.50,"upper_bound":999.99},` +
+      `{"field_id":13,"name":"element","path":"tags.element","type":"string",` +
+      `"value_count":500000,"null_count":0,"size_bytes":4096,` +
+      `"lower_bound":"aardvark","upper_bound":"🦔"},` +
+      `{"field_id":14,"name":"note","path":"note","type":"string",` +
+      `"value_count":500000,"null_count":500000,"lower_bound":null,` +
+      `"upper_bound":null},` +
+      `{"field_id":15,"name":"active","path":"active","type":"boolean",` +
+      `"value_count":500000,"null_count":0,"lower_bound":false,` +
+      `"upper_bound":true},` +
+      `{"field_id":16,"name":"score","path":"score","type":"double",` +
+      `"value_count":500000,"null_count":0,"lower_bound":-0.0,` +
+      `"upper_bound":"Infinity"},` +
+      `{"field_id":17,"name":"seen_at","path":"seen_at","type":"timestamptz",` +
+      `"value_count":500000,"null_count":0,` +
+      `"lower_bound":"1970-01-01T00:00:00Z",` +
+      `"upper_bound":"2026-09-05T12:00:00Z"}]}`;
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === `${base}/files/101/stats`)
+        return new Response(statsWireBody, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      return happyHandler(url);
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await user.click(
+      await screen.findByRole("button", { name: "toggle stats for file 101" }),
+    );
+
+    // long bounds, exact — 2^53+1 would round to ...992 through a double.
+    expect(await screen.findByText("9007199254740993")).toBeInTheDocument();
+    expect(screen.getByText("9223372036854775807")).toBeInTheDocument();
+    // decimal at the column scale, token verbatim.
+    expect(screen.getByText("1.50")).toBeInTheDocument();
+    expect(screen.getByText("999.99")).toBeInTheDocument();
+    // strings verbatim; a nested leaf shows its dotted path.
+    expect(screen.getByText("aardvark")).toBeInTheDocument();
+    expect(screen.getByText("🦔")).toBeInTheDocument();
+    expect(screen.getByText("tags.element")).toBeInTheDocument();
+    // All-null column: explicit null bounds, flagged as "no bound".
+    expect(screen.getAllByTitle(/no bound stored/)).toHaveLength(2);
+    // Boolean bounds render their JSON tokens, never a placeholder.
+    expect(screen.getByText("false")).toBeInTheDocument();
+    expect(screen.getByText("true")).toBeInTheDocument();
+    // The Infinity sentinel STRING reaches the cell verbatim.
+    expect(screen.getByText("Infinity")).toBeInTheDocument();
+    // -0.0 keeps its sign: the raw token is the value (String(-0) in a
+    // double round-trip would render "0").
+    expect(screen.getByText("-0.0")).toBeInTheDocument();
+    // Temporal bounds are the server's ISO strings, verbatim.
+    expect(screen.getByText("2026-09-05T12:00:00Z")).toBeInTheDocument();
+
+    // Collapse hides the panel again.
+    await user.click(
+      screen.getByRole("button", { name: "toggle stats for file 101" }),
+    );
+    expect(screen.queryByText("aardvark")).not.toBeInTheDocument();
+  });
+
+  it("shows the no-stats reason for a pending file", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === `${base}/files/102/stats`)
+        return jsonResponse({
+          data_file_id: "102",
+          stats_state: "pending",
+          columns: [],
+          no_stats_reason:
+            "stats_state is 'pending': column statistics have not been " +
+            "hydrated yet, so no per-column rows exist; with no bounds, " +
+            "callers must not prune this file",
+        });
+      return happyHandler(url);
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await user.click(
+      await screen.findByRole("button", { name: "toggle stats for file 102" }),
+    );
+
+    expect(
+      await screen.findByText(/callers must not prune this file/),
+    ).toBeInTheDocument();
+  });
+
   it("shows the 404 detail when the table does not exist", async () => {
     mockFetch((url) =>
       url.startsWith(base)

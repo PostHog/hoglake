@@ -83,6 +83,19 @@ const INT64_FIELDS = new Set([
 
 const DECIMAL_INT_RE = /^-?\d+$/;
 
+/**
+ * Wire fields whose NUMBER values are carried as their exact raw token —
+ * whatever numeric shape they are, not just int64s. The decoded bounds
+ * of GET .../files/{fileId}/stats are polymorphic (long, uint64 and
+ * decimal exceed 2^53; decimal carries a scale the double would erase;
+ * -0.0 has a sign), so the token IS the value for display. Booleans and
+ * strings under these names pass through untouched. Distinct from
+ * INT64_FIELDS: these are not int64-typed in the spec, and the commit
+ * REQUEST reuses the names for base64 strings (never parsed here — this
+ * reviver only ever sees responses).
+ */
+const RAW_NUMBER_FIELDS = new Set(["lower_bound", "upper_bound"]);
+
 type ReviverContext = { source?: string };
 
 /**
@@ -113,6 +126,12 @@ export function parseInt64Json(text: string): unknown {
         const source = ctx?.source;
         if (source !== undefined && DECIMAL_INT_RE.test(source)) return source;
         return String(value);
+      }
+      if (typeof value === "number" && RAW_NUMBER_FIELDS.has(key)) {
+        // Any numeric token, verbatim (decimals and exponents included);
+        // String(value) is the sub-2^53 fallback where the raw source
+        // API is unavailable.
+        return ctx?.source ?? String(value);
       }
       return value;
     },

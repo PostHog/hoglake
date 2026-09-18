@@ -158,7 +158,7 @@ internal object BoundsVectorFile {
      * shrinking coverage in silence. Update DELIBERATELY when vectors are
      * added, together with the identical pin in pyhoglake/tests/qe_vectors.py.
      */
-    const val EXPECTED_COUNT = 107
+    const val EXPECTED_COUNT = 109
 
     private const val REPO_RELATIVE = "pyhoglake/tests/vectors/bounds_vectors.json"
 

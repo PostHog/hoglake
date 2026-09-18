@@ -3,13 +3,17 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ChangesPlan
+import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
+import com.posthog.hoglake.model.FileColumnStats
+import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.nodeCount
@@ -400,6 +404,89 @@ class CatalogService(private val jdbi: Jdbi) {
                     )
             FileRepo.listAt(h, cat.catalogId, t.tableId, at)
         }
+
+    /**
+     * Per-column statistics for ONE data file (GET
+     * .../files/{fileId}/stats), with each stats row joined to its
+     * column identity — name, dotted path, type — as visible at the
+     * resolved snapshot. The file must belong to the named table and be
+     * visible at that snapshot (404 otherwise, like every read here).
+     *
+     * The join is deliberately REFLECTIVE, never generative: one entry
+     * per stored stats row whose field id resolves to a visible column.
+     * Variant columns and containers never have rows (the commit door
+     * refuses them; the hydrator never emits them), so they never
+     * appear; a row whose field id is not visible at the snapshot (a
+     * dropped column) is omitted, because without a column there is no
+     * type to decode its bounds under.
+     *
+     * Decoding of the bound BYTES is the wire layer's job
+     * (api/FileStatsDto, over stats/BoundWire) — this returns the
+     * stored rows and the type context, nothing pre-rendered.
+     */
+    fun fileStats(
+        catalog: String,
+        namespace: String,
+        table: String,
+        fileId: Long,
+        snapshot: Long? = null,
+        atTimestamp: Instant? = null,
+    ): FileStats =
+        jdbi.withHandleUnchecked { h ->
+            val cat = requireCatalog(h, catalog)
+            val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
+            val ns = requireNamespace(h, cat, namespace)
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
+            val file =
+                FileRepo.findAt(h, cat.catalogId, t.tableId, fileId, at)
+                    ?: throw HoglakeException.NotFound(
+                        "data file $fileId of table '$namespace.$table' in catalog " +
+                            "'$catalog' at snapshot $at",
+                    )
+            // pending/failed files have no stats rows by construction —
+            // answer the explicit empty shape without querying for rows
+            // that cannot exist.
+            if (file.statsState != StatsState.PROVIDED) {
+                return@withHandleUnchecked FileStats(fileId, file.statsState, emptyList())
+            }
+            val byFieldId = columnsByFieldId(TableRepo.columnsAt(h, cat.catalogId, t.tableId, at))
+            val columns =
+                FileRepo.columnStats(h, cat.catalogId, fileId).mapNotNull { row ->
+                    byFieldId[row.fieldId]?.let { (path, column) ->
+                        FileColumnStats(
+                            fieldId = row.fieldId,
+                            name = column.def.name,
+                            path = path,
+                            type = column.def.type,
+                            typeParams = column.def.typeParams,
+                            stats = row,
+                        )
+                    }
+                }
+            FileStats(fileId, file.statsState, columns)
+        }
+
+    /** Every node of the column forest keyed by field id, with its dotted path. */
+    private fun columnsByFieldId(forest: List<Column>): Map<Long, Pair<String, Column>> {
+        val out = mutableMapOf<Long, Pair<String, Column>>()
+
+        fun walk(
+            columns: List<Column>,
+            prefix: String,
+        ) {
+            for (column in columns) {
+                val path = if (prefix.isEmpty()) column.def.name else "$prefix.${column.def.name}"
+                out[column.fieldId] = path to column
+                walk(column.children, path)
+            }
+        }
+        walk(forest, "")
+        return out
+    }
 
     /**
      * Changefeed plan for (fromSnapshot, toSnapshot]: the table's

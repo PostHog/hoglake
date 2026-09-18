@@ -136,6 +136,18 @@ fun Application.installApiRoutes(
                                     ).map { it.toDto() },
                                 )
                             }
+                            get("/files/{fileId}/stats") {
+                                call.respond(
+                                    catalogs.fileStats(
+                                        call.catalog(),
+                                        call.namespace(),
+                                        call.table(),
+                                        call.longPath("fileId"),
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).toDto(),
+                                )
+                            }
                             get("/changes") {
                                 val from =
                                     call.longQuery("from_snapshot")
@@ -254,6 +266,12 @@ internal fun ApplicationCall.namespace() = pathParam("namespace")
 private fun ApplicationCall.table() = pathParam("table")
 
 private fun ApplicationCall.consumer() = pathParam("consumer")
+
+private fun ApplicationCall.longPath(name: String): Long {
+    val raw = pathParam(name)
+    return raw.toLongOrNull()
+        ?: throw BadRequestException("path parameter '$name' must be an integer, got '$raw'")
+}
 
 private fun ApplicationCall.uuidPath(name: String): UUID {
     val raw = pathParam(name)

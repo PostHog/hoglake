@@ -7,6 +7,7 @@ import io.ktor.http.HttpHeaders
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.JsonConvertException
 import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.ContentTransformationException
 import io.ktor.server.plugins.statuspages.StatusPagesConfig
 import io.ktor.server.request.httpMethod
 import io.ktor.server.request.uri
@@ -28,7 +29,12 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
  *                          never a generic 500)
- * - malformed body / unparseable query or path params -> 400
+ * - malformed body / unparseable query or path params -> 400. This
+ *   includes the receives ktor refuses BEFORE deserialization even
+ *   starts (ContentTransformationException): a body sent under a
+ *   Content-Type no converter handles (bare curl -d posts
+ *   x-www-form-urlencoded) and a JSON `null` body, both of which
+ *   otherwise escape to the Throwable catch-all as 500s.
  * - CorruptDefinitionException -> 500 `corrupt_definition`, NAMING the
  *   unreadable receipt (a stored row nobody can act on without knowing
  *   which one it is)
@@ -83,6 +89,14 @@ fun StatusPagesConfig.installErrorMapping() {
         call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", rootMessage(cause)))
     }
     exception<JsonConvertException> { call, cause ->
+        call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", rootMessage(cause)))
+    }
+    // Receives ktor refuses without a converter ever running: an
+    // unsupported Content-Type (UnsupportedMediaTypeException) and a
+    // body whose transformation yields nothing to bind — a JSON `null`
+    // (CannotTransformContentToTypeException). Both are the caller's
+    // malformed request, same 400 as a body Jackson cannot parse.
+    exception<ContentTransformationException> { call, cause ->
         call.respond(HttpStatusCode.BadRequest, ApiErrorDto("bad_request", rootMessage(cause)))
     }
     exception<Throwable> { call, cause ->

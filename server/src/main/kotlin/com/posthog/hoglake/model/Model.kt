@@ -762,6 +762,32 @@ data class ColumnStats(
     override fun hashCode(): Int = fieldId.hashCode()
 }
 
+/**
+ * One data file's per-column statistics, resolved against the columns
+ * visible at the requested snapshot (GET .../files/{fileId}/stats).
+ * [columns] carries one entry per stored `hog_file_column_stats` row
+ * whose field id resolves to a visible LEAF — nothing is fabricated:
+ * variant columns and containers never have rows, and a row whose field
+ * id is not visible at the snapshot (a dropped column) is omitted.
+ */
+data class FileStats(
+    val dataFileId: Long,
+    val statsState: StatsState,
+    val columns: List<FileColumnStats>,
+)
+
+/** One stats row joined to its column identity at the resolved snapshot. */
+data class FileColumnStats(
+    val fieldId: Long,
+    /** The leaf's own name (synthetic element/key/value included). */
+    val name: String,
+    /** Dotted path from the top level, e.g. `addr.zip` or `l.element`. */
+    val path: String,
+    val type: ColType,
+    val typeParams: Map<String, Any?>?,
+    val stats: ColumnStats,
+)
+
 /** One file offered to the commit endpoint. */
 data class FileRegistration(
     val path: String,

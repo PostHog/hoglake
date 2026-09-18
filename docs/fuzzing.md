@@ -75,6 +75,7 @@ Targets (one class, one `@FuzzTest` each):
 |---|---|---|
 | `IcebergSingleValueDecodeFuzzTest` | `IcebergSingleValue.decode` (arbitrary bytes × every ColType) | only `IllegalArgumentException` refusals; `encode(decode(x)) == x` for canonical encodings |
 | `IcebergSingleValueCompareFuzzTest` | `encode`/`compareValues` over generated typed values | round-trip; comparator sign-antisymmetry, reflexivity, transitivity, equals-consistency |
+| `BoundWireFuzzTest` | `BoundWire.render` (arbitrary type × scale × bytes — the decode surface of `.../files/{fileId}/stats` and `/v1/debug/decode-bound`) | only `IllegalArgumentException` refusals (the family the endpoints map to 422/null); every produced node serializes and reparses through the production mapper; total over the full int64 temporal range |
 | `ParquetFooterFuzzTest` | the hydrator's footer parse (`FooterParse.parse`) + `FooterStats` | `IOException` refusals only — `FooterParse` translates every other escape from parquet-java into `FooterParseException`, so the contract needs no stack inspection; `FooterStats.*` total over parsed footers; 1 MiB input cap |
 | `PuffinDeletionVectorFuzzTest` | `PuffinDeletionVector.read` (highest value: fresh code on writer-supplied bytes) | loud typed refusals (IAE/ISE/IOException), deterministic decode, no silent mis-decode |
 | `IdentifiersFuzzTest` | `Identifiers.validate` + the RequestId header shape | only `HoglakeException.Validation`; decisions stable and equal to a character-walk reference of the documented policy |

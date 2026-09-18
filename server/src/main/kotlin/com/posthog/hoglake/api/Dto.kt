@@ -1,5 +1,7 @@
 package com.posthog.hoglake.api
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.NullNode
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangesPlan
 import com.posthog.hoglake.model.ColType
@@ -12,15 +14,19 @@ import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.ViewInfo
+import com.posthog.hoglake.stats.BoundWire
 import java.time.Instant
 import java.util.UUID
 
@@ -304,6 +310,98 @@ fun DataFile.toDto() =
         partitionValues = partitionValues,
         explicitRowIds = explicitRowIds,
     )
+
+// ---- per-file column statistics (decoded bounds) ---------------------------
+
+/**
+ * GET .../files/{fileId}/stats — one stats row with its bounds DECODED
+ * to the JSON wire conventions (stats/BoundWire; documented on the
+ * spec's FileColumnStats schema). `lower`/`upper` are typed [JsonNode]
+ * rather than Kotlin nullables so an all-null column's stored NULL
+ * bound serializes as an EXPLICIT JSON null (the global NON_NULL
+ * inclusion would silently omit a null property — and "null bound" is
+ * an answer, not an absence).
+ */
+data class FileColumnStatsDto(
+    val fieldId: Long,
+    val name: String,
+    val path: String,
+    val type: String,
+    val typeParams: Map<String, Any?>? = null,
+    val valueCount: Long,
+    val nullCount: Long,
+    val nanCount: Long? = null,
+    val sizeBytes: Long? = null,
+    val lowerBound: JsonNode,
+    val upperBound: JsonNode,
+)
+
+data class FileStatsDto(
+    val dataFileId: Long,
+    val statsState: String,
+    val columns: List<FileColumnStatsDto>,
+    /** Present iff the file has no stats rows (stats_state != provided). */
+    val noStatsReason: String? = null,
+)
+
+fun FileStats.toDto(): FileStatsDto =
+    FileStatsDto(
+        dataFileId = dataFileId,
+        statsState = statsState.wire,
+        columns = columns.map { it.toDto() },
+        noStatsReason =
+            when (statsState) {
+                StatsState.PROVIDED -> null
+                StatsState.PENDING ->
+                    "stats_state is 'pending': column statistics have not been hydrated yet, " +
+                        "so no per-column rows exist; with no bounds, callers must not prune " +
+                        "this file"
+                StatsState.FAILED ->
+                    "stats_state is 'failed': stats hydration failed structurally " +
+                        "(see POST .../maintenance/rehydrate), so no per-column rows exist; " +
+                        "with no bounds, callers must not prune this file"
+            },
+    )
+
+fun FileColumnStats.toDto(): FileColumnStatsDto =
+    FileColumnStatsDto(
+        fieldId = fieldId,
+        name = name,
+        path = path,
+        type = type.wire,
+        typeParams = typeParams,
+        valueCount = stats.valueCount,
+        nullCount = stats.nullCount,
+        nanCount = stats.nanCount,
+        sizeBytes = stats.sizeBytes,
+        lowerBound = renderBoundOrNull(this, stats.lowerBound),
+        upperBound = renderBoundOrNull(this, stats.upperBound),
+    )
+
+/**
+ * A stored bound as wire JSON, or JSON null when there is none — and
+ * ALSO null when the stored bytes cannot be decoded/rendered under the
+ * column's live type (a stale-width bound from a pre-promote writer,
+ * an out-of-domain value): the "NULL, never guessed" read-side dual. A
+ * bound the reader cannot decode is treated as absent, and the spec
+ * says absent bounds mean "do not prune". Never a 500: this endpoint
+ * reports the store, it does not vouch for it.
+ */
+private fun renderBoundOrNull(
+    column: FileColumnStats,
+    bytes: ByteArray?,
+): JsonNode {
+    if (bytes == null) return NullNode.instance
+    return try {
+        BoundWire.render(
+            column.type,
+            BoundWire.scaleOf(column.typeParams),
+            bytes,
+        )
+    } catch (_: IllegalArgumentException) {
+        NullNode.instance
+    }
+}
 
 // ---- scan planning -------------------------------------------------------
 

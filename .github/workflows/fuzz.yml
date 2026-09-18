@@ -1,6 +1,6 @@
 name: Fuzz nightly
 
-# Deep coverage-guided Jazzer soak of the six hermetic fuzz targets
+# Deep coverage-guided Jazzer soak of the hermetic fuzz targets
 # (fuzzing.md layer 4). The normal server suite only REPLAYS the
 # committed seed corpus; this run actually fuzzes, and accumulates its
 # generated corpus across nights through the cache so coverage compounds.
@@ -32,9 +32,9 @@ jobs:
   fuzz:
     if: github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
-    # Six sequential targets x the default 600s budget, plus build:
-    # ~65 min. Dispatch with a bigger budget needs this raised too.
-    timeout-minutes: 90
+    # Eight sequential targets x the default 600s budget, plus build:
+    # ~90 min. Dispatch with a bigger budget needs this raised too.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
