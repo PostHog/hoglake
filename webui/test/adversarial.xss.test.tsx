@@ -26,7 +26,17 @@ function noInjectedMarkup(container: HTMLElement) {
   // elements would exist somewhere in the document.
   expect(container.querySelector("script")).toBeNull();
   expect(container.querySelector("img")).toBeNull();
-  expect(container.querySelector("svg")).toBeNull();
+  // The app renders its own decorative SVG icons (copy buttons), so a bare
+  // "no svg at all" check would fail on legitimate markup and, worse, would
+  // have to be deleted — taking the guard with it. Every icon this app
+  // draws is aria-hidden; markup parsed out of a hostile string would not
+  // be, so that attribute is the discriminator rather than the tag.
+  expect(container.querySelector('svg:not([aria-hidden="true"])')).toBeNull();
+  for (const svg of container.querySelectorAll("svg")) {
+    // An injected icon would also have to carry an event handler to be
+    // worth anything; ours carry none.
+    expect(svg.outerHTML).not.toMatch(/on[a-z]+=/i);
+  }
 }
 
 describe("hostile strings render as text, never markup", () => {
