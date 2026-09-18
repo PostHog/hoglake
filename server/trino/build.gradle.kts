@@ -27,7 +27,7 @@ dependencies {
     // `implementation` deps of the root project, so not exported to us).
     testImplementation("io.ktor:ktor-server-core:$ktorVersion")
     testImplementation("io.ktor:ktor-server-netty:$ktorVersion")
-    testImplementation("com.zaxxer:HikariCP:6.2.1")
+    testImplementation("com.zaxxer:HikariCP:7.1.0")
     testImplementation("org.jdbi:jdbi3-core:3.54.0")
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
     testImplementation("org.testcontainers:junit-jupiter:$testcontainersVersion")
