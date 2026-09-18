@@ -4,6 +4,7 @@ import com.posthog.hoglake.Config
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -169,6 +170,71 @@ class CompactionConfigTest {
         }
         assertThat(ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW)
             .isEqualTo(documented.replace(",", "").toInt())
+    }
+
+    // ---- the output codec: the same four things again ------------------
+    //
+    // Same hole, same shape. The codec that matters is the one a running
+    // server writes with, and CompactionCodecTest proves the rewriter
+    // honours whatever it is handed — which is silent about whether
+    // production hands it anything. UNCOMPRESSED was never chosen here;
+    // it was inherited from ExampleParquetWriter's default, and the way
+    // it stays chosen again is App's wiring line going away while
+    // OutputCodec's own default keeps every test green.
+
+    @Test
+    fun `a config with NO override carries the rewriter's default codec`() {
+        assertThat(defaulted().codec).isEqualTo(ParquetRewriter.OutputCodec())
+        assertThat(defaulted().codec.name)
+            .describedAs("compaction must not write UNCOMPRESSED by default")
+            .isNotEqualTo(CompressionCodecName.UNCOMPRESSED)
+    }
+
+    @Test
+    fun `the env-backed Config defaults to the same codec and level the rewriter does`() {
+        assertThat(ParquetRewriter.OutputCodec.parse(Config().compactionCodec, Config().compactionZstdLevel))
+            .isEqualTo(ParquetRewriter.OutputCodec())
+        assertThat(Config().compactionZstdLevel).isEqualTo(ParquetRewriter.DEFAULT_ZSTD_LEVEL)
+    }
+
+    @Test
+    fun `App wires the codec env knobs into the planner's config`() {
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .describedAs("App must pass Config.compactionCodec and compactionZstdLevel into CompactionConfig")
+            .containsPattern("""codec\s*=\s*ParquetRewriter\.OutputCodec\.parse\(""")
+            .contains("cfg.compactionCodec")
+            .contains("cfg.compactionZstdLevel")
+    }
+
+    @Test
+    fun `an unusable codec name is refused at construction, not at the first rewrite`() {
+        // The knob is a string an operator sets. A name this server
+        // cannot write must fail at boot; failing per-group inside the
+        // sweep is a catch-all counter rising forever with the cause
+        // buried in a log line.
+        assertThatThrownBy {
+            CompactionConfig(
+                targetBytes = target,
+                tierTarget = 8,
+                maxGroupsPerRun = 1,
+                codec = ParquetRewriter.OutputCodec.parse("lzo"),
+            )
+        }.isInstanceOf(IllegalArgumentException::class.java)
+    }
+
+    @Test
+    fun `the documented codec default is the one the code uses`() {
+        // Same rule as the node budget below: an operator sizing a
+        // maintenance pod's CPU reads the docs, not the constant.
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must document HOGLAKE_COMPACTION_CODEC's real default", doc)
+                .contains("HOGLAKE_COMPACTION_CODEC")
+                .contains("HOGLAKE_COMPACTION_ZSTD_LEVEL")
+                .containsPattern("""(?i)zstd_level[^.]{0,40}\*\*${ParquetRewriter.DEFAULT_ZSTD_LEVEL}\*\*""")
+        }
+        assertThat(ParquetRewriter.DEFAULT_CODEC).isEqualTo(CompressionCodecName.ZSTD)
     }
 
     @Test

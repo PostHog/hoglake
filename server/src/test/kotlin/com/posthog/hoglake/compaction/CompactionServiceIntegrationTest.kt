@@ -136,7 +136,19 @@ class CompactionServiceIntegrationTest {
 
     private data class TestRow(val id: Long, val name: String?, val score: Double?)
 
-    private fun parquetBytes(rows: List<TestRow>): ByteArray =
+    /**
+     * [codec] is UNCOMPRESSED for the fixtures whose sizes are arbitrary,
+     * and the rewriter's own default for the two tests that compare an
+     * INPUT's bytes against an OUTPUT's. Those two are the only ones for
+     * which it matters, and for them it matters absolutely: a tier is a
+     * byte band, so an uncompressed input and a compressed output of the
+     * same rows are not in it together, and the test would be asserting
+     * the writer's codec rather than the ladder.
+     */
+    private fun parquetBytes(
+        rows: List<TestRow>,
+        codec: CompressionCodecName = CompressionCodecName.UNCOMPRESSED,
+    ): ByteArray =
         customParquetBytes(
             schema,
             rows.map { r ->
@@ -146,11 +158,13 @@ class CompactionServiceIntegrationTest {
                     r.score?.let { g.add("score", it) }
                 }
             },
+            codec,
         )
 
     private fun customParquetBytes(
         fileSchema: MessageType,
         rows: List<(Group) -> Unit>,
+        codec: CompressionCodecName = CompressionCodecName.UNCOMPRESSED,
     ): ByteArray {
         val tmp = Files.createTempFile("compact-e2e", ".parquet")
         try {
@@ -158,7 +172,7 @@ class CompactionServiceIntegrationTest {
             val factory = SimpleGroupFactory(fileSchema)
             ExampleParquetWriter.builder(LocalOutputFile(tmp))
                 .withType(fileSchema)
-                .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                .withCompressionCodec(codec)
                 .build()
                 .use { w ->
                     for (fill in rows) {
@@ -618,6 +632,46 @@ class CompactionServiceIntegrationTest {
         val again = svc.runOnce(fx.cat, cfg)
         assertThat(again.groupsCompacted).isZero()
         assertThat(again.skippedConflicts).isZero()
+    }
+
+    @Test
+    fun `the committed object carries the configured codec, in every column chunk`() {
+        // CompactionCodecTest pins the rewriter; CompactionConfigTest pins
+        // the env wiring into CompactionConfig. Between them sits the
+        // sweep, which has to hand its config's codec to the rewriter and
+        // upload what came back — and nothing else in this suite would
+        // notice if it passed the default instead, because every other
+        // assertion here is about values, ids and metadata, all identical
+        // under any codec. So: read the codec out of the COMMITTED
+        // object's footer, per column chunk, at the default and under an
+        // override that cannot be confused with it.
+        val fx = fixture(dvOnMiddle = false)
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+        val defaulted = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        assertThat(codecsOf(store.get(defaulted.path)))
+            .describedAs("default sweep: every column chunk of %s", defaulted.path)
+            .containsOnly(ParquetRewriter.DEFAULT_CODEC)
+
+        val other = fixture(dvOnMiddle = false)
+        val overridden = cfg.copy(codec = ParquetRewriter.OutputCodec(CompressionCodecName.GZIP))
+        assertThat(svc.runOnce(other.cat, overridden).groupsCompacted).isEqualTo(1)
+        val out = catalogs.listFiles(other.cat, "ns", "t").single { it.explicitRowIds }
+        assertThat(codecsOf(store.get(out.path)))
+            .describedAs("overridden sweep: every column chunk of %s", out.path)
+            .containsOnly(CompressionCodecName.GZIP)
+    }
+
+    /** Every column chunk's recorded codec, across every row group. */
+    private fun codecsOf(bytes: ByteArray): List<CompressionCodecName> {
+        val tmp = Files.createTempFile("codec-read", ".parquet")
+        return try {
+            Files.write(tmp, bytes)
+            ParquetFileReader.open(LocalInputFile(tmp)).use { reader ->
+                reader.footer.blocks.flatMap { block -> block.columns.map { it.codec } }
+            }
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
     }
 
     @Test
@@ -1420,7 +1474,11 @@ class CompactionServiceIntegrationTest {
             name: String,
             rows: List<TestRow>,
         ) {
-            val bytes = parquetBytes(rows)
+            // Written with the codec compaction writes, because this test
+            // compares an OUTPUT's tier against an INPUT's (see
+            // parquetBytes): uncompressed inputs and a compressed output
+            // of the same rows are never tier peers.
+            val bytes = parquetBytes(rows, ParquetRewriter.DEFAULT_CODEC)
             val path = "s3://$BUCKET/$cat/data/ns/t/$name.parquet"
             store.put(path, bytes)
             commits.commit(
@@ -1438,10 +1496,18 @@ class CompactionServiceIntegrationTest {
             )
         }
 
-        // Row sizes are DELIBERATE (incompressible names -> file bytes track
-        // row content): a+b clear the tier-0 floor (16384) of the
-        // target=65536 ladder, their uncompressed output lands in tier 1
-        // (< 32768), and output+c clears the tier-1 floor (32768).
+        // Row sizes are DELIBERATE: a+b clear a tier floor of the
+        // target=65536 ladder, their output lands one tier up, and
+        // output+c clear THAT tier's floor so the second run has a group.
+        // Inputs and outputs are written with the same codec (above), so
+        // the bands hold whatever the codec is.
+        //
+        // The padding is genuinely high-entropy. An earlier version
+        // called a `(id * 31 + it * 17) % 26` cycle "incompressible"; 17
+        // and 26 are coprime, so it is a repeating 26-character string
+        // that any LZ77 codec collapses ~100x, and the tier arithmetic
+        // above was only ever true because the writer happened not to
+        // compress at all.
         fun paddedRows(
             start: Long,
             n: Int,
@@ -1449,8 +1515,11 @@ class CompactionServiceIntegrationTest {
         ): List<TestRow> =
             (0 until n).map { i ->
                 val id = start + i
-                // Pseudo-random, deterministic, incompressible.
-                val chars = (0 until pad).map { 'a' + ((id * 31 + it * 17) % 26).toInt() }.joinToString("")
+                val rng = kotlin.random.Random(id)
+                // Printable ASCII, uniformly drawn: ~6.6 bits of entropy
+                // per byte, which no general-purpose codec improves on
+                // by much.
+                val chars = String(CharArray(pad) { (0x20 + rng.nextInt(0x5F)).toChar() })
                 TestRow(id, chars, id.toDouble())
             }
         appendRows("a", paddedRows(100, 3, 5000)) // row ids 0..2
@@ -1567,7 +1636,10 @@ class CompactionServiceIntegrationTest {
                     val id = nextId++
                     TestRow(id, String(CharArray(64) { ('a'.code + random.nextInt(26)).toChar() }), random.nextDouble())
                 }
-            val bytes = parquetBytes(rows)
+            // Same-codec inputs and outputs: this test asserts the tier
+            // a compaction OUTPUT lands in against the tier its INPUTS
+            // came from, which is a comparison between byte bands.
+            val bytes = parquetBytes(rows, ParquetRewriter.DEFAULT_CODEC)
             val path = "s3://$BUCKET/$cat/$name.parquet"
             store.put(path, bytes)
             return FileRegistration(path, count.toLong(), bytes.size.toLong())

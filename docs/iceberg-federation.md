@@ -336,6 +336,23 @@ with BOTH nested columns and a live sort order is planned under
 the top of the measured 30-70x range), which puts the materialized graph
 back under roughly the target. That is a bounded mitigation per GROUP,
 not spilling; the per-ROW bound is the node budget above.
+A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
+**zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
+gzip, lz4_raw and uncompressed are the other legal names, and an
+unknown one is refused at boot). An input's own codec is never an
+instruction — the rewrite decodes and re-encodes, so a group of mixed
+snappy, zstd and uncompressed inputs produces one output under the
+configured codec. The choice is not per-file: the tier ladder rewrites
+a table's hot rows once per tier and every output is the next tier's
+input, so this is the codec a fully compacted table is stored and
+scanned under. The writer previously took parquet-java's UNCOMPRESSED
+default, which made each merge a permanent decompression — measured on
+event-shaped data, an uncompressed merge of snappy inputs is 1.4-1.8x
+the input bytes, zstd 0.6-0.84x, and zstd is 0.43-0.45x of the
+uncompressed output for roughly 25-30% more rewrite CPU. The level is
+pinned rather than inherited so a parquet-java bump cannot move a
+shared maintenance pod's CPU budget silently.
+
 Inputs are matched by SHAPE, not by the synthetic group names (the
 parquet spec says those are insignificant), but a shape that disagrees
 with the live column — a struct over a primitive, a 2-level legacy list,

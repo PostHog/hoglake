@@ -198,6 +198,111 @@ object ParquetRewriter {
     const val MAP_ENTRY_GROUP = "key_value"
 
     /**
+     * parquet-java's zstd level key, and the level this rewriter pins by
+     * default. Named rather than typed because the value travels to the
+     * codec through the writer's untyped configuration map.
+     */
+    const val ZSTD_LEVEL_KEY = "parquet.compression.codec.zstd.level"
+    const val DEFAULT_ZSTD_LEVEL = 3
+    const val MIN_ZSTD_LEVEL = 1
+    const val MAX_ZSTD_LEVEL = 22
+
+    /** See [OutputCodec]. */
+    val DEFAULT_CODEC: CompressionCodecName = CompressionCodecName.ZSTD
+
+    /** See [OutputCodec]: readable by every consumer, implemented on the classpath. */
+    val SUPPORTED: List<CompressionCodecName> =
+        listOf(
+            CompressionCodecName.ZSTD,
+            CompressionCodecName.SNAPPY,
+            CompressionCodecName.GZIP,
+            CompressionCodecName.LZ4_RAW,
+            CompressionCodecName.UNCOMPRESSED,
+        )
+
+    /**
+     * The compression codec a compaction output is written with.
+     *
+     * The default is ZSTD, and the reason is that compaction is the one
+     * writer in this system that rewrites the SAME rows repeatedly. A
+     * table's hot bytes pass through the tier ladder four times
+     * (…1 MiB -> 8 MiB -> 64 MiB -> 512 MiB), each pass writing what the
+     * next pass reads, so an output codec is not a per-file choice: it
+     * is the codec a fully compacted table is stored and scanned under
+     * forever. UNCOMPRESSED — which is what this used to be, inherited
+     * from `ExampleParquetWriter`'s default rather than chosen — made
+     * that ladder a one-way decompressor: clients write snappy
+     * (pyarrow's default, and DuckDB's, which is what pyhoglake and the
+     * duckdb-client produce) or zstd (hedgerow's explicit COPY option),
+     * and every merge threw that away permanently. A dev-catalog run
+     * merged 67.6 MiB of inputs into 80.1 MiB of output.
+     *
+     * ZSTD over SNAPPY because the cost sits on the side that is paid
+     * once. Compression happens once per rewrite; the output is then
+     * read by every scan, by the next tier's rewrite, and paid for in
+     * S3 storage until expiry. zstd at level 3 lands well under snappy's
+     * size on the text-heavy event shapes this catalog holds, and its
+     * DEcompression — what readers and the next tier actually spend —
+     * is in snappy's league. The compaction sweep is CPU-bound on a
+     * shared maintenance pod, so the level is pinned rather than
+     * inherited: [DEFAULT_ZSTD_LEVEL] is parquet-java's own default
+     * today, and pinning it means a library bump cannot silently move
+     * this pod's CPU budget. parquet-java's zstd workers default to 0
+     * (in-thread), which is what a shared pod wants, so nothing here
+     * asks for threads.
+     *
+     * The allow-list is [SUPPORTED] — every codec on it is readable by
+     * all four consumers of these files (DuckDB extension, Trino
+     * connector, pyarrow, parquet-java itself) and has its
+     * implementation on the server's runtime classpath. UNCOMPRESSED
+     * stays on it deliberately: it is the escape hatch for an operator
+     * who has measured their own data, and it is what makes the
+     * regression test's red state reachable. LZO and BROTLI are off it
+     * because their codecs are not on the classpath — a rewrite would
+     * fail at the writer rather than at boot.
+     */
+    data class OutputCodec(
+        val name: CompressionCodecName = DEFAULT_CODEC,
+        /** Ignored unless [name] is ZSTD. */
+        val zstdLevel: Int = DEFAULT_ZSTD_LEVEL,
+    ) {
+        init {
+            require(name in SUPPORTED) {
+                "compaction codec '$name' is not supported; choose one of " +
+                    SUPPORTED.joinToString(", ") { it.name.lowercase() }
+            }
+            // zstd's own legal range. Out of range, zstd-jni clamps or
+            // throws from inside the writer, mid-rewrite, per group —
+            // refuse it at construction, which is boot.
+            require(zstdLevel in MIN_ZSTD_LEVEL..MAX_ZSTD_LEVEL) {
+                "compaction zstd level must be in $MIN_ZSTD_LEVEL..$MAX_ZSTD_LEVEL, got $zstdLevel"
+            }
+        }
+
+        companion object {
+            /**
+             * Parse an operator-supplied codec name (case-insensitive,
+             * `HOGLAKE_COMPACTION_CODEC`). An unknown name is refused by
+             * NAME, at boot, listing the legal set — `valueOf` alone
+             * answers a typo with a bare IllegalArgumentException that
+             * does not say what was legal.
+             */
+            fun parse(
+                name: String,
+                zstdLevel: Int = DEFAULT_ZSTD_LEVEL,
+            ): OutputCodec {
+                val wanted =
+                    SUPPORTED.firstOrNull { it.name.equals(name.trim(), ignoreCase = true) }
+                        ?: throw IllegalArgumentException(
+                            "unknown compaction codec '$name'; choose one of " +
+                                SUPPORTED.joinToString(", ") { it.name.lowercase() },
+                        )
+                return OutputCodec(wanted, zstdLevel)
+            }
+        }
+    }
+
+    /**
      * One input file staged to local disk: its row-id range start, the
      * decoded live DV to apply (null = no live DV), and whether the
      * catalog says this file carries EXPLICIT row ids.
@@ -386,7 +491,9 @@ object ParquetRewriter {
      * Merge [inputs] (caller orders them by rowIdStart) into [output]
      * under the live schema [liveColumns] (ordinal order). [sortFields]
      * non-empty sorts the merged survivors by the table's sort order
-     * (nulls per spec); empty keeps row-id order.
+     * (nulls per spec); empty keeps row-id order. [codec] is the output's
+     * compression (see [OutputCodec]) — an output's codec is independent
+     * of its inputs', which may be any mix.
      */
     fun rewrite(
         inputs: List<Input>,
@@ -394,6 +501,7 @@ object ParquetRewriter {
         sortFields: List<SortFieldDef>,
         output: Path,
         maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
+        codec: OutputCodec = OutputCodec(),
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
         // VARIANT anywhere in the forest, not just at the top. #77
@@ -428,7 +536,7 @@ object ParquetRewriter {
         // throw. Callers still clean their own temp dirs; this makes the
         // contract hold for every caller, not just the careful one.
         try {
-            return rewriteInto(inputs, liveColumns, sortFields, output, maxNodesPerRow)
+            return rewriteInto(inputs, liveColumns, sortFields, output, maxNodesPerRow, codec)
         } catch (e: Throwable) {
             runCatching { output.deleteIfExists() }
             throw e
@@ -441,6 +549,7 @@ object ParquetRewriter {
         sortFields: List<SortFieldDef>,
         output: Path,
         maxNodesPerRow: Int,
+        codec: OutputCodec,
     ): RewriteResult {
         val outputSchema = outputSchema(liveColumns)
         val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
@@ -461,7 +570,7 @@ object ParquetRewriter {
             // worst case is one counted invalid_data skip.
             var written = 0L
             var minRowId: Long? = null
-            newWriter(outputSchema, output).use { writer ->
+            newWriter(outputSchema, output, codec).use { writer ->
                 for (input in inputs) {
                     forEachSurvivor(
                         input,
@@ -509,7 +618,7 @@ object ParquetRewriter {
             }
         }
         val ordered = rows.sortedWith(comparator(outputSchema, sortFields))
-        newWriter(outputSchema, output).use { writer -> for (row in ordered) writer.write(row.group) }
+        newWriter(outputSchema, output, codec).use { writer -> for (row in ordered) writer.write(row.group) }
         return RewriteResult(ordered.size.toLong(), minRowId)
     }
 
@@ -741,13 +850,28 @@ object ParquetRewriter {
         }
     }
 
+    /**
+     * The output writer. [codec] is chosen, not inherited: this builder
+     * defaults to UNCOMPRESSED, and taking that default is what made
+     * every compaction a permanent decompression of its inputs (see
+     * [OutputCodec]).
+     *
+     * The zstd level rides the writer's configuration map — parquet-java
+     * constructs the codec reflectively from it — and is set
+     * unconditionally because it is inert for every other codec. Setting
+     * it explicitly, rather than trusting the library default, keeps a
+     * parquet-java bump from moving a shared maintenance pod's CPU
+     * budget without a diff.
+     */
     private fun newWriter(
         outputSchema: MessageType,
         output: Path,
+        codec: OutputCodec,
     ): ParquetWriter<Group> =
         ExampleParquetWriter.builder(LocalOutputFile(output))
             .withType(outputSchema)
-            .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+            .withCompressionCodec(codec.name)
+            .config(ZSTD_LEVEL_KEY, codec.zstdLevel.toString())
             .withWriteMode(ParquetFileWriter.Mode.OVERWRITE)
             .build()
 
