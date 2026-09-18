@@ -7,6 +7,7 @@ footer-derived stats via the commit endpoint (footer-shipping commits).
 
 from __future__ import annotations
 
+import contextlib
 import io
 import struct
 import uuid as _uuid
@@ -143,6 +144,29 @@ def _seg(name: object) -> str:
     a table named "a/b" or "a?x" must stay inside its segment, not
     rewrite the route (QE find, 2026-09-05)."""
     return quote(str(name), safe="")
+
+
+def _record_uploads(error: BaseException, uploaded: Sequence[str]) -> None:
+    """Stamp completed-upload progress on an exception before re-raise.
+
+    ``uploaded_files`` / ``uploaded_uris`` are set on the exception the
+    caller already catches rather than wrapped in a new type: pyhoglake
+    is published, and consumers catch ``ValidationError`` /
+    ``HoglakeError`` / ``OSError`` today. No existing type changes, and
+    ``getattr(error, "uploaded_files", 0)`` reads correctly on any
+    exception — including one raised before the first upload, where
+    these are 0 and ``()``.
+
+    Kept out of the message on purpose: a wide fanout would otherwise
+    put a few hundred uris into every log line that formats the error.
+
+    Best-effort: an exception type that refuses attributes (``__slots__``
+    on a third-party error) must never turn a real object-store failure
+    into an ``AttributeError`` from the annotation.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        error.uploaded_files = len(uploaded)  # type: ignore[attr-defined]
+        error.uploaded_uris = tuple(uploaded)  # type: ignore[attr-defined]
 
 
 @dataclass
@@ -858,104 +882,136 @@ class Table:
         uploads, but cannot publish rows. Never regenerate files after preparing.
         With allow_optional_fields, external writers may use optional physical
         fields for required catalog columns only when footer counts prove no nulls.
+
+        Orphan accounting: every exception out of this call carries what it
+        already wrote, on the exception object itself (no new type, so
+        existing ``except`` clauses keep working):
+
+        ``uploaded_files``
+            How many uploads COMPLETED — the output stream closed without
+            error. A file whose upload raised partway is NOT counted, in
+            either direction: the open may never have succeeded, or the
+            close may have failed over a TRUNCATED object that exists in
+            the store. So the count is a lower bound on objects present,
+            and the failing file must be treated as possibly-there.
+        ``uploaded_uris``
+            The uris of exactly those completed uploads, in order, always
+            ``uploaded_files`` long.
+
+        A refusal raised before the first upload carries ``0`` / ``()``.
+        Sweep the uris, not the ``{idempotency_key}/`` prefix: a retry
+        under the same key writes new object names beside the old ones,
+        so a prefix sweep after a later success deletes live files.
         """
-        _uuid.UUID(idempotency_key)
-        catalog = self._namespace._catalog
-        read_snapshot = catalog.refresh().head_snapshot_id
-        expected = expected_table_uuid or self.table_uuid
-        info = self._check_incarnation(expected)
-        if expected_table_info is not None and (
-            info.columns,
-            info.partition_spec,
-            info.sort_spec,
-        ) != (
-            expected_table_info.columns,
-            expected_table_info.partition_spec,
-            expected_table_info.sort_spec,
-        ):
-            raise ValidationError(
-                "prepared append destination layout changed", status_code=None
-            )
-        has_variant = any(c.type == "variant" for c in info.columns)
-        schema = columns_to_arrow_schema(
-            tuple(c for c in info.columns if c.type != "variant")
-        )
-        # Parquet has no seconds timestamp unit: our writer stores timestamp_s
-        # as milliseconds. Preserve all field IDs/nullability/metadata checks.
-        schema = pa.schema(
-            [
-                field.with_type(pa.timestamp("ms"))
-                if field.type == pa.timestamp("s")
-                else field
-                for field in schema
-            ],
-            metadata=schema.metadata,
-        )
-        registrations = []
-        for index, (path, partition) in enumerate(files):
-            with pq.ParquetFile(path) as parquet:
-                if has_variant or allow_optional_fields:
-                    validate_variant_file(path, parquet, info.columns)
-                elif not parquet.schema_arrow.equals(schema, check_metadata=True):
-                    raise ValidationError(
-                        "prepared Parquet schema/field IDs differ from destination",
-                        status_code=None,
-                    )
-                metadata = parquet.metadata
-            arity = len(info.partition_spec.fields) if info.partition_spec else 0
-            if (arity and (partition is None or len(partition) != arity)) or (
-                not arity and partition is not None
+        uploaded: list[str] = []
+        try:
+            _uuid.UUID(idempotency_key)
+            catalog = self._namespace._catalog
+            read_snapshot = catalog.refresh().head_snapshot_id
+            expected = expected_table_uuid or self.table_uuid
+            info = self._check_incarnation(expected)
+            if expected_table_info is not None and (
+                info.columns,
+                info.partition_spec,
+                info.sort_spec,
+            ) != (
+                expected_table_info.columns,
+                expected_table_info.partition_spec,
+                expected_table_info.sort_spec,
             ):
                 raise ValidationError(
-                    "prepared file partition arity differs from destination",
-                    status_code=None,
+                    "prepared append destination layout changed", status_code=None
                 )
-            if metadata.num_rows <= 0:
+            has_variant = any(c.type == "variant" for c in info.columns)
+            schema = columns_to_arrow_schema(
+                tuple(c for c in info.columns if c.type != "variant")
+            )
+            # Parquet has no seconds timestamp unit: our writer stores timestamp_s
+            # as milliseconds. Preserve all field IDs/nullability/metadata checks.
+            schema = pa.schema(
+                [
+                    field.with_type(pa.timestamp("ms"))
+                    if field.type == pa.timestamp("s")
+                    else field
+                    for field in schema
+                ],
+                metadata=schema.metadata,
+            )
+            registrations = []
+            for index, (path, partition) in enumerate(files):
+                with pq.ParquetFile(path) as parquet:
+                    if has_variant or allow_optional_fields:
+                        validate_variant_file(path, parquet, info.columns)
+                    elif not parquet.schema_arrow.equals(schema, check_metadata=True):
+                        raise ValidationError(
+                            "prepared Parquet schema/field IDs differ from destination",
+                            status_code=None,
+                        )
+                    metadata = parquet.metadata
+                arity = len(info.partition_spec.fields) if info.partition_spec else 0
+                if (arity and (partition is None or len(partition) != arity)) or (
+                    not arity and partition is not None
+                ):
+                    raise ValidationError(
+                        "prepared file partition arity differs from destination",
+                        status_code=None,
+                    )
+                if metadata.num_rows <= 0:
+                    raise ValidationError(
+                        "prepared file must contain rows", status_code=None
+                    )
+                uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
+                with open(path, "rb") as source:
+                    source.seek(0, 2)
+                    size = source.tell()
+                    source.seek(-8, 2)
+                    trailer = source.read(8)
+                    footer_size = struct.unpack("<I", trailer[:4])[0]
+                    source.seek(0)
+                    with catalog._client._filesystem().open_output_stream(
+                        uri.removeprefix("s3://")
+                    ) as sink:
+                        while chunk := source.read(8 * 1024 * 1024):
+                            sink.write(chunk)
+                # Only past the stream's close: an object-store write is
+                # not durable until then, so counting any earlier would
+                # claim uploads that never landed.
+                uploaded.append(uri)
+                reg: dict[str, Any] = {
+                    "path": uri,
+                    "record_count": metadata.num_rows,
+                    "file_size_bytes": size,
+                    "footer_size": footer_size,
+                    "column_stats": [
+                        stat.to_wire()
+                        for stat in extract_column_stats(metadata, info.columns)
+                    ],
+                }
+                if partition is not None:
+                    reg["partition_values"] = list(partition)
+                registrations.append(reg)
+            if not registrations:
                 raise ValidationError(
-                    "prepared file must contain rows", status_code=None
+                    "prepared append must contain files", status_code=None
                 )
-            uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
-            with open(path, "rb") as source:
-                source.seek(0, 2)
-                size = source.tell()
-                source.seek(-8, 2)
-                trailer = source.read(8)
-                footer_size = struct.unpack("<I", trailer[:4])[0]
-                source.seek(0)
-                with catalog._client._filesystem().open_output_stream(
-                    uri.removeprefix("s3://")
-                ) as sink:
-                    while chunk := source.read(8 * 1024 * 1024):
-                        sink.write(chunk)
-            reg: dict[str, Any] = {
-                "path": uri,
-                "record_count": metadata.num_rows,
-                "file_size_bytes": size,
-                "footer_size": footer_size,
-                "column_stats": [
-                    stat.to_wire()
-                    for stat in extract_column_stats(metadata, info.columns)
+            return {
+                "idempotency_key": idempotency_key,
+                "read_snapshot": read_snapshot,
+                "appends": [
+                    {
+                        "namespace": self.namespace,
+                        "table": self.name,
+                        "expected_table_uuid": expected,
+                        "files": registrations,
+                    }
                 ],
             }
-            if partition is not None:
-                reg["partition_values"] = list(partition)
-            registrations.append(reg)
-        if not registrations:
-            raise ValidationError(
-                "prepared append must contain files", status_code=None
-            )
-        return {
-            "idempotency_key": idempotency_key,
-            "read_snapshot": read_snapshot,
-            "appends": [
-                {
-                    "namespace": self.namespace,
-                    "table": self.name,
-                    "expected_table_uuid": expected,
-                    "files": registrations,
-                }
-            ],
-        }
+        except BaseException as error:
+            # BaseException on purpose: a KeyboardInterrupt through a wide
+            # fanout orphans objects exactly like an OSError does, and the
+            # operator needs the same list.
+            _record_uploads(error, uploaded)
+            raise
 
     def _check_incarnation(self, expected_uuid: str) -> TableInfo:
         """Pre-flight fast-fail: re-resolve this table by name and raise
