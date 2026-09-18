@@ -28,6 +28,7 @@ from typing import Any
 import httpx
 
 from . import seed as seed_task
+from . import stream as stream_task
 from .context import Bench, BenchConfig
 from .runner import BenchAbort, InvariantViolation
 from .scenarios import (
@@ -152,6 +153,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_common(p_seed)
     seed_task.add_args(p_seed)
+    # `stream` is a task too, and for a harder reason: it runs until it
+    # is interrupted. Putting a forever-loop in SCENARIOS would make
+    # `all` never finish.
+    p_stream = sub.add_parser(
+        "stream",
+        help="stream synthetic events continuously until interrupted",
+    )
+    _add_common(p_stream)
+    stream_task.add_args(p_stream)
     p_all = sub.add_parser("all", help="run every scenario")
     _add_common(p_all)
     profile = p_all.add_mutually_exclusive_group()
@@ -340,6 +350,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.scenario == "seed":
             try:
                 seed_task.run(bench, args)
+            except BenchAbort as exc:
+                print(f"\nABORT: {exc}", file=sys.stderr)
+                return EXIT_ABORT
+            return EXIT_OK
+        if args.scenario == "stream":
+            # Ctrl-C is this task's designed exit, so a clean stop is
+            # exit 0. A second Ctrl-C never reaches here: the handler
+            # exits on the spot with 130.
+            print(f"=== stream [{stream_task.IO_MODE}] (run {bench.cfg.run_id}) ===")
+            try:
+                stream_task.run(bench, args)
             except BenchAbort as exc:
                 print(f"\nABORT: {exc}", file=sys.stderr)
                 return EXIT_ABORT

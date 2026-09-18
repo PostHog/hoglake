@@ -172,6 +172,186 @@ wrote 101.0 MB in 43 files across 6 tables in 4.6s (target 100.0 MB, +1.0% — o
 `seed` is deliberately **not** a scenario: `all` never runs it, it
 journals no metrics, and it flags no regressions.
 
+## Streaming events continuously
+
+`seed` fills a catalog and stops. `stream` never stops: it writes
+synthetic events into one hour-partitioned table, in the shape millpond
+produces, until you interrupt it. It is for **watching the maintenance
+loops under live pressure** — compaction, expiry, the changefeed, the
+console — rather than for producing a number.
+
+```sh
+just bench stream                                  # 20k events/s until Ctrl-C
+just bench stream --rate 100000 --flush-mb 256     # harder
+just bench stream --hours-per-minute 60            # roll hours every second
+flox activate -- uv run hoglake-bench stream --rate-mb-s 25
+```
+
+The table is `events.pageviews` — the **seeded warehouse's own pageviews
+column set**, plus a `properties` text blob (millpond's property payload;
+properties stay VARCHAR, as they do in millpond's string-only mode, and
+`variant` is out of scope here for the same reason it is in `seed`).
+
+- **Partitioned `hour(ts)` — the timestamp alone.** No `team_id` in the
+  spec: the production events table is not partitioned per tenant, so
+  every team's events land in the same hourly cell. Hour granularity is
+  the whole point — partitions close within the hour (within seconds
+  under `--hours-per-minute`), so compaction and expiry always have
+  settled cells to chew on while the stream keeps running.
+- **Sort order `team_id, ts`,** declared on the table and honoured by
+  every batch before it is handed to the writer — millpond does exactly
+  this (`MILLPOND_SORT_BY=team_id,timestamp`). With no team
+  partitioning, sortedness is the *only* thing that gives a reader team
+  locality, which makes this table a real test of whether compaction
+  preserves clustering: a sorted table should get **more** prunable each
+  compaction round, and a concat-style merge that ignored sort order
+  would destroy that.
+- **The skew therefore lands inside the files, not across them.** Most
+  rows of every file belong to the whale, the tail scattered through, so
+  a file's `team_id` bounds span the active range — wide unless the sort
+  actually held. That is the production shape, and it is what makes the
+  per-file bounds worth reading.
+
+### What the default distribution is, and is not
+
+Teams are drawn from a **whale plus a Zipf tail**: one team takes
+`--whale-share` of all events outright (default `0.45`), and the
+remaining teams split the rest by a power law with exponent `--zipf`
+(default `1.1`) over `--teams` teams (default 250). At the defaults the
+whale (`team_id` 10000) carries 45%, the runner-up 11.4%, the tenth team
+1.0%, and the smallest 0.03% — synthetic ids from 10000, identifying
+nothing.
+
+**That default is a plausible shape, not a measured production
+distribution, and nothing in this repo or in millpond can make it one.**
+What the trees actually contain: `seed`'s own `TEAM_WEIGHTS` is
+self-labelled as a deliberate synthetic skew and its tests only assert
+that the weights sum to 1; millpond's include/exclude config is an
+allowlist — membership with no volume attached — whose live contents
+come from a control-plane endpoint the repo deliberately knows nothing
+about; and millpond's own load generator picks `team_id` *uniformly*,
+applying its Zipf law to `distinct_id` instead. The nearest real
+measurement that could exist is millpond's
+`millpond_filter_matched_total{value=...}` series at run time. If
+somebody reads it, change the default and say so in
+`stream/distribution.py`.
+
+Weights are fixed for the life of a run, so a whale stays a whale across
+hours; `--seed` makes the whole stream reproducible.
+
+### Rate, flush cadence and fanout
+
+| Knob | Default | What it does |
+|---|---|---|
+| `--rate` | `20000` | target events/second; `0` = as fast as the stack takes it |
+| `--rate-mb-s` | — | target Arrow MB/s instead, converted via a measured bytes-per-event probe (mutually exclusive with `--rate`) |
+| `--flush-mb` | `100` | flush after this many MB of buffered **Arrow** bytes (millpond's `FLUSH_SIZE`) |
+| `--flush-seconds` | `60` | ...or after this long, whichever comes first (millpond's `FLUSH_INTERVAL_MS`) |
+| `--hours-per-minute` | real time | compress event time so hour partitions roll over without waiting |
+| `--teams` / `--whale-share` / `--zipf` | `250` / `0.45` / `1.1` | the distribution above |
+| `--properties-bytes` | `192` | size of the per-row properties blob |
+| `--max-events` / `--duration` | unbounded | bounded runs, for tests |
+| `--max-flush-retries` | `8` | attempts per flush before the run gives up |
+
+Rate control is **backpressure, not a busy loop**: the producer sleeps
+exactly the time it owes, in chunks so a signal is noticed promptly. A
+long stall (a slow flush, a retry storm) re-anchors the limiter rather
+than banking credit, so catching up can never become an unthrottled
+burst. The achieved rate is reported on every progress line and again in
+the summary.
+
+**Fanout at the defaults.** Events cost ~492 Arrow bytes each
+(`--properties-bytes 192`), so 20,000/s fills the 100 MB buffer in about
+**10 seconds** — the byte trigger fires long before the 60 s one. Each
+flush therefore covers ~10 seconds of event time, which lies inside one
+hour cell, so **one flush writes one file**; only the flush that
+straddles the boundary writes two. That is roughly **350 flushes and
+~353 files per hour**, at ~58 MB of parquet each (the stream measures its
+own Arrow-to-parquet ratio and prints it — ~1.7x on this payload, not
+millpond's 3-4x, because a random property blob does not compress),
+i.e. ~20 GB and 72M events per hour into a single hourly partition.
+That is exactly the small-file population compaction exists for: 350
+same-spec, same-partition files per hour, tier after tier.
+
+Under `--hours-per-minute` the arithmetic changes, deliberately: a flush
+that spans N hour cells fans out to N files. At `--hours-per-minute 60`
+(one hour per real second) a 10-second flush writes ten files in ten
+partitions — which is how you get a week of settled partitions to
+compact in ten minutes.
+
+### Progress, and stopping it
+
+A line every `--progress-seconds` (10 by default), human-first but all
+`key=value`:
+
+```
+[     9.6s] events=380,000 events_s=39,443 arrow_mb_s=19.41 flushes=19 files=19 hours=1 hour=2026-09-18T23Z retries=0 failures=0 buffered_rows=0 buffered_mb=0.0
+```
+
+A transient server error — 503 admission backpressure, a commit
+conflict, a timeout, a server that goes away entirely — is retried with
+capped exponential backoff and counted in `retries`; it never kills a
+long run. A **permanent** error (422 validation, a changed table
+incarnation) stops immediately with a message saying so, because
+retrying a contract violation cannot help.
+
+**Ctrl-C is the designed exit, not an error path.** The first
+SIGINT/SIGTERM lets the in-flight flush finish — an append is one atomic
+commit, so there is no such thing as a half-published flush, and
+abandoning it mid-upload would only orphan parquet for cleanup to
+reclaim. The **unflushed remainder of the buffer is then discarded** and
+reported, so the table only ever contains policy-triggered flushes and a
+Ctrl-C cannot leave a runt file behind for the next run to trip over. A
+run that ends by hitting `--max-events`/`--duration` does flush its
+remainder: that data was asked for. Then the summary prints and the
+process exits **0**:
+
+```
+=== stream summary (stopped by SIGINT) ===
+  elapsed              13.1s
+  events               520,000 (39,552/s achieved, target 40,000/s)
+  arrow bytes          255.8 MB (19.46 MB/s)
+  flushes              26 (bytes 26)
+  files written        26
+  hour partitions      1
+  retries              0 (flush failures 0)
+  parquet bytes        149.3 MB (1.71x smaller than Arrow)
+  top 10 teams by events
+    team 10000             233,807   45.0%
+    team 10001              59,364   11.4%
+    ...
+```
+
+A **second** Ctrl-C exits immediately with 130, whatever is in flight.
+
+Like `seed`, `stream` is a task and not a scenario — `all` never runs it
+(a forever-loop would never finish) and it flags no regressions — but it
+journals a normal `bench-results.jsonl` line with `io_mode:
+"end-to-end"`, because every byte it writes is real parquet.
+
+`--catalog` reuse appends: a restarted stream keeps filling the same
+table, provided the existing table's partition spec and sort order match
+(it refuses rather than mixing specs in one table).
+
+### From the bench pod
+
+Same image, same pod as everything else below — `stream` is just another
+subcommand:
+
+```sh
+kubectl apply -f bench/deploy/bench-pod.yaml
+kubectl -n gigahog exec -it bench-shell -- \
+  hoglake-bench stream --rate 50000 --bucket posthog-gigahog-mw-dev
+```
+
+Ctrl-C reaches it through `exec -it` and it stops cleanly. If you
+detached instead, `kubectl -n gigahog exec bench-shell -- pkill -INT -f
+hoglake-bench` does the same thing (the task treats SIGTERM identically,
+so deleting the pod is also a clean stop — with the unflushed buffer
+dropped, as above). Run it under `nohup`/`setsid` if you want it to
+outlive your exec session; deleting the pod is still the whole cleanup,
+and the catalog it wrote stays until you drop it.
+
 ## Running in-cluster
 
 Seeding a deployed environment means running bench *next to* the server
@@ -349,6 +529,23 @@ plus a live `-m integration` smoke that seeds 0.1 GB and verifies the
 result from the server's `/tables` info — tables exist with plausible
 row/byte counts, events carry two partition values per file, dims are
 single files, and row-id ranges tile every table.
+
+The `stream` task has its own unit tests (whale share within tolerance
+over 200k samples and determinism under `--seed`; batch sorting against
+the declared sort order; `hour` partition-tuple derivation checked
+against pyhoglake's own `transforms.hour` rather than a restated
+constant; flush triggers, bytes vs time, including the empty-buffer
+refusal a partitioned append would 422 on; the rate limiter's pacing,
+its no-credit-banking rule and the assertion that every wait is a real
+sleep rather than a spin; signal handling, where a simulated SIGINT must
+produce a clean summary and a second one must take the immediate-exit
+path; and retry classification — 503/409/timeout retryable, 422 and a
+changed incarnation fatal) plus live `-m integration` runs bounded with
+`--max-events`: the hour spec and sort order read back off the API, the
+one-file-per-flush fanout, hour rollover under time compression (with
+every row checked against the hour cell its file is registered in, so a
+`day` spec cannot pass), per-file sortedness read back out of the
+written parquet, and the within-file skew.
 
 Caveat on correlations: a 2-stage `--stages` list (the quick profile)
 makes `catalog_latency_corr` a two-point Pearson, which is ±1 by
