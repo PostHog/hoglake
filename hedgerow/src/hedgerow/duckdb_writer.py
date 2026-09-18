@@ -40,7 +40,13 @@ class DuckDBWriterOptions:
     target_file_bytes: int = 256 * 1024 * 1024
     memory_bytes: int = 512 * 1024 * 1024
     scratch_bytes: int = 8 * 1024 * 1024 * 1024
-    row_group_rows: int = 8192
+    # DuckDB's own default. The previous 8192 mirrored discovery's Arrow
+    # batch size, which is a per-batch memory concern and not an output
+    # layout one: at 8192 a 2M-row file carries 245 row groups and is ~7%
+    # larger than the same data at 122,880 (17 groups), measured. The
+    # trade is coarser row-group pruning for readers of the destination,
+    # which is why it is DuckDB's default rather than something larger.
+    row_group_rows: int = 122_880
 
     def __post_init__(self):
         if min(self.target_file_bytes, self.memory_bytes, self.scratch_bytes) <= 0:
@@ -131,6 +137,11 @@ def write_duckdb_event_partition(
                 connection.execute(f"SET {name} = {_literal(value)}")
             selects = []
             expected_schema = None
+            # Output columns that land as native VARIANT, and so have to
+            # be proven free of top-level nulls. Identical across
+            # fragments (projected schemas are checked equal below), but
+            # accumulated rather than assumed.
+            variant_outputs: set[str] = set()
             for fragment in fragments:
                 scan = f"read_parquet({_literal(fragment.path)}, hive_partitioning=false, file_row_number=true)"
                 schema = {
@@ -185,27 +196,17 @@ def write_duckdb_event_partition(
                     f"month({_identifier('timestamp')}) - 1 = {month}"
                 )
                 selected = f"SELECT * FROM {scan} WHERE ({group_filter}) AND {routing}"
-                count = connection.execute(
-                    f"SELECT count(*) FROM ({selected})"
-                ).fetchone()[0]
-                if count != fragment.rows:
-                    raise DataIntegrityError(
-                        "flush row count differs from discovered source fragment"
-                    )
-                for name in source_names:
-                    if name not in json_columns and schema[name] != "VARIANT":
-                        continue
-                    null_check = f"{_identifier(name)} IS NULL"
-                    if name in json_columns:
-                        null_check += (
-                            f" OR json_type(CAST({_identifier(name)} AS JSON)) = 'NULL'"
-                        )
-                    if connection.execute(
-                        f"SELECT count(*) FROM ({selected}) WHERE {null_check}"
-                    ).fetchone()[0]:
-                        raise DataIntegrityError(
-                            "top-level null cannot be preserved distinctly in native VARIANT"
-                        )
+                # No pre-flight scan here. The row count and the VARIANT
+                # null proof are both taken from the OUTPUT after the
+                # write (see below): each pre-flight pass re-read the
+                # selected row groups over S3, decoding the payload
+                # column a second and third time to learn things the
+                # output can answer locally.
+                variant_outputs.update(
+                    name
+                    for name in source_names
+                    if name in json_columns or schema[name] == "VARIANT"
+                )
                 projection = []
                 for name in field_ids:
                     expression = _identifier(name)
@@ -229,13 +230,50 @@ def write_duckdb_event_partition(
                 (workspace / "output").glob("data_*.parquet"),
                 key=lambda p: int(p.stem.removeprefix("data_")),
             )
-            count = sum(
-                connection.execute(
-                    "SELECT num_rows FROM parquet_file_metadata(?)", [str(p)]
-                ).fetchone()[0]
-                for p in paths
-            )
-            if count != sum(f.rows for f in fragments):
+            expected_rows = sum(f.rows for f in fragments)
+            if variant_outputs and paths:
+                # The VARIANT null proof, taken from the output we just
+                # wrote. It is a scan, but of LOCAL scratch rather than of
+                # the source row groups over S3 — which is the whole
+                # point: one S3 decode of the payload instead of three.
+                #
+                # Not from the output footers, though that looks
+                # tempting: a top-level null VARIANT is written as a
+                # non-null `value` holding the variant null primitive,
+                # and a shredded value writes `value` NULL. So the leaf
+                # null counts conflate "absent because shredded" with
+                # "present and null", and a lone SQL NULL, a lone JSON
+                # `null` and a lone scalar 1 all produce byte-identical
+                # footer stats. Reading the column back is what
+                # distinguishes them.
+                #
+                # Both rejected shapes collapse to SQL NULL on read — a
+                # JSON `null` literal casts to a null VARIANT — so one
+                # IS NULL test covers what the two pre-flight predicates
+                # covered.
+                nulls = ", ".join(
+                    f"count(*) FILTER (WHERE {_identifier(name)} IS NULL)"
+                    for name in sorted(variant_outputs)
+                )
+                files = ", ".join(_literal(str(p)) for p in paths)
+                row = connection.execute(
+                    f"SELECT count(*), {nulls} FROM read_parquet([{files}])"
+                ).fetchone()
+                count = row[0]
+                if any(row[1:]):
+                    raise DataIntegrityError(
+                        "top-level null cannot be preserved distinctly in native VARIANT"
+                    )
+            else:
+                # Nothing to prove, so stay on the footers: count without
+                # decoding a page.
+                count = sum(
+                    connection.execute(
+                        "SELECT num_rows FROM parquet_file_metadata(?)", [str(p)]
+                    ).fetchone()[0]
+                    for p in paths
+                )
+            if count != expected_rows:
                 raise DataIntegrityError("output row count differs from frozen work")
         promoted = []
         try:

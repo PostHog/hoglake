@@ -43,8 +43,10 @@ paths = write_duckdb_event_partition(
 ## Data contract
 
 - Each path is a literal immutable file, not a glob. Row-group IDs must exist.
-  Each file appears once per call. Selected counts must match frozen discovery
-  before writing; total output count is checked again afterwards.
+  Each file appears once per call. The total output count must match frozen
+  discovery, checked after the write. Each source fragment is scanned exactly
+  once: the row count and the VARIANT null proof are taken from the written
+  output (local scratch), not from pre-flight passes over the source.
 - Fields named by `field_ids` are the exact output projection; `event_date` is
   derived rather than copied. Projected source types must agree across files.
 - `team_id` is INTEGER/BIGINT; `timestamp` is microsecond TIMESTAMP/TIMESTAMPTZ;
@@ -59,8 +61,14 @@ paths = write_duckdb_event_partition(
   Invalid JSON and malformed UUIDs
   fail rather than being replaced with nulls. Conversion follows DuckDB JSON
   numeric semantics; arbitrary-precision JSON numbers are not promised.
-- Row-group selection uses file-row-number ranges. Correct selection is tested;
-  efficient row-group I/O pruning and production S3 read amplification are not.
+- Row-group selection uses file-row-number ranges. Correct selection is tested,
+  and `test_source_fragments_are_scanned_exactly_once` pins the one-scan
+  property; efficient row-group I/O pruning is still not measured here.
+- The VARIANT null proof reads the output column back rather than its footer.
+  A top-level null VARIANT is written as a non-null `value` holding the variant
+  null primitive, while a shredded value writes `value` NULL — so leaf null
+  counts conflate "absent because shredded" with "present and null", and a lone
+  SQL NULL, a lone JSON `null` and a lone scalar produce identical footer stats.
 - Raw files remain indefinitely as backups. This component never deletes them.
 
 ## Resources and failure handling
