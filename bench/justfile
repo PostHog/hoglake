@@ -71,6 +71,11 @@ analytics-lifecycle *args:
 seed *args:
     {{_uv}} run hoglake-bench seed {{args}}
 
+# Stream synthetic events into an hour-partitioned table until Ctrl-C
+[group('real-data')]
+stream *args:
+    {{_uv}} run hoglake-bench stream {{args}}
+
 # Entire suite; the integration smoke hits HOGLAKE_URL and skips when down
 [group('tests')]
 test:
