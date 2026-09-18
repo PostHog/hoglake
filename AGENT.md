@@ -374,7 +374,19 @@ there would break that gate on every build.
   minimum 2) sets both geometric tier spacing and max fan-in. Divide
   the final target downward by T (ceiling-rounded integer bytes), consume
   minimal row-id-ordered prefixes reaching each tier's quota, and repeat
-  until the remainder is short. A table's plan is fixed before execution:
+  until the remainder is short. Output compression is
+  `HOGLAKE_COMPACTION_CODEC` (default **zstd** at
+  `HOGLAKE_COMPACTION_ZSTD_LEVEL` 3; snappy/gzip/lz4_raw/uncompressed
+  also legal, an unknown name refused at boot). Not a per-file detail:
+  the ladder rewrites hot rows once per tier and every output is the
+  next tier's input, so it is the codec a fully compacted table is
+  stored and scanned under. It was UNCOMPRESSED — inherited from
+  `ExampleParquetWriter`'s default, never chosen — which made every
+  merge a permanent decompression of clients that write snappy (pyarrow
+  and DuckDB defaults) or zstd (hedgerow), measured at 1.4-1.8x the
+  input bytes. An input's codec is never an instruction; the rewrite
+  decodes and re-encodes.
+  A table's plan is fixed before execution:
   outputs are never re-compacted within that run. Input bytes estimate
   promotion; actual output size determines the next-run tier. The existing
   max-groups-per-run budget still caps executed attempts. Rewrite via **parquet-java**

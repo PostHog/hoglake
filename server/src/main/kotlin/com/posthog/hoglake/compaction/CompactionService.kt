@@ -84,6 +84,17 @@ data class CompactionConfig(
      * ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW.
      */
     val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
+    /**
+     * The compression codec (and zstd level) compaction outputs are
+     * written with — `HOGLAKE_COMPACTION_CODEC` /
+     * `HOGLAKE_COMPACTION_ZSTD_LEVEL`. See
+     * [ParquetRewriter.OutputCodec] for why zstd and why the level is
+     * pinned; the short version is that the tier ladder rewrites a
+     * table's hot rows four times, so this is the codec a fully
+     * compacted table is stored and scanned under, not a per-file
+     * detail.
+     */
+    val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
 ) {
     init {
         CompactionTiers.of(targetBytes, tierTarget)
@@ -276,6 +287,8 @@ class CompactionService(
         val sortFields: List<SortFieldDef>,
         /** Per-row node budget for the rewrite (CompactionConfig.maxNodesPerRow). */
         val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
+        /** Output compression for the rewrite (CompactionConfig.codec). */
+        val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
     ) {
         /**
          * Live column types by field id (stats aggregation), over EVERY
@@ -355,6 +368,7 @@ class CompactionService(
                     SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
                         ?.fields ?: emptyList(),
                 maxNodesPerRow = cfg.maxNodesPerRow,
+                codec = cfg.codec,
             )
         return PlanWithContext(ctx, CompactionPlan(t.tableId, ns.name, t.name, groups(h, ctx, cfg)))
     }
@@ -692,6 +706,7 @@ class CompactionService(
                     ctx.sortFields,
                     outLocal,
                     ctx.maxNodesPerRow,
+                    ctx.codec,
                 )
             check(rewritten.rowsWritten == group.survivingRecords) {
                 "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +

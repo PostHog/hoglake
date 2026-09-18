@@ -102,6 +102,32 @@ data class Config(
             "HOGLAKE_COMPACTION_MAX_NODES_PER_ROW",
             "${com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW}",
         ).toInt(),
+    /**
+     * Compression codec for compaction OUTPUT files: zstd (default),
+     * snappy, gzip, lz4_raw or uncompressed, case-insensitive. Every
+     * name on that list is readable by all four consumers of these
+     * files (DuckDB extension, Trino connector, pyarrow, parquet-java)
+     * and implemented on the server's runtime classpath; an unknown one
+     * is refused at boot.
+     *
+     * Not a per-file detail: the tier ladder rewrites a table's hot rows
+     * once per tier, each output feeding the next tier's input, so this
+     * is the codec a fully compacted table is stored and scanned under.
+     * See ParquetRewriter.OutputCodec for the zstd-over-snappy argument.
+     */
+    val compactionCodec: String =
+        env("HOGLAKE_COMPACTION_CODEC", com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_CODEC.name.lowercase()),
+    /**
+     * zstd compression level (1-22) when the codec above is zstd; inert
+     * otherwise. Pinned rather than inherited from parquet-java so a
+     * library bump cannot move the maintenance pod's CPU budget without
+     * a diff. See ParquetRewriter.DEFAULT_ZSTD_LEVEL.
+     */
+    val compactionZstdLevel: Int =
+        env(
+            "HOGLAKE_COMPACTION_ZSTD_LEVEL",
+            "${com.posthog.hoglake.compaction.ParquetRewriter.DEFAULT_ZSTD_LEVEL}",
+        ).toInt(),
     /** Dashboard sampling: one bounded metadata page per tick, persisted between ticks/restarts. */
     val maintenanceSummaryIntervalMs: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS", "1000").toLong(),
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),

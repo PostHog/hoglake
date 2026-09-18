@@ -368,6 +368,34 @@ The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
 executed attempts per catalog, including failures and skips. There is
 no separate minimum-file-count knob.
 
+`HOGLAKE_COMPACTION_CODEC` (default **zstd**, with
+`HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**) is the compression the
+rewrite writes its OUTPUT with; the legal set is zstd, snappy, gzip,
+lz4_raw and uncompressed, case-insensitive, and an unknown name is
+refused at boot. It is not a per-file detail. The tier ladder rewrites a
+table's hot rows once per tier and every output is the next tier's
+input, so this is the codec a fully compacted table is stored and
+scanned under — permanently. The writer used to take
+`ExampleParquetWriter`'s UNCOMPRESSED default, which made every merge a
+one-way decompression of clients that all write snappy (pyarrow's and
+DuckDB's default, so pyhoglake and the duckdb-client) or zstd
+(hedgerow): one dev-catalog run merged 67.6 MiB of inputs into 80.1 MiB
+of output.
+
+zstd over snappy because the cost falls on the side paid once.
+Measured on event-shaped data (`CodecMeasurement`, four files of 200k
+pageview rows, inputs written snappy): high-cardinality strings
+compact to **1.41x** the input bytes uncompressed, 1.03x under snappy
+and **0.60x** under zstd; low-cardinality enums to 1.84x, 1.27x and
+0.84x. Against the uncompressed output, zstd is 0.43-0.45x and snappy
+0.69-0.74x. The rewrite's wall time for that group was 0.85 s
+uncompressed, 0.86 s snappy, 1.25 s zstd and 3.5 s gzip — so zstd costs
+roughly 25-30% more CPU than writing raw, for less than half the bytes,
+while gzip pays 4x the CPU for a worse ratio than zstd. The level is
+pinned rather than inherited because the sweep is CPU-bound on a shared
+maintenance pod and a parquet-java bump must not move that budget
+without a diff. parquet-java's zstd workers stay at 0 (in-thread).
+
 `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
 one ROW's materialized object graph, which no group-level budget can:
 both rewrite paths materialize a row whole, so a single row holding a

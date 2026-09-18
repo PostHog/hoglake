@@ -13,6 +13,7 @@ import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
 import com.posthog.hoglake.compaction.CompactionService
+import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.observability.Audit
@@ -101,6 +102,7 @@ class App private constructor(
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
+                codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
             ),
         )
 
