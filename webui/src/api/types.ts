@@ -203,6 +203,41 @@ export interface DataFile {
   partition_values?: (string | null)[];
 }
 
+/**
+ * A decoded bound after parsing: null (no bound stored, or a bound the
+ * server could not decode — either way the caller must not prune),
+ * a boolean, or a STRING. Strings cover both the string-shaped wire
+ * values (temporals, uuid, base64 binary, string/json, the
+ * "Infinity"/"-Infinity" sentinels) and every NUMBER, which the fetch
+ * layer captures as its exact raw token (see int64.ts) so long/uint64/
+ * decimal bounds never round through a double. The webui carries no
+ * bounds codec — this is the server's decoded JSON, displayed verbatim.
+ */
+export type DecodedBound = string | boolean | null;
+
+/** One column's stats for one file (GET .../files/{fileId}/stats). */
+export interface FileColumnStats {
+  field_id: Int64;
+  name: string;
+  path: string;
+  type: ColumnType;
+  type_params?: Record<string, unknown>;
+  value_count: Int64;
+  null_count: Int64;
+  nan_count?: Int64;
+  size_bytes?: Int64;
+  lower_bound: DecodedBound;
+  upper_bound: DecodedBound;
+}
+
+export interface FileStats {
+  data_file_id: Int64;
+  stats_state: StatsState;
+  columns: FileColumnStats[];
+  /** Present iff the file has no stats rows (stats_state != provided). */
+  no_stats_reason?: string;
+}
+
 export interface DeleteFile {
   delete_file_id: Int64;
   data_file_id: Int64;

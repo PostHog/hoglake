@@ -782,3 +782,26 @@ button.ghost:hover:not(:disabled) {
   border-radius: 4px;
   background: var(--warn);
 }
+
+/* -- per-file stats expansion (Files tab) --------------------------------- */
+
+/* Neutral expander, like theme-toggle: must not pick up the accent
+   button look inside a table cell. */
+button.expand-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  padding: 0 4px;
+  cursor: pointer;
+}
+button.expand-toggle:hover {
+  color: var(--text);
+}
+.detail-row > td {
+  background: var(--bg-inset, transparent);
+  padding: 8px 12px 12px 28px;
+}
+.detail-row .data-table {
+  margin: 0;
+}

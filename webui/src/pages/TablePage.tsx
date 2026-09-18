@@ -1,10 +1,10 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { getTable, listFiles, planScan } from "../api/client";
+import { getFileStats, getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
-import type { Column, Int64, Table } from "../api/types";
+import type { Column, DecodedBound, Int64, Table } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
@@ -188,6 +188,90 @@ function SchemaTab({ table }: { table: Table }) {
   );
 }
 
+/**
+ * One decoded bound cell. The server ships bounds already decoded
+ * (GET .../files/{fileId}/stats — the webui carries no codec): strings
+ * and booleans verbatim, numbers as their exact raw tokens (int64.ts),
+ * and null meaning "no bound" — a real answer (all-null column, or a
+ * bound the server could not decode), flagged so an operator knows it
+ * forbids pruning rather than describing an empty range.
+ */
+function BoundCell({ bound }: { bound: DecodedBound }) {
+  if (bound === null) {
+    return (
+      <td className="num mono subtle" title="no bound stored — do not prune">
+        null
+      </td>
+    );
+  }
+  return <td className="num mono">{String(bound)}</td>;
+}
+
+/** The expanded stats panel for one file: its per-column decoded stats. */
+function FileStatsPanel({
+  catalog,
+  namespace,
+  table,
+  fileId,
+  snapshot,
+}: {
+  catalog: string;
+  namespace: string;
+  table: string;
+  fileId: Int64;
+  snapshot?: Int64;
+}) {
+  const { data, isPending, isError, error } = useQuery({
+    queryKey: ["fileStats", catalog, namespace, table, fileId, snapshot ?? "head"],
+    queryFn: () => getFileStats(catalog, namespace, table, fileId, snapshot),
+  });
+  if (isError) return <ErrorBox error={error} />;
+  if (isPending) return <SkeletonBlock />;
+  if (data.columns.length === 0) {
+    return (
+      <p className="empty">
+        {data.no_stats_reason ?? "No column statistics recorded for this file."}
+      </p>
+    );
+  }
+  return (
+    <table className="data-table">
+      <thead>
+        <tr>
+          <th className="num">field_id</th>
+          <th>column</th>
+          <th>type</th>
+          <th className="num">values</th>
+          <th className="num">nulls</th>
+          <th className="num">nan</th>
+          <th className="num">size</th>
+          <th className="num">lower_bound</th>
+          <th className="num">upper_bound</th>
+        </tr>
+      </thead>
+      <tbody>
+        {data.columns.map((c) => (
+          <tr key={c.field_id}>
+            <td className="num mono">{c.field_id}</td>
+            <td className="mono">{c.path}</td>
+            <td className="mono">{c.type}</td>
+            <td className="num mono">{formatCount(c.value_count)}</td>
+            <td className="num mono">{formatCount(c.null_count)}</td>
+            <td className="num mono">
+              {c.nan_count !== undefined ? formatCount(c.nan_count) : "—"}
+            </td>
+            <td className="num mono">
+              {c.size_bytes !== undefined ? formatBytes(c.size_bytes) : "—"}
+            </td>
+            <BoundCell bound={c.lower_bound} />
+            <BoundCell bound={c.upper_bound} />
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
 function FilesTab({
   catalog,
   namespace,
@@ -203,11 +287,13 @@ function FilesTab({
     queryKey: ["files", catalog, namespace, table, snapshot ?? "head"],
     queryFn: () => listFiles(catalog, namespace, table, snapshot),
   });
+  const [expanded, setExpanded] = useState<Int64 | null>(null);
   if (isError) return <ErrorBox error={error} />;
   return (
     <table className="data-table">
       <thead>
         <tr>
+          <th />
           <th className="num">id</th>
           <th>path</th>
           <th className="num">record_count</th>
@@ -219,37 +305,67 @@ function FilesTab({
         </tr>
       </thead>
       {isPending ? (
-        <SkeletonRows rows={5} cols={8} />
+        <SkeletonRows rows={5} cols={9} />
       ) : (
         <tbody>
           {data.length === 0 && (
             <tr>
-              <td colSpan={8} className="empty">
+              <td colSpan={9} className="empty">
                 No data files at this snapshot.
               </td>
             </tr>
           )}
           {data.map((f) => (
-            <tr key={f.data_file_id}>
-              <td className="num mono">{f.data_file_id}</td>
-              <td className="mono path-cell" title={f.path}>
-                {f.path}
-              </td>
-              <td className="num mono">{formatCount(f.record_count)}</td>
-              <td className="num mono" title={`${f.file_size_bytes}`}>
-                {formatBytes(f.file_size_bytes)}
-              </td>
-              <td className="num mono">{f.row_id_start}</td>
-              <td>
-                <StatsStateBadge state={f.stats_state} />
-              </td>
-              <td className="num mono">{f.begin_snapshot}</td>
-              <td className="mono">
-                {f.partition_values
-                  ? `[${f.partition_values.map((v) => v ?? "null").join(", ")}]`
-                  : "—"}
-              </td>
-            </tr>
+            <Fragment key={f.data_file_id}>
+              <tr>
+                <td>
+                  <button
+                    type="button"
+                    className="expand-toggle"
+                    aria-label={`toggle stats for file ${f.data_file_id}`}
+                    aria-expanded={expanded === f.data_file_id}
+                    onClick={() =>
+                      setExpanded(
+                        expanded === f.data_file_id ? null : f.data_file_id,
+                      )
+                    }
+                  >
+                    {expanded === f.data_file_id ? "▾" : "▸"}
+                  </button>
+                </td>
+                <td className="num mono">{f.data_file_id}</td>
+                <td className="mono path-cell" title={f.path}>
+                  {f.path}
+                </td>
+                <td className="num mono">{formatCount(f.record_count)}</td>
+                <td className="num mono" title={`${f.file_size_bytes}`}>
+                  {formatBytes(f.file_size_bytes)}
+                </td>
+                <td className="num mono">{f.row_id_start}</td>
+                <td>
+                  <StatsStateBadge state={f.stats_state} />
+                </td>
+                <td className="num mono">{f.begin_snapshot}</td>
+                <td className="mono">
+                  {f.partition_values
+                    ? `[${f.partition_values.map((v) => v ?? "null").join(", ")}]`
+                    : "—"}
+                </td>
+              </tr>
+              {expanded === f.data_file_id && (
+                <tr className="detail-row">
+                  <td colSpan={9}>
+                    <FileStatsPanel
+                      catalog={catalog}
+                      namespace={namespace}
+                      table={table}
+                      fileId={f.data_file_id}
+                      snapshot={snapshot}
+                    />
+                  </td>
+                </tr>
+              )}
+            </Fragment>
           ))}
         </tbody>
       )}

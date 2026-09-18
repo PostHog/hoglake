@@ -9,6 +9,7 @@ import type {
   CreateCatalogRequest,
   CreateTableRequest,
   DataFile,
+  FileStats,
   InstanceMaintenanceStatus,
   Int64,
   MaintenanceRunPage,
@@ -163,6 +164,21 @@ export function listFiles(
   return request(
     buildUrl(
       `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/files`,
+      { snapshot },
+    ),
+  );
+}
+
+export function getFileStats(
+  catalog: string,
+  namespace: string,
+  table: string,
+  fileId: Int64,
+  snapshot?: Int64,
+): Promise<FileStats> {
+  return request(
+    buildUrl(
+      `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/files/${seg(fileId)}/stats`,
       { snapshot },
     ),
   );
