@@ -38,6 +38,7 @@ from .scenarios import (
     delete_contention,
     end_to_end,
     expiry_throughput,
+    lifecycle,
 )
 from .scenarios.common import ScenarioReport
 
@@ -49,6 +50,7 @@ SCENARIOS: dict[str, Any] = {
     "expiry-throughput": expiry_throughput,
     "ddl-churn": ddl_churn,
     "end-to-end-writer": end_to_end,
+    "analytics-lifecycle": lifecycle,
 }
 
 # Per-scenario argument overrides for `all --quick` (a ~2-3 minute smoke
@@ -76,6 +78,7 @@ QUICK_PROFILE: dict[str, dict[str, Any]] = {
     "expiry-throughput": {"snapshots": 1500, "batch": 500, "objects": 50},
     "ddl-churn": {"tables": 100, "ops": 30},
     "end-to-end-writer": {"rows": 20_000, "batch_rows": 5_000},
+    "analytics-lifecycle": {"scale": 1, "rows_per_load": 500},
 }
 FULL_PROFILE: dict[str, dict[str, Any]] = {name: {} for name in SCENARIOS}
 
