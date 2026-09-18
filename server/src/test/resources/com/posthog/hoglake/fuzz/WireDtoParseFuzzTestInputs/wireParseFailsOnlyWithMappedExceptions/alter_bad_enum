@@ -1,1 +1,1 @@
-{"ops":[{"op":"add_column","column":{"name":"c","type":"uint64"}}]}
+{"ops":[{"op":"add_column","column":{"name":"c","type":"int128"}}]}

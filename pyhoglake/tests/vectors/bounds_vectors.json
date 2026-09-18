@@ -1,401 +1,417 @@
 {
   "format": "hoglake-bounds-vectors",
   "version": 1,
-  "description": "Cross-language differential vectors for the Iceberg single-value binary bounds codec. Each vector is (type, type_params, value, hex): hex is the lowercase hex of the exact encoding. Any implementation (Python, JVM, ...) must satisfy encode(value) == unhex(hex) and, unless verify == 'encode_only', decode(unhex(hex)) == value and encode(decode(unhex(hex))) == unhex(hex).",
+  "description": "Cross-language differential vectors for the Iceberg single-value binary bounds codec. Each vector is (type, type_params, value, hex): hex is the lowercase hex of the exact encoding. Any implementation (Python, JVM, ...) must satisfy encode(value) == unhex(hex) and, unless verify == 'encode_only', decode(unhex(hex)) == value and encode(decode(unhex(hex))) == unhex(hex). Vectors additionally carry `wire` or `wire_refused` - the read-time JSON rendering contract - per wire_conventions below.",
   "value_conventions": {
     "boolean": "'true' | 'false'",
+    "int8": "decimal integer string",
+    "int16": "decimal integer string",
     "int": "decimal integer string (int32 domain)",
     "long": "decimal integer string (int64 domain)",
+    "uint8": "decimal integer string",
+    "uint16": "decimal integer string",
+    "uint32": "decimal integer string in [0, 2^32)",
+    "uint64": "decimal integer string in [0, 2^64)",
     "float": "decimal string or 'NaN'/'Infinity'/'-Infinity'; for NaN the hex bytes are authoritative (payload NaNs share the 'NaN' value token)",
     "double": "same conventions as float, 8-byte width",
+    "decimal": "UNSCALED integer as decimal string; type_params.scale applies",
     "date": "days since 1970-01-01, decimal integer string",
     "time": "microseconds since midnight, decimal integer string",
+    "timestamp_s": "MICROSECONDS since 1970-01-01T00:00:00, decimal integer string (the declared seconds precision is metadata; bounds are micros)",
+    "timestamp_ms": "MICROSECONDS since 1970-01-01T00:00:00, decimal integer string (the declared millis precision is metadata; bounds are micros)",
     "timestamp": "microseconds since 1970-01-01T00:00:00, decimal integer string",
+    "timestamp_ns": "NANOSECONDS since 1970-01-01T00:00:00, decimal integer string",
     "timestamptz": "microseconds since 1970-01-01T00:00:00Z, decimal integer string",
     "string": "the string itself (JSON string escapes apply)",
+    "json": "the document text itself (JSON string escapes apply)",
     "uuid": "canonical 8-4-4-4-12 lowercase form",
-    "binary": "standard base64 of the raw bytes",
-    "decimal": "UNSCALED integer as decimal string; type_params.scale applies"
+    "binary": "standard base64 of the raw bytes"
   },
-  "generated_by": "pyhoglake 0.1.0 bounds codec via tests/qe_vectors.py conventions",
+  "wire_conventions": "Additive JSON-wire pinning for the read-time decode surface (GET .../files/{fileId}/stats and POST /v1/debug/decode-bound; conventions documented in openapi/hoglake.yaml FileColumnStats). `wire` is the decoded bound as it appears in a JSON response: booleans as booleans; every integer type as an exact JSON number; decimal as an exact JSON number at the column's scale in PLAIN notation (unscaled x 10^-scale with exactly `scale` fraction digits - '1.50', never 1E-38); float/double as shortest-round-trip JSON numbers with the string sentinels \"Infinity\"/\"-Infinity\" (JVM-side tests compare these by VALUE - exponent spelling differs per language; the stored tokens are the Python oracle's); date/time/timestamps as ISO-8601 strings whose trailing zero units are ELIDED ('00:00', '1970-01-01T00:00' - seconds omitted when seconds and fraction are both zero; nonzero fractions print in groups of 3 digits; years above 9999 use the expanded '+YYYYY' form), timestamptz as a UTC instant with a trailing Z and seconds never elided; string/json/uuid as strings; binary as base64. `wire_refused` marks a value the JSON layer refuses instead of rendering (NaN bounds - the store never holds one, and the decode endpoint answers a named 422). bound_normalization cases additionally carry raw_wire/stored_wire: the rendering of raw_hex and stored_hex, pinning that a stored -0.0 renders with its sign. Every wire cell is generated and checked by tests/wire_oracle.py (independent of the JVM implementation); regenerate with `uv run python tests/wire_oracle.py --write`, and treat any --check disagreement as a cross-language finding, not a cell to edit.",
   "vectors": [
     {
       "type": "boolean",
       "type_params": null,
       "value": "true",
       "hex": "01",
-      "note": "canonical true = 0x01"
+      "note": "canonical true = 0x01",
+      "wire": true
     },
     {
       "type": "boolean",
       "type_params": null,
       "value": "false",
       "hex": "00",
-      "note": "canonical false = 0x00"
+      "note": "canonical false = 0x00",
+      "wire": false
+    },
+    {
+      "type": "int8",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "zero",
+      "wire": 0
+    },
+    {
+      "type": "int8",
+      "type_params": null,
+      "value": "127",
+      "hex": "7f000000",
+      "note": "int8 max, still a 4-byte Iceberg int",
+      "wire": 127
+    },
+    {
+      "type": "int8",
+      "type_params": null,
+      "value": "-128",
+      "hex": "80ffffff",
+      "note": "int8 min: sign-extended to 4 bytes, not 0x80",
+      "wire": -128
+    },
+    {
+      "type": "int16",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "zero",
+      "wire": 0
+    },
+    {
+      "type": "int16",
+      "type_params": null,
+      "value": "32767",
+      "hex": "ff7f0000",
+      "note": "int16 max",
+      "wire": 32767
+    },
+    {
+      "type": "int16",
+      "type_params": null,
+      "value": "-32768",
+      "hex": "0080ffff",
+      "note": "int16 min: sign-extended to 4 bytes",
+      "wire": -32768
     },
     {
       "type": "int",
       "type_params": null,
       "value": "0",
       "hex": "00000000",
-      "note": "zero"
+      "note": "zero",
+      "wire": 0
     },
     {
       "type": "int",
       "type_params": null,
       "value": "-1",
       "hex": "ffffffff",
-      "note": "all-ones LE"
+      "note": "all-ones LE",
+      "wire": -1
     },
     {
       "type": "int",
       "type_params": null,
       "value": "2147483647",
       "hex": "ffffff7f",
-      "note": "int32 max"
+      "note": "int32 max",
+      "wire": 2147483647
     },
     {
       "type": "int",
       "type_params": null,
       "value": "-2147483648",
       "hex": "00000080",
-      "note": "int32 min"
+      "note": "int32 min",
+      "wire": -2147483648
     },
     {
       "type": "int",
       "type_params": null,
       "value": "305419896",
       "hex": "78563412",
-      "note": "byte-order witness: LE 78 56 34 12"
+      "note": "byte-order witness: LE 78 56 34 12",
+      "wire": 305419896
     },
     {
       "type": "long",
       "type_params": null,
       "value": "9223372036854775807",
       "hex": "ffffffffffffff7f",
-      "note": "int64 max"
+      "note": "int64 max",
+      "wire": 9223372036854775807
     },
     {
       "type": "long",
       "type_params": null,
       "value": "-9223372036854775808",
       "hex": "0000000000000080",
-      "note": "int64 min"
+      "note": "int64 min",
+      "wire": -9223372036854775808
     },
     {
       "type": "long",
       "type_params": null,
       "value": "4611686018427387904",
       "hex": "0000000000000040",
-      "note": "2^62 (snapshot-id scale)"
+      "note": "2^62 (snapshot-id scale)",
+      "wire": 4611686018427387904
     },
     {
       "type": "long",
       "type_params": null,
       "value": "-1",
       "hex": "ffffffffffffffff",
-      "note": "all-ones LE"
+      "note": "all-ones LE",
+      "wire": -1
+    },
+    {
+      "type": "uint8",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "zero",
+      "wire": 0
+    },
+    {
+      "type": "uint8",
+      "type_params": null,
+      "value": "128",
+      "hex": "80000000",
+      "note": "MSB of the byte set: never sign-wraps, the int is positive",
+      "wire": 128
+    },
+    {
+      "type": "uint8",
+      "type_params": null,
+      "value": "255",
+      "hex": "ff000000",
+      "note": "uint8 max",
+      "wire": 255
+    },
+    {
+      "type": "uint16",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "zero",
+      "wire": 0
+    },
+    {
+      "type": "uint16",
+      "type_params": null,
+      "value": "32768",
+      "hex": "00800000",
+      "note": "MSB of the halfword set: stays positive",
+      "wire": 32768
+    },
+    {
+      "type": "uint16",
+      "type_params": null,
+      "value": "65535",
+      "hex": "ffff0000",
+      "note": "uint16 max",
+      "wire": 65535
+    },
+    {
+      "type": "uint32",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "zero; uint32 maps to Iceberg long, so 8 bytes",
+      "wire": 0
+    },
+    {
+      "type": "uint32",
+      "type_params": null,
+      "value": "2147483648",
+      "hex": "0000008000000000",
+      "note": "2^31: the int32 sign boundary uint32 exists to survive",
+      "wire": 2147483648
+    },
+    {
+      "type": "uint32",
+      "type_params": null,
+      "value": "4294967295",
+      "hex": "ffffffff00000000",
+      "note": "uint32 max",
+      "wire": 4294967295
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "0",
+      "hex": "00",
+      "note": "zero is one 0x00 byte (decimal(20,0) minimal form)",
+      "wire": 0
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "9223372036854775808",
+      "hex": "008000000000000000",
+      "note": "2^63: minimal two's-complement grows a 0x00 sign byte, 9 bytes",
+      "wire": 9223372036854775808
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "18446744073709551615",
+      "hex": "00ffffffffffffffff",
+      "note": "uint64 max, 9 bytes",
+      "wire": 18446744073709551615
     },
     {
       "type": "float",
       "type_params": null,
       "value": "0.0",
       "hex": "00000000",
-      "note": "positive zero"
+      "note": "positive zero",
+      "wire": 0.0
     },
     {
       "type": "float",
       "type_params": null,
       "value": "-0.0",
       "hex": "00000080",
-      "note": "negative zero: sign bit only"
+      "note": "negative zero: sign bit only",
+      "wire": -0.0
     },
     {
       "type": "float",
       "type_params": null,
       "value": "1.0",
       "hex": "0000803f",
-      "note": "one"
+      "note": "one",
+      "wire": 1.0
     },
     {
       "type": "float",
       "type_params": null,
       "value": "-2.5",
       "hex": "000020c0",
-      "note": "exact binary fraction"
+      "note": "exact binary fraction",
+      "wire": -2.5
     },
     {
       "type": "float",
       "type_params": null,
       "value": "3.4028235e38",
       "hex": "ffff7f7f",
-      "note": "float32 max finite"
+      "note": "float32 max finite",
+      "wire": 3.4028235e+38
     },
     {
       "type": "float",
       "type_params": null,
       "value": "1e-45",
       "hex": "01000000",
-      "note": "float32 min subnormal"
+      "note": "float32 min subnormal",
+      "wire": 1e-45
     },
     {
       "type": "float",
       "type_params": null,
       "value": "Infinity",
       "hex": "0000807f",
-      "note": "+inf"
+      "note": "+inf",
+      "wire": "Infinity"
     },
     {
       "type": "float",
       "type_params": null,
       "value": "-Infinity",
       "hex": "000080ff",
-      "note": "-inf"
+      "note": "-inf",
+      "wire": "-Infinity"
     },
     {
       "type": "float",
       "type_params": null,
       "value": "NaN",
       "hex": "0000c07f",
-      "note": "canonical quiet NaN (Python packs 7fc00000)"
+      "note": "canonical quiet NaN (Python packs 7fc00000)",
+      "wire_refused": "nan_bound"
     },
     {
       "type": "float",
       "type_params": null,
       "value": "NaN",
       "hex": "0100c07f",
-      "note": "NaN with payload 0x400001: codec preserves NaN bits verbatim"
+      "note": "NaN with payload 0x400001: codec preserves NaN bits verbatim",
+      "wire_refused": "nan_bound"
     },
     {
       "type": "double",
       "type_params": null,
       "value": "0.0",
       "hex": "0000000000000000",
-      "note": "positive zero"
+      "note": "positive zero",
+      "wire": 0.0
     },
     {
       "type": "double",
       "type_params": null,
       "value": "-0.0",
       "hex": "0000000000000080",
-      "note": "negative zero: sign bit only"
+      "note": "negative zero: sign bit only",
+      "wire": -0.0
     },
     {
       "type": "double",
       "type_params": null,
       "value": "1.0",
       "hex": "000000000000f03f",
-      "note": "one"
+      "note": "one",
+      "wire": 1.0
     },
     {
       "type": "double",
       "type_params": null,
       "value": "0.1",
       "hex": "9a9999999999b93f",
-      "note": "classic non-representable decimal"
+      "note": "classic non-representable decimal",
+      "wire": 0.1
     },
     {
       "type": "double",
       "type_params": null,
       "value": "1.7976931348623157e308",
       "hex": "ffffffffffffef7f",
-      "note": "double max finite"
+      "note": "double max finite",
+      "wire": 1.7976931348623157e+308
     },
     {
       "type": "double",
       "type_params": null,
       "value": "5e-324",
       "hex": "0100000000000000",
-      "note": "double min subnormal"
+      "note": "double min subnormal",
+      "wire": 5e-324
     },
     {
       "type": "double",
       "type_params": null,
       "value": "Infinity",
       "hex": "000000000000f07f",
-      "note": "+inf"
+      "note": "+inf",
+      "wire": "Infinity"
     },
     {
       "type": "double",
       "type_params": null,
       "value": "NaN",
       "hex": "000000000000f87f",
-      "note": "canonical quiet NaN (7ff8000000000000)"
+      "note": "canonical quiet NaN (7ff8000000000000)",
+      "wire_refused": "nan_bound"
     },
     {
       "type": "double",
       "type_params": null,
       "value": "NaN",
       "hex": "390500000000f87f",
-      "note": "NaN with payload: bits preserved bit-exactly"
-    },
-    {
-      "type": "date",
-      "type_params": null,
-      "value": "0",
-      "hex": "00000000",
-      "note": "1970-01-01"
-    },
-    {
-      "type": "date",
-      "type_params": null,
-      "value": "-1",
-      "hex": "ffffffff",
-      "note": "1969-12-31"
-    },
-    {
-      "type": "date",
-      "type_params": null,
-      "value": "-719162",
-      "hex": "c606f5ff",
-      "note": "date 0001-01-01 (python date.min)"
-    },
-    {
-      "type": "date",
-      "type_params": null,
-      "value": "2932896",
-      "hex": "a0c02c00",
-      "note": "date 9999-12-31 (python date.max)"
-    },
-    {
-      "type": "time",
-      "type_params": null,
-      "value": "0",
-      "hex": "0000000000000000",
-      "note": "midnight"
-    },
-    {
-      "type": "time",
-      "type_params": null,
-      "value": "86399999999",
-      "hex": "ff5fd71d14000000",
-      "note": "23:59:59.999999 - last legal micro"
-    },
-    {
-      "type": "time",
-      "type_params": null,
-      "value": "49062123456",
-      "hex": "c097546c0b000000",
-      "note": "13:37:42.123456"
-    },
-    {
-      "type": "timestamp",
-      "type_params": null,
-      "value": "0",
-      "hex": "0000000000000000",
-      "note": "1970-01-01T00:00:00"
-    },
-    {
-      "type": "timestamp",
-      "type_params": null,
-      "value": "-1",
-      "hex": "ffffffffffffffff",
-      "note": "one microsecond before epoch"
-    },
-    {
-      "type": "timestamp",
-      "type_params": null,
-      "value": "1788609600000500",
-      "hex": "f491d91fbb5a0600",
-      "note": "2026-09-04T12:00:00.000500"
-    },
-    {
-      "type": "timestamp",
-      "type_params": null,
-      "value": "-62135596800000000",
-      "hex": "0040d400014023ff",
-      "note": "0001-01-01T00:00:00 (decode floor)"
-    },
-    {
-      "type": "timestamptz",
-      "type_params": null,
-      "value": "1788609600000000",
-      "hex": "0090d91fbb5a0600",
-      "note": "2026-09-04T12:00:00Z; tz encodes identically to timestamp"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "",
-      "hex": "",
-      "note": "empty string - a legal empty payload"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "ab",
-      "hex": "6162",
-      "note": "plain ascii"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "h\u00e9llo",
-      "hex": "68c3a96c6c6f",
-      "note": "2-byte UTF-8 sequence"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "\u65e5\u672c\u8a9e",
-      "hex": "e697a5e69cace8aa9e",
-      "note": "3-byte UTF-8 sequences"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "\ud83e\udd94",
-      "hex": "f09fa694",
-      "note": "astral plane: HEDGEHOG emoji, 4-byte UTF-8"
-    },
-    {
-      "type": "string",
-      "type_params": null,
-      "value": "a\u0000b",
-      "hex": "610062",
-      "note": "embedded NUL survives"
-    },
-    {
-      "type": "uuid",
-      "type_params": null,
-      "value": "00000000-0000-0000-0000-000000000000",
-      "hex": "00000000000000000000000000000000",
-      "note": "all zeros"
-    },
-    {
-      "type": "uuid",
-      "type_params": null,
-      "value": "ffffffff-ffff-ffff-ffff-ffffffffffff",
-      "hex": "ffffffffffffffffffffffffffffffff",
-      "note": "all ones"
-    },
-    {
-      "type": "uuid",
-      "type_params": null,
-      "value": "f79c3e09-677c-4bbd-a479-3f349cb785e7",
-      "hex": "f79c3e09677c4bbda4793f349cb785e7",
-      "note": "big-endian: first encoded byte is 0xf7"
-    },
-    {
-      "type": "uuid",
-      "type_params": null,
-      "value": "80000000-0000-0000-0000-000000000001",
-      "hex": "80000000000000000000000000000001",
-      "note": "MSB set: sign-bit trap for signed-byte JVM readers"
-    },
-    {
-      "type": "binary",
-      "type_params": null,
-      "value": "",
-      "hex": "",
-      "note": "empty payload"
-    },
-    {
-      "type": "binary",
-      "type_params": null,
-      "value": "AAH/",
-      "hex": "0001ff",
-      "note": "base64 of 00 01 ff"
+      "note": "NaN with payload: bits preserved bit-exactly",
+      "wire_refused": "nan_bound"
     },
     {
       "type": "decimal",
@@ -405,7 +421,8 @@
       },
       "value": "0",
       "hex": "00",
-      "note": "zero is one 0x00 byte"
+      "note": "zero is one 0x00 byte",
+      "wire": 0.00
     },
     {
       "type": "decimal",
@@ -415,7 +432,8 @@
       },
       "value": "127",
       "hex": "7f",
-      "note": "max positive single byte"
+      "note": "max positive single byte",
+      "wire": 1.27
     },
     {
       "type": "decimal",
@@ -425,7 +443,8 @@
       },
       "value": "128",
       "hex": "0080",
-      "note": "needs a leading sign byte: 00 80"
+      "note": "needs a leading sign byte: 00 80",
+      "wire": 1.28
     },
     {
       "type": "decimal",
@@ -435,7 +454,8 @@
       },
       "value": "-128",
       "hex": "80",
-      "note": "min negative single byte: 80"
+      "note": "min negative single byte: 80",
+      "wire": -1.28
     },
     {
       "type": "decimal",
@@ -445,7 +465,8 @@
       },
       "value": "-129",
       "hex": "ff7f",
-      "note": "two bytes: ff 7f"
+      "note": "two bytes: ff 7f",
+      "wire": -1.29
     },
     {
       "type": "decimal",
@@ -455,7 +476,8 @@
       },
       "value": "1234",
       "hex": "04d2",
-      "note": "12.34 at scale 2"
+      "note": "12.34 at scale 2",
+      "wire": 12.34
     },
     {
       "type": "decimal",
@@ -465,7 +487,8 @@
       },
       "value": "-1234",
       "hex": "fb2e",
-      "note": "-12.34 at scale 2"
+      "note": "-12.34 at scale 2",
+      "wire": -12.34
     },
     {
       "type": "decimal",
@@ -475,7 +498,8 @@
       },
       "value": "9999999999999999999999999999",
       "hex": "204fce5e3e2502610fffffff",
-      "note": "28 digits: the largest width the Python decode context survives"
+      "note": "28 digits: the largest width the Python decode context survives",
+      "wire": 9999999999999999999999999999
     },
     {
       "type": "decimal",
@@ -486,7 +510,8 @@
       "value": "99999999999999999999999999999999999999",
       "hex": "4b3b4ca85a86c47a098a223fffffffff",
       "note": "precision-38 max: 16 bytes. encode_only: pyhoglake decode_bound rounds >28-digit unscaled values (decimal-context bug)",
-      "verify": "encode_only"
+      "verify": "encode_only",
+      "wire": 99999999999999999999999999999999999999
     },
     {
       "type": "decimal",
@@ -497,7 +522,545 @@
       "value": "-99999999999999999999999999999999999999",
       "hex": "b4c4b357a5793b85f675ddc000000001",
       "note": "precision-38 min. encode_only: same decode-context bug",
-      "verify": "encode_only"
+      "verify": "encode_only",
+      "wire": -99999999999999999999999999999999999999
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 38,
+        "scale": 38
+      },
+      "value": "1",
+      "hex": "01",
+      "note": "unscaled 1 at the widest scale: the wire token stays PLAIN notation (never 1E-38)",
+      "wire": 0.00000000000000000000000000000000000001
+    },
+    {
+      "type": "decimal",
+      "type_params": {
+        "precision": 10,
+        "scale": 7
+      },
+      "value": "1",
+      "hex": "01",
+      "note": "unscaled 1 at scale 7, just past BigDecimal.toString's plain-notation window: wire stays plain (never 1E-7)",
+      "wire": 0.0000001
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "0",
+      "hex": "00000000",
+      "note": "1970-01-01",
+      "wire": "1970-01-01"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffff",
+      "note": "1969-12-31",
+      "wire": "1969-12-31"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "-719162",
+      "hex": "c606f5ff",
+      "note": "date 0001-01-01 (python date.min)",
+      "wire": "0001-01-01"
+    },
+    {
+      "type": "date",
+      "type_params": null,
+      "value": "2932896",
+      "hex": "a0c02c00",
+      "note": "date 9999-12-31 (python date.max)",
+      "wire": "9999-12-31"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "midnight",
+      "wire": "00:00"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "86399999999",
+      "hex": "ff5fd71d14000000",
+      "note": "23:59:59.999999 - last legal micro",
+      "wire": "23:59:59.999999"
+    },
+    {
+      "type": "time",
+      "type_params": null,
+      "value": "49062123456",
+      "hex": "c097546c0b000000",
+      "note": "13:37:42.123456",
+      "wire": "13:37:42.123456"
+    },
+    {
+      "type": "timestamp_s",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "1970-01-01T00:00:00; stored as MICROS, not seconds",
+      "wire": "1970-01-01T00:00"
+    },
+    {
+      "type": "timestamp_s",
+      "type_params": null,
+      "value": "1788609600000000",
+      "hex": "0090d91fbb5a0600",
+      "note": "2026-09-05T12:00:00",
+      "wire": "2026-09-05T12:00"
+    },
+    {
+      "type": "timestamp_s",
+      "type_params": null,
+      "value": "-86400000000",
+      "hex": "00a028e2ebffffff",
+      "note": "1969-12-31T00:00:00",
+      "wire": "1969-12-31T00:00"
+    },
+    {
+      "type": "timestamp_ms",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "1970-01-01T00:00:00; stored as MICROS, not millis",
+      "wire": "1970-01-01T00:00"
+    },
+    {
+      "type": "timestamp_ms",
+      "type_params": null,
+      "value": "1788609600123000",
+      "hex": "7870db1fbb5a0600",
+      "note": "2026-09-05T12:00:00.123000",
+      "wire": "2026-09-05T12:00:00.123"
+    },
+    {
+      "type": "timestamp_ms",
+      "type_params": null,
+      "value": "-86399877000",
+      "hex": "78802ae2ebffffff",
+      "note": "1969-12-31T00:00:00.123000",
+      "wire": "1969-12-31T00:00:00.123"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "1970-01-01T00:00:00",
+      "wire": "1970-01-01T00:00"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffffffffffff",
+      "note": "one microsecond before epoch",
+      "wire": "1969-12-31T23:59:59.999999"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "1788609600000500",
+      "hex": "f491d91fbb5a0600",
+      "note": "2026-09-05T12:00:00.000500",
+      "wire": "2026-09-05T12:00:00.000500"
+    },
+    {
+      "type": "timestamp",
+      "type_params": null,
+      "value": "-62135596800000000",
+      "hex": "0040d400014023ff",
+      "note": "0001-01-01T00:00:00 (decode floor)",
+      "wire": "0001-01-01T00:00"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "0",
+      "hex": "0000000000000000",
+      "note": "1970-01-01T00:00:00; NANOS are the stored unit",
+      "wire": "1970-01-01T00:00"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "1788609600123456789",
+      "hex": "154d3671f46ad218",
+      "note": "sub-microsecond digits survive only because the unit is nanos",
+      "wire": "2026-09-05T12:00:00.123456789"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "-1",
+      "hex": "ffffffffffffffff",
+      "note": "one NANOsecond before the epoch",
+      "wire": "1969-12-31T23:59:59.999999999"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "-86400000000000",
+      "hex": "0000b16e6bb1ffff",
+      "note": "1969-12-31T00:00:00",
+      "wire": "1969-12-31T00:00"
+    },
+    {
+      "type": "timestamptz",
+      "type_params": null,
+      "value": "1788609600000000",
+      "hex": "0090d91fbb5a0600",
+      "note": "2026-09-05T12:00:00Z; tz encodes identically to timestamp",
+      "wire": "2026-09-05T12:00:00Z"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "",
+      "hex": "",
+      "note": "empty string - a legal empty payload",
+      "wire": ""
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "ab",
+      "hex": "6162",
+      "note": "plain ascii",
+      "wire": "ab"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "h\u00e9llo",
+      "hex": "68c3a96c6c6f",
+      "note": "2-byte UTF-8 sequence",
+      "wire": "h\u00e9llo"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "\u65e5\u672c\u8a9e",
+      "hex": "e697a5e69cace8aa9e",
+      "note": "3-byte UTF-8 sequences",
+      "wire": "\u65e5\u672c\u8a9e"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "\ud83e\udd94",
+      "hex": "f09fa694",
+      "note": "astral plane: HEDGEHOG emoji, 4-byte UTF-8",
+      "wire": "\ud83e\udd94"
+    },
+    {
+      "type": "string",
+      "type_params": null,
+      "value": "a\u0000b",
+      "hex": "610062",
+      "note": "embedded NUL survives",
+      "wire": "a\u0000b"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{}",
+      "hex": "7b7d",
+      "note": "the empty document",
+      "wire": "{}"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"city\":\"M\u00fcnchen\"}",
+      "hex": "7b2263697479223a224dc3bc6e6368656e227d",
+      "note": "non-ASCII value: UTF-8 bytes verbatim, never re-escaped",
+      "wire": "{\"city\":\"M\u00fcnchen\"}"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"q\":\"he said \\\"hi\\\"\"}",
+      "hex": "7b2271223a2268652073616964205c2268695c22227d",
+      "note": "embedded JSON escape: the document text is the payload, backslash included",
+      "wire": "{\"q\":\"he said \\\"hi\\\"\"}"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "00000000-0000-0000-0000-000000000000",
+      "hex": "00000000000000000000000000000000",
+      "note": "all zeros",
+      "wire": "00000000-0000-0000-0000-000000000000"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "ffffffff-ffff-ffff-ffff-ffffffffffff",
+      "hex": "ffffffffffffffffffffffffffffffff",
+      "note": "all ones",
+      "wire": "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "f79c3e09-677c-4bbd-a479-3f349cb785e7",
+      "hex": "f79c3e09677c4bbda4793f349cb785e7",
+      "note": "big-endian: first encoded byte is 0xf7",
+      "wire": "f79c3e09-677c-4bbd-a479-3f349cb785e7"
+    },
+    {
+      "type": "uuid",
+      "type_params": null,
+      "value": "80000000-0000-0000-0000-000000000001",
+      "hex": "80000000000000000000000000000001",
+      "note": "MSB set: sign-bit trap for signed-byte JVM readers",
+      "wire": "80000000-0000-0000-0000-000000000001"
+    },
+    {
+      "type": "binary",
+      "type_params": null,
+      "value": "",
+      "hex": "",
+      "note": "empty payload",
+      "wire": ""
+    },
+    {
+      "type": "binary",
+      "type_params": null,
+      "value": "AAH/",
+      "hex": "0001ff",
+      "note": "base64 of 00 01 ff",
+      "wire": "AAH/"
+    },
+    {
+      "type": "uint32",
+      "type_params": null,
+      "value": "2147483647",
+      "hex": "ffffff7f00000000",
+      "note": "int32 max: the last value a signed and an unsigned reading agree on",
+      "wire": 2147483647
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "127",
+      "hex": "7f",
+      "note": "1-byte minimal two's-complement, high bit clear",
+      "wire": 127
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "128",
+      "hex": "0080",
+      "note": "1 -> 2 byte transition: 0x80 needs a leading 0x00 sign byte",
+      "wire": 128
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "255",
+      "hex": "00ff",
+      "note": "2 bytes, both significant",
+      "wire": 255
+    },
+    {
+      "type": "uint64",
+      "type_params": null,
+      "value": "9223372036854775807",
+      "hex": "7fffffffffffffff",
+      "note": "int64 max: 8 bytes, the last value before the 9-byte sign-byte form",
+      "wire": 9223372036854775807
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"e\":\"\ud83e\udd94\"}",
+      "hex": "7b2265223a22f09fa694227d",
+      "note": "astral-plane codepoint: UTF-8 bytes order it above the BMP, UTF-16 units do not",
+      "wire": "{\"e\":\"\ud83e\udd94\"}"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"a\":\"\u65e5\u672c\u8a9e\"}",
+      "hex": "7b2261223a22e697a5e69cace8aa9e227d",
+      "note": "3-byte UTF-8 sequences",
+      "wire": "{\"a\":\"\u65e5\u672c\u8a9e\"}"
+    },
+    {
+      "type": "json",
+      "type_params": null,
+      "value": "{\"a\":\"x\u0000y\"}",
+      "hex": "7b2261223a22780079227d",
+      "note": "embedded NUL inside a JSON string value",
+      "wire": "{\"a\":\"x\u0000y\"}"
+    },
+    {
+      "type": "timestamp_s",
+      "type_params": null,
+      "value": "9223372036854000000",
+      "hex": "8029f4ffffffff7f",
+      "note": "second 9223372036854 expressed in micros: the largest whole second inside the int64 micros domain (int64 max is 807 micros later). encode_only: pyhoglake decode_bound materializes a datetime, whose year-9999 ceiling (~2.5e17 micros) this is 36x past",
+      "wire": "+294247-01-10T04:00:54"
+    },
+    {
+      "type": "timestamp_ms",
+      "type_params": null,
+      "value": "9223372036854775000",
+      "hex": "d8fcffffffffff7f",
+      "note": "milli 9223372036854775 expressed in micros: the largest whole milli inside the int64 micros domain (int64 max is 807 micros later). encode_only: same datetime-range overflow in pyhoglake decode_bound",
+      "wire": "+294247-01-10T04:00:54.775"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "9223372036854775807",
+      "hex": "ffffffffffffff7f",
+      "note": "int64 max nanos",
+      "wire": "2262-04-11T23:47:16.854775807"
+    },
+    {
+      "type": "timestamp_ns",
+      "type_params": null,
+      "value": "-9223372036854775808",
+      "hex": "0000000000000080",
+      "note": "int64 min nanos",
+      "wire": "1677-09-21T00:12:43.145224192"
     }
-  ]
+  ],
+  "bound_normalization": {
+    "description": "Iceberg's single-value rule for the signed zeros: a float/double LOWER bound is stored as -0.0 and an UPPER bound as +0.0. The two are IEEE-equal, so normalizing widens nothing, but a total-order evaluator (Iceberg compares float/double bounds in natural order, where -0.0 < 0.0) reads a stored pair of (lower=+0.0, upper=-0.0) as an EMPTY range and skips a file that holds 0.0. Every door that stores a bound applies this; the bytes are the contract, so each case gives the raw encoding a writer may hand over and the encoding that must be stored for that role.",
+    "case_fields": "type: hoglake column type. role: 'lower' | 'upper'. raw_hex: the bound as produced. stored_hex: what normalization must store. Cases where raw_hex == stored_hex are the fixed points and must not be skipped -- normalizing the wrong role is the error they catch.",
+    "cases": [
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "00000000",
+        "stored_hex": "00000080",
+        "note": "+0.0 lower becomes -0.0",
+        "raw_wire": 0.0,
+        "stored_wire": -0.0
+      },
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "00000080",
+        "stored_hex": "00000080",
+        "note": "-0.0 lower is already canonical",
+        "raw_wire": -0.0,
+        "stored_wire": -0.0
+      },
+      {
+        "type": "float",
+        "role": "upper",
+        "raw_hex": "00000080",
+        "stored_hex": "00000000",
+        "note": "-0.0 upper becomes +0.0",
+        "raw_wire": -0.0,
+        "stored_wire": 0.0
+      },
+      {
+        "type": "float",
+        "role": "upper",
+        "raw_hex": "00000000",
+        "stored_hex": "00000000",
+        "note": "+0.0 upper is already canonical",
+        "raw_wire": 0.0,
+        "stored_wire": 0.0
+      },
+      {
+        "type": "float",
+        "role": "lower",
+        "raw_hex": "0000803f",
+        "stored_hex": "0000803f",
+        "note": "a non-zero float is untouched",
+        "raw_wire": 1.0,
+        "stored_wire": 1.0
+      },
+      {
+        "type": "double",
+        "role": "lower",
+        "raw_hex": "0000000000000000",
+        "stored_hex": "0000000000000080",
+        "note": "+0.0 lower becomes -0.0",
+        "raw_wire": 0.0,
+        "stored_wire": -0.0
+      },
+      {
+        "type": "double",
+        "role": "lower",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000080",
+        "note": "-0.0 lower is already canonical",
+        "raw_wire": -0.0,
+        "stored_wire": -0.0
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000000",
+        "note": "-0.0 upper becomes +0.0",
+        "raw_wire": -0.0,
+        "stored_wire": 0.0
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "0000000000000000",
+        "stored_hex": "0000000000000000",
+        "note": "+0.0 upper is already canonical",
+        "raw_wire": 0.0,
+        "stored_wire": 0.0
+      },
+      {
+        "type": "double",
+        "role": "upper",
+        "raw_hex": "000000000000f03f",
+        "stored_hex": "000000000000f03f",
+        "note": "a non-zero double is untouched",
+        "raw_wire": 1.0,
+        "stored_wire": 1.0
+      },
+      {
+        "type": "int",
+        "role": "lower",
+        "raw_hex": "00000000",
+        "stored_hex": "00000000",
+        "note": "integer zero has one representation; no type but float and double normalizes",
+        "raw_wire": 0,
+        "stored_wire": 0
+      },
+      {
+        "type": "long",
+        "role": "upper",
+        "raw_hex": "0000000000000080",
+        "stored_hex": "0000000000000080",
+        "note": "the double -0.0 bytes read as a long bound are the value -2^63 and must survive untouched",
+        "raw_wire": -9223372036854775808,
+        "stored_wire": -9223372036854775808
+      },
+      {
+        "type": "decimal",
+        "role": "lower",
+        "raw_hex": "00",
+        "stored_hex": "00",
+        "note": "decimal zero is one minimal two's-complement byte; nothing to normalize",
+        "raw_wire": 0,
+        "stored_wire": 0
+      }
+    ]
+  }
 }

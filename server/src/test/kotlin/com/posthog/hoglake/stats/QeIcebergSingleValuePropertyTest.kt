@@ -25,7 +25,7 @@ import java.time.LocalDate
 import java.util.UUID
 
 /**
- * QE property assault on IcebergSingleValue (fuzzing.md layer 1, JVM
+ * QE property assault on IcebergSingleValue (docs/fuzzing.md layer 1, JVM
  * side): encode determinism, fixed-width invariants per type over the
  * full value domains, and the codec's edge policies pinned as
  * assertions so a change in behavior is a test failure, not a silent
@@ -380,7 +380,11 @@ class QeIcebergSingleValuePropertyTest {
                     ColType.TIME to 1,
                     ColType.TIMESTAMP to Instant.EPOCH,
                     ColType.TIMESTAMPTZ to java.time.LocalDateTime.MIN,
-                    ColType.STRING to byteArrayOf(1),
+                    // STRING is deliberately absent: a ByteArray is a
+                    // LEGAL string bound, not a cross-type mistake. The
+                    // encoding IS bytes, and decode hands bytes back for
+                    // a bound that is not valid UTF-8, so encode has to
+                    // take them — see the round-trip test below.
                     ColType.UUID_T to "f79c3e09-677c-4bbd-a479-3f349cb785e7",
                     ColType.BINARY to "bytes",
                     ColType.DECIMAL to 1.0,
@@ -390,6 +394,26 @@ class QeIcebergSingleValuePropertyTest {
                     .describedAs("%s should reject %s", type, value::class.simpleName)
                     .isInstanceOf(IllegalArgumentException::class.java)
             }
+            // The one type that takes both forms still rejects a third.
+            assertThatThrownBy { IcebergSingleValue.encode(ColType.STRING, 1) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+        }
+
+        @Test
+        fun `a string bound that is not valid UTF-8 round-trips as bytes`() {
+            // String(bytes, UTF_8) substitutes U+FFFD, and re-encoding
+            // that returns four bytes where there were two. Compaction's
+            // bounds merge is decode -> compare -> encode, so a lossy
+            // decode rewrote a file's bound during a rewrite.
+            val raw = byteArrayOf(0xFE.toByte(), 0x02)
+            val decoded = IcebergSingleValue.decode(ColType.STRING, raw)
+            assertThat(decoded).isInstanceOf(ByteArray::class.java)
+            assertThat(IcebergSingleValue.encode(ColType.STRING, decoded)).isEqualTo(raw)
+            // Valid UTF-8 still decodes to a String, and still compares
+            // against the byte form in unsigned byte order.
+            assertThat(IcebergSingleValue.decode(ColType.STRING, "hi".toByteArray())).isEqualTo("hi")
+            assertThat(IcebergSingleValue.compareValues(ColType.STRING, decoded, "hi"))
+                .isGreaterThan(0)
         }
     }
 }

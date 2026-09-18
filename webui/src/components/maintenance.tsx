@@ -137,13 +137,15 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
               {formatCount(r.failed_groups)} failed (logged; retried next run)
             </span>
           )}
-          {(r.skipped_conflicts !== "0" ||
-            r.dv_superseded !== "0" ||
-            r.unconvertible_schema !== "0") && (
+          {(positive(r.skipped_conflicts) ||
+            positive(r.dv_superseded) ||
+            positive(r.unconvertible_schema) ||
+            positive(r.invalid_data)) && (
             <span className="badge badge-warn">
               skipped {formatCount(r.skipped_conflicts)}, dv-superseded{" "}
               {formatCount(r.dv_superseded)}, unconvertible{" "}
-              {formatCount(r.unconvertible_schema)}
+              {formatCount(r.unconvertible_schema)}, invalid-data{" "}
+              {formatCount(r.invalid_data ?? "0")}
             </span>
           )}
         </>

@@ -1,6 +1,6 @@
 name: Fuzz nightly
 
-# Deep coverage-guided Jazzer soak of the six hermetic fuzz targets
+# Deep coverage-guided Jazzer soak of the hermetic fuzz targets
 # (fuzzing.md layer 4). The normal server suite only REPLAYS the
 # committed seed corpus; this run actually fuzzes, and accumulates its
 # generated corpus across nights through the cache so coverage compounds.
@@ -32,9 +32,9 @@ jobs:
   fuzz:
     if: github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
-    # Six sequential targets x the default 600s budget, plus build:
-    # ~65 min. Dispatch with a bigger budget needs this raised too.
-    timeout-minutes: 90
+    # Eight sequential targets x the default 600s budget, plus build:
+    # ~90 min. Dispatch with a bigger budget needs this raised too.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -68,7 +68,9 @@ jobs:
           case "$FUZZ_SECONDS" in
             ''|*[!0-9]*) echo "fuzz_seconds must be an integer, got '$FUZZ_SECONDS'" >&2; exit 1 ;;
           esac
-          ./gradlew --no-daemon fuzz -PfuzzSeconds="$FUZZ_SECONDS"
+          # tee for the triage job below; bash runs with pipefail, so
+          # the gradle exit code survives the pipe.
+          ./gradlew --no-daemon fuzz -PfuzzSeconds="$FUZZ_SECONDS" 2>&1 | tee ../fuzz-run.log
 
       # jazzer-junit writes crashing inputs into the committed seed
       # corpus directories — on a red run, ship exactly those new files
@@ -86,6 +88,146 @@ jobs:
           name: fuzz-findings-${{ github.run_id }}
           path: |
             fuzz-findings.txt
+            fuzz-run.log
             server/src/test/resources/com/posthog/hoglake/fuzz/
             server/build/reports/tests/
           if-no-files-found: warn
+
+  # AI triage of a red night: classify the failure and, when it looks
+  # like a genuine finding, open (or bump) a tracking issue. The model
+  # only ever classifies — issue creation is plain shell, deduped by
+  # jazzer's DEDUP_TOKEN so a recurring crash bumps one issue instead
+  # of opening one per night. A FLAKE/UNCLEAR verdict just logs; a
+  # missed real finding still shows as the red run it always was.
+  triage:
+    needs: fuzz
+    if: ${{ always() && needs.fuzz.result == 'failure' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+      models: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: fuzz-findings-${{ github.run_id }}
+          path: findings
+
+      # Boil the run down to what a triager reads: which targets
+      # failed, the crash stacks, jazzer's dedup tokens, and the new
+      # corpus files. Bounded so the model prompt stays small.
+      - name: Extract evidence
+        run: |
+          {
+            echo "## Failed targets"
+            grep -E "^> Task :fuzz.+ FAILED" findings/fuzz-run.log || echo "(none parsed)"
+            echo
+            echo "## Crash stacks"
+            grep -B1 -A6 "FuzzTestFindingException\|== Java Exception" findings/fuzz-run.log | head -80
+            echo
+            echo "## Dedup tokens"
+            grep -oE "DEDUP_TOKEN: [0-9a-f]+" findings/fuzz-run.log | sort -u
+            echo
+            echo "## New corpus files"
+            head -20 findings/fuzz-findings.txt 2>/dev/null || true
+            echo
+            echo "## Tail of run"
+            tail -30 findings/fuzz-run.log
+          } > evidence.md
+          grep -oE "DEDUP_TOKEN: [0-9a-f]+" findings/fuzz-run.log \
+            | awk '{print $2}' | sort -u > tokens.txt
+          cat evidence.md
+
+      - name: Classify the failure
+        id: verdict
+        uses: actions/ai-inference@2c43c91ae16266ca159d311430343c67a5ffa222 # v3
+        with:
+          system-prompt: >-
+            You triage nightly Jazzer fuzz failures for the hoglake
+            lakehouse catalog. REAL means a genuine finding: a
+            FuzzTestFindingException whose cause lands in
+            com.posthog.hoglake code, usually with a DEDUP_TOKEN and a
+            crash file written into the seed-corpus directories. FLAKE
+            means infrastructure: runner OOM or eviction, network or
+            dependency-download failure, gradle daemon or cache
+            trouble, a timeout with no crash stack. Answer with a
+            first line of exactly "VERDICT: REAL", "VERDICT: FLAKE" or
+            "VERDICT: UNCLEAR", then a short rationale naming the
+            evidence you used.
+          prompt-file: evidence.md
+
+      # Plain shell acts on the verdict; the model's text is never
+      # executed, only parsed for its first VERDICT line and quoted
+      # into the issue body.
+      - name: Open or bump the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESPONSE: ${{ steps.verdict.outputs.response }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '%s\n' "$RESPONSE" > verdict.txt
+          # ${var:-} default, not `|| echo`: the pipeline's last command
+          # succeeds even when grep matches nothing, so the fallback
+          # would fire only under pipefail — make it unconditional.
+          verdict=$(grep -m1 -oE "VERDICT: (REAL|FLAKE|UNCLEAR)" verdict.txt | awk '{print $2}' || true)
+          verdict=${verdict:-UNCLEAR}
+          echo "verdict: $verdict"
+          if [ "$verdict" != "REAL" ]; then
+            echo "No issue filed ($verdict). Evidence and rationale stay in this run's log."
+            exit 0
+          fi
+          created=0
+          while read -r token; do
+            [ -n "$token" ] || continue
+            existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+              --search "in:body $token" --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" \
+                --body "Reproduced again by the nightly fuzz run: $RUN_URL (dedup token \`$token\`)."
+              echo "bumped #$existing for $token"
+              continue
+            fi
+            if [ "$created" -ge 3 ]; then
+              echo "issue cap reached; $token stays in the run log"
+              continue
+            fi
+            target=$(grep -B40 "DEDUP_TOKEN: $token" findings/fuzz-run.log \
+              | grep -oE "[A-Za-z]+FuzzTest" | tail -1)
+            {
+              echo "The nightly fuzz run found a crash that automated triage classified as a real finding."
+              echo
+              echo "- Run: $RUN_URL (crash inputs in the \`fuzz-findings-*\` artifact)"
+              echo "- Dedup token: \`$token\`"
+              echo
+              echo "## Evidence"
+              echo '```'
+              cat evidence.md
+              echo '```'
+              echo
+              echo "## Triage rationale (model output — verify before trusting)"
+              sed -n '1,15p' verdict.txt
+              echo
+              echo "## Promotion rule (fuzzing.md)"
+              echo "A real finding becomes a committed corpus entry, a pinned regression test in \`:test\`, and a \`bounds_vectors.json\` entry when the surface is cross-language."
+            } > issue-body.md
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Nightly fuzz: ${target:-unknown target} crash (dedup $token)" \
+              --body-file issue-body.md
+            created=$((created + 1))
+          done < tokens.txt
+          if [ ! -s tokens.txt ]; then
+            echo "REAL verdict but no dedup tokens parsed; filing a single untokened issue"
+            {
+              echo "The nightly fuzz run failed and automated triage classified it as a real finding, but no DEDUP_TOKEN was parsed — read the run."
+              echo
+              echo "- Run: $RUN_URL"
+              echo
+              echo '```'
+              cat evidence.md
+              echo '```'
+            } > issue-body.md
+            gh issue create --repo "$GITHUB_REPOSITORY" \
+              --title "Nightly fuzz: unclassified crash ($(date -u +%Y-%m-%d))" \
+              --body-file issue-body.md
+          fi

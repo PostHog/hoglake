@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
@@ -26,6 +26,26 @@ function ThemeToggle() {
   );
 }
 
+function useDocumentTitle() {
+  // Shares the fetch-once ["instance-info"] key with the badges below, so
+  // naming the tab costs no extra request.
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  const name = data?.name;
+  useEffect(() => {
+    // The instance name leads: browser tabs truncate from the RIGHT, and
+    // when several hoglake consoles are open the discriminator is the
+    // only part worth keeping legible at a few characters wide. An
+    // unnamed instance keeps the bare product name rather than showing a
+    // separator with nothing before it.
+    document.title = name ? `${name} · hoglake` : "hoglake";
+  }, [name]);
+}
+
 function InstanceName() {
   const { data } = useQuery({
     queryKey: ["instance-info"],
@@ -47,12 +67,18 @@ function ServerVersion() {
     retry: false,
   });
   if (!data?.version) return null;
+  // The version alone cannot tell two deploys apart: it stays constant
+  // between releases. The build stamp is what names WHICH build is live,
+  // and it is absent on anything not packaged by the pipeline.
+  const title = data.build
+    ? `Running hoglake server version ${data.version}, build ${data.build} ` +
+      "(the packaging stamp, UTC; GET /v1/info)"
+    : `Running hoglake server version ${data.version}, built locally ` +
+      "(no pipeline build stamp; GET /v1/info)";
   return (
-    <span
-      className="server-version"
-      title={`Running hoglake server version ${data.version} (GET /v1/info)`}
-    >
+    <span className="server-version" title={title}>
       v{data.version}
+      {data.build && <span className="server-build">+{data.build}</span>}
     </span>
   );
 }
@@ -141,6 +167,7 @@ function Breadcrumbs() {
 }
 
 export function Layout() {
+  useDocumentTitle();
   return (
     <div className="app">
       <header className="topbar">
@@ -153,6 +180,7 @@ export function Layout() {
         <Breadcrumbs />
         <div className="topbar-right">
           <Link to="/maintenance">maintenance</Link>
+          <Link to="/database">database</Link>
           <Link to="/metrics">metrics</Link>
           <a href="/openapi.yaml" target="_blank" rel="noreferrer">
             openapi.yaml

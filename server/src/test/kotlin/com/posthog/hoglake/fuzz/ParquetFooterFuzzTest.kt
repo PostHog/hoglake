@@ -14,7 +14,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Fuzz target (fuzzing.md layer 4, target c): the parquet footer parse
+ * Fuzz target (docs/fuzzing.md layer 4, target c): the parquet footer parse
  * the hydrator runs on writer-supplied bytes, plus [FooterStats] over
  * whatever parses.
  *

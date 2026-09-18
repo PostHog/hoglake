@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.0.1-dev"
+version = "1.1.2-dev"
 
 repositories {
     mavenCentral()
@@ -16,7 +16,7 @@ val ktorVersion = "3.5.2"
 
 dependencies {
     testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.2")
-    testImplementation("org.junit.jupiter:junit-jupiter:5.11.3")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.assertj:assertj-core:3.27.7")
     // Integration tests: the hoglake server runs in-process from the
@@ -39,8 +39,13 @@ dependencies {
     // Real parquet files for the end-to-end read test (same writer the
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
-    // Bucket creation + parquet upload to MinIO.
+    // Bucket creation + parquet/deletion-vector upload to MinIO.
     testImplementation("software.amazon.awssdk:s3:2.54.13")
+    // Real puffin deletion vectors for the DV read tests: the portable
+    // 64-bit roaring serialization IS the Java library's format, so the
+    // harness writes the same bytes the server and DuckDB client do.
+    // Keep in step with the root project's pin.
+    testImplementation("org.roaringbitmap:RoaringBitmap:1.6.21")
 }
 
 kotlin {

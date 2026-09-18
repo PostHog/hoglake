@@ -1,7 +1,7 @@
 """Client-side Iceberg partition transforms for the writer path.
 
 Implements the server's Transform vocabulary (``identity``, ``bucket``,
-``year``, ``month``, ``day``, ``hour`` — Model.kt, iceberg-federation.md
+``year``, ``month``, ``day``, ``hour`` — Model.kt, docs/iceberg-federation.md
 §3) plus ``truncate`` with Iceberg-spec semantics, ready for the day the
 server vocabulary grows it. Semantics follow the Apache Iceberg Table
 Spec exactly:
@@ -18,6 +18,20 @@ Spec exactly:
   **codepoints** of a string / W bytes of a binary.
 - A null source value transforms to a null partition value (its own
   partition group), per Iceberg's null handling.
+- ``json`` takes **identity only**. bucket hashes bytes and truncate
+  slices them, but two documents equal as JSON (key order, whitespace,
+  number spelling) have different bytes, so either transform would
+  scatter equal values across partitions and prune away files that do
+  match.
+- ``uint32``/``uint64``/``timestamp_s``/``timestamp_ms``/``timestamp_ns``
+  take identity and truncate but NOT bucket — see ``_BUCKETABLE`` for the
+  hash-domain reason. The server's gate is identical
+  (``AlterService.BUCKETABLE_TYPES``); the two sets are pinned equal by a
+  test that parses the Kotlin.
+- ``timestamp_ns`` partition values are NANOS as a decimal string, not
+  an isoformat timestamp: a Python datetime cannot carry nanoseconds,
+  and arrow will not even render a sub-microsecond ``timestamp[ns]`` as
+  one. The other timestamp widths keep isoformat.
 
 The wire shape for the commit's ``partition_values`` is a list of
 strings by key_index (nullable — see openapi FileRegistration); the
@@ -42,18 +56,47 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as pc
 
-from .bounds import _micros_since_epoch, _minimal_twos_complement, _unscaled
+from .bounds import (
+    _micros_since_epoch,
+    _minimal_twos_complement,
+    _nanos_since_epoch,
+    _unscaled,
+)
 from .errors import ValidationError
 
 _EPOCH_DATE = date(1970, 1, 1)
 _MICROS_PER_HOUR = 3_600_000_000
 _MICROS_PER_DAY = 86_400_000_000
 
-#: Column types bucket() accepts (Iceberg spec: no boolean/float/double).
+#: Column types bucket() accepts. Three exclusion reasons:
+#:
+#:  - boolean/float/double: outside the Iceberg spec's Appendix-B hash
+#:    domain outright.
+#:  - json: see the note above _TRUNCATABLE.
+#:  - uint32/uint64/timestamp_s/timestamp_ms/timestamp_ns: the
+#:    hash-domain mismatch. Appendix B hashes the MAPPED Iceberg type's
+#:    representation — timestamps as micros, uint64-as-decimal(20,0) as
+#:    minimal two's-complement bytes, uint32-as-long as the
+#:    zero-extended value — and hoglake has neither a cross-language
+#:    contract for hashing on the mapped value nor cross-language bucket
+#:    vectors proving both sides agree on it. A bucket value nobody has
+#:    verified prunes silently and wrongly, so until those exist these
+#:    five are identity/truncate only (they stay in _TRUNCATABLE; only
+#:    bucket is withdrawn). Re-admitting them is a deliberate future
+#:    change with those vectors attached, not a default.
+#:
+#: Must equal AlterService.BUCKETABLE_TYPES exactly — the server accepts
+#: the spec, but the client is what computes the values, so a divergence
+#: means an accepted spec the writer cannot honour. Pinned by a test that
+#: parses the Kotlin.
 _BUCKETABLE = frozenset(
     {
+        "int8",
+        "int16",
         "int",
         "long",
+        "uint8",
+        "uint16",
         "date",
         "time",
         "timestamp",
@@ -64,9 +107,46 @@ _BUCKETABLE = frozenset(
         "decimal",
     }
 )
-_TRUNCATABLE = frozenset({"int", "long", "string", "binary", "decimal"})
-_YEAR_MONTH_DAY_TYPES = frozenset({"date", "timestamp", "timestamptz"})
-_HOUR_TYPES = frozenset({"timestamp", "timestamptz"})
+#: json is deliberately absent from both gates: bucket hashes the bytes
+#: and truncate slices them, but two documents that are EQUAL as JSON
+#: (key order, whitespace, number spelling) have different bytes. Either
+#: transform would scatter equal values across partitions and prune away
+#: files that do match. Identity is the only honest transform for json —
+#: the same gate the server enforces (AlterService.BUCKETABLE_TYPES
+#: excludes json alongside boolean/float/double).
+_TRUNCATABLE = frozenset(
+    {
+        "int8",
+        "int16",
+        "int",
+        "long",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "string",
+        "binary",
+        "decimal",
+    }
+)
+_YEAR_MONTH_DAY_TYPES = frozenset(
+    {
+        "date",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamp",
+        "timestamp_ns",
+        "timestamptz",
+    }
+)
+_HOUR_TYPES = frozenset(
+    {"timestamp_s", "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz"}
+)
+
+#: Integer column types that hash, truncate and stringify like int/long.
+_INT_TYPES = frozenset(
+    {"int8", "int16", "int", "long", "uint8", "uint16", "uint32", "uint64"}
+)
 
 _INT32_MASK = 0xFFFFFFFF
 _INT31_MASK = 0x7FFFFFFF  # Java Integer.MAX_VALUE
@@ -131,12 +211,17 @@ def bucket_encode(
     """Iceberg Appendix-B hash input encoding for ``value``.
 
     Diverges from the bounds codec (:mod:`pyhoglake.bounds`) where the
-    spec says so: ``int`` and ``date`` hash as 8-byte LE **longs**
-    (``hashInt(v) = hashLong(long(v))``), not the 4-byte forms the
-    bounds codec stores. ``decimal``/``uuid``/``string``/``binary``
-    reuse the bounds encodings, which already match the spec.
+    spec says so: every bucketable integer width and ``date`` hash as
+    8-byte LE **longs** (``hashInt(v) = hashLong(long(v))``), not the
+    4-byte forms the bounds codec stores for ``int``/``int8``/``int16``/
+    ``uint8``/``uint16``/``date``. ``decimal``/``uuid``/``string``/
+    ``binary`` reuse the bounds encodings, which already match the spec.
+
+    The types _BUCKETABLE withholds fall through to the ValidationError:
+    an encoding nobody has verified cross-language is worse than a
+    refusal, because its partition values look fine and prune wrong.
     """
-    if col_type in ("int", "long"):
+    if col_type in ("int", "long", "int8", "int16", "uint8", "uint16"):
         return struct.pack("<q", int(value))
     if col_type == "date":
         return struct.pack("<q", _days_since_epoch(value))
@@ -197,7 +282,7 @@ def truncate(
         raise ValidationError(f"truncate requires a positive width, got {width!r}")
     if value is None:
         return None
-    if col_type in ("int", "long"):
+    if col_type in _INT_TYPES:
         v = int(value)
         return v - (v % width)  # Python % is floor-mod: negative-correct
     if col_type == "string":
@@ -293,14 +378,33 @@ def wire_string(col_type: str, transform: str, transformed: Any) -> str | None:
     # identity / truncate: stringify by the SOURCE column type
     if col_type == "boolean":
         return "true" if v else "false"
-    if col_type in ("int", "long"):
+    if col_type in _INT_TYPES:
         return str(int(v))
     if col_type in ("float", "double"):
         return repr(float(v))
     if col_type == "string":
         return str(v)
-    if col_type in ("date", "time", "timestamp", "timestamptz"):
+    # json stringifies verbatim; identity is its only transform, so this
+    # is the document text exactly as it arrived.
+    if col_type == "json":
+        return str(v)
+    if col_type in (
+        "date",
+        "time",
+        "timestamp",
+        "timestamp_s",
+        "timestamp_ms",
+        "timestamptz",
+    ):
         return v.isoformat()
+    if col_type == "timestamp_ns":
+        # Nanos, never isoformat. A datetime cannot hold nanoseconds, so
+        # the array driver must feed this branch raw int64 nanos (arrow
+        # refuses to render a sub-microsecond timestamp[ns] as a
+        # datetime at all). Scalar callers passing a datetime convert
+        # here too, or the two paths would put one value in two
+        # partitions.
+        return str(_nanos_since_epoch(v))
     if col_type == "decimal":
         return str(v)
     if col_type == "uuid":
@@ -312,6 +416,50 @@ def wire_string(col_type: str, transform: str, transformed: Any) -> str | None:
     raise ValidationError(f"cannot stringify partition value for type {col_type!r}")
 
 
+# -- nested partition sources ------------------------------------------------
+
+#: Container column types. A partition or sort source is always a LEAF —
+#: a container has no single value per row to transform.
+_NESTED_TYPES = frozenset({"list", "struct", "map"})
+
+
+def partition_source_array(data: pa.Table, chain: list[Any]) -> pa.ChunkedArray:
+    """The source array for a partition field, given the root-to-leaf
+    ``chain`` of catalog Columns that reaches it.
+
+    A top-level column is ``data.column(name)``; a STRUCT leaf is
+    extracted with ``struct_field``, which Iceberg allows as a partition
+    source (``source-id`` may point at a struct's leaf field).
+
+    Refused, by name: a container itself (no single value per row), and
+    anything under a list or a map (MANY values per row — a partition key
+    would have to pick one, and there is no rule that says which). The
+    server refuses the same specs at DDL time; this is the client-side
+    twin, so a hand-built spec fails before it writes a file.
+    """
+    leaf = chain[-1]
+    path = ".".join(c.name for c in chain)
+    if leaf.type in _NESTED_TYPES:
+        raise ValidationError(
+            f"partition source {path!r} is a {leaf.type!r}: a nested container has "
+            "no single value per row and cannot be a partition source; use one of "
+            "its leaf fields",
+            status_code=None,
+        )
+    repeated = next((c for c in chain[:-1] if c.type in ("list", "map")), None)
+    if repeated is not None:
+        raise ValidationError(
+            f"partition source {path!r} sits under {repeated.name!r}, a "
+            f"{repeated.type!r}: a row has many such values, so it cannot be a "
+            "partition source; struct leaves are the only nested fields that can",
+            status_code=None,
+        )
+    column = data.column(chain[0].name)
+    for step in chain[1:]:
+        column = pc.struct_field(column, step.name)
+    return column
+
+
 # -- array-level driver (the fanout path) -----------------------------------
 
 
@@ -319,22 +467,58 @@ def _floordiv(arr: pa.Array, divisor: int) -> pa.Array:
     """Floor division on an int64 array (arrow's ``divide`` truncates
     toward zero; Iceberg's day/hour need flooring for pre-epoch values)."""
     q = pc.divide(arr, divisor)
-    r = pc.subtract(arr, pc.multiply(q, divisor))
+    # |q * divisor| <= |arr| by construction, so this cannot overflow —
+    # the checked kernels are used anyway so that no unchecked integer
+    # arithmetic survives in the partition-value path at all.
+    r = pc.subtract_checked(arr, pc.multiply_checked(q, divisor))
     adjust = pc.and_(pc.less(arr, 0), pc.not_equal(r, 0))
-    return pc.subtract(q, pc.cast(adjust, pa.int64()))
+    return pc.subtract_checked(q, pc.cast(adjust, pa.int64()))
+
+
+def _timestamp_micros(arr: pa.Array) -> pa.Array:
+    """Raw int64 micros for a timestamp array of ANY unit.
+
+    ``pc.cast(arr, int64)`` yields the array's own unit, not micros, so
+    feeding it straight to the day/hour divisors below lands every
+    timestamp[s] row 10^6 times too low, every timestamp[ms] row 10^3
+    times too low, and every timestamp[ns] row 10^3 times too high.
+    Exact integer math keyed on the unit fixes that; the nanos case
+    FLOOR-divides (never arrow's
+    truncate-toward-zero ``divide``) so a pre-epoch instant with a
+    sub-microsecond remainder still lands in the earlier micro, which is
+    what keeps day/hour flooring correct across the epoch.
+    """
+    raw = pc.cast(arr, pa.int64())
+    unit = arr.type.unit
+    # multiply_CHECKED, not multiply: arrow's unchecked kernel wraps on
+    # int64 overflow, and the wrap is silent. A timestamp[s] tick of 2^62
+    # is a perfectly legal value that scales to exactly 0 micros — every
+    # such row would partition as the epoch, and pruning would then miss
+    # the file for its real range. Raising is the only honest answer; the
+    # caller cannot partition what it cannot represent.
+    if unit == "s":
+        return pc.multiply_checked(raw, 1_000_000)
+    if unit == "ms":
+        return pc.multiply_checked(raw, 1_000)
+    if unit == "ns":
+        return _floordiv(raw, 1_000)
+    return raw  # "us": already the stored unit
 
 
 def _temporal_ints(transform: str, arr: pa.Array, col_type: str) -> pa.Array:
     """Arrow-native year/month/day/hour over a date/timestamp column."""
     _check_temporal(transform, col_type)
     if transform == "year":
-        return pc.subtract(pc.year(arr), 1970)
+        return pc.subtract_checked(pc.year(arr), 1970)
     if transform == "month":
-        years = pc.subtract(pc.year(arr), 1970)
-        return pc.add(pc.multiply(years, 12), pc.subtract(pc.month(arr), 1))
+        years = pc.subtract_checked(pc.year(arr), 1970)
+        return pc.add_checked(
+            pc.multiply_checked(years, 12),
+            pc.subtract_checked(pc.month(arr), 1),
+        )
     if col_type == "date":  # day; hour is rejected for date by _check_temporal
         return pc.cast(pc.cast(arr, pa.int32()), pa.int64())
-    micros = pc.cast(arr, pa.int64())
+    micros = _timestamp_micros(arr)
     divisor = _MICROS_PER_DAY if transform == "day" else _MICROS_PER_HOUR
     return _floordiv(micros, divisor)
 
@@ -357,6 +541,13 @@ def transform_strings(
         return pc.cast(_temporal_ints(transform, arr, col_type), pa.string())
     if transform not in ("identity", "bucket", "truncate"):
         raise ValidationError(f"unknown partition transform {transform!r}")
+    if col_type == "timestamp_ns" and pa.types.is_timestamp(arr.type):
+        # Arrow REFUSES to render a sub-microsecond timestamp[ns] as a
+        # datetime (to_pylist raises ValueError), and micro-aligned ones
+        # it renders lossily. Cast to raw int64 nanos so the per-value
+        # Python path below sees the codec's own carrier: encode_bound
+        # and wire_string both take an int as nanos.
+        arr = pc.cast(arr, pa.int64())
 
     def one(value: Any) -> str | None:
         return wire_string(

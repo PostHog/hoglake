@@ -9,7 +9,7 @@ import java.nio.charset.CharacterCodingException
 import java.nio.charset.CodingErrorAction
 
 /**
- * Fuzz target (fuzzing.md layer 4, target a): [IcebergSingleValue.decode]
+ * Fuzz target (docs/fuzzing.md layer 4, target a): [IcebergSingleValue.decode]
  * over arbitrary bytes for every [ColType].
  *
  * Contract under test:
@@ -24,9 +24,13 @@ import java.nio.charset.CodingErrorAction
  *  - a decoded value compares equal to itself under
  *    [IcebergSingleValue.compareValues].
  *
- * Input shape: byte 0 selects the ColType (mod 13), the rest is the
- * encoding under test. The committed corpus is derived from
- * pyhoglake/tests/vectors/bounds_vectors.json (see FuzzSeedGenerator).
+ * Input shape: byte 0 selects the ColType (modulo the vocabulary size),
+ * the rest is the encoding under test. The committed corpus is derived
+ * from pyhoglake/tests/vectors/bounds_vectors.json (see
+ * FuzzSeedGenerator) — adding a ColType shifts every ordinal, so the
+ * corpus must be REGENERATED with the vocabulary, not just extended, or
+ * the seeds silently start exercising different types than their names
+ * claim.
  */
 class IcebergSingleValueDecodeFuzzTest {
     @FuzzTest(maxDuration = "120s")
@@ -66,9 +70,12 @@ class IcebergSingleValueDecodeFuzzTest {
             // decode maps any nonzero byte to true; only 0x00/0x01 are canonical.
             ColType.BOOLEAN -> payload.size == 1 && payload[0] in 0..1
             // BigInteger re-encodes minimally; redundant sign-extension bytes drop.
-            ColType.DECIMAL -> BigInteger(payload).toByteArray().size == payload.size
+            // uint64 shares decimal's encoding, so it shares the exemption —
+            // an 8-byte uint64 bound is the COMMON non-minimal case (every
+            // value below 2^56 has leading zero bytes to shed).
+            ColType.UINT64, ColType.DECIMAL -> BigInteger(payload).toByteArray().size == payload.size
             // Invalid UTF-8 decodes with U+FFFD replacement and cannot round-trip.
-            ColType.STRING -> isValidUtf8(payload)
+            ColType.STRING, ColType.JSON -> isValidUtf8(payload)
             else -> true
         }
 

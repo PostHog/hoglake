@@ -6,26 +6,55 @@ is range-delete based; snapshots/s here is the headline.
 
 Seeding registers one fabricated file per snapshot on a table that is
 then DROPPED, so expiry makes every file row unreachable and queues its
-path (files queued/s). A second table holds --objects REAL MinIO
-objects so the cleanup drain deletes actual bytes; the fabricated paths
-drain as 'missing' (cleanup treats a missing object as done). Any
-still_referenced count is an invariant violation.
+path (files queued/s). Expiry itself is metadata work by nature, so the
+fabricated seed is honest for the snapshots/s headline. A second table
+holds --objects REAL parquet objects (real bytes, footer-derived stats
+via realfiles.py) so the cleanup drain performs actual object-store
+deletes; the fabricated paths drain as 'missing' (cleanup treats a
+missing object as done). The cleanup metric reports the two populations
+separately — `removed`/`removed_s` is the real-IO number, `missing` is
+the metadata-only drain of the fabricated seed — because a mixed rate
+would flatter the server by averaging in deletes that never touched
+storage. Any still_referenced count is an invariant violation.
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-import uuid
+
+import numpy as np
+import pyarrow as pa
 
 from ..context import Bench
-from ..fabricate import BENCH_SCHEMA, fabricated_files
+from ..fabricate import BENCH_SCHEMA
+from ..realfiles import build_real_registration
 from ..runner import FailureGuard
 from ..stats import Metric, Recorder
 from .common import ScenarioReport, check, notice, seed_snapshots
 
-REAL_OBJECT_BYTES = b"hoglake-bench cleanup probe\n" * 4
+#: Mixed: the expiry drain works on fabricated registrations (expiry is
+#: metadata work by nature); the cleanup drain deletes REAL parquet
+#: objects for the `removed` count, while `missing` counts the
+#: fabricated paths (metadata-only drain).
+IO_MODE = "mixed"
+
 FILES_PER_REAL_COMMIT = 50
+#: Rows per real probe file — small on purpose: the probes exist so the
+#: cleanup drain performs real object-store deletes, not to move data.
+PROBE_ROWS = 8
+
+
+def _probe_data(offset: int) -> pa.Table:
+    """A distinct small batch per probe, so bounds differ file to file."""
+    ids = np.arange(offset, offset + PROBE_ROWS, dtype=np.int64)
+    return pa.table(
+        {
+            "id": pa.array(ids),
+            "v": pa.array(ids.astype(np.float64) / 7.0),
+        },
+        schema=BENCH_SCHEMA,
+    )
 
 
 def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
@@ -53,20 +82,27 @@ def run(bench: Bench, args: argparse.Namespace) -> ScenarioReport:
         )
     )
 
-    # real objects, registered in batched commits (failure-guard capped:
-    # a dead server/MinIO trips the guard instead of looping forever)
+    # real objects: real parquet bytes uploaded to MinIO, stats extracted
+    # from each written footer (never invented), registered in batched
+    # commits (failure-guard capped: a dead server/MinIO trips the guard
+    # instead of looping forever)
     bench.ensure_bucket()
+    real_columns = tuple(t_real.columns)
     uploaded = 0
     while uploaded < args.objects:
         n = min(FILES_PER_REAL_COMMIT, args.objects - uploaded)
         try:
-            regs = fabricated_files(catalog, t_real, n, record_count=10)
-            for reg in regs:
-                reg["path"] = (
-                    f"{catalog.data_path}data/bench/real/{uuid.uuid4().hex}.parquet"
+            regs = []
+            for i in range(n):
+                reg, payload = build_real_registration(
+                    _probe_data((uploaded + i) * PROBE_ROWS),
+                    real_columns,
+                    data_path=catalog.data_path,
+                    namespace="bench",
+                    table="real",
                 )
-                reg["file_size_bytes"] = len(REAL_OBJECT_BYTES)
-                bench.put_object(reg["path"], REAL_OBJECT_BYTES)
+                bench.put_object(reg["path"], payload)
+                regs.append(reg)
             catalog._commit(
                 {"appends": [{"namespace": "bench", "table": "real", "files": regs}]}
             )

@@ -520,4 +520,621 @@ class FooterStatsTest {
         assertThat(out).containsOnlyKeys(1L)
         assertThat(out[1L]!!.upperBound).isEqualTo(le(2L))
     }
+
+    // ---- the DuckLake scalar-parity types ----------------------------------
+    //
+    // Bounds are always the MAPPED Iceberg type's encoding, so the
+    // assertions below are really assertions about docs/iceberg-federation.md
+    // §2's table: 4-byte ints for everything int-mapped, 8-byte longs for
+    // uint32, decimal bytes for uint64, micros for the timestamp
+    // precisions and nanos for timestamp_ns.
+
+    @Test
+    fun `small int widths ride int32 and keep the 4-byte int bound`() {
+        val widths =
+            listOf(
+                Triple(ColType.INT8, 8, true),
+                Triple(ColType.INT16, 16, true),
+                Triple(ColType.UINT8, 8, false),
+                Triple(ColType.UINT16, 16, false),
+            )
+        for ((type, width, signed) in widths) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, signed),
+                )
+            val lo = if (signed) -5 else 0
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(lo), le(9)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isEqualTo(le(lo))
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isEqualTo(le(9))
+        }
+    }
+
+    @Test
+    fun `uint32 from the hoglake-written int64 form is a plain long bound`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0L), le(4_294_967_295L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(0L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(4_294_967_295L))
+    }
+
+    @Test
+    fun `uint32 from an arrow-written unsigned int32 zero-extends past 2 to the 31`() {
+        // The bug this pins: sign-extending 0xFFFFFFFF gives -1, which is
+        // not a uint32 bound and inverts the range.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(-1)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(0L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(4_294_967_295L))
+    }
+
+    @Test
+    fun `uint32 from an int32 WITHOUT the unsigned annotation drops bounds`() {
+        // Without the annotation parquet computed min/max in SIGNED order,
+        // so reinterpreting them as unsigned would invert the range. Null,
+        // never guessed.
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT32)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(7)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT32, null))
+        assertThat(out[1L]!!.valueCount).isEqualTo(10)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `an unsigned int32 under a catalog long zero-extends at every width`() {
+        // A `long` column's domain contains every unsigned value up to
+        // 32 bits, and arrow and DuckDB both emit unsigned data as INT32
+        // + INT(w, unsigned), so a client declaring the column `long`
+        // produces exactly this pairing with no ALTER involved.
+        // Sign-extending it is the ParquetRewriter hazard in its
+        // read-path twin: 0xFFFFFFFF becomes -1, the upper bound lands
+        // BELOW the lower one, and a pruner silently drops the file.
+        val widths = listOf(8 to 255, 16 to 65_535, 32 to -1)
+        for ((width, maxBits) in widths) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(maxBits)))))
+            val out = agg(m, CatalogColumn(1, "a", ColType.LONG, null))
+            val expectedMax = maxBits.toLong() and 0xFFFFFFFFL
+            assertThat(out[1L]!!.lowerBound).describedAs("uint%d lower", width).isEqualTo(le(0L))
+            assertThat(out[1L]!!.upperBound)
+                .describedAs("uint%d upper (must zero-extend, not sign-extend)", width)
+                .isEqualTo(le(expectedMax))
+        }
+    }
+
+    @Test
+    fun `a signed int32 under a catalog long still sign-extends`() {
+        // The control: the pre-existing int -> long promotion must keep
+        // meaning what it meant.
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT32)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(-7), le(9)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.LONG, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(-7L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(9L))
+    }
+
+    @Test
+    fun `an unsigned int64 under any catalog type but uint64 drops bounds`() {
+        // Found by QeFooterStatsBoundsPropertyTest's lower <= upper
+        // invariant. Parquet ordered this chunk UNSIGNED, so a long
+        // column reading the same bits signed inherits an ordering it
+        // disagrees with — and the values above 2^63 are not longs at
+        // all. uint64 is the one reader that zero-extends into a
+        // decimal(20,0) bound, so it is the one reader allowed.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.intType(64, false),
+            )
+        // Unsigned-ordered min/max whose signed reading inverts.
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1L), le(-1L)))))
+        for (type in listOf(ColType.LONG, ColType.TIMESTAMP, ColType.TIMESTAMPTZ, ColType.DECIMAL)) {
+            val out = agg(m, CatalogColumn(1, "a", type, 0))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isNull()
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isNull()
+        }
+        // The allowed reader still gets its bounds, right way up.
+        val ok = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        assertThat(ok[1L]!!.lowerBound).isEqualTo(java.math.BigInteger.ONE.toByteArray())
+        assertThat(ok[1L]!!.upperBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+    }
+
+    @Test
+    fun `an unsigned int32 under a date column drops bounds`() {
+        // Same find, same shape: date maps to Iceberg int and reads the
+        // int32 signed, so an unsigned-ordered chunk inverts under it.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1), le(-1)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.DATE, null))
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `a NARROW unsigned annotation is refused by types too small to hold it`() {
+        // The per-width half of the rule, which a full-width-only gate
+        // gets wrong while looking fine: INT(16, unsigned) holding 65535
+        // decodes to a positive int, fits four bytes, and sorts the right
+        // way round — it is simply not an int8 bound. Every row here is a
+        // narrow width, because the wide ones cannot tell the two rules
+        // apart.
+        val cases =
+            listOf(
+                // (catalog type, annotation width, the value that overflows it)
+                Triple(ColType.INT8, 8, 255),
+                Triple(ColType.INT8, 16, 65_535),
+                Triple(ColType.INT16, 16, 65_535),
+                Triple(ColType.UINT8, 16, 65_535),
+            )
+        for ((type, width, max) in cases) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(max)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.valueCount)
+                .describedAs("%s keeps its counts", type.wire)
+                .isEqualTo(10)
+            assertThat(out[1L]!!.lowerBound)
+                .describedAs("%s must not bound an INT(%d, unsigned) leaf", type.wire, width)
+                .isNull()
+            assertThat(out[1L]!!.upperBound).describedAs("%s upper", type.wire).isNull()
+        }
+    }
+
+    @Test
+    fun `a narrow unsigned annotation IS read by types that contain it`() {
+        // The control for the rule's other side: int16 holds 255, int
+        // holds 65535, and refusing those would lose bounds on files
+        // nothing is wrong with.
+        val cases =
+            listOf(
+                Triple(ColType.INT16, 8, 255),
+                Triple(ColType.INT, 8, 255),
+                Triple(ColType.INT, 16, 65_535),
+                Triple(ColType.UINT8, 8, 255),
+                Triple(ColType.UINT16, 16, 65_535),
+            )
+        for ((type, width, max) in cases) {
+            val a =
+                leaf(
+                    "a",
+                    PrimitiveType.PrimitiveTypeName.INT32,
+                    logical = LogicalTypeAnnotation.intType(width, false),
+                )
+            val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(max)))))
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.lowerBound)
+                .describedAs("%s reads an INT(%d, unsigned) leaf", type.wire, width)
+                .isEqualTo(le(0))
+            assertThat(out[1L]!!.upperBound).describedAs("%s upper", type.wire).isEqualTo(le(max))
+        }
+    }
+
+    @Test
+    fun `an unsigned int32 under an int-mapped catalog type drops bounds`() {
+        // No legal promotion produces this pairing (nothing promotes INTO
+        // int from uint32), so it can only arrive from a foreign writer
+        // disagreeing with the declared type. The values do not fit a
+        // 4-byte signed Iceberg int bound and parquet ordered the chunk's
+        // min/max unsigned, so there is nothing honest to store.
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT32,
+                logical = LogicalTypeAnnotation.intType(32, false),
+            )
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(0), le(-1)))))
+        for (type in listOf(ColType.INT, ColType.INT8, ColType.INT16, ColType.UINT8, ColType.UINT16)) {
+            val out = agg(m, CatalogColumn(1, "a", type, null))
+            assertThat(out[1L]!!.valueCount).describedAs(type.wire).isEqualTo(10)
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isNull()
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isNull()
+        }
+    }
+
+    @Test
+    fun `uint64 bounds are the decimal encoding of the unsigned value`() {
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.intType(64, false),
+            )
+        // max is the bit pattern of 2^64-1; min is 2^63 (Long.MIN_VALUE's bits).
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(Long.MIN_VALUE), le(-1L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        // 2^63 and 2^64-1 both need the leading 0x00 sign byte.
+        assertThat(out[1L]!!.lowerBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(63).toByteArray())
+        assertThat(out[1L]!!.upperBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+    }
+
+    @Test
+    fun `uint64 without the unsigned annotation drops bounds`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1L), le(2L)))))
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        assertThat(out[1L]!!.lowerBound).isNull()
+    }
+
+    @Test
+    fun `timestamp_s files are physically millis and still bound in micros`() {
+        // Parquet has no seconds unit, so this IS the shape a timestamp_s
+        // column's files have (pyarrow coerces timestamp[s] to MILLIS).
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(-1_000L), le(2_000L)))))
+        for (type in listOf(ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS)) {
+            val out = agg(m, CatalogColumn(1, "ts", type, null))
+            assertThat(out[1L]!!.lowerBound).describedAs(type.wire).isEqualTo(le(-1_000_000L))
+            assertThat(out[1L]!!.upperBound).describedAs(type.wire).isEqualTo(le(2_000_000L))
+        }
+    }
+
+    @Test
+    fun `timestamp_ns bounds are nanos, not micros`() {
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.NANOS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(-1_500L), le(2_500L)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+        // Verbatim: no flooring, no ceiling, no unit change.
+        assertThat(out[1L]!!.lowerBound).isEqualTo(le(-1_500L))
+        assertThat(out[1L]!!.upperBound).isEqualTo(le(2_500L))
+    }
+
+    @Test
+    fun `timestamp_ns scales a millis or micros file UP exactly`() {
+        val scales =
+            listOf(
+                LogicalTypeAnnotation.TimeUnit.MILLIS to 1_000_000L,
+                LogicalTypeAnnotation.TimeUnit.MICROS to 1_000L,
+            )
+        for ((unit, factor) in scales) {
+            val ts =
+                leaf(
+                    "ts",
+                    PrimitiveType.PrimitiveTypeName.INT64,
+                    logical = LogicalTypeAnnotation.timestampType(false, unit),
+                )
+            val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(3L), le(4L)))))
+            val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+            assertThat(out[1L]!!.lowerBound).describedAs("$unit").isEqualTo(le(3L * factor))
+        }
+    }
+
+    @Test
+    fun `timestamp_ns scaling overflow drops bounds, never throws`() {
+        val ts =
+            leaf(
+                "ts",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.timestampType(false, LogicalTypeAnnotation.TimeUnit.MILLIS),
+            )
+        val m = meta(schema(ts), 10, listOf(chunk(ts, 10, stats(ts, le(1L), le(Long.MAX_VALUE)))))
+        val out = agg(m, CatalogColumn(1, "ts", ColType.TIMESTAMP_NS, null))
+        assertThat(out).containsOnlyKeys(1L)
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    @Test
+    fun `json bounds are the document bytes, compared unsigned like string`() {
+        val j =
+            leaf(
+                "j",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.jsonType(),
+            )
+        val m =
+            meta(
+                schema(j),
+                20,
+                listOf(chunk(j, 10, stats(j, "{\"a\":1}".toByteArray(), "{\"µ\":2}".toByteArray()))),
+                listOf(chunk(j, 10, stats(j, "{\"b\":1}".toByteArray(), "{\"c\":2}".toByteArray()))),
+            )
+        val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo("{\"a\":1}".toByteArray())
+        // 'µ' is 0xC2 0xB5 in UTF-8 — above 'c' only under an UNSIGNED
+        // byte compare, which is the one that matches Iceberg's ordering.
+        assertThat(out[1L]!!.upperBound).isEqualTo("{\"µ\":2}".toByteArray())
+    }
+
+    @Test
+    fun `json also reads a plain BYTE_ARRAY with no JSON annotation`() {
+        // The annotation changes neither the bytes nor their sort order,
+        // so requiring it would only lose bounds on files from writers
+        // that do not stamp it.
+        val j = leaf("j", PrimitiveType.PrimitiveTypeName.BINARY)
+        val m = meta(schema(j), 10, listOf(chunk(j, 10, stats(j, "[]".toByteArray(), "{}".toByteArray()))))
+        val out = agg(m, CatalogColumn(1, "j", ColType.JSON, null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo("[]".toByteArray())
+    }
+
+    @Test
+    fun `variant group field id governs renames and child stats are omitted`() {
+        val variant =
+            Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                .named("old_properties")
+        val schema = schema(variant)
+        assertThat(FooterStats.usesFieldIds(schema)).isTrue()
+        assertThat(FooterStats.missingFieldIds(schema)).isFalse()
+        assertThat(agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.VARIANT, null))).isEmpty()
+
+        // DEGRADES, where #77 threw. `aggregate` is documented total and
+        // every other shape disagreement in this object takes the
+        // offending subtree out of the results with a warning; throwing
+        // cost the whole FILE its stats — every other column included —
+        // for a column that produces none either way. The observable
+        // contract is the same where it matters: no stats row.
+        assertThat(agg(meta(schema, 1), CatalogColumn(7, "renamed", ColType.STRING, null)))
+            .describedAs("a variant group bound to a scalar column yields nothing")
+            .isEmpty()
+        val plain =
+            Types.optionalGroup().id(7)
+                .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("properties")
+        assertThat(agg(meta(schema(plain), 1), CatalogColumn(7, "properties", ColType.VARIANT, null)))
+            .describedAs("a group without the variant annotation is not a variant")
+            .isEmpty()
+    }
+
+    @Test
+    fun `a CONTAINER column bound to a variant group fabricates nothing`(
+        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
+    ) {
+        // #77's aggregate prologue had a second check — "native VARIANT
+        // cannot bind to scalar column" — and the merge dropped it,
+        // because for a SCALAR the group-vs-primitive fallthrough covers
+        // it. It does not cover a CONTAINER: isContainerAnnotation knows
+        // only LIST/MAP/MAP_KEY_VALUE, so a catalog struct descended
+        // into metadata/value/typed_value, and the name fallback (those
+        // children carry no ids, so it applies even under useFieldIds)
+        // bound a struct field literally named `value` to the variant's
+        // binary payload. Measured before the fix: bounds AAA..zzz for a
+        // column that has no such values.
+        //
+        // A REAL file with real chunk statistics: a synthesized footer
+        // with no chunks produces no stats whatever the binding does, so
+        // the assertion would have held with the guard deleted.
+        fun fileWith(id: Int?): java.nio.file.Path {
+            val b =
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte()))
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+            val schema = MessageType("m", listOf<Type>(if (id != null) b.id(id).named("p") else b.named("p")))
+            val path = tmp.resolve("variant-${id ?: "noid"}.parquet")
+            val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+            org.apache.parquet.hadoop.example.ExampleParquetWriter
+                .builder(org.apache.parquet.io.LocalOutputFile(path))
+                .withType(schema)
+                .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
+                .build()
+                .use { w ->
+                    for (v in listOf("AAA", "mmm", "zzz")) {
+                        val g = factory.newGroup()
+                        g.addGroup(0).also {
+                            it.add(0, org.apache.parquet.io.api.Binary.fromString("meta"))
+                            it.add(1, org.apache.parquet.io.api.Binary.fromString(v))
+                        }
+                        w.write(g)
+                    }
+                }
+            return path
+        }
+
+        fun statsFor(
+            path: java.nio.file.Path,
+            col: CatalogColumn,
+        ) = FooterStats.aggregate(
+            FooterParse.parse(org.apache.parquet.io.LocalInputFile(path)),
+            listOf(col),
+            path.toString(),
+        )
+
+        val struct =
+            CatalogColumn(
+                1,
+                "p",
+                ColType.STRUCT,
+                null,
+                children = listOf(CatalogColumn(2, "value", ColType.STRING, null)),
+            )
+        // The sanity check the vacuous version lacked: this file really
+        // does carry bounds, so an empty result means the BINDING
+        // refused, not that there was nothing to find.
+        assertThat(statsFor(fileWith(1), CatalogColumn(1, "p", ColType.VARIANT, null)))
+            .describedAs("a variant column yields no stats either, by design")
+            .isEmpty()
+        assertThat(statsFor(fileWith(1), struct)).describedAs("id-bearing file").isEmpty()
+        assertThat(statsFor(fileWith(null), struct)).describedAs("name-fallback file").isEmpty()
+        assertThat(
+            statsFor(
+                fileWith(1),
+                CatalogColumn(
+                    1,
+                    "p",
+                    ColType.LIST,
+                    null,
+                    children = listOf(CatalogColumn(2, "element", ColType.STRING, null)),
+                ),
+            ),
+        ).describedAs("list column").isEmpty()
+    }
+
+    @Test
+    fun `an invalid variant is reported, with the fault named`(
+        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
+    ) {
+        // The merge turned #77's throw into a degrade, which is right —
+        // `aggregate` is total — but a degrade nobody can see is a
+        // silent drop. #77's test asserted the THROW's message; the
+        // rewrite asserted only `.isEmpty()`, which the generic
+        // shape-mismatch arm satisfies, so `variantFault`'s six messages
+        // became unreachable-by-test. Assert the warn.
+        val events = java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>()
+        val appender =
+            object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+                override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = org.slf4j.LoggerFactory.getILoggerFactory() as ch.qos.logback.classic.LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(FooterStats::class.java.name) as ch.qos.logback.classic.Logger
+        logger.addAppender(appender)
+        try {
+            fun faultOf(
+                label: String,
+                group: Type,
+            ): String {
+                events.clear()
+                val schema = MessageType("m", listOf(group))
+                val path = tmp.resolve("$label.parquet")
+                val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+                org.apache.parquet.hadoop.example.ExampleParquetWriter
+                    .builder(org.apache.parquet.io.LocalOutputFile(path))
+                    .withType(schema)
+                    .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                    .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
+                    .build()
+                    .use { w -> w.write(factory.newGroup()) }
+                FooterStats.aggregate(
+                    FooterParse.parse(org.apache.parquet.io.LocalInputFile(path)),
+                    listOf(CatalogColumn(1, "p", ColType.VARIANT, null)),
+                    path.toString(),
+                )
+                return events.filter { it.level == ch.qos.logback.classic.Level.WARN }
+                    .joinToString(" | ") { it.formattedMessage }
+            }
+
+            // No variant annotation at all.
+            assertThat(
+                faultOf(
+                    "plain",
+                    Types.optionalGroup().id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).contains("is not a native parquet VARIANT of spec version 1")
+
+            // Annotated, but `metadata` is optional where the spec says required.
+            assertThat(
+                faultOf(
+                    "optional-metadata",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).contains("has no REQUIRED binary 'metadata'")
+
+            // A child the variant spec does not define.
+            assertThat(
+                faultOf(
+                    "stray-child",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("stray").named("p"),
+                ),
+            ).contains("outside metadata/value/typed_value")
+
+            // Neither payload child.
+            assertThat(
+                faultOf(
+                    "no-payload",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata").named("p"),
+                ),
+            ).contains("has neither 'value' nor 'typed_value'")
+
+            // And a WELL-FORMED variant logs nothing: the degrade must
+            // not fire on the shape it is meant to accept.
+            assertThat(
+                faultOf(
+                    "good",
+                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+                ),
+            ).describedAs("a valid variant is silent").isEmpty()
+        } finally {
+            logger.detachAppender(appender)
+        }
+    }
+
+    @Test
+    fun `DuckDB native fixture hydrates scalar stats and preserves variant field identity`() {
+        val path = java.nio.file.Path.of(javaClass.getResource("/variant/native_variant.parquet")!!.toURI())
+        org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(path)).use { reader ->
+            assertThat(FooterStats.missingFieldIds(reader.footer.fileMetaData.schema)).isFalse()
+            val stats =
+                agg(
+                    reader.footer,
+                    CatalogColumn(1, "id", ColType.LONG, null),
+                    CatalogColumn(2, "properties", ColType.VARIANT, null),
+                )
+            assertThat(stats.keys).containsExactly(1L)
+        }
+    }
+
+    @Test
+    fun `a nested group's own field id DOES gate the file, now that groups are columns`() {
+        // #77 asserted FALSE here, and that was right in a world where a
+        // parquet group was never a catalog column: an id on one meant
+        // nothing, so ignoring it was free. Containers changed the
+        // premise — a struct/list/map wrapper IS a catalog column with
+        // its own field id — and ignoring it was the round-1 data
+        // substitution: a file with ids on its wrappers and none on its
+        // leaves read as id-less, so the reader produced no stats while
+        // the rewriter copied it by name.
+        val nested =
+            Types.optionalGroup().id(9)
+                .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("child").named("nested")
+        assertThat(FooterStats.usesFieldIds(schema(nested)))
+            .describedAs("a group carrying an id is a binding node")
+            .isTrue()
+        // And the child that carries none still flags the contract.
+        assertThat(FooterStats.missingFieldIds(schema(nested))).isTrue()
+    }
 }

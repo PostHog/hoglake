@@ -168,28 +168,65 @@ CREATE TABLE hog_column (
     name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
     -- Closed type set: every member has a defined Iceberg mapping
     -- (iceberg-federation.md §2). Extend by migration, never ad hoc.
+    -- Member ORDER is load-bearing: V4__scalar_types.sql and
+    -- V9__nested_types.sql recreate this constraint and the
+    -- schema-equivalence gate compares the normalized
+    -- pg_get_constraintdef text, which preserves the order.
+    -- list/struct/map are CONTAINERS: they carry no values, they have
+    -- child rows (parent_field_id below), and they never carry stats.
     col_type       text   NOT NULL CHECK (col_type IN (
-                       'boolean', 'int', 'long', 'float', 'double',
-                       'decimal', 'date', 'time', 'timestamp',
-                       'timestamptz', 'string', 'uuid', 'binary')),
+                       'boolean', 'int8', 'int16', 'int', 'long', 'uint8', 'uint16',
+                       'uint32', 'uint64', 'float', 'double', 'decimal', 'date', 'time',
+                       'timestamp_s', 'timestamp_ms', 'timestamp', 'timestamp_ns',
+                       'timestamptz', 'string', 'json', 'uuid', 'binary', 'variant',
+                       'list', 'struct', 'map')),
     type_params    jsonb,          -- e.g. {"precision":38,"scale":9} for decimal
     nullable       boolean NOT NULL DEFAULT true,
+    -- Orders SIBLINGS: 0-based within the parent (top-level columns
+    -- share the NULL parent).
     ordinal        int    NOT NULL CHECK (ordinal >= 0),
+    -- The tree edge (V9): NULL = top-level column, else the field_id of
+    -- the containing list/struct/map. A same-table reference by
+    -- (catalog_id, table_id, field_id) IDENTITY and deliberately NOT a
+    -- foreign key: these rows are versioned (begin_snapshot is in the
+    -- PK), so an FK would have to name one VERSION of the parent and
+    -- would break the moment the parent is renamed or promoted. Field
+    -- ids are stable across versions; versions are not.
+    parent_field_id bigint,
     PRIMARY KEY (catalog_id, table_id, field_id, begin_snapshot),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
-    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
+    CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot),
+    -- The one cycle a single row can express on its own. Deeper cycles
+    -- are impossible by construction (ids are allocated strictly
+    -- increasing, parents before children).
+    CONSTRAINT hog_column_parent_not_self
+        CHECK (parent_field_id IS NULL OR parent_field_id <> field_id),
+    -- Ids are allocated depth-first, parents before children, so a
+    -- parent's id is always BELOW its children's. That ordering is what
+    -- makes deeper cycles impossible by construction; as a row-local
+    -- CHECK it costs nothing and it subsumes the self-reference above,
+    -- which keeps its own name because its message is the one a
+    -- confused client needs.
+    CONSTRAINT hog_column_parent_precedes_child
+        CHECK (parent_field_id IS NULL OR parent_field_id < field_id)
 );
 CREATE INDEX hog_column_live
     ON hog_column (catalog_id, table_id) WHERE end_snapshot IS NULL;
 -- Writers stamp parquet field order from ordinals: a duplicate live
 -- ordinal is a silent corruption vector, so the DB refuses it.
+-- Per-PARENT since V9 — ordinals order siblings, so two struct fields in
+-- different structs are both legitimately ordinal 0. NULLS NOT DISTINCT
+-- keeps the guarantee for top-level columns, whose parent_field_id is
+-- NULL: without it Postgres treats every NULL as distinct and the
+-- duplicate-ordinal vector comes back for exactly the rows this index
+-- used to cover.
 -- IMMEDIATE and write-order-sensitive: a single-statement swap of two
 -- live ordinals violates it mid-update (verified). Every alter op must
 -- end-snapshot old rows before inserting new ones (AlterService does);
 -- a future reorder-columns op must keep that shape or this index must
 -- become a deferrable constraint.
 CREATE UNIQUE INDEX hog_column_live_ordinal
-    ON hog_column (catalog_id, table_id, ordinal)
+    ON hog_column (catalog_id, table_id, parent_field_id, ordinal) NULLS NOT DISTINCT
     WHERE end_snapshot IS NULL;
 
 -- Table-level rollup + the row-id allocator. One row per table, created
@@ -553,3 +590,32 @@ CREATE INDEX hog_data_file_changefeed
     ON hog_data_file (catalog_id, table_id, begin_snapshot);
 CREATE INDEX hog_delete_file_changefeed
     ON hog_delete_file (catalog_id, table_id, begin_snapshot);
+-- Durable receipts are deliberately retained; expiry only closes prepared operations.
+CREATE TABLE hog_table_creation (
+    catalog_id bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    operation_id uuid NOT NULL,
+    namespace_id bigint NOT NULL,
+    definition jsonb NOT NULL,
+    table_uuid uuid NOT NULL,
+    write_path text NOT NULL,
+    state text NOT NULL DEFAULT 'prepared' CHECK (state IN ('prepared', 'committed', 'rejected', 'aborted')),
+    expires_at timestamptz NOT NULL DEFAULT clock_timestamp() + interval '24 hours',
+    files jsonb,
+    snapshot_id bigint,
+    schema_version bigint,
+    reason text,
+    PRIMARY KEY (catalog_id, operation_id),
+    UNIQUE (catalog_id, table_uuid),
+    CHECK ((state = 'committed') = (snapshot_id IS NOT NULL AND schema_version IS NOT NULL))
+);
+
+-- Publication receipts outlive snapshot expiry: retrying an old request must
+-- never publish it again. Keys are scoped to a catalog and immutable payload.
+CREATE TABLE hog_commit_receipt (
+    catalog_id BIGINT NOT NULL REFERENCES hog_catalog(catalog_id) ON DELETE CASCADE,
+    idempotency_key UUID NOT NULL,
+    request JSONB NOT NULL,
+    snapshot_id BIGINT NOT NULL,
+    schema_version BIGINT NOT NULL,
+    PRIMARY KEY (catalog_id, idempotency_key)
+);

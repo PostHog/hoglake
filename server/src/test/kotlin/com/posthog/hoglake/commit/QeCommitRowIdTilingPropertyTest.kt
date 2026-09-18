@@ -22,7 +22,7 @@ import org.junit.jupiter.api.TestInstance
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * The lineage guarantee as a property (fuzzing.md layer 1): for
+ * The lineage guarantee as a property (docs/fuzzing.md layer 1): for
  * GENERATED sequences of append commits — random table subsets, file
  * counts, and record counts INCLUDING zero-record files — the per-table
  * row-id ranges must tile [0, totalRows) exactly, in commit order, with

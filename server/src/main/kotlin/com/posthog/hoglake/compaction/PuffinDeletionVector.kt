@@ -32,7 +32,7 @@ class DeletionVector internal constructor(
 
 /**
  * Reader for hoglake's one delete encoding: an Iceberg v3 puffin file
- * carrying a single `deletion-vector-v1` blob (iceberg-federation.md §4
+ * carrying a single `deletion-vector-v1` blob (docs/iceberg-federation.md §4
  * — internal readers and the facade share this encoding by design; the
  * hog_delete_file.file_format vocabulary is exactly 'puffin-dv').
  *
@@ -128,11 +128,29 @@ object PuffinDeletionVector {
         val bucketCount = java.lang.Long.reverseBytes(stream.readLong())
         require(bucketCount in 0..Int.MAX_VALUE.toLong()) { "implausible DV bucket count $bucketCount" }
         val buckets = LinkedHashMap<Int, RoaringBitmap>()
-        repeat(Math.toIntExact(bucketCount)) {
+        repeat(Math.toIntExact(bucketCount)) { bucket ->
             val key = Integer.reverseBytes(stream.readInt())
             val bitmap = RoaringBitmap()
-            // The Java stream format IS the spec's portable 32-bit format.
-            bitmap.deserialize(stream)
+            // The Java stream format IS the spec's portable 32-bit format,
+            // so the container count and every container's size are read
+            // by the roaring library from bytes we do not get to validate
+            // first: reimplementing that parse here to bounds-check it
+            // would duplicate the library's format knowledge and rot the
+            // day the format gains a variant. Contain it instead. A
+            // hostile size surfaces as NegativeArraySizeException (#83);
+            // the catch is by CATEGORY, not by class, so the next shape
+            // this parser fails on is covered the day it appears.
+            // IOException is deliberately not caught — a truncated stream
+            // is already an honest refusal.
+            try {
+                bitmap.deserialize(stream)
+            } catch (e: RuntimeException) {
+                throw IllegalArgumentException(
+                    "corrupt $BLOB_TYPE roaring bitmap in bucket $bucket (key $key): " +
+                        "${e.javaClass.name}: ${e.message ?: "<no message>"}",
+                    e,
+                )
+            }
             require(buckets.put(key, bitmap) == null) { "duplicate DV bucket key $key" }
         }
         require(stream.read() == -1) { "trailing bytes after the DV bitmap" }

@@ -6,12 +6,19 @@ Two totality claims under test:
    type and back to itself; every canonical arrow type is a fixed point
    after one round-trip (non-canonical spellings — large_string,
    tz-of-any-name, uuid extension — converge to a fixed point in one
-   hop and never drift further).
-2. Rejection completeness: every generated exotic arrow type (other
-   int widths, other temporal units, decimal256, and ANY nested or
-   parameterized combinator, even over supported inner types) raises
+   hop and never drift further). "uint32" is the ONE exception, carved
+   out into its own test: its writer contract is pa.int64(), so it
+   settles on "long" — see test_uint32_converges_to_long_in_one_hop.
+2. Rejection completeness: every generated exotic arrow type (float16,
+   date64, the time32/time64(ns) widths, tz-aware non-micros
+   timestamps, durations, decimal256, dictionaries) raises
    UnsupportedTypeError — never a silent wrong mapping, never a
-   different exception type.
+   different exception type — AND so does any nesting that contains
+   one, however deep. list/struct/map over supported inner types are
+   themselves supported since phase 2, so the exotic generator is
+   rooted at unsupported LEAVES: every type it builds carries at least
+   one, which is what keeps the property about rejection rather than
+   about nesting.
 """
 
 import pyarrow as pa
@@ -31,20 +38,36 @@ from pyhoglake.types import (
 
 # -- generators -------------------------------------------------------------
 
+#: pa.json_() arrived in pyarrow 19; the project floor is 17. Without it
+#: "json" maps to pa.string() and comes back as "string", so it is not a
+#: round-trip type on that pyarrow and must leave the identity property.
+HAS_JSON = hasattr(pa, "json_")
+
+#: Round-trip coltypes: coltype -> arrow -> the SAME coltype. "uint32" is
+#: deliberately absent (it maps to pa.int64(), i.e. "long" on the way
+#: back) — see test_uint32_converges_to_long_in_one_hop.
 SIMPLE_COLTYPES = [
     "boolean",
+    "int8",
+    "int16",
     "int",
     "long",
+    "uint8",
+    "uint16",
+    "uint64",
     "float",
     "double",
     "string",
     "binary",
     "date",
     "time",
+    "timestamp_s",
+    "timestamp_ms",
     "timestamp",
+    "timestamp_ns",
     "timestamptz",
     "uuid",
-]
+] + (["json"] if HAS_JSON else [])
 
 coltype_with_params = st.one_of(
     st.tuples(st.sampled_from(SIMPLE_COLTYPES), st.none()),
@@ -60,18 +83,27 @@ canonical_arrow = st.one_of(
     st.sampled_from(
         [
             pa.bool_(),
+            pa.int8(),
+            pa.int16(),
             pa.int32(),
             pa.int64(),
+            pa.uint8(),
+            pa.uint16(),
+            pa.uint64(),
             pa.float32(),
             pa.float64(),
             pa.string(),
             pa.binary(),
             pa.date32(),
             pa.time64("us"),
+            pa.timestamp("s"),
+            pa.timestamp("ms"),
             pa.timestamp("us"),
+            pa.timestamp("ns"),
             pa.timestamp("us", tz="UTC"),
             pa.binary(16),
         ]
+        + ([pa.json_()] if HAS_JSON else [])
     ),
     st.integers(1, 38).flatmap(
         lambda p: st.integers(0, p).map(lambda s: pa.decimal128(p, s))
@@ -87,20 +119,15 @@ noncanonical_arrow = st.one_of(
 
 _unsupported_scalars = [
     pa.null(),
-    pa.int8(),
-    pa.int16(),
-    pa.uint8(),
-    pa.uint16(),
-    pa.uint32(),
-    pa.uint64(),
     pa.float16(),
     pa.date64(),
     pa.time32("s"),
     pa.time32("ms"),
     pa.time64("ns"),
-    pa.timestamp("s"),
-    pa.timestamp("ms"),
-    pa.timestamp("ns"),
+    # tz-aware is micros-only: hoglake has no timestamptz_s/_ms/_ns, so a
+    # tz-aware second/milli/nano column has nowhere to land.
+    pa.timestamp("s", tz="UTC"),
+    pa.timestamp("ms", tz="UTC"),
     pa.timestamp("ns", tz="UTC"),
     pa.timestamp("s", tz="America/New_York"),
     pa.duration("s"),
@@ -115,31 +142,37 @@ unsupported_scalar = st.one_of(
     st.sampled_from(_unsupported_scalars),
     # fixed_size_binary of any width except the uuid-blessed 16
     st.integers(1, 64).filter(lambda w: w != 16).map(pa.binary),
+    # dictionary-encoded: even dictionary<string> must be rejected. A
+    # LEAF, not a nesting — hoglake has no dictionary column type, so
+    # there is nothing to descend into.
+    st.sampled_from([pa.string(), pa.int64()]).map(
+        lambda v: pa.dictionary(pa.int32(), v)
+    ),
 )
-
-any_inner = st.one_of(canonical_arrow, unsupported_scalar)
 
 
 def _nest(inner: st.SearchStrategy) -> st.SearchStrategy:
+    """Wrap a strategy in every container spelling arrow offers."""
     return st.one_of(
         inner.map(pa.list_),
         inner.map(pa.large_list),
         st.tuples(inner, st.integers(1, 4)).map(lambda t: pa.list_(t[0], t[1])),
         inner.map(lambda t: pa.struct([("a", t)])),
         st.tuples(inner, inner).map(lambda t: pa.struct([("a", t[0]), ("b", t[1])])),
-        st.tuples(canonical_arrow, inner).map(lambda t: pa.map_(pa.string(), t[1])),
-        # dictionary-encoded: even dictionary<string> must be rejected
-        st.sampled_from([pa.string(), pa.int64()]).map(
-            lambda v: pa.dictionary(pa.int32(), v)
-        ),
+        inner.map(lambda t: pa.map_(pa.string(), t)),
     )
 
 
-exotic_arrow = st.recursive(
-    st.one_of(unsupported_scalar, _nest(any_inner)),
-    _nest,
-    max_leaves=6,
-)
+#: Rooted at UNSUPPORTED leaves, so every generated type contains one
+#: however deeply it is wrapped. Nesting over supported leaves is the
+#: other property below (test_nested_over_supported_inner_is_supported).
+exotic_arrow = st.recursive(unsupported_scalar, _nest, max_leaves=6)
+
+#: The mirror: containers over supported inner types, which ARE
+#: supported. Without this the change that made list/struct/map real
+#: would have been invisible to this module — every assertion here is
+#: about refusal, and refusal got easier, not harder.
+supported_nested = st.recursive(canonical_arrow, _nest, max_leaves=4)
 
 
 # -- round-trip properties --------------------------------------------------
@@ -176,6 +209,28 @@ def test_noncanonical_arrow_converges_in_one_hop(t):
     assert coltype_to_arrow(c2, p2).equals(a1)  # stable thereafter
 
 
+def test_uint32_converges_to_long_in_one_hop():
+    """The single mapping that is not a round trip in EITHER direction,
+    and the only one excluded from the two identity properties above.
+
+    ``coltype_to_arrow("uint32")`` is ``pa.int64()`` on purpose (the
+    writer contract — pyarrow's pa.uint32() becomes parquet INT32 +
+    Int(32, unsigned), which an Iceberg reader takes as SIGNED, so
+    values above 2^31 would read back negative). So "uint32" settles on
+    "long" after one hop, and ``pa.uint32()`` settles on ``pa.int64()``.
+    Both then stay put — the mapping loses the unsigned NAME, never a
+    value, and never drifts further.
+    """
+    assert coltype_to_arrow("uint32") == pa.int64()
+    assert arrow_type_to_coltype(pa.int64()) == ("long", None)
+    assert coltype_to_arrow("long") == pa.int64()  # fixed point reached
+
+    assert arrow_type_to_coltype(pa.uint32()) == ("uint32", None)
+    a1 = coltype_to_arrow("uint32")
+    assert arrow_type_to_coltype(a1)[0] == "long"
+    assert coltype_to_arrow("long").equals(a1)  # stable thereafter
+
+
 # -- rejection completeness -------------------------------------------------
 
 
@@ -191,11 +246,42 @@ def test_exotic_types_rejected_at_schema_level_too(schema):
         schema_to_column_defs(schema)
 
 
+@given(supported_nested)
+def test_nested_over_supported_inner_is_supported(t):
+    """A container over supported leaves maps, and maps to a container.
+
+    The shape rules ride along: a list's child is always named `element`,
+    a map's are `key` (non-nullable) then `value`, and a struct's keep
+    their own names — the server enforces exactly this, so a client that
+    emitted anything else would be shipping a guaranteed 422.
+    """
+    coltype, params = arrow_type_to_coltype(t)
+    assert params is None or coltype == "decimal"
+    defs = schema_to_column_defs(pa.schema([pa.field("x", t)]))
+    assert len(defs) == 1
+    _assert_nested_shape(defs[0])
+
+
+def _assert_nested_shape(col):
+    kids = col.get("children")
+    if col["type"] not in ("list", "struct", "map"):
+        assert kids is None
+        return
+    assert kids, f"{col['type']} must have children"
+    if col["type"] == "list":
+        assert [k["name"] for k in kids] == ["element"]
+    elif col["type"] == "map":
+        assert [k["name"] for k in kids] == ["key", "value"]
+        assert kids[0]["nullable"] is False
+    for k in kids:
+        _assert_nested_shape(k)
+
+
 def test_unsupported_type_error_is_typeerror_and_hoglake_error():
     from pyhoglake import HoglakeError
 
     try:
-        arrow_type_to_coltype(pa.int8())
+        arrow_type_to_coltype(pa.float16())  # int8 is a supported type now
     except UnsupportedTypeError as e:
         assert isinstance(e, TypeError)
         assert isinstance(e, HoglakeError)

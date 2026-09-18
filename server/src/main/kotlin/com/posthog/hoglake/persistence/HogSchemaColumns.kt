@@ -17,6 +17,9 @@ package com.posthog.hoglake.persistence
 object HogSchemaColumns {
     val TABLES: Map<String, Set<String>> =
         mapOf(
+            // CommitService: immutable publication receipts, independent of snapshot retention.
+            "hog_commit_receipt" to
+                setOf("catalog_id", "idempotency_key", "request", "snapshot_id", "schema_version"),
             // MaintenanceSummarySampler: published samples + durable scan checkpoints.
             "hog_maintenance_summary" to
                 setOf(
@@ -67,6 +70,8 @@ object HogSchemaColumns {
                 setOf(
                     "catalog_id", "table_id", "field_id", "begin_snapshot", "end_snapshot",
                     "name", "col_type", "type_params", "nullable", "ordinal",
+                    // V9: the tree edge; NULL = top-level column.
+                    "parent_field_id",
                 ),
             // CommitService.writeAppends (rollup + row-id allocator).
             "hog_table_stats" to
@@ -125,6 +130,12 @@ object HogSchemaColumns {
                 setOf(
                     "removal_id", "catalog_id", "path", "file_kind", "reason", "scheduled_at",
                     "attempts", "last_attempt_at", "drained_at", "drained_outcome",
+                ),
+            // TableCreationService: immutable preparation and terminal receipts.
+            "hog_table_creation" to
+                setOf(
+                    "catalog_id", "operation_id", "namespace_id", "definition", "table_uuid",
+                    "write_path", "state", "expires_at", "files", "snapshot_id", "schema_version", "reason",
                 ),
             // MaintenanceRunStore (insert + last-run/history mappers),
             // CleanupService (retention purge).

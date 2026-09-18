@@ -20,7 +20,7 @@ import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * Property-based assault on the expiry floor math (fuzzing.md layer 1):
+ * Property-based assault on the expiry floor math (docs/fuzzing.md layer 1):
  * generated (head, freshness cut, retention, consumer offsets, files,
  * batch, floor flag) configurations are seeded into a REAL Postgres
  * catalog via SQL, ExpiryService.runOnce is executed, and the sweep's

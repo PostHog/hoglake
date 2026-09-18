@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.0.1-dev"
+version = "1.1.2-dev"
 
 repositories {
     mavenCentral()
@@ -71,7 +71,7 @@ dependencies {
 
     // Tests
     testImplementation(kotlin("test"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
+    testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.assertj:assertj-core:3.27.7")
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
@@ -83,7 +83,7 @@ dependencies {
     testImplementation("org.awaitility:awaitility:4.3.0")
     testImplementation("io.kotest:kotest-property:5.9.1")
 
-    // Coverage-guided fuzzing (fuzzing.md layer 4): jazzer-junit @FuzzTest
+    // Coverage-guided fuzzing (docs/fuzzing.md layer 4): jazzer-junit @FuzzTest
     // targets in src/test/kotlin/com/posthog/hoglake/fuzz. Inside the normal
     // :test run they replay the committed corpus deterministically
     // (regression mode); the `fuzz` task reruns the same targets under
@@ -101,6 +101,10 @@ application {
 
 tasks.test {
     useJUnitPlatform()
+    // Rehearse a Postgres major-version move against the whole suite:
+    // `./gradlew :test -PpgImage=postgres:18`. Unset, the harness pins
+    // the version production runs.
+    (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
     // Integration tests need Docker (Testcontainers); tag-gated so `gradle
     // test -PunitOnly` stays runnable without it.
     if (project.hasProperty("unitOnly")) {
@@ -119,7 +123,7 @@ tasks.test {
     }
 }
 
-// ---- fuzzing (fuzzing.md layer 4) -----------------------------------------
+// ---- fuzzing (docs/fuzzing.md layer 4) -----------------------------------------
 //
 // `./gradlew fuzz -PfuzzSeconds=300` runs every @FuzzTest target under
 // libFuzzer for the given per-target budget (default 60s). jazzer-junit
@@ -134,11 +138,13 @@ tasks.test {
 val fuzzTargets =
     listOf(
         "IcebergSingleValueDecodeFuzzTest",
+        "BoundWireFuzzTest",
         "IcebergSingleValueCompareFuzzTest",
         "ParquetFooterFuzzTest",
         "PuffinDeletionVectorFuzzTest",
         "IdentifiersFuzzTest",
         "WireDtoParseFuzzTest",
+        "NestedAgreementFuzzTest",
     )
 
 val fuzzSeconds = (project.findProperty("fuzzSeconds") as String?)?.toLongOrNull() ?: 60L
@@ -186,6 +192,56 @@ tasks.register("fuzz") {
     dependsOn(fuzzTasks)
 }
 
+// Deterministic seed-loop soak runner for the nested campaigns
+// (NestedFuzzSoak): the same oracles the jazzer target uses, driven by a
+// seeded RNG instead of libFuzzer, so every finding replays exactly with
+// -Pseeds=<seed>..<seed>. Complements `fuzz` rather than replacing it —
+// libFuzzer brings coverage feedback, this brings reproducibility and a
+// per-iteration hang timeout.
+//
+//   ./gradlew nestedSoak -Pcampaign=agreement -Pseeds=0..100000 -PtimeBudget=1200
+//
+// campaigns: agreement | footer | data | trees | codec
+tasks.register<JavaExec>("nestedSoak") {
+    description = "Deterministic nested fuzz soak (manual; -Pcampaign, -Pseeds, -PtimeBudget)"
+    group = "verification"
+    mainClass.set("com.posthog.hoglake.fuzz.NestedFuzzSoak")
+    classpath = sourceSets.test.get().runtimeClasspath
+    val seeds = (project.findProperty("seeds") as String?) ?: "0..10000"
+    val range = seeds.split("..")
+    args(
+        (project.findProperty("campaign") as String?) ?: "agreement",
+        range.first(),
+        range.getOrElse(1) { range.first() },
+        (project.findProperty("timeBudget") as String?) ?: "600",
+        (project.findProperty("iterationTimeout") as String?) ?: "30",
+        (project.findProperty("strictDomains") as String?) ?: "true",
+    )
+}
+
+// The soak FLEET: `nestedSoak` is one JVM, and one JVM saturates one of
+// twelve cores. A real campaign partitions the seed space across ~9-10
+// detached workers, which needs the test classpath as a plain file so a
+// worker can be launched without Gradle (a Gradle daemon per worker
+// would spend the cores on Gradle).
+//
+//   ./gradlew writeTestClasspath
+//   for w in 0 1 2 ...; do
+//     java -cp "$(cat build/test-classpath.txt)" \
+//       com.posthog.hoglake.fuzz.NestedFuzzSoak agreement $from $to 1400 90 true &
+//   done
+tasks.register("writeTestClasspath") {
+    description = "Write the test runtime classpath to build/test-classpath.txt (soak fleet)"
+    group = "verification"
+    val cp = sourceSets.test.get().runtimeClasspath
+    val out = layout.buildDirectory.file("test-classpath.txt")
+    dependsOn(cp)
+    outputs.file(out)
+    doLast {
+        out.get().asFile.writeText(cp.asPath)
+    }
+}
+
 // One-shot (manual) seed-corpus generator: writes the committed corpus under
 // src/test/resources/com/posthog/hoglake/fuzz from the cross-language vector
 // file plus freshly built parquet footers / puffin DV blobs. Rerun only when
@@ -209,17 +265,30 @@ tasks.register<JavaExec>("generateFuzzSeeds") {
 // likely to be wrong. project.version is the single source (build.gradle
 // -> here -> GET /v1/info -> webui badge), so there is nothing to keep in
 // sync by hand.
+// The build stamp is SUPPLIED, never generated here: an ordinary local
+// build has nothing to stamp with and reports no build, which is the
+// point — only a packaged image (the CD Docker build) carries one, so a
+// stamp in the webui always means "this came off the pipeline". Gradle
+// generating a timestamp per invocation would make every local `gradle
+// build` claim a distinct build and make the field meaningless.
+val buildStamp =
+    providers.gradleProperty("buildStamp")
+        .orElse(providers.environmentVariable("HOGLAKE_BUILD_STAMP"))
+        .orElse("")
+
 val generateVersionResource =
     tasks.register("generateVersionResource") {
-        description = "Write the project version into a resource the server reads at runtime"
+        description = "Write the project version and build stamp into a resource the server reads at runtime"
         val outputDir = layout.buildDirectory.dir("generated/version")
         val projectVersion = version.toString()
+        val stamp = buildStamp
         inputs.property("version", projectVersion)
+        inputs.property("buildStamp", stamp)
         outputs.dir(outputDir)
         doLast {
             val file = outputDir.get().file("com/posthog/hoglake/version.properties").asFile
             file.parentFile.mkdirs()
-            file.writeText("version=$projectVersion\n")
+            file.writeText("version=$projectVersion\nbuild=${stamp.get()}\n")
         }
     }
 
@@ -247,3 +316,5 @@ tasks.register("checkOpenapiVersion") {
     }
 }
 tasks.named("check") { dependsOn("checkOpenapiVersion") }
+
+// Scratch runner for the imported fuzz repro mains (temporary).

@@ -21,6 +21,17 @@ Pinned policies (verified here):
   row group has no min/max -> bounds omitted entirely (never a
   truncated — i.e. WRONG — upper bound).
 * A file column absent from the catalog schema is skipped.
+* timestamp_ns bounds come from Statistics.min_raw/max_raw, not
+  min/max: pyarrow renders a timestamp[ns] statistic as a datetime and
+  RAISES ValueError for any value that is not a whole microsecond. The
+  raw int64 is nanos, which is the stored unit encode_bound wants.
+* uint64 footer stats are non-negative Python ints up to 2^64-1 (never
+  sign-wrapped), so no masking is needed on the hand-off.
+* A statistic the bound path cannot read or represent yields NULL
+  BOUNDS, never an exception out of the commit — the file's physical
+  type and unit are foreign inputs, not givens. Asserted over the full
+  catalog-type x footer-shape cross product, which is how the last two
+  escaping paths were found.
 """
 
 import io
@@ -72,6 +83,34 @@ COLUMN_KINDS = {
         st.integers(-(10**18) + 1, 10**18 - 1).map(lambda n: Decimal(n).scaleb(-3)),
     ),
     "uuid": (None, st.binary(min_size=16, max_size=16)),
+    "int8": (None, st.integers(-(2**7), 2**7 - 1)),
+    "int16": (None, st.integers(-(2**15), 2**15 - 1)),
+    "uint8": (None, st.integers(0, 2**8 - 1)),
+    "uint16": (None, st.integers(0, 2**16 - 1)),
+    # uint32 writes as parquet INT64 (the writer contract), so its stats
+    # come back as plain ints across the whole unsigned domain
+    "uint32": (None, st.integers(0, 2**32 - 1)),
+    # the footer reports a UINT64 column's min/max as a non-negative
+    # Python int all the way to 2^64-1 — never sign-wrapped (verified)
+    "uint64": (None, st.integers(0, 2**64 - 1)),
+    # seconds/millis columns: pyarrow reports these as datetimes, which
+    # encode_bound converts to the stored micros
+    "timestamp_s": (
+        None,
+        st.datetimes(datetime(1700, 1, 1), datetime(2400, 1, 1)).map(
+            lambda d: d.replace(microsecond=0)
+        ),
+    ),
+    "timestamp_ms": (
+        None,
+        st.datetimes(datetime(1700, 1, 1), datetime(2400, 1, 1)).map(
+            lambda d: d.replace(microsecond=(d.microsecond // 1000) * 1000)
+        ),
+    ),
+    # nanos: ground truth is the raw int, because arrow will not render
+    # a sub-microsecond timestamp[ns] as a datetime at all
+    "timestamp_ns": (None, st.integers(-(2**62), 2**62)),
+    "json": (None, st.text(max_size=40)),
 }
 
 
@@ -167,6 +206,153 @@ def test_extracted_stats_match_ground_truth(case):
         else:
             assert got_lo == lo
             assert got_hi == hi
+
+
+@STATS_SETTINGS
+@given(st.data())
+def test_every_column_kind_is_exercised_at_least_once(data):
+    """The property above samples 4 kinds out of 21 per example, so a new
+    type could ride along untested. This one walks the whole table."""
+    for kind, (params, value_st) in sorted(COLUMN_KINDS.items()):
+        col = Column(
+            name="c",
+            type=kind,
+            field_id=1,
+            ordinal=0,
+            nullable=True,
+            type_params=params,
+        )
+        vals = data.draw(
+            st.lists(st.one_of(st.none(), value_st), min_size=1, max_size=6)
+        )
+        schema = columns_to_arrow_schema((col,))
+        table = pa.table({"c": pa.array(vals, schema.field("c").type)}, schema=schema)
+        (s,) = extract_column_stats(_write_meta(table, 2), (col,))
+        assert s.value_count == len(vals)
+        assert s.null_count == sum(1 for v in vals if v is None)
+        lo, hi = _ground_truth_minmax(kind, vals)
+        if lo is None:
+            assert s.lower_bound is None and s.upper_bound is None
+            continue
+        assert _normalize(kind, decode_bound(kind, s.lower_bound, params)) == lo
+        assert _normalize(kind, decode_bound(kind, s.upper_bound, params)) == hi
+
+
+# -- foreign footers: a mismatched catalog type must degrade, not raise ----
+#
+# Everything above writes the arrow type the catalog column implies. The
+# stats path is also handed footers OTHER writers produced, where the
+# physical type and unit are inputs rather than givens; the whole cross
+# product is walked here because the failure mode is an exception out of
+# an otherwise-valid append, and each type pairing reaches the bound code
+# by a different route.
+
+_FOREIGN_FOOTERS = {
+    "int64": (pa.int64(), [0, 2**40]),  # wider than a 4-byte Iceberg int
+    "timestamp_us": (pa.timestamp("us"), [0, 253_402_214_400_000_000]),  # year 9999
+    "timestamp_ms": (pa.timestamp("ms"), [-(2**40), 2**40]),
+    "timestamp_ns": (pa.timestamp("ns"), [1, 1_000_000_001]),  # sub-micro: st.min dies
+    "string": (pa.string(), ["a", "z"]),
+    "double": (pa.float64(), [1.5, 2.5]),
+    "binary": (pa.binary(), [b"\x00", b"\xff"]),
+    "boolean": (pa.bool_(), [False, True]),
+}
+
+#: (footer, catalog type) cells where the two genuinely AGREE, so a bound
+#: must actually come out. Without these the test above is satisfied by a
+#: codec that returned None for everything — "did not raise" is a very
+#: low bar, and nulling every bound in the lake clears it.
+_MUST_PRODUCE = {
+    ("int64", "long"),
+    ("double", "double"),
+    # NOT ("double", "float"): a float64 footer under a `float` column is
+    # a NARROWING, and Kotlin's FLOAT arm takes only a FLOAT physical.
+    # Python used to produce a bound here purely because it never looked
+    # at the footer's type; it now refuses, like the hydrator. (The
+    # reverse, float32 under `double`, is a legal widening and is
+    # accepted by both — covered by the property test's own matrix.)
+    ("string", "string"),
+    ("string", "json"),
+    ("binary", "binary"),
+    ("boolean", "boolean"),
+    # timestamptz is absent from COLUMN_KINDS, so there is no cell to
+    # claim — caught by the seen == _MUST_PRODUCE check, which is what it
+    # is for.
+    #
+    # Every timestamp precision reads a timestamp footer of ANY unit:
+    # the decode is unit-driven (the file's annotation says what its
+    # int64s mean) and scales to the type's own stored unit. So the
+    # timestamp footers x timestamp catalog types form a full block, not
+    # a diagonal.
+    ("timestamp_us", "timestamp"),
+    ("timestamp_us", "timestamp_s"),
+    ("timestamp_us", "timestamp_ms"),
+    ("timestamp_ms", "timestamp"),
+    ("timestamp_ms", "timestamp_s"),
+    ("timestamp_ms", "timestamp_ms"),
+    # A millis footer scales UP to nanos exactly; a nanos footer is read
+    # raw. Both are the paths a timestamp_ns column actually takes.
+    ("timestamp_ms", "timestamp_ns"),
+    ("timestamp_ns", "timestamp_ns"),
+    # BYTE_ARRAY is BYTE_ARRAY: string, json and binary share a physical
+    # form, and the catalog type decides only how the bytes are read.
+    ("binary", "string"),
+    ("binary", "json"),
+    # uint32 maps to Iceberg long, and hoglake's own writer emits INT64
+    # for it — so an int64 footer is the NATIVE shape, not a mismatch.
+    ("int64", "uint32"),
+}
+
+
+def test_mismatched_catalog_type_over_a_foreign_footer_degrades():
+    """EVERY catalog type over EVERY foreign footer shape degrades to
+    absent bounds rather than raising.
+
+    The cross product is the point: the two gaps this originally found
+    (float/double's total-order min/max running outside the guard, and
+    decimal's InvalidOperation being an ArithmeticError rather than a
+    ValueError) were each reachable only from one cell of it, and
+    neither was reachable from the paths anyone had thought to test.
+    A foreign footer is an INPUT, not a given — the writer does not get
+    to fail a commit because someone else's file had a statistic it
+    could not read.
+
+    The assertion is TWO-SIDED. _MUST_PRODUCE pins the cells where
+    footer and catalog type correspond — a codec that degraded
+    everything to null cannot pass — and every other cell must produce
+    NO bound at all, so a codec that coerces mismatched values into
+    plausible-looking bytes cannot pass either. A cell that legitimately
+    starts producing belongs in _MUST_PRODUCE explicitly; it does not
+    belong in a weakened else-branch.
+    """
+    seen: set[tuple[str, str]] = set()
+    for footer, (arrow_type, values) in sorted(_FOREIGN_FOOTERS.items()):
+        table = pa.table({"c": pa.array(values, arrow_type)})
+        meta = _write_meta(table, 1)  # one row group per value
+        for kind, (params, _) in sorted(COLUMN_KINDS.items()):
+            col = Column(name="c", type=kind, field_id=1, ordinal=0, type_params=params)
+            stats = extract_column_stats(meta, (col,))
+            # counts never depend on whether a bound could be read
+            assert len(stats) == 1, (kind, footer)
+            assert stats[0].value_count == len(values), (kind, footer)
+            assert stats[0].null_count == 0, (kind, footer)
+            if (footer, kind) in _MUST_PRODUCE:
+                assert stats[0].lower_bound is not None, (kind, footer)
+                assert stats[0].upper_bound is not None, (kind, footer)
+                seen.add((footer, kind))
+            else:
+                # Two-sided, and this half is the one that matters most:
+                # a cell where footer and catalog type do NOT correspond
+                # must produce NO bound, not an arbitrary one. Before the
+                # physical-type check existed, a boolean footer under a
+                # `long` column truthiness-coerced False/True into bounds
+                # of 0/1 — well-formed bytes describing data that is not
+                # there, which prunes real rows away.
+                assert stats[0].lower_bound is None, (kind, footer)
+                assert stats[0].upper_bound is None, (kind, footer)
+    # Every declared cell was actually reachable: a typo in _MUST_PRODUCE
+    # would otherwise make it a set of assertions nobody runs.
+    assert seen == _MUST_PRODUCE, _MUST_PRODUCE - seen
 
 
 # -- NaN policy (targeted; property above excludes NaN by construction) ----

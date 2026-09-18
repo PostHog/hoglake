@@ -6,7 +6,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.Identifiers
 
 /**
- * Fuzz target (fuzzing.md layer 4, target e): the identifier allowlists —
+ * Fuzz target (docs/fuzzing.md layer 4, target e): the identifier allowlists —
  * [Identifiers.validate] (namespace/table/view/column names, 422 policy)
  * and the RequestId header shape (observability/RequestId.kt).
  *

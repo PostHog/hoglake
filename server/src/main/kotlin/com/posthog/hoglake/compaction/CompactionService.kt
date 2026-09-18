@@ -10,6 +10,8 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.StatsSanity
+import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
@@ -44,9 +46,73 @@ data class CompactionConfig(
     val tierTarget: Int,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
+    /**
+     * How far the SORTED path's group budget is derated for a table with
+     * nested columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
+     *
+     * The sorted path materializes every survivor of a group as
+     * parquet-java `Group` objects so it can sort them — that is what
+     * makes sorting safe at all, since the row ids are explicit data
+     * rather than position. For FLAT rows the object graph is a few
+     * boxed values per row and [targetBytes] is a fair proxy for the
+     * heap. For NESTED rows it is not, and not by a little: a measured
+     * `list<long>` table with five elements per row peaked at 343 MiB of
+     * heap from a 4.6 MiB compressed input — **70x** — because every
+     * element becomes its own `SimpleGroup` with its own object header,
+     * field array and boxed value, and compression that packs an int64
+     * column 10:1 does nothing for object headers.
+     *
+     * So the planner derates: for a table that has BOTH nested columns
+     * and a live sort order, the effective group budget is
+     * `targetBytes / expansion`, which brings the materialized heap back
+     * under roughly targetBytes. 64 is deliberately near the top of the
+     * measured 30-70x range — erring large costs smaller compaction
+     * groups, erring small costs an OOM in a background loop.
+     *
+     * NOT a spill implementation, and not a promise. It bounds the
+     * SORTED path only, and only per GROUP: one pathological ROW (a
+     * million-element list) still materializes whole on either path, and
+     * nothing here changes that — a per-row bound would need a limit the
+     * commit path does not have.
+     */
+    val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
+    /**
+     * Per-ROW node budget for the rewrite
+     * (HOGLAKE_COMPACTION_MAX_NODES_PER_ROW). [nestedSortExpansion]
+     * bounds a GROUP's materialized heap; this bounds a single ROW's,
+     * which no group budget can. See
+     * ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW.
+     */
+    val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
 ) {
     init {
         CompactionTiers.of(targetBytes, tierTarget)
+        require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
+        require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
+    }
+
+    /**
+     * The group byte budget to plan [table] under: [targetBytes] unless
+     * the table both nests and sorts, in which case the sorted path's
+     * materialization forces the derate. Never below 2 — the tier ladder
+     * refuses a smaller target, and a table whose target derated to
+     * nothing would stop compacting entirely.
+     */
+    fun effectiveTargetBytes(
+        columns: List<Column>,
+        sorted: Boolean,
+    ): Long {
+        if (!sorted || nestedSortExpansion == 1) return targetBytes
+        if (columns.allNodes().none { it.def.type.isNested }) return targetBytes
+        return maxOf(2L, targetBytes / nestedSortExpansion)
+    }
+
+    companion object {
+        /**
+         * Erring at the top of the measured 30-70x expansion; see
+         * [nestedSortExpansion].
+         */
+        const val DEFAULT_NESTED_SORT_EXPANSION = 64
     }
 }
 
@@ -65,6 +131,19 @@ data class CompactionCandidate(
     val fileSizeBytes: Long,
     val rowIdStart: Long,
     val statsProvided: Boolean,
+    /**
+     * `hog_data_file.explicit_row_ids` — true when this file is a
+     * COMPACTION OUTPUT and carries its row ids in a physical
+     * `_hog_row_id` column, false when its ids are positional from
+     * [rowIdStart].
+     *
+     * The authoritative answer to a question the rewriter was
+     * previously guessing at from the file's own schema. It decides
+     * whether a malformed `_hog_row_id` field is corruption (in a file
+     * hoglake wrote, where the carrier is the identity) or an ordinary
+     * client column that happens to share the name.
+     */
+    val explicitRowIds: Boolean = false,
     /** The file's live DV as planned; the rewrite APPLIES it. Null = none. */
     val dv: LiveDv? = null,
 )
@@ -195,9 +274,22 @@ class CompactionService(
         val columns: List<Column>,
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
         val sortFields: List<SortFieldDef>,
+        /** Per-row node budget for the rewrite (CompactionConfig.maxNodesPerRow). */
+        val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
     ) {
-        /** Live column types by field id (stats aggregation). */
-        val columnTypes: Map<Long, ColType> get() = columns.associate { it.fieldId to it.def.type }
+        /**
+         * Live column types by field id (stats aggregation), over EVERY
+         * node of the column forest — not just the top level.
+         *
+         * Stats are keyed on LEAF field ids, and a leaf inside a struct,
+         * a list or a map is not a top-level column. Built from the
+         * top-level list alone, the merge silently dropped every nested
+         * leaf's stats row on the way through compaction: counts and
+         * bounds present before the rewrite, gone after it, with nothing
+         * anywhere saying so.
+         */
+        val columnTypes: Map<Long, ColType>
+            get() = columns.allNodes().associate { it.fieldId to it.def.type }
     }
 
     private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
@@ -262,6 +354,7 @@ class CompactionService(
                 sortFields =
                     SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
                         ?.fields ?: emptyList(),
+                maxNodesPerRow = cfg.maxNodesPerRow,
             )
         return PlanWithContext(ctx, CompactionPlan(t.tableId, ns.name, t.name, groups(h, ctx, cfg)))
     }
@@ -271,15 +364,31 @@ class CompactionService(
         ctx: TableContext,
         cfg: CompactionConfig,
     ): List<CompactionGroup> {
+        // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
+        // work that could drop payloads or repeatedly fail the maintenance loop.
+        // allNodes, not the top level: a variant nested inside a struct
+        // is still a variant the rewriter cannot write, and `struct{v:
+        // variant}` has no top-level one. #77's check predates
+        // containers, where the two were the same question.
+        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return emptyList()
+
         data class Bucket(val specId: Long?, val values: List<String?>?)
 
         data class Row(val candidate: CompactionCandidate, val bucket: Bucket)
+
+        // The DERATED budget, not the raw one: a nested+sorted table's
+        // group has to stay small enough that materializing it to sort
+        // fits in heap (CompactionConfig.nestedSortExpansion). It
+        // narrows the candidate filter too — a file above the derated
+        // target can never reach a tier quota under it, so fetching it
+        // would only be work.
+        val budget = cfg.effectiveTargetBytes(ctx.columns, ctx.sortFields.isNotEmpty())
 
         val rows =
             h.createQuery(
                 """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
-                   f.row_id_start, f.spec_id, f.stats_state,
+                   f.row_id_start, f.spec_id, f.stats_state, f.explicit_row_ids,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count,
                    (SELECT array_agg(pv.value ORDER BY pv.key_index)
                     FROM hog_file_partition_value pv
@@ -298,7 +407,7 @@ class CompactionService(
             )
                 .bind("catalogId", ctx.catalogId)
                 .bind("tableId", ctx.tableId)
-                .bind("targetBytes", cfg.targetBytes)
+                .bind("targetBytes", budget)
                 .map { rs, _ ->
                     Row(
                         CompactionCandidate(
@@ -308,6 +417,7 @@ class CompactionService(
                             fileSizeBytes = rs.getLong("file_size_bytes"),
                             rowIdStart = rs.getLong("row_id_start"),
                             statsProvided = rs.getString("stats_state") == "provided",
+                            explicitRowIds = rs.getBoolean("explicit_row_ids"),
                             dv =
                                 rs.getObject("dv_id")?.let {
                                     LiveDv(
@@ -327,7 +437,7 @@ class CompactionService(
                 }
                 .list()
 
-        val tiers = CompactionTiers.of(cfg.targetBytes, cfg.tierTarget)
+        val tiers = CompactionTiers.of(budget, cfg.tierTarget)
         val out = mutableListOf<Pair<Int, CompactionGroup>>()
         for ((bucket, bucketRows) in rows.groupBy { it.bucket }) {
             for (take in tiers.groups(bucketRows.map { it.candidate }) { it.fileSizeBytes }) {
@@ -380,7 +490,7 @@ class CompactionService(
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
-                    "failed_groups=${r.failedGroups}"
+                    "invalid_data=${r.invalidData} failed_groups=${r.failedGroups}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -391,6 +501,10 @@ class CompactionService(
             val result = doRunOnce(catalog, cfg)
             Metrics.compactionGroups(catalog, result.groupsCompacted)
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
+            Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
+            Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
+            // The red-flag outcome, and it had no series either.
+            Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
             result
         }
 
@@ -406,9 +520,12 @@ class CompactionService(
         var skipped = 0L
         var dvSuperseded = 0L
         var unconvertible = 0L
+        var invalidData = 0L
         var failed = 0L
 
-        fun budgetSpent() = groupsCompacted + skipped + dvSuperseded + unconvertible + failed >= cfg.maxGroupsPerRun
+        fun budgetSpent() =
+            groupsCompacted + skipped + dvSuperseded + unconvertible + invalidData + failed >=
+                cfg.maxGroupsPerRun
         outer@ for ((namespace, table) in tables) {
             if (budgetSpent()) break
             val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
@@ -434,6 +551,21 @@ class CompactionService(
                             "schema (${e.message}); skipping"
                     }
                     unconvertible++
+                } catch (e: InvalidDataException) {
+                    // Skip-with-reason as well, but a DIFFERENT reason:
+                    // DURABLE and the writer's fault. Unlike a schema
+                    // skip this will not clear on its own, so re-planning
+                    // it every sweep is a permanent loop. Counted apart
+                    // so a nonzero value reads as "a writer produced
+                    // something its own registration or schema forbids",
+                    // and logged at warn with the offending detail for
+                    // exactly that hunt.
+                    log.warn {
+                        "compaction group of ${group.files.size} files for " +
+                            "$catalog/$namespace.$table cannot be rewritten as registered " +
+                            "(${e.message}); skipping"
+                    }
+                    invalidData++
                 } catch (e: Exception) {
                     // One bad group (unreadable input, corrupt DV, S3
                     // hiccup) never wedges the sweep — but it IS counted:
@@ -456,6 +588,7 @@ class CompactionService(
             skippedConflicts = skipped,
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertible,
+            invalidData = invalidData,
             failedGroups = failed,
         )
     }
@@ -521,29 +654,61 @@ class CompactionService(
                     tmpFiles.add(local)
                     val dv =
                         f.dv?.let { planned ->
-                            val decoded = PuffinDeletionVector.read(store.get(planned.path))
-                            check(decoded.cardinality == planned.deleteCount) {
-                                "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
-                                    "but is registered with delete_count ${planned.deleteCount} — " +
-                                    "refusing to compact on inconsistent metadata"
+                            // The FETCH stays outside: an object-store error is
+                            // transient and belongs in the retryable channel.
+                            // What the decoder says about bytes it already has
+                            // is durable — a registered .dv never changes — so
+                            // a refusal from it (PuffinDeletionVector's own
+                            // requires, and the containment around the roaring
+                            // library) is invalid_data, not a group re-planned
+                            // and re-refused every sweep forever.
+                            val raw = store.get(planned.path)
+                            val decoded =
+                                try {
+                                    PuffinDeletionVector.read(raw)
+                                } catch (e: IllegalArgumentException) {
+                                    if (e is InvalidDataException) throw e
+                                    throw InvalidDataException(
+                                        "DV ${planned.path} does not decode: ${e.message}",
+                                    )
+                                }
+                            if (decoded.cardinality != planned.deleteCount) {
+                                throw InvalidDataException(
+                                    "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
+                                        "but is registered with delete_count ${planned.deleteCount} — " +
+                                        "refusing to compact on inconsistent metadata",
+                                )
                             }
                             decoded
                         }
-                    ParquetRewriter.Input(local, f.rowIdStart, dv)
+                    ParquetRewriter.Input(local, f.rowIdStart, dv, f.explicitRowIds)
                 }
             val outLocal = tmpDir.resolve("out.parquet")
             tmpFiles.add(outLocal)
             val rewritten =
-                ParquetRewriter.rewrite(inputs, ctx.columns, ctx.sortFields, outLocal)
+                ParquetRewriter.rewrite(
+                    inputs,
+                    ctx.columns,
+                    ctx.sortFields,
+                    outLocal,
+                    ctx.maxNodesPerRow,
+                )
             check(rewritten.rowsWritten == group.survivingRecords) {
                 "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
                     "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
             }
             val outputBytes = outLocal.fileSize()
             val footerSize = footerSize(outLocal)
+            // Bare UUID, deliberately indistinguishable from an ingested
+            // file (the pyhoglake writer's shape). A `compacted-` prefix
+            // used to sit here; it told readers nothing the catalog does
+            // not already say — explicit_row_ids is the flag that decides
+            // how a file's row ids are read, and no reader may infer that
+            // from a path — while giving every compaction output in a
+            // table the same 10-character lead-in.
             val outputPath =
                 "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                    "compacted-${UUID.randomUUID()}.parquet"
+                    "${UUID.randomUUID()}.parquet"
 
             // Claim ticket BEFORE the upload (its own committed
             // transaction): if this group never commits — skip, crash,
@@ -915,20 +1080,83 @@ class CompactionService(
         for ((fieldId, fieldRows) in rows.groupBy { it.fieldId }) {
             if (fieldRows.size != inputIds.size) continue // not every input covered the field
             val type = columnTypes[fieldId] ?: continue // column dropped since the inputs landed
+            // REPAIR ON READ, before the merge. Every row here was
+            // stored before StatsSanity existed or came through a door
+            // that predates it, so an inverted pair or an impossible
+            // count can already be sitting in the table — and a merge
+            // takes min(lowers) and max(uppers), which carries the
+            // damage into a BRAND NEW file and keeps it live for
+            // another compaction generation. Repairing the inputs as
+            // they are read stops the propagation without a migration;
+            // a backfill of the historical rows is a separate operation
+            // (noted as a follow-up, deliberately not done here — it
+            // rewrites rows for files nothing is compacting).
+            val clean =
+                fieldRows.map { r ->
+                    sane(
+                        ColumnStats(
+                            fieldId = fieldId,
+                            valueCount = r.valueCount,
+                            nullCount = r.nullCount,
+                            nanCount = r.nanCount,
+                            sizeBytes = r.sizeBytes,
+                            lowerBound = r.lower,
+                            upperBound = r.upper,
+                        ),
+                        type,
+                        "input of ${ctx.namespace}.${ctx.table}",
+                    )
+                }
+            // And again on the MERGE: the sum of sound inputs is not
+            // automatically sound (bounds merged from files with
+            // different live types, counts that overflow their
+            // relationship), and this is the row that gets stored.
             out +=
-                ColumnStats(
-                    fieldId = fieldId,
-                    valueCount = fieldRows.sumOf { it.valueCount },
-                    nullCount = fieldRows.sumOf { it.nullCount },
-                    nanCount =
-                        if (fieldRows.any { it.nanCount == null }) null else fieldRows.sumOf { it.nanCount!! },
-                    sizeBytes =
-                        if (fieldRows.any { it.sizeBytes == null }) null else fieldRows.sumOf { it.sizeBytes!! },
-                    lowerBound = mergeBound(type, fieldRows.map { it.lower }, takeUpper = false),
-                    upperBound = mergeBound(type, fieldRows.map { it.upper }, takeUpper = true),
+                sane(
+                    ColumnStats(
+                        fieldId = fieldId,
+                        valueCount = clean.sumOf { it.valueCount },
+                        nullCount = clean.sumOf { it.nullCount },
+                        nanCount =
+                            if (clean.any { it.nanCount == null }) null else clean.sumOf { it.nanCount!! },
+                        sizeBytes =
+                            if (clean.any { it.sizeBytes == null }) null else clean.sumOf { it.sizeBytes!! },
+                        lowerBound = mergeBound(type, clean.map { it.lowerBound }, takeUpper = false),
+                        upperBound = mergeBound(type, clean.map { it.upperBound }, takeUpper = true),
+                    ),
+                    type,
+                    "merged output for ${ctx.namespace}.${ctx.table}",
                 )
         }
         return out.sortedBy { it.fieldId }
+    }
+
+    /**
+     * One stats row through [StatsSanity], warning + counting any
+     * repair under the `compaction` source.
+     *
+     * The THIRD door. The commit path and the hydrator each ran this
+     * rule; compaction wrote `hog_file_column_stats` directly, so a
+     * malformed row could be merged into a new file's metadata and stay
+     * live — and every reader prunes on it.
+     */
+    private fun sane(
+        stats: ColumnStats,
+        type: ColType,
+        where: String,
+    ): ColumnStats {
+        val checked = StatsSanity.check(stats, type)
+        // The sanitizer's output is stored whether or not it reported
+        // anything: signed-zero canonicalization is a conformance
+        // rewrite, not a repair, so it carries no warning and no metric.
+        if (checked.repairs.isNotEmpty()) {
+            Metrics.statsRepaired("compaction")
+            log.warn {
+                "column stats for field_id ${stats.fieldId} in the $where are not internally " +
+                    "consistent (${checked.repairs.joinToString("; ")}); using the repaired row"
+            }
+        }
+        return checked.stats
     }
 
     private fun mergeBound(

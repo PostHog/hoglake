@@ -161,16 +161,50 @@ class TableSummary:
 
 @dataclass(frozen=True)
 class Column:
+    """One catalog column.
+
+    Recursive: a container type (``list``/``struct``/``map``) carries its
+    ``children``, each with its own server-assigned ``field_id``.
+    ``ordinal`` orders a column among its SIBLINGS — top-level columns
+    share one sequence, and each container's children have their own —
+    so it is not a table-wide position.
+    """
+
     name: str
     type: str
     field_id: int
     ordinal: int
     nullable: bool = True
     type_params: dict[str, Any] | None = None
+    #: Present only for list/struct/map.
+    children: tuple[Column, ...] | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> Column:
-        return _wire("Column", d, lambda d: cls(**_pick(cls, d)))
+        def build(d: Mapping[str, Any]) -> Column:
+            kw = dict(_pick(cls, d))
+            kids = kw.get("children")
+            if kids is not None:
+                if not isinstance(kids, (list, tuple)):
+                    raise MalformedResponseError(
+                        "Column: children must be an array or null, got "
+                        f"{type(kids).__name__}"
+                    )
+                # Sorted by ordinal HERE, once, at the wire boundary.
+                # The server returns children in ordinal order today, but
+                # ordinal is the contract and array order is not — and
+                # every consumer downstream (the Arrow schema builder,
+                # the stats walk, the console) reads position. One sort
+                # at the edge beats three that can disagree.
+                kw["children"] = tuple(
+                    sorted(
+                        (Column.from_wire(c) for c in kids),
+                        key=lambda c: c.ordinal,
+                    )
+                )
+            return cls(**kw)
+
+        return _wire("Column", d, build)
 
 
 @dataclass(frozen=True)
@@ -213,6 +247,34 @@ class PartitionSpec:
 
 
 @dataclass(frozen=True)
+class SortField:
+    source_field_id: int
+    direction: str
+    null_order: str
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SortField:
+        return _wire("SortField", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
+class SortSpec:
+    sort_id: int
+    fields: tuple[SortField, ...]
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> SortSpec:
+        return _wire(
+            "SortSpec",
+            d,
+            lambda d: cls(
+                sort_id=d["sort_id"],
+                fields=tuple(SortField.from_wire(f) for f in d["fields"]),
+            ),
+        )
+
+
+@dataclass(frozen=True)
 class TableInfo:
     name: str
     namespace: str
@@ -222,6 +284,7 @@ class TableInfo:
     file_count: int
     file_size_bytes: int
     partition_spec: PartitionSpec | None = None
+    sort_spec: SortSpec | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -236,6 +299,9 @@ class TableInfo:
                 file_count=d["file_count"],
                 file_size_bytes=d["file_size_bytes"],
                 partition_spec=PartitionSpec.from_wire(spec) if spec else None,
+                sort_spec=SortSpec.from_wire(d["sort_spec"])
+                if d.get("sort_spec")
+                else None,
             )
 
         return _wire("TableInfo", d, build)

@@ -368,6 +368,52 @@ The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
 executed attempts per catalog, including failures and skips. There is
 no separate minimum-file-count knob.
 
+`HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
+one ROW's materialized object graph, which no group-level budget can:
+both rewrite paths materialize a row whole, so a single row holding a
+hundred-million-element list is an OOM, and an OOM in a background loop
+takes the request path down with it. A row past the budget is refused
+as `invalid_data` — one counted skip instead of a process kill. The
+allowance is spent inside the parquet record materializer as the row is
+decoded, and again — from a FRESH allowance — by the copy; counting it
+after `read()` returned would only have reported the allocation that
+already happened, and sharing one allowance across both phases charged
+the same graph twice and silently halved the ceiling.
+
+Calibrate in NODES, not elements: a scalar column costs 1 per row, a
+list element costs 2 (its synthetic entry group plus the value), a map
+entry 3. The default therefore admits roughly half a million list
+elements in a single row — far above any honest row, and far below what
+a heap holds at ~50-100 bytes a node.
+
+Per-phase allowances mean peak live heap is up to **2x** the budget: the
+decoded row is still reachable while the copy builds its own. That is
+the price of the advertised ceiling being the real one, and it is
+measured, not assumed — a 999,999-node row rewrites under `-Xmx192m`.
+
+Three non-success outcomes carry a counter, all under
+`hoglake_compaction_skipped_total{catalog, reason}`:
+`unconvertible_schema` rising means a table has stopped compacting,
+`invalid_data` rising means a writer produced something its own
+registration or schema forbids — bad values, or a file whose schema
+contradicts its `explicit_row_ids` registration — and `failed` is the
+outright failure that gets retried next run. The first two never show up as failures — a sweep with either can
+look perfectly healthy — which is why they get a line rather than only a
+log and a ledger row. The self-healing skips (commit conflicts, DV
+supersession) stay uncounted: they re-plan on the next run.
+
+**`reason="failed"` is a FAILURE filed under a metric named
+`skipped`.** That is deliberate — one series for "groups that did not
+compact, by reason" beats three — but it means
+`sum(rate(hoglake_compaction_skipped_total[5m]))` now includes failures,
+so an alert written against the two-reason version has silently changed
+meaning. Alert on the label: `{reason="failed"}` is the page-worthy one,
+`{reason="unconvertible_schema"}` is a backlog that will not clear on
+its own, and `{reason="invalid_data"}` is a bug report against whoever
+wrote the file. The axis separating the last two is DURABILITY AND
+FAULT, not values-versus-schema: an `invalid_data` group is re-planned
+and re-refused every sweep, because nothing about it will change.
+
 Each table's candidate list is fixed before rewriting starts. Promoted
 outputs cannot feed another group in the **same run**. Input bytes are
 only a promotion estimate: encoding, schema changes and DV removal can
@@ -586,8 +632,60 @@ container attached to the compose network — as the endpoint.
 ## Testing
 
 JUnit 5 + AssertJ; property tests via kotest-property (strategy:
-[../fuzzing.md](../fuzzing.md)). Integration tests use Testcontainers
+[../fuzzing.md](../docs/fuzzing.md)). Integration tests use Testcontainers
 (Postgres 16, MinIO), tagged `integration`, and need Docker
 (`docker-java.properties` in test resources pins the Docker API version
 for recent daemons). The schema-equivalence test and an OCC concurrency
 torture suite run with everything else in `just test`.
+
+
+## Atomic CREATE / CTAS
+
+Catalog responses advertise `atomic-table-creation-v1`. Prepare a definition with
+`PUT /v1/catalogs/{catalog}/table-creations/{operation-uuid}`, write Parquet using
+the returned field IDs and `write_path`, then POST the ordered file registrations
+to that operation's `/commit`. Preparation creates no visible table or snapshot
+and does not reserve the target name. Publication installs the definition, files,
+and receipt in one database transaction and one snapshot. Empty registrations
+create an empty table. INSERT continues to use the existing append API.
+
+Repeat preparation with the same definition, or publication with the identical
+ordered file list, to recover lost responses. Different payloads under the same
+operation ID conflict. GET the operation to inspect its durable state. A committed
+receipt remains valid even after subsequent table deletion or replacement.
+POST `/abort` to atomically fence publication; if publication already won, abort
+returns `committed` and never deletes the table. HTTP 200 reports operation state,
+including `rejected` and `aborted`; clients must inspect the response state.
+
+Only publication takes the catalog-wide commit lock, followed by the operation
+row lock. Status, abort, and expiry serialize on the operation row; preparation
+uses the unique operation key to resolve concurrent retries. No operation takes
+the catalog lock while holding an operation row lock. Both row and catalog waits
+honor `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` (default 30000; 0 disables the bound),
+returning 503 with `Retry-After` when the bound is exceeded.
+
+Prepared operations expire after 24 hours, checked under the operation row lock on
+status, abort, preparation retry, or publication. Terminal receipts are retained
+for the lifetime of the catalog in this version. No automatic object deletion is added: failed or
+aborted writes can leave objects. A `prepared` status or an unavailable receipt is
+not permission to delete data. Only terminal aborted/rejected operations are
+eligible for operator cleanup, after their writers have stopped. Never remove
+files from committed operations based on operation age; normal catalog retention
+owns their lifecycle. There is no automatic fallback to staging-table rename.
+
+The API supports unpartitioned creation, at most 10000 columns and 10000 files per
+operation, and validates registration metadata using the existing append checks.
+It does not open Parquet objects at publication time. Field IDs are table-local,
+start at one, and are installed with the prepared UUID at publication. Expanding
+receipt retention, automated orphan cleanup, or idempotent INSERT is separate work.
+
+Atomic preparation, publication, and abort emit `table_creation_*` audit events
+after their transactions finish. `hoglake_table_creation_total` labels attempts
+by catalog, action, and outcome; terminal retries are `replayed`. Only first-time
+successful publication increments `hoglake_commits_total{result="committed"}`.
+Stored definitions carry a format version and stable wire type names; existing
+unversioned receipts remain readable and retryable.
+
+A supplied `footer_size` must be nonnegative and fit within `file_size_bytes - 8`
+for both initial publication and INSERT. Atomic publication requires this field;
+ordinary INSERT retains support for omitted footer metadata.

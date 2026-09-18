@@ -226,6 +226,51 @@ class PartitionStatsServiceIntegrationTest {
     // ---- partition field naming ------------------------------------------------
 
     @Test
+    fun `a struct leaf source is labelled by its DOTTED PATH, not its bare name`() {
+        // Struct leaves are legal partition sources, and two structs may
+        // each hold a `zip`. Labelled by bare name both render "zip",
+        // and the console shows one table partitioned twice by the same
+        // apparent column — which is either confusing or wrong depending
+        // on how hard the reader looks.
+        val cat =
+            fixture(
+                columns =
+                    listOf(
+                        ColumnDef("id", ColType.LONG),
+                        ColumnDef(
+                            "home",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("zip", ColType.STRING)),
+                        ),
+                        ColumnDef(
+                            "work",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("zip", ColType.STRING)),
+                        ),
+                    ),
+            )
+        // ids: 1 id, 2 home, 3 home.zip, 4 work, 5 work.zip.
+        alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                AlterOp.SetPartitionSpec(
+                    listOf(
+                        PartitionFieldDef(3, Transform.IDENTITY),
+                        PartitionFieldDef(5, Transform.IDENTITY),
+                    ),
+                ),
+            ),
+        )
+        append(cat, "t", file("a", 100, values = listOf("1000", "2000")))
+
+        val report = svc.partitionStats(cat, null, null, 50)
+        assertThat(report.partitions.single().partitionValues)
+            .containsExactly(PartitionValue("home.zip", "1000"), PartitionValue("work.zip", "2000"))
+    }
+
+    @Test
     fun `field names are column names for identity and column_transform otherwise`() {
         val cat =
             fixture(

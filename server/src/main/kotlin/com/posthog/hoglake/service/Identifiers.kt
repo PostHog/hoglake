@@ -16,7 +16,52 @@ import com.posthog.hoglake.model.HoglakeException
 object Identifiers {
     const val PATTERN = "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
 
+    /**
+     * The prefix hoglake reserves for its own columns.
+     *
+     * Compaction outputs carry `_hog_row_id`, a physical column that is
+     * not a catalog column and binds by a reserved field id. A user
+     * column of that name collides with it head-on: the rewriter builds
+     * an output schema holding the name twice, and parquet-java throws
+     * an untyped decoding error from deep inside the writer instead of
+     * the server refusing the DDL that made it possible. The whole `_hog`
+     * prefix is reserved rather than the one name, so the next physical
+     * column hoglake needs does not repeat this.
+     *
+     * Enforced at EVERY nesting level: a struct field named `_hog_row_id`
+     * is only harmless by accident today, and "harmless today" is how the
+     * top-level one got in.
+     */
+    const val RESERVED_COLUMN_PREFIX = "_hog"
+
     private val regex = Regex(PATTERN)
+
+    /**
+     * An UNVALIDATED caller fragment, capped for an error message.
+     *
+     * THE one place this is defined, because it is needed wherever a
+     * message is built BEFORE [validate] has run — and those are exactly
+     * the places that forget. A duplicate-name refusal, an
+     * already-exists refusal, a synthetic child's name and a decimal
+     * parameter all quote something the identifier policy has not vetted,
+     * so "names are bounded by the pattern" is not yet true when the
+     * message is assembled. Measured: two top-level columns named
+     * `"z" * 5000` produced a 5,026-character 422 body, and a list whose
+     * element was named the same produced 5,085.
+     *
+     * 64, matching [validate]'s own truncation — the two do the same job
+     * and an operator should not get a different amount of their input
+     * back depending on which refusal they hit. An earlier 40/37 split
+     * was also applied to values that are NOT unvalidated (paths built
+     * from stored catalog names, names already resolved against the live
+     * schema), where it removed the half of a legitimately deep path the
+     * operator actually needed. Apply this only to input the identifier
+     * policy has not yet seen.
+     */
+    fun cap(value: Any?): String {
+        val text = value.toString()
+        return if (text.length > 64) text.take(61) + "..." else text
+    }
 
     /** Validate [name] as a [kind] identifier; violation -> Validation (422). */
     fun validate(
@@ -28,6 +73,26 @@ object Identifiers {
             val shown = if (name.length > 64) name.take(61) + "..." else name
             throw HoglakeException.Validation(
                 "invalid $kind name '$shown' (must match $PATTERN)",
+            )
+        }
+    }
+
+    /**
+     * Validate a COLUMN name at any nesting level: the identifier policy
+     * plus the [RESERVED_COLUMN_PREFIX] refusal. [qualified] is the
+     * dotted path for the message (the bare name for a top-level
+     * column), so a rejected struct field says where it is.
+     */
+    fun validateColumn(
+        name: String,
+        qualified: String = name,
+    ) {
+        validate("column", name)
+        if (name.startsWith(RESERVED_COLUMN_PREFIX)) {
+            throw HoglakeException.Validation(
+                "column name '$qualified' uses the reserved prefix " +
+                    "'$RESERVED_COLUMN_PREFIX': names starting with it belong to hoglake's own " +
+                    "physical columns (compaction's _hog_row_id)",
             )
         }
     }

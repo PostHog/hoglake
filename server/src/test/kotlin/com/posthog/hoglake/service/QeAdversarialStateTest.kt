@@ -20,7 +20,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 
 /**
- * Adversarial state (fuzzing.md layer 3): hostile identifiers, boundary
+ * Adversarial state (docs/fuzzing.md layer 3): hostile identifiers, boundary
  * payload shapes, and history-shredding sequences, driven through the
  * services against a real Postgres. Includes the parameterization proof
  * (SQL-injection names round-trip; the catalog survives), CHECK

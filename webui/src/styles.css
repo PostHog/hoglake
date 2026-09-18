@@ -244,8 +244,19 @@ td.nullable-mark {
 .data-table tbody tr:hover {
   background: var(--bg-hover);
 }
+/* The cell lays out left-to-right so the copy button sits AFTER the
+   path; the rtl truncation lives on the text alone (.path-text). */
 .path-cell {
   max-width: 340px;
+}
+.path-cell > * {
+  vertical-align: middle;
+}
+/* Truncate from the left: the end of an object path is what
+   distinguishes it, so that is the part worth keeping on screen. */
+.path-text {
+  display: inline-block;
+  max-width: calc(100% - 22px);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -366,6 +377,13 @@ tr.has-deletes {
   font-variant-numeric: tabular-nums;
   color: var(--text-dim);
   white-space: nowrap;
+}
+
+/* Dimmer than the version it follows: the build stamp is long, and the
+   version is what the eye should land on first. */
+.server-build {
+  margin-left: 1px;
+  opacity: 0.65;
 }
 
 .instance-name {
@@ -497,17 +515,34 @@ button.ghost:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--text-dim);
 }
+/* Icon-only, and quiet: it appears on every row of the files table, so
+   it must not compete with the data it sits beside. */
+/* Icon-only, and quiet: it appears on every row of the files table, so
+   it must not compete with the data beside it. Dimming is done with
+   colour ALONE — stacking opacity on an already-dim token made it hard
+   to see at rest, which for a control you have to find is the wrong
+   trade. */
 .copy-btn {
   background: transparent;
-  border: 1px solid var(--border);
+  border: none;
   color: var(--text-dim);
-  font-size: 10px;
-  padding: 0 6px;
+  padding: 0 2px;
+  margin-left: 4px;
   border-radius: 3px;
-  vertical-align: 1px;
+  line-height: 1;
+  cursor: pointer;
 }
 .copy-btn:hover {
   color: var(--text);
+}
+/* Keyboard users get the same affordance as the mouse; without this the
+   button takes focus invisibly. */
+.copy-btn:focus-visible {
+  color: var(--text);
+  outline: 1px solid var(--accent);
+}
+.copy-btn-done {
+  color: var(--ok);
 }
 .load-more {
   background: transparent;
@@ -774,4 +809,162 @@ button.ghost:hover:not(:disabled) {
   height: 100%;
   border-radius: 4px;
   background: var(--warn);
+}
+
+/* -- per-file stats expansion (Files tab) --------------------------------- */
+
+/* Neutral expander, like theme-toggle: must not pick up the accent
+   button look inside a table cell. */
+button.expand-toggle {
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font: inherit;
+  padding: 0 4px;
+  cursor: pointer;
+}
+button.expand-toggle:hover {
+  color: var(--text);
+}
+.detail-row > td {
+  background: var(--bg-inset, transparent);
+  padding: 8px 12px 12px 28px;
+}
+.detail-row .data-table {
+  margin: 0;
+
+/* -- database health page ------------------------------------------------- */
+
+/* Findings lead the page: an operator should be able to act without
+   reading the statistics tables below them. */
+.db-findings {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.db-finding {
+  border: 1px solid var(--border);
+  border-left-width: 3px;
+  border-radius: 4px;
+  padding: 10px 12px;
+}
+.db-finding-info {
+  border-left-color: var(--text-dim);
+}
+.db-finding-warn {
+  border-left-color: var(--warn);
+}
+.db-finding-critical {
+  border-left-color: var(--bad);
+}
+.db-finding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.db-finding-title {
+  font-weight: 600;
+}
+.db-finding-detail {
+  margin: 0;
+  font-size: 13px;
+}
+/* The hoglake reading of the number, set apart from the measurement so
+   the two are not mistaken for each other. */
+.db-finding-impact {
+  margin: 6px 0 0;
+  font-size: 13px;
+  color: var(--text-dim);
+  border-top: 1px dotted var(--border);
+  padding-top: 6px;
+}
+.severity-info {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
+}
+.severity-warn {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.severity-critical {
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+.db-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+.db-stat {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 12px;
+  min-width: 120px;
+}
+.db-stat-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.db-stat-value {
+  display: block;
+  font-size: 18px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.db-stat-warn .db-stat-value {
+  color: var(--warn);
+}
+.db-stat-critical .db-stat-value {
+  color: var(--bad);
+}
+.db-cell-warn {
+  color: var(--warn);
+}
+
+/* The page's own limits, set apart so they read as caveats rather than
+   as findings. */
+.db-blind-spots {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+.db-blind-spots li {
+  margin-bottom: 4px;
+}
+
+/* -- decoded partition cell ----------------------------------------------- */
+
+.partition-cell {
+  white-space: nowrap;
+}
+/* " / " matches formatPartition on the partitions page, and evokes the
+   hive-style nesting these keys describe: team_id=42 / month=2026-04.
+   Rendered as an element rather than generated content so the tests can
+   see it. */
+.partition-sep {
+  color: var(--text-dim);
+  white-space: pre;
+}
+/* The field name is context; the value is the answer. Dimming the name
+   lets the eye land on what differs between rows. */
+.partition-field {
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.partition-eq {
+  color: var(--text-dim);
+  margin: 0 1px;
+}
+.partition-value {
+  font-size: 12px;
 }

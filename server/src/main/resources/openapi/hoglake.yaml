@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.0.1-dev
+  version: 1.1.2-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -325,6 +325,47 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
 
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files/{fileId}/stats:
+    get:
+      operationId: getFileStats
+      summary: >
+        Per-column statistics for one data file, bounds DECODED. Each
+        stored stats row is joined to its column as visible at the
+        requested snapshot (name, dotted path, type) and its
+        lower/upper bounds are decoded from the stored Iceberg
+        single-value bytes to plain JSON per the conventions on
+        FileColumnStats — so callers read bounds without shipping the
+        binary codec. Reflective, never generative: one entry per
+        stored row whose field id resolves to a visible leaf. Variant
+        columns have no statistics at any depth and containers never
+        carry rows, so neither appears; a row whose field id is not
+        visible at the snapshot (a dropped column) is omitted. A file
+        without stats rows (stats_state pending or failed) answers the
+        explicit empty shape with no_stats_reason — and with no bounds
+        the caller MUST NOT prune the file.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: fileId
+          in: path
+          required: true
+          description: >
+            data_file_id, from the /files listing or a scan plan. The
+            file must belong to this table and be visible at the
+            resolved snapshot (404 otherwise).
+          schema: { type: integer, format: int64 }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Per-column statistics with decoded bounds.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileStats" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
       operationId: getChanges
@@ -538,6 +579,26 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CleanupResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+
+  /database/health:
+    get:
+      operationId: getDatabaseHealth
+      summary: >
+        Health of the Postgres instance backing the catalog, read from
+        the statistics views, plus findings interpreting those numbers
+        for this schema. Instance-level: the manifest tables, the vacuum
+        horizon and the connection budget are shared by every catalog in
+        the database. Reads catalog and pg_stat_* relations only — never
+        a hog_* table — so the cost does not scale with the manifest.
+        Carries NO query text: pg_stat_activity.query holds literal
+        values (object paths, identifiers, author strings), so only
+        durations and counts cross the wire.
+      responses:
+        "200":
+          description: Database health
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DatabaseHealth" }
 
   /maintenance/status:
     get:
@@ -852,6 +913,200 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /catalogs/{catalog}/table-creations/{operation}:
+    put:
+      operationId: prepareTableCreation
+      summary: Prepare an unpublished, idempotent table definition (no target-name reservation)
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns]
+              properties:
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+    get:
+      operationId: getTableCreation
+      summary: Read a durable receipt; prepared is not permission to delete files
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/commit:
+    post:
+      operationId: publishTableCreation
+      summary: Atomically publish the table, initial files, and durable receipt in one snapshot
+      description: >
+        Requires atomic-table-creation-v1 capability. Target must be absent at publication.
+        The exact ordered file list is compared as JSON on retries; an identical retry
+        returns the original terminal result even if the table was subsequently dropped.
+        Up to 10000 unique file paths, all under the operation write_path. Empty files
+        creates an empty table. No object-store reads occur during publication.
+        Aborted or expired operations cannot publish. Terminal receipts are retained.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/FileRegistration" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/abort:
+    post:
+      operationId: abortTableCreation
+      summary: Fence publication; a committed operation remains committed and its table is never dropped
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
+  /catalogs/{catalog}/commit/prepared:
+    post:
+      operationId: commitPrepared
+      summary: Publish an immutable request with durable replay protection
+      description: >
+        Same commit semantics as /commit, but requires idempotency_key.
+        Clients requiring replay protection use this endpoint so that an older
+        server cannot silently ignore the key. Receipts survive snapshot expiry.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -993,6 +1248,54 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotImplemented" }
 
+  /debug/decode-bound:
+    post:
+      operationId: decodeBound
+      summary: >
+        Stateless decode of one Iceberg single-value encoding — the
+        incident tool. Paste a column type name and the base64 of a
+        stored bound (a hog_file_column_stats bound, a value out of a
+        log line), get the decoded JSON scalar back under the same wire
+        conventions FileColumnStats documents. Reads nothing, writes
+        nothing, touches no catalog. This endpoint parses hostile input
+        by design, so every failure is a NAMED 422 (or a 400 for a
+        malformed body), never a 500: an unknown type name gets the
+        type-parity refusal (a permanently unsupported DuckLake name —
+        int128, geometry, ... — gets its own reason, never
+        "unknown"); malformed base64, wrong-length or empty bytes,
+        variant/container types, NaN float/double bytes (a NaN is never
+        a bound — StatsSanity refuses one at every door), an
+        out-of-day time and a non-UTF-8 string bound each answer a 422
+        naming the rule.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DecodeBoundRequest" }
+      responses:
+        "200":
+          description: The decoded JSON scalar.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecodeBoundResponse" }
+        "400":
+          description: >
+            Malformed body — unparseable JSON, a missing required
+            field, a JSON null body, or a body sent under a
+            Content-Type this API does not read (bare curl -d posts
+            x-www-form-urlencoded).
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: >
+            Named refusal — unknown/refused type name, a non-string
+            or over-cap (1024 decoded bytes) value, malformed base64,
+            wrong-length bytes, NaN, out-of-domain value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /info:
     get:
       operationId: getInstanceInfo
@@ -1000,15 +1303,15 @@ paths:
         Identity of this hoglake instance: the operator-configured
         display name (HOGLAKE_INSTANCE_NAME, e.g. "GigaHog") the webui
         shows so deployments are tellable apart. Name omitted when
-        unset. Carries the running server's version, which the webui
-        shows beside the brand so the deployed build is readable
-        without shelling in. Also carries instance-wide live-data
-        totals for the webui header: sums over live data files
-        (end_snapshot unset) across every catalog, refreshed by the
-        server's periodic metrics sampler — display numbers, not a
-        consistency primitive. total_rows is gross of deletion-vector
-        masking. Both totals are omitted in the boot window before the
-        first sample.
+        unset. Carries the running server's version and, when the image
+        came off the pipeline, its build stamp — the webui shows both
+        beside the brand so the deployed build is readable without
+        shelling in. Also carries instance-wide live-data totals for the
+        webui header: sums over live data files (end_snapshot unset)
+        across every catalog, refreshed by the server's periodic metrics
+        sampler — display numbers, not a consistency primitive.
+        total_rows is gross of deletion-vector masking. Both totals are
+        omitted in the boot window before the first sample.
       responses:
         "200":
           description: Instance info
@@ -1025,6 +1328,18 @@ paths:
                       The running server's version, as built (e.g.
                       1.0.1-dev). Always present: "unknown" when the
                       binary carries no version resource, never omitted.
+                  build:
+                    type: string
+                    description: >
+                      Packaging stamp identifying WHICH build this is,
+                      within a version that stays constant between
+                      releases (e.g. 20260915T2104Z, a UTC build time).
+                      Supplied by the pipeline that packages the image,
+                      so it is OMITTED on any build nobody stamped —
+                      every local build and every PR image. Absent means
+                      "not off the pipeline", not an error. Opaque and
+                      display-only: never parse it for ordering you
+                      depend on.
                   total_rows: { type: integer, format: int64 }
                   total_size_bytes: { type: integer, format: int64 }
 
@@ -1201,6 +1516,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
+        capabilities: { type: array, items: { type: string }, description: Includes atomic-table-creation-v1 when supported }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1227,25 +1543,138 @@ components:
       properties:
         name: { type: string }
 
+    TableCreation:
+      type: object
+      required: [operation_id, table_uuid, namespace, name, columns, write_path, state, expires_at]
+      properties:
+        operation_id: { type: string, format: uuid }
+        table_uuid: { type: string, format: uuid }
+        namespace: { type: string }
+        name: { type: string }
+        columns:
+          type: array
+          items: { $ref: "#/components/schemas/Column" }
+        write_path: { type: string }
+        state: { type: string, enum: [prepared, committed, rejected, aborted] }
+        expires_at: { type: string, format: date-time, description: Prepared operations expire after 24 hours; terminal receipts do not expire }
+        snapshot_id: { type: integer, format: int64 }
+        schema_version: { type: integer, format: int64 }
+        reason:
+          type: string
+          enum: [target_exists, namespace_changed, client_abort, expired,
+                 definition_invalid]
+          description: >
+            Why a `rejected` receipt cannot be published.
+            `definition_invalid` means the definition was legal when it
+            was PREPARED and is not any more — a rule tightened between
+            prepare and publish. The receipt is terminal: prepare a new
+            one with a definition the current server accepts. (Without
+            this the operation stayed `prepared` forever, since the
+            failing publish rolled itself back and only an explicit
+            abort could end it.)
+
     ColumnDef:
       type: object
       required: [name, type]
       properties:
         name:
           type: string
+          # PATTERN STAYS IN ITS SIBLING POSITION. Every other identifier
+          # in this spec declares it here, and a generator reads
+          # `schema.pattern`: moving it inside a composition keyword
+          # made column names the one field with NO pattern as far as
+          # codegen is concerned,
+          # which is strictly worse than the gap it was fixing. The
+          # `not` below carries the prefix rule for validators that
+          # implement it; generators that ignore it are no worse off
+          # than before, and the description states the rule for the
+          # humans writing the client.
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
+          not: { pattern: "^_hog" }
           description: >
             Identifier policy (shared by namespace/table/view/column
             names): letter or underscore start, then letters, digits,
-            underscore, hyphen; max 128 chars. Violations are 422.
+            underscore, hyphen; max 128 chars.
+
+            COLUMN names carry one rule the others do not: the `_hog`
+            prefix is RESERVED, at every nesting level, for hoglake's own
+            physical columns (compaction writes `_hog_row_id` into every
+            output, bound by a reserved field id). A column named
+            `_hog...` collides with it, so create_table, add_column and
+            rename_column all refuse one — including a field inside a
+            struct, a list element or a map value.
+
+            Both violations are 422. The reserved-prefix refusal names
+            the offending DOTTED PATH, so a rejected struct field says
+            where it is: "column name 'addr._hog_x' uses the reserved
+            prefix '_hog'".
+
+            The prefix rule is a sibling `not`, not a negative
+            lookahead inside `pattern`: lookahead is legal ECMA-262 but
+            RE2 — which Go clients generate against — cannot compile it,
+            and a client that fails to build is worse than one that
+            checks the prefix a layer up.
         type:
           type: string
-          enum: [boolean, int, long, float, double, decimal, date, time,
-                 timestamp, timestamptz, string, uuid, binary]
+          enum: [boolean, int8, int16, int, long, uint8, uint16, uint32,
+                 uint64, float, double, decimal, date, time, timestamp_s,
+                 timestamp_ms, timestamp, timestamp_ns, timestamptz,
+                 string, json, uuid, binary, variant,
+                 list, struct, map]
+          description: >
+            The closed column-type vocabulary: every member has a
+            defined Iceberg facade mapping (iceberg-federation.md §2),
+            which is the membership rule. VARIANT maps to Iceberg v3 variant and
+            requires native Parquet VARIANT(1), with its field ID on the group.
+            VARIANT has no whole-column statistics and cannot be a partition or
+            sort source. Scalar compaction skips tables containing VARIANT.
+
+            Stats bounds for a column are stored — and returned — in the
+            Iceberg single-value binary serialization of the MAPPED
+            Iceberg type, not of the hoglake type. Consequences worth
+            knowing before decoding: int8/int16/uint8/uint16 bounds are
+            4-byte little-endian ints; uint32 bounds are 8-byte
+            little-endian longs; uint64 bounds are the minimal
+            two's-complement big-endian unscaled value of a
+            decimal(20,0); timestamp_s and timestamp_ms bounds are
+            MICROSECONDS since the epoch (like timestamp), while
+            timestamp_ns bounds are NANOSECONDS; json bounds are UTF-8
+            bytes, like string.
+
+            list, struct and map are CONTAINERS: they carry no values of
+            their own, they require `children`, and they NEVER carry
+            stats. Bounds and counts are per LEAF field — the element of
+            a list, the key and value of a map, the scalar fields of a
+            struct — so a commit shipping column_stats for a container's
+            field_id is refused with a 422. They map natively to the
+            Iceberg V2 list/struct/map, element/key/value field ids
+            included.
+
+            Shape rules, each its own named 422: a list has exactly one
+            child, named `element`; a map has exactly two, `key` then
+            `value`, and the key must have nullable=false (Iceberg map
+            keys are non-nullable); a struct has one or more children,
+            which keep their own names; a scalar type has none. Nesting
+            depth is capped at 8, counting a top-level column as 1.
+
+            These DuckLake type names are permanently unsupported and
+            are refused with a 422 naming the type and the reason, never
+            an unknown-type error: int128 and uint128 (39 decimal
+            digits, past Iceberg's widest exact numeric decimal(38)),
+            timetz and interval (no Iceberg mapping), and the geometry
+            family — point, linestring, polygon, multipoint,
+            multilinestring, multipolygon, linestring_z,
+            geometrycollection (out of scope).
         type_params:
           type: object
           additionalProperties: true
         nullable: { type: boolean, default: true }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/ColumnDef" }
+          description: >
+            Required for list/struct/map, forbidden for every scalar
+            type. Recursive, bounded by the depth cap above.
 
     Column:
       allOf:
@@ -1254,7 +1683,19 @@ components:
           required: [field_id, ordinal]
           properties:
             field_id: { type: integer, format: int64 }
-            ordinal: { type: integer }
+            ordinal:
+              type: integer
+              description: >
+                0-based position among the column's SIBLINGS — top-level
+                columns share one sequence, and each container's children
+                have their own. Not a table-wide position.
+            children:
+              type: array
+              items: { $ref: "#/components/schemas/Column" }
+              description: >
+                Present only for list/struct/map, with the field ids the
+                server assigned. Ids are allocated depth-first, so a
+                container's id is always below its descendants'.
 
     CreateTableRequest:
       type: object
@@ -1353,6 +1794,14 @@ components:
       type: object
       description: At least one of appends/deletes must be non-empty.
       properties:
+        idempotency_key:
+          type: string
+          format: uuid
+          description: >
+            Optional catalog-scoped publication identity. Exact request replays
+            return the original result without writing, including after snapshot
+            expiry. Reusing a key with a different request returns 422. Receipts
+            are retained indefinitely. Persist the complete request before sending.
         read_snapshot:
           type: integer
           format: int64
@@ -1426,7 +1875,15 @@ components:
       type: object
       required: [source_field_id, transform]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         transform:
           type: string
           enum: [identity, bucket, year, month, day, hour]
@@ -1447,7 +1904,15 @@ components:
       type: object
       required: [source_field_id, direction, null_order]
       properties:
-        source_field_id: { type: integer, format: int64 }
+        source_field_id:
+          type: integer
+          format: int64
+          description: >
+            A LEAF column's field id. A struct's leaf field is legal
+            (Iceberg's source-id may point at one); a nested container
+            itself is not (no single value per row), and neither is
+            anything under a list or a map (many values per row). Both
+            are named 422s.
         direction:
           type: string
           enum: [asc, desc]
@@ -1473,18 +1938,47 @@ components:
     AlterOp:
       type: object
       required: [op]
-      description: Discriminated by `op`.
+      description: >
+        Discriminated by `op`.
+
+        Column-addressing ops (`drop_column`, `rename_column`,
+        `promote_column`, and `add_column`'s `parent`) name their target
+        by a DOTTED PATH of column names — `addr` for a top-level column,
+        `addr.zip` for a field of the struct `addr`. Names cannot contain
+        `.` (the identifier pattern), so the path is unambiguous.
+
+        Only STRUCT interiors are addressable. A path stepping through a
+        list or a map is a 422: Iceberg has no add/drop/rename for an
+        element, a key or a value, and the container's shape is part of
+        its type. Nested containers are also not promotable — promote a
+        struct's LEAF field, which follows the ordinary scalar matrix.
       properties:
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
                  rename_table, set_partition_spec, set_sort_order]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
+        parent:                       # add_column, optional
+          type: string
+          description: >
+            Dotted path of an existing STRUCT to append the new field
+            to (new field id, ordinal = max sibling + 1). Absent = a new
+            top-level column. Naming a list or a map here is a 422.
         name: { type: string }        # drop_column, promote_column
         from: { type: string }        # rename_column
-        # rename_column target (must satisfy the ColumnDef.name identifier
-        # pattern); promote_column target type
-        to: { type: string }
+        to:
+          type: string
+          description: >
+            Dual-use: the new NAME for rename_column, the target TYPE
+            for promote_column. It therefore carries no `pattern` of its
+            own — a schema that constrained it to the identifier regex
+            would reject every promote_column, whose values are type
+            names from the ColumnDef.type vocabulary.
+
+            For rename_column the value must satisfy ColumnDef.name in
+            full: the identifier pattern AND the reserved `_hog` prefix
+            rule. Both are 422s, with the same messages ColumnDef.name
+            documents.
         new_name:                     # rename_table
           type: string
           pattern: "^[A-Za-z_][A-Za-z0-9_-]{0,127}$"
@@ -1530,6 +2024,161 @@ components:
             be row-id-contiguous. When true, row_id_start is
             min(input row ids) and has no positional meaning; readers
             needing row identity must read the column.
+
+    FileColumnStats:
+      type: object
+      required: [field_id, name, path, type, value_count, null_count,
+                 lower_bound, upper_bound]
+      description: >
+        One column's statistics for one data file, bounds DECODED from
+        the stored Iceberg single-value serialization to plain JSON.
+
+        The wire conventions, by mapped type family — shared verbatim
+        by decodeBound, and pinned cross-language by the `wire` fields
+        of pyhoglake/tests/vectors/bounds_vectors.json:
+
+        * boolean -> JSON boolean.
+
+        * EVERY integer type (int8..uint64) and decimal -> an exact
+          JSON number, never routed through a double. WARNING for
+          consumers: long, uint64 and decimal values can exceed 2^53,
+          and JavaScript's JSON.parse silently rounds them — parse
+          these fields exactly (BigInt / raw-token parsing), the way
+          the hoglake webui does. Decimal renders at the COLUMN's
+          scale (unscaled x 10^-scale, e.g. "1.50" for a scale-2
+          column) and ALWAYS in plain notation — never
+          scientific/exponent form, so a decimal(38,38) lower bound
+          of unscaled 1 is the 38-fraction-digit token
+          0.00000000000000000000000000000000000001, not 1E-38;
+          uint64 is decimal(20,0), an integer.
+
+        * float/double -> JSON numbers. The infinities cannot be JSON
+          numbers and render as the STRING sentinels "Infinity" and
+          "-Infinity". NaN never appears: it is not a bound
+          (StatsSanity refuses one at every storing door; NaNs are
+          counted in nan_count). Negative zero renders as -0.0 — it is
+          what is stored: the normalization rule fixes -0.0 as the
+          lower-bound zero and +0.0 as the upper-bound zero, so a
+          lower bound of an all-zero column reads -0.0 by design.
+
+        * temporals -> ISO-8601 strings, UTC-referenced: date
+          "2026-09-05"; time "13:37:42.123456"; timestamp_s /
+          timestamp_ms / timestamp "2026-09-05T12:00:00.123456" (no
+          offset designator — the type is zoneless; bounds for the
+          seconds/millis variants are STORED in micros, the mapped
+          Iceberg type's unit, and render accordingly); timestamp_ns
+          with nanosecond digits; timestamptz as an instant with a
+          trailing Z. Years beyond 9999 use the expanded "+YYYYY"
+          form. ISO tokens ELIDE trailing zero units — a whole-minute
+          time is "00:00" and a whole-minute timestamp
+          "1970-01-01T00:00", both valid ISO-8601 — so consumers must
+          parse them as ISO-8601, never with fixed-precision
+          patterns.
+
+        * string/json -> the string itself; uuid -> canonical
+          8-4-4-4-12; binary -> base64.
+
+        A bound is JSON null when the column stored none (an all-null
+        column has nothing to bound — a real answer, distinct from the
+        file-level no-stats shape) AND when the stored bytes cannot be
+        decoded under the column's visible type (a stale-width bound
+        left by a pre-promote writer, an out-of-domain value): the
+        "NULL, never guessed" rule's read side. Either way, a null
+        bound means the caller MUST NOT prune on this column.
+      properties:
+        field_id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: The leaf's own name (synthetic element/key/value included).
+        path:
+          type: string
+          description: >
+            Dotted path from the top level (e.g. addr.zip, l.element,
+            m.key) — nested leaves carry stats exactly like top-level
+            columns.
+        type:
+          type: string
+          description: The column's wire type name at the resolved snapshot.
+        type_params:
+          type: object
+          additionalProperties: true
+          description: The column's type_params (decimal scale/precision), when present.
+        value_count: { type: integer, format: int64 }
+        null_count: { type: integer, format: int64 }
+        nan_count: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+        lower_bound:
+          nullable: true
+          description: Decoded lower bound (JSON scalar per the conventions above).
+        upper_bound:
+          nullable: true
+          description: Decoded upper bound (JSON scalar per the conventions above).
+
+    FileStats:
+      type: object
+      required: [data_file_id, stats_state, columns]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        stats_state: { type: string, enum: [provided, pending, failed] }
+        columns:
+          type: array
+          description: >
+            One entry per stored stats row whose field id is a visible
+            leaf, field-id order. Empty when the file has no stats
+            rows. Columns absent from this array have no recorded
+            statistics (variant columns never do; containers never
+            carry rows) — absent bounds mean the caller must not prune
+            on them.
+          items: { $ref: "#/components/schemas/FileColumnStats" }
+        no_stats_reason:
+          type: string
+          description: >
+            Present iff stats_state is not 'provided': why the file
+            has no per-column rows (deferred stats not yet hydrated,
+            or hydration failed). With no bounds, callers must not
+            prune this file.
+
+    DecodeBoundRequest:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          description: >
+            A wire column type name (the ColumnDef.type vocabulary,
+            case-insensitive). variant and the containers have no
+            single-value encoding and are named 422s.
+        value:
+          type: string
+          description: >
+            Standard base64 of the Iceberg single-value encoding.
+            Validated strictly; malformed base64 is a named 422, and
+            the value MUST be a JSON string — a bare JSON number is a
+            named 422 rather than being coerced into digits that
+            happen to decode. Capped at 1024 decoded bytes (a named
+            422 past it): stored bounds can be longer — the commit
+            path caps nothing — but this is a paste-one-value
+            diagnostic, not a bulk door.
+        type_params:
+          type: object
+          additionalProperties: true
+          description: >
+            For decimal: the scale to render at ({"scale": 2}),
+            defaulting to 0 — the scale lives in the column, not the
+            bytes. Ignored for every other type.
+
+    DecodeBoundResponse:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          description: The canonical wire spelling of the requested type.
+        value:
+          description: >
+            The decoded JSON scalar, exactly as FileColumnStats'
+            lower_bound/upper_bound render it (same conventions, same
+            code path).
 
     ChangePlan:
       type: object
@@ -1682,7 +2331,7 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema, failed_groups]
+                 unconvertible_schema, invalid_data, failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -1713,6 +2362,22 @@ components:
             Groups skipped because a live column's type cannot be
             produced from an input file's parquet type (outside identity
             and the int->long / float->double promotions).
+        invalid_data:
+          type: integer
+          format: int64
+          description: >
+            Groups skipped for a fault that is DURABLE and the writer's:
+            a value that cannot exist under the type its own file
+            declares (an empty byte array under a decimal, an unscaled
+            value wider than the destination precision), a row large
+            enough to threaten the heap, or a file whose schema
+            contradicts its own registration (the reserved row-id field
+            id present or absent against explicit_row_ids).
+
+            Unlike unconvertible_schema this never clears on its own, so
+            the group is re-planned and re-refused every sweep. The axis
+            is durability and fault, not values-versus-schema: a nonzero
+            count is a writer bug, not a backlog.
         failed_groups:
           type: integer
           format: int64
@@ -1806,6 +2471,190 @@ components:
             (absent on an empty queue); compaction -> small_files
             (files selected into complete geometric-tier prefix groups,
             excluding incomplete suffixes), target_bytes; verify -> none.
+
+    DatabaseHealth:
+      type: object
+      required: [server, activity, commit_locks, replication_slots, tables,
+                 indexes, findings, blind_spots]
+      properties:
+        server: { $ref: "#/components/schemas/DatabaseServer" }
+        activity: { $ref: "#/components/schemas/DatabaseActivity" }
+        commit_locks:
+          type: array
+          items: { $ref: "#/components/schemas/CommitLockHolder" }
+        replication_slots:
+          type: array
+          items: { $ref: "#/components/schemas/ReplicationSlot" }
+        blind_spots:
+          type: array
+          items: { type: string }
+          description: >
+            What this page cannot see, stated so a clean report is not
+            read as "the database is fine" — disk fullness is invisible
+            from SQL on a managed instance, and orphaned catalog rows are
+            excluded by the no-hog_*-tables rule.
+        tables:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseTable" }
+        indexes:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseIndex" }
+        findings:
+          type: array
+          items: { $ref: "#/components/schemas/DatabaseFinding" }
+
+    DatabaseServer:
+      type: object
+      required: [version, database, size_bytes, connections_used, connections_max,
+                 deadlocks, committed, rolled_back, xid_age, xid_freeze_max_age,
+                 autovacuum_enabled]
+      properties:
+        version: { type: string, description: "Release only, build flags stripped." }
+        database: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        started_at: { type: string, format: date-time }
+        connections_used: { type: integer }
+        connections_max: { type: integer }
+        cache_hit_ratio:
+          type: number
+          description: >
+            Fraction of block reads served from cache since the last
+            statistics reset. Omitted before anything has been read.
+        deadlocks: { type: integer, format: int64 }
+        committed: { type: integer, format: int64 }
+        rolled_back: { type: integer, format: int64 }
+        xid_age:
+          type: integer
+          format: int64
+          description: age(datfrozenxid) for this database.
+        xid_freeze_max_age: { type: integer, format: int64 }
+        autovacuum_enabled: { type: boolean }
+        temp_files:
+          type: integer
+          format: int64
+          description: Queries that spilled to disk (work_mem pressure).
+        temp_bytes: { type: integer, format: int64 }
+        checkpoints_timed:
+          type: integer
+          format: int64
+          description: >
+            Scheduled checkpoints. Omitted when the statistics view is
+            unreadable — the columns moved from pg_stat_bgwriter to
+            pg_stat_checkpointer in PG 17, so this is version-dependent.
+        checkpoints_requested:
+          type: integer
+          format: int64
+          description: Checkpoints forced by WAL reaching max_wal_size.
+
+    CommitLockHolder:
+      type: object
+      required: [catalog_id, pid, granted, waiters]
+      properties:
+        catalog_id:
+          type: integer
+          format: int64
+          description: >
+            The low 32 bits of the advisory key, which is the catalog id
+            by construction (see Locks.kt).
+        catalog:
+          type: string
+          description: Null if the catalog row is gone.
+        pid: { type: integer }
+        granted:
+          type: boolean
+          description: False for a session queued behind the lock.
+        held_seconds:
+          type: number
+          description: Age of the holder's transaction.
+        waiters:
+          type: integer
+          description: Sessions queued behind this lock.
+
+    ReplicationSlot:
+      type: object
+      required: [name, slot_type, active]
+      properties:
+        name: { type: string }
+        slot_type: { type: string }
+        active: { type: boolean }
+        retained_wal_bytes:
+          type: integer
+          format: int64
+          description: >
+            WAL pinned by this slot. An inactive slot retains it until
+            the volume fills, which is invisible from SQL on a managed
+            instance.
+
+    DatabaseActivity:
+      type: object
+      required: [active, idle, idle_in_transaction, waiting]
+      properties:
+        active: { type: integer }
+        idle: { type: integer }
+        idle_in_transaction: { type: integer }
+        waiting:
+          type: integer
+          description: Sessions blocked on a lock.
+        longest_transaction_seconds: { type: number }
+        longest_idle_in_transaction_seconds:
+          type: number
+          description: >
+            Age of the oldest open-but-idle transaction. This pins the
+            vacuum horizon for the whole database.
+        longest_wait_seconds: { type: number }
+
+    DatabaseTable:
+      type: object
+      required: [name, live_tuples, dead_tuples, table_bytes, index_bytes,
+                 toast_bytes, total_bytes, seq_scans, index_scans, autovacuum_count]
+      properties:
+        name: { type: string }
+        live_tuples: { type: integer, format: int64 }
+        dead_tuples: { type: integer, format: int64 }
+        dead_ratio:
+          type: number
+          description: Omitted for an empty table rather than reported as zero.
+        table_bytes: { type: integer, format: int64 }
+        index_bytes: { type: integer, format: int64 }
+        toast_bytes: { type: integer, format: int64 }
+        total_bytes: { type: integer, format: int64 }
+        seq_scans: { type: integer, format: int64 }
+        index_scans: { type: integer, format: int64 }
+        last_vacuum: { type: string, format: date-time }
+        last_autovacuum: { type: string, format: date-time }
+        last_analyze: { type: string, format: date-time }
+        last_autoanalyze: { type: string, format: date-time }
+        autovacuum_count: { type: integer, format: int64 }
+
+    DatabaseIndex:
+      type: object
+      required: [table, name, size_bytes, scans, constraint_backing]
+      properties:
+        table: { type: string }
+        name: { type: string }
+        size_bytes: { type: integer, format: int64 }
+        scans:
+          type: integer
+          format: int64
+          description: Cumulative since the last statistics reset.
+        constraint_backing:
+          type: boolean
+          description: >
+            Backs a unique or primary-key constraint, so it is doing a
+            job whether or not it is ever scanned and must not be
+            reported as droppable.
+
+    DatabaseFinding:
+      type: object
+      required: [severity, code, title, detail, hoglake_impact]
+      properties:
+        severity: { type: string, enum: [info, warn, critical] }
+        code: { type: string }
+        title: { type: string }
+        detail: { type: string, description: What was measured. }
+        hoglake_impact:
+          type: string
+          description: What it means for this schema and its commit path.
 
     MaintenanceStatus:
       type: object

@@ -80,6 +80,16 @@ class CompactionServiceIntegrationTest {
     private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
 
     private companion object {
+        /**
+         * An object name carrying nothing but identity: the pyhoglake
+         * writer's shape, and now compaction's too. A compaction output
+         * that announces itself in its name tells a reader something the
+         * catalog already owns (explicit_row_ids) and gives every output
+         * in a table the same lead-in — see #23.
+         */
+        private const val BARE_UUID_PARQUET =
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\\.parquet"
+
         const val BUCKET = "hoglake-compaction-test"
 
         val minio: MinIOContainer by lazy {
@@ -212,6 +222,20 @@ class CompactionServiceIntegrationTest {
         return ids
     }
 
+    /**
+     * #83's fuzz-found puffin DV: every field this reader owns is sound,
+     * and the roaring payload's container count is not. Read from the
+     * corpus entry so the bytes here and the ones the fuzz target
+     * replays cannot drift apart.
+     */
+    private fun corruptDvBytes(): ByteArray =
+        checkNotNull(
+            javaClass.classLoader.getResourceAsStream(
+                "com/posthog/hoglake/fuzz/PuffinDeletionVectorFuzzTestInputs/" +
+                    "readRefusesLoudlyOrDecodesDeterministically/crash-1c1d87ae",
+            ),
+        ) { "the #83 fuzz corpus entry is missing" }.use { it.readBytes() }
+
     /** Upload a real puffin DV and register it against [dataFileId]. */
     private fun registerDv(
         cat: String,
@@ -287,6 +311,100 @@ class CompactionServiceIntegrationTest {
      * file deleting positions 1 and 3 (row ids 6 and 8) — the group
      * mixes DV-bearing and DV-free inputs.
      */
+    @Test
+    fun `a malformed pre-existing stats row cannot reach the compaction output`() {
+        // The THIRD door. Commit and the hydrator both sanitize; this
+        // path wrote hog_file_column_stats directly, so a row stored
+        // before the sanitizer existed could be merged into a new
+        // file's metadata and stay live for another compaction
+        // generation. Readers prune on these.
+        val fx = fixture(dvOnMiddle = false)
+
+        // A MIXED population, which is the only one that tests what the
+        // comment claims. Corrupting every input makes input-repair and
+        // output-repair indistinguishable: both produce null bounds, so
+        // the assertion passes with the input-level repair deleted.
+        //
+        // Corrupt exactly ONE of the three inputs. The true range across
+        // them is -10..5. With the input repaired, the bad file
+        // contributes nothing and the merge is null (its counts no
+        // longer cover the field). WITHOUT it, min(-10, 500) = -10 and
+        // max(5, 100) = 100 — a pair that is NOT inverted, so
+        // StatsSanity sees nothing wrong and it is stored live. Every
+        // pruner then reads `lower = -10, upper = 100` and drops the
+        // file for `WHERE id < -10`... and worse, an inverted-looking
+        // pair would at least have been caught. A plausible wrong answer
+        // beats a detectable one, which is why this needs its own test.
+        val victim =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT min(f.data_file_id) FROM hog_data_file f
+                      JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                     WHERE c.name = :cat
+                    """,
+                ).bind("cat", fx.cat).mapTo(Long::class.java).one()
+            }
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_file_column_stats s
+                   SET lower_bound = :lo, upper_bound = :hi, null_count = value_count + 7
+                  FROM hog_catalog c
+                 WHERE c.catalog_id = s.catalog_id AND c.name = :cat
+                   AND s.field_id = 1 AND s.data_file_id = :victim
+                """,
+            )
+                .bind("cat", fx.cat)
+                .bind("victim", victim)
+                .bind("lo", longLe(500))
+                .bind("hi", longLe(100))
+                .execute()
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single()
+        val row =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT value_count, null_count, lower_bound, upper_bound
+                      FROM hog_file_column_stats s
+                      JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                     WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = 1
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .map { rs, _ ->
+                        listOf(
+                            rs.getLong("value_count"),
+                            rs.getLong("null_count"),
+                        ) to (rs.getBytes("lower_bound") to rs.getBytes("upper_bound"))
+                    }
+                    .one()
+            }
+        val (counts, bounds) = row
+        assertThat(counts[1])
+            .describedAs("null_count must not exceed the value_count it is a subset of")
+            .isLessThanOrEqualTo(counts[0])
+        // The merged bound must not be the plausible-looking blend of a
+        // sound file's minimum with a corrupt file's maximum.
+        assertThat(bounds.first to bounds.second)
+            .describedAs("a repaired input contributes no bound, so the merge has none")
+            .isEqualTo(null to null)
+        // The inverted pair is DROPPED, not narrowed: nothing in the row
+        // says which of the two was the wrong one, so keeping either
+        // would be picking at random — and the kept one would prune.
+        assertThat(bounds.first).describedAs("inverted lower bound must not survive").isNull()
+        assertThat(bounds.second).describedAs("inverted upper bound must not survive").isNull()
+    }
+
+    private fun longLe(v: Long): ByteArray =
+        java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(v).array()
+
     private fun fixture(dvOnMiddle: Boolean = true): Fixture {
         val cat = "compact-e2e-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
@@ -431,7 +549,15 @@ class CompactionServiceIntegrationTest {
         assertThat(filesAtHead).hasSize(1)
         val output = filesAtHead.single()
         assertThat(output.explicitRowIds).isTrue()
-        assertThat(output.path).contains("/data/ns/t/compacted-")
+        // A FRESH object in the table's data directory, named exactly as
+        // an ingested file is: a bare UUID (#23). Pinned positively
+        // rather than as "does not start with compacted-", so the
+        // convention itself is enforced and not just one former
+        // violation of it. explicit_row_ids above is what marks a
+        // compaction output; nothing may infer that from the path.
+        assertThat(output.path).contains("/data/ns/t/")
+        assertThat(output.path).isNotIn(fx.paths)
+        assertThat(output.path.substringAfterLast('/')).matches(BARE_UUID_PARQUET)
         assertThat(output.recordCount).isEqualTo(13) // 15 gross - 2 deleted
         assertThat(output.rowIdStart).isEqualTo(0) // min surviving id; positional meaning void
         assertThat(output.beginSnapshot).isEqualTo(compactionSnap)
@@ -539,7 +665,11 @@ class CompactionServiceIntegrationTest {
         assertThat(stats[2L]!!.second).isEqualTo(IcebergSingleValue.encodeString("a"))
         assertThat(stats[2L]!!.third).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
         assertThat(stats[3L]!!.first).isEqualTo(15L to 2L)
-        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(0.0))
+        // -0.0, not +0.0: a stored lower bound takes the sign Iceberg
+        // fixes for the role, so a total-order evaluator cannot read the
+        // pair as an empty range. Same number, canonical bytes — and
+        // this is the compaction door proving it all the way to the row.
+        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(-0.0))
         assertThat(stats[3L]!!.third).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
         assertVerifyPasses(fx.cat)
     }
@@ -596,6 +726,230 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `a mixed-width bound pair from a promotion race merges to null, not to garbage`() {
+        // The race AlterService documents: the promote-time re-encode
+        // rewrites existing 4-byte bounds to 8, but a hydrator already
+        // in flight under the OLD type can land another 4-byte row
+        // AFTER it. The merge then sees one bound of each width for the
+        // same column, and decoding a 4-byte payload as the live 8-byte
+        // type is not a near miss — it is an exception, which used to
+        // wedge the group on every sweep until its inputs expired.
+        //
+        // Exercised on a NEW type so the backstop is known to cover the
+        // parity set too: uint8 -> uint32 is int -> long in Iceberg
+        // terms, so it is a width-changing promotion exactly like
+        // int -> long, just with neither name saying "long".
+        val fx = fixture(dvOnMiddle = false)
+        val added =
+            alter.alterTable(
+                fx.cat,
+                "ns",
+                "t",
+                listOf(AlterOp.AddColumn(ColumnDef("small", ColType.UINT8))),
+            )
+        val field = added.columns.single { it.def.name == "small" }.fieldId
+
+        // Pre-promotion bounds on every input, in the 4-byte int encoding.
+        db.jdbi.useHandleUnchecked { h ->
+            for (fileId in fx.fileIds) {
+                h.execute(
+                    """
+                    INSERT INTO hog_file_column_stats
+                        (catalog_id, data_file_id, field_id, value_count, null_count,
+                         lower_bound, upper_bound)
+                    VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
+                    """,
+                    fx.cat,
+                    fileId,
+                    field,
+                    IcebergSingleValue.encodeInt(1),
+                    IcebergSingleValue.encodeInt(200),
+                )
+            }
+        }
+
+        alter.alterTable(
+            fx.cat,
+            "ns",
+            "t",
+            listOf(AlterOp.PromoteColumn("small", ColType.UINT32)),
+        )
+
+        // The promote widened all of them; now simulate the racing
+        // hydrator by putting ONE back to the pre-promotion width.
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                UPDATE hog_file_column_stats SET lower_bound = ?, upper_bound = ?
+                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)
+                  AND data_file_id = ? AND field_id = ?
+                """,
+                IcebergSingleValue.encodeInt(1),
+                IcebergSingleValue.encodeInt(200),
+                fx.cat,
+                fx.fileIds[0],
+                field,
+            )
+        }
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).describedAs("the sweep is not wedged").isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val merged =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = :field
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .map { rs, _ -> rs.getBytes("lower_bound") to rs.getBytes("upper_bound") }
+                    .one()
+            }
+        // Honest absence, not a bound merged from a payload that was
+        // reinterpreted at the wrong width.
+        assertThat(merged.first).describedAs("mixed-width merge yields no lower bound").isNull()
+        assertThat(merged.second).describedAs("mixed-width merge yields no upper bound").isNull()
+
+        // The columns that were consistent still merged normally — one
+        // poisoned field must not null the whole file's stats.
+        val others =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                      AND s.field_id <> :field AND s.lower_bound IS NOT NULL
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .bind("field", field)
+                    .mapTo(Long::class.java)
+                    .one()
+            }
+        assertThat(others).describedAs("unaffected columns keep their merged bounds").isGreaterThan(0)
+    }
+
+    @Test
+    fun `bound-merge is unsigned for uint64 and byte-ordered for json`() {
+        // The two new types whose merge is NOT its natural JVM ordering.
+        // uint64 decodes to a BigInteger, so the winner must be picked by
+        // magnitude across the 2^63 boundary where a signed long would
+        // flip; json decodes to a String, which must compare as UTF-8
+        // BYTES (String.compareTo is UTF-16 unit order, and the two
+        // disagree above the BMP).
+        val fx = fixture(dvOnMiddle = false)
+        val added =
+            alter.alterTable(
+                fx.cat,
+                "ns",
+                "t",
+                listOf(
+                    AlterOp.AddColumn(ColumnDef("big", ColType.UINT64)),
+                    AlterOp.AddColumn(ColumnDef("doc", ColType.JSON)),
+                ),
+            )
+        val bigField = added.columns.single { it.def.name == "big" }.fieldId
+        val docField = added.columns.single { it.def.name == "doc" }.fieldId
+
+        // Per input file: a uint64 bound pair straddling 2^63, and a json
+        // pair whose UTF-8 order differs from UTF-16 order. The first
+        // file's uint64 lower is written NON-MINIMALLY (a redundant
+        // leading sign byte), which is what a sloppy writer produces and
+        // which the merge must re-minimalise on re-encode.
+        val twoPow63 = java.math.BigInteger.ONE.shiftLeft(63)
+        val uintBounds =
+            listOf(
+                byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 7) to twoPow63.toByteArray(),
+                twoPow63.toByteArray() to twoPow63.add(java.math.BigInteger.TEN).toByteArray(),
+                java.math.BigInteger.valueOf(9).toByteArray() to
+                    java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray(),
+            )
+        // The orders only diverge ABOVE the BMP, so the discriminating
+        // pair needs an astral codepoint: U+1F600 is F0 9F 98 80 in
+        // UTF-8, above U+FFFD's EF BF BD, but its UTF-16 lead surrogate
+        // D83D is BELOW FFFD. A String.compareTo merge would pick the
+        // replacement character as the upper bound; the byte order picks
+        // the emoji.
+        val jsonBounds =
+            listOf(
+                """{"a":1}""" to """{"z":1}""",
+                """{"b":1}""" to """{"😀":1}""",
+                """{"c":1}""" to """{"�":1}""",
+            )
+        db.jdbi.useHandleUnchecked { h ->
+            for ((i, fileId) in fx.fileIds.withIndex()) {
+                val rows =
+                    listOf(
+                        bigField to uintBounds[i],
+                        docField to
+                            (
+                                IcebergSingleValue.encodeString(jsonBounds[i].first) to
+                                    IcebergSingleValue.encodeString(jsonBounds[i].second)
+                            ),
+                    )
+                for ((field, pair) in rows) {
+                    h.execute(
+                        """
+                        INSERT INTO hog_file_column_stats
+                            (catalog_id, data_file_id, field_id, value_count, null_count,
+                             lower_bound, upper_bound)
+                        VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
+                        """,
+                        fx.cat,
+                        fileId,
+                        field,
+                        pair.first,
+                        pair.second,
+                    )
+                }
+            }
+        }
+
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        val merged =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("fileId", output.dataFileId)
+                    .map { rs, _ ->
+                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
+                    }
+                    .list()
+                    .toMap()
+            }
+
+        // uint64: smallest is 7, largest 2^64-1 — a signed merge would
+        // have called 2^63 and above negative and picked 7 as the max.
+        assertThat(merged[bigField]!!.first)
+            .describedAs("uint64 lower re-minimalises the 9-byte input")
+            .isEqualTo(java.math.BigInteger.valueOf(7).toByteArray())
+        assertThat(merged[bigField]!!.second)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+
+        // json: byte order puts the two-byte UTF-8 sequence on top.
+        assertThat(merged[docField]!!.first).isEqualTo(IcebergSingleValue.encodeString("""{"a":1}"""))
+        assertThat(merged[docField]!!.second)
+            .describedAs("json upper is the UTF-8 byte winner, not the UTF-16 one")
+            .isEqualTo(IcebergSingleValue.encodeString("""{"😀":1}"""))
+    }
+
+    @Test
     fun `changefeed replays original files and never the compacted output`() {
         val fx = fixture()
         svc.runOnce(fx.cat, cfg)
@@ -615,6 +969,93 @@ class CompactionServiceIntegrationTest {
         val tail = catalogs.changes(fx.cat, "ns", "t", fromSnapshot = fx.dvSnapshot)
         assertThat(tail.files).isEmpty()
         assertThat(tail.deleteFiles).isEmpty()
+    }
+
+    @Test
+    fun `a table holding a variant at ANY depth produces no candidates`() {
+        // THE GATE, which had no test: the rewriter's refusal is only
+        // the backstop, and reverting the planner to #77's top-level
+        // check left the whole suite green. A nested variant would then
+        // be enqueued, reach the rewriter, and come back a skip on every
+        // sweep forever — work the planner is supposed to never
+        // schedule.
+        //
+        // UNSORTED, and self-validating. Two earlier attempts passed
+        // against the bug: the first used files too small to group at
+        // all, the second used the sorted fixture, where ANY nested
+        // column triggers the heap derate and empties the plan on its
+        // own. Here the same catalog is planned before and after the
+        // variant arrives, with the struct already present, so the only
+        // thing that changes is the variant.
+        for (nested in listOf(false, true)) {
+            val label = if (nested) "nested" else "top-level"
+            val cat = "compact-variant-$label-${counter.incrementAndGet()}"
+            catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+            catalogs.createNamespace(cat, "ns")
+            catalogs.createTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    ColumnDef("id", ColType.LONG, nullable = false),
+                    ColumnDef("name", ColType.STRING),
+                    ColumnDef("score", ColType.DOUBLE),
+                ),
+            )
+            if (nested) {
+                alter.alterTable(
+                    cat,
+                    "ns",
+                    "t",
+                    listOf(
+                        AlterOp.AddColumn(
+                            ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("n", ColType.LONG))),
+                        ),
+                    ),
+                )
+            }
+            repeat(3) { i ->
+                val rows = (0 until 3).map { r -> TestRow((i * 3 + r).toLong(), "name-$i-$r", r.toDouble()) }
+                val bytes = parquetBytes(rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/f$i.parquet"
+                store.put(path, bytes)
+                commits.commit(
+                    cat,
+                    CommitRequest(
+                        appends =
+                            listOf(
+                                TableAppend(
+                                    "ns",
+                                    "t",
+                                    listOf(FileRegistration(path, rows.size.toLong(), bytes.size.toLong())),
+                                ),
+                            ),
+                    ),
+                )
+            }
+            assertThat(svc.planTable(cat, "ns", "t", cfg).groups)
+                .describedAs("%s: the file set IS groupable before the variant exists", label)
+                .isNotEmpty()
+
+            alter.alterTable(
+                cat,
+                "ns",
+                "t",
+                listOf(
+                    if (nested) {
+                        AlterOp.AddColumn(ColumnDef("v", ColType.VARIANT), parent = "s")
+                    } else {
+                        AlterOp.AddColumn(ColumnDef("v", ColType.VARIANT))
+                    },
+                ),
+            )
+            assertThat(svc.planTable(cat, "ns", "t", cfg).groups)
+                .describedAs("%s variant: nothing is enqueued", label)
+                .isEmpty()
+            assertThat(svc.runOnce(cat, cfg).groupsCompacted)
+                .describedAs("%s variant: and nothing is compacted", label)
+                .isZero()
+        }
     }
 
     // ---- plan-to-commit races ----------------------------------------------
@@ -772,6 +1213,59 @@ class CompactionServiceIntegrationTest {
         assertThat(output.rowIdStart).isZero() // min input start: diagnostics only
         assertThat(readRowIds(store.get(output.path))).isEmpty()
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `a corrupt DV object is invalid_data, not a group retried every sweep`() {
+        // #83's crafted bitmap, now a typed refusal at the reader (#84).
+        // The refusal has to reach the loop's DURABLE channel: the bytes
+        // of a registered .dv object never change, so re-planning the
+        // group every sweep is the permanent loop `invalid_data` exists
+        // to name. Before this it landed in the catch-all as a failed
+        // group — the same misfiling the reserved-id and decimal cases
+        // had, one layer out.
+        val cat = "compact-corrupt-dv-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            ),
+        )
+        val regs =
+            listOf(
+                listOf(TestRow(1, "a", 1.0), TestRow(2, "b", 2.0)),
+                listOf(TestRow(3, "c", 3.0)),
+            ).mapIndexed { i, rows ->
+                val bytes = parquetBytes(rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/c$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        val fileIds =
+            catalogs.listFiles(cat, "ns", "t").sortedBy { it.rowIdStart }.map { it.dataFileId }
+        val dvPath = "s3://$BUCKET/$cat/dv/c0.puffin"
+        registerDv(cat, fileIds[0], dvPath, listOf(0L))
+        // Registered sound, then the OBJECT rots — a hostile or corrupt
+        // .dv under valid catalog metadata, which is the only shape that
+        // reaches the decoder at all.
+        store.put(dvPath, corruptDvBytes())
+
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        assertThat(result.invalidData).describedAs("durable, counted once").isEqualTo(1)
+        assertThat(result.failedGroups).describedAs("not a retryable failure").isZero()
+        assertThat(result.groupsCompacted).isZero()
+        // Nothing was rewritten, and the sweep stays green enough to run
+        // again: the group is simply never worth re-attempting.
+        assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
+            .containsExactlyInAnyOrderElementsOf(regs.map { it.path })
         assertVerifyPasses(cat)
     }
 
@@ -963,15 +1457,28 @@ class CompactionServiceIntegrationTest {
         appendRows("b", paddedRows(200, 2, 5000)) // row ids 3..4
         val ladder = cfg.copy(targetBytes = 65536, tierTarget = 2)
 
+        // A DV on `a` BEFORE the first compaction, so the first output's
+        // ids come out NON-CONTIGUOUS. That is what makes the second
+        // compaction's assertion discriminating: with ids 0..4 and
+        // row_id_start 0, positional numbering produces exactly the same
+        // answer as reading the carrier, so the test passed with the
+        // explicit_row_ids plumbing neutered — it asserted a property it
+        // could not distinguish.
+        val fileA = catalogs.listFiles(cat, "ns", "t").single { it.rowIdStart == 0L }
+        registerDv(cat, fileA.dataFileId, "s3://$BUCKET/$cat/dv/a.puffin", listOf(1L))
+
         // First compaction: unsorted table -> physical order = row-id order.
         assertThat(svc.runOnce(cat, ladder).groupsCompacted).isEqualTo(1)
         val first = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(first.explicitRowIds).isTrue()
-        assertThat(readRowIds(store.get(first.path))).containsExactly(0L, 1L, 2L, 3L, 4L)
+        assertThat(first.rowIdStart).isEqualTo(0)
+        // Id 1 is GONE, so the carrier no longer equals row_id_start +
+        // ordinal for any row past the first.
+        assertThat(readRowIds(store.get(first.path))).containsExactly(0L, 2L, 3L, 4L)
 
-        // A DV lands on the compacted output: physical positions 0 and 4,
-        // i.e. row ids 0 and 4 die. Then more data arrives.
-        registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 4L))
+        // A DV lands on the compacted output: physical positions 0 and
+        // 3, i.e. row ids 0 and 4 die. Then more data arrives.
+        registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 3L))
         // c is a peer of the first output, not a fresh lower-tier file.
         appendRows("c", paddedRows(300, 2, 10000)) // row ids 5..6
         val peers = catalogs.listFiles(cat, "ns", "t")
@@ -983,9 +1490,11 @@ class CompactionServiceIntegrationTest {
         val second = svc.runOnce(cat, ladder)
         assertThat(second.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
-        assertThat(output.recordCount).isEqualTo(5)
-        assertThat(output.rowIdStart).isEqualTo(1) // 0 died; min survivor is 1
-        assertThat(readRowIds(store.get(output.path))).containsExactly(1L, 2L, 3L, 5L, 6L)
+        assertThat(output.recordCount).isEqualTo(4)
+        assertThat(output.rowIdStart).isEqualTo(2) // 0 and 4 died; min survivor is 2
+        // [2, 3] from the carrier, NOT [1, 2] — which is what positional
+        // numbering of the surviving ordinals {1, 2} would have produced.
+        assertThat(readRowIds(store.get(output.path))).containsExactly(2L, 3L, 5L, 6L)
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
         assertVerifyPasses(cat)
     }
@@ -1326,10 +1835,11 @@ class CompactionServiceIntegrationTest {
             .containsExactlyInAnyOrderElementsOf(fx.paths)
         assertThat(queued.filter { it.second == "delete" }.map { it.first })
             .containsExactly(fx.dvPath)
-        // Only the compacted output survives.
+        // Only the compaction output survives — identified as "none of
+        // the inputs" rather than by a name shape (#23).
         assertThat(catalogs.listFiles(fx.cat, "ns", "t").map { it.path })
             .singleElement()
-            .matches { it.contains("compacted-") }
+            .matches({ it !in fx.paths && it != fx.dvPath }, "a fresh path, not an input")
     }
 
     @Test

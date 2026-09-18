@@ -17,11 +17,41 @@ describe("NamespacePage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("clicks")).toBeInTheDocument();
 
-    // Dynamic column row: name input, 13-type dropdown, nullable toggle.
+    // Dynamic column row: name input, 23-type dropdown, nullable toggle.
     expect(screen.getByLabelText("column 1 name")).toBeInTheDocument();
     const typeSelect = screen.getByLabelText("column 1 type");
-    expect(typeSelect.querySelectorAll("option")).toHaveLength(13);
+    expect(typeSelect.querySelectorAll("option")).toHaveLength(23);
     expect(screen.getByLabelText("column 1 nullable")).toBeChecked();
+  });
+
+  it("offers the DuckLake scalar types and never the ones the server refuses", async () => {
+    mockFetch((url) => (url === tablesUrl ? jsonResponse([]) : undefined));
+    renderApp("/catalogs/analytics/namespaces/events");
+
+    await screen.findByText("No tables in this namespace.");
+    const options = Array.from(
+      screen.getByLabelText("column 1 type").querySelectorAll("option"),
+    ).map((o) => o.value);
+
+    expect(options).toEqual(expect.arrayContaining([
+      "int8", "int16", "uint8", "uint16", "uint32", "uint64",
+      "timestamp_s", "timestamp_ms", "timestamp_ns", "json",
+    ]));
+    // Permanently unsupported server-side (int128/uint128 exceed Iceberg's
+    // decimal(38), timetz/interval have no Iceberg mapping, geometry is out
+    // of scope): offering them would be offering a guaranteed 422.
+    expect(options).not.toEqual(expect.arrayContaining(["int128"]));
+    expect(options).not.toEqual(expect.arrayContaining(["uint128"]));
+    expect(options).not.toEqual(expect.arrayContaining(["timetz"]));
+    expect(options).not.toEqual(expect.arrayContaining(["interval"]));
+    expect(options).not.toEqual(expect.arrayContaining(["point"]));
+    expect(options).not.toEqual(expect.arrayContaining(["geometrycollection"]));
+    // list/struct/map are real server types now, and still absent here:
+    // they REQUIRE children and this form has no child editor, so picking
+    // one would be a guaranteed 422 exactly like the refused names above.
+    expect(options).not.toEqual(expect.arrayContaining(["list"]));
+    expect(options).not.toEqual(expect.arrayContaining(["struct"]));
+    expect(options).not.toEqual(expect.arrayContaining(["map"]));
   });
 
   it("adds and removes column rows dynamically", async () => {

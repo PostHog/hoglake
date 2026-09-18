@@ -308,6 +308,11 @@ class Hydrator(
             } else {
                 catalogColumns(h, file, at = file.beginSnapshot)
             }
+        // FooterStats.aggregate applies StatsSanity before it returns,
+        // so these are already checked: a bound the catalog type cannot
+        // decode, or one that sorts above its partner, never reaches
+        // here (same rule the commit path runs on client-supplied
+        // column_stats).
         val aggs = FooterStats.aggregate(footer, columns, file.path)
         for (agg in aggs) upsertStats(h, file, agg)
         val flipped =
@@ -419,42 +424,67 @@ class Hydrator(
         h: Handle,
         file: PendingFile,
         at: Long?,
-    ): List<CatalogColumn> =
-        h.createQuery(
-            if (at == null) {
-                """
-                SELECT field_id, name, col_type, type_params::text AS type_params
-                FROM hog_column
-                WHERE catalog_id = :catalogId AND table_id = :tableId
-                  AND end_snapshot IS NULL
-                ORDER BY ordinal
-                """
-            } else {
-                """
-                SELECT field_id, name, col_type, type_params::text AS type_params
-                FROM hog_column
-                WHERE catalog_id = :catalogId AND table_id = :tableId
-                  AND begin_snapshot <= :at
-                  AND (end_snapshot IS NULL OR :at < end_snapshot)
-                ORDER BY ordinal
-                """
-            },
-        )
-            .bind("catalogId", file.catalogId)
-            .bind("tableId", file.tableId)
-            .apply { if (at != null) bind("at", at) }
-            .map { rs, _ ->
-                CatalogColumn(
-                    fieldId = rs.getLong("field_id"),
-                    name = rs.getString("name"),
-                    type = ColType.fromWire(rs.getString("col_type")),
-                    decimalScale =
-                        rs.getString("type_params")?.let { params ->
-                            json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
-                        },
-                )
-            }
-            .list()
+    ): List<CatalogColumn> {
+        data class Row(val parentFieldId: Long?, val ordinal: Int, val col: CatalogColumn)
+
+        val rows =
+            h.createQuery(
+                if (at == null) {
+                    """
+                    SELECT field_id, parent_field_id, ordinal, name, col_type,
+                           type_params::text AS type_params
+                    FROM hog_column
+                    WHERE catalog_id = :catalogId AND table_id = :tableId
+                      AND end_snapshot IS NULL
+                    """
+                } else {
+                    """
+                    SELECT field_id, parent_field_id, ordinal, name, col_type,
+                           type_params::text AS type_params
+                    FROM hog_column
+                    WHERE catalog_id = :catalogId AND table_id = :tableId
+                      AND begin_snapshot <= :at
+                      AND (end_snapshot IS NULL OR :at < end_snapshot)
+                    """
+                },
+            )
+                .bind("catalogId", file.catalogId)
+                .bind("tableId", file.tableId)
+                .apply { if (at != null) bind("at", at) }
+                .map { rs, _ ->
+                    Row(
+                        parentFieldId = rs.getObject("parent_field_id", java.lang.Long::class.java)?.toLong(),
+                        ordinal = rs.getInt("ordinal"),
+                        col =
+                            CatalogColumn(
+                                fieldId = rs.getLong("field_id"),
+                                name = rs.getString("name"),
+                                type = ColType.fromWire(rs.getString("col_type")),
+                                decimalScale =
+                                    rs.getString("type_params")?.let { params ->
+                                        json.readTree(params).get("scale")?.takeIf { it.isInt }?.asInt()
+                                    },
+                            ),
+                    )
+                }
+                .list()
+
+        // Assemble the tree: ordinals order SIBLINGS, so the sort has to
+        // happen per parent group, not over the whole result set.
+        val byParent = rows.groupBy { it.parentFieldId }
+
+        fun build(parent: Long?): List<CatalogColumn> =
+            (byParent[parent] ?: emptyList())
+                .sortedBy { it.ordinal }
+                .map { row ->
+                    if (row.col.type.isNested) {
+                        row.col.copy(children = build(row.col.fieldId))
+                    } else {
+                        row.col
+                    }
+                }
+        return build(null)
+    }
 
     // ---- footer fetch ------------------------------------------------------
 

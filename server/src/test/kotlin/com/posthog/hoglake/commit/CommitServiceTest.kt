@@ -100,6 +100,57 @@ class CommitServiceTest {
             Fixture(catalogId, namespaceId, tables)
         }
 
+    @Test
+    fun `publication receipt survives retry and rejects changed payload`() {
+        seed()
+        val request =
+            CommitRequest(
+                idempotencyKey = java.util.UUID.randomUUID(),
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/once.parquet", 7)))),
+            )
+        val first = service.commit("cat", request)
+        assertThat(service.commit("cat", request)).isEqualTo(first)
+        assertThatThrownBy { service.commit("cat", request.copy(message = "different")) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+        jdbi.useHandle<Exception> { h ->
+            assertThat(h.createQuery("SELECT SUM(record_count) FROM hog_data_file").mapTo(Long::class.java).one())
+                .isEqualTo(7L)
+            // Receipts must not disappear when snapshot history is expired.
+            h.execute("DELETE FROM hog_snapshot_change")
+            h.execute("DELETE FROM hog_snapshot")
+        }
+        assertThat(service.commit("cat", request)).isEqualTo(first)
+    }
+
+    @Test
+    fun `simultaneous publication retries allocate rows only once`() {
+        seed()
+        val request =
+            CommitRequest(
+                idempotencyKey = java.util.UUID.randomUUID(),
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/race.parquet", 7)))),
+            )
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val start = CountDownLatch(1)
+            val futures =
+                (1..2).map {
+                    pool.submit<com.posthog.hoglake.model.CommitResult> {
+                        start.await()
+                        service.commit("cat", request)
+                    }
+                }
+            start.countDown()
+            assertThat(futures[0].get(10, TimeUnit.SECONDS)).isEqualTo(futures[1].get(10, TimeUnit.SECONDS))
+            jdbi.useHandle<Exception> { h ->
+                assertThat(h.createQuery("SELECT COUNT(*) FROM hog_data_file").mapTo(Long::class.java).one())
+                    .isEqualTo(1L)
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
     /** Mint a snapshot with one change row via direct SQL (DDL simulation). */
     private fun seedChange(
         catalogId: Long,
@@ -133,7 +184,7 @@ class CommitServiceTest {
         path: String,
         records: Long,
         bytes: Long = records * 100,
-        footerSize: Long? = 1234,
+        footerSize: Long? = if (bytes >= 28) 20 else null,
         stats: List<ColumnStats>? = null,
     ) = FileRegistration(path, records, bytes, footerSize, stats)
 
@@ -288,10 +339,10 @@ class CommitServiceTest {
         assertThat(files).hasSize(2)
         assertThat(files.map { it.dataFileId }).containsExactly(1L, 2L)
         assertThat(files[0]).isEqualTo(
-            DbFile(1, tableId, "s3://b/cat/f1.parquet", 10, 0, "provided", 1, 1234),
+            DbFile(1, tableId, "s3://b/cat/f1.parquet", 10, 0, "provided", 1, 20),
         )
         assertThat(files[1]).isEqualTo(
-            DbFile(2, tableId, "s3://b/cat/f2.parquet", 5, 10, "provided", 1, 1234),
+            DbFile(2, tableId, "s3://b/cat/f2.parquet", 5, 10, "provided", 1, 20),
         )
 
         // Stats rows for every (file, field).
@@ -562,6 +613,57 @@ class CommitServiceTest {
         assertThat(dataFiles(fx.catalogId)).isEmpty()
         assertThat(statsRowCount(fx.catalogId)).isEqualTo(0)
         assertThat(tableStats(fx.catalogId, tableId)).isEqualTo(Triple(0L, 0L, 0L))
+    }
+
+    @Test
+    fun `a commit's zero bounds are stored with Iceberg's canonical signs`() {
+        // The commit door takes bounds from a client verbatim, and +0.0
+        // and -0.0 are IEEE-equal, so a writer may hand over either for
+        // either bound. Iceberg's evaluators compare float and double
+        // bounds in NATURAL order, where -0.0 < 0.0, so the pair
+        // (lower = +0.0, upper = -0.0) stored as given reads as an empty
+        // range and prunes away a file that holds 0.0. Each role gets the
+        // sign the spec fixes for it, here proved on the stored row.
+        val fx = seed()
+        jdbi.useHandle<Exception> { h ->
+            h.createUpdate("UPDATE hog_column SET col_type = 'double' WHERE catalog_id = ? AND field_id = 1")
+                .bind(0, fx.catalogId).execute()
+        }
+        val positiveZero = ByteArray(8)
+        val negativeZero = ByteArray(8).also { it[7] = 0x80.toByte() }
+        service.commit(
+            "cat",
+            CommitRequest(
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "events",
+                            listOf(
+                                file(
+                                    "s3://b/zero.parquet",
+                                    3,
+                                    stats =
+                                        listOf(
+                                            ColumnStats(1, 3, 0, 0, 24, positiveZero, negativeZero),
+                                        ),
+                                ),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+        val stored =
+            jdbi.withHandle<Pair<ByteArray, ByteArray>, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT lower_bound, upper_bound FROM hog_file_column_stats
+                     WHERE catalog_id = ? AND field_id = 1
+                    """,
+                ).bind(0, fx.catalogId).map { rs, _ -> rs.getBytes(1) to rs.getBytes(2) }.one()
+            }
+        assertThat(stored.first).describedAs("stored lower bound").isEqualTo(negativeZero)
+        assertThat(stored.second).describedAs("stored upper bound").isEqualTo(positiveZero)
     }
 
     @Test

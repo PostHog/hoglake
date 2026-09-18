@@ -27,6 +27,14 @@ object Metrics {
     }
 
     /** hoglake_commits_total{catalog, result=committed|conflict|validation|error} */
+    fun tableCreationRecorded(
+        catalog: String,
+        action: String,
+        outcome: String,
+    ) {
+        increment("hoglake_table_creation_total", 1.0, "catalog", catalog, "action", action, "outcome", outcome)
+    }
+
     fun commitRecorded(
         catalog: String,
         result: String,
@@ -47,6 +55,24 @@ object Metrics {
     ) {
         if (count > 0) increment("hoglake_files_removed_total", count.toDouble(), "catalog", catalog)
     }
+
+    /**
+     * hoglake_stats_repaired_total{source=commit|hydrator|compaction} —
+     * stats rows stored only after StatsSanity had to repair them (an
+     * undecodable or inverted bound dropped, an impossible count
+     * clamped).
+     *
+     * `compaction` is the one that can fire on HISTORY: it repairs the
+     * input rows it merges, which may predate the rule entirely, so a
+     * standing nonzero count there means old malformed rows are still
+     * being read rather than that something is writing new ones.
+     *
+     * Nonzero means a WRITER is producing metadata its own data
+     * contradicts. Silence here is the normal state; a rising line is a
+     * bug report against whoever is writing those files, and without the
+     * counter the repair would be invisible — the commit still succeeds.
+     */
+    fun statsRepaired(source: String) = increment("hoglake_stats_repaired_total", 1.0, "source", source)
 
     /** hoglake_stats_hydrated_total{result=provided|failed} */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
@@ -74,6 +100,47 @@ object Metrics {
     ) {
         if (count > 0) {
             increment("hoglake_compaction_files_rewritten_total", count.toDouble(), "catalog", catalog)
+        }
+    }
+
+    /**
+     * hoglake_compaction_skipped_total{catalog, reason} — groups the
+     * sweep declined to compact, by reason.
+     *
+     * `unconvertible_schema` and `invalid_data` had a DTO field, a log
+     * line and a ledger row each, and no counter — so the only way to
+     * see either was to read a run's payload or grep the logs. They are
+     * the two an operator most needs a LINE for: unconvertible_schema
+     * rising means a table has stopped compacting, invalid_data rising
+     * means a writer is emitting values its own schema forbids. Neither
+     * is visible as a failure, which is exactly why neither gets
+     * noticed.
+     *
+     * `failed` joins them, for the opposite reason: it IS the red-flag
+     * outcome and it had no series either. (An earlier version of this
+     * comment claimed every other compaction outcome was already a
+     * series. It was not — `skipped_conflicts`, `dv_superseded`,
+     * `bytes_in`/`bytes_out` and `failed_groups` all had none. Only
+     * groups and files-rewritten did.)
+     *
+     * The self-healing skips — commit conflicts, DV supersession — stay
+     * uncounted: they re-plan on the next run, so a line for them is
+     * noise rather than signal.
+     */
+    fun compactionSkipped(
+        catalog: String,
+        reason: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment(
+                "hoglake_compaction_skipped_total",
+                count.toDouble(),
+                "catalog",
+                catalog,
+                "reason",
+                reason,
+            )
         }
     }
 

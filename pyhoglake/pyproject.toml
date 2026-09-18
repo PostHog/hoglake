@@ -1,6 +1,6 @@
 [project]
 name = "pyhoglake"
-version = "1.0.1.dev0"
+version = "1.1.2.dev0"
 description = "Python client for hoglake, the Postgres-native lakehouse-catalog control plane"
 readme = "README.md"
 license = "MIT"
@@ -17,6 +17,7 @@ classifiers = [
 dependencies = [
     "httpx>=0.27",
     "pyarrow>=17.0",
+    "thrift>=0.22.0,<1",
 ]
 
 [project.urls]
@@ -61,7 +62,7 @@ python_version = "3.11"
 
 [[tool.mypy.overrides]]
 # pyarrow ships no type information.
-module = ["pyarrow", "pyarrow.*"]
+module = ["pyarrow", "pyarrow.*", "thrift", "thrift.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

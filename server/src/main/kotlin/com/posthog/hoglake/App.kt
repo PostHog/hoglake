@@ -2,11 +2,13 @@ package com.posthog.hoglake
 
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
+import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
+import com.posthog.hoglake.api.installTableCreationRoutes
 import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
@@ -21,6 +23,7 @@ import com.posthog.hoglake.observability.requestId
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
+import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
@@ -28,6 +31,7 @@ import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.service.ViewService
 import io.ktor.http.ContentType
@@ -95,6 +99,8 @@ class App private constructor(
                 targetBytes = cfg.compactionTargetBytes,
                 tierTarget = cfg.compactionTierTarget,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
+                nestedSortExpansion = cfg.compactionNestedSortExpansion,
+                maxNodesPerRow = cfg.compactionMaxNodesPerRow,
             ),
         )
 
@@ -207,6 +213,9 @@ class App private constructor(
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
         )
+        app.installTableCreationRoutes(
+            TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
+        )
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)
@@ -218,9 +227,11 @@ class App private constructor(
             verifyService,
             hydrator,
             maintenanceStatusService,
+            DatabaseHealthService(jdbi),
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPublicationRoutes()
+        app.installDebugRoutes()
     }
 
     /**

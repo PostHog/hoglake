@@ -53,28 +53,47 @@ TABLE_WIRE = {
 
 
 class _FakeStream(io.BytesIO):
-    def __init__(self, store: dict, key: str):
+    def __init__(self, store: dict, key: str, *, fail_on_close: bool = False):
         super().__init__()
         self._store = store
         self._key = key
+        self._fail_on_close = fail_on_close
 
     def close(self):
         if not self.closed:
+            # A close that fails still leaves whatever bytes landed: the
+            # truncated-object case the caller cannot distinguish.
             self._store[self._key] = self.getvalue()
+            if self._fail_on_close:
+                super().close()
+                raise OSError(f"object store lost the tail of {self._key}")
         super().close()
 
 
 class FakeS3:
-    """Duck-typed stand-in for S3Config + pyarrow S3FileSystem."""
+    """Duck-typed stand-in for S3Config + pyarrow S3FileSystem.
+
+    ``fail_at`` injects an object-store fault on the Nth (0-based)
+    ``open_output_stream`` call — on the open itself, or on the stream's
+    close with ``fail_on_close``, which is the case where a truncated
+    object exists.
+    """
 
     def __init__(self):
         self.files: dict[str, bytes] = {}
+        self.opened: list[str] = []
+        self.fail_at: int | None = None
+        self.fail_on_close: bool = False
 
     def filesystem(self):
         return self
 
     def open_output_stream(self, key: str):
-        return _FakeStream(self.files, key)
+        failing = self.fail_at == len(self.opened)
+        self.opened.append(key)
+        if failing and not self.fail_on_close:
+            raise OSError(f"object store refused {key}")
+        return _FakeStream(self.files, key, fail_on_close=failing)
 
 
 @pytest.fixture
@@ -183,8 +202,9 @@ def test_append_reserved_hog_column_fast_fails(table, httpx_mock, fake_s3):
     """A user ``_hog*`` field in the append batch fast-fails client-side
     BEFORE the pre-flight resolve and the parquet upload. The prefix is
     reserved for hoglake internals (``_hog_row_id`` is compaction's row-id
-    carrier) but the server does not enforce it (hoglake#36), so this check
-    is the barrier — and failing early also saves the S3 write."""
+    carrier); the server refuses it as well (hoglake#36), so failing here
+    saves a round trip and the S3 write rather than being the only
+    barrier."""
     data = pa.table({"id": [1], "name": ["a"], "_hog_row_id": [7]})
     with pytest.raises(ValidationError, match="reserved"):
         table.append(data)
@@ -425,3 +445,445 @@ def test_append_without_s3_config(httpx_mock):
     with pytest.raises(HoglakeError, match="S3 configuration"):
         t.append(pa.table({"id": [1], "name": ["a"]}))
     client.close()
+
+
+def test_nested_name_check_covers_the_whole_list_family():
+    """large_list and fixed_size_list normalize to catalog ``list``, so
+    the recursive nested-name check must know all three.
+
+    It knew only the canonical member, so appending either of the other
+    two walked into a branch that answered "no mismatch" without
+    looking — and the typo'd inner struct field the check exists to
+    catch reached the cast and appended as an all-NULL column whose own
+    stats said ``null_count == record_count``.
+    """
+    from pyhoglake.client import _nested_field_mismatch
+
+    inner_ok = pa.struct([pa.field("a", pa.int64())])
+    inner_typo = pa.struct([pa.field("aa", pa.int64())])
+    for maker in (
+        lambda t: pa.list_(t),
+        lambda t: pa.large_list(t),
+        lambda t: pa.list_(t, 3),
+    ):
+        missing, extra = _nested_field_mismatch(maker(inner_typo), maker(inner_ok), "l")
+        assert missing == ["l.element.a"], maker
+        assert extra == ["l.element.aa"], maker
+        # The matching shape stays quiet.
+        assert _nested_field_mismatch(maker(inner_ok), maker(inner_ok), "l") == ([], [])
+
+
+def test_list_family_predicate_puts_map_first():
+    """Arrow's map is physically a list of structs and answers yes to
+    ``is_list``; every caller of the family predicate must test
+    ``is_map`` first, so the predicate documents that rather than
+    pretending otherwise."""
+    from pyhoglake.types import is_list_family
+
+    assert is_list_family(pa.list_(pa.int64()))
+    assert is_list_family(pa.large_list(pa.int64()))
+    assert is_list_family(pa.list_(pa.int64(), 4))
+    assert not is_list_family(pa.struct([pa.field("a", pa.int64())]))
+    # Pinned as an OBSERVATION, not a dependency: pyarrow 25 reports a
+    # map as not-a-list, earlier comments in this package claimed the
+    # opposite, and every caller dispatches on is_map first so neither
+    # answer can change behaviour. If this flips, the ordering already
+    # covers it and only this assertion needs updating.
+    assert not is_list_family(pa.map_(pa.string(), pa.int64()))
+
+
+def test_prepared_files_upload_then_commit_exact_request(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / "sorted.parquet"
+    data = pa.Table.from_pylist([{"id": 1, "name": "a"}], schema=schema)
+    pq.write_table(data, path)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    key = str(uuid.uuid4())
+    request = table.prepare_append_files([(str(path), None)], idempotency_key=key)
+    assert request["idempotency_key"] == key
+    assert request["read_snapshot"] == 5
+    assert request["appends"][0]["expected_table_uuid"] == TABLE_WIRE["table_uuid"]
+    assert len(fake_s3.files) == 1
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    # Publication has not happened as part of prepare. Persisting this request
+    # is the caller's responsibility; publication uses a capability-safe route.
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit/prepared",
+        json={"snapshot_id": 6, "schema_version": 2},
+        is_reusable=True,
+    )
+    catalog = table._namespace._catalog
+    assert catalog.commit_prepared(request) == catalog.commit_prepared(request)
+    posts = [r for r in httpx_mock.get_requests() if r.method == "POST"]
+    assert len(posts) == 2
+    assert posts[0].content == posts[1].content
+
+
+@pytest.mark.parametrize("defect", [None, "field_id", "nullability", "unit"])
+def test_prepared_seconds_timestamp_preserves_schema_guards(
+    table, httpx_mock, fake_s3, tmp_path, defect
+):
+    from datetime import datetime
+
+    from pyhoglake.models import TableInfo
+    from pyhoglake.types import columns_to_arrow_schema
+
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            *TABLE_WIRE["columns"],
+            {
+                "name": "created_at",
+                "type": "timestamp_s",
+                "field_id": 3,
+                "ordinal": 2,
+                "nullable": False,
+            },
+        ],
+    }
+    schema = columns_to_arrow_schema(TableInfo.from_wire(wire).columns)
+    field = schema.field("created_at")
+    if defect == "field_id":
+        field = field.with_metadata({b"PARQUET:field_id": b"99"})
+    elif defect == "nullability":
+        field = field.with_nullable(True)
+    elif defect == "unit":
+        field = field.with_type(pa.timestamp("us"))
+    schema = schema.set(2, field)
+    path = tmp_path / "seconds.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": 1, "name": "a", "created_at": datetime(2026, 1, 1)}], schema=schema
+        ),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    if defect:
+        with pytest.raises(ValidationError, match="schema/field IDs"):
+            table.prepare_append_files(
+                [(str(path), None)], idempotency_key=str(uuid.uuid4())
+            )
+        assert not fake_s3.files
+    else:
+        request = table.prepare_append_files(
+            [(str(path), None)], idempotency_key=str(uuid.uuid4())
+        )
+        assert request["appends"][0]["files"][0]["record_count"] == 1
+        uploaded = pq.read_table(io.BytesIO(next(iter(fake_s3.files.values()))))
+        assert uploaded["created_at"].to_pylist() == [datetime(2026, 1, 1)]
+
+
+def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_s3):
+    from pathlib import Path
+
+    from pyhoglake.models import TableInfo
+
+    path = Path(__file__).parent / "data" / "native_variant.parquet"
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            TABLE_WIRE["columns"][0],
+            {
+                "name": "properties",
+                "type": "variant",
+                "field_id": 2,
+                "ordinal": 1,
+                "nullable": False,
+            },
+        ],
+    }
+    table._info = TableInfo.from_wire(wire)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    request = table.prepare_append_files(
+        [(str(path), None)], idempotency_key=str(uuid.uuid4())
+    )
+    assert next(iter(fake_s3.files.values())) == path.read_bytes()
+    stats = request["appends"][0]["files"][0]["column_stats"]
+    assert [stat["field_id"] for stat in stats] == [1]
+
+
+@pytest.mark.parametrize("null_id", [False, True])
+def test_prepared_external_optional_fields_require_zero_nulls(
+    table, httpx_mock, fake_s3, tmp_path, null_id
+):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    schema = schema.set(0, schema.field(0).with_nullable(True))
+    path = tmp_path / "external.parquet"
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": None if null_id else 1, "name": "a"}], schema=schema
+        ),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,
+    )
+    if null_id:
+        with pytest.raises(ValidationError, match="non-null"):
+            table.prepare_append_files(
+                [(str(path), None)],
+                idempotency_key=str(uuid.uuid4()),
+                allow_optional_fields=True,
+            )
+        assert not fake_s3.files
+    else:
+        table.prepare_append_files(
+            [(str(path), None)],
+            idempotency_key=str(uuid.uuid4()),
+            allow_optional_fields=True,
+        )
+        assert next(iter(fake_s3.files.values())) == path.read_bytes()
+
+
+# --- orphan accounting on a failed prepare -------------------------------
+#
+# `prepare_append_files` fans out uploads before it returns anything, so a
+# mid-fanout object-store fault used to leave the caller unable to say how
+# many objects it had orphaned. Every exception out of the call now carries
+# `uploaded_files` / `uploaded_uris`, counting only uploads whose output
+# stream CLOSED successfully.
+
+
+def _prepare_mocks(httpx_mock, table_wire=TABLE_WIRE):
+    # prepare refreshes the catalog (read_snapshot) then re-resolves the
+    # table once (the incarnation pre-flight).
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=table_wire,
+    )
+
+
+def _prepared_file(table, tmp_path, name, *, rows=1):
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(table.columns)
+    path = tmp_path / name
+    pq.write_table(
+        pa.Table.from_pylist(
+            [{"id": i, "name": "a"} for i in range(rows)], schema=schema
+        ),
+        path,
+    )
+    return str(path)
+
+
+def _assert_nothing_uploaded(error, fake_s3):
+    assert error.uploaded_files == 0
+    assert error.uploaded_uris == ()
+    # The consumer-side read of the same facts.
+    assert getattr(error, "uploaded_files", 0) == 0
+    assert getattr(error, "uploaded_uris", ()) == ()
+    assert not fake_s3.files
+
+
+@pytest.mark.parametrize("defect", ["schema", "arity", "empty", "no_files"])
+def test_prepare_per_file_refusals_report_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path, defect
+):
+    """A refusal raised BEFORE any upload orphans nothing, and says so."""
+    if defect == "schema":
+        # No field ids, so the destination-schema comparison refuses it.
+        path = str(tmp_path / "idless.parquet")
+        pq.write_table(pa.table({"id": [1], "name": ["a"]}), path)
+        files = [(path, None)]
+        expected = "schema/field IDs"
+    elif defect == "arity":
+        files = [(_prepared_file(table, tmp_path, "a.parquet"), ("2026-01",))]
+        expected = "partition arity"
+    elif defect == "empty":
+        files = [(_prepared_file(table, tmp_path, "empty.parquet", rows=0), None)]
+        expected = "must contain rows"
+    else:
+        files = []
+        expected = "must contain files"
+    _prepare_mocks(httpx_mock)
+    with pytest.raises(ValidationError, match=expected) as excinfo:
+        table.prepare_append_files(files, idempotency_key=str(uuid.uuid4()))
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_bad_idempotency_key_reports_zero_uploads(table, fake_s3):
+    """Not a HoglakeError at all — the uniform attribute is on whatever
+    leaves the call, so a caller never needs to know the type."""
+    with pytest.raises(ValueError) as excinfo:
+        table.prepare_append_files([], idempotency_key="not-a-uuid")
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_incarnation_refusal_reports_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    files = [(_prepared_file(table, tmp_path, "a.parquet"), None)]
+    _prepare_mocks(
+        httpx_mock,
+        table_wire={**TABLE_WIRE, "table_uuid": "11111111-2222-3333-4444-555555555555"},
+    )
+    with pytest.raises(IncarnationChangedError) as excinfo:
+        table.prepare_append_files(files, idempotency_key=str(uuid.uuid4()))
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+def test_prepare_layout_change_refusal_reports_zero_uploads(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    from pyhoglake.models import TableInfo
+
+    files = [(_prepared_file(table, tmp_path, "a.parquet"), None)]
+    stale = TableInfo.from_wire(
+        {
+            **TABLE_WIRE,
+            "columns": [
+                *TABLE_WIRE["columns"],
+                {
+                    "name": "extra",
+                    "type": "long",
+                    "field_id": 3,
+                    "ordinal": 2,
+                    "nullable": True,
+                },
+            ],
+        }
+    )
+    _prepare_mocks(httpx_mock)
+    with pytest.raises(ValidationError, match="layout changed") as excinfo:
+        table.prepare_append_files(
+            files, idempotency_key=str(uuid.uuid4()), expected_table_info=stale
+        )
+    _assert_nothing_uploaded(excinfo.value, fake_s3)
+
+
+@pytest.mark.parametrize("fail_on_close", [False, True])
+@pytest.mark.parametrize("completed", [0, 1, 3])
+def test_prepare_counts_completed_uploads_on_object_store_failure(
+    table, httpx_mock, fake_s3, tmp_path, completed, fail_on_close
+):
+    """Failing while uploading the (k+1)-th of n files reports exactly k.
+
+    The failing file is NOT completed in either flavour: an open that
+    never succeeded wrote nothing, and a close that failed may have left
+    a truncated object the caller cannot tell apart from a whole one.
+    """
+    total = 4
+    files = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None)
+        for i in range(total)
+    ]
+    fake_s3.fail_at = completed
+    fake_s3.fail_on_close = fail_on_close
+    key = str(uuid.uuid4())
+    _prepare_mocks(httpx_mock)
+    # The object store's own OSError, unwrapped: an existing
+    # `except OSError` in a published consumer must keep catching it.
+    with pytest.raises(OSError) as excinfo:
+        table.prepare_append_files(files, idempotency_key=key)
+    error = excinfo.value
+    assert error.uploaded_files == completed
+    assert len(error.uploaded_uris) == completed
+    # The uris name the objects that exist, not the ones that were tried.
+    assert [u.removeprefix("s3://") for u in error.uploaded_uris] == fake_s3.opened[
+        :completed
+    ]
+    for uri in error.uploaded_uris:
+        assert uri.startswith(f"{CATALOG_WIRE['data_path']}/data/ns1/events/{key}/")
+        assert uri.endswith(".parquet")
+    if fail_on_close:
+        # The truncated object landed in the store and is deliberately
+        # NOT counted; the prefix alone cannot tell the caller that.
+        assert len(fake_s3.files) == completed + 1
+        assert fake_s3.opened[completed].removeprefix("s3://") not in [
+            u.removeprefix("s3://") for u in error.uploaded_uris
+        ]
+    else:
+        assert len(fake_s3.files) == completed
+
+
+def test_prepare_success_is_unaffected(table, httpx_mock, fake_s3, tmp_path):
+    total = 3
+    files = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None)
+        for i in range(total)
+    ]
+    key = str(uuid.uuid4())
+    _prepare_mocks(httpx_mock)
+    request = table.prepare_append_files(files, idempotency_key=key)
+    assert len(request["appends"][0]["files"]) == total
+    assert len(fake_s3.files) == total
+    assert request["idempotency_key"] == key
+    assert [reg["record_count"] for reg in request["appends"][0]["files"]] == [
+        1
+    ] * total
+
+
+def test_prepare_consumer_style_getattr_reads_every_case(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    """How a downstream sink actually reads this: one getattr, no
+    knowledge of pyhoglake's exception hierarchy, correct in all three
+    shapes (refusal, mid-fanout fault, success)."""
+
+    def sweep(files, **kwargs):
+        try:
+            table.prepare_append_files(files, **kwargs)
+        except Exception as error:  # the consumer shape: one catch-all
+            return (
+                getattr(error, "uploaded_files", 0),
+                tuple(getattr(error, "uploaded_uris", ())),
+            )
+        return None
+
+    good = [
+        (_prepared_file(table, tmp_path, f"part{i}.parquet"), None) for i in range(3)
+    ]
+    empty = [(_prepared_file(table, tmp_path, "empty.parquet", rows=0), None)]
+
+    _prepare_mocks(httpx_mock)
+    assert sweep(empty, idempotency_key=str(uuid.uuid4())) == (0, ())
+
+    fake_s3.fail_at = 2
+    _prepare_mocks(httpx_mock)
+    orphans = sweep(good, idempotency_key=str(uuid.uuid4()))
+    assert orphans is not None
+    assert orphans[0] == 2
+    assert len(orphans[1]) == 2
+
+    fake_s3.fail_at = None
+    fake_s3.files.clear()
+    _prepare_mocks(httpx_mock)
+    assert sweep(good, idempotency_key=str(uuid.uuid4())) is None

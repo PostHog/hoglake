@@ -3,6 +3,7 @@ package com.posthog.hoglake.api
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.databind.node.ObjectNode
 import com.posthog.hoglake.model.CatalogOptions
 import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.CompactionResult
@@ -12,6 +13,7 @@ import com.posthog.hoglake.model.MaintenanceBacklog
 import com.posthog.hoglake.model.MaintenanceRun
 import com.posthog.hoglake.model.MaintenanceRunPage
 import com.posthog.hoglake.model.MaintenanceStatus
+import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTaskStatus
 import com.posthog.hoglake.model.RehydrateResult
 import com.posthog.hoglake.model.VerifyCheck
@@ -80,6 +82,7 @@ data class CompactionResultDto(
     val skippedConflicts: Long,
     val dvSuperseded: Long,
     val unconvertibleSchema: Long,
+    val invalidData: Long,
     val failedGroups: Long,
 )
 
@@ -93,6 +96,7 @@ fun CompactionResult.toDto() =
         skippedConflicts = skippedConflicts,
         dvSuperseded = dvSuperseded,
         unconvertibleSchema = unconvertibleSchema,
+        invalidData = invalidData,
         failedGroups = failedGroups,
     )
 
@@ -163,8 +167,44 @@ fun MaintenanceRun.toDto(): MaintenanceRunDto =
         finishedAt = finishedAt,
         status = status.wire,
         error = error,
-        result = resultJson?.let { RAW_JSON.readTree(it) },
+        result = resultJson?.let { normalizeLedgerResult(task, RAW_JSON.readTree(it)) },
     )
+
+/**
+ * Fill in counters a ledger row predates.
+ *
+ * A run's result is stored as the RAW JSON the API returned at the time
+ * and handed back verbatim, so every row written before a counter
+ * existed is missing it — while the OpenAPI schema lists it as
+ * required. A client generated from the spec then meets a
+ * CompactionResult with no `invalid_data` and a webui guard written as
+ * `!== "0"` is TRUE for `undefined`, which is why every historical run
+ * grew an "invalid-data —" badge.
+ *
+ * Normalizing on READ rather than migrating: the stored row is an
+ * accurate record of what that run reported, and rewriting history to
+ * make a later schema fit is the worse of the two. Zero is not a guess
+ * here — the counter did not exist, so nothing it counts could have
+ * happened.
+ */
+private fun normalizeLedgerResult(
+    task: MaintenanceTask,
+    node: JsonNode,
+): JsonNode {
+    if (task != MaintenanceTask.COMPACTION || !node.isObject) return node
+    val obj = node as ObjectNode
+    for (field in COMPACTION_COUNTERS_ADDED_LATER) {
+        if (!obj.has(field)) obj.put(field, 0L)
+    }
+    return obj
+}
+
+/**
+ * Compaction result counters added after the ledger started recording.
+ * Append-only: a counter joins this list in the same change that adds
+ * it to CompactionResult, and never leaves.
+ */
+private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data")
 
 data class MaintenanceTaskStatusDto(
     val task: String,

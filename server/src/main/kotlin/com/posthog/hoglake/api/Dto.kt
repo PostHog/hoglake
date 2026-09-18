@@ -1,5 +1,7 @@
 package com.posthog.hoglake.api
 
+import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.NullNode
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangesPlan
 import com.posthog.hoglake.model.ColType
@@ -12,15 +14,19 @@ import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileColumnStats
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.ViewInfo
+import com.posthog.hoglake.stats.BoundWire
 import java.time.Instant
 import java.util.UUID
 
@@ -49,6 +55,7 @@ data class CatalogDto(
     val schemaVersion: Long,
     /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
     val earliestSnapshotTime: Instant? = null,
+    val capabilities: List<String> = listOf("atomic-table-creation-v1"),
 )
 
 fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion, earliestSnapshotTime)
@@ -70,18 +77,26 @@ data class ColumnDefDto(
     val type: String,
     val typeParams: Map<String, Any?>? = null,
     val nullable: Boolean = true,
+    /**
+     * Children of a container type (list/struct/map). Recursive, and
+     * bounded by the depth cap the service enforces
+     * ([com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH]) — Jackson
+     * itself will refuse a pathologically deep body first
+     * (StreamReadConstraints), which is a 400 rather than a stack
+     * overflow.
+     */
+    val children: List<ColumnDefDto>? = null,
 ) {
     fun toModel(): ColumnDef =
         ColumnDef(
             name = name,
-            type =
-                try {
-                    ColType.fromWire(type)
-                } catch (_: IllegalArgumentException) {
-                    throw HoglakeException.Validation("unknown column type '$type' for column '$name'")
-                },
+            // parseWire, not fromWire: a permanently unsupported DuckLake
+            // type name gets a 422 that names the type and says WHY, so a
+            // client stops trying instead of hunting for a spelling.
+            type = ColType.parseWire(type) { "unknown column type '$type' for column '$name'" },
             typeParams = typeParams,
             nullable = nullable,
+            children = children?.map { it.toModel() },
         )
 }
 
@@ -94,9 +109,15 @@ data class ColumnDto(
     val nullable: Boolean,
     val fieldId: Long,
     val ordinal: Int,
+    /**
+     * Children of a container type, with their assigned field ids;
+     * NON_NULL omits it entirely for a scalar column, so a pre-phase-2
+     * client sees the shape it always saw.
+     */
+    val children: List<ColumnDto>? = null,
 )
 
-fun Column.toDto() =
+fun Column.toDto(): ColumnDto =
     ColumnDto(
         name = def.name,
         type = def.type.wire,
@@ -104,6 +125,7 @@ fun Column.toDto() =
         nullable = def.nullable,
         fieldId = fieldId,
         ordinal = ordinal,
+        children = if (def.type.isNested) children.map { it.toDto() } else null,
     )
 
 data class TableSummaryDto(val name: String, val tableUuid: UUID)
@@ -236,6 +258,7 @@ data class CommitRequestDto(
     val deletes: List<TableDeletesDto> = emptyList(),
     val author: String? = null,
     val message: String? = null,
+    val idempotencyKey: UUID? = null,
 ) {
     fun toModel() =
         CommitRequest(
@@ -244,6 +267,7 @@ data class CommitRequestDto(
             deletes = deletes.map { it.toModel() },
             author = author,
             message = message,
+            idempotencyKey = idempotencyKey,
         )
 }
 
@@ -286,6 +310,98 @@ fun DataFile.toDto() =
         partitionValues = partitionValues,
         explicitRowIds = explicitRowIds,
     )
+
+// ---- per-file column statistics (decoded bounds) ---------------------------
+
+/**
+ * GET .../files/{fileId}/stats — one stats row with its bounds DECODED
+ * to the JSON wire conventions (stats/BoundWire; documented on the
+ * spec's FileColumnStats schema). `lower`/`upper` are typed [JsonNode]
+ * rather than Kotlin nullables so an all-null column's stored NULL
+ * bound serializes as an EXPLICIT JSON null (the global NON_NULL
+ * inclusion would silently omit a null property — and "null bound" is
+ * an answer, not an absence).
+ */
+data class FileColumnStatsDto(
+    val fieldId: Long,
+    val name: String,
+    val path: String,
+    val type: String,
+    val typeParams: Map<String, Any?>? = null,
+    val valueCount: Long,
+    val nullCount: Long,
+    val nanCount: Long? = null,
+    val sizeBytes: Long? = null,
+    val lowerBound: JsonNode,
+    val upperBound: JsonNode,
+)
+
+data class FileStatsDto(
+    val dataFileId: Long,
+    val statsState: String,
+    val columns: List<FileColumnStatsDto>,
+    /** Present iff the file has no stats rows (stats_state != provided). */
+    val noStatsReason: String? = null,
+)
+
+fun FileStats.toDto(): FileStatsDto =
+    FileStatsDto(
+        dataFileId = dataFileId,
+        statsState = statsState.wire,
+        columns = columns.map { it.toDto() },
+        noStatsReason =
+            when (statsState) {
+                StatsState.PROVIDED -> null
+                StatsState.PENDING ->
+                    "stats_state is 'pending': column statistics have not been hydrated yet, " +
+                        "so no per-column rows exist; with no bounds, callers must not prune " +
+                        "this file"
+                StatsState.FAILED ->
+                    "stats_state is 'failed': stats hydration failed structurally " +
+                        "(see POST .../maintenance/rehydrate), so no per-column rows exist; " +
+                        "with no bounds, callers must not prune this file"
+            },
+    )
+
+fun FileColumnStats.toDto(): FileColumnStatsDto =
+    FileColumnStatsDto(
+        fieldId = fieldId,
+        name = name,
+        path = path,
+        type = type.wire,
+        typeParams = typeParams,
+        valueCount = stats.valueCount,
+        nullCount = stats.nullCount,
+        nanCount = stats.nanCount,
+        sizeBytes = stats.sizeBytes,
+        lowerBound = renderBoundOrNull(this, stats.lowerBound),
+        upperBound = renderBoundOrNull(this, stats.upperBound),
+    )
+
+/**
+ * A stored bound as wire JSON, or JSON null when there is none — and
+ * ALSO null when the stored bytes cannot be decoded/rendered under the
+ * column's live type (a stale-width bound from a pre-promote writer,
+ * an out-of-domain value): the "NULL, never guessed" read-side dual. A
+ * bound the reader cannot decode is treated as absent, and the spec
+ * says absent bounds mean "do not prune". Never a 500: this endpoint
+ * reports the store, it does not vouch for it.
+ */
+private fun renderBoundOrNull(
+    column: FileColumnStats,
+    bytes: ByteArray?,
+): JsonNode {
+    if (bytes == null) return NullNode.instance
+    return try {
+        BoundWire.render(
+            column.type,
+            BoundWire.scaleOf(column.typeParams),
+            bytes,
+        )
+    } catch (_: IllegalArgumentException) {
+        NullNode.instance
+    }
+}
 
 // ---- scan planning -------------------------------------------------------
 
@@ -410,10 +526,17 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
  * Version is the running server's own, always present (BuildInfo falls
  * back to "unknown" rather than omitting it — "which version is this?"
  * having no answer is itself the answer an operator needs).
+ *
+ * Build is the packaging stamp and is omitted on any build nobody
+ * stamped — every local build, every PR image. Absent means "not off
+ * the pipeline", which is why it is a separate optional field and not
+ * folded into `version`: `version` is the contract version the spec is
+ * gated against, and it must keep meaning exactly that.
  */
 data class InstanceInfoDto(
     val name: String?,
     val version: String,
+    val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
 )

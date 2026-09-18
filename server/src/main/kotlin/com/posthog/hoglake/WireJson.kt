@@ -1,6 +1,7 @@
 package com.posthog.hoglake
 
 import com.fasterxml.jackson.annotation.JsonInclude
+import com.fasterxml.jackson.core.StreamWriteFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.databind.SerializationFeature
@@ -54,6 +55,14 @@ fun ObjectMapper.configureHoglakeWire(): ObjectMapper =
         propertyNamingStrategy = PropertyNamingStrategies.SNAKE_CASE
         disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
         setSerializationInclusion(JsonInclude.Include.NON_NULL)
+        // Decimal bound tokens are PLAIN notation at every scale
+        // (BigDecimal.toPlainString): BigDecimal.toString would flip a
+        // decimal(38,38) bound to "1E-38", but the documented convention
+        // (openapi FileColumnStats: "unscaled x 10^-scale, e.g. '1.50'")
+        // is a plain JSON number token, and the cross-language wire
+        // oracle renders plain tokens too. BigDecimal is the only wire
+        // type this touches — every other number serializes unchanged.
+        factory.enable(StreamWriteFeature.WRITE_BIGDECIMAL_AS_PLAIN.mappedFeature())
     }
 
 /** A standalone mapper carrying [configureHoglakeWire], for tests and tools. */

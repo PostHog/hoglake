@@ -2,6 +2,7 @@ package com.posthog.hoglake.service
 
 import com.posthog.hoglake.compaction.CompactionTiers
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.PartitionDebt
 import com.posthog.hoglake.model.PartitionStatsReport
 import com.posthog.hoglake.model.PartitionValue
@@ -265,19 +266,12 @@ class PartitionStatsService(
         if (tableIds.isEmpty()) return emptyMap()
 
         data class FieldRow(val tableId: Long, val specId: Long, val keyIndex: Int, val name: String)
+
+        val paths = columnPaths(h, catalogId, tableIds)
         return h.createQuery(
             """
-            SELECT pf.table_id, pf.spec_id, pf.key_index, pf.transform, pf.source_field_id,
-                   c.name AS column_name
+            SELECT pf.table_id, pf.spec_id, pf.key_index, pf.transform, pf.source_field_id
             FROM hog_partition_field pf
-            LEFT JOIN LATERAL (
-                SELECT name FROM hog_column c
-                WHERE c.catalog_id = pf.catalog_id
-                  AND c.table_id = pf.table_id
-                  AND c.field_id = pf.source_field_id
-                ORDER BY (c.end_snapshot IS NULL) DESC, c.begin_snapshot DESC
-                LIMIT 1
-            ) c ON true
             WHERE pf.catalog_id = :catalogId AND pf.table_id IN (<tableIds>)
             ORDER BY pf.table_id, pf.spec_id, pf.key_index
             """,
@@ -285,10 +279,12 @@ class PartitionStatsService(
             .bind("catalogId", catalogId)
             .bindList("tableIds", tableIds)
             .map { rs, _ ->
-                val column = rs.getString("column_name") ?: "field_${rs.getLong("source_field_id")}"
+                val tableId = rs.getLong("table_id")
+                val sourceFieldId = rs.getLong("source_field_id")
+                val column = paths[tableId to sourceFieldId] ?: "field_$sourceFieldId"
                 val transform = rs.getString("transform")
                 FieldRow(
-                    tableId = rs.getLong("table_id"),
+                    tableId = tableId,
                     specId = rs.getLong("spec_id"),
                     keyIndex = rs.getInt("key_index"),
                     name = if (transform == "identity") column else "${column}_$transform",
@@ -297,6 +293,67 @@ class PartitionStatsService(
             .list()
             .groupBy({ it.tableId to it.specId }, { it })
             .mapValues { (_, rows) -> rows.sortedBy { it.keyIndex }.map { it.name } }
+    }
+
+    /**
+     * The DOTTED PATH of every column of [tableIds], by (table, field id).
+     *
+     * A bare name is not a label: struct leaves are legal partition
+     * sources, so two structs each holding a `zip` would both render
+     * "zip" and the console would show one table partitioned twice by
+     * the same apparent column. Resolved here rather than in SQL because
+     * walking `parent_field_id` is a recursion over versioned rows, and
+     * a Kotlin walk over one flat fetch reads better than a recursive
+     * CTE with a per-level "prefer the live row" tie-break inside it.
+     *
+     * DISTINCT ON picks one version per field id — the live one, else the
+     * most recent — so a dropped source still labels from its last
+     * version, exactly as the previous single-row lookup did.
+     */
+    private fun columnPaths(
+        h: Handle,
+        catalogId: Long,
+        tableIds: List<Long>,
+    ): Map<Pair<Long, Long>, String> {
+        data class Node(val name: String, val parent: Long?)
+
+        val nodes = mutableMapOf<Pair<Long, Long>, Node>()
+        h.createQuery(
+            """
+            SELECT DISTINCT ON (table_id, field_id)
+                   table_id, field_id, name, parent_field_id
+            FROM hog_column
+            WHERE catalog_id = :catalogId AND table_id IN (<tableIds>)
+            ORDER BY table_id, field_id, (end_snapshot IS NULL) DESC, begin_snapshot DESC
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bindList("tableIds", tableIds)
+            .map { rs, _ ->
+                nodes[rs.getLong("table_id") to rs.getLong("field_id")] =
+                    Node(
+                        rs.getString("name"),
+                        rs.getObject("parent_field_id", java.lang.Long::class.java)?.toLong(),
+                    )
+            }
+            .list()
+
+        return nodes.mapValues { (key, _) ->
+            val (tableId, _) = key
+            val segments = mutableListOf<String>()
+            var cursor: Pair<Long, Long>? = key
+            // Bounded by the depth cap, but guarded anyway: a doctored
+            // catalog with a parent cycle must not spin a maintenance
+            // read forever.
+            var hops = 0
+            while (cursor != null && hops <= MAX_COLUMN_NESTING_DEPTH) {
+                val node = nodes[cursor] ?: break
+                segments += node.name
+                cursor = node.parent?.let { tableId to it }
+                hops++
+            }
+            segments.reversed().joinToString(".")
+        }
     }
 
     companion object {

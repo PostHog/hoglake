@@ -19,7 +19,10 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from .buffered_config import BufferedConfig
 
 import yaml
 
@@ -81,6 +84,7 @@ class S3Settings:
     access_key: str | None = None
     secret_key: str | None = None
     path_style: bool = True
+    region: str | None = None
 
     @classmethod
     def parse(cls, d: Mapping[str, Any] | None, where: str) -> S3Settings:
@@ -88,7 +92,9 @@ class S3Settings:
             return cls()
         if not isinstance(d, Mapping):
             raise ConfigError(f"{where} must be a mapping")
-        _check_keys(d, {"endpoint", "access_key", "secret_key", "path_style"}, where)
+        _check_keys(
+            d, {"endpoint", "access_key", "secret_key", "path_style", "region"}, where
+        )
         path_style = d.get("path_style", True)
         if not isinstance(path_style, bool):
             raise ConfigError(f"{where}.path_style must be a boolean")
@@ -97,6 +103,7 @@ class S3Settings:
             access_key=_str(d, "access_key", where, required=False),
             secret_key=_str(d, "secret_key", where, required=False),
             path_style=path_style,
+            region=_str(d, "region", where, required=False),
         )
 
     def to_pyhoglake(self):
@@ -110,7 +117,7 @@ class S3Settings:
             access_key=self.access_key,
             secret_key=self.secret_key,
             endpoint_override=self.endpoint,
-            region="us-east-1" if self.endpoint else None,
+            region=self.region or ("us-east-1" if self.endpoint else None),
             allow_bucket_creation=False,
         )
 
@@ -303,15 +310,52 @@ class HedgerowConfig:
     replication: ReplicationConfig = field(default_factory=ReplicationConfig)
     metrics: MetricsConfig = field(default_factory=MetricsConfig)
     filter: FilterConfig | None = None
+    mode: str = "direct"
+    buffered: BufferedConfig | None = None
 
     @classmethod
     def parse(cls, d: Any) -> HedgerowConfig:
         if not isinstance(d, Mapping):
             raise ConfigError("config root must be a mapping")
         _check_keys(
-            d, {"source", "destination", "filter", "replication", "metrics"}, "config"
+            d,
+            {
+                "source",
+                "destination",
+                "filter",
+                "replication",
+                "metrics",
+                "mode",
+                "buffered",
+            },
+            "config",
         )
+        mode = d.get("mode", "direct")
+        if mode not in ("direct", "buffered"):
+            raise ConfigError("mode must be direct or buffered")
+        buffered = None
+        if mode == "buffered":
+            from .buffered_config import BufferedConfig
+
+            buffered = BufferedConfig.parse(d.get("buffered"))
+            if d.get("filter") is not None:
+                raise ConfigError("filter is not supported in buffered mode")
+            if MetricsConfig.parse(d.get("metrics")).port:
+                raise ConfigError(
+                    "buffered mode currently supports structured logs only; metrics.port must be 0"
+                )
+            replication = d.get("replication") or {}
+            if isinstance(replication, Mapping):
+                _check_keys(
+                    replication,
+                    {"poll_interval_s", "max_snapshot_window"},
+                    "buffered replication",
+                )
+        elif "buffered" in d:
+            raise ConfigError("buffered settings require mode: buffered")
         return cls(
+            mode=mode,
+            buffered=buffered,
             source=SourceConfig.parse(_require(d, "source", "config")),
             destination=DestinationConfig.parse(_require(d, "destination", "config")),
             filter=FilterConfig.parse(d.get("filter")),

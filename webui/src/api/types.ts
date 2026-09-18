@@ -31,20 +31,66 @@ export interface Namespace {
   name: string;
 }
 
-export const COLUMN_TYPES = [
+// The server's closed column-type vocabulary, in the spec's enum order
+// (ColumnDef.type in openapi/hoglake.yaml). Types the server refuses
+// permanently — int128, uint128, timetz, interval, geometry — are absent
+// on purpose: the console must not offer what the API always rejects.
+/**
+ * The types the create-table form can build. Scalars only, on purpose:
+ * list/struct/map require `children`, the form has no child editor, and
+ * offering them in the dropdown would make every such choice a
+ * guaranteed 422 — the same reason the permanently refused DuckLake
+ * names are absent.
+ */
+export const SCALAR_COLUMN_TYPES = [
   "boolean",
+  "int8",
+  "int16",
   "int",
   "long",
+  "uint8",
+  "uint16",
+  "uint32",
+  "uint64",
   "float",
   "double",
   "decimal",
   "date",
   "time",
+  "timestamp_s",
+  "timestamp_ms",
   "timestamp",
+  "timestamp_ns",
   "timestamptz",
   "string",
+  "json",
   "uuid",
   "binary",
+] as const;
+
+/**
+ * The container types. Readable everywhere (a table can have them), but
+ * not creatable from the console — see SCALAR_COLUMN_TYPES.
+ */
+export const NESTED_COLUMN_TYPES = ["list", "struct", "map"] as const;
+
+/**
+ * Readable, not creatable, and not a container.
+ *
+ * VARIANT is a catalog scalar, but it belongs here rather than in
+ * SCALAR_COLUMN_TYPES for the same reason the containers do: the create
+ * form is a name and a type picker, and there is no useful variant a
+ * form can produce. #77 added the type server-side without touching the
+ * console, so a table holding one had a `type` outside ColumnType
+ * entirely.
+ */
+export const OPAQUE_COLUMN_TYPES = ["variant"] as const;
+
+/** Everything the server's ColumnDef.type enum accepts. */
+export const COLUMN_TYPES = [
+  ...SCALAR_COLUMN_TYPES,
+  ...OPAQUE_COLUMN_TYPES,
+  ...NESTED_COLUMN_TYPES,
 ] as const;
 
 export type ColumnType = (typeof COLUMN_TYPES)[number];
@@ -54,11 +100,51 @@ export interface ColumnDef {
   type: ColumnType;
   type_params?: Record<string, unknown>;
   nullable?: boolean;
+  /** Present only for list/struct/map. */
+  children?: ColumnDef[];
 }
 
 export interface Column extends ColumnDef {
   field_id: Int64;
+  /** 0-based among SIBLINGS, not table-wide. */
   ordinal: number;
+  children?: Column[];
+}
+
+/**
+ * A container column's type as one readable signature —
+ * `list&lt;int&gt;`, `map&lt;string, long&gt;`,
+ * `struct&lt;a: int, b: string&gt;` — and a scalar's as its own name.
+ */
+export function formatColumnType(c: ColumnDef): string {
+  // Ordered by ordinal where there is one: ordinal is the contract and
+  // array order is not, and a struct signature that listed its fields in
+  // whatever order the JSON arrived in would disagree with the table
+  // below it on the same page.
+  const kids = [...(c.children ?? [])].sort((a, b) =>
+    "ordinal" in a && "ordinal" in b
+      ? (a as Column).ordinal - (b as Column).ordinal
+      : 0,
+  );
+  if (c.type === "list") {
+    return `list<${kids.length === 1 ? formatColumnType(kids[0]) : "?"}>`;
+  }
+  if (c.type === "map") {
+    return kids.length === 2
+      ? `map<${formatColumnType(kids[0])}, ${formatColumnType(kids[1])}>`
+      : "map<?>";
+  }
+  if (c.type === "struct") {
+    // `struct<>` reads as a valid empty struct; it is not one — a
+    // struct with no children is a shape the server refuses, so it can
+    // only mean the children were not loaded or were dropped on the way
+    // here. List and map say `<?>` for the same condition, and an
+    // unknown should look the same wherever it appears.
+    return kids.length === 0
+      ? "struct<?>"
+      : `struct<${kids.map((k) => `${k.name}: ${formatColumnType(k)}`).join(", ")}>`;
+  }
+  return c.type;
 }
 
 export interface CreateTableRequest {
@@ -115,6 +201,41 @@ export interface DataFile {
   begin_snapshot: Int64;
   spec_id?: Int64;
   partition_values?: (string | null)[];
+}
+
+/**
+ * A decoded bound after parsing: null (no bound stored, or a bound the
+ * server could not decode — either way the caller must not prune),
+ * a boolean, or a STRING. Strings cover both the string-shaped wire
+ * values (temporals, uuid, base64 binary, string/json, the
+ * "Infinity"/"-Infinity" sentinels) and every NUMBER, which the fetch
+ * layer captures as its exact raw token (see int64.ts) so long/uint64/
+ * decimal bounds never round through a double. The webui carries no
+ * bounds codec — this is the server's decoded JSON, displayed verbatim.
+ */
+export type DecodedBound = string | boolean | null;
+
+/** One column's stats for one file (GET .../files/{fileId}/stats). */
+export interface FileColumnStats {
+  field_id: Int64;
+  name: string;
+  path: string;
+  type: ColumnType;
+  type_params?: Record<string, unknown>;
+  value_count: Int64;
+  null_count: Int64;
+  nan_count?: Int64;
+  size_bytes?: Int64;
+  lower_bound: DecodedBound;
+  upper_bound: DecodedBound;
+}
+
+export interface FileStats {
+  data_file_id: Int64;
+  stats_state: StatsState;
+  columns: FileColumnStats[];
+  /** Present iff the file has no stats rows (stats_state != provided). */
+  no_stats_reason?: string;
 }
 
 export interface DeleteFile {
@@ -264,6 +385,24 @@ export interface CompactionResult {
   skipped_conflicts: Int64;
   dv_superseded: Int64;
   unconvertible_schema: Int64;
+  /**
+   * Groups skipped for a fault that is DURABLE and the writer's: a
+   * value that cannot exist under the type its own file declares, or a
+   * file whose schema contradicts its own explicit_row_ids
+   * registration. Unlike unconvertible_schema it never clears on its
+   * own, so the group is re-planned and re-refused every sweep. The axis
+   * is durability and fault, not values-versus-schema; a nonzero count
+   * is a writer bug, not a backlog.
+   *
+   * OPTIONAL here although the schema requires it. The server fills it
+   * in for ledger rows recorded before the counter existed, so a
+   * current server always sends it — but a rolling deploy can serve
+   * this page from an older one, and `!== "0"` is TRUE for `undefined`,
+   * which put an "invalid-data —" badge on every historical run. The
+   * type says what the wire can actually carry; the guards use
+   * `positive()`, which is undefined-safe.
+   */
+  invalid_data?: Int64;
   /** Groups that failed outright (logged, retried next run) — red-flag counter. */
   failed_groups: Int64;
 }

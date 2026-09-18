@@ -25,6 +25,10 @@ from .common import (
     require_samples,
 )
 
+#: Deliberately metadata-only: churn cycles and probe commits use
+#: fabricated registrations — the measured tax is pure catalog state.
+IO_MODE = "metadata-only"
+
 RECORD_COUNT = 100
 
 
