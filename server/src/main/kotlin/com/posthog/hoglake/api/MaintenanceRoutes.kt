@@ -6,6 +6,7 @@ import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.service.CleanupService
+import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
@@ -41,6 +42,7 @@ fun Application.installMaintenanceRoutes(
     verify: VerifyService,
     hydrator: Hydrator,
     status: MaintenanceStatusService,
+    databaseHealth: DatabaseHealthService,
 ) {
     routing {
         route("/v1/catalogs/{catalog}") {
@@ -138,6 +140,12 @@ fun Application.installMaintenanceRoutes(
         // per-catalog routes.
         get("/v1/maintenance/status") {
             call.respond(status.instanceStatus(call.request.queryParameters["after"], call.limitQuery()).toDto())
+        }
+        // The backing store's own health. Instance-level, not per
+        // catalog: the manifest tables, the vacuum horizon and the
+        // connection budget are shared by every catalog in the database.
+        get("/v1/database/health") {
+            call.respond(databaseHealth.report().toDto())
         }
         get("/v1/maintenance/runs") {
             call.respond(

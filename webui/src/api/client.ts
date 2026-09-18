@@ -313,6 +313,108 @@ export async function fetchMetricsText(): Promise<string> {
   return res.text();
 }
 
+// -- database health --------------------------------------------------------
+
+export interface DatabaseServer {
+  version: string;
+  database: string;
+  size_bytes: Int64;
+  started_at?: string;
+  connections_used: number;
+  connections_max: number;
+  // Absent before anything has been read, rather than reported as 100%.
+  cache_hit_ratio?: number;
+  deadlocks: Int64;
+  committed: Int64;
+  rolled_back: Int64;
+  xid_age: Int64;
+  xid_freeze_max_age: Int64;
+  autovacuum_enabled: boolean;
+  temp_files: Int64;
+  temp_bytes: Int64;
+  // Absent where the statistics view is unreadable: the columns moved
+  // from pg_stat_bgwriter to pg_stat_checkpointer in PG 17.
+  checkpoints_timed?: Int64;
+  checkpoints_requested?: Int64;
+}
+
+export interface CommitLockHolder {
+  catalog_id: Int64;
+  catalog?: string;
+  pid: number;
+  granted: boolean;
+  held_seconds?: number;
+  waiters: number;
+}
+
+export interface ReplicationSlot {
+  name: string;
+  slot_type: string;
+  active: boolean;
+  retained_wal_bytes?: Int64;
+}
+
+export interface DatabaseActivity {
+  active: number;
+  idle: number;
+  idle_in_transaction: number;
+  waiting: number;
+  longest_transaction_seconds?: number;
+  longest_idle_in_transaction_seconds?: number;
+  longest_wait_seconds?: number;
+}
+
+export interface DatabaseTable {
+  name: string;
+  live_tuples: Int64;
+  dead_tuples: Int64;
+  dead_ratio?: number;
+  table_bytes: Int64;
+  index_bytes: Int64;
+  toast_bytes: Int64;
+  total_bytes: Int64;
+  seq_scans: Int64;
+  index_scans: Int64;
+  last_vacuum?: string;
+  last_autovacuum?: string;
+  last_analyze?: string;
+  last_autoanalyze?: string;
+  autovacuum_count: Int64;
+}
+
+export interface DatabaseIndex {
+  table: string;
+  name: string;
+  size_bytes: Int64;
+  scans: Int64;
+  constraint_backing: boolean;
+}
+
+export type FindingSeverity = "info" | "warn" | "critical";
+
+export interface DatabaseFinding {
+  severity: FindingSeverity;
+  code: string;
+  title: string;
+  detail: string;
+  hoglake_impact: string;
+}
+
+export interface DatabaseHealth {
+  server: DatabaseServer;
+  activity: DatabaseActivity;
+  commit_locks: CommitLockHolder[];
+  replication_slots: ReplicationSlot[];
+  tables: DatabaseTable[];
+  indexes: DatabaseIndex[];
+  findings: DatabaseFinding[];
+  blind_spots: string[];
+}
+
+export function getDatabaseHealth(): Promise<DatabaseHealth> {
+  return request(buildUrl("/database/health"));
+}
+
 // -- health -----------------------------------------------------------------
 
 export async function checkHealth(): Promise<boolean> {
