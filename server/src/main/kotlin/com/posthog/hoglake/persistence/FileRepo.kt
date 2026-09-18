@@ -1,5 +1,6 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.StatsState
 import org.jdbi.v3.core.Handle
@@ -63,6 +64,72 @@ object FileRepo {
             .bind("tableId", tableId)
             .bind("snapshot", snapshot)
             .map(fileMapper)
+            .list()
+
+    /**
+     * One file by id, IF it belongs to [tableId] and is visible at
+     * [snapshot] — the read the per-file stats endpoint resolves
+     * through, so a file id from another table (or a not-yet/no-longer
+     * visible file) answers null and the route 404s.
+     */
+    fun findAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        dataFileId: Long,
+        snapshot: Long,
+    ): DataFile? =
+        handle.createQuery(
+            """
+            SELECT $COLUMNS
+            FROM hog_data_file f
+            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+              AND f.data_file_id = :dataFileId
+              AND f.begin_snapshot <= :snapshot
+              AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("dataFileId", dataFileId)
+            .bind("snapshot", snapshot)
+            .map(fileMapper)
+            .findOne()
+            .orElse(null)
+
+    /**
+     * The stored `hog_file_column_stats` rows for one file, field-id
+     * order. Rows are NOT versioned (they live and die with the file),
+     * so there is no snapshot predicate here; visibility is the FILE's,
+     * checked by [findAt].
+     */
+    fun columnStats(
+        handle: Handle,
+        catalogId: Long,
+        dataFileId: Long,
+    ): List<ColumnStats> =
+        handle.createQuery(
+            """
+            SELECT field_id, value_count, null_count, nan_count, size_bytes,
+                   lower_bound, upper_bound
+            FROM hog_file_column_stats
+            WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
+            ORDER BY field_id
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("dataFileId", dataFileId)
+            .map { rs, _ ->
+                ColumnStats(
+                    fieldId = rs.getLong("field_id"),
+                    valueCount = rs.getLong("value_count"),
+                    nullCount = rs.getLong("null_count"),
+                    nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
+                    sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
+                    lowerBound = rs.getBytes("lower_bound"),
+                    upperBound = rs.getBytes("upper_bound"),
+                )
+            }
             .list()
 
     /**

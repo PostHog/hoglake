@@ -2,6 +2,7 @@ package com.posthog.hoglake
 
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
+import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
@@ -228,6 +229,7 @@ class App private constructor(
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPublicationRoutes()
+        app.installDebugRoutes()
     }
 
     /**

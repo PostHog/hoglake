@@ -325,6 +325,47 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
 
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files/{fileId}/stats:
+    get:
+      operationId: getFileStats
+      summary: >
+        Per-column statistics for one data file, bounds DECODED. Each
+        stored stats row is joined to its column as visible at the
+        requested snapshot (name, dotted path, type) and its
+        lower/upper bounds are decoded from the stored Iceberg
+        single-value bytes to plain JSON per the conventions on
+        FileColumnStats — so callers read bounds without shipping the
+        binary codec. Reflective, never generative: one entry per
+        stored row whose field id resolves to a visible leaf. Variant
+        columns have no statistics at any depth and containers never
+        carry rows, so neither appears; a row whose field id is not
+        visible at the snapshot (a dropped column) is omitted. A file
+        without stats rows (stats_state pending or failed) answers the
+        explicit empty shape with no_stats_reason — and with no bounds
+        the caller MUST NOT prune the file.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: fileId
+          in: path
+          required: true
+          description: >
+            data_file_id, from the /files listing or a scan plan. The
+            file must belong to this table and be visible at the
+            resolved snapshot (404 otherwise).
+          schema: { type: integer, format: int64 }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Per-column statistics with decoded bounds.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FileStats" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/changes:
     get:
       operationId: getChanges
@@ -1187,6 +1228,49 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "501": { $ref: "#/components/responses/NotImplemented" }
 
+  /debug/decode-bound:
+    post:
+      operationId: decodeBound
+      summary: >
+        Stateless decode of one Iceberg single-value encoding — the
+        incident tool. Paste a column type name and the base64 of a
+        stored bound (a hog_file_column_stats bound, a value out of a
+        log line), get the decoded JSON scalar back under the same wire
+        conventions FileColumnStats documents. Reads nothing, writes
+        nothing, touches no catalog. This endpoint parses hostile input
+        by design, so every failure is a NAMED 422 (or a 400 for a
+        malformed body), never a 500: an unknown type name gets the
+        type-parity refusal (a permanently unsupported DuckLake name —
+        int128, geometry, ... — gets its own reason, never
+        "unknown"); malformed base64, wrong-length or empty bytes,
+        variant/container types, NaN float/double bytes (a NaN is never
+        a bound — StatsSanity refuses one at every door), an
+        out-of-day time and a non-UTF-8 string bound each answer a 422
+        naming the rule.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DecodeBoundRequest" }
+      responses:
+        "200":
+          description: The decoded JSON scalar.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecodeBoundResponse" }
+        "400":
+          description: Malformed body.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "422":
+          description: >
+            Named refusal — unknown/refused type name, malformed
+            base64, wrong-length bytes, NaN, out-of-domain value.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /info:
     get:
       operationId: getInstanceInfo
@@ -1915,6 +1999,147 @@ components:
             be row-id-contiguous. When true, row_id_start is
             min(input row ids) and has no positional meaning; readers
             needing row identity must read the column.
+
+    FileColumnStats:
+      type: object
+      required: [field_id, name, path, type, value_count, null_count,
+                 lower_bound, upper_bound]
+      description: >
+        One column's statistics for one data file, bounds DECODED from
+        the stored Iceberg single-value serialization to plain JSON.
+
+        The wire conventions, by mapped type family — shared verbatim
+        by decodeBound, and pinned cross-language by the `wire` fields
+        of pyhoglake/tests/vectors/bounds_vectors.json:
+
+        * boolean -> JSON boolean.
+
+        * EVERY integer type (int8..uint64) and decimal -> an exact
+          JSON number, never routed through a double. WARNING for
+          consumers: long, uint64 and decimal values can exceed 2^53,
+          and JavaScript's JSON.parse silently rounds them — parse
+          these fields exactly (BigInt / raw-token parsing), the way
+          the hoglake webui does. Decimal renders at the COLUMN's
+          scale (unscaled x 10^-scale, e.g. "1.50" for a scale-2
+          column); uint64 is decimal(20,0), an integer.
+
+        * float/double -> JSON numbers. The infinities cannot be JSON
+          numbers and render as the STRING sentinels "Infinity" and
+          "-Infinity". NaN never appears: it is not a bound
+          (StatsSanity refuses one at every storing door; NaNs are
+          counted in nan_count). Negative zero renders as -0.0 — it is
+          what is stored: the normalization rule fixes -0.0 as the
+          lower-bound zero and +0.0 as the upper-bound zero, so a
+          lower bound of an all-zero column reads -0.0 by design.
+
+        * temporals -> ISO-8601 strings, UTC-referenced: date
+          "2026-09-05"; time "13:37:42.123456"; timestamp_s /
+          timestamp_ms / timestamp "2026-09-05T12:00:00.123456" (no
+          offset designator — the type is zoneless; bounds for the
+          seconds/millis variants are STORED in micros, the mapped
+          Iceberg type's unit, and render accordingly); timestamp_ns
+          with nanosecond digits; timestamptz as an instant with a
+          trailing Z. Years beyond 9999 use the expanded "+YYYYY"
+          form.
+
+        * string/json -> the string itself; uuid -> canonical
+          8-4-4-4-12; binary -> base64.
+
+        A bound is JSON null when the column stored none (an all-null
+        column has nothing to bound — a real answer, distinct from the
+        file-level no-stats shape) AND when the stored bytes cannot be
+        decoded under the column's visible type (a stale-width bound
+        left by a pre-promote writer, an out-of-domain value): the
+        "NULL, never guessed" rule's read side. Either way, a null
+        bound means the caller MUST NOT prune on this column.
+      properties:
+        field_id: { type: integer, format: int64 }
+        name:
+          type: string
+          description: The leaf's own name (synthetic element/key/value included).
+        path:
+          type: string
+          description: >
+            Dotted path from the top level (e.g. addr.zip, l.element,
+            m.key) — nested leaves carry stats exactly like top-level
+            columns.
+        type:
+          type: string
+          description: The column's wire type name at the resolved snapshot.
+        type_params:
+          type: object
+          additionalProperties: true
+          description: The column's type_params (decimal scale/precision), when present.
+        value_count: { type: integer, format: int64 }
+        null_count: { type: integer, format: int64 }
+        nan_count: { type: integer, format: int64 }
+        size_bytes: { type: integer, format: int64 }
+        lower_bound:
+          nullable: true
+          description: Decoded lower bound (JSON scalar per the conventions above).
+        upper_bound:
+          nullable: true
+          description: Decoded upper bound (JSON scalar per the conventions above).
+
+    FileStats:
+      type: object
+      required: [data_file_id, stats_state, columns]
+      properties:
+        data_file_id: { type: integer, format: int64 }
+        stats_state: { type: string, enum: [provided, pending, failed] }
+        columns:
+          type: array
+          description: >
+            One entry per stored stats row whose field id is a visible
+            leaf, field-id order. Empty when the file has no stats
+            rows. Columns absent from this array have no recorded
+            statistics (variant columns never do; containers never
+            carry rows) — absent bounds mean the caller must not prune
+            on them.
+          items: { $ref: "#/components/schemas/FileColumnStats" }
+        no_stats_reason:
+          type: string
+          description: >
+            Present iff stats_state is not 'provided': why the file
+            has no per-column rows (deferred stats not yet hydrated,
+            or hydration failed). With no bounds, callers must not
+            prune this file.
+
+    DecodeBoundRequest:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          description: >
+            A wire column type name (the ColumnDef.type vocabulary,
+            case-insensitive). variant and the containers have no
+            single-value encoding and are named 422s.
+        value:
+          type: string
+          description: >
+            Standard base64 of the Iceberg single-value encoding.
+            Validated strictly; malformed base64 is a named 422.
+        type_params:
+          type: object
+          additionalProperties: true
+          description: >
+            For decimal: the scale to render at ({"scale": 2}),
+            defaulting to 0 — the scale lives in the column, not the
+            bytes. Ignored for every other type.
+
+    DecodeBoundResponse:
+      type: object
+      required: [type, value]
+      properties:
+        type:
+          type: string
+          description: The canonical wire spelling of the requested type.
+        value:
+          description: >
+            The decoded JSON scalar, exactly as FileColumnStats'
+            lower_bound/upper_bound render it (same conventions, same
+            code path).
 
     ChangePlan:
       type: object

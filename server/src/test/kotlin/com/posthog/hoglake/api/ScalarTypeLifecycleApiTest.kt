@@ -154,9 +154,10 @@ class ScalarTypeLifecycleApiTest {
             assertThat(files[0]["stats_state"].asText()).isEqualTo("provided")
             assertThat(files[0]["path"].asText()).isEqualTo(path)
 
-            // The bounds themselves are write-only on the wire (no read
-            // endpoint exposes column stats), so the round trip is checked
-            // where they land.
+            // The stored BYTES are asserted at the database (the decoded
+            // read surface is .../files/{fileId}/stats, whose wire form
+            // FileStatsApiTest pins; this test pins the base64 -> bytea
+            // hop itself).
             val stored = storedBounds(path)
             for (type in types) {
                 val fieldId = fieldIds.getValue("c_$type")
