@@ -135,6 +135,24 @@ class BoundWireTest {
     }
 
     @Test
+    fun `a uint64 encoding wider than 9 bytes is refused by name`() {
+        // uint64 max (2^64-1) is 8 magnitude bytes plus one 0x00 sign
+        // byte in minimal two's complement — 9 bytes. Anything wider can
+        // only encode a value no uint64 column can hold (or a non-minimal
+        // padding no writer emits), so it is refused by name; only
+        // decimal keeps the 16-byte decimal(38) width.
+        assertThatThrownBy { render(ColType.UINT64, ByteArray(10)) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("9 bytes")
+        // The widest legal uint64 (9 bytes) still renders.
+        assertThat(wire(ColType.UINT64, BigInteger("18446744073709551615")))
+            .isEqualTo("18446744073709551615")
+        // A 10-byte decimal remains legal (decimal(38) needs up to 16).
+        assertThat(render(ColType.DECIMAL, ByteArray(10)).decimalValue())
+            .isEqualByComparingTo(BigDecimal.ZERO)
+    }
+
+    @Test
     fun `empty decimal bytes are refused by the codec, not rendered`() {
         assertThatThrownBy { render(ColType.DECIMAL, ByteArray(0)) }
             .isInstanceOf(IllegalArgumentException::class.java)

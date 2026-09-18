@@ -1269,8 +1269,9 @@ paths:
               schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: >
-            Named refusal — unknown/refused type name, malformed
-            base64, wrong-length bytes, NaN, out-of-domain value.
+            Named refusal — unknown/refused type name, a non-string
+            or over-cap (1024 decoded bytes) value, malformed base64,
+            wrong-length bytes, NaN, out-of-domain value.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -2048,7 +2049,11 @@ components:
           Iceberg type's unit, and render accordingly); timestamp_ns
           with nanosecond digits; timestamptz as an instant with a
           trailing Z. Years beyond 9999 use the expanded "+YYYYY"
-          form.
+          form. ISO tokens ELIDE trailing zero units — a whole-minute
+          time is "00:00" and a whole-minute timestamp
+          "1970-01-01T00:00", both valid ISO-8601 — so consumers must
+          parse them as ISO-8601, never with fixed-precision
+          patterns.
 
         * string/json -> the string itself; uuid -> canonical
           8-4-4-4-12; binary -> base64.
@@ -2127,7 +2132,13 @@ components:
           type: string
           description: >
             Standard base64 of the Iceberg single-value encoding.
-            Validated strictly; malformed base64 is a named 422.
+            Validated strictly; malformed base64 is a named 422, and
+            the value MUST be a JSON string — a bare JSON number is a
+            named 422 rather than being coerced into digits that
+            happen to decode. Capped at 1024 decoded bytes (a named
+            422 past it): stored bounds can be longer — the commit
+            path caps nothing — but this is a paste-one-value
+            diagnostic, not a bulk door.
         type_params:
           type: object
           additionalProperties: true

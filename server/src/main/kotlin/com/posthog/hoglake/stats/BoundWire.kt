@@ -86,14 +86,20 @@ object BoundWire {
         // "decimal" renders a number token past the default number-length
         // limit of Jackson (and most JSON parsers) — a crash deferred to
         // every consumer. No legal hoglake decimal exceeds decimal(38),
-        // whose unscaled value fits 16 bytes (uint64 is decimal(20,0),
-        // 9), so anything wider cannot be a bound and is refused by name.
-        if ((type == ColType.DECIMAL || type == ColType.UINT64) &&
-            bytes.size > MAX_DECIMAL_UNSCALED_BYTES
-        ) {
+        // whose unscaled value fits 16 bytes; uint64 is decimal(20,0),
+        // whose max (2^64-1) is 8 magnitude bytes plus the 0x00 sign
+        // byte — 9. Anything wider cannot be a bound of its type and is
+        // refused by name, per type.
+        if (type == ColType.DECIMAL && bytes.size > MAX_DECIMAL_UNSCALED_BYTES) {
             throw IllegalArgumentException(
                 "${type.wire} bound is ${bytes.size} bytes, wider than any decimal(38) " +
                     "unscaled value (max $MAX_DECIMAL_UNSCALED_BYTES bytes)",
+            )
+        }
+        if (type == ColType.UINT64 && bytes.size > MAX_UINT64_UNSCALED_BYTES) {
+            throw IllegalArgumentException(
+                "${type.wire} bound is ${bytes.size} bytes, wider than any uint64 " +
+                    "(decimal(20,0)) unscaled value (max $MAX_UINT64_UNSCALED_BYTES bytes)",
             )
         }
         return renderDecoded(type, scale, IcebergSingleValue.decode(type, bytes))
@@ -101,6 +107,9 @@ object BoundWire {
 
     /** decimal(38)'s widest minimal two's-complement unscaled value. */
     private const val MAX_DECIMAL_UNSCALED_BYTES = 16
+
+    /** uint64 max in minimal two's complement: 8 magnitude bytes + 0x00 sign. */
+    private const val MAX_UINT64_UNSCALED_BYTES = 9
 
     private fun renderDecoded(
         type: ColType,

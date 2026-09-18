@@ -97,9 +97,13 @@ class DecodeBoundApiTest {
             assertThat(body(tstz)["value"].asText()).isEqualTo("2026-09-05T12:00:00Z")
             val date = client.decode("""{"type": "date", "value": "${b64(ColType.DATE, 20701)}"}""")
             assertThat(body(date)["value"].asText()).isEqualTo("2026-09-05")
-            // Case-insensitive like every wire type name.
+            // Case-insensitive like every wire type name — and the
+            // response echoes the CANONICAL wire spelling, never the
+            // caller's casing (the spec's DecodeBoundResponse.type).
             val time = client.decode("""{"type": "TIME", "value": "${b64(ColType.TIME, 49_062_123_456L)}"}""")
-            assertThat(body(time)["value"].asText()).isEqualTo("13:37:42.123456")
+            val timeNode = body(time)
+            assertThat(timeNode["type"].asText()).isEqualTo("time")
+            assertThat(timeNode["value"].asText()).isEqualTo("13:37:42.123456")
         }
 
     @Test
@@ -265,6 +269,38 @@ class DecodeBoundApiTest {
                 ),
                 "scale",
             )
+        }
+
+    @Test
+    fun `a JSON number value is a named 422 - base64 is a string`() =
+        api { client ->
+            // Jackson happily coerces 1234 into the String "1234", whose
+            // characters ARE valid base64 — so a caller who forgot the
+            // quotes used to get a 200 decoding bytes they never sent
+            // (binary renders any bytes). The value must be a JSON
+            // string, refused by name otherwise.
+            assertValidation(
+                client.decode("""{"type": "binary", "value": 1234}"""),
+                "value must be a JSON string",
+            )
+        }
+
+    @Test
+    fun `an oversized value is a named 422 at the documented cap`() =
+        api { client ->
+            // 1 KiB decoded is the cap (spec DecodeBoundRequest): the
+            // largest bound families are unbounded-length string/json/
+            // binary, and no diagnostic paste needs more than this.
+            val overCap = Base64.getEncoder().encodeToString(ByteArray(1025) { 'a'.code.toByte() })
+            assertValidation(
+                client.decode("""{"type": "string", "value": "$overCap"}"""),
+                "1024",
+            )
+            // The cap itself still decodes.
+            val atCap = Base64.getEncoder().encodeToString(ByteArray(1024) { 'a'.code.toByte() })
+            val response = client.decode("""{"type": "string", "value": "$atCap"}""")
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(response)["value"].asText()).hasSize(1024)
         }
 
     @Test
