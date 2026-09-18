@@ -3,6 +3,8 @@ package com.posthog.hoglake
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
 import org.flywaydb.core.Flyway
+import org.flywaydb.core.api.configuration.FluentConfiguration
+import org.flywaydb.database.postgresql.PostgreSQLConfigurationExtension
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.KotlinPlugin
 import org.jdbi.v3.postgres.PostgresPlugin
@@ -35,21 +37,38 @@ object Database {
         return HikariDataSource(hc)
     }
 
+    /**
+     * The migration configuration, as ONE definition. The migration
+     * integration tests drive this function rather than restating it: a
+     * helper that merely copies these lines asserts that it compiles, not
+     * that it matches production, and the copies silently diverged the
+     * moment this setting had to change.
+     */
+    fun flywayConfig(ds: DataSource): FluentConfiguration =
+        Flyway.configure()
+            .dataSource(ds)
+            .locations("classpath:db/migration")
+            // Concurrent index builds wait for old transactions; Flyway
+            // must not hold its own transaction-level lock open while
+            // executing a nontransactional migration.
+            //
+            // The TYPED extension, not the `.configuration(mapOf(...))`
+            // string-map form: as of Flyway 13 that form throws on this
+            // namespace unless jackson-databind is reachable to it, and a
+            // misspelled key in that map was never an error — it was
+            // dropped in silence, leaving the lock held.
+            .also {
+                it.getConfigurationExtension(PostgreSQLConfigurationExtension::class.java)
+                    .isTransactionalLock = false
+            }
+
     fun migrate(ds: DataSource) {
         ds.connection.use { conn ->
             conn.createStatement().use { st ->
                 st.execute("SELECT pg_advisory_lock($MIGRATION_LOCK_KEY)")
             }
             try {
-                Flyway.configure()
-                    .dataSource(ds)
-                    // Concurrent index builds wait for old transactions;
-                    // Flyway must not hold its own transaction-level lock
-                    // open while executing a nontransactional migration.
-                    .configuration(mapOf("flyway.postgresql.transactional.lock" to "false"))
-                    .locations("classpath:db/migration")
-                    .load()
-                    .migrate()
+                flywayConfig(ds).load().migrate()
             } finally {
                 conn.createStatement().use { st ->
                     st.execute("SELECT pg_advisory_unlock($MIGRATION_LOCK_KEY)")

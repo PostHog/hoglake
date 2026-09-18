@@ -13,7 +13,19 @@ repositories {
 
 val ktorVersion = "3.5.2"
 val jdbiVersion = "3.54.0"
-val flywayVersion = "11.8.2"
+// Current stable, looked up on Maven Central rather than recalled (the
+// 11.8.2 this replaced was 16 months old). Anything before ~11.10 warns
+// "PostgreSQL 18.6 is newer than this version of Flyway ... latest
+// supported is 17" on every migration run, which is what forced the bump;
+// going to the head of the line rather than the minimum that silences it
+// is the dependency convention in AGENT.md.
+//
+// The jump off 11.x is NOT drop-in: `.configuration(mapOf(...))` no
+// longer accepts the postgresql namespace, so Database.flywayConfig sets
+// the transactional lock through the typed configuration extension. See
+// the comment there — losing that setting HANGS every migration rather
+// than failing it.
+val flywayVersion = "13.7.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
 val awsSdkVersion = "2.54.13"
@@ -102,7 +114,7 @@ application {
 tasks.test {
     useJUnitPlatform()
     // Rehearse a Postgres major-version move against the whole suite:
-    // `./gradlew :test -PpgImage=postgres:18`. Unset, the harness pins
+    // `./gradlew :test -PpgImage=postgres:19`. Unset, the harness pins
     // the version production runs.
     (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
     // Integration tests need Docker (Testcontainers); tag-gated so `gradle
