@@ -97,3 +97,38 @@ describe("topbar server version", () => {
     expect(document.querySelector(".server-version")).toBeNull();
   });
 });
+
+describe("browser tab title", () => {
+  it("leads with the instance name so tabs stay distinguishable", async () => {
+    mockFetch((url) => {
+      if (url === "/v1/info") return jsonResponse({ name: "gigahog-dev" });
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    await screen.findByText("gigahog-dev");
+    // Name first: tabs truncate from the right, so the discriminator has
+    // to survive a narrow tab.
+    expect(document.title).toBe("gigahog-dev · hoglake");
+  });
+
+  it("keeps the bare product name when the instance is unnamed", async () => {
+    mockFetch((url) =>
+      url === "/v1/catalogs" ? jsonResponse(catalogsFixture) : undefined,
+    );
+    renderApp("/");
+    await screen.findByText("hoglake");
+    expect(document.title).toBe("hoglake");
+  });
+
+  it("keeps the bare product name when the info endpoint fails", async () => {
+    mockFetch((url) => {
+      if (url === "/v1/info") return jsonResponse({ error: "nope" }, 500);
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      return undefined;
+    });
+    renderApp("/");
+    await screen.findByText("hoglake");
+    expect(document.title).toBe("hoglake");
+  });
+});
