@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
@@ -24,6 +24,26 @@ function ThemeToggle() {
       {theme === "dark" ? "☀" : "☾"}
     </button>
   );
+}
+
+function useDocumentTitle() {
+  // Shares the fetch-once ["instance-info"] key with the badges below, so
+  // naming the tab costs no extra request.
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  const name = data?.name;
+  useEffect(() => {
+    // The instance name leads: browser tabs truncate from the RIGHT, and
+    // when several hoglake consoles are open the discriminator is the
+    // only part worth keeping legible at a few characters wide. An
+    // unnamed instance keeps the bare product name rather than showing a
+    // separator with nothing before it.
+    document.title = name ? `${name} · hoglake` : "hoglake";
+  }, [name]);
 }
 
 function InstanceName() {
@@ -147,6 +167,7 @@ function Breadcrumbs() {
 }
 
 export function Layout() {
+  useDocumentTitle();
   return (
     <div className="app">
       <header className="topbar">
