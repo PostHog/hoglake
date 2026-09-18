@@ -27,6 +27,11 @@ from .common import (
     check,
 )
 
+#: Deliberately metadata-only: fabricated appends stress the OCC
+#: commit path without object-store IO. Contention numbers are
+#: control-plane cost, never end-to-end write cost.
+IO_MODE = "metadata-only"
+
 RECORD_COUNT = 100
 
 

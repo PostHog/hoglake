@@ -43,5 +43,5 @@ def settle_stats(dsn: str) -> bool:
             conn.execute(f"ANALYZE {', '.join(SETTLE_TABLES)}")
             conn.commit()
         return True
-    except Exception:
+    except Exception:  # noqa: BLE001 - any failure means "stats not settled"
         return False

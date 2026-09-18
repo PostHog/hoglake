@@ -41,7 +41,7 @@ delete-contention *args:
 changefeed-scan *args:
     {{_uv}} run hoglake-bench changefeed-scan {{args}}
 
-# Expiry of fabricated registrations plus deletion of real non-Parquet probe objects
+# Expiry of fabricated registrations plus deletion of real Parquet probe objects
 [group('mixed')]
 expiry-throughput *args:
     {{_uv}} run hoglake-bench expiry-throughput {{args}}
@@ -51,10 +51,15 @@ expiry-throughput *args:
 ddl-churn *args:
     {{_uv}} run hoglake-bench ddl-churn {{args}}
 
-# Real Parquet writes, uploads and catalog registration
+# Real Parquet writes, uploads and catalog registration (--table-schema typed = full 1.1.0 type matrix)
 [group('real-data')]
 end-to-end-writer *args:
     {{_uv}} run hoglake-bench end-to-end-writer {{args}}
+
+# Seeded, replayable modeling workflow: staged loads, schema evolution, CTAS, changefeed
+[group('real-data')]
+analytics-lifecycle *args:
+    {{_uv}} run hoglake-bench analytics-lifecycle {{args}}
 
 # Populate a synthetic warehouse with real Parquet objects (e.g. --gb 2.5)
 [group('real-data')]

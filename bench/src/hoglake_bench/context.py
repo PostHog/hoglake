@@ -83,16 +83,21 @@ class Bench:
         flags: list[str] | None = None,
         error: str | None = None,
         config: dict[str, Any] | None = None,
+        io_mode: str | None = None,
     ) -> None:
         """One JSONL line per completed-OR-failed scenario. Stable
         schema: status is always present ('ok', 'regression', 'aborted',
-        'invariant_violation', 'error'); flags/error/config are always
-        present (empty list / null / {})."""
+        'invariant_violation', 'error'); flags/error/config/io_mode are
+        always present (empty list / null / {} / null). ``io_mode`` is
+        the scenario's IO honesty label ('metadata-only' numbers skip
+        object-store IO on purpose and must never be read as end-to-end;
+        'mixed' scenarios say per metric which half is which)."""
         record = {
             "ts": time.time(),
             "run_id": self.cfg.run_id,
             "scenario": scenario,
             "status": status,
+            "io_mode": io_mode,
             "params": params,
             "config": config or {},
             "flags": flags or [],

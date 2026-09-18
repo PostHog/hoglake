@@ -38,6 +38,7 @@ from .scenarios import (
     delete_contention,
     end_to_end,
     expiry_throughput,
+    lifecycle,
 )
 from .scenarios.common import ScenarioReport
 
@@ -49,6 +50,7 @@ SCENARIOS: dict[str, Any] = {
     "expiry-throughput": expiry_throughput,
     "ddl-churn": ddl_churn,
     "end-to-end-writer": end_to_end,
+    "analytics-lifecycle": lifecycle,
 }
 
 # Per-scenario argument overrides for `all --quick` (a ~2-3 minute smoke
@@ -76,6 +78,7 @@ QUICK_PROFILE: dict[str, dict[str, Any]] = {
     "expiry-throughput": {"snapshots": 1500, "batch": 500, "objects": 50},
     "ddl-churn": {"tables": 100, "ops": 30},
     "end-to-end-writer": {"rows": 20_000, "batch_rows": 5_000},
+    "analytics-lifecycle": {"scale": 1, "rows_per_load": 500},
 }
 FULL_PROFILE: dict[str, dict[str, Any]] = {name: {} for name in SCENARIOS}
 
@@ -212,7 +215,15 @@ def _run_scenario(
 ) -> tuple[int, list[str]]:
     """Run one scenario; journal a JSONL line whether it completed or
     failed (always with a ``status`` field); return (exit code, flags)."""
-    print(f"=== {name} (run {bench.cfg.run_id}) ===", flush=True)
+    io_mode = SCENARIOS[name].IO_MODE
+    print(f"=== {name} [{io_mode}] (run {bench.cfg.run_id}) ===", flush=True)
+    if io_mode == "metadata-only":
+        print(
+            "    metadata-only: registrations are fabricated (no parquet "
+            "bytes in the object store); these are control-plane numbers, "
+            "not end-to-end numbers",
+            flush=True,
+        )
     t0 = time.monotonic()
     try:
         report: ScenarioReport = SCENARIOS[name].run(bench, args)
@@ -224,6 +235,7 @@ def _run_scenario(
             status="invariant_violation",
             error=str(exc),
             config=config,
+            io_mode=io_mode,
         )
         print(
             f"\nINVARIANT VIOLATION in {name}: {exc}\n"
@@ -240,6 +252,7 @@ def _run_scenario(
             status="aborted",
             error=str(exc),
             config=config,
+            io_mode=io_mode,
         )
         print(f"\nABORT in {name}: {exc}", file=sys.stderr)
         return EXIT_ABORT, []
@@ -251,6 +264,7 @@ def _run_scenario(
             status="error",
             error=f"{type(exc).__name__}: {exc}",
             config=config,
+            io_mode=io_mode,
         )
         traceback.print_exc()
         print(
@@ -267,6 +281,7 @@ def _run_scenario(
         status=status,
         flags=report.flags,
         config=config,
+        io_mode=io_mode,
     )
     print(f"=== {name} done in {time.monotonic() - t0:.1f}s ===\n", flush=True)
     return (EXIT_REGRESSION if report.flags else EXIT_OK), report.flags

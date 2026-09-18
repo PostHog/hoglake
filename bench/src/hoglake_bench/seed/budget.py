@@ -43,14 +43,18 @@ class TableSpec:
         return f"{self.namespace}.{self.table}"
 
 
-#: The warehouse shape: one big partitioned event stream, two facts, three
-#: dims. Shares sum to 1.0. Dims are capped by row count when they seed
-#: (a dimension does not grow to 500 MB just because the budget did), and
-#: whatever they leave unspent is rebalanced onto the events/fact tables.
+#: The warehouse shape: one big partitioned event stream, two facts, the
+#: typed telemetry pair (full 1.1.0 scalar matrix + nested types — see
+#: seed/typed_tables.py), three dims. Shares sum to 1.0. Dims are capped
+#: by row count when they seed (a dimension does not grow to 500 MB just
+#: because the budget did), and whatever they leave unspent is rebalanced
+#: onto the events/fact/telemetry tables.
 WAREHOUSE_SHAPE: tuple[TableSpec, ...] = (
-    TableSpec("events", "pageviews", 0.65, "events"),
-    TableSpec("warehouse", "fact_orders", 0.18, "fact"),
-    TableSpec("warehouse", "fact_sessions", 0.12, "fact"),
+    TableSpec("events", "pageviews", 0.60, "events"),
+    TableSpec("warehouse", "fact_orders", 0.15, "fact"),
+    TableSpec("warehouse", "fact_sessions", 0.10, "fact"),
+    TableSpec("telemetry", "device_metrics", 0.05, "fact"),
+    TableSpec("telemetry", "app_events", 0.05, "fact"),
     TableSpec("warehouse", "dim_users", 0.030, "dim"),
     TableSpec("warehouse", "dim_products", 0.012, "dim"),
     TableSpec("warehouse", "dim_teams", 0.008, "dim"),

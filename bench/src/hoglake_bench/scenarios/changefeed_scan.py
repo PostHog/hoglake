@@ -26,6 +26,10 @@ from .common import (
     seed_snapshots,
 )
 
+#: Deliberately metadata-only: the catalog is grown with fabricated
+#: registrations and changes()/offsets are metadata reads/writes.
+IO_MODE = "metadata-only"
+
 FIXED_WINDOW = 100
 
 
