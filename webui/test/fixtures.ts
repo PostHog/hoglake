@@ -27,8 +27,15 @@ export const catalogsFixture: Catalog[] = [
     data_path: "s3://hog-lake/analytics",
     head_snapshot_id: "4211",
     schema_version: "7",
+    // Sampled. live_rows is past 2^53 deliberately: it must survive as
+    // an exact string, which is why these keys are in INT64_FIELDS.
+    table_count: "42",
+    live_rows: "9007199254740993",
+    live_size_bytes: "5368709120",
   },
   {
+    // NOT sampled: the totals are absent rather than zero, which is the
+    // case the page has to render as an em dash.
     name: "scratch",
     data_path: "s3://hog-lake/scratch",
     head_snapshot_id: "12",

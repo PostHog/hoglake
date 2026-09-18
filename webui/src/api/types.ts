@@ -20,6 +20,12 @@ export interface Catalog {
   data_path: string;
   head_snapshot_id: Int64;
   schema_version: Int64;
+  // Live totals from the metrics sampler's last pass. Absent — never
+  // zero — for a catalog it has not covered yet, so the page can tell
+  // "not sampled" from "empty".
+  table_count?: Int64;
+  live_rows?: Int64;
+  live_size_bytes?: Int64;
 }
 
 export interface CreateCatalogRequest {

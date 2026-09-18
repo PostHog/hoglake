@@ -26,6 +26,7 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.ViewInfo
+import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.stats.BoundWire
 import java.time.Instant
 import java.util.UUID
@@ -56,9 +57,34 @@ data class CatalogDto(
     /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
     val earliestSnapshotTime: Instant? = null,
     val capabilities: List<String> = listOf("atomic-table-creation-v1"),
+    /**
+     * Live totals from the metrics sampler's last pass — display
+     * numbers, not a consistency primitive, and the same provenance as
+     * the instance totals on GET /v1/info.
+     *
+     * All three are OMITTED rather than zeroed when the catalog has not
+     * been sampled yet (the boot window, or a catalog created since the
+     * last pass): an unsampled catalog and an empty one are different
+     * facts, and zero would assert the wrong one. table_count counts
+     * live tables; live_rows is gross of deletion-vector masking, as
+     * /v1/info's totals are.
+     */
+    val tableCount: Long? = null,
+    val liveRows: Long? = null,
+    val liveSizeBytes: Long? = null,
 )
 
-fun CatalogInfo.toDto() = CatalogDto(name, dataPath, headSnapshotId, schemaVersion, earliestSnapshotTime)
+fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
+    CatalogDto(
+        name = name,
+        dataPath = dataPath,
+        headSnapshotId = headSnapshotId,
+        schemaVersion = schemaVersion,
+        earliestSnapshotTime = earliestSnapshotTime,
+        tableCount = totals?.tableCount,
+        liveRows = totals?.liveRows,
+        liveSizeBytes = totals?.liveBytes,
+    )
 
 data class CreateCatalogRequestDto(val name: String, val dataPath: String)
 

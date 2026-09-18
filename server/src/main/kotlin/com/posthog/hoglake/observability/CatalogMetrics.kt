@@ -13,6 +13,26 @@ import java.util.concurrent.atomic.AtomicLong
 data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
 
 /**
+ * One catalog's live totals, as of the last metrics sample.
+ *
+ * Retained rather than recomputed: the sampler already produces these
+ * for the Prometheus gauges, so serving them costs nothing extra. A SUM
+ * over live data files per catalog on every listing request is the
+ * O(live files) load issue #8 exists to remove, on the same instance
+ * that serves the commit tail.
+ *
+ * The consequence is that these are up to one sample interval old, and
+ * ABSENT before the first sample. Callers must render that absence
+ * rather than substituting zero — an empty catalog and an unsampled one
+ * are different facts.
+ */
+data class CatalogTotals(
+    val tableCount: Long,
+    val liveRows: Long,
+    val liveBytes: Long,
+)
+
+/**
  * Catalog-health gauges (README.md §8 — the catalog reports on itself,
  * retiring the metrics-cron layer). A lightweight periodic sampler
  * refreshes per-catalog MultiGauges; each sample is ONE batched query
@@ -46,6 +66,15 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
     /** Null until the first successful sample (boot runs one immediately). */
     @Volatile
     var latestTotals: InstanceTotals? = null
+        private set
+
+    /**
+     * Per-catalog live totals from the last sample, keyed by catalog
+     * name. Empty until the first sample; a catalog created since then is
+     * absent rather than zero.
+     */
+    @Volatile
+    var latestByCatalog: Map<String, CatalogTotals> = emptyMap()
         private set
 
     private fun multiGauge(
@@ -152,6 +181,13 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
         // never computed per call (a manifest sum per request would tax
         // the same RDS that serves the commit tail at fleet scale).
         latestTotals = InstanceTotals(rows.sumOf { it.liveRows }, rows.sumOf { it.liveBytes })
+        // The same rows, kept per catalog for the catalogs listing. The
+        // map is replaced wholesale so a reader never sees a half-updated
+        // mixture of two samples.
+        latestByCatalog =
+            rows.associate {
+                it.name to CatalogTotals(it.tables, it.liveRows, it.liveBytes)
+            }
 
         val headByCatalog = rows.associate { it.name to it.head }
         val byCatalog = offsets.groupBy { it.first }

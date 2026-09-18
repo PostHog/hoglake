@@ -1529,6 +1529,27 @@ components:
             floor. Absent/null until expiry has ever advanced it. 410
             responses below the floor cite this time so consumers know
             WHEN their range was lost.
+        table_count:
+          type: integer
+          format: int64
+          description: >
+            Live (undropped) tables, from the metrics sampler's last
+            pass. Display number, not a consistency primitive.
+        live_rows:
+          type: integer
+          format: int64
+          description: >
+            Rows across live data files, from the same sample. Gross of
+            deletion-vector masking, as GET /v1/info's totals are.
+        live_size_bytes:
+          type: integer
+          format: int64
+          description: >
+            Bytes across live data files, from the same sample. All
+            three totals are OMITTED — never zeroed — for a catalog the
+            sampler has not covered yet (the boot window, or one created
+            since the last pass): an unsampled catalog and an empty one
+            are different facts.
 
     CreateCatalogRequest:
       type: object

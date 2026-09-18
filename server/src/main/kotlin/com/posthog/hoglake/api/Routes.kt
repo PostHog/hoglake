@@ -2,6 +2,7 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ScanService
@@ -32,6 +33,7 @@ fun Application.installApiRoutes(
     commits: CommitService,
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
+    catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
 ) {
     routing {
         get("/v1/info") {
@@ -52,7 +54,10 @@ fun Application.installApiRoutes(
         }
         route("/v1/catalogs") {
             get {
-                call.respond(catalogs.listCatalogs().map { it.toDto() })
+                // Totals ride the sampler's last pass (catalogTotals), so
+                // listing catalogs never sums the manifest per request.
+                val totals = catalogTotals()
+                call.respond(catalogs.listCatalogs().map { it.toDto(totals[it.name]) })
             }
             post {
                 val req = call.receive<CreateCatalogRequestDto>()

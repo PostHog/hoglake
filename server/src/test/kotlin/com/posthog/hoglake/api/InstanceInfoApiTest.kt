@@ -55,6 +55,9 @@ class InstanceInfoApiTest {
 
     private suspend fun body(response: HttpResponse): JsonNode = json.readTree(response.bodyAsText())
 
+    /** The listing is an array; `.single { }` reads better than an index. */
+    private fun JsonNode.single(match: (JsonNode) -> Boolean): JsonNode = elements().asSequence().single(match)
+
     private fun seed(cat: String) {
         catalogs.createCatalog(cat, "s3://bucket/$cat")
         catalogs.createNamespace(cat, "analytics")
@@ -133,6 +136,53 @@ class InstanceInfoApiTest {
             BuildInfo.buildStamp?.let { assertThat(root["build"].asText()).isEqualTo(it) }
             // ...while version stays present regardless.
             assertThat(root["version"].asText()).isEqualTo(BuildInfo.version)
+        }
+
+    @Test
+    fun `catalog listing carries per-catalog totals only once sampled`() =
+        api { client ->
+            val cat = "info-catalog-totals"
+            seed(cat)
+
+            // BEFORE any sample: the three totals must be ABSENT, not
+            // zero. Zero would say "this catalog is empty", which is a
+            // different — and wrong — claim about a catalog holding 15
+            // rows.
+            val before = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(before.has("table_count")).isFalse()
+            assertThat(before.has("live_rows")).isFalse()
+            assertThat(before.has("live_size_bytes")).isFalse()
+
+            app.catalogMetrics.sampleOnce()
+
+            val after = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(after["table_count"].asLong()).isEqualTo(1)
+            assertThat(after["live_rows"].asLong()).isEqualTo(15)
+            assertThat(after["live_size_bytes"].asLong()).isEqualTo(1_050_624)
+        }
+
+    @Test
+    fun `per-catalog totals come from the sample, not from a per-request query`() =
+        api { client ->
+            val cat = "info-catalog-stale"
+            seed(cat)
+            app.catalogMetrics.sampleOnce()
+
+            // Drop the table: the catalog is now empty in the database.
+            catalogs.dropTable(cat, "analytics", "events")
+
+            // The listing still reports the SAMPLED numbers, because it
+            // reads the sampler's map rather than summing the manifest
+            // per request. That staleness is the deliberate trade (see
+            // CatalogTotals) and this pins it — if someone "fixes" it
+            // with a live query, this test says what they gave up.
+            val stale = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(stale["live_rows"].asLong()).isEqualTo(15)
+
+            app.catalogMetrics.sampleOnce()
+            val fresh = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(fresh["live_rows"].asLong()).isZero()
+            assertThat(fresh["table_count"].asLong()).isZero()
         }
 
     @Test
