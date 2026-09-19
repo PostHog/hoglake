@@ -723,7 +723,53 @@ data class DataFile(
      * row_id_start is min(input row ids) and has no positional meaning.
      */
     val explicitRowIds: Boolean = false,
+    /**
+     * The file's ORDERING-KEY range, populated by the files LISTING
+     * alone (GET .../files). The changefeed and the scan plan leave it
+     * null: they answer "what changed" and "what to read", neither of
+     * which is a question about one column's span, and filling it there
+     * would cost a stats join on every consumer poll.
+     */
+    val orderingBounds: FileOrderingBounds? = null,
 )
+
+/**
+ * The range a file covers along the key its rows are ORDERED by — the
+ * one bound pair worth carrying beside a file, because it is the range
+ * a reader prunes on and the range that says whether two files overlap.
+ *
+ * Which key that is follows the table, not the file:
+ *
+ *  - a table with a sort spec is ordered by its sort key, and
+ *    [SortKey] carries the LEADING field's stored bounds. Row ids say
+ *    nothing about such a table's layout — a sorted rewrite remaps
+ *    them — so they are not offered.
+ *  - an unsorted table has exactly one ordering: the row id, which is
+ *    the append order. [RowIds] carries it.
+ */
+sealed class FileOrderingBounds {
+    /**
+     * The leading sort-spec field's stats row, kept in its STORED form
+     * (Iceberg single-value bytes, plus the column identity to decode
+     * them under) — decoding belongs to the wire layer, as it does for
+     * the per-file stats endpoint, so there is one decode path and not
+     * two.
+     */
+    data class SortKey(val column: FileColumnStats) : FileOrderingBounds()
+
+    /**
+     * The file's row-id span. [upper] is null when it CANNOT be known:
+     * a compaction output carries explicit row ids, where row_id_start
+     * is only min(input row ids) and `row_id_start + record_count - 1`
+     * is arithmetic on a meaning the file does not have. The ids live
+     * in the file's own `_hog_row_id` column, which is not a catalog
+     * column and therefore has no `hog_file_column_stats` row to read
+     * a maximum out of — so the honest answer is "unknown", not a
+     * computed number that would be wrong by exactly the amount the
+     * inputs were non-contiguous.
+     */
+    data class RowIds(val lower: Long, val upper: Long?) : FileOrderingBounds()
+}
 
 /** A registered deletion-vector file (one live DV per data file). */
 data class DeleteFile(

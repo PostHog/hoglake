@@ -56,6 +56,14 @@ export const hostileTableFixture: Table = {
  * record_count   = 2^53 + 1 = 9007199254740993
  * file_size_bytes= 2^62 + 1 = 4611686018427387905
  * row_id_start   = 2^53 + 3 = 9007199254740995
+ *
+ * The table is unsorted, so the ordering key is the row id and the
+ * server states the span it computes from those two: lower
+ * 9007199254740995, upper row_id_start + record_count - 1 =
+ * 18014398509481987. Both ends are the columns the files table renders,
+ * and both are past 2^53. The file's stats are PENDING and it has a
+ * span anyway — row_id_start is assigned at commit for every file,
+ * deferred stats included.
  */
 export const bigIntFilesWireBody =
   '[{"data_file_id":1,' +
@@ -65,6 +73,8 @@ export const bigIntFilesWireBody =
   '"file_size_bytes":4611686018427387905,' +
   '"row_id_start":9007199254740995,' +
   '"stats_state":"pending",' +
+  '"ordering_bounds":{"lower_bound":9007199254740995,' +
+  '"upper_bound":18014398509481987},' +
   '"begin_snapshot":5}]';
 
 /**
@@ -84,15 +94,21 @@ export const closeBigIntFilesWireBody =
   '[{"data_file_id":1,"path":"s3://ui-qe/adv/f1.parquet",' +
   '"file_format":"parquet","record_count":10,' +
   '"file_size_bytes":9007199254740992,"row_id_start":0,' +
-  '"stats_state":"provided","begin_snapshot":1},' +
+  '"stats_state":"provided",' +
+  '"ordering_bounds":{"lower_bound":0,"upper_bound":9},' +
+  '"begin_snapshot":1},' +
   '{"data_file_id":2,"path":"s3://ui-qe/adv/f2.parquet",' +
   '"file_format":"parquet","record_count":10,' +
   '"file_size_bytes":9007199254740993,"row_id_start":10,' +
-  '"stats_state":"provided","begin_snapshot":2},' +
+  '"stats_state":"provided",' +
+  '"ordering_bounds":{"lower_bound":10,"upper_bound":19},' +
+  '"begin_snapshot":2},' +
   '{"data_file_id":3,"path":"s3://ui-qe/adv/f3.parquet",' +
   '"file_format":"parquet","record_count":10,' +
   '"file_size_bytes":9007199254740995,"row_id_start":20,' +
-  '"stats_state":"provided","begin_snapshot":3}]';
+  '"stats_state":"provided",' +
+  '"ordering_bounds":{"lower_bound":20,"upper_bound":29},' +
+  '"begin_snapshot":3}]';
 
 /**
  * Raw wire bodies for a catalog whose head snapshot id exceeds 2^53 —

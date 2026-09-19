@@ -80,7 +80,14 @@ export const tableFixture: Table = {
   },
 };
 
-/** One file per stats_state variant: provided / pending / failed. */
+/**
+ * One file per stats_state variant: provided / pending / failed.
+ *
+ * tableFixture is UNSORTED, so every file's ordering key is the row id
+ * and the server states the span it computes from row_id_start and
+ * record_count — for all three, stats_state included, since row ids
+ * need no statistics.
+ */
 export const filesFixture: DataFile[] = [
   {
     data_file_id: "101",
@@ -97,6 +104,7 @@ export const filesFixture: DataFile[] = [
     // emits it — 20697 is 2026-09-01. A date string here was not a
     // value the writer can produce.
     partition_values: ["20697", "7"],
+    ordering_bounds: { lower_bound: "0", upper_bound: "499999" },
   },
   {
     data_file_id: "102",
@@ -109,6 +117,7 @@ export const filesFixture: DataFile[] = [
     begin_snapshot: "4100",
     spec_id: "1",
     partition_values: ["20698", null],
+    ordering_bounds: { lower_bound: "500000", upper_bound: "979999" },
   },
   {
     data_file_id: "103",
@@ -119,6 +128,87 @@ export const filesFixture: DataFile[] = [
     row_id_start: "980000",
     stats_state: "failed",
     begin_snapshot: "4200",
+    ordering_bounds: { lower_bound: "980000", upper_bound: "1234566" },
+  },
+];
+
+/**
+ * The same table, SORTED by user_id (field 2) — the case where the row
+ * id says nothing and the files table reports the leading sort field's
+ * bounds instead.
+ */
+export const sortedTableFixture: Table = {
+  ...tableFixture,
+  sort_spec: {
+    sort_id: "3",
+    fields: [
+      { source_field_id: "2", direction: "asc", null_order: "nulls_last" },
+      // A second key, deliberately: only the LEADING field's bounds are
+      // shown, because a tiebreaker's per-file range spans the column.
+      { source_field_id: "1", direction: "desc", null_order: "nulls_first" },
+    ],
+  },
+};
+
+/**
+ * Files of the sorted table, covering the three states the bound cells
+ * have to tell apart:
+ *
+ *  - 201: bounds of the sort key, decoded.
+ *  - 202: a compaction OUTPUT whose ordering key is still the sort key,
+ *    with a null lower bound — an all-null column, so nothing to prune
+ *    on.
+ *  - 203: stats pending, so no ordering_bounds at all. Its row ids are
+ *    not offered in their place: on a sorted table they describe
+ *    nothing, since a sorted rewrite remaps them.
+ */
+export const sortedFilesFixture: DataFile[] = [
+  {
+    data_file_id: "201",
+    path: "s3://hog-lake/analytics/events/pageviews/data-00201.parquet",
+    file_format: "parquet",
+    record_count: "500000",
+    file_size_bytes: "268435456",
+    row_id_start: "0",
+    stats_state: "provided",
+    begin_snapshot: "4001",
+    spec_id: "1",
+    partition_values: ["20697", "7"],
+    ordering_bounds: {
+      field_id: "2",
+      lower_bound: "1000",
+      upper_bound: "4999",
+    },
+  },
+  {
+    data_file_id: "202",
+    path: "s3://hog-lake/analytics/events/pageviews/data-00202.parquet",
+    file_format: "parquet",
+    record_count: "480000",
+    file_size_bytes: "251658240",
+    row_id_start: "500000",
+    stats_state: "provided",
+    begin_snapshot: "4100",
+    spec_id: "1",
+    partition_values: ["20698", null],
+    explicit_row_ids: true,
+    ordering_bounds: {
+      field_id: "2",
+      lower_bound: null,
+      upper_bound: "9999",
+    },
+  },
+  {
+    data_file_id: "203",
+    path: "s3://hog-lake/analytics/events/pageviews/data-00203.parquet",
+    file_format: "parquet",
+    record_count: "254567",
+    file_size_bytes: "134217728",
+    row_id_start: "980000",
+    stats_state: "pending",
+    begin_snapshot: "4200",
+    spec_id: "1",
+    partition_values: ["20699", "3"],
   },
 ];
 

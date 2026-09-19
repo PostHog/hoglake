@@ -245,9 +245,16 @@ td.nullable-mark {
   background: var(--bg-hover);
 }
 /* The cell lays out left-to-right so the copy button sits AFTER the
-   path; the rtl truncation lives on the text alone (.path-text). */
+   path; the rtl truncation lives on the text alone (.path-text).
+
+   Narrow, because the path is the least informative column here: a
+   hoglake object name is a guid, so every row's path differs only in
+   its tail, and the tail is exactly what the rtl truncation keeps. The
+   width it gives up pays for the ordering-key min/max columns, which
+   are what an operator reads a file row FOR. Nothing is lost: the full
+   path stays in the tooltip and on the copy button. */
 .path-cell {
-  max-width: 340px;
+  max-width: 200px;
 }
 .path-cell > * {
   vertical-align: middle;

@@ -133,6 +133,56 @@ object FileRepo {
             .list()
 
     /**
+     * ONE field's stats rows across MANY files, keyed by data file id —
+     * the files listing's ordering-key bounds.
+     *
+     * Deliberately a single query over the whole page rather than
+     * [columnStats] per row: the listing returns every live file at the
+     * snapshot, and a per-file read would turn one screen into
+     * thousands of round trips for a column the table shows in every
+     * row. Files with no row for [fieldId] (stats pending or failed, a
+     * column added after the file landed, a heterogeneous compaction
+     * group) are simply absent from the map — the caller renders that
+     * as "no bounds", never as a zero.
+     */
+    fun columnStatsFor(
+        handle: Handle,
+        catalogId: Long,
+        dataFileIds: List<Long>,
+        fieldId: Long,
+    ): Map<Long, ColumnStats> {
+        // `IN (<ids>)` with an empty list is not valid SQL, and an empty
+        // table has no files to bound.
+        if (dataFileIds.isEmpty()) return emptyMap()
+        return handle.createQuery(
+            """
+            SELECT data_file_id, field_id, value_count, null_count, nan_count,
+                   size_bytes, lower_bound, upper_bound
+            FROM hog_file_column_stats
+            WHERE catalog_id = :catalogId AND field_id = :fieldId
+              AND data_file_id IN (<dataFileIds>)
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("fieldId", fieldId)
+            .bindList("dataFileIds", dataFileIds)
+            .map { rs, _ ->
+                rs.getLong("data_file_id") to
+                    ColumnStats(
+                        fieldId = rs.getLong("field_id"),
+                        valueCount = rs.getLong("value_count"),
+                        nullCount = rs.getLong("null_count"),
+                        nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
+                        sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
+                        lowerBound = rs.getBytes("lower_bound"),
+                        upperBound = rs.getBytes("upper_bound"),
+                    )
+            }
+            .list()
+            .toMap()
+    }
+
+    /**
      * Snapshot-scoped table aggregates: (file_count, record_count,
      * file_size_bytes) over the files VISIBLE at [snapshot]. TableInfo
      * must use this, never hog_table_stats — the stats row is the gross

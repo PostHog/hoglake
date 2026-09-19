@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.FileColumnStats
+import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
@@ -402,8 +403,94 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
                     )
-            FileRepo.listAt(h, cat.catalogId, t.tableId, at)
+            withOrderingBounds(
+                h,
+                cat.catalogId,
+                t.tableId,
+                at,
+                FileRepo.listAt(h, cat.catalogId, t.tableId, at),
+            )
         }
+
+    /**
+     * Attach each file's ordering-key range — the bounds of the column
+     * the table's rows are ORDERED by, which is what tells a reader
+     * which files a predicate can skip and which files overlap.
+     *
+     * The key is the TABLE's, resolved once for the whole listing:
+     *
+     *  - a sort spec at [at] means the rows are ordered by its LEADING
+     *    field, so that field's stored bounds are the answer. The
+     *    leading field alone: it is the only one whose range is a
+     *    contiguous interval per file (the second key only orders rows
+     *    that TIE on the first, so its per-file min/max spans the whole
+     *    column and prunes nothing), and it is the field a reader's
+     *    predicate has to hit before any other key matters.
+     *  - no sort spec means the only ordering is the append order,
+     *    which is the row id.
+     *
+     * Bounds come from ONE query for the whole page, not one per file.
+     * A file with no stats row for the key gets no bounds rather than
+     * an invented range: pending/failed files have no rows at all, and
+     * a key column added after a file landed has none on that file.
+     * The row-id range needs no stats and is always given — row_id_start
+     * is assigned at commit for every file, deferred stats included.
+     */
+    private fun withOrderingBounds(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        at: Long,
+        files: List<DataFile>,
+    ): List<DataFile> {
+        val leading =
+            SortRepo.sortSpecAt(h, catalogId, tableId, at)?.fields?.firstOrNull()
+                ?: return files.map { it.copy(orderingBounds = rowIdBounds(it)) }
+        // A sort spec can outlive the column it names only through a
+        // drop, which AlterService refuses while the column is a sort
+        // source — but a read at an older snapshot can still land on a
+        // spec whose source is not visible there, and a field id with no
+        // column has no type to decode its bounds under.
+        val (path, column) =
+            columnsByFieldId(TableRepo.columnsAt(h, catalogId, tableId, at))[leading.sourceFieldId]
+                ?: return files
+        val statsByFile =
+            FileRepo.columnStatsFor(h, catalogId, files.map { it.dataFileId }, leading.sourceFieldId)
+        return files.map { file ->
+            val stats = statsByFile[file.dataFileId] ?: return@map file
+            file.copy(
+                orderingBounds =
+                    FileOrderingBounds.SortKey(
+                        FileColumnStats(
+                            fieldId = leading.sourceFieldId,
+                            name = column.def.name,
+                            path = path,
+                            type = column.def.type,
+                            typeParams = column.def.typeParams,
+                            stats = stats,
+                        ),
+                    ),
+            )
+        }
+    }
+
+    /**
+     * The row-id range of one file, or null when there is no range to
+     * state: an EMPTY file spans nothing, and `row_id_start - 1` as its
+     * maximum would read as a range running backwards.
+     *
+     * The maximum is positional arithmetic, which is only sound while
+     * the ids ARE positions. A compaction output's are not (see
+     * [FileOrderingBounds.RowIds]), so it reports its minimum and
+     * leaves the maximum unknown.
+     */
+    private fun rowIdBounds(file: DataFile): FileOrderingBounds? {
+        if (file.recordCount <= 0L) return null
+        return FileOrderingBounds.RowIds(
+            lower = file.rowIdStart,
+            upper = if (file.explicitRowIds) null else file.rowIdStart + file.recordCount - 1,
+        )
+    }
 
     /**
      * Per-column statistics for ONE data file (GET

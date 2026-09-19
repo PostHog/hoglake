@@ -1,7 +1,14 @@
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
-import { filesFixture, notFoundError, scanFixture, tableFixture } from "./fixtures";
+import {
+  filesFixture,
+  notFoundError,
+  scanFixture,
+  sortedFilesFixture,
+  sortedTableFixture,
+  tableFixture,
+} from "./fixtures";
 import {
   bigIntFilesWireBody,
   closeBigIntFilesWireBody,
@@ -106,6 +113,87 @@ describe("TablePage", () => {
     // present and the rendering still read "team_id=42ts_day=…".
     const cell = screen.getAllByText("ts_day")[0].closest("td");
     expect(cell?.textContent).toBe("ts_day=2026-09-01 / url_bucket=bucket 7/16");
+  });
+
+  /** The cells of the file row whose id cell reads [id]. */
+  function fileRowCells(id: string): string[] {
+    const row = screen
+      .getAllByRole("row")
+      .find((r) => r.querySelector("td:first-child")?.textContent === id);
+    if (!row) throw new Error(`no file row ${id}`);
+    return [...row.querySelectorAll("td")].map((c) => c.textContent ?? "");
+  }
+
+  it("bounds an unsorted table's files by their row-id span", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("101");
+
+    // No sort spec means the row id IS the ordering key, and the
+    // headers say so by naming it. row_id_start alone is gone: a start
+    // with no end never said which files overlap.
+    expect(
+      screen.getByRole("button", { name: /^_hog_row_id min/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^_hog_row_id max/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^row_id_start/ }),
+    ).not.toBeInTheDocument();
+
+    // Both ends of every file's span, the pending and failed files
+    // included: row ids need no statistics.
+    expect(fileRowCells("101")).toContain("0");
+    expect(fileRowCells("101")).toContain("499999");
+    expect(fileRowCells("102")).toContain("979999");
+    expect(fileRowCells("103")).toContain("1234566");
+  });
+
+  it("bounds a sorted table's files by its leading sort field", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(sortedTableFixture);
+      if (path === `${base}/files`) return jsonResponse(sortedFilesFixture);
+      return undefined;
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("201");
+
+    // The LEADING sort field names both columns — user_id, not the `ts`
+    // tiebreaker and not the row id, which a sorted rewrite remaps and
+    // which therefore describes nothing here.
+    expect(
+      screen.getByRole("button", { name: /^user_id min/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /^user_id max/ }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /^_hog_row_id/ }),
+    ).not.toBeInTheDocument();
+
+    expect(fileRowCells("201")).toContain("1000");
+    expect(fileRowCells("201")).toContain("4999");
+
+    // A stored NULL bound is an answer — the column is all-null, so
+    // nothing can be pruned on it — and it is labelled as one.
+    expect(fileRowCells("202")).toContain("null");
+    expect(
+      screen.getByTitle("no bound stored — do not prune"),
+    ).toBeInTheDocument();
+
+    // A file whose statistics are pending has no bounds AT ALL, which is
+    // a different fact from a null bound: em dashes, not zeros, and not
+    // the row ids either.
+    expect(fileRowCells("203")).toContain("—");
+    expect(fileRowCells("203")).not.toContain("980000");
   });
 
   it("pairs data files with deletion vectors on the Scan tab", async () => {
@@ -229,8 +317,12 @@ describe("TablePage", () => {
     expect(
       await screen.findByText("9,007,199,254,740,993"),
     ).toBeInTheDocument();
-    // row_id_start 2^53+3 verbatim — the lineage anchor an operator reads.
+    // The row-id span, both ends verbatim: lower is row_id_start 2^53+3,
+    // upper is row_id_start + record_count - 1. These are the ordering
+    // key an unsorted table's files are read by, and both ends are past
+    // the point where a Number round-trip would start lying.
     expect(screen.getByText("9007199254740995")).toBeInTheDocument();
+    expect(screen.getByText("18014398509481987")).toBeInTheDocument();
     // file_size_bytes 2^62+1: humanized cell, exact value in the tooltip.
     const sizeCell = screen.getByTitle("4611686018427387905");
     expect(sizeCell).toBeInTheDocument();
@@ -266,16 +358,18 @@ describe("TablePage", () => {
     expect(fileIdOrder()).toEqual(["103", "102", "101"]);
     expect(size.closest("th")).toHaveAttribute("aria-sort", "ascending");
 
-    // record_count and row_id_start order numerically, not as text.
+    // record_count and the ordering-key bounds order numerically, not as
+    // text.
     await user.click(screen.getByRole("button", { name: /^record_count/ }));
     expect(fileIdOrder()).toEqual(["101", "102", "103"]);
 
     // A different column starts descending again, and only one column
-    // is ever marked as the sort.
-    const rowId = screen.getByRole("button", { name: /^row_id_start/ });
-    await user.click(rowId);
+    // is ever marked as the sort. The table is unsorted, so its ordering
+    // key is the row id.
+    const keyMin = screen.getByRole("button", { name: /^_hog_row_id min/ });
+    await user.click(keyMin);
     expect(fileIdOrder()).toEqual(["103", "102", "101"]);
-    expect(rowId.closest("th")).toHaveAttribute("aria-sort", "descending");
+    expect(keyMin.closest("th")).toHaveAttribute("aria-sort", "descending");
     expect(
       screen.getByRole("button", { name: /^record_count/ }).closest("th"),
     ).toHaveAttribute("aria-sort", "none");

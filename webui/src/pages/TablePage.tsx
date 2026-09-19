@@ -11,6 +11,7 @@ import type {
   Int64,
   PartitionSpec,
   ScanFile,
+  SortSpec,
   StatsState,
   Table,
 } from "../api/types";
@@ -20,6 +21,7 @@ import { StatsStateBadge } from "../components/badges";
 import { CopyButton } from "../components/CopyButton";
 import { decodePartition, type PartitionDecode } from "../lib/partitions";
 import {
+  columnPath,
   formatBytes,
   formatCount,
   formatPartitionField,
@@ -236,6 +238,9 @@ function SchemaTab({ table }: { table: Table }) {
  */
 const BOUND_INLINE_MAX_CHARS = 48;
 
+/** What a null bound means wherever a column's statistics are shown. */
+const NO_BOUND_TITLE = "no bound stored — do not prune";
+
 /**
  * One decoded bound cell. The server ships bounds already decoded
  * (GET .../files/{fileId}/stats — the webui carries no codec): strings
@@ -243,11 +248,22 @@ const BOUND_INLINE_MAX_CHARS = 48;
  * and null meaning "no bound" — a real answer (all-null column, or a
  * bound the server could not decode), flagged so an operator knows it
  * forbids pruning rather than describing an empty range.
+ *
+ * [nullTitle] overrides what that null MEANS, because it does not
+ * always mean the same thing: on a column's stats it is "nothing was
+ * stored, so do not prune", while on the upper end of a compaction
+ * output's row-id span it is "unknown" — see [OrderingBoundCell].
  */
-function BoundCell({ bound }: { bound: DecodedBound }) {
+function BoundCell({
+  bound,
+  nullTitle = NO_BOUND_TITLE,
+}: {
+  bound: DecodedBound;
+  nullTitle?: string;
+}) {
   if (bound === null) {
     return (
-      <td className="num mono subtle" title="no bound stored — do not prune">
+      <td className="num mono subtle" title={nullTitle}>
         null
       </td>
     );
@@ -518,13 +534,88 @@ function partitionSortText(d: PartitionDecode): string {
   }
 }
 
+/** The implicit ordering key of an unsorted table, by its server name. */
+const ROW_ID_COLUMN = "_hog_row_id";
+
+/** What a null upper bound means on a row-id span (never on a sort key). */
+const UNKNOWN_ROW_ID_TITLE =
+  "unknown — this file carries explicit row ids (a compaction output), " +
+  "so row_id_start is only min(input row ids) and the maximum cannot be " +
+  "computed from it";
+
+/**
+ * The ORDERING KEY of a table's files: the column whose per-file min and
+ * max say which files a predicate can skip and which files overlap.
+ *
+ * A sorted table's key is its LEADING sort field — the only one whose
+ * per-file range is a contiguous interval, because a second key orders
+ * only the rows that TIE on the first and so spans the whole column. An
+ * unsorted table's is the row id: the append order, and the one
+ * ordering every file has. When a sort spec exists the row id says
+ * nothing about layout (a sorted rewrite remaps it), so it is not shown.
+ *
+ * The header is the DOTTED path, not the bare leaf name: two structs may
+ * each hold a `zip`, and a column headed "zip" on a table sorted by
+ * `addr.zip` names the wrong one.
+ */
+function orderingKeyName(sortSpec?: SortSpec, columns?: Column[]): string {
+  const leading = sortSpec?.fields[0];
+  if (!leading) return ROW_ID_COLUMN;
+  return (
+    columnPath(columns, leading.source_field_id) ??
+    `field ${leading.source_field_id}`
+  );
+}
+
+/**
+ * One end of a file's ordering-key range — three states, which are three
+ * different facts.
+ *
+ * NO `ordering_bounds` at all is the page's absent em dash: the server
+ * had no range to state, which is what a sorted table's pending or
+ * failed file has, along with a file that landed before the key column
+ * existed and a file of zero records.
+ *
+ * A VALUE renders like any other decoded bound.
+ *
+ * A NULL inside the object is a stated answer, and which answer depends
+ * on the key. On a sort key the bound was never stored, so the file
+ * cannot be pruned on it. On the upper end of a row-id span it is
+ * genuinely unknown: the file carries explicit row ids, and there is no
+ * `_hog_row_id` statistics row to read a maximum out of — an invented
+ * `row_id_start + record_count - 1` would be wrong by exactly however
+ * non-contiguous the compaction inputs were.
+ */
+function OrderingBoundCell({
+  file,
+  end,
+}: {
+  file: DataFile;
+  end: "lower" | "upper";
+}) {
+  const bounds = file.ordering_bounds;
+  if (!bounds) return <td className="num mono subtle">—</td>;
+  // Absent field_id IS the row-id case: the row id is not a catalog
+  // column, so the server has no field id to name it with.
+  const rowIdSpan = bounds.field_id === undefined;
+  return (
+    <BoundCell
+      bound={end === "lower" ? bounds.lower_bound : bounds.upper_bound}
+      nullTitle={
+        rowIdSpan && end === "upper" ? UNKNOWN_ROW_ID_TITLE : NO_BOUND_TITLE
+      }
+    />
+  );
+}
+
 type FileSortKey =
   | "id"
   | "partition"
   | "path"
   | "records"
   | "size"
-  | "rowId"
+  | "keyMin"
+  | "keyMax"
   | "stats"
   | "snapshot";
 
@@ -534,13 +625,41 @@ interface FileRow {
   partition: PartitionDecode;
 }
 
+/**
+ * An ordering-key bound column, compared as the values the bounds are:
+ * exact integers when both ends are decimal integers — a long key or a
+ * row id runs past 2^53, which is why these arrive as raw tokens — and
+ * natural text otherwise. The same rule the partition column uses, for
+ * the same reason.
+ */
+function boundColumn(
+  get: (row: FileRow) => DecodedBound | undefined,
+): ColumnSort<FileRow> {
+  const text = (row: FileRow): string | undefined => {
+    const bound = get(row);
+    return bound === null || bound === undefined ? undefined : String(bound);
+  };
+  return {
+    compare: (a, b) => {
+      const x = text(a);
+      const y = text(b);
+      return isDecimalInt(x) && isDecimalInt(y) ? cmpInt64(x, y) : cmpText(x, y);
+    },
+    // A file with no range and a file whose bound is a stated null are
+    // both "no value here", and an em dash that merely compared as
+    // smallest would ride to the top of a largest-first sort.
+    absent: (row) => text(row) === undefined,
+  };
+}
+
 const FILE_COMPARATORS: Record<FileSortKey, ColumnSort<FileRow>> = {
   id: int64Column((r) => r.file.data_file_id),
   partition: { compare: (a, b) => cmpPartition(a.partition, b.partition) },
   path: textColumn((r) => r.file.path),
   records: int64Column((r) => r.file.record_count),
   size: int64Column((r) => r.file.file_size_bytes),
-  rowId: int64Column((r) => r.file.row_id_start),
+  keyMin: boundColumn((r) => r.file.ordering_bounds?.lower_bound),
+  keyMax: boundColumn((r) => r.file.ordering_bounds?.upper_bound),
   // Grouping, not ranking: the point is to bring the failures together.
   stats: textColumn((r) => r.file.stats_state),
   snapshot: int64Column((r) => r.file.begin_snapshot),
@@ -552,6 +671,7 @@ function FilesTab({
   table,
   snapshot,
   spec,
+  sortSpec,
   columns,
 }: {
   catalog: string;
@@ -559,6 +679,7 @@ function FilesTab({
   table: string;
   snapshot?: Int64;
   spec?: PartitionSpec;
+  sortSpec?: SortSpec;
   columns?: Column[];
 }) {
   const { data, isPending, isError, error } = useQuery({
@@ -574,12 +695,15 @@ function FilesTab({
   // The column appears only for a partitioned table: on an unpartitioned
   // one it would be a column of dashes.
   const partitioned = (spec?.fields.length ?? 0) > 0;
-  // Fixed columns: id, path, record_count, size, row_id_start, stats,
-  // begin_snapshot — plus partition when there is one. The stats column
-  // doubles as the expander, so there is no separate toggle column.
-  // Drives the skeleton and the empty-state colSpan, so a wrong count
-  // shows as a short row rather than an error.
-  const cols = partitioned ? 8 : 7;
+  // The ordering key both bound columns report, named once for the two
+  // headers — see orderingKeyName.
+  const keyName = orderingKeyName(sortSpec, columns);
+  // Fixed columns: id, path, record_count, size, the ordering key's min
+  // and max, stats, begin_snapshot — plus partition when there is one.
+  // The stats column doubles as the expander, so there is no separate
+  // toggle column. Drives the skeleton and the empty-state colSpan, so a
+  // wrong count shows as a short row rather than an error.
+  const cols = partitioned ? 9 : 8;
   // Sorting is over the WHOLE table: GET /files returns every live file
   // at the snapshot, so "largest file" here is the largest file, not the
   // largest of a page.
@@ -614,8 +738,15 @@ function FilesTab({
           />
           <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
           <SortableTh
-            label="row_id_start"
-            sortKey="rowId"
+            label={`${keyName} min`}
+            sortKey="keyMin"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh
+            label={`${keyName} max`}
+            sortKey="keyMax"
             sort={sort}
             onSort={onSort}
             numeric
@@ -651,7 +782,8 @@ function FilesTab({
                 <td className="num mono" title={`${f.file_size_bytes}`}>
                   {formatBytes(f.file_size_bytes)}
                 </td>
-                <td className="num mono">{f.row_id_start}</td>
+                <OrderingBoundCell file={f} end="lower" />
+                <OrderingBoundCell file={f} end="upper" />
                 <StatsCell
                   state={f.stats_state}
                   expanded={expanded === f.data_file_id}
@@ -881,6 +1013,10 @@ export function TablePage() {
              undefined while it loads, which reads as "not yet decodable"
              rather than as "unpartitioned". */
           spec={tableQuery.data?.partition_spec}
+          /* Names the ordering key whose bounds each file row reports;
+             undefined while it loads, and undefined for good on an
+             unsorted table, where the key is the row id. */
+          sortSpec={tableQuery.data?.sort_spec}
           columns={tableQuery.data?.columns}
         />
       )}

@@ -1,6 +1,7 @@
 package com.posthog.hoglake.api
 
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.node.LongNode
 import com.fasterxml.jackson.databind.node.NullNode
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangesPlan
@@ -15,6 +16,7 @@ import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileColumnStats
+import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
@@ -319,7 +321,48 @@ data class DataFileDto(
     val partitionValues: List<String?>? = null,
     /** True for compaction outputs: row ids ride the physical _hog_row_id column. */
     val explicitRowIds: Boolean = false,
+    /**
+     * The file's ordering-key range; the files LISTING fills it, the
+     * changefeed and the scan plan leave it absent (NON_NULL omits it).
+     */
+    val orderingBounds: FileOrderingBoundsDto? = null,
 )
+
+/**
+ * A file's range along the key its table is ordered by (GET
+ * .../files). [fieldId] names the sort-spec field the bounds belong to;
+ * ABSENT means the table is unsorted and the bounds are the file's
+ * row-id span, the implicit ordering key — the row id is not a catalog
+ * column and has no field id to give.
+ *
+ * `lower_bound`/`upper_bound` are typed [JsonNode] for the same reason
+ * [FileColumnStatsDto]'s are: a JSON null is an ANSWER here, not an
+ * absence. On a sort key it is "no bound stored, so do not prune"; on a
+ * row-id span it is "unknown", which a compaction output's maximum
+ * genuinely is. NON_NULL inclusion would silently drop either, and the
+ * reader would see a range with one end missing rather than a stated
+ * one.
+ */
+data class FileOrderingBoundsDto(
+    val fieldId: Long? = null,
+    val lowerBound: JsonNode,
+    val upperBound: JsonNode,
+)
+
+fun FileOrderingBounds.toDto(): FileOrderingBoundsDto =
+    when (this) {
+        is FileOrderingBounds.SortKey ->
+            FileOrderingBoundsDto(
+                fieldId = column.fieldId,
+                lowerBound = renderBoundOrNull(column, column.stats.lowerBound),
+                upperBound = renderBoundOrNull(column, column.stats.upperBound),
+            )
+        is FileOrderingBounds.RowIds ->
+            FileOrderingBoundsDto(
+                lowerBound = LongNode.valueOf(lower),
+                upperBound = upper?.let { LongNode.valueOf(it) } ?: NullNode.instance,
+            )
+    }
 
 fun DataFile.toDto() =
     DataFileDto(
@@ -335,6 +378,7 @@ fun DataFile.toDto() =
         specId = specId,
         partitionValues = partitionValues,
         explicitRowIds = explicitRowIds,
+        orderingBounds = orderingBounds?.toDto(),
     )
 
 // ---- per-file column statistics (decoded bounds) ---------------------------
