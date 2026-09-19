@@ -351,21 +351,31 @@ function FileStatsPanel({
  * for whom the decoded form is the wrong answer.
  */
 /**
- * Why a file has no column statistics. The same ground the server states
- * in FileStats.no_stats_reason, said in the space a tooltip has.
+ * What each stats marker means. EVERY state gets one: the shape alone
+ * says whether a row opens, not what the state is or what it costs the
+ * reader, and the triangle needs explaining as much as the circle does.
  *
- * Carried here rather than fetched because the reason is a property of
- * the STATE, not of the file: every pending file has the same one. That
- * is also what makes the marker safe to leave unclickable — expanding
- * one of these rows only ever produced this sentence.
+ * All three answer the same three things in the same order — what the
+ * state is, what it means for a reader planning a scan, and what to do
+ * about it — so hovering any two rows compares like with like.
+ *
+ * For the states with no statistics this is the ground the server gives
+ * in FileStats.no_stats_reason, said in the space a tooltip has. It is
+ * carried here rather than fetched because the reason belongs to the
+ * STATE, not the file: every pending file has the same one. That is
+ * also what makes the circle safe to leave unclickable — expanding one
+ * of those rows only ever produced this sentence.
  */
-const NO_STATS_REASON: Record<Exclude<StatsState, "provided">, string> = {
+const STATS_TOOLTIP: Record<StatsState, string> = {
+  provided:
+    "Column statistics are hydrated: per-column bounds, null counts and " +
+    "sizes are recorded, so a reader can prune this file. Click to see them.",
   pending:
-    "Column statistics have not been hydrated yet. With no bounds, " +
-    "readers cannot prune this file.",
+    "Column statistics have not been hydrated yet, so this file carries no " +
+    "bounds and a reader cannot prune it. The hydrator sweep will claim it.",
   failed:
-    "Stats hydration failed. With no bounds, readers cannot prune this " +
-    "file; requeue with POST .../maintenance/rehydrate.",
+    "Stats hydration failed, so this file carries no bounds and a reader " +
+    "cannot prune it. Requeue with POST .../maintenance/rehydrate.",
 };
 
 /**
@@ -401,7 +411,7 @@ function StatsCell({
           aria-label={`toggle stats for file ${fileId}`}
           aria-expanded={expanded}
           onClick={onToggle}
-          title="Column statistics — click to expand"
+          title={STATS_TOOLTIP.provided}
         >
           {expanded ? "▾" : "▸"}
         </button>
@@ -416,7 +426,7 @@ function StatsCell({
         className={`stats-marker stats-${state}`}
         role="img"
         aria-label={`${state}: no column statistics for file ${fileId}`}
-        title={NO_STATS_REASON[state]}
+        title={STATS_TOOLTIP[state]}
       >
         ●
       </span>

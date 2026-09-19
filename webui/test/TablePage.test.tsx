@@ -438,7 +438,7 @@ describe("TablePage", () => {
     expect(screen.queryByText("aardvark")).not.toBeInTheDocument();
   });
 
-  it("gives the no-stats reason without a click, and asks the server for nothing", async () => {
+  it("explains every stats marker on hover, without a click or a request", async () => {
     // It used to take a click and a round trip to learn why a file has
     // no statistics. The answer is a property of the STATE — every
     // pending file has the same one — so it now rides the marker's
@@ -455,14 +455,35 @@ describe("TablePage", () => {
     await user.click(await screen.findByRole("tab", { name: "files" }));
     await screen.findByText("101");
 
-    expect(
-      screen.getByLabelText("pending: no column statistics for file 102"),
-    ).toHaveAttribute("title", expect.stringContaining("not been hydrated yet"));
-    expect(
-      screen.getByLabelText("failed: no column statistics for file 103"),
-    ).toHaveAttribute("title", expect.stringContaining("rehydrate"));
+    // EVERY marker explains itself, the expandable one included: the
+    // shape says whether a row opens, never what the state costs a
+    // reader planning a scan.
+    const tips = {
+      provided: screen
+        .getByRole("button", { name: "toggle stats for file 101" })
+        .getAttribute("title"),
+      pending: screen
+        .getByLabelText("pending: no column statistics for file 102")
+        .getAttribute("title"),
+      failed: screen
+        .getByLabelText("failed: no column statistics for file 103")
+        .getAttribute("title"),
+    };
+    expect(tips.provided).toMatch(/hydrated/);
+    expect(tips.provided).toMatch(/click to see them/i);
+    expect(tips.pending).toMatch(/not been hydrated yet/);
+    expect(tips.failed).toMatch(/rehydrate/);
 
-    // Both reasons are on screen, and neither cost a request.
+    // Each says what the state costs a reader, in the same words, so
+    // hovering two rows compares like with like.
+    expect(tips.provided).toMatch(/can prune this file/);
+    expect(tips.pending).toMatch(/cannot prune it/);
+    expect(tips.failed).toMatch(/cannot prune it/);
+
+    // Three distinct explanations, not one text reused.
+    expect(new Set(Object.values(tips)).size).toBe(3);
+
+    // All of it is on screen, and none of it cost a request.
     expect(seen.filter((u) => u.includes("/stats"))).toEqual([]);
   });
 
