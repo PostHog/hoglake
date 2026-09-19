@@ -1,4 +1,5 @@
 import { screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { catalogsFixture, notFoundError } from "./fixtures";
 import { bigIntCatalogsWireBody } from "./fixtures.adversarial";
@@ -79,5 +80,69 @@ describe("catalog totals", () => {
     const row = (await screen.findByText("scratch")).closest("tr");
     expect(row?.textContent).toContain("—");
     expect(row?.textContent).not.toContain("0 B");
+  });
+
+  it("keeps an unsampled catalog out of the top of a largest-first sort", async () => {
+    // An em dash is not a size. Sorting by size descending must show the
+    // biggest catalog first — a blank that merely compares as "smallest"
+    // would flip to the TOP here and read as the largest catalog having
+    // no size at all.
+    mockFetch((url) =>
+      url === "/v1/catalogs" ? jsonResponse(catalogsFixture) : undefined,
+    );
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByText("analytics");
+
+    const names = () =>
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((r) => r.querySelector("td:first-child")?.textContent ?? "")
+        .filter((t) => t !== "");
+
+    const size = screen.getByRole("button", { name: /^size/ });
+    await user.click(size);
+    expect(names()).toEqual(["analytics", "scratch"]);
+    // And still last the other way round, where "smallest first" would
+    // otherwise be its natural home.
+    await user.click(size);
+    expect(names()).toEqual(["analytics", "scratch"]);
+  });
+
+  it("sorts row counts that are the same double, in the order the data says", async () => {
+    // "smaller" holds 2^53 and analytics 2^53+1 — ONE apart, and the
+    // same double. It is listed FIRST, so a comparator that ties them
+    // leaves it first (the sort is stable) and the wrong answer is the
+    // one that looks untouched.
+    mockFetch((url) =>
+      url === "/v1/catalogs"
+        ? jsonResponse([
+            {
+              name: "smaller",
+              data_path: "s3://hog-lake/smaller",
+              head_snapshot_id: "9",
+              schema_version: "1",
+              table_count: "1",
+              live_rows: "9007199254740992",
+              live_size_bytes: "1024",
+            },
+            ...catalogsFixture,
+          ])
+        : undefined,
+    );
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByText("smaller");
+
+    await user.click(screen.getByRole("button", { name: /^rows/ }));
+    const names = screen
+      .getAllByRole("row")
+      .slice(1)
+      .map((r) => r.querySelector("td:first-child")?.textContent ?? "")
+      .filter((t) => t !== "");
+    // analytics (2^53+1) above smaller (2^53) — a distinction no double
+    // can make — and unsampled scratch last regardless.
+    expect(names).toEqual(["analytics", "smaller", "scratch"]);
   });
 });

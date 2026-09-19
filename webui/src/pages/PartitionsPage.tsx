@@ -6,6 +6,9 @@ import type { PartitionStats } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
+import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
+import type { ColumnSort, SortState } from "../lib/sort";
+import { SortableTh } from "../components/SortableTh";
 
 const LIMIT = 50;
 
@@ -35,13 +38,6 @@ function DebtBar({ small, total }: { small: string; total: string }) {
   );
 }
 
-/** Non-negative decimal int64 strings: shorter is smaller, then lexicographic
- *  — never through Number (lossy above 2^53). */
-function cmpInt64(a: string, b: string): number {
-  if (a.length !== b.length) return a.length - b.length;
-  return a < b ? -1 : a > b ? 1 : 0;
-}
-
 type SortKey =
   | "table"
   | "partition"
@@ -53,61 +49,22 @@ type SortKey =
   | "dvs"
   | "score";
 
-const COMPARATORS: Record<SortKey, (a: PartitionStats, b: PartitionStats) => number> = {
-  table: (a, b) =>
-    `${a.namespace}.${a.table}`.localeCompare(`${b.namespace}.${b.table}`),
-  partition: (a, b) => formatPartition(a).localeCompare(formatPartition(b)),
-  files: (a, b) => cmpInt64(a.file_count, b.file_count),
-  small: (a, b) => cmpInt64(a.small_file_count, b.small_file_count),
+const COMPARATORS: Record<SortKey, ColumnSort<PartitionStats>> = {
+  table: textColumn((p) => `${p.namespace}.${p.table}`),
+  partition: textColumn(formatPartition),
+  files: int64Column((p) => p.file_count),
+  small: int64Column((p) => p.small_file_count),
   // The debt ratio drives pixels, so double precision is fine here too.
-  debt: (a, b) =>
-    Number(a.small_file_count) / Math.max(1, Number(a.file_count)) -
-    Number(b.small_file_count) / Math.max(1, Number(b.file_count)),
-  total: (a, b) => cmpInt64(a.total_bytes, b.total_bytes),
-  avg: (a, b) => cmpInt64(a.avg_file_bytes, b.avg_file_bytes),
-  dvs: (a, b) => cmpInt64(a.dv_count, b.dv_count),
-  score: (a, b) => cmpInt64(a.debt_score, b.debt_score),
+  debt: {
+    compare: (a, b) =>
+      Number(a.small_file_count) / Math.max(1, Number(a.file_count)) -
+      Number(b.small_file_count) / Math.max(1, Number(b.file_count)),
+  },
+  total: int64Column((p) => p.total_bytes),
+  avg: int64Column((p) => p.avg_file_bytes),
+  dvs: int64Column((p) => p.dv_count),
+  score: int64Column((p) => p.debt_score),
 };
-
-interface SortState {
-  key: SortKey;
-  desc: boolean;
-}
-
-function SortableTh({
-  label,
-  sortKey,
-  sort,
-  onSort,
-  numeric,
-  tooltip,
-}: {
-  label: string;
-  sortKey: SortKey;
-  sort: SortState | null;
-  onSort: (key: SortKey) => void;
-  numeric?: boolean;
-  tooltip?: string;
-}) {
-  const active = sort?.key === sortKey;
-  const arrow = !active ? "" : sort.desc ? " ↓" : " ↑";
-  return (
-    <th
-      className={numeric ? "num sortable" : "sortable"}
-      aria-sort={active ? (sort.desc ? "descending" : "ascending") : "none"}
-    >
-      <button
-        type="button"
-        className="th-sort"
-        onClick={() => onSort(sortKey)}
-        title={tooltip}
-      >
-        {tooltip ? <span className="th-hint">{label}</span> : label}
-        {arrow}
-      </button>
-    </th>
-  );
-}
 
 export function PartitionsPage() {
   const { catalog } = useParams();
@@ -117,7 +74,7 @@ export function PartitionsPage() {
   const [nsDraft, setNsDraft] = useState(namespace);
   const [tableDraft, setTableDraft] = useState(table);
   // null = the server's order (score desc, ties by small-file bytes desc).
-  const [sort, setSort] = useState<SortState | null>(null);
+  const [sort, setSort] = useState<SortState<SortKey> | null>(null);
 
   const query = useQuery({
     queryKey: ["partition-stats", catalog, namespace, table],
@@ -133,17 +90,8 @@ export function PartitionsPage() {
   });
   if (!catalog) return null;
 
-  const onSort = (key: SortKey) =>
-    setSort((prev) =>
-      prev?.key === key ? { key, desc: !prev.desc } : { key, desc: true },
-    );
-
-  const partitions = (() => {
-    const rows = query.data?.partitions ?? [];
-    if (!sort) return rows;
-    const cmp = COMPARATORS[sort.key];
-    return [...rows].sort((a, b) => (sort.desc ? cmp(b, a) : cmp(a, b)));
-  })();
+  const onSort = (key: SortKey) => setSort((prev) => nextSort(prev, key));
+  const partitions = applySort(query.data?.partitions ?? [], sort, COMPARATORS);
 
   const threshold = query.data?.small_file_threshold_bytes;
   const smallTooltip =

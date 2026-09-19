@@ -2,7 +2,10 @@ import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { filesFixture, notFoundError, scanFixture, tableFixture } from "./fixtures";
-import { bigIntFilesWireBody } from "./fixtures.adversarial";
+import {
+  bigIntFilesWireBody,
+  closeBigIntFilesWireBody,
+} from "./fixtures.adversarial";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
 const base = "/v1/catalogs/analytics/namespaces/events/tables/pageviews";
@@ -211,6 +214,105 @@ describe("TablePage", () => {
     const sizeCell = screen.getByTitle("4611686018427387905");
     expect(sizeCell).toBeInTheDocument();
     expect(sizeCell.textContent).not.toContain("NaN");
+  });
+
+  /** The id cell of every file row, in render order. */
+  function fileIdOrder(): string[] {
+    return screen
+      .getAllByRole("row")
+      .slice(1) // drop the header
+      .map((r) => r.querySelector("td:nth-child(2)")?.textContent ?? "")
+      .filter((t) => t !== "");
+  }
+
+  it("sorts the files table by any column, and back to the server's order", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+
+    // Opens in the server's order, which is the manifest's: by
+    // begin_snapshot, then row_id_start, then id.
+    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
+
+    // First click is DESCENDING: "which are the big ones" in one click.
+    const size = screen.getByRole("button", { name: /^size/ });
+    await user.click(size);
+    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
+    expect(size.closest("th")).toHaveAttribute("aria-sort", "descending");
+
+    await user.click(size);
+    expect(fileIdOrder()).toEqual(["103", "102", "101"]);
+    expect(size.closest("th")).toHaveAttribute("aria-sort", "ascending");
+
+    // record_count and row_id_start order numerically, not as text.
+    await user.click(screen.getByRole("button", { name: /^record_count/ }));
+    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
+
+    // A different column starts descending again, and only one column
+    // is ever marked as the sort.
+    const rowId = screen.getByRole("button", { name: /^row_id_start/ });
+    await user.click(rowId);
+    expect(fileIdOrder()).toEqual(["103", "102", "101"]);
+    expect(rowId.closest("th")).toHaveAttribute("aria-sort", "descending");
+    expect(
+      screen.getByRole("button", { name: /^record_count/ }).closest("th"),
+    ).toHaveAttribute("aria-sort", "none");
+  });
+
+  it("sorts file sizes that are the same double exactly", async () => {
+    // Three sizes one apart above 2^53. Through Number they all compare
+    // equal, so a lossy sort returns them untouched — and untouched is
+    // indistinguishable from a correct descending sort unless the input
+    // is ASCENDING, as it is here.
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(tableFixture);
+      if (path === `${base}/files`)
+        return new Response(closeBigIntFilesWireBody, {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      return undefined;
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+
+    expect(fileIdOrder()).toEqual(["1", "2", "3"]);
+    await user.click(screen.getByRole("button", { name: /^size/ }));
+    expect(fileIdOrder()).toEqual(["3", "2", "1"]);
+  });
+
+  it("sorts the scan table, keeping files without a deletion vector last", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: "scan" }));
+
+    const ids = () =>
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((r) => r.querySelector("td:first-child")?.textContent ?? "");
+    const before = ids();
+    expect(before.length).toBeGreaterThan(1);
+
+    // delete_count is absent on a file with no deletion vector. Absent
+    // is not "zero deletes", so those rows stay at the bottom whichever
+    // way the column points.
+    const deletes = screen.getByRole("button", { name: /^delete_count/ });
+    await user.click(deletes);
+    const desc = ids();
+    await user.click(deletes);
+    const asc = ids();
+    const noDv = before.filter(
+      (id) => !scanFixture.find((sf) => sf.data_file.data_file_id === id)?.delete_file,
+    );
+    for (const id of noDv) {
+      expect(desc.slice(-noDv.length)).toContain(id);
+      expect(asc.slice(-noDv.length)).toContain(id);
+    }
   });
 
   // 300-odd characters, the shape a $properties column's bounds actually

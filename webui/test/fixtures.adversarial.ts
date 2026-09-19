@@ -68,6 +68,33 @@ export const bigIntFilesWireBody =
   '"begin_snapshot":5}]';
 
 /**
+ * Three files in ASCENDING size order, two of which are the SAME double:
+ * 2^53 and 2^53+1 both round to 2^53, while 2^53+3 rounds to 2^53+4.
+ *
+ * The collision is the whole point and it has to be checked rather than
+ * assumed — consecutive integers up here do NOT generally collide
+ * (2^53+1, +2, +3 land on three distinct doubles), so a fixture picked
+ * by eye passes against a lossy comparator and proves nothing.
+ *
+ * Sorting descending must give f3, f2, f1. A comparator that goes
+ * through Number sees f1 and f2 as equal, and the stable sort then
+ * leaves them in the order they arrived: f3, f1, f2.
+ */
+export const closeBigIntFilesWireBody =
+  '[{"data_file_id":1,"path":"s3://ui-qe/adv/f1.parquet",' +
+  '"file_format":"parquet","record_count":10,' +
+  '"file_size_bytes":9007199254740992,"row_id_start":0,' +
+  '"stats_state":"provided","begin_snapshot":1},' +
+  '{"data_file_id":2,"path":"s3://ui-qe/adv/f2.parquet",' +
+  '"file_format":"parquet","record_count":10,' +
+  '"file_size_bytes":9007199254740993,"row_id_start":10,' +
+  '"stats_state":"provided","begin_snapshot":2},' +
+  '{"data_file_id":3,"path":"s3://ui-qe/adv/f3.parquet",' +
+  '"file_format":"parquet","record_count":10,' +
+  '"file_size_bytes":9007199254740995,"row_id_start":20,' +
+  '"stats_state":"provided","begin_snapshot":3}]';
+
+/**
  * Raw wire bodies for a catalog whose head snapshot id exceeds 2^53 —
  * head = 2^53+5 (odd: any Number round-trip would flip it to 2^53+4).
  * Same string-literal rule as above.

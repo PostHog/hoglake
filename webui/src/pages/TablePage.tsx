@@ -4,7 +4,15 @@ import { useQuery } from "@tanstack/react-query";
 import { getFileStats, getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
-import type { Column, DecodedBound, Int64, PartitionSpec, Table } from "../api/types";
+import type {
+  Column,
+  DataFile,
+  DecodedBound,
+  Int64,
+  PartitionSpec,
+  ScanFile,
+  Table,
+} from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
@@ -15,6 +23,17 @@ import {
   formatCount,
   formatPartitionField,
 } from "../lib/format";
+import {
+  applySort,
+  cmpInt64,
+  cmpText,
+  int64Column,
+  isDecimalInt,
+  nextSort,
+  textColumn,
+} from "../lib/sort";
+import type { ColumnSort, SortState } from "../lib/sort";
+import { SortableTh } from "../components/SortableTh";
 
 const TABS = ["schema", "files", "scan"] as const;
 type Tab = (typeof TABS)[number];
@@ -378,6 +397,70 @@ function PartitionCell({ decoded }: { decoded: PartitionDecode }) {
   );
 }
 
+/**
+ * A file's partition as one ordered sort key.
+ *
+ * Compared on the STORED ordinals, not on the rendered dates, because
+ * the ordinals are what carry the order: `month` is months since 1970-01
+ * and floors, so a pre-epoch partition is negative and sorts correctly
+ * as an integer while "1969-12" sorts after "2026-04" as text. Where a
+ * tuple was not decoded (a foreign spec, an arity mismatch) the rendered
+ * text is all there is, and it compares naturally — `team_id=9` before
+ * `team_id=10`.
+ */
+function cmpPartition(a: PartitionDecode, b: PartitionDecode): number {
+  if (a.kind === "decoded" && b.kind === "decoded") {
+    for (let i = 0; i < Math.min(a.values.length, b.values.length); i++) {
+      const x = a.values[i];
+      const y = b.values[i];
+      const bothInts = isDecimalInt(x.raw) && isDecimalInt(y.raw);
+      const c = bothInts ? cmpInt64(x.raw, y.raw) : cmpText(x.display, y.display);
+      if (c !== 0) return c;
+    }
+    return a.values.length - b.values.length;
+  }
+  return cmpText(partitionSortText(a), partitionSortText(b));
+}
+
+function partitionSortText(d: PartitionDecode): string {
+  switch (d.kind) {
+    case "unpartitioned":
+      return "";
+    case "decoded":
+      return d.values.map((v) => `${v.field}=${v.display}`).join(" / ");
+    default:
+      return d.raw;
+  }
+}
+
+type FileSortKey =
+  | "id"
+  | "partition"
+  | "path"
+  | "records"
+  | "size"
+  | "rowId"
+  | "stats"
+  | "snapshot";
+
+/** A row plus its decoded partition, so the decode is done once per file. */
+interface FileRow {
+  file: DataFile;
+  partition: PartitionDecode;
+}
+
+const FILE_COMPARATORS: Record<FileSortKey, ColumnSort<FileRow>> = {
+  id: int64Column((r) => r.file.data_file_id),
+  partition: { compare: (a, b) => cmpPartition(a.partition, b.partition) },
+  path: textColumn((r) => r.file.path),
+  records: int64Column((r) => r.file.record_count),
+  size: int64Column((r) => r.file.file_size_bytes),
+  rowId: int64Column((r) => r.file.row_id_start),
+  // Grouping, not ranking: the point is to bring the failures together.
+  stats: textColumn((r) => r.file.stats_state),
+  snapshot: int64Column((r) => r.file.begin_snapshot),
+};
+
 function FilesTab({
   catalog,
   namespace,
@@ -398,6 +481,10 @@ function FilesTab({
     queryFn: () => listFiles(catalog, namespace, table, snapshot),
   });
   const [expanded, setExpanded] = useState<Int64 | null>(null);
+  // null = the server's order, which is the manifest's: begin_snapshot,
+  // then row_id_start, then id.
+  const [sort, setSort] = useState<SortState<FileSortKey> | null>(null);
+  const onSort = (key: FileSortKey) => setSort((prev) => nextSort(prev, key));
   if (isError) return <ErrorBox error={error} />;
   // The column appears only for a partitioned table: on an unpartitioned
   // one it would be a column of dashes.
@@ -407,33 +494,69 @@ function FilesTab({
   // one. Drives the skeleton and the empty-state colSpan, so a wrong
   // count shows as a short row rather than an error.
   const cols = partitioned ? 9 : 8;
+  // Sorting is over the WHOLE table: GET /files returns every live file
+  // at the snapshot, so "largest file" here is the largest file, not the
+  // largest of a page.
+  const rows = applySort(
+    (data ?? []).map((file) => ({
+      file,
+      partition: decodePartition(file, spec, columns),
+    })),
+    sort,
+    FILE_COMPARATORS,
+  );
   return (
     <table className="data-table">
       <thead>
         <tr>
           <th />
-          <th className="num">id</th>
-          {partitioned && <th>partition</th>}
-          <th>path</th>
-          <th className="num">record_count</th>
-          <th className="num">size</th>
-          <th className="num">row_id_start</th>
-          <th>stats</th>
-          <th className="num">begin_snapshot</th>
+          <SortableTh label="id" sortKey="id" sort={sort} onSort={onSort} numeric />
+          {partitioned && (
+            <SortableTh
+              label="partition"
+              sortKey="partition"
+              sort={sort}
+              onSort={onSort}
+            />
+          )}
+          <SortableTh label="path" sortKey="path" sort={sort} onSort={onSort} />
+          <SortableTh
+            label="record_count"
+            sortKey="records"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
+          <SortableTh
+            label="row_id_start"
+            sortKey="rowId"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="stats" sortKey="stats" sort={sort} onSort={onSort} />
+          <SortableTh
+            label="begin_snapshot"
+            sortKey="snapshot"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
         </tr>
       </thead>
       {isPending ? (
         <SkeletonRows rows={5} cols={cols} />
       ) : (
         <tbody>
-          {data.length === 0 && (
+          {rows.length === 0 && (
             <tr>
               <td colSpan={cols} className="empty">
                 No data files at this snapshot.
               </td>
             </tr>
           )}
-          {data.map((f) => (
+          {rows.map(({ file: f, partition }) => (
             <Fragment key={f.data_file_id}>
               <tr>
                 <td>
@@ -452,9 +575,7 @@ function FilesTab({
                   </button>
                 </td>
                 <td className="num mono">{f.data_file_id}</td>
-                {partitioned && (
-                  <PartitionCell decoded={decodePartition(f, spec, columns)} />
-                )}
+                {partitioned && <PartitionCell decoded={partition} />}
                 <PathCell path={f.path} />
                 <td className="num mono">{formatCount(f.record_count)}</td>
                 <td className="num mono" title={`${f.file_size_bytes}`}>
@@ -487,6 +608,25 @@ function FilesTab({
   );
 }
 
+type ScanSortKey = "id" | "path" | "records" | "stats" | "dv" | "deletes";
+
+const SCAN_COMPARATORS: Record<ScanSortKey, ColumnSort<ScanFile>> = {
+  id: int64Column((sf) => sf.data_file.data_file_id),
+  path: textColumn((sf) => sf.data_file.path),
+  records: int64Column((sf) => sf.data_file.record_count),
+  stats: textColumn((sf) => sf.data_file.stats_state),
+  // Files WITH a deletion vector first on the descending click, which is
+  // the question this column is here to answer. Not int64Column: "no
+  // deletion vector" is the answer here, not a missing value.
+  dv: {
+    compare: (a, b) =>
+      Number(Boolean(a.delete_file)) - Number(Boolean(b.delete_file)),
+  },
+  // A file with no deletion vector has no delete_count, so it sorts last
+  // whichever way this column points.
+  deletes: int64Column((sf) => sf.delete_file?.delete_count),
+};
+
 function ScanTab({
   catalog,
   namespace,
@@ -502,31 +642,58 @@ function ScanTab({
     queryKey: ["scan", catalog, namespace, table, snapshot ?? "head"],
     queryFn: () => planScan(catalog, namespace, table, snapshot),
   });
+  // null = the server's scan-plan order.
+  const [sort, setSort] = useState<SortState<ScanSortKey> | null>(null);
+  const onSort = (key: ScanSortKey) => setSort((prev) => nextSort(prev, key));
   if (isError) return <ErrorBox error={error} />;
+  const rows = applySort(data ?? [], sort, SCAN_COMPARATORS);
   return (
     <table className="data-table">
       <thead>
         <tr>
-          <th className="num">data_file</th>
-          <th>path</th>
-          <th className="num">record_count</th>
-          <th>stats</th>
-          <th>deletion vector</th>
-          <th className="num">delete_count</th>
+          <SortableTh
+            label="data_file"
+            sortKey="id"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="path" sortKey="path" sort={sort} onSort={onSort} />
+          <SortableTh
+            label="record_count"
+            sortKey="records"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="stats" sortKey="stats" sort={sort} onSort={onSort} />
+          <SortableTh
+            label="deletion vector"
+            sortKey="dv"
+            sort={sort}
+            onSort={onSort}
+          />
+          <SortableTh
+            label="delete_count"
+            sortKey="deletes"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
         </tr>
       </thead>
       {isPending ? (
         <SkeletonRows rows={5} cols={6} />
       ) : (
         <tbody>
-          {data.length === 0 && (
+          {rows.length === 0 && (
             <tr>
               <td colSpan={6} className="empty">
                 Empty scan plan at this snapshot.
               </td>
             </tr>
           )}
-          {data.map((sf) => (
+          {rows.map((sf) => (
             <tr
               key={sf.data_file.data_file_id}
               className={sf.delete_file ? "has-deletes" : undefined}

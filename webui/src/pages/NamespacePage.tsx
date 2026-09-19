@@ -2,10 +2,20 @@ import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createTable, listTables } from "../api/client";
-import { SCALAR_COLUMN_TYPES, type ColumnType } from "../api/types";
+import { SCALAR_COLUMN_TYPES, type ColumnType, type TableSummary } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { columnNameError, identifierError } from "../lib/names";
+import { applySort, nextSort, textColumn } from "../lib/sort";
+import type { ColumnSort, SortState } from "../lib/sort";
+import { SortableTh } from "../components/SortableTh";
+
+type SortKey = "name" | "uuid";
+
+const COMPARATORS: Record<SortKey, ColumnSort<TableSummary>> = {
+  name: textColumn((t) => t.name),
+  uuid: textColumn((t) => t.table_uuid),
+};
 
 interface ColumnRow {
   name: string;
@@ -166,6 +176,10 @@ export function NamespacePage() {
     queryFn: () => listTables(catalog!, namespace!),
     enabled,
   });
+  // null = the server's order (name).
+  const [sort, setSort] = useState<SortState<SortKey> | null>(null);
+  const onSort = (key: SortKey) => setSort((prev) => nextSort(prev, key));
+  const rows = applySort(data ?? [], sort, COMPARATORS);
   if (!catalog || !namespace) return null;
 
   return (
@@ -179,22 +193,27 @@ export function NamespacePage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>name</th>
-              <th>table_uuid</th>
+              <SortableTh label="name" sortKey="name" sort={sort} onSort={onSort} />
+              <SortableTh
+                label="table_uuid"
+                sortKey="uuid"
+                sort={sort}
+                onSort={onSort}
+              />
             </tr>
           </thead>
           {isPending ? (
             <SkeletonRows rows={4} cols={2} />
           ) : (
             <tbody>
-              {data.length === 0 && (
+              {rows.length === 0 && (
                 <tr>
                   <td colSpan={2} className="empty">
                     No tables in this namespace.
                   </td>
                 </tr>
               )}
-              {data.map((t) => (
+              {rows.map((t) => (
                 <tr key={t.table_uuid}>
                   <td>
                     <Link

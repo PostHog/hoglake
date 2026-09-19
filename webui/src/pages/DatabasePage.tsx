@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   getDatabaseHealth,
@@ -10,6 +11,9 @@ import {
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock } from "../components/Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
+import { applySort, cmpText, int64Column, nextSort, textColumn } from "../lib/sort";
+import type { ColumnSort, SortState } from "../lib/sort";
+import { SortableTh } from "../components/SortableTh";
 
 // Health of the Postgres the catalog lives in. The findings lead, because
 // they are the part that needs no Postgres expertise to act on; the raw
@@ -157,24 +161,86 @@ function Slots({ slots }: { slots: ReplicationSlot[] }) {
   );
 }
 
+type TableSortKey =
+  | "name"
+  | "live"
+  | "dead"
+  | "ratio"
+  | "heap"
+  | "indexes"
+  | "scans"
+  | "vacuum";
+
+const TABLE_COMPARATORS: Record<TableSortKey, ColumnSort<DatabaseTable>> = {
+  name: textColumn((t) => t.name),
+  live: int64Column((t) => t.live_tuples),
+  dead: int64Column((t) => t.dead_tuples),
+  // A table postgres has no statistics for yet has no ratio at all;
+  // absent sorts last rather than reading as 0% bloat.
+  ratio: {
+    compare: (a, b) => (a.dead_ratio ?? 0) - (b.dead_ratio ?? 0),
+    absent: (t) => t.dead_ratio === undefined,
+  },
+  heap: int64Column((t) => t.table_bytes),
+  indexes: int64Column((t) => t.index_bytes),
+  // Sequential scans are the number worth ranking here: the cell shows
+  // both, and a table being seq-scanned is what an operator looks for.
+  scans: int64Column((t) => t.seq_scans),
+  // A table never autovacuumed is the LEAST recently vacuumed, so it
+  // sorts as the oldest time (the empty string collates first) and the
+  // ascending click surfaces it. Not marked absent: "never" is an
+  // answer about this table, not a gap in what we know about it.
+  vacuum: {
+    compare: (a, b) =>
+      cmpText(a.last_autovacuum ?? "", b.last_autovacuum ?? ""),
+  },
+};
+
 function Tables({ tables }: { tables: DatabaseTable[] }) {
+  const [sort, setSort] = useState<SortState<TableSortKey> | null>(null);
+  const onSort = (key: TableSortKey) => setSort((prev) => nextSort(prev, key));
+  const rows = applySort(tables, sort, TABLE_COMPARATORS);
   if (tables.length === 0) return <p className="empty">No tables.</p>;
   return (
     <table className="data-table">
       <thead>
         <tr>
-          <th>table</th>
-          <th className="num">live</th>
-          <th className="num">dead</th>
-          <th className="num">dead %</th>
-          <th className="num">heap</th>
-          <th className="num">indexes</th>
-          <th className="num">seq / idx scans</th>
-          <th>last autovacuum</th>
+          <SortableTh label="table" sortKey="name" sort={sort} onSort={onSort} />
+          <SortableTh label="live" sortKey="live" sort={sort} onSort={onSort} numeric />
+          <SortableTh label="dead" sortKey="dead" sort={sort} onSort={onSort} numeric />
+          <SortableTh
+            label="dead %"
+            sortKey="ratio"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="heap" sortKey="heap" sort={sort} onSort={onSort} numeric />
+          <SortableTh
+            label="indexes"
+            sortKey="indexes"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh
+            label="seq / idx scans"
+            sortKey="scans"
+            sort={sort}
+            onSort={onSort}
+            numeric
+            tooltip="Sorts on sequential scans — the number worth ranking."
+          />
+          <SortableTh
+            label="last autovacuum"
+            sortKey="vacuum"
+            sort={sort}
+            onSort={onSort}
+          />
         </tr>
       </thead>
       <tbody>
-        {tables.map((t) => (
+        {rows.map((t) => (
           <tr key={t.name}>
             <td className="mono">{t.name}</td>
             <td className="num">{formatCount(t.live_tuples)}</td>
@@ -199,21 +265,43 @@ function Tables({ tables }: { tables: DatabaseTable[] }) {
   );
 }
 
+type IndexSortKey = "name" | "table" | "size" | "scans" | "role";
+
+const INDEX_COMPARATORS: Record<IndexSortKey, ColumnSort<DatabaseIndex>> = {
+  name: textColumn((i) => i.name),
+  table: textColumn((i) => i.table),
+  size: int64Column((i) => i.size_bytes),
+  scans: int64Column((i) => i.scans),
+  role: {
+    compare: (a, b) =>
+      Number(Boolean(a.constraint_backing)) - Number(Boolean(b.constraint_backing)),
+  },
+};
+
 function Indexes({ indexes }: { indexes: DatabaseIndex[] }) {
+  const [sort, setSort] = useState<SortState<IndexSortKey> | null>(null);
+  const onSort = (key: IndexSortKey) => setSort((prev) => nextSort(prev, key));
+  const rows = applySort(indexes, sort, INDEX_COMPARATORS);
   if (indexes.length === 0) return <p className="empty">No indexes.</p>;
   return (
     <table className="data-table">
       <thead>
         <tr>
-          <th>index</th>
-          <th>table</th>
-          <th className="num">size</th>
-          <th className="num">scans</th>
-          <th>role</th>
+          <SortableTh label="index" sortKey="name" sort={sort} onSort={onSort} />
+          <SortableTh label="table" sortKey="table" sort={sort} onSort={onSort} />
+          <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
+          <SortableTh
+            label="scans"
+            sortKey="scans"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh label="role" sortKey="role" sort={sort} onSort={onSort} />
         </tr>
       </thead>
       <tbody>
-        {indexes.map((i) => (
+        {rows.map((i) => (
           <tr key={`${i.table}.${i.name}`}>
             <td className="mono">{i.name}</td>
             <td className="mono">{i.table}</td>
