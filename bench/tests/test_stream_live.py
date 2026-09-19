@@ -154,7 +154,6 @@ def test_the_skew_lands_inside_the_files_not_across_them(bench: Bench) -> None:
         rate=0,
         flush_mb=0.05,
         teams=50,
-        whale_share=0.6,
         progress_seconds=999,
     )
     fs = bench.client._filesystem()

@@ -24,39 +24,59 @@ from hoglake_bench.seed import tables as T
 from hoglake_bench.seed.vocab import build_vocabulary
 from hoglake_bench.stream import events, pacing, streamer
 from hoglake_bench.stream.distribution import (
-    DEFAULT_WHALE_SHARE,
+    LADDER,
     TeamDistribution,
+    ladder_weights,
 )
 
 # -- distribution ------------------------------------------------------------
 
 
-def test_whale_share_is_honoured_within_tolerance() -> None:
-    dist = TeamDistribution.build(teams=200, whale_share=0.45, zipf_s=1.1)
+def test_sampling_matches_the_declared_weights() -> None:
+    dist = TeamDistribution.build(teams=200)
     rng = np.random.default_rng(7)
-    idx = dist.sample_indices(rng, 200_000)
-    whale = float((idx == 0).mean())
-    assert whale == pytest.approx(0.45, abs=0.01)
+    idx = dist.sample_indices(rng, 400_000)
+    observed = float((idx == 0).mean())
+    assert observed == pytest.approx(dist.weights[0], abs=0.01)
 
 
-def test_weights_sum_to_one_and_tail_is_monotone() -> None:
-    dist = TeamDistribution.build(teams=50, whale_share=0.4, zipf_s=1.2)
+def test_weights_sum_to_one_and_fall_monotonically_by_rank() -> None:
+    dist = TeamDistribution.build(teams=500)
     assert sum(dist.weights) == pytest.approx(1.0)
-    assert dist.weights[0] == pytest.approx(0.4)
-    tail = dist.weights[1:]
-    assert all(a >= b for a, b in itertools.pairwise(tail))
-    # the whale outweighs the biggest ordinary team
-    assert dist.weights[0] > dist.weights[1] * 2
+    assert all(a >= b for a, b in itertools.pairwise(dist.weights))
 
 
-def test_the_default_shape_is_dominated_by_one_team() -> None:
+def test_the_ladder_anchors_are_hit() -> None:
+    """Each anchor's volume, relative to the median tenant, is what the
+    ladder declares — that is the whole contract of the model."""
+    teams = 150_000
+    w = ladder_weights(teams)
+    median = w[teams // 2]
+    for fraction, volume in LADDER:
+        rank = max(1, int(fraction * teams))
+        assert w[rank - 1] / median == pytest.approx(volume, rel=0.01)
+
+
+def test_the_default_shape_is_heavy_headed_with_a_long_idle_tail() -> None:
     dist = TeamDistribution.build()
-    assert dist.whale_share == DEFAULT_WHALE_SHARE
-    # the whale carries several times the runner-up and hundreds of times
-    # an ordinary tail team
-    assert dist.weights[0] > dist.weights[1] * 3
-    assert dist.weights[0] > dist.weights[-1] * 100
-    assert sum(dist.weights[1:]) == pytest.approx(1.0 - DEFAULT_WHALE_SHARE)
+    w = np.asarray(dist.weights)
+    n = len(w)
+    # A dominant tenant, but single-digit percent — not a majority.
+    assert 0.03 < w[0] < 0.10
+    # Most tenants are near-idle: the mean is orders above the median.
+    assert (1.0 / n) / w[n // 2] > 50
+    # And the head really is a head.
+    assert float(np.cumsum(w)[int(0.01 * n) - 1]) > 0.5
+
+
+def test_team_id_is_uncorrelated_with_volume() -> None:
+    """Ids come from a shuffle, so rank order is not id order. Dense
+    ascending ids would make sorting by team_id a sort by volume."""
+    dist = TeamDistribution.build(teams=5_000)
+    ids = np.asarray(dist.team_ids, dtype=np.int64)
+    assert sorted(ids.tolist()) == [10_000 + i for i in range(5_000)]
+    ranks = np.arange(len(ids), dtype=np.float64)
+    assert abs(float(np.corrcoef(ids, ranks)[0, 1])) < 0.1
 
 
 def test_sampling_is_deterministic_under_a_seed() -> None:
@@ -69,7 +89,7 @@ def test_sampling_is_deterministic_under_a_seed() -> None:
 
 def test_a_whale_is_a_whale_across_windows() -> None:
     """Per-team rates are stable: the same team dominates every window."""
-    dist = TeamDistribution.build(teams=120, whale_share=0.5)
+    dist = TeamDistribution.build(teams=120)
     rng = np.random.default_rng(99)
     for _ in range(6):
         idx = dist.sample_indices(rng, 40_000)
@@ -88,9 +108,10 @@ def test_single_team_distribution_is_degenerate_but_legal() -> None:
     "kwargs",
     [
         {"teams": 0},
-        {"whale_share": 1.0},
-        {"whale_share": -0.1},
-        {"zipf_s": 0.0},
+        {"ladder": ((0.0, 1.0),)},
+        {"ladder": ((0.5, 2.0), (0.1, 1.0))},
+        {"ladder": ((0.0, 1.0), (1.0, 0.0))},
+        {"ladder": ((0.0, 1.0), (1.5, 0.5))},
     ],
 )
 def test_bad_distribution_parameters_are_refused(kwargs: dict[str, object]) -> None:
@@ -138,7 +159,7 @@ def test_batches_are_sorted_to_match_the_declared_sort_order() -> None:
 
 
 def test_batch_carries_the_skew_and_the_requested_time_window() -> None:
-    dist = TeamDistribution.build(teams=30, whale_share=0.6)
+    dist = TeamDistribution.build(teams=30)
     lo, hi = 1_700_000_000_000_000, 1_700_003_600_000_000
     batch, idx = events.make_batch(
         np.random.default_rng(5),
@@ -149,7 +170,10 @@ def test_batch_carries_the_skew_and_the_requested_time_window() -> None:
         hi_us=hi,
     )
     assert len(idx) == batch.num_rows
-    assert float((idx == 0).mean()) == pytest.approx(0.6, abs=0.03)
+    # The batch carries the distribution's own skew, not a fixed number:
+    # the ladder decides the busiest tenant's share, and make_batch's job
+    # is only to sample from it faithfully.
+    assert float((idx == 0).mean()) == pytest.approx(dist.weights[0], abs=0.03)
     micros = [int(v.value) for v in batch.column("ts")]
     assert min(micros) >= lo
     assert max(micros) < hi
