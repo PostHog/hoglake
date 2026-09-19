@@ -3,7 +3,14 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isLoopDisabled, isQuietRun, RunOutcomeBadge, RunsTable, RunSummary } from "../src/components/maintenance";
+import {
+  isQuietRun,
+  loopCadence,
+  noRunningLoop,
+  RunOutcomeBadge,
+  RunsTable,
+  RunSummary,
+} from "../src/components/maintenance";
 import type { MaintenanceRun } from "../src/api/types";
 import { maintenanceRunsFixture } from "./fixtures";
 import { jsonResponse, mockFetch } from "./helpers";
@@ -64,10 +71,65 @@ describe("maintenance outcome and history", () => {
     expect(screen.getByText(/invalid-data 3/)).toBeInTheDocument();
   });
 
-  it.each(["0", "-1", "-9223372036854775808"])("treats interval %s as disabled", (interval) => {
-    expect(isLoopDisabled(interval)).toBe(true);
-    expect(isLoopDisabled("1")).toBe(false);
-    expect(isLoopDisabled(undefined)).toBe(false);
+  describe("loopCadence", () => {
+    /**
+     * The header's whole job is answering "is this task running?" from
+     * the ledger. Each of these is a DIFFERENT state that the old
+     * config-derived header collapsed into "disabled" or a cadence it
+     * could not know (#114).
+     */
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      vi.setSystemTime(new Date("2026-09-11T10:00:00Z"));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("reports the observed cadence, rounded", () => {
+      // A loop sleeps AFTER its body, so a 60s loop with an 8.8s sweep
+      // is measured at 68.8s. Rounding it keeps the header readable
+      // without claiming a precision the measurement does not have.
+      expect(loopCadence({ observed_interval_ms: "68800" })).toBe("every ~69s");
+      expect(loopCadence({ observed_interval_ms: "3630000" })).toBe("every ~61m");
+      expect(loopCadence({ observed_interval_ms: "450" })).toBe("every ~450ms");
+    });
+
+    it("falls back to the last run when no cadence can be derived", () => {
+      expect(loopCadence({ last_run_at: "2026-09-11T09:58:00Z" })).toBe(
+        "last loop run 2m ago",
+      );
+    });
+
+    it("reads an empty ledger the way the response says to", () => {
+      // For a task that records every sweep, no rows means nothing is
+      // running it.
+      expect(loopCadence({ records_every_sweep: true })).toBe("no loop runs");
+      // For the hydrator it means no work arrived here. Its loop may be
+      // perfectly healthy, so saying "no loop runs" would be the bug
+      // this change exists to remove, moved to a new place.
+      expect(loopCadence({ records_every_sweep: false })).toBe("nothing to do here");
+    });
+
+    it("distinguishes a task with no loop from a server that did not answer", () => {
+      // null = verify, which has no loop at all. undefined = an older
+      // server. Rendering the second as the first would put a claim on
+      // screen that the response never made.
+      expect(loopCadence(null)).toBe("manual only");
+      expect(loopCadence(undefined)).toBeNull();
+    });
+  });
+
+  describe("noRunningLoop", () => {
+    it("is true only on positive evidence that nothing is running", () => {
+      expect(noRunningLoop({})).toBe(true);
+      expect(noRunningLoop({ last_run_at: "2026-09-11T08:00:00Z" })).toBe(true);
+      expect(noRunningLoop({ observed_interval_ms: "60000" })).toBe(false);
+      // Neither an absent observation nor a task that has no loop is
+      // evidence of an unattended queue, so neither may raise a warning.
+      expect(noRunningLoop(undefined)).toBe(false);
+      expect(noRunningLoop(null)).toBe(false);
+    });
   });
 
   function table() {
@@ -254,50 +316,79 @@ describe("isQuietRun", () => {
   });
 });
 
-describe("RunsTable filters", () => {
-  // A realistic screenful: two sweeps that did work, three that did not,
-  // one outright failure, and one all-zero compaction that skipped a group.
-  const busyCompaction = { ...compaction, run_id: "301" } as MaintenanceRun;
-  const busyCleanup = { ...cleanup, run_id: "302" } as MaintenanceRun;
-  const skippedCompaction = withField(
-    { ...quiet.compaction, run_id: "303" } as MaintenanceRun,
-    "unconvertible_schema",
-    "2",
-  );
-  const feed: MaintenanceRun[] = [
-    busyCompaction,
-    quiet.compaction,
-    skippedCompaction,
-    busyCleanup,
-    quiet.cleanup,
-    quiet.expiry,
-    failedRun,
-  ];
+// A realistic screenful: two sweeps that did work, three that did not,
+// one outright failure, and one all-zero compaction that skipped a group.
+const busyCompaction = { ...compaction, run_id: "301" } as MaintenanceRun;
+const busyCleanup = { ...cleanup, run_id: "302" } as MaintenanceRun;
+const skippedCompaction = withField(
+  { ...quiet.compaction, run_id: "303" } as MaintenanceRun,
+  "unconvertible_schema",
+  "2",
+);
+const feed: MaintenanceRun[] = [
+  busyCompaction,
+  quiet.compaction,
+  skippedCompaction,
+  busyCleanup,
+  quiet.cleanup,
+  quiet.expiry,
+  failedRun,
+];
 
+/**
+ * A mock /maintenance/runs that pages the way the server does: newest first
+ * over the ledger the caller supplies (read fresh on every request, so a test
+ * can let new runs arrive between polls), honouring `?task`, the exclusive
+ * `?before` run_id cursor and `?limit`.
+ *
+ * Worth the twenty lines: a mock that answers every request with the same
+ * rows cannot tell a table that pages from one that filters a single fetched
+ * window, which is exactly the bug these tests are about. `seen` collects the
+ * request URLs so a test can assert WHERE the filtering happened.
+ */
+function mockLedger(ledger: () => MaintenanceRun[], seen?: string[]) {
+  return mockFetch((url) => {
+    if (!url.includes("/maintenance/runs")) return undefined;
+    seen?.push(url);
+    const q = new URL(url, "http://hoglake.test").searchParams;
+    const task = q.get("task");
+    const limit = Number(q.get("limit") ?? 50);
+    const before = q.get("before");
+    let rows = ledger();
+    if (task) rows = rows.filter((r) => r.task === task);
+    if (before) rows = rows.filter((r) => Number(r.run_id) < Number(before));
+    return jsonResponse({
+      runs: rows.slice(0, limit),
+      has_more: rows.length > limit,
+    });
+  });
+}
+
+function bodyRows(): HTMLElement[] {
+  const table = screen.getAllByRole("table")[0];
+  return screen.getAllByRole("row").filter((r) => r.closest("tbody") && table.contains(r));
+}
+
+const hideToggle = () =>
+  screen.getByRole("checkbox", { name: /hide runs that did nothing/i });
+const taskSelect = () => screen.getByRole("combobox", { name: /task/i });
+
+function renderTable() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter><RunsTable catalog="analytics" /></MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { client, view };
+}
+
+describe("RunsTable filters", () => {
   beforeEach(() => window.localStorage.clear());
   afterEach(() => vi.useRealTimers());
 
-  function renderTable(runs: MaintenanceRun[] = feed) {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const view = render(
-      <QueryClientProvider client={client}>
-        <MemoryRouter><RunsTable catalog="analytics" /></MemoryRouter>
-      </QueryClientProvider>,
-    );
-    return { client, view, runs };
-  }
-
-  function bodyRows(): HTMLElement[] {
-    const table = screen.getAllByRole("table")[0];
-    return screen.getAllByRole("row").filter((r) => r.closest("tbody") && table.contains(r));
-  }
-
-  const hideToggle = () =>
-    screen.getByRole("checkbox", { name: /hide runs that did nothing/i });
-  const taskSelect = () => screen.getByRole("combobox", { name: /task/i });
-
   it("shows every run by default — the toggle is off until asked", async () => {
-    mockFetch(() => jsonResponse({ runs: feed, has_more: false }));
+    mockLedger(() => feed);
     const { client } = renderTable();
     try {
       await screen.findByText("301");
@@ -308,7 +399,7 @@ describe("RunsTable filters", () => {
   });
 
   it("hides only runs that succeeded AND changed nothing, and says how many", async () => {
-    mockFetch(() => jsonResponse({ runs: feed, has_more: false }));
+    mockLedger(() => feed);
     const { client } = renderTable();
     try {
       await screen.findByText("301");
@@ -323,12 +414,16 @@ describe("RunsTable filters", () => {
   });
 
   it("narrows to one task, and composes with the quiet filter", async () => {
-    mockFetch(() => jsonResponse({ runs: feed, has_more: false }));
+    const seen: string[] = [];
+    mockLedger(() => feed, seen);
     const { client } = renderTable();
     try {
       await screen.findByText("301");
       const user = userEvent.setup();
       await user.selectOptions(taskSelect(), "compaction");
+      // The narrowing is the SERVER's: the dropdown re-queries.
+      await screen.findByText("303");
+      expect(seen.some((u) => u.includes("task=compaction"))).toBe(true);
       expect(bodyRows()).toHaveLength(3); // 301, 204, 303
       expect(screen.queryByText("302")).not.toBeInTheDocument();
 
@@ -339,7 +434,7 @@ describe("RunsTable filters", () => {
   });
 
   it("says the list is filtered, not empty, when nothing survives", async () => {
-    mockFetch(() => jsonResponse({ runs: [quiet.verify], has_more: false }));
+    mockLedger(() => [quiet.verify]);
     const { client } = renderTable();
     try {
       await screen.findByText("205");
@@ -354,12 +449,13 @@ describe("RunsTable filters", () => {
     // fireEvent, not userEvent: userEvent's own waits never resolve under
     // fake timers, and the poll is what this test needs fake timers for.
     let runs = feed;
-    mockFetch(() => jsonResponse({ runs, has_more: false }));
+    mockLedger(() => runs);
     const { client } = renderTable();
     try {
       await act(async () => { await vi.advanceTimersByTimeAsync(50); });
       fireEvent.change(taskSelect(), { target: { value: "compaction" } });
       fireEvent.click(hideToggle());
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
       expect(bodyRows()).toHaveLength(2);
 
       // A new quiet compaction sweep lands on the next poll.
@@ -374,7 +470,7 @@ describe("RunsTable filters", () => {
   });
 
   it("remembers both choices for the next visit", async () => {
-    mockFetch(() => jsonResponse({ runs: feed, has_more: false }));
+    mockLedger(() => feed);
     const first = renderTable();
     try {
       await screen.findByText("301");
@@ -391,5 +487,155 @@ describe("RunsTable filters", () => {
       expect(taskSelect()).toHaveValue("cleanup");
       expect(bodyRows()).toHaveLength(1);
     } finally { second.client.clear(); }
+  });
+});
+
+// ---- the filters against the WHOLE ledger, not one fetched page ----------
+//
+// #120's filters ran client-side over the newest page the server had already
+// returned, so a run that did something dropped out of view the moment enough
+// quiet sweeps landed on top of it, and no amount of toggling brought it back:
+// the client had never asked the server for it. These tests page a ledger
+// deeper than one window on purpose.
+
+/** A quiet compaction sweep with the given run id. */
+function quietAt(id: number): MaintenanceRun {
+  return { ...quiet.compaction, run_id: String(id) } as MaintenanceRun;
+}
+
+/** Newest-first ids `hi` down to `lo`, all quiet. */
+function quietRange(hi: number, lo: number): MaintenanceRun[] {
+  const out: MaintenanceRun[] = [];
+  for (let id = hi; id >= lo; id--) out.push(quietAt(id));
+  return out;
+}
+
+describe("RunsTable paging under the filters", () => {
+  beforeEach(() => window.localStorage.clear());
+  afterEach(() => vi.useRealTimers());
+
+  it("reaches a run that did something from beyond the first page", async () => {
+    // One compaction that moved files, buried under 30 quiet sweeps — past
+    // the 20-run first page, so a client-side filter over that page shows an
+    // empty table and cannot do anything about it.
+    const interesting = { ...compaction, run_id: "470" } as MaintenanceRun;
+    const ledger = [...quietRange(500, 471), interesting, ...quietRange(469, 440)];
+    mockLedger(() => ledger);
+    const { client } = renderTable();
+    try {
+      await screen.findByText("500");
+      await userEvent.setup().click(hideToggle());
+      expect(await screen.findByText("470")).toBeInTheDocument();
+      expect(screen.queryByText("No runs match these filters.")).not.toBeInTheDocument();
+    } finally { client.clear(); }
+  });
+
+  it("does not let newly arrived quiet sweeps evict it again", async () => {
+    vi.useFakeTimers();
+    const interesting = { ...compaction, run_id: "470" } as MaintenanceRun;
+    let ledger = [...quietRange(500, 471), interesting, ...quietRange(469, 440)];
+    mockLedger(() => ledger);
+    const { client } = renderTable();
+    try {
+      await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+      fireEvent.click(hideToggle());
+      await act(async () => { await vi.advanceTimersByTimeAsync(200); });
+      expect(screen.getByText("470")).toBeInTheDocument();
+
+      // Two more windows' worth of quiet sweeps land on top of it.
+      ledger = [...quietRange(540, 501), ...ledger];
+      await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+
+      expect(screen.getByText("470")).toBeInTheDocument();
+    } finally { client.clear(); }
+  });
+
+  it("asks the server for the task rather than filtering a fetched page", async () => {
+    // Only the newest 20 rows are cleanup; the compaction row the dropdown
+    // must find is older than any of them, so a client-side task filter over
+    // the first page finds nothing.
+    const cleanups = Array.from({ length: 25 }, (_, i) =>
+      ({ ...cleanup, run_id: String(600 - i) }) as MaintenanceRun,
+    );
+    const ledger = [...cleanups, { ...compaction, run_id: "570" } as MaintenanceRun];
+    const seen: string[] = [];
+    mockLedger(() => ledger, seen);
+    const { client } = renderTable();
+    try {
+      await screen.findByText("600");
+      await userEvent.setup().selectOptions(taskSelect(), "compaction");
+      expect(await screen.findByText("570")).toBeInTheDocument();
+      expect(bodyRows()).toHaveLength(1);
+      expect(seen.some((u) => u.includes("task=compaction"))).toBe(true);
+    } finally { client.clear(); }
+  });
+
+  it("keeps Load more working with both filters on", async () => {
+    // 60 compaction runs, every other one loud. Two 20-row pages already
+    // satisfy the quiet filter's screenful, so the auto-search settles with
+    // a third page still unread — which is what Load more is for.
+    const ledger = Array.from({ length: 60 }, (_, i) => {
+      const id = 700 - i;
+      return i % 2 === 0
+        ? ({ ...compaction, run_id: String(id) } as MaintenanceRun)
+        : quietAt(id);
+    });
+    const seen: string[] = [];
+    mockLedger(() => ledger, seen);
+    const { client } = renderTable();
+    try {
+      await screen.findByText("700");
+      const user = userEvent.setup();
+      await user.selectOptions(taskSelect(), "compaction");
+      await user.click(hideToggle());
+      // Settled on the second page: 20 loud rows, id 662 the oldest.
+      await screen.findByText("662");
+      const shown = bodyRows().length;
+      expect(screen.queryByText("660")).not.toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: "Load more" }));
+      expect(await screen.findByText("660")).toBeInTheDocument();
+      expect(bodyRows().length).toBeGreaterThan(shown);
+      // The cursor page carries the task with it — the two compose.
+      expect(seen.some((u) => u.includes("task=compaction") && u.includes("before="))).toBe(true);
+    } finally { client.clear(); }
+  });
+
+  it("stops after a bounded number of requests when the ledger is all quiet", async () => {
+    // A catalog whose ledger is nothing but no-op sweeps: the search for a
+    // loud run must give up rather than walk the whole history.
+    const seen: string[] = [];
+    mockLedger(() => quietRange(9000, 1), seen);
+    const { client } = renderTable();
+    try {
+      await screen.findByText("9000");
+      seen.length = 0;
+      await userEvent.setup().click(hideToggle());
+      await screen.findByText("No runs match these filters.");
+      await new Promise((r) => setTimeout(r, 300));
+      // It looked past the first window — and then it stopped. Both halves
+      // matter: no search at all is the bug, and an unbounded one is worse.
+      expect(seen.length).toBeGreaterThan(1);
+      expect(seen.length).toBeLessThanOrEqual(10);
+      const settled = seen.length;
+      await new Promise((r) => setTimeout(r, 300));
+      expect(seen.length).toBe(settled);
+    } finally { client.clear(); }
+  });
+
+  it("scopes the hidden count to what it actually searched", async () => {
+    // "20 quiet runs hidden" over an empty table reads as "the filter works";
+    // it must instead say how far back the number goes.
+    mockLedger(() => quietRange(9000, 1));
+    const { client } = renderTable();
+    try {
+      await screen.findByText("9000");
+      await userEvent.setup().click(hideToggle());
+      await screen.findByText("No runs match these filters.");
+      const readout = screen.getByText(/quiet runs? hidden/);
+      expect(readout).toHaveTextContent(/of the newest \d+ runs searched/);
+      expect(readout).toHaveTextContent(/load more/i);
+    } finally { client.clear(); }
   });
 });

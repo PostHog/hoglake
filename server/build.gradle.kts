@@ -28,7 +28,7 @@ val jdbiVersion = "3.54.0"
 val flywayVersion = "13.7.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.54.13"
+val awsSdkVersion = "2.54.17"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -99,7 +99,7 @@ dependencies {
     // Compaction applies DVs at rewrite time (PuffinDeletionVector.kt), and
     // the Java RoaringBitmap serialize/deserialize format IS the portable
     // interoperable format the spec requires.
-    implementation("org.roaringbitmap:RoaringBitmap:1.6.21")
+    implementation("org.roaringbitmap:RoaringBitmap:1.6.23")
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.3")
@@ -136,6 +136,40 @@ kotlin {
 
 application {
     mainClass.set("com.posthog.hoglake.MainKt")
+
+    // HEAP SIZING, and it belongs HERE rather than in the Dockerfile or
+    // the chart: these become DEFAULT_JVM_OPTS in the generated
+    // `bin/hoglake-server` start script, which is what the image's
+    // ENTRYPOINT runs, so every environment gets them — image, compose
+    // stack, `just server run` — from one place, and `JAVA_OPTS` /
+    // `HOGLAKE_SERVER_OPTS` still override at run time without a rebuild.
+    // Nothing set any JVM flag anywhere before this (no ENV JAVA_OPTS, no
+    // chart env, no applicationDefaultJvmArgs), which is the whole bug:
+    // with no flag the JVM takes its container DEFAULT of 25%, so the
+    // 4 GiB maintenance pod ran compaction — the one component whose job
+    // is materializing row groups in memory — on ~1 GiB of heap, and
+    // OOM'd every sweep (hoglake#118).
+    //
+    // 70% and not more, because a meaningful part of this process's
+    // memory is NOT heap and MaxRAMPercentage does not know about any of
+    // it: zstd-jni's compressor and decompressor contexts (compaction's
+    // default output codec) are native allocations, the S3 client's
+    // buffers are direct, parquet's own allocations sit beside the heap,
+    // and then the fixed JVM overheads — metaspace and code cache for a
+    // Kotlin/Ktor/JDBI server (~300 MiB), ~50 thread stacks, GC bookkeeping
+    // proportional to heap. That lands around 700-900 MiB on the 4 GiB
+    // pod; 70% leaves ~1.2 GiB for it, a comfortable margin on the
+    // estimate. 75% is the usual container recommendation and is the
+    // number to move to once the off-heap side is measured rather than
+    // estimated; 100% is wrong for the reasons above and 25% is how we
+    // got here.
+    //
+    // Deliberately NOT -XX:+HeapDumpOnOutOfMemoryError: compaction now
+    // CATCHES an OutOfMemoryError at the group boundary and carries on
+    // (CompactionService), and the dump hook fires on the throw, not on
+    // an uncaught one — so a contained, counted skip would write a
+    // multi-gigabyte dump into the pod's ephemeral disk every sweep.
+    applicationDefaultJvmArgs = listOf("-XX:MaxRAMPercentage=70.0")
 }
 
 tasks.test {

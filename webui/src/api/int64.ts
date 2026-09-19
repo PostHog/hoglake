@@ -56,6 +56,7 @@ const INT64_FIELDS = new Set([
   "run_id",
   "sampled_snapshot_id",
   "loop_interval_ms",
+  "observed_interval_ms",
   "pending_files",
   "failed_files",
   "queued_removals",
@@ -82,6 +83,7 @@ const INT64_FIELDS = new Set([
   "dv_superseded",
   "unconvertible_schema",
   "invalid_data",
+  "heap_budget_exceeded",
   "failed_groups",
   "violations",
 ]);

@@ -180,6 +180,60 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
             .associateBy { it.catalog to it.task }
     }
 
+    /** Recent loop-run start times per task for [catalogId], on the caller's handle. */
+    fun recentLoopRuns(
+        h: Handle,
+        catalogId: Long,
+    ): Map<MaintenanceTask, List<Instant>> =
+        recentLoopRunsAll(h, listOf(catalogId)).entries.associate { (key, value) -> key.second to value }
+
+    /**
+     * The start times of the last [LOOP_SAMPLES] LOOP runs per (catalog,
+     * task), newest first — the evidence behind the status page's
+     * observed cadence. Unordered pairs are absent, never empty.
+     *
+     * Only tasks that have a loop are asked for: verify has none, so a
+     * `run_trigger = 'loop'` row cannot exist for it, and the LATERAL
+     * would read every verify row the catalog has to prove it. For the
+     * tasks that do loop, loop rows vastly outnumber manual ones, so the
+     * index scan stops within a few rows of the newest.
+     */
+    fun recentLoopRunsAll(
+        h: Handle,
+        catalogIds: List<Long>,
+    ): Map<Pair<String, MaintenanceTask>, List<Instant>> {
+        if (catalogIds.isEmpty()) return emptyMap()
+        val looping = MaintenanceTask.entries.filter { it.hasLoop }
+        return h.createQuery(
+            """
+            SELECT c.name AS catalog_name, tasks.task, r.started_at
+              FROM hog_catalog c
+              CROSS JOIN unnest(:tasks::text[]) AS tasks(task)
+              CROSS JOIN LATERAL (
+                  SELECT started_at FROM hog_maintenance_run r
+                  WHERE r.catalog_id = c.catalog_id AND r.task = tasks.task
+                    AND r.run_trigger = 'loop'
+                  ORDER BY run_id DESC LIMIT :samples
+              ) r
+             WHERE c.catalog_id = ANY(:ids)
+            """,
+        )
+            .bindArray("ids", Long::class.javaObjectType, catalogIds)
+            .bindArray("tasks", String::class.java, looping.map { it.wire })
+            .bind("samples", LOOP_SAMPLES)
+            .map { rs, _ ->
+                Triple(
+                    rs.getString("catalog_name"),
+                    MaintenanceTask.fromWire(rs.getString("task"))!!,
+                    rs.getTimestamp("started_at").toInstant(),
+                )
+            }
+            .list()
+            .groupBy({ it.first to it.second }) { it.third }
+            // The outer query imposes no order on the LATERAL's rows.
+            .mapValues { (_, times) -> times.sortedDescending() }
+    }
+
     /**
      * Newest-first history: runs with run_id < [before] (null = from the
      * latest), optionally restricted to one [task]. The caller asks for
@@ -302,6 +356,13 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
     companion object {
         /** Cap on recorded error detail — a stack trace is not a ledger row. */
         const val MAX_ERROR_LENGTH = 2000
+
+        /**
+         * Loop runs read per (catalog, task) for the observed cadence.
+         * Enough gaps for a median to survive one slow sweep, few enough
+         * that the read stays a handful of index rows.
+         */
+        const val LOOP_SAMPLES = 6
 
         /**
          * Result payloads serialize exactly like the wire: snake_case,

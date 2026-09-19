@@ -50,7 +50,8 @@ import java.util.Comparator
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MaintenanceApiTest {
     private val db = PgTestSupport.freshDatabase()
-    private val app = App.build(Config(hydratorIntervalMs = 0), db.jdbi)
+    private val cfg = Config(hydratorIntervalMs = 0)
+    private val app = App.build(cfg, db.jdbi)
     private val json = ObjectMapper()
 
     /** Never contacted: every request in this class drains an empty queue. */
@@ -509,7 +510,10 @@ class MaintenanceApiTest {
                 .containsExactlyInAnyOrder("hydrator", "expiry", "cleanup", "compaction", "verify")
 
             val expiry = tasks.getValue("expiry")
-            assertThat(expiry["loop_interval_ms"].asLong()).isEqualTo(60_000)
+            // The endpoint's job is to report the interval this app was
+            // built with; restating the default here would assert the
+            // literal against itself and break on every cadence change.
+            assertThat(expiry["loop_interval_ms"].asLong()).isEqualTo(cfg.expiryIntervalMs)
             // last_run is ALWAYS present (null when none); this catalog ran one.
             val lastRun = expiry["last_run"]
             assertThat(lastRun.isNull).isFalse()

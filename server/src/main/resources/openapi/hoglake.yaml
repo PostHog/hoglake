@@ -2352,7 +2352,8 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema, invalid_data, failed_groups]
+                 unconvertible_schema, invalid_data, heap_budget_exceeded,
+                 failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -2399,6 +2400,34 @@ components:
             the group is re-planned and re-refused every sweep. The axis
             is durability and fault, not values-versus-schema: a nonzero
             count is a writer bug, not a backlog.
+        heap_budget_exceeded:
+          type: integer
+          format: int64
+          description: >
+            Groups the SORTED rewrite path declined because
+            materializing them to sort would not fit the compaction heap
+            budget: tier-eligible by input bytes, too many rows for the
+            heap. Refused in metadata at planning time from the
+            registered record counts, before any object-store IO, so a
+            group that cannot fit never spends ninety seconds finding
+            out.
+
+            Durable, like invalid_data, but the fault is neither the
+            writer's nor the schema's: it is a table whose sort order and
+            row width exceed the heap this process was given. It clears
+            by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD
+            sized for it) or by dropping the table's sort order, which
+            moves it to the streaming path where group size costs no
+            heap.
+
+            TEMPORARY. The ceiling exists only because the sorted rewrite
+            sorts a whole group in memory. An external merge sort removes
+            it: at tier 2 and above every input is a previous compaction
+            output and therefore an already-sorted run, so merging needs
+            one row per input rather than all of them, and tier-1 client
+            files (whose sort order is advisory and unverified) are the
+            smallest and can each be sorted alone and spilled to the
+            scratch directory the rewrite already uses.
         failed_groups:
           type: integer
           format: int64
@@ -2465,17 +2494,63 @@ components:
           type: boolean
           description: More runs exist below this page (page with `before`).
 
+    LoopObservation:
+      type: object
+      required: [records_every_sweep]
+      description: >
+        What the run ledger observed about this task's background loop.
+        Read from recorded runs, so it describes the whole fleet, and it
+        is the only field here that can answer "is this task running".
+      properties:
+        observed_interval_ms:
+          type: integer
+          format: int64
+          description: >
+            The gap the loop is currently keeping, from the median of
+            the recent recorded gaps. Absent when the ledger cannot say:
+            fewer than two loop runs, a loop that has stopped (runs no
+            longer arriving at that gap), or the hydrator, whose
+            instance-wide sweep records only for the catalogs it claimed
+            files for and so measures work arrival, not cadence.
+        last_run_at:
+          type: string
+          format: date-time
+          description: >
+            Start of the most recent loop run. Absent when the ledger
+            holds none inside its retention window.
+        records_every_sweep:
+          type: boolean
+          description: >
+            Whether every sweep of this task records a run, which is how
+            a reader must interpret SILENCE here. True (expiry, cleanup,
+            compaction): no runs means no loop is running the task.
+            False (hydrator): its sweep is instance-wide and records only
+            for the catalogs it claimed files for, so no runs means no
+            work arrived for this catalog and says nothing about whether
+            the loop is alive.
+
     MaintenanceTaskStatus:
       type: object
-      required: [task, last_run, backlog]
+      required: [task, last_run, backlog, loop]
       properties:
         task: { $ref: "#/components/schemas/MaintenanceTask" }
         loop_interval_ms:
           type: integer
           format: int64
           description: >
-            Background loop cadence (0 = the loop is disabled; manual
-            triggers still work). Absent for verify, which has no loop.
+            The RESPONDING PROCESS's configured cadence (0 = the loop is
+            off in this process; manual triggers still work). Absent for
+            verify, which has no loop. A deployment may run a task's
+            loop in a pod other than the one serving the API, so this
+            must not be read as "the task is not running" — use `loop`.
+        loop:
+          oneOf:
+            - { $ref: "#/components/schemas/LoopObservation" }
+            - { type: object, nullable: true, enum: [null] }
+          description: >
+            Always included; null when the task has no loop at all
+            (verify). A MISSING key means an older server that does not
+            report it, which is not the same claim.
         last_run:
           oneOf:
             - { $ref: "#/components/schemas/MaintenanceRun" }

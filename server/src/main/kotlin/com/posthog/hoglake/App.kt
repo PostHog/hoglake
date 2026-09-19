@@ -101,6 +101,7 @@ class App private constructor(
                 tierTarget = cfg.compactionTierTarget,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
+                sortedHeapBytes = cfg.compactionSortedHeapBytes,
                 maxNodesPerRow = cfg.compactionMaxNodesPerRow,
                 codec = ParquetRewriter.OutputCodec.parse(cfg.compactionCodec, cfg.compactionZstdLevel),
             ),

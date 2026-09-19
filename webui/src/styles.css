@@ -263,6 +263,23 @@ td.nullable-mark {
   direction: rtl;
   text-align: left;
 }
+/* A bound over a text column can be a whole JSON payload. Unconstrained,
+   one such cell pushes both bound columns off the viewport and squeezes
+   every column before them, so past BOUND_INLINE_MAX_CHARS the value is
+   truncated with its full text in the tooltip. Truncated from the right,
+   unlike .path-text: a path is distinguished by its end, a bound by its
+   beginning. */
+.bound-cell {
+  max-width: 340px;
+  text-align: left;
+}
+.bound-text {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 tr.has-deletes {
   background: rgba(229, 116, 95, 0.06);
 }
