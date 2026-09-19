@@ -120,7 +120,7 @@ dependencies {
     testImplementation("io.ktor:ktor-server-test-host:$ktorVersion")
     testImplementation("io.ktor:ktor-client-content-negotiation:$ktorVersion")
     testImplementation("org.awaitility:awaitility:4.3.0")
-    testImplementation("io.kotest:kotest-property:5.9.1")
+    testImplementation("io.kotest:kotest-property:6.2.5")
 
     // Coverage-guided fuzzing (docs/fuzzing.md layer 4): jazzer-junit @FuzzTest
     // targets in src/test/kotlin/com/posthog/hoglake/fuzz. Inside the normal
