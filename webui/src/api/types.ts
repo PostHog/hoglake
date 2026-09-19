@@ -182,6 +182,26 @@ export interface PartitionSpec {
   fields: PartitionField[];
 }
 
+export type SortDirection = "asc" | "desc";
+export type NullOrder = "nulls_first" | "nulls_last";
+
+export interface SortField {
+  source_field_id: Int64;
+  direction: SortDirection;
+  null_order: NullOrder;
+}
+
+/**
+ * A table's sort order at the requested snapshot; absent when the table
+ * is unsorted there. Advisory for writers, binding for compaction — and
+ * for the files table it is what names the ordering key whose bounds
+ * each file reports.
+ */
+export interface SortSpec {
+  sort_id: Int64;
+  fields: SortField[];
+}
+
 export interface Table {
   name: string;
   namespace: string;
@@ -191,6 +211,7 @@ export interface Table {
   file_count: Int64;
   file_size_bytes: Int64;
   partition_spec?: PartitionSpec;
+  sort_spec?: SortSpec;
 }
 
 export type StatsState = "provided" | "pending" | "failed";
@@ -207,6 +228,33 @@ export interface DataFile {
   begin_snapshot: Int64;
   spec_id?: Int64;
   partition_values?: (string | null)[];
+  /**
+   * True for compaction outputs: the row ids ride an explicit physical
+   * `_hog_row_id` column, so row_id_start is min(input row ids) and has
+   * no positional meaning.
+   */
+  explicit_row_ids?: boolean;
+  ordering_bounds?: FileOrderingBounds;
+}
+
+/**
+ * The range one file covers along the key its table is ORDERED by, as
+ * GET .../files ships it. `field_id` names the leading sort-spec field
+ * the bounds belong to; ABSENT means the table is unsorted and the
+ * range is the file's row-id span — the row id is the implicit ordering
+ * key and has no field id.
+ *
+ * The whole object is absent when the server has no range to state (a
+ * sorted table's file whose stats are pending or failed, a key column
+ * added after the file landed, an empty file), which is not the same
+ * fact as a null bound INSIDE it: null is a stated answer — "no bound
+ * stored, do not prune" on a sort key, "unknown" for the upper end of a
+ * compaction output's row-id span.
+ */
+export interface FileOrderingBounds {
+  field_id?: Int64;
+  lower_bound: DecodedBound;
+  upper_bound: DecodedBound;
 }
 
 /**

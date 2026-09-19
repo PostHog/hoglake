@@ -40,6 +40,7 @@ const INT64_FIELDS = new Set([
   "field_id",
   "source_field_id",
   "spec_id",
+  "sort_id",
   "value_count",
   "null_count",
   "nan_count",

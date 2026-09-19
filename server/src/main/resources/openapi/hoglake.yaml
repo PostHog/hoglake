@@ -2045,6 +2045,65 @@ components:
             be row-id-contiguous. When true, row_id_start is
             min(input row ids) and has no positional meaning; readers
             needing row identity must read the column.
+        ordering_bounds:
+          $ref: '#/components/schemas/FileOrderingBounds'
+
+    FileOrderingBounds:
+      type: object
+      required: [lower_bound, upper_bound]
+      description: >
+        The range this file covers along the key its table is ORDERED
+        by — the span a reader prunes on, and the span that says
+        whether two files overlap.
+
+        Populated by GET .../files ONLY. The changefeed and the scan
+        plan embed the same DataFile schema and omit this property:
+        they answer "what changed" and "what to read", neither of which
+        is a question about one column's span.
+
+        Which key it describes follows the TABLE, not the file. When
+        the table has a sort spec at the requested snapshot the bounds
+        are the LEADING sort field's, and `field_id` names it — the
+        leading field alone, because it is the only one whose per-file
+        range is a contiguous interval (a second key orders only the
+        rows that TIE on the first, so its per-file min/max spans the
+        whole column and prunes nothing). When the table is unsorted
+        the only ordering is the append order, so the bounds are the
+        file's row-id span and `field_id` is ABSENT: the row id is not
+        a catalog column and has no field id.
+
+        The property is absent altogether when the server has no range
+        to state: a sorted table's file with no stats row for the key
+        (stats_state pending or failed, or a key column added after the
+        file landed), and any file of zero records. The row-id span
+        needs no statistics and is always given, deferred-stats files
+        included — row_id_start is assigned at commit for every file.
+
+        `lower_bound`/`upper_bound` follow the FileColumnStats wire
+        conventions and are DECODED, so the same 2^53 warning applies:
+        a row-id span or a long sort key exceeds what JSON.parse can
+        hold exactly, and consumers must parse these tokens exactly.
+        A JSON null is an ANSWER, never an absence: on a sort key it is
+        "no bound stored, so do not prune"; on a row-id span's
+        upper_bound it is "unknown", which is the honest answer for a
+        compaction output — explicit_row_ids means row_id_start is
+        min(input row ids), so `row_id_start + record_count - 1` is
+        arithmetic on a meaning the file does not have, and the ids
+        live in a `_hog_row_id` column that is not a catalog column and
+        therefore has no statistics row to read a maximum out of.
+      properties:
+        field_id:
+          type: integer
+          format: int64
+          description: >
+            The sort-spec field these bounds belong to; absent when the
+            table is unsorted and the bounds are the row-id span.
+        lower_bound:
+          nullable: true
+          description: Decoded low end of the range, or null (see above).
+        upper_bound:
+          nullable: true
+          description: Decoded high end of the range, or null (see above).
 
     FileColumnStats:
       type: object
