@@ -27,13 +27,7 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.nio.file.Files
-import java.nio.file.Path
 import java.util.UUID
-import kotlin.io.path.deleteIfExists
-import kotlin.io.path.fileSize
 
 /** Per-run compaction knobs (Config's HOGLAKE_COMPACTION_* env surface). */
 data class CompactionConfig(
@@ -348,6 +342,13 @@ data class CompactionCandidate(
     val path: String,
     val recordCount: Long,
     val fileSizeBytes: Long,
+    /**
+     * Registered thrift footer length, or null when the writer never
+     * supplied one. A HINT for [S3InputFile]'s tail prefetch — it
+     * decides whether opening the file costs a round trip, never
+     * whether it reads correctly.
+     */
+    val footerSize: Long?,
     val rowIdStart: Long,
     val statsProvided: Boolean,
     /**
@@ -636,7 +637,8 @@ class CompactionService(
             h.createQuery(
                 """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
-                   f.row_id_start, f.spec_id, f.stats_state, f.explicit_row_ids,
+                   f.footer_size, f.row_id_start, f.spec_id, f.stats_state,
+                   f.explicit_row_ids,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count,
                    (SELECT array_agg(pv.value ORDER BY pv.key_index)
                     FROM hog_file_partition_value pv
@@ -663,6 +665,7 @@ class CompactionService(
                             path = rs.getString("path"),
                             recordCount = rs.getLong("record_count"),
                             fileSizeBytes = rs.getLong("file_size_bytes"),
+                            footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
                             rowIdStart = rs.getLong("row_id_start"),
                             statsProvided = rs.getString("stats_state") == "provided",
                             explicitRowIds = rs.getBoolean("explicit_row_ids"),
@@ -995,14 +998,17 @@ class CompactionService(
         ctx: TableContext,
         group: CompactionGroup,
     ): GroupOutcome {
-        val tmpDir = Files.createTempDirectory("hoglake-compaction")
-        val tmpFiles = mutableListOf<Path>()
-        try {
+        run {
             val inputs =
                 group.files.map { f ->
-                    val local = tmpDir.resolve("in-${f.dataFileId}.parquet")
-                    Files.write(local, store.get(f.path))
-                    tmpFiles.add(local)
+                    // Read the object IN PLACE. This used to fetch the
+                    // whole thing into a heap array and write it to
+                    // java.io.tmpdir first — three passes over every
+                    // input byte before the rewrite began, and a staging
+                    // footprint that scaled with the group against an
+                    // emptyDir whose overrun EVICTS the pod.
+                    val source =
+                        S3InputFile(store, f.path, f.fileSizeBytes, f.footerSize)
                     val dv =
                         f.dv?.let { planned ->
                             // The FETCH stays outside: an object-store error is
@@ -1032,25 +1038,8 @@ class CompactionService(
                             }
                             decoded
                         }
-                    ParquetRewriter.Input(local, f.rowIdStart, dv, f.explicitRowIds)
+                    ParquetRewriter.Input(source, f.path, f.rowIdStart, dv, f.explicitRowIds)
                 }
-            val outLocal = tmpDir.resolve("out.parquet")
-            tmpFiles.add(outLocal)
-            val rewritten =
-                ParquetRewriter.rewrite(
-                    inputs,
-                    ctx.columns,
-                    ctx.sortFields,
-                    outLocal,
-                    ctx.maxNodesPerRow,
-                    ctx.codec,
-                )
-            check(rewritten.rowsWritten == group.survivingRecords) {
-                "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
-                    "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
-            }
-            val outputBytes = outLocal.fileSize()
-            val footerSize = footerSize(outLocal)
             // Bare UUID, deliberately indistinguishable from an ingested
             // file (the pyhoglake writer's shape). A `compacted-` prefix
             // used to sit here; it told readers nothing the catalog does
@@ -1062,12 +1051,62 @@ class CompactionService(
                 "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
                     "${UUID.randomUUID()}.parquet"
 
-            // Claim ticket BEFORE the upload (its own committed
+            // Claim ticket BEFORE the rewrite (its own committed
             // transaction): if this group never commits — skip, crash,
             // failed upload — the undrained row hands the object to the
             // normal cleanup drain. The group commit settles it.
+            //
+            // ORDERING CHANGED when the rewrite began streaming, and the
+            // consequence is worth stating because it relaxed an
+            // invariant the tests used to pin. The old sequence was
+            // fetch -> rewrite to local disk -> claim -> upload, so a
+            // rewrite that failed had touched nothing and left no row.
+            // The output now streams to its final path, so bytes can
+            // land the moment parquet flushes its first part, and the
+            // claim has to come first.
+            //
+            // So for a DV-free group there is no longer any point at
+            // which compaction can fail WITHOUT having claimed a ticket.
+            // Every failure leaves one removal row for a path that holds
+            // no object — S3OutputFile aborts its multipart upload — and
+            // the cleanup drain reclaims it, counting it `missing`,
+            // which it already handles.
+            //
+            // The trade: one extra removal row per failed group, against
+            // a claim that now covers the WHOLE window in which bytes
+            // could exist rather than starting after it. Taken
+            // deliberately; the alternative is to have the sink claim
+            // the ticket on its first part upload, which preserves the
+            // old invariant exactly but threads a side effect into the
+            // writer and makes the claim's timing invisible at this call
+            // site. Revisit if the `missing` rows ever become noise.
             val stagingId = stageOutputPath(ctx.catalogId, outputPath)
-            store.put(outputPath, Files.readAllBytes(outLocal))
+
+            // The rewrite streams STRAIGHT to the output path, so the
+            // ticket above must already be claimed: bytes begin landing
+            // the moment parquet flushes its first part, not after. That
+            // is the whole reason the path is minted before the rewrite
+            // rather than after it.
+            //
+            // Nothing is written locally and nothing is read back: the
+            // stream reports its own size and footer length, which used
+            // to cost two more full passes over the output.
+            val sink = S3OutputFile(store, outputPath)
+            val rewritten =
+                ParquetRewriter.rewrite(
+                    inputs,
+                    ctx.columns,
+                    ctx.sortFields,
+                    sink,
+                    ctx.maxNodesPerRow,
+                    ctx.codec,
+                )
+            check(rewritten.rowsWritten == group.survivingRecords) {
+                "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
+                    "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
+            }
+            val outputBytes = sink.bytesWritten
+            val footerSize = sink.footerSize
 
             val stats =
                 if (group.files.all { it.statsProvided && it.dv == null }) {
@@ -1100,9 +1139,6 @@ class CompactionService(
                     }
             }
             return outcome
-        } finally {
-            tmpFiles.forEach { it.deleteIfExists() }
-            tmpDir.deleteIfExists()
         }
     }
 
@@ -1124,13 +1160,6 @@ class CompactionService(
                 .mapTo(Long::class.javaObjectType)
                 .one()
         }
-
-    /** Thrift footer length from the 4 LE bytes before the trailing "PAR1". */
-    private fun footerSize(file: Path): Long {
-        val bytes = Files.readAllBytes(file)
-        require(bytes.size >= 8) { "output too small to be parquet" }
-        return ByteBuffer.wrap(bytes, bytes.size - 8, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong()
-    }
 
     /**
      * The metadata commit for one group: one transaction under the

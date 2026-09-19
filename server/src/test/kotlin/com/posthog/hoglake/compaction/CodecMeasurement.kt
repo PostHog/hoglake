@@ -73,13 +73,15 @@ object CodecMeasurement {
     ) {
         val schema = schemaOf(shape)
         val live = liveColumns(shape)
-        val inputs =
+        val written =
             (0 until files).map { f ->
                 val path = dir.resolve("$shape-in-$f.parquet")
                 writeInput(path, schema, shape, rowsPerFile, seed = 1000L + f)
-                ParquetRewriter.Input(path, f.toLong() * rowsPerFile)
+                path to localInput(path, f.toLong() * rowsPerFile)
             }
-        val inputBytes = inputs.sumOf { it.localPath.fileSize() }
+        val inputPaths = written.map { it.first }
+        val inputs = written.map { it.second }
+        val inputBytes = inputPaths.sumOf { it.fileSize() }
 
         println()
         println("== $shape: $files files x $rowsPerFile rows, inputs written SNAPPY (client default)")
@@ -103,7 +105,7 @@ object CodecMeasurement {
         for (codec in order) {
             val out = dir.resolve("$shape-out-${codec.name}.parquet")
             val started = System.nanoTime()
-            ParquetRewriter.rewrite(
+            rewriteToLocal(
                 inputs,
                 live,
                 emptyList(),
@@ -128,7 +130,7 @@ object CodecMeasurement {
             println("                  footer says: ${footerCodecs(out)}")
             out.toFile().delete()
         }
-        inputs.forEach { it.localPath.toFile().delete() }
+        inputPaths.forEach { it.toFile().delete() }
     }
 
     /** Every column chunk's recorded codec, as the footer holds it. */

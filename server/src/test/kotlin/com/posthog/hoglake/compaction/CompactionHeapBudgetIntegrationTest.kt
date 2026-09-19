@@ -301,12 +301,24 @@ class CompactionHeapBudgetIntegrationTest {
     }
 
     @Test
-    fun `an OOM before the staging ticket leaves nothing at all`() {
-        // The other side of the boundary, and the site the dev OOM
-        // actually hit: the group dies while reading its inputs, before
-        // any output path has been minted. Nothing to reclaim, because
-        // nothing was ever claimed — and the sweep still resolves into a
-        // counted result instead of an unwound run ledger.
+    fun `an OOM reading an input leaves a reclaimable orphan and no catalog row`() {
+        // The site the dev OOM actually hit: the group dies while
+        // reading its inputs.
+        //
+        // This used to be "before the staging ticket leaves nothing at
+        // all" — inputs were fetched before the output path was minted,
+        // so nothing had been claimed. Inputs are now read in place
+        // DURING the rewrite, which is after the claim, so a read-side
+        // failure leaves the same reclaimable ticket a write-side one
+        // does. See the ordering note in CompactionService.compactGroup:
+        // for a DV-free group there is no longer a pre-claim failure
+        // point at all.
+        //
+        // What still matters, and is what this asserts: the failure is
+        // COUNTED rather than unwinding the run ledger, no snapshot is
+        // cut, no catalog row appears, and the claimed path is left for
+        // the cleanup drain — which finds no object, because the
+        // multipart upload was aborted.
         val cfg = smallFileConfig()
         val fx = realTable("oom-get")
         val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
@@ -316,23 +328,46 @@ class CompactionHeapBudgetIntegrationTest {
 
         assertThat(result.heapBudgetExceeded).isEqualTo(1)
         assertThat(result.groupsCompacted).isZero()
-        assertThat(removalRows(fx)).isEmpty()
+        assertThat(removalRows(fx)).describedAs("the claimed path is left to reclaim").hasSize(1)
         assertThat(liveFileCount(fx)).isEqualTo(3)
         assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
         assertVerifyPasses(fx)
     }
 
-    /** An ObjectStore that exhausts the heap on upload — after the claim ticket. */
+    /**
+     * An ObjectStore that exhausts the heap while UPLOADING — after the
+     * claim ticket.
+     *
+     * Cuts at `uploadPart`, not `put`: compaction streams its output
+     * through a multipart upload and never calls `put`. Overriding the
+     * old seam here would inject a fault nothing reaches, and the test
+     * would pass by never failing at all.
+     */
     private class OomOnPut : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-        override fun put(
+        override fun uploadPart(
             pathUri: String,
+            uploadId: String,
+            partNumber: Int,
             bytes: ByteArray,
-        ): Unit = throw OutOfMemoryError("Java heap space")
+            length: Int,
+        ): String = throw OutOfMemoryError("Java heap space")
     }
 
-    /** An ObjectStore that exhausts the heap on fetch — before the claim ticket. */
+    /**
+     * An ObjectStore that exhausts the heap while READING an input.
+     *
+     * Cuts at `getRange` for the same reason: inputs are read in place
+     * now, so `get` is only reached for a deletion vector. Note this no
+     * longer lands BEFORE the claim ticket — see the ordering note in
+     * CompactionService.compactGroup. It is kept as the read-side fault,
+     * with the post-ticket expectations that implies.
+     */
     private class OomOnGet : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-        override fun get(pathUri: String): ByteArray = throw OutOfMemoryError("Java heap space")
+        override fun getRange(
+            pathUri: String,
+            startInclusive: Long,
+            length: Int,
+        ): ByteArray = throw OutOfMemoryError("Java heap space")
     }
 
     // ---- fixtures ----------------------------------------------------------

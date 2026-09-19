@@ -102,8 +102,8 @@ object BudgetOomRepro {
         val out = path.resolveSibling("budget-out.parquet")
         val t =
             probe("read-new (budget=$budget)") {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(path, 0L, null)),
+                rewriteToLocal(
+                    listOf(localInput(path, 0L, null)),
                     live,
                     emptyList(),
                     out,

@@ -4,6 +4,8 @@ import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.MixedIdBindingRepro
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -264,8 +266,8 @@ class NestedCampaignRegressionTest {
         // was `liveColumns.none { ... }`, which a nested variant walks
         // straight past.
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 0L, null)),
+            rewriteToLocal(
+                listOf(localInput(src, 0L, null)),
                 live,
                 emptyList(),
                 tmp.resolve("nested-variant-out.parquet"),
@@ -555,8 +557,8 @@ class NestedCampaignRegressionTest {
             listOf(g)
         }
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds = true)),
+            rewriteToLocal(
+                listOf(localInput(src, 0L, null, explicitRowIds = true)),
                 live,
                 emptyList(),
                 tmp.resolve("o2.parquet"),
@@ -627,8 +629,8 @@ class NestedCampaignRegressionTest {
             }
         }
         val out =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = false)),
+            rewriteToLocal(
+                listOf(localInput(src, 5000L, null, explicitRowIds = false)),
                 listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                 emptyList(),
                 tmp.resolve("client-named-out.parquet"),
@@ -696,8 +698,8 @@ class NestedCampaignRegressionTest {
                     else -> "is not a primitive int64"
                 }
             assertThatThrownBy {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = true)),
+                rewriteToLocal(
+                    listOf(localInput(src, 5000L, null, explicitRowIds = true)),
                     live,
                     emptyList(),
                     tmp.resolve("compacted-$label-out.parquet"),
@@ -744,9 +746,9 @@ class NestedCampaignRegressionTest {
         }
 
         val byId =
-            ParquetRewriter.rewrite(
+            rewriteToLocal(
                 listOf(
-                    ParquetRewriter.Input(
+                    localInput(
                         fileWith(
                             "by-id",
                             Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
@@ -765,9 +767,9 @@ class NestedCampaignRegressionTest {
         assertThat(byId.minRowId).describedAs("the carrier's ids, not positional").isEqualTo(700L)
 
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
+            rewriteToLocal(
                 listOf(
-                    ParquetRewriter.Input(
+                    localInput(
                         fileWith(
                             "by-name",
                             Types.optional(PrimitiveType.PrimitiveTypeName.INT64)
@@ -821,8 +823,8 @@ class NestedCampaignRegressionTest {
         }
         for (flag in listOf(true, false)) {
             assertThatThrownBy {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds = flag)),
+                rewriteToLocal(
+                    listOf(localInput(src, 0L, null, explicitRowIds = flag)),
                     listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                     emptyList(),
                     tmp.resolve("dup-reserved-out-$flag.parquet"),
@@ -880,8 +882,8 @@ class NestedCampaignRegressionTest {
                 )
             }
             assertThatThrownBy {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 5000L, null, explicitRowIds = false)),
+                rewriteToLocal(
+                    listOf(localInput(src, 5000L, null, explicitRowIds = false)),
                     listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                     emptyList(),
                     tmp.resolve("poison-$label-out.parquet"),
@@ -930,8 +932,8 @@ class NestedCampaignRegressionTest {
         // A budget of 8 stands in for the production million: the
         // behaviour under test is the refusal, not the constant.
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 0L, null)),
+            rewriteToLocal(
+                listOf(localInput(src, 0L, null)),
                 live,
                 emptyList(),
                 tmp.resolve("o4.parquet"),
@@ -1563,7 +1565,7 @@ class NestedCampaignRegressionTest {
         src: Path,
         live: List<Column>,
         out: Path,
-    ) = ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+    ) = rewriteToLocal(listOf(localInput(src, 0L, null)), live, emptyList(), out)
 
     private fun write(
         schema: MessageType,

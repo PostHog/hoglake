@@ -18,8 +18,8 @@ import org.apache.parquet.hadoop.ParquetWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.io.ColumnIOFactory
-import org.apache.parquet.io.LocalInputFile
-import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.InputFile
+import org.apache.parquet.io.OutputFile
 import org.apache.parquet.io.api.Binary
 import org.apache.parquet.io.api.Converter
 import org.apache.parquet.io.api.GroupConverter
@@ -32,8 +32,6 @@ import org.apache.parquet.schema.PrimitiveType
 import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import java.math.BigInteger
-import java.nio.file.Path
-import kotlin.io.path.deleteIfExists
 
 /**
  * A compaction group whose inputs cannot be rewritten under the live
@@ -316,7 +314,20 @@ object ParquetRewriter {
      * test that does not care) at the ordinary shape.
      */
     data class Input(
-        val localPath: Path,
+        /**
+         * Where the bytes are. An [InputFile] rather than a local path so
+         * compaction can read an object in place (see S3InputFile)
+         * instead of staging it to disk first; a local file is still one
+         * of these, via the secondary constructor below.
+         */
+        val source: InputFile,
+        /**
+         * Identity for diagnostics — the object URI or the local path.
+         * Carried explicitly because [InputFile] has no name: parquet's
+         * own LocalInputFile does not override toString, so leaning on it
+         * would turn every error message into an object hash.
+         */
+        val label: String,
         val rowIdStart: Long,
         val deletes: DeletionVector? = null,
         val explicitRowIds: Boolean = false,
@@ -345,7 +356,7 @@ object ParquetRewriter {
      *
      * [reset] is called once per row, by the root converter's `start`.
      */
-    private class NodeBudget(private val limit: Int, private val source: Path) {
+    private class NodeBudget(private val limit: Int, private val source: String) {
         private var spent = 0
 
         fun reset() {
@@ -499,7 +510,7 @@ object ParquetRewriter {
         inputs: List<Input>,
         liveColumns: List<Column>,
         sortFields: List<SortFieldDef>,
-        output: Path,
+        output: OutputFile,
         maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
         codec: OutputCodec = OutputCodec(),
     ): RewriteResult {
@@ -529,16 +540,17 @@ object ParquetRewriter {
                     "or guess the payload",
             )
         }
-        // A refusal mid-write leaves a truncated parquet file on disk —
-        // no footer, unreadable, and (when the caller reuses the path)
-        // indistinguishable from a real output. The rewriter owns the
-        // path it was handed, so it owns the cleanup: nothing survives a
-        // throw. Callers still clean their own temp dirs; this makes the
-        // contract hold for every caller, not just the careful one.
+        // A refusal mid-write leaves a partial output — a truncated
+        // local file with no footer, or a multipart upload with parts
+        // that are billed and invisible. Either way nothing survives a
+        // throw: the rewriter owns what it was handed, and asks the
+        // destination to discard itself. HOW to discard differs by
+        // destination (unlink vs abort the upload), which is why it is
+        // the OutputFile's job and not a `delete` here.
         try {
             return rewriteInto(inputs, liveColumns, sortFields, output, maxNodesPerRow, codec)
         } catch (e: Throwable) {
-            runCatching { output.deleteIfExists() }
+            runCatching { (output as? DiscardableOutputFile)?.discard() }
             throw e
         }
     }
@@ -547,7 +559,7 @@ object ParquetRewriter {
         inputs: List<Input>,
         liveColumns: List<Column>,
         sortFields: List<SortFieldDef>,
-        output: Path,
+        output: OutputFile,
         maxNodesPerRow: Int,
         codec: OutputCodec,
     ): RewriteResult {
@@ -632,12 +644,12 @@ object ParquetRewriter {
         maxNodesPerRow: Int,
         emit: (Group, Long) -> Unit,
     ) {
-        val schema = readSchema(input.localPath)
+        val schema = readSchema(input.source)
         refuseDuplicateNames(schema, emptyList())
         // A previously-compacted input carries its ids in its own
         // row-id column; positional ids would be wrong for it.
         val srcRowIdIndex = rowIdCarrier(schema, input)
-        val plan = columnPlan(schema, liveColumns, input.localPath)
+        val plan = columnPlan(schema, liveColumns, input.label)
         var applied = 0L
         // One allowance per row PER PHASE. The root converter renews it
         // at each row boundary for the decode; the copy renews it again
@@ -654,8 +666,8 @@ object ParquetRewriter {
         // likes, while the copy's size is already bounded by what the
         // decode produced. Charging the copy is belt-and-braces; charging
         // it from the same allowance turns the braces into a tighter belt.
-        val budget = NodeBudget(maxNodesPerRow, input.localPath)
-        readRows(input.localPath, schema, budget) { src, ordinal ->
+        val budget = NodeBudget(maxNodesPerRow, input.label)
+        readRows(input.source, schema, budget) { src, ordinal ->
             if (input.deletes?.contains(ordinal) == true) {
                 applied++
                 return@readRows
@@ -686,7 +698,7 @@ object ParquetRewriter {
                     // committed with.
                     if (src.getFieldRepetitionCount(srcRowIdIndex) == 0) {
                         throw InvalidDataException(
-                            "row $ordinal of ${input.localPath} has a null $ROW_ID_COLUMN; the " +
+                            "row $ordinal of ${input.label} has a null $ROW_ID_COLUMN; the " +
                                 "row id of a compacted file is required",
                         )
                     }
@@ -699,7 +711,7 @@ object ParquetRewriter {
         }
         val expected = input.deletes?.cardinality ?: 0L
         check(applied == expected) {
-            "deletion vector for ${input.localPath} claims $expected positions but only " +
+            "deletion vector for ${input.label} claims $expected positions but only " +
                 "$applied fell inside the file — refusing a lossy compaction"
         }
     }
@@ -750,7 +762,7 @@ object ParquetRewriter {
         schema: MessageType,
         input: Input,
     ): Int? {
-        val source = input.localPath
+        val source = input.label
         val reservedAt = schema.fields.indices.filter { schema.fields[it].id?.intValue() == ROW_ID_FIELD_ID }
 
         // ONE carrier or none. Two fields sharing the reserved id is the
@@ -865,10 +877,10 @@ object ParquetRewriter {
      */
     private fun newWriter(
         outputSchema: MessageType,
-        output: Path,
+        output: OutputFile,
         codec: OutputCodec,
     ): ParquetWriter<Group> =
-        ExampleParquetWriter.builder(LocalOutputFile(output))
+        ExampleParquetWriter.builder(output)
             .withType(outputSchema)
             .withCompressionCodec(codec.name)
             .config(ZSTD_LEVEL_KEY, codec.zstdLevel.toString())
@@ -877,8 +889,8 @@ object ParquetRewriter {
 
     // ---- schema ----------------------------------------------------------
 
-    private fun readSchema(path: Path): MessageType =
-        ParquetFileReader.open(LocalInputFile(path)).use { it.footer.fileMetaData.schema }
+    private fun readSchema(file: InputFile): MessageType =
+        ParquetFileReader.open(file).use { it.footer.fileMetaData.schema }
 
     /**
      * The output schema is the LIVE schema: every live column in
@@ -1116,7 +1128,7 @@ object ParquetRewriter {
     private fun columnPlan(
         schema: MessageType,
         liveColumns: List<Column>,
-        inputPath: Path,
+        inputPath: String,
     ): List<Step?> {
         // DUPLICATE IDS, before any binding. planChildren elects the
         // FIRST field with a matching id, so a file declaring one id
@@ -1172,7 +1184,7 @@ object ParquetRewriter {
         srcFields: List<Type>,
         liveColumns: List<Column>,
         useFieldIds: Boolean,
-        inputPath: Path,
+        inputPath: String,
     ): List<Step?> =
         liveColumns.map { column ->
             val srcIndex =
@@ -1208,7 +1220,7 @@ object ParquetRewriter {
         position: Int,
         column: Column,
         useFieldIds: Boolean,
-        inputPath: Path,
+        inputPath: String,
     ): Step? {
         // POSITION decides, and the id only VERIFIES — the reader's rule
         // (FooterStats.childBinds), and the two have to hold the same
@@ -1256,7 +1268,7 @@ object ParquetRewriter {
         srcIndex: Int,
         column: Column,
         useFieldIds: Boolean,
-        inputPath: Path,
+        inputPath: String,
     ): Step {
         fun refuseShape(detail: String): Nothing =
             throw UnconvertibleSchemaException(
@@ -1389,7 +1401,7 @@ object ParquetRewriter {
     private fun copyMode(
         src: PrimitiveType,
         column: Column,
-        inputPath: Path,
+        inputPath: String,
     ): CopyMode {
         val srcName = src.primitiveTypeName
         val live = column.def.type
@@ -1587,12 +1599,12 @@ object ParquetRewriter {
     // ---- row IO ----------------------------------------------------------
 
     private fun readRows(
-        path: Path,
+        file: InputFile,
         schema: MessageType,
         budget: NodeBudget,
         consume: (Group, Long) -> Unit,
     ) {
-        ParquetFileReader.open(LocalInputFile(path)).use { reader ->
+        ParquetFileReader.open(file).use { reader ->
             val columnIO = ColumnIOFactory().getColumnIO(schema)
             var ordinal = 0L
             var pages = reader.readNextRowGroup()

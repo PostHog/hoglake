@@ -3,6 +3,8 @@ package com.posthog.hoglake.fuzz
 import com.fasterxml.jackson.core.JacksonException
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.CreateTableRequestDto
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
@@ -678,8 +680,8 @@ object ParquetRewriterCall {
             } else {
                 emptyList()
             }
-        return com.posthog.hoglake.compaction.ParquetRewriter.rewrite(
-            listOf(com.posthog.hoglake.compaction.ParquetRewriter.Input(src, 0L, null)),
+        return com.posthog.hoglake.compaction.rewriteToLocal(
+            listOf(com.posthog.hoglake.compaction.localInput(src, 0L, null)),
             live,
             sort,
             out,

@@ -517,8 +517,8 @@ class NestedTypeRewriteRoundTripTest {
             }
         val first = tmp.resolve("rowid-out1.parquet")
         val result =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(path, 100)),
+            rewriteToLocal(
+                listOf(localInput(path, 100)),
                 listOf(listColumn),
                 emptyList(),
                 first,
@@ -530,10 +530,10 @@ class NestedTypeRewriteRoundTripTest {
         val second = tmp.resolve("rowid-out2.parquet")
         // rowIdStart 0 on purpose: a rewriter that reassigned positionally
         // would renumber these 0..3 and the assertion would catch it.
-        ParquetRewriter.rewrite(
+        rewriteToLocal(
             // `first` is a compaction output; its ids live in the
             // carrier, so the catalog bit says so here too.
-            listOf(ParquetRewriter.Input(first, 0, null, explicitRowIds = true)),
+            listOf(localInput(first, 0, null, explicitRowIds = true)),
             listOf(listColumn),
             emptyList(),
             second,
@@ -600,8 +600,8 @@ class NestedTypeRewriteRoundTripTest {
                 inner.add(1, "r$i")
             }
         val out = tmp.resolve("sort-out.parquet")
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(path, 0)),
+        rewriteToLocal(
+            listOf(localInput(path, 0)),
             listOf(structColumn),
             listOf(SortFieldDef(2, SortDirection.ASC, NullOrder.NULLS_LAST)),
             out,
@@ -621,8 +621,8 @@ class NestedTypeRewriteRoundTripTest {
                 inner.add(1, "x")
             }
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(path, 0)),
+            rewriteToLocal(
+                listOf(localInput(path, 0)),
                 listOf(structColumn),
                 // field 1 is the struct itself
                 listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)),
@@ -640,8 +640,8 @@ class NestedTypeRewriteRoundTripTest {
                 g.addGroup(0).addGroup(0).add(0, 1)
             }
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(path, 0)),
+            rewriteToLocal(
+                listOf(localInput(path, 0)),
                 listOf(listColumn),
                 // field 2 is the list ELEMENT: many values per row.
                 listOf(SortFieldDef(2, SortDirection.ASC, NullOrder.NULLS_LAST)),
@@ -1281,8 +1281,8 @@ class NestedTypeRewriteRoundTripTest {
         out: Path,
         explicitRowIds: Boolean = false,
     ) {
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(input, 0, null, explicitRowIds)),
+        rewriteToLocal(
+            listOf(localInput(input, 0, null, explicitRowIds)),
             live,
             emptyList(),
             out,

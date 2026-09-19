@@ -2,6 +2,8 @@ package com.posthog.hoglake.fuzz
 
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -99,9 +101,9 @@ object NestedTargetedProbe {
         val out = tmp.resolve("b6-out.parquet")
         val r =
             try {
-                ParquetRewriter.rewrite(
+                rewriteToLocal(
                     // rowIdStart = 5000: the row ids the SERVER assigned.
-                    listOf(ParquetRewriter.Input(src, 5000L, null)),
+                    listOf(localInput(src, 5000L, null)),
                     live,
                     emptyList(),
                     out,
@@ -329,10 +331,10 @@ object NestedTargetedProbe {
         val t =
             try {
                 val r =
-                    ParquetRewriter.rewrite(
+                    rewriteToLocal(
                         listOf(
-                            ParquetRewriter.Input(a, 0L, null),
-                            ParquetRewriter.Input(b, 100L, null),
+                            localInput(a, 0L, null),
+                            localInput(b, 100L, null),
                         ),
                         live,
                         emptyList(),
@@ -446,8 +448,8 @@ object NestedTargetedProbe {
         explicitRowIds: Boolean = false,
     ): Throwable? =
         try {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(src, 0L, null, explicitRowIds)),
+            rewriteToLocal(
+                listOf(localInput(src, 0L, null, explicitRowIds)),
                 live,
                 emptyList(),
                 out,
