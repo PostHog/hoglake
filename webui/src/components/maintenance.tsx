@@ -17,11 +17,19 @@ import { SkeletonRows } from "./Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
 import { useStoredPref } from "../lib/prefs";
 
-/** Coarse duration: "45s", "12m", "3h", "2d". Rounded, never exact. */
+/**
+ * Coarse duration: "45s", "12min", "3h", "2d". Rounded, never exact.
+ *
+ * Minutes are "min", not "m". These durations sit in column headers that
+ * CSS upper-cases, and beside tables of counts a bare "M" reads as the
+ * SI mega prefix — "EVERY ~17M" looks like 17 million of something. The
+ * database page's own duration helper already says "min"; the other
+ * units have no such collision.
+ */
 export function formatSeconds(seconds: number): string {
   if (seconds < 120) return `${Math.round(seconds)}s`;
   const m = seconds / 60;
-  if (m < 120) return `${Math.round(m)}m`;
+  if (m < 120) return `${Math.round(m)}min`;
   const h = m / 60;
   if (h < 48) return `${Math.round(h)}h`;
   return `${Math.round(h / 24)}d`;
