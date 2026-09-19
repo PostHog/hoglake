@@ -1,7 +1,8 @@
 package com.posthog.hoglake.fuzz
 
-import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -88,8 +89,8 @@ object NestedReprosD {
             ).singleOrNull()
         val refusal =
             try {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 0L, null)),
+                rewriteToLocal(
+                    listOf(localInput(src, 0L, null)),
                     live,
                     emptyList(),
                     tmp.resolve("d1-out.parquet"),
@@ -147,8 +148,8 @@ object NestedReprosD {
             val live = listOf(Column(1, 0, ColumnDef("j", t)))
             val rewrite =
                 try {
-                    ParquetRewriter.rewrite(
-                        listOf(ParquetRewriter.Input(src, 0L, null)),
+                    rewriteToLocal(
+                        listOf(localInput(src, 0L, null)),
                         live,
                         emptyList(),
                         tmp.resolve("d2-out-${t.wire}.parquet"),
@@ -257,7 +258,7 @@ object NestedReprosD {
         val aggs =
             FooterStats.aggregate(FooterParse.parse(LocalInputFile(src)), catalog, src.toString())
         val out = tmp.resolve("d3-out.parquet")
-        val r = ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+        val r = rewriteToLocal(listOf(localInput(src, 0L, null)), live, emptyList(), out)
         val copied =
             NestedFuzz.leafStats(out).second.firstOrNull { it.fieldId == 5 }
                 ?.let { it.valueCount - (it.nullCount ?: 0) } ?: 0L

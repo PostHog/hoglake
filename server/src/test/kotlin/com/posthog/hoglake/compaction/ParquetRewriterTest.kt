@@ -138,8 +138,8 @@ class ParquetRewriterTest {
             )
         val thrown =
             catchThrowable {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(input, 0)),
+                rewriteToLocal(
+                    listOf(localInput(input, 0)),
                     live,
                     emptyList(),
                     tmp.resolve("budget-decode-out.parquet"),
@@ -190,8 +190,8 @@ class ParquetRewriterTest {
                 ),
             )
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(input, 0)),
+            rewriteToLocal(
+                listOf(localInput(input, 0)),
                 live,
                 emptyList(),
                 tmp.resolve("budget-nulls-out.parquet"),
@@ -243,8 +243,8 @@ class ParquetRewriterTest {
             )
 
         fun rewriteAt(budget: Int) =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(input, 0)),
+            rewriteToLocal(
+                listOf(localInput(input, 0)),
                 live,
                 emptyList(),
                 tmp.resolve("budget-ceiling-out-$budget.parquet"),
@@ -275,8 +275,8 @@ class ParquetRewriterTest {
                 (0 until 100).map { i -> { g: Group -> g.add(0, i.toLong()) } },
             )
         val result =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(input, 0)),
+            rewriteToLocal(
+                listOf(localInput(input, 0)),
                 listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
                 emptyList(),
                 tmp.resolve("budget-renew-out.parquet"),
@@ -321,8 +321,8 @@ class ParquetRewriterTest {
             mapOf("precision" to 9, "scale" to 2),
         ).withIndex()) {
             assertThatThrownBy {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(input, 0)),
+                rewriteToLocal(
+                    listOf(localInput(input, 0)),
                     listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, params))),
                     emptyList(),
                     tmp.resolve("decimal-refused-$index.parquet"),
@@ -335,8 +335,8 @@ class ParquetRewriterTest {
         val overflow = writeCustom("decimal-overflow.parquet", schema, listOf({ it.add(0, 10000000000L) }))
         val out = tmp.resolve("decimal-overflow-output.parquet")
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(overflow, 0)),
+            rewriteToLocal(
+                listOf(localInput(overflow, 0)),
                 listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 2)))),
                 emptyList(),
                 out,
@@ -387,12 +387,12 @@ class ParquetRewriterTest {
                         }
                     },
                 )
-            inputs.add(ParquetRewriter.Input(path, expected.size.toLong()))
+            inputs.add(localInput(path, expected.size.toLong()))
             expected.addAll(values)
         }
         val columns = listOf(Column(1, 0, ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 38, "scale" to 2))))
         val output = tmp.resolve("decimal-output.parquet")
-        ParquetRewriter.rewrite(inputs, columns, emptyList(), output)
+        rewriteToLocal(inputs, columns, emptyList(), output)
         val actual = mutableListOf<BigInteger?>()
         ParquetFileReader.open(LocalInputFile(output)).use { reader ->
             val schema = reader.footer.fileMetaData.schema
@@ -457,8 +457,8 @@ class ParquetRewriterTest {
         val b = writeInput("b.parquet", listOf(TestRow(200, "m", 3.0), TestRow(201, "n", 4.0), TestRow(202, "o", 5.0)))
         val out = tmp.resolve("out1.parquet")
         val result =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(a, 0), ParquetRewriter.Input(b, 10)),
+            rewriteToLocal(
+                listOf(localInput(a, 0), localInput(b, 10)),
                 liveColumns,
                 emptyList(),
                 out,
@@ -488,9 +488,9 @@ class ParquetRewriterTest {
         val b = writeInput("dv-b.parquet", listOf(TestRow(200, "m", 5.0), TestRow(201, "n", 6.0)))
         val out = tmp.resolve("dv-out.parquet")
         val result =
-            ParquetRewriter.rewrite(
+            rewriteToLocal(
                 // Positions 0 and 2 of `a` die: row ids 7 and 9 vanish forever.
-                listOf(ParquetRewriter.Input(a, 7, dv(0, 2)), ParquetRewriter.Input(b, 20)),
+                listOf(localInput(a, 7, dv(0, 2)), localInput(b, 20)),
                 liveColumns,
                 emptyList(),
                 out,
@@ -508,8 +508,8 @@ class ParquetRewriterTest {
         val b = writeInput("full-b.parquet", listOf(TestRow(3, "c", 3.0)))
         val out = tmp.resolve("full-out.parquet")
         val partial =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(a, 0, dv(0, 1)), ParquetRewriter.Input(b, 5)),
+            rewriteToLocal(
+                listOf(localInput(a, 0, dv(0, 1)), localInput(b, 5)),
                 liveColumns,
                 emptyList(),
                 out,
@@ -518,8 +518,8 @@ class ParquetRewriterTest {
         assertThat(partial.minRowId).isEqualTo(5)
 
         val empty =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(a, 0, dv(0, 1)), ParquetRewriter.Input(b, 5, dv(0))),
+            rewriteToLocal(
+                listOf(localInput(a, 0, dv(0, 1)), localInput(b, 5, dv(0))),
                 liveColumns,
                 emptyList(),
                 tmp.resolve("empty-out.parquet"),
@@ -536,8 +536,8 @@ class ParquetRewriterTest {
     fun `a DV position beyond the file refuses the rewrite instead of losing the delete`() {
         val a = writeInput("oob-a.parquet", listOf(TestRow(1, "a", 1.0), TestRow(2, "b", 2.0)))
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(a, 0, dv(1, 17))),
+            rewriteToLocal(
+                listOf(localInput(a, 0, dv(1, 17))),
                 liveColumns,
                 emptyList(),
                 tmp.resolve("oob-out.parquet"),
@@ -551,8 +551,8 @@ class ParquetRewriterTest {
         val a = writeInput("s-a.parquet", listOf(TestRow(1, "e", 5.0), TestRow(2, "d", null), TestRow(3, "c", 1.0)))
         val b = writeInput("s-b.parquet", listOf(TestRow(4, "b", 4.0), TestRow(5, "a", null), TestRow(6, "f", 0.5)))
         val out = tmp.resolve("out2.parquet")
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(a, 0), ParquetRewriter.Input(b, 100)),
+        rewriteToLocal(
+            listOf(localInput(a, 0), localInput(b, 100)),
             liveColumns,
             listOf(SortFieldDef(3, SortDirection.ASC, NullOrder.NULLS_LAST)),
             out,
@@ -567,8 +567,8 @@ class ParquetRewriterTest {
     fun `descending with nulls first`() {
         val a = writeInput("d-a.parquet", listOf(TestRow(1, "a", 1.0), TestRow(2, "b", null), TestRow(3, "c", 9.0)))
         val out = tmp.resolve("out3.parquet")
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(a, 0)),
+        rewriteToLocal(
+            listOf(localInput(a, 0)),
             liveColumns,
             listOf(SortFieldDef(3, SortDirection.DESC, NullOrder.NULLS_FIRST)),
             out,
@@ -581,7 +581,7 @@ class ParquetRewriterTest {
     fun `inputs without embedded field ids bind to live columns by name`() {
         val a = writeInput("no-ids.parquet", listOf(TestRow(1, "a", 1.0)), withIds = false)
         val out = tmp.resolve("out4.parquet")
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(a, 0)), liveColumns, emptyList(), out)
+        rewriteToLocal(listOf(localInput(a, 0)), liveColumns, emptyList(), out)
         val (schema, rows) = readOutput(out)
         assertThat(schema.getType("id").id.intValue()).isEqualTo(1)
         assertThat(schema.getType("score").id.intValue()).isEqualTo(3)
@@ -627,8 +627,8 @@ class ParquetRewriterTest {
 
         val out = tmp.resolve("het-out.parquet")
         val result =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(v1, 0), ParquetRewriter.Input(v2, 2)),
+            rewriteToLocal(
+                listOf(localInput(v1, 0), localInput(v2, 2)),
                 liveColumns,
                 emptyList(),
                 out,
@@ -666,7 +666,7 @@ class ParquetRewriterTest {
                 }),
             )
         val out = tmp.resolve("float-out.parquet")
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(f, 0)), liveColumns, emptyList(), out)
+        rewriteToLocal(listOf(localInput(f, 0)), liveColumns, emptyList(), out)
         val (schema, rows) = readOutput(out)
         assertThat(schema.getType("score").asPrimitiveType().primitiveTypeName)
             .isEqualTo(PrimitiveTypeName.DOUBLE)
@@ -686,8 +686,8 @@ class ParquetRewriterTest {
                 .named("t")
         val bad = writeCustom("bad.parquet", badSchema, listOf({ g -> g.add("id", "not-a-long") }))
         assertThatThrownBy {
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(bad, 0)),
+            rewriteToLocal(
+                listOf(localInput(bad, 0)),
                 liveColumns,
                 emptyList(),
                 tmp.resolve("bad-out.parquet"),
@@ -714,7 +714,7 @@ class ParquetRewriterTest {
             )
         val out = tmp.resolve("stray-out.parquet")
         val result =
-            ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(stray, 0)), liveColumns, emptyList(), out)
+            rewriteToLocal(listOf(localInput(stray, 0)), liveColumns, emptyList(), out)
         assertThat(result.rowsWritten).isEqualTo(1)
         val (schema, rows) = readOutput(out)
         assertThat(schema.fields.map { it.name }).doesNotContain("stray")
@@ -725,15 +725,15 @@ class ParquetRewriterTest {
     fun `re-compacting an explicit-row-id input keeps its ids, never positional`() {
         val a = writeInput("r-a.parquet", listOf(TestRow(1, "a", 1.0), TestRow(2, "b", 2.0)))
         val out1 = tmp.resolve("first.parquet")
-        ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(a, 40)), liveColumns, emptyList(), out1)
+        rewriteToLocal(listOf(localInput(a, 40)), liveColumns, emptyList(), out1)
         // Second pass: rowIdStart deliberately WRONG (0) — the ids must come
         // from the file's own _hog_row_id column, not position.
         val out2 = tmp.resolve("second.parquet")
-        ParquetRewriter.rewrite(
+        rewriteToLocal(
             // out1 is a compaction OUTPUT: the catalog row for it
             // carries explicit_row_ids, so the rewriter must be told
             // the same or it will renumber positionally.
-            listOf(ParquetRewriter.Input(out1, 0, null, explicitRowIds = true)),
+            listOf(localInput(out1, 0, null, explicitRowIds = true)),
             liveColumns,
             emptyList(),
             out2,
@@ -749,8 +749,8 @@ class ParquetRewriterTest {
         val a = writeInput("rd-a.parquet", listOf(TestRow(1, "a", 3.0), TestRow(2, "b", 1.0), TestRow(3, "c", 2.0)))
         val out1 = tmp.resolve("rd-first.parquet")
         // Sorted first pass: physical order becomes score ASC -> ids 51, 52, 50.
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(a, 50)),
+        rewriteToLocal(
+            listOf(localInput(a, 50)),
             liveColumns,
             listOf(SortFieldDef(3, SortDirection.ASC, NullOrder.NULLS_LAST)),
             out1,
@@ -759,8 +759,8 @@ class ParquetRewriterTest {
         // which carries id 51 — that is the row that must die.
         val out2 = tmp.resolve("rd-second.parquet")
         val result =
-            ParquetRewriter.rewrite(
-                listOf(ParquetRewriter.Input(out1, 0, dv(0), explicitRowIds = true)),
+            rewriteToLocal(
+                listOf(localInput(out1, 0, dv(0), explicitRowIds = true)),
                 liveColumns,
                 emptyList(),
                 out2,
@@ -801,8 +801,8 @@ class ParquetRewriterTest {
     ): Pair<org.apache.parquet.schema.PrimitiveType, List<Group>> {
         val f = writeCustom("$name-in.parquet", input, rows)
         val out = tmp.resolve("$name-out.parquet")
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(f, 0)),
+        rewriteToLocal(
+            listOf(localInput(f, 0)),
             listOf(Column(1, 0, ColumnDef("v", live))),
             sort,
             out,

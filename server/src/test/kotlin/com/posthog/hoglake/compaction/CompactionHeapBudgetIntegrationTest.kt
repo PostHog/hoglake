@@ -301,12 +301,24 @@ class CompactionHeapBudgetIntegrationTest {
     }
 
     @Test
-    fun `an OOM before the staging ticket leaves nothing at all`() {
-        // The other side of the boundary, and the site the dev OOM
-        // actually hit: the group dies while reading its inputs, before
-        // any output path has been minted. Nothing to reclaim, because
-        // nothing was ever claimed — and the sweep still resolves into a
-        // counted result instead of an unwound run ledger.
+    fun `an OOM reading an input leaves a reclaimable orphan and no catalog row`() {
+        // The site the dev OOM actually hit: the group dies while
+        // reading its inputs.
+        //
+        // This used to be "before the staging ticket leaves nothing at
+        // all" — inputs were fetched before the output path was minted,
+        // so nothing had been claimed. Inputs are now read in place
+        // DURING the rewrite, which is after the claim, so a read-side
+        // failure leaves the same reclaimable ticket a write-side one
+        // does. See the ordering note in CompactionService.compactGroup:
+        // for a DV-free group there is no longer a pre-claim failure
+        // point at all.
+        //
+        // What still matters, and is what this asserts: the failure is
+        // COUNTED rather than unwinding the run ledger, no snapshot is
+        // cut, no catalog row appears, and the claimed path is left for
+        // the cleanup drain — which finds no object, because the
+        // multipart upload was aborted.
         val cfg = smallFileConfig()
         val fx = realTable("oom-get")
         val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
@@ -316,23 +328,75 @@ class CompactionHeapBudgetIntegrationTest {
 
         assertThat(result.heapBudgetExceeded).isEqualTo(1)
         assertThat(result.groupsCompacted).isZero()
-        assertThat(removalRows(fx)).isEmpty()
+        assertThat(removalRows(fx)).describedAs("the claimed path is left to reclaim").hasSize(1)
         assertThat(liveFileCount(fx)).isEqualTo(3)
         assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
         assertVerifyPasses(fx)
     }
 
-    /** An ObjectStore that exhausts the heap on upload — after the claim ticket. */
-    private class OomOnPut : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-        override fun put(
-            pathUri: String,
-            bytes: ByteArray,
-        ): Unit = throw OutOfMemoryError("Java heap space")
+    @Test
+    fun `a read fault on an UNSORTED table leaves no object behind`() {
+        // The case the rest of this class cannot reach. On the streaming
+        // path the writer — and therefore the multipart upload — is open
+        // before the first input is read, so a read-side failure has a
+        // live upload to leave behind. It must be discarded, not
+        // completed: completion is atomic, and parquet writes a valid
+        // footer while closing even on the exception path, so a
+        // truncated-but-well-formed object is exactly what an
+        // insufficiently careful implementation publishes here.
+        val cfg = smallFileConfig()
+        val fx = unsortedRealTable("oom-unsorted")
+        val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
+        val headBefore = headSnapshot(fx)
+
+        val result = svc.runOnce(fx, cfg, MaintenanceTrigger.LOOP)
+
+        assertThat(result.groupsCompacted).isZero()
+        assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
+        assertThat(liveFileCount(fx)).isEqualTo(3)
+
+        val staged = removalRows(fx).filter { it.reason == "compaction_staging" }
+        assertThat(staged).describedAs("the path is claimed").hasSize(1)
+        assertThat(objectExists(staged.single().path))
+            .describedAs("nothing may be published at %s", staged.single().path)
+            .isFalse()
+        assertVerifyPasses(fx)
     }
 
-    /** An ObjectStore that exhausts the heap on fetch — before the claim ticket. */
+    /**
+     * An ObjectStore that exhausts the heap while UPLOADING — after the
+     * claim ticket.
+     *
+     * Cuts at `uploadPart`, not `put`: compaction streams its output
+     * through a multipart upload and never calls `put`. Overriding the
+     * old seam here would inject a fault nothing reaches, and the test
+     * would pass by never failing at all.
+     */
+    private class OomOnPut : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+        override fun uploadPart(
+            pathUri: String,
+            uploadId: String,
+            partNumber: Int,
+            bytes: ByteArray,
+            length: Int,
+        ): String = throw OutOfMemoryError("Java heap space")
+    }
+
+    /**
+     * An ObjectStore that exhausts the heap while READING an input.
+     *
+     * Cuts at `getRange` for the same reason: inputs are read in place
+     * now, so `get` is only reached for a deletion vector. Note this no
+     * longer lands BEFORE the claim ticket — see the ordering note in
+     * CompactionService.compactGroup. It is kept as the read-side fault,
+     * with the post-ticket expectations that implies.
+     */
     private class OomOnGet : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-        override fun get(pathUri: String): ByteArray = throw OutOfMemoryError("Java heap space")
+        override fun getRange(
+            pathUri: String,
+            startInclusive: Long,
+            length: Int,
+        ): ByteArray = throw OutOfMemoryError("Java heap space")
     }
 
     // ---- fixtures ----------------------------------------------------------
@@ -373,6 +437,40 @@ class CompactionHeapBudgetIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         return cat
     }
+
+    /**
+     * The UNSORTED twin of [realTable], which matters more than it
+     * sounds. Every other failure test here sets a sort order, and the
+     * sorted rewrite materialises all its inputs BEFORE opening the
+     * writer — so the upload never starts and a failure cannot leave an
+     * object behind whatever the code does. The streaming path opens
+     * the writer first, which is where a failure genuinely can publish
+     * something, and it had no failure coverage at all.
+     */
+    private fun unsortedRealTable(label: String): String {
+        val cat = "heap-$label-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        val regs =
+            (0 until 3).map { i ->
+                val bytes = parquetBytes((0 until 4).map { it + i * 4L })
+                val path = "s3://$BUCKET/$cat/data/ns/t/r$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 4, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        return cat
+    }
+
+    /** Does the object actually exist in MinIO? */
+    private fun objectExists(pathUri: String): Boolean =
+        try {
+            store.get(pathUri)
+            true
+        } catch (_: Exception) {
+            false
+        }
 
     /** A sorted table with three REAL small parquet objects behind it. */
     private fun realTable(label: String): String {

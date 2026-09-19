@@ -365,8 +365,8 @@ class ScalarTypeRewriteRoundTripTest {
         out: Path,
         explicitRowIds: Boolean = false,
     ) {
-        ParquetRewriter.rewrite(
-            listOf(ParquetRewriter.Input(input, 0, null, explicitRowIds)),
+        rewriteToLocal(
+            listOf(localInput(input, 0, null, explicitRowIds)),
             listOf(Column(1, 0, ColumnDef("v", type))),
             emptyList(),
             out,

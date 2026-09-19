@@ -1,7 +1,8 @@
 package com.posthog.hoglake.fuzz
 
-import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -202,8 +203,8 @@ object NestedMinimizedRepros {
         // Rewriter: raw NumberFormatException.
         val thrown =
             try {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 0L, null)),
+                rewriteToLocal(
+                    listOf(localInput(src, 0L, null)),
                     live,
                     emptyList(),
                     tmp.resolve("a1-out.parquet"),
@@ -248,8 +249,8 @@ object NestedMinimizedRepros {
         }
         val thrown =
             try {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 0L, null)),
+                rewriteToLocal(
+                    listOf(localInput(src, 0L, null)),
                     live,
                     listOf(
                         com.posthog.hoglake.model.SortFieldDef(
@@ -316,7 +317,7 @@ object NestedMinimizedRepros {
         val usesIds = FooterStats.usesFieldIds(schema)
 
         val out = tmp.resolve("a2-out.parquet")
-        val result = ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+        val result = rewriteToLocal(listOf(localInput(src, 0L, null)), live, emptyList(), out)
         val outLeaves = NestedFuzz.leafStats(out).second
         val copied =
             outLeaves.firstOrNull { it.fieldId == 2 }
@@ -359,8 +360,8 @@ object NestedMinimizedRepros {
             }
         val thrown =
             try {
-                ParquetRewriter.rewrite(
-                    listOf(ParquetRewriter.Input(src, 0L, null)),
+                rewriteToLocal(
+                    listOf(localInput(src, 0L, null)),
                     live,
                     emptyList(),
                     tmp.resolve("a3-out.parquet"),
@@ -399,7 +400,7 @@ object NestedMinimizedRepros {
         val out = tmp.resolve("a4-out.parquet")
         val thrown =
             try {
-                ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+                rewriteToLocal(listOf(localInput(src, 0L, null)), live, emptyList(), out)
                 null
             } catch (t: Throwable) {
                 t

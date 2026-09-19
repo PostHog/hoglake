@@ -33,8 +33,10 @@ ARG HOGLAKE_BUILD_STAMP=""
 RUN ./gradlew --no-daemon :installDist -x test -x ktlintCheck -PbuildStamp="$HOGLAKE_BUILD_STAMP"
 
 FROM eclipse-temurin:21-jre-noble
-# Non-root: the server needs no filesystem beyond /tmp (parquet footer
-# reads stream from S3; compaction spills under java.io.tmpdir).
+# Non-root: the server needs no filesystem at all for its data path.
+# Parquet footer reads stream from S3, and compaction streams both its
+# inputs and its output (S3InputFile / S3OutputFile) rather than staging
+# to java.io.tmpdir as it once did.
 RUN useradd --system --uid 10001 hoglake
 COPY --from=build /src/build/install/hoglake-server/ /app/
 USER 10001

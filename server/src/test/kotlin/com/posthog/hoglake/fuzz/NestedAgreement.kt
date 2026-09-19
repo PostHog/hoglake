@@ -3,6 +3,8 @@ package com.posthog.hoglake.fuzz
 import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.localInput
+import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -152,8 +154,8 @@ object NestedAgreement {
             var dataRefused = false
             val result =
                 try {
-                    ParquetRewriter.rewrite(
-                        listOf(ParquetRewriter.Input(src, 0L, null)),
+                    rewriteToLocal(
+                        listOf(localInput(src, 0L, null)),
                         listOf(col),
                         sortFields,
                         out,

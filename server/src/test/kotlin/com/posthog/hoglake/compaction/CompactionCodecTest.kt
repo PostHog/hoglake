@@ -145,11 +145,11 @@ class CompactionCodecTest {
         val gzipIn = writeInput("mixed-gzip.parquet", 1000, CompressionCodecName.GZIP)
         val out = tmp.resolve("mixed-out.parquet")
 
-        ParquetRewriter.rewrite(
+        rewriteToLocal(
             listOf(
-                ParquetRewriter.Input(snappyIn, 0),
-                ParquetRewriter.Input(rawIn, 500),
-                ParquetRewriter.Input(gzipIn, 1000),
+                localInput(snappyIn, 0),
+                localInput(rawIn, 500),
+                localInput(gzipIn, 1000),
             ),
             liveColumns,
             emptyList(),
@@ -235,11 +235,11 @@ class CompactionCodecTest {
         val a = writeInput("in-a-$name", 0, CompressionCodecName.SNAPPY)
         val b = writeInput("in-b-$name", ROWS.toLong(), CompressionCodecName.SNAPPY)
         val out = tmp.resolve("out-$name")
-        val inputs = listOf(ParquetRewriter.Input(a, 0), ParquetRewriter.Input(b, ROWS.toLong()))
+        val inputs = listOf(localInput(a, 0), localInput(b, ROWS.toLong()))
         if (codec == null) {
-            ParquetRewriter.rewrite(inputs, liveColumns, emptyList(), out)
+            rewriteToLocal(inputs, liveColumns, emptyList(), out)
         } else {
-            ParquetRewriter.rewrite(inputs, liveColumns, emptyList(), out, codec = codec)
+            rewriteToLocal(inputs, liveColumns, emptyList(), out, codec = codec)
         }
         return out
     }

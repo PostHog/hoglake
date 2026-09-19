@@ -1857,12 +1857,16 @@ class CompactionServiceIntegrationTest {
         assertThat(result.skippedConflicts).isZero()
         assertThat(result.dvSuperseded).isZero()
 
-        // Nothing moved: no snapshot, both files live, no staging ticket
-        // (unconvertibility is detected before anything is staged or
-        // uploaded).
+        // Nothing moved: no snapshot, both files live. The staging
+        // ticket IS claimed, though, and that is not an oversight —
+        // unconvertibility is detected while reading the inputs, which
+        // now happens during the rewrite, after the claim. See the
+        // ordering note in CompactionService.compactGroup. The claimed
+        // path holds no object (the multipart upload aborted) and the
+        // cleanup drain reclaims the row.
         assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(headBefore)
         assertThat(catalogs.listFiles(cat, "ns", "t")).hasSize(2)
-        assertThat(removalRows(cat)).isEmpty()
+        assertThat(removalRows(cat)).describedAs("claimed, reclaimable, holds nothing").hasSize(1)
     }
 
     // ---- lifecycle ---------------------------------------------------------

@@ -28,7 +28,8 @@ import java.net.URI
 
 /**
  * Physical-delete side of the file-removal queue [ObjectStore] cannot
- * provide (it is read/put-only and off-limits to this layer): existence
+ * provide (it reads, puts and uploads, but never deletes — that is
+ * off-limits to that layer): existence
  * probe + delete, speaking the same `s3://bucket/key` URIs via
  * [ObjectStore.parse]. Same construction surface as ObjectStore so
  * App.kt wires it identically (`RemovalStore(cfg)`).

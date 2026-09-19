@@ -84,7 +84,7 @@ object MixedIdBindingRepro {
         val out = tmp.resolve("mixed-out.parquet")
         val written =
             try {
-                ParquetRewriter.rewrite(listOf(ParquetRewriter.Input(src, 0L, null)), live, emptyList(), out)
+                rewriteToLocal(listOf(localInput(src, 0L, null)), live, emptyList(), out)
                 readFirstLong(out)
             } catch (t: Throwable) {
                 "${t.javaClass.simpleName}: ${t.message?.take(90)}"
