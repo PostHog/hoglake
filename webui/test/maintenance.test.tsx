@@ -91,13 +91,27 @@ describe("maintenance outcome and history", () => {
       // is measured at 68.8s. Rounding it keeps the header readable
       // without claiming a precision the measurement does not have.
       expect(loopCadence({ observed_interval_ms: "68800" })).toBe("every ~69s");
-      expect(loopCadence({ observed_interval_ms: "3630000" })).toBe("every ~61m");
+      // "min", never a bare "m": these land in headers CSS upper-cases,
+      // where "~61M" beside a table of counts reads as 61 million.
+      expect(loopCadence({ observed_interval_ms: "3630000" })).toBe("every ~61min");
       expect(loopCadence({ observed_interval_ms: "450" })).toBe("every ~450ms");
+    });
+
+    it("never abbreviates minutes to a bare m, at any minute value", () => {
+      // The headers are upper-cased by CSS, so "M" is what an operator
+      // actually reads — the SI mega prefix, next to columns of counts.
+      // Checked across the whole minutes band rather than at one value,
+      // since the unit is chosen by a threshold.
+      for (const ms of ["120000", "600000", "3600000", "7139000"]) {
+        const text = loopCadence({ observed_interval_ms: ms })!;
+        expect(text).toMatch(/\d+min\b/);
+        expect(text.toUpperCase()).not.toMatch(/\d+M\b/);
+      }
     });
 
     it("falls back to the last run when no cadence can be derived", () => {
       expect(loopCadence({ last_run_at: "2026-09-11T09:58:00Z" })).toBe(
-        "last loop run 2m ago",
+        "last loop run 2min ago",
       );
     });
 

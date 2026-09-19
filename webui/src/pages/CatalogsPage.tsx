@@ -2,9 +2,28 @@ import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createCatalog, listCatalogs } from "../api/client";
+import type { Catalog } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
 import { formatBytes, formatCount } from "../lib/format";
+import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
+import type { ColumnSort, SortState } from "../lib/sort";
+import { SortableTh } from "../components/SortableTh";
+
+type SortKey = "name" | "path" | "tables" | "rows" | "size" | "head" | "schema";
+
+const COMPARATORS: Record<SortKey, ColumnSort<Catalog>> = {
+  name: textColumn((c) => c.name),
+  path: textColumn((c) => c.data_path),
+  // The three sampler totals are absent — not zero — on a catalog the
+  // sampler has not reached, so int64Column keeps those rows off the top
+  // of a largest-first sort.
+  tables: int64Column((c) => c.table_count),
+  rows: int64Column((c) => c.live_rows),
+  size: int64Column((c) => c.live_size_bytes),
+  head: int64Column((c) => c.head_snapshot_id),
+  schema: int64Column((c) => c.schema_version),
+};
 
 function CreateCatalogForm() {
   const queryClient = useQueryClient();
@@ -61,6 +80,10 @@ export function CatalogsPage() {
     queryKey: ["catalogs"],
     queryFn: listCatalogs,
   });
+  // null = the server's order (name).
+  const [sort, setSort] = useState<SortState<SortKey> | null>(null);
+  const onSort = (key: SortKey) => setSort((prev) => nextSort(prev, key));
+  const rows = applySort(data ?? [], sort, COMPARATORS);
 
   return (
     <section>
@@ -71,27 +94,62 @@ export function CatalogsPage() {
         <table className="data-table">
           <thead>
             <tr>
-              <th>name</th>
-              <th>data_path</th>
-              <th className="num">tables</th>
-              <th className="num">rows</th>
-              <th className="num">size</th>
-              <th className="num">head_snapshot_id</th>
-              <th className="num">schema_version</th>
+              <SortableTh label="name" sortKey="name" sort={sort} onSort={onSort} />
+              <SortableTh
+                label="data_path"
+                sortKey="path"
+                sort={sort}
+                onSort={onSort}
+              />
+              <SortableTh
+                label="tables"
+                sortKey="tables"
+                sort={sort}
+                onSort={onSort}
+                numeric
+              />
+              <SortableTh
+                label="rows"
+                sortKey="rows"
+                sort={sort}
+                onSort={onSort}
+                numeric
+              />
+              <SortableTh
+                label="size"
+                sortKey="size"
+                sort={sort}
+                onSort={onSort}
+                numeric
+              />
+              <SortableTh
+                label="head_snapshot_id"
+                sortKey="head"
+                sort={sort}
+                onSort={onSort}
+                numeric
+              />
+              <SortableTh
+                label="schema_version"
+                sortKey="schema"
+                sort={sort}
+                onSort={onSort}
+                numeric
+              />
             </tr>
           </thead>
           {isPending ? (
             <SkeletonRows rows={4} cols={7} />
           ) : (
             <tbody>
-              {data.length === 0 && (
+              {rows.length === 0 && (
                 <tr>
                   <td colSpan={7} className="empty">
                     No catalogs yet.
                   </td>
                 </tr>
               )}
-              {data.map((c) => (
+              {rows.map((c) => (
                 <tr key={c.name}>
                   <td>
                     <Link to={`/catalogs/${encodeURIComponent(c.name)}`}>
