@@ -16,8 +16,15 @@ import java.net.URI
 /**
  * Thin S3/MinIO wrapper for the hydrator. Speaks `s3://bucket/key` URIs
  * (the absolute object-store paths stored in `hog_data_file.path`).
+ *
+ * `open`, with [get] and [put] open, for ONE reason: compaction's
+ * failure-path tests need to fail at a chosen point in the fetch ->
+ * stage -> upload -> commit sequence, and where the failure lands
+ * relative to the staging ticket is the whole question (hoglake#118's
+ * OOM-leak verification). A real S3 cannot be asked to throw an
+ * OutOfMemoryError on the third call.
  */
-class ObjectStore(
+open class ObjectStore(
     endpoint: String?,
     region: String,
     accessKey: String?,
@@ -49,7 +56,7 @@ class ObjectStore(
     data class Location(val bucket: String, val key: String)
 
     /** Fetch the whole object at [pathUri] (`s3://bucket/key`). */
-    fun get(pathUri: String): ByteArray {
+    open fun get(pathUri: String): ByteArray {
         val loc = parse(pathUri)
         return s3.getObjectAsBytes(
             GetObjectRequest.builder().bucket(loc.bucket).key(loc.key).build(),
@@ -79,7 +86,7 @@ class ObjectStore(
         ).asByteArray()
     }
 
-    fun put(
+    open fun put(
         pathUri: String,
         bytes: ByteArray,
     ) {

@@ -396,6 +396,40 @@ pinned rather than inherited because the sweep is CPU-bound on a shared
 maintenance pod and a parquet-java bump must not move that budget
 without a diff. parquet-java's zstd workers stay at 0 (in-thread).
 
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default **512 MiB**) bounds one
+GROUP's materialized object graph on the SORTED path, which is the only
+path that materializes one: the unsorted path streams a record at a time
+and its heap is flat in group size. `HOGLAKE_COMPACTION_TARGET_BYTES`
+used to stand in for this, on the stated assumption that a flat row's
+object graph is near its byte size. Measured, it is not: a flat
+11-column event row costs about **1.7 KiB** of heap against **119
+bytes** of snappy input — 14x — and since compaction started writing
+zstd its own outputs are **1.70x** denser again, so the same byte budget
+was admitting 24x the rows a heap could hold. A 512 MiB group of zstd
+event data would want roughly 13 GiB.
+
+So the planner works in ROWS and converts. The heap budget divides by
+the live schema's node count (~192 B per materialized node, measured) to
+give a row ceiling; the table's own registered bytes-per-row — from
+`hog_data_file.file_size_bytes` and `record_count`, metadata only, no
+footer reads — converts that ceiling back into the byte budget the tier
+ladder is planned under, capped at the target. Denser inputs therefore
+buy fewer bytes per group, automatically and per table, with no guessed
+compression ratio anywhere. One consequence is worth stating plainly: a
+file that alone holds more rows than the ceiling stops being a compaction
+candidate, because merging it could not fit the sort buffer.
+
+The ladder's scaling is an average, so the exact check happens per
+group: a planned group whose registered survivor count is above the
+ceiling is refused in METADATA, counted as `heap_budget_exceeded` and
+exported as `hoglake_compaction_skipped_total{reason="heap_budget"}`. It
+costs no object-store IO, unlike the `java.lang.OutOfMemoryError` ninety
+seconds into a rewrite that it replaces (hoglake#118), and it does not
+consume the run's group budget — a table that cannot compact must not
+starve the ones that can. Raising it means raising the process heap with
+it; dropping a table's sort order moves it to the streaming path, where
+group size costs no heap at all.
+
 `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
 one ROW's materialized object graph, which no group-level budget can:
 both rewrite paths materialize a row whole, so a single row holding a

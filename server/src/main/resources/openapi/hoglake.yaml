@@ -2331,7 +2331,8 @@ components:
       type: object
       required: [groups_compacted, files_in, files_out, bytes_in,
                  bytes_out, skipped_conflicts, dv_superseded,
-                 unconvertible_schema, invalid_data, failed_groups]
+                 unconvertible_schema, invalid_data, heap_budget_exceeded,
+                 failed_groups]
       properties:
         groups_compacted: { type: integer, format: int64 }
         files_in: { type: integer, format: int64 }
@@ -2378,6 +2379,25 @@ components:
             the group is re-planned and re-refused every sweep. The axis
             is durability and fault, not values-versus-schema: a nonzero
             count is a writer bug, not a backlog.
+        heap_budget_exceeded:
+          type: integer
+          format: int64
+          description: >
+            Groups the SORTED rewrite path declined because
+            materializing them to sort would not fit the compaction heap
+            budget: tier-eligible by input bytes, too many rows for the
+            heap. Refused in metadata at planning time from the
+            registered record counts, before any object-store IO, so a
+            group that cannot fit never spends ninety seconds finding
+            out.
+
+            Durable, like invalid_data, but the fault is neither the
+            writer's nor the schema's: it is a table whose sort order and
+            row width exceed the heap this process was given. It clears
+            by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a heap
+            sized for it) or by dropping the table's sort order, which
+            moves it to the streaming path where group size costs no
+            heap.
         failed_groups:
           type: integer
           format: int64

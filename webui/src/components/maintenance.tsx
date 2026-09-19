@@ -117,6 +117,7 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         r.dv_superseded,
         r.unconvertible_schema,
         r.invalid_data,
+        r.heap_budget_exceeded,
         r.failed_groups,
       ].some(positive);
     }
@@ -218,12 +219,14 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {(positive(r.skipped_conflicts) ||
             positive(r.dv_superseded) ||
             positive(r.unconvertible_schema) ||
-            positive(r.invalid_data)) && (
+            positive(r.invalid_data) ||
+            positive(r.heap_budget_exceeded)) && (
             <span className="badge badge-warn">
               skipped {formatCount(r.skipped_conflicts)}, dv-superseded{" "}
               {formatCount(r.dv_superseded)}, unconvertible{" "}
               {formatCount(r.unconvertible_schema)}, invalid-data{" "}
-              {formatCount(r.invalid_data ?? "0")}
+              {formatCount(r.invalid_data ?? "0")}, heap-budget{" "}
+              {formatCount(r.heap_budget_exceeded ?? "0")}
             </span>
           )}
         </>

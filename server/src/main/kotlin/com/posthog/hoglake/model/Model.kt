@@ -930,6 +930,26 @@ data class CompactionResult(
      */
     val invalidData: Long = 0,
     /**
+     * Groups the SORTED path declined because materializing them would
+     * not fit CompactionConfig.sortedHeapBytes — tier-eligible by bytes,
+     * too many rows for the heap.
+     *
+     * Almost always refused in METADATA, at planning, from
+     * hog_data_file.record_count: exact, free, and before any IO. The
+     * remainder is an OutOfMemoryError actually caught mid-rewrite,
+     * which means the per-node heap estimate is wrong for that table's
+     * shape and ends the sweep.
+     *
+     * Durable like [invalidData] — the same table re-plans and
+     * re-refuses every sweep — but the fault is neither the writer's nor
+     * the schema's: it is a table whose sort order plus row width
+     * exceeds the heap this process was given. It clears by raising
+     * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a heap sized for it) or
+     * by dropping the sort order, which puts the table on the streaming
+     * path where group size costs no heap at all.
+     */
+    val heapBudgetExceeded: Long = 0,
+    /**
      * Groups that FAILED outright (unreadable input, S3 error, corrupt
      * DV): the group is retried next run, and unlike the skip flavors
      * this is not self-healing signal — a nonzero count here with a

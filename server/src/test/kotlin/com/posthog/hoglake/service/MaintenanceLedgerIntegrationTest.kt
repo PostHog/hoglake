@@ -169,6 +169,9 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(result["invalid_data"].asLong())
             .describedAs("normalized on READ; the counter did not exist, so nothing it counts happened")
             .isZero()
+        assertThat(result["heap_budget_exceeded"].asLong())
+            .describedAs("and every counter added after it, by the same rule")
+            .isZero()
         // Every other field survives untouched, and the row is complete
         // against the schema's required list.
         assertThat(result["groups_compacted"].asLong()).isEqualTo(2)
@@ -176,7 +179,7 @@ class MaintenanceLedgerIntegrationTest {
             .containsExactlyInAnyOrder(
                 "groups_compacted", "files_in", "files_out", "bytes_in", "bytes_out",
                 "skipped_conflicts", "dv_superseded", "unconvertible_schema",
-                "invalid_data", "failed_groups",
+                "invalid_data", "heap_budget_exceeded", "failed_groups",
             )
     }
 

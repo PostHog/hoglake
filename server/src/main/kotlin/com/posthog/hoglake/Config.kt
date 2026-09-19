@@ -77,20 +77,39 @@ data class Config(
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
     /**
-     * Sorted-path heap derate for NESTED tables: the group byte budget a
-     * table with both nested columns and a live sort order is planned
-     * under is compaction_target_bytes / this. The sorted path
-     * materializes a whole group to sort it, and a nested row's object
-     * graph measured 30-70x its compressed bytes, so the raw target is
-     * not a heap bound for such a table. 1 disables the derate — which
-     * is the setting to reach for only with a heap sized for it.
-     * See CompactionConfig.nestedSortExpansion.
+     * Sorted-path heap derate for NESTED tables: the sorted ROW CEILING
+     * of a table with both nested columns and a live sort order is
+     * divided by this. The sorted path materializes a whole group to
+     * sort it, and a nested row's node count is not knowable from the
+     * catalog (list lengths are data) — measured at 30-70x its
+     * compressed bytes — so the per-node accounting below cannot see it.
+     * 1 disables the derate, which is the setting to reach for only with
+     * a heap sized for it. See CompactionConfig.nestedSortExpansion.
      */
     val compactionNestedSortExpansion: Int =
         env(
             "HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION",
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
+    /**
+     * How much HEAP one group's sorted-path materialization may take,
+     * default 512 MiB. This — not compaction_target_bytes — is the
+     * sorted path's bound: the planner converts it to a row ceiling
+     * using the live schema's node count, and converts THAT back to a
+     * group byte budget using the table's own observed bytes-per-row.
+     *
+     * Raise it only alongside the process heap
+     * (-XX:MaxRAMPercentage in server/build.gradle.kts): the default is
+     * sized at under a fifth of the ~2.8 GiB a 4 GiB maintenance pod
+     * gets, leaving room for the whole-object byte arrays compaction
+     * buffers and the request path sharing the process.
+     * See CompactionConfig.sortedHeapBytes.
+     */
+    val compactionSortedHeapBytes: Long =
+        env(
+            "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SORTED_HEAP_BYTES}",
+        ).toLong(),
     /**
      * Per-ROW node budget for the compaction rewrite. Bounds one row's
      * materialized object graph, which no group-level budget can; a row

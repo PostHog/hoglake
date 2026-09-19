@@ -116,6 +116,13 @@ object Metrics {
      * is visible as a failure, which is exactly why neither gets
      * noticed.
      *
+     * `heap_budget` is a third of the same kind: a table whose sorted
+     * groups are too many ROWS for the compaction heap budget stops
+     * compacting, silently, forever — the debt page shows growing debt
+     * and nothing says why. It is also the counter that says the row
+     * ceiling is doing its job, since the alternative reading of the
+     * same condition is the OOM it replaced.
+     *
      * `failed` joins them, for the opposite reason: it IS the red-flag
      * outcome and it had no series either. (An earlier version of this
      * comment claimed every other compaction outcome was already a

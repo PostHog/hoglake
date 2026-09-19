@@ -403,6 +403,20 @@ export interface CompactionResult {
    * `positive()`, which is undefined-safe.
    */
   invalid_data?: Int64;
+  /**
+   * Groups the SORTED rewrite path declined because materializing them
+   * to sort would not fit the compaction heap budget: tier-eligible by
+   * input bytes, too many rows for the heap. Refused in metadata at
+   * planning time, before any object-store IO.
+   *
+   * Durable like invalid_data, but the fault is neither the writer's nor
+   * the schema's — it is a table whose sort order and row width exceed
+   * the heap the server was given.
+   *
+   * OPTIONAL for the same reason invalid_data is: the counter postdates
+   * ledger rows a rolling deploy can still serve from an older server.
+   */
+  heap_budget_exceeded?: Int64;
   /** Groups that failed outright (logged, retried next run) — red-flag counter. */
   failed_groups: Int64;
 }
