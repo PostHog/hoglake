@@ -81,8 +81,6 @@ from . import events as E
 from . import pacing
 from .distribution import (
     DEFAULT_TEAMS,
-    DEFAULT_WHALE_SHARE,
-    DEFAULT_ZIPF_S,
     TeamDistribution,
 )
 
@@ -492,9 +490,7 @@ def _chunk_rows(rate_per_s: float) -> int:
 
 
 def run(bench: Bench, args: argparse.Namespace) -> None:
-    teams = TeamDistribution.build(
-        teams=args.teams, whale_share=args.whale_share, zipf_s=args.zipf
-    )
+    teams = TeamDistribution.build(teams=args.teams)
     speedup = (
         pacing.speedup_for_hours_per_minute(args.hours_per_minute)
         if args.hours_per_minute
@@ -546,8 +542,8 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
         f"{', '.join(E.SORT_COLUMNS)}]\n"
         f"  rate={'unlimited' if rate <= 0 else f'{rate:,.0f} events/s'}  "
         f"flush={args.flush_mb:g}MB Arrow or {args.flush_seconds:g}s  "
-        f"teams={len(teams.team_ids)} (whale {teams.whale_id} at "
-        f"{teams.whale_share * 100:.0f}%)  "
+        f"teams={len(teams.team_ids):,} (busiest {teams.whale_id} at "
+        f"{teams.whale_share * 100:.1f}%)  "
         f"event-time x{speedup:g}\n"
         "  Ctrl-C to stop (again to exit immediately)",
         flush=True,
@@ -737,8 +733,6 @@ def _journal_params(
         "flush_mb": args.flush_mb,
         "flush_seconds": args.flush_seconds,
         "teams": args.teams,
-        "whale_share": args.whale_share,
-        "zipf": args.zipf,
         "properties_bytes": args.properties_bytes,
         "hours_per_minute": args.hours_per_minute,
         "event_time_speedup": speedup,
@@ -795,20 +789,6 @@ def add_args(p: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_TEAMS,
         help=f"how many teams the stream covers (default {DEFAULT_TEAMS})",
-    )
-    p.add_argument(
-        "--whale-share",
-        type=float,
-        default=DEFAULT_WHALE_SHARE,
-        help="share of all events belonging to the single dominant team "
-        f"(default {DEFAULT_WHALE_SHARE:g} — a PLAUSIBLE shape, not a "
-        "measured production distribution)",
-    )
-    p.add_argument(
-        "--zipf",
-        type=float,
-        default=DEFAULT_ZIPF_S,
-        help=f"power-law exponent over the non-whale tail (default {DEFAULT_ZIPF_S:g})",
     )
     p.add_argument(
         "--defer-stats",

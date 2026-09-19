@@ -237,27 +237,40 @@ of this flag.
 
 ### What the default distribution is, and is not
 
-Teams are drawn from a **whale plus a Zipf tail**: one team takes
-`--whale-share` of all events outright (default `0.45`), and the
-remaining teams split the rest by a power law with exponent `--zipf`
-(default `1.1`) over `--teams` teams (default 250). At the defaults the
-whale (`team_id` 10000) carries 45%, the runner-up 11.4%, the tenth team
-1.0%, and the smallest 0.03% — synthetic ids from 10000, identifying
-nothing.
+Teams are drawn from a **volume ladder**, not a formula. A handful of
+`(rank fraction, volume relative to the median tenant)` anchors, with
+log-log interpolation between them — so each segment is a power law and
+the joins are continuous. `stream/distribution.py` holds the anchors.
 
-**That default is a plausible shape, not a measured production
-distribution, and nothing in this repo or in millpond can make it one.**
-What the trees actually contain: `seed`'s own `TEAM_WEIGHTS` is
-self-labelled as a deliberate synthetic skew and its tests only assert
-that the weights sum to 1; millpond's include/exclude config is an
-allowlist — membership with no volume attached — whose live contents
-come from a control-plane endpoint the repo deliberately knows nothing
-about; and millpond's own load generator picks `team_id` *uniformly*,
-applying its Zipf law to `distinct_id` instead. The nearest real
-measurement that could exist is millpond's
-`millpond_filter_matched_total{value=...}` series at run time. If
-somebody reads it, change the default and say so in
-`stream/distribution.py`.
+A single exponent cannot model this shape. Between the busiest tenant
+and the 99th percentile, volume falls about as fast as rank rises — an
+exponent near 1. Between the 99th and the 50th, the same fit gives an
+exponent near 2. Fit the head and the median tenant comes out orders of
+magnitude too busy; fit the median and the largest tenant vanishes.
+
+At the defaults — 150,000 teams — the busiest tenant carries a few
+percent of all events, the 99th percentile sends ~1,600x the median
+tenant, the 95th ~193x, and the long tail below the median is nearly
+idle. The mean is two orders of magnitude above the median, which is
+why no per-tenant sizing should ever use the mean.
+
+The ladder is **calibrated to the shape of a large multi-tenant event
+stream, and deliberately records no provenance**: volumes are multiples
+of the median, so only the ratios mean anything, and there are no
+absolute throughputs in it. Absolute rate is `--rate`. Team ids are
+synthetic, dense from 10000, and identify nothing.
+
+Two properties it gets right that a whale-plus-Zipf model did not:
+
+- **A flush covers the active head**, so a file's `team_id` bounds span
+  essentially the whole domain however its rows are ordered. That is a
+  property of flush-by-time-and-size, and it is why file-level pruning
+  on a tenant key is worthless until compaction produces range-disjoint
+  files.
+- **Team id is independent of volume** — ids come from a seeded shuffle.
+  Dense ascending ids paired with descending weights would make sorting
+  by `team_id` almost the same thing as sorting by volume, which
+  flatters any layout scheme measured against it.
 
 Weights are fixed for the life of a run, so a whale stays a whale across
 hours; `--seed` makes the whole stream reproducible.
@@ -271,7 +284,7 @@ hours; `--seed` makes the whole stream reproducible.
 | `--flush-mb` | `100` | flush after this many MB of buffered **Arrow** bytes (millpond's `FLUSH_SIZE`) |
 | `--flush-seconds` | `60` | ...or after this long, whichever comes first (millpond's `FLUSH_INTERVAL_MS`) |
 | `--hours-per-minute` | real time | compress event time so hour partitions roll over without waiting |
-| `--teams` / `--whale-share` / `--zipf` | `250` / `0.45` / `1.1` | the distribution above |
+| `--teams` | `150000` | how many tenants the ladder spreads over (the distribution above) |
 | `--properties-bytes` | `192` | size of the per-row properties blob |
 | `--max-events` / `--duration` | unbounded | bounded runs, for tests |
 | `--max-flush-retries` | `8` | attempts per flush before the run gives up |

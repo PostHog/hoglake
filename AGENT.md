@@ -544,4 +544,7 @@ predecessor's production bugs, and where hoglake answers each).
 [hedgerow](hedgerow/README.md) · [bench](bench/README.md).
 
 Bug-hunt writeups and in-flight worklists stay local-only (they are
-snapshots of a moving tree, not documentation).
+snapshots of a moving tree, not documentation). Name one
+`<whatever>-not-for-commit.md` and `.gitignore` will refuse to stage it
+— no edit to `.gitignore`, and the filename never lands in a tracked
+file, which matters when the name itself would disclose something.

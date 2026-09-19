@@ -3,6 +3,13 @@
 
 # Local-only working documents (bug-hunt snapshots, in-flight worklists,
 # personal trackers) — never committed; see AGENT.md doc conventions.
+#
+# The general rule first: anything named *-not-for-commit.* is local, so
+# a working document can be made unstageable by naming it, without
+# editing this file and without the filename itself landing in a tracked
+# file. That last part matters when the document is a design note or a
+# calibration export whose NAME would disclose something.
+*-not-for-commit.*
 /plan.md
 /gaps.md
 /bugs.md
