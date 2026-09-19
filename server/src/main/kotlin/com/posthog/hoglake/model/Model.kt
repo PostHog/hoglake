@@ -944,9 +944,15 @@ data class CompactionResult(
      * re-refuses every sweep — but the fault is neither the writer's nor
      * the schema's: it is a table whose sort order plus row width
      * exceeds the heap this process was given. It clears by raising
-     * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a heap sized for it) or
+     * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD sized for it) or
      * by dropping the sort order, which puts the table on the streaming
      * path where group size costs no heap at all.
+     *
+     * TEMPORARY, and a nonzero count should be read that way. The
+     * ceiling exists only because the sorted rewrite sorts a whole group
+     * in memory; an external merge sort removes it, and compaction's own
+     * outputs are already sorted runs, so tier 2 and above barely need
+     * one. See CompactionConfig.sortedHeapBytes for the full argument.
      */
     val heapBudgetExceeded: Long = 0,
     /**

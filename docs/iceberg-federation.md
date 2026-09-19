@@ -336,7 +336,9 @@ materialized heap against 119 bytes of snappy input (14x), and
 compaction's own zstd outputs are 1.70x denser again (24x).
 
 So the sorted path is bounded in ROWS.
-`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default 512 MiB) divided by the
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default 1 GiB — the largest
+value safe on today's 4 GiB maintenance pod; bigger pods take
+proportionally more, see server/README.md) divided by the
 live schema's node count (~192 B per node, measured) gives a row
 ceiling; the table's registered bytes-per-row — catalog metadata, never
 a footer read — converts that ceiling into the byte budget the tier
@@ -349,6 +351,16 @@ that is still above the ceiling on its registered counts is refused in
 metadata as `heap_budget_exceeded`, before any IO. That is a bounded
 mitigation per GROUP, not spilling; the per-ROW bound is the node budget
 above.
+
+The group bound is explicitly TEMPORARY. It exists only because the
+sorted rewrite sorts a whole group in memory, and the replacement is an
+external merge sort: at tier 2 and above every input is a previous
+compaction output and therefore an already-sorted run, so a k-way merge
+holds one row per input rather than the whole group, while tier-1 client
+files — whose sort order is advisory and never verified by the server —
+are the smallest and can each be sorted alone and spilled as a temp run
+to the scratch directory the rewrite already uses. That removes the heap
+bound on group size, and with it the knob, the ceiling and the skip.
 A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
 **zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
 gzip, lz4_raw and uncompressed are the other legal names, and an

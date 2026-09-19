@@ -98,11 +98,60 @@ data class CompactionConfig(
      * which is why the conversion between them ([effectiveTargetBytes])
      * has to consult it.
      *
-     * 512 MiB, against the ~2.8 GiB heap `MaxRAMPercentage` gives the
-     * 4 GiB maintenance pod (server/build.gradle.kts): under a fifth of
-     * the heap for the sort buffer, leaving the rest for the whole-object
-     * input/output byte arrays compaction still buffers, parquet-java's
-     * own row-group buffering, and the request path sharing the process.
+     * # THIS BOUND IS TEMPORARY, AND THE WAY OUT IS KNOWN
+     *
+     * It exists because the sorted rewrite reads the WHOLE group into an
+     * `ArrayList<Group>` and calls `sortedWith`. That is an in-memory
+     * sort, so the group has to fit in memory, so the group has to be
+     * small — measured, about 34 MiB of zstd input per GiB of sort
+     * buffer for a ten-column table. Capping a 512 MiB compaction target
+     * at tens of megabytes is a real cost: sorted tables stop being
+     * compacted to the size the ladder was designed around, and no
+     * setting of this knob fixes that, it only moves it.
+     *
+     * The fix is an EXTERNAL MERGE SORT, and compaction is unusually
+     * well set up for one:
+     *
+     *  - **Tier 2 and above need no sort at all.** Every input to those
+     *    groups is a previous compaction OUTPUT, and this rewriter sorts
+     *    what it writes (`ParquetRewriter.rewriteInto`, and
+     *    schema.sql's sort-spec comment: the spec is BINDING for
+     *    compaction rewrites). So each input is an already-sorted RUN,
+     *    and merging k sorted runs needs one row per run in a priority
+     *    queue — O(files) live rows, not O(group). The tier ladder means
+     *    this is where almost all the bytes are.
+     *  - **Tier 1 cannot assume it**, because a client's sort order is
+     *    ADVISORY — `schema.sql` says so in as many words, and the server
+     *    never verifies file sortedness. But tier-1 files are the
+     *    SMALLEST ones by construction, and sorting one file alone is
+     *    bounded by that one file rather than by the group. Sort each
+     *    tier-1 input on its own, spill it as a temp run to the scratch
+     *    directory the rewrite already uses (`compactGroup` creates one
+     *    per group; the Dockerfile notes compaction spills under
+     *    `java.io.tmpdir`), and stream-merge the runs like any other.
+     *
+     * Do that and group size stops being a heap question entirely — this
+     * knob, [sortedRowCeiling], and the `heap_budget` skip all go away.
+     * Until then this is the bound that converts an OOM into a counted
+     * refusal (hoglake#118).
+     *
+     * # The default, and the pod it assumes
+     *
+     * 1 GiB, which is the LARGEST value that is safe on the maintenance
+     * pod as it exists today: 4 GiB, so ~2.8 GiB of heap at the image's
+     * `MaxRAMPercentage=70` (server/build.gradle.kts). Worst-case peak
+     * at 1 GiB is ~1260 MiB — the sort buffer's measured ~0.79x of the
+     * declared budget (the 192 B/node constant rounds up from 151.6),
+     * plus the group's input and output byte arrays, plus parquet-java's
+     * 128 MiB row-group block, plus the hydrator's 256 MiB whole-object
+     * ceiling if it fires in the same tick — which is 44% of that heap.
+     * Going higher on a 4 GiB pod spends margin this process does not
+     * have.
+     *
+     * Bigger pods buy proportionally bigger groups, and the arithmetic
+     * is linear (server/README.md carries the table). Raising this knob
+     * WITHOUT raising the pod converts the counted refusal back into the
+     * OOM it replaced.
      */
     val sortedHeapBytes: Long = DEFAULT_SORTED_HEAP_BYTES,
     /**
@@ -245,8 +294,17 @@ data class CompactionConfig(
          */
         const val SORTED_HEAP_BYTES_PER_NODE = 192L
 
-        /** See [sortedHeapBytes]: under a fifth of the maintenance pod's heap. */
-        const val DEFAULT_SORTED_HEAP_BYTES = 512L * 1024 * 1024
+        /**
+         * See [sortedHeapBytes] — including why this bound is TEMPORARY
+         * and what replaces it (an external merge sort, which tier 2+
+         * barely needs since its inputs are already sorted runs).
+         *
+         * 1 GiB: the largest value whose worst-case peak (~1260 MiB)
+         * still fits the 4 GiB maintenance pod's ~2.8 GiB heap with
+         * margin. Bigger pods take a bigger value; the knob is linear in
+         * the group bytes it buys and server/README.md has the ladder.
+         */
+        const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
     }
 }
 
@@ -648,9 +706,15 @@ class CompactionService(
                 "compaction refused ${refused.size} tier-eligible group(s) of " +
                     "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +
                     "${refused.maxOf { it.second.survivingRecords }} rows against a ceiling of " +
-                    "$ceiling (heap budget ${cfg.sortedHeapBytes} B). The table keeps its debt; " +
-                    "raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES with a heap sized for it, or drop " +
-                    "the table's sort order to take the streaming path"
+                    "$ceiling (heap budget ${cfg.sortedHeapBytes} B). The table keeps its debt. " +
+                    "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
+                    "pod's memory (the default is sized for a 4 GiB pod), or drop the table's " +
+                    "sort order to move it to the streaming path, whose heap is flat in group " +
+                    "size. This ceiling is TEMPORARY: the sorted rewrite sorts the whole group " +
+                    "in memory, and replacing that with an external merge sort removes it — " +
+                    "tier-2-and-above inputs are already-sorted compaction outputs, so merging " +
+                    "them needs one row per input rather than all of them. See " +
+                    "CompactionConfig.sortedHeapBytes"
             }
         }
         // Most-fragmented tier first, then row-id order within the tier.
@@ -847,7 +911,9 @@ class CompactionService(
                             "$catalog/$namespace.$table despite a row ceiling of " +
                             "${cfg.sortedRowCeiling(ctx.columns)}; ending the sweep. The " +
                             "per-node heap estimate is too small for this table's shape — " +
-                            "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or raise the heap"
+                            "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or raise the heap. " +
+                            "Both are workarounds for an in-memory group sort that should be " +
+                            "an external merge sort; see CompactionConfig.sortedHeapBytes"
                     }
                     break@outer
                 } catch (e: Exception) {

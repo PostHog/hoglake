@@ -93,17 +93,22 @@ data class Config(
         ).toInt(),
     /**
      * How much HEAP one group's sorted-path materialization may take,
-     * default 512 MiB. This — not compaction_target_bytes — is the
+     * default 1 GiB. This — not compaction_target_bytes — is the
      * sorted path's bound: the planner converts it to a row ceiling
      * using the live schema's node count, and converts THAT back to a
      * group byte budget using the table's own observed bytes-per-row.
      *
-     * Raise it only alongside the process heap
-     * (-XX:MaxRAMPercentage in server/build.gradle.kts): the default is
-     * sized at under a fifth of the ~2.8 GiB a 4 GiB maintenance pod
-     * gets, leaving room for the whole-object byte arrays compaction
-     * buffers and the request path sharing the process.
-     * See CompactionConfig.sortedHeapBytes.
+     * The default is the largest value that is safe on the maintenance
+     * pod AS IT IS TODAY (4 GiB, so ~2.8 GiB of heap at the image's
+     * MaxRAMPercentage=70): worst-case peak ~1260 MiB, 44% of that heap.
+     * Raise it only together with the pod's memory — on a bigger pod the
+     * group bytes it buys scale linearly (server/README.md has the
+     * ladder), and raising it WITHOUT the pod turns a counted refusal
+     * back into the OOM it replaced.
+     *
+     * TEMPORARY. The bound exists only because the sorted rewrite sorts
+     * a whole group in memory; an external merge sort removes it
+     * entirely. See CompactionConfig.sortedHeapBytes.
      */
     val compactionSortedHeapBytes: Long =
         env(

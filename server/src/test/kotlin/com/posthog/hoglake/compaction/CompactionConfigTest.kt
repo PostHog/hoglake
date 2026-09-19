@@ -411,9 +411,75 @@ class CompactionConfigTest {
             assertThat(Files.readString(Path.of(doc)))
                 .describedAs("%s must document HOGLAKE_COMPACTION_SORTED_HEAP_BYTES's real default", doc)
                 .contains("HOGLAKE_COMPACTION_SORTED_HEAP_BYTES")
-                .contains("512 MiB")
+                .contains("1 GiB")
         }
-        assertThat(CompactionConfig.DEFAULT_SORTED_HEAP_BYTES).isEqualTo(512L * 1024 * 1024)
+        assertThat(CompactionConfig.DEFAULT_SORTED_HEAP_BYTES).isEqualTo(1024L * 1024 * 1024)
+    }
+
+    @Test
+    fun `the default is sized for the pod the maintenance deployment actually has`() {
+        // The knob is only honest if its default is safe on the pod that
+        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap, and
+        // the worst-case peak is the sort buffer (measured 0.79x of the
+        // DECLARED budget, since 192 B/node rounds 151.6 up) plus the
+        // group's input and output byte arrays, plus parquet-java's
+        // 128 MiB row-group block, plus the hydrator's 256 MiB
+        // whole-object ceiling firing in the same tick.
+        //
+        // Pinned as an inequality against the REAL heap rather than as
+        // an equality on the constant: the failure this guards is
+        // someone raising the default because bigger groups would be
+        // nice, without the charts change that makes it survivable.
+        val podBytes = 4.0 * 1024 * 1024 * 1024
+        val heap = podBytes * 0.70
+        val declared = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
+        val sortBuffer = declared * (151.6 / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE)
+        // Group bytes at the measured zstd density, which is the denser
+        // of the two and therefore the smaller group — but the input and
+        // output arrays are the group's, so use snappy's larger number.
+        val groupBytes = declared * (119.0 / 11.0) / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE
+        val peak = sortBuffer + 2 * groupBytes + (128 + 256) * 1024 * 1024
+        assertThat(peak / heap)
+            .describedAs(
+                "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
+                peak / 1024 / 1024,
+                heap / 1024 / 1024,
+            )
+            .isLessThan(0.5)
+    }
+
+    @Test
+    fun `the sorted heap cap is labelled temporary with its replacement named`() {
+        // The cap costs real throughput — sorted tables compact to tens
+        // of megabytes instead of the 512 MiB the ladder is designed
+        // around — and it ships anyway because it converts an OOM into a
+        // counted refusal. What must not happen is it quietly becoming
+        // the permanent answer because nobody wrote down that a real fix
+        // exists. The fix is an external merge sort: tier-2+ inputs are
+        // compaction's own outputs and therefore already-sorted runs, so
+        // a k-way merge holds one row per input instead of the group.
+        //
+        // Pinned in the two places someone hitting the ceiling lands:
+        // the knob's own doc comment, and the operator-facing docs.
+        val source = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/compaction/CompactionService.kt"))
+        assertThat(source)
+            .describedAs("CompactionConfig.sortedHeapBytes must say the bound is temporary")
+            .containsIgnoringCase("TEMPORARY")
+            .describedAs("...and must name the way out, not just that one exists")
+            .containsIgnoringCase("external merge sort")
+            .containsIgnoringCase("already-sorted")
+        // And the refusal itself, since a log line is what an operator
+        // reads before they ever open the source.
+        assertThat(source)
+            .describedAs("the heap_budget refusal must point at the same argument")
+            .containsPattern("""(?s)compaction refused .{0,2000}external merge sort""")
+
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must mark the sorted cap temporary and name the replacement", doc)
+                .containsIgnoringCase("external merge sort")
+                .containsIgnoringCase("advisory")
+        }
     }
 
     @Test

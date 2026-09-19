@@ -2394,10 +2394,19 @@ components:
             Durable, like invalid_data, but the fault is neither the
             writer's nor the schema's: it is a table whose sort order and
             row width exceed the heap this process was given. It clears
-            by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a heap
+            by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD
             sized for it) or by dropping the table's sort order, which
             moves it to the streaming path where group size costs no
             heap.
+
+            TEMPORARY. The ceiling exists only because the sorted rewrite
+            sorts a whole group in memory. An external merge sort removes
+            it: at tier 2 and above every input is a previous compaction
+            output and therefore an already-sorted run, so merging needs
+            one row per input rather than all of them, and tier-1 client
+            files (whose sort order is advisory and unverified) are the
+            smallest and can each be sorted alone and spilled to the
+            scratch directory the rewrite already uses.
         failed_groups:
           type: integer
           format: int64
