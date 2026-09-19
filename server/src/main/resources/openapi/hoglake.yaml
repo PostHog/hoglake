@@ -314,9 +314,47 @@ paths:
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
         - { $ref: "#/components/parameters/atTimestamp" }
+        - name: sort
+          in: query
+          required: false
+          description: >
+            Column to order by. One of the raw stored columns: id, path,
+            record_count, size, stats, begin_snapshot. Omitted means
+            manifest order (begin_snapshot, row_id_start, data_file_id).
+            The decoded columns the console also shows (partition, and
+            the ordering-key bounds) are NOT sortable here: their display
+            order is computed from encoded bytes and a text[] of ordinals
+            and matches no single SQL column.
+          schema:
+            type: string
+            enum: [id, path, record_count, size, stats, begin_snapshot]
+        - name: order
+          in: query
+          required: false
+          description: Sort direction; defaults to asc. Ignored without `sort`.
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: limit
+          in: query
+          required: false
+          description: >
+            Page size. OMITTED returns every file (the historical,
+            unbounded behavior). A stable data_file_id tiebreak makes the
+            page boundary deterministic across offsets. Capped at 10000.
+          schema: { type: integer, minimum: 1, maximum: 10000 }
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip; use with `limit` to page. Defaults to 0.
+          schema: { type: integer, minimum: 0 }
       responses:
         "200":
-          description: Files
+          description: >
+            Files, as a bare array. When `limit` is given the array is one
+            page; the client detects a further page by receiving exactly
+            `limit` rows. The shape is unchanged by paging, so an unpaged
+            caller is unaffected.
           content:
             application/json:
               schema:

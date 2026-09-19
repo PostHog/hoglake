@@ -1,6 +1,6 @@
 import { Fragment, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { getFileStats, getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
@@ -26,15 +26,7 @@ import {
   formatCount,
   formatPartitionField,
 } from "../lib/format";
-import {
-  applySort,
-  cmpInt64,
-  cmpText,
-  int64Column,
-  isDecimalInt,
-  nextSort,
-  textColumn,
-} from "../lib/sort";
+import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
 
@@ -498,42 +490,6 @@ function PartitionCell({ decoded }: { decoded: PartitionDecode }) {
   );
 }
 
-/**
- * A file's partition as one ordered sort key.
- *
- * Compared on the STORED ordinals, not on the rendered dates, because
- * the ordinals are what carry the order: `month` is months since 1970-01
- * and floors, so a pre-epoch partition is negative and sorts correctly
- * as an integer while "1969-12" sorts after "2026-04" as text. Where a
- * tuple was not decoded (a foreign spec, an arity mismatch) the rendered
- * text is all there is, and it compares naturally — `team_id=9` before
- * `team_id=10`.
- */
-function cmpPartition(a: PartitionDecode, b: PartitionDecode): number {
-  if (a.kind === "decoded" && b.kind === "decoded") {
-    for (let i = 0; i < Math.min(a.values.length, b.values.length); i++) {
-      const x = a.values[i];
-      const y = b.values[i];
-      const bothInts = isDecimalInt(x.raw) && isDecimalInt(y.raw);
-      const c = bothInts ? cmpInt64(x.raw, y.raw) : cmpText(x.display, y.display);
-      if (c !== 0) return c;
-    }
-    return a.values.length - b.values.length;
-  }
-  return cmpText(partitionSortText(a), partitionSortText(b));
-}
-
-function partitionSortText(d: PartitionDecode): string {
-  switch (d.kind) {
-    case "unpartitioned":
-      return "";
-    case "decoded":
-      return d.values.map((v) => `${v.field}=${v.display}`).join(" / ");
-    default:
-      return d.raw;
-  }
-}
-
 /** The implicit ordering key of an unsorted table, by its server name. */
 const ROW_ID_COLUMN = "_hog_row_id";
 
@@ -608,62 +564,30 @@ function OrderingBoundCell({
   );
 }
 
-type FileSortKey =
-  | "id"
-  | "partition"
-  | "path"
-  | "records"
-  | "size"
-  | "keyMin"
-  | "keyMax"
-  | "stats"
-  | "snapshot";
-
-/** A row plus its decoded partition, so the decode is done once per file. */
-interface FileRow {
-  file: DataFile;
-  partition: PartitionDecode;
-}
-
 /**
- * An ordering-key bound column, compared as the values the bounds are:
- * exact integers when both ends are decimal integers — a long key or a
- * row id runs past 2^53, which is why these arrive as raw tokens — and
- * natural text otherwise. The same rule the partition column uses, for
- * the same reason.
+ * The columns the server can sort a file page by, each mapped to its
+ * wire name. Only the raw stored columns: the listing is paginated
+ * server-side, so sorting is the server's job (a client sort would only
+ * order the loaded page, which is the misleading case the sort lib warns
+ * about). The decoded columns — partition and the ordering-key min/max —
+ * are shown but not sortable: their display order is computed from
+ * encoded bytes and a text[] of ordinals, which no single SQL column's
+ * order matches, so the server refuses to sort by them and neither can
+ * an honest paginated client.
  */
-function boundColumn(
-  get: (row: FileRow) => DecodedBound | undefined,
-): ColumnSort<FileRow> {
-  const text = (row: FileRow): string | undefined => {
-    const bound = get(row);
-    return bound === null || bound === undefined ? undefined : String(bound);
-  };
-  return {
-    compare: (a, b) => {
-      const x = text(a);
-      const y = text(b);
-      return isDecimalInt(x) && isDecimalInt(y) ? cmpInt64(x, y) : cmpText(x, y);
-    },
-    // A file with no range and a file whose bound is a stated null are
-    // both "no value here", and an em dash that merely compared as
-    // smallest would ride to the top of a largest-first sort.
-    absent: (row) => text(row) === undefined,
-  };
-}
+type FileSortKey = "id" | "path" | "records" | "size" | "stats" | "snapshot";
 
-const FILE_COMPARATORS: Record<FileSortKey, ColumnSort<FileRow>> = {
-  id: int64Column((r) => r.file.data_file_id),
-  partition: { compare: (a, b) => cmpPartition(a.partition, b.partition) },
-  path: textColumn((r) => r.file.path),
-  records: int64Column((r) => r.file.record_count),
-  size: int64Column((r) => r.file.file_size_bytes),
-  keyMin: boundColumn((r) => r.file.ordering_bounds?.lower_bound),
-  keyMax: boundColumn((r) => r.file.ordering_bounds?.upper_bound),
-  // Grouping, not ranking: the point is to bring the failures together.
-  stats: textColumn((r) => r.file.stats_state),
-  snapshot: int64Column((r) => r.file.begin_snapshot),
+const FILE_SORT_WIRE: Record<FileSortKey, string> = {
+  id: "id",
+  path: "path",
+  records: "record_count",
+  size: "size",
+  stats: "stats",
+  snapshot: "begin_snapshot",
 };
+
+/** Files shown per page; "Load more" walks offsets in the current sort. */
+const FILE_PAGE_SIZE = 100;
 
 function FilesTab({
   catalog,
@@ -682,16 +606,33 @@ function FilesTab({
   sortSpec?: SortSpec;
   columns?: Column[];
 }) {
-  const { data, isPending, isError, error } = useQuery({
-    queryKey: ["files", catalog, namespace, table, snapshot ?? "head"],
-    queryFn: () => listFiles(catalog, namespace, table, snapshot),
-  });
   const [expanded, setExpanded] = useState<Int64 | null>(null);
-  // null = the server's order, which is the manifest's: begin_snapshot,
-  // then row_id_start, then id.
+  // null = the server's default order (manifest: begin_snapshot,
+  // row_id_start, id). A set sort is in the query key, so it drives the
+  // request and ordering happens server-side over the WHOLE table — a
+  // client sort would only order the loaded page.
   const [sort, setSort] = useState<SortState<FileSortKey> | null>(null);
   const onSort = (key: FileSortKey) => setSort((prev) => nextSort(prev, key));
-  if (isError) return <ErrorBox error={error} />;
+  const query = useInfiniteQuery({
+    queryKey: ["files", catalog, namespace, table, snapshot ?? "head", sort],
+    queryFn: ({ pageParam }) =>
+      listFiles(catalog, namespace, table, snapshot, {
+        sort: sort ? FILE_SORT_WIRE[sort.key] : undefined,
+        order: sort ? (sort.desc ? "desc" : "asc") : undefined,
+        limit: FILE_PAGE_SIZE,
+        offset: pageParam,
+      }),
+    initialPageParam: 0,
+    // A full page means there may be more; the next offset is the count
+    // loaded so far. A short page is the end. (A table whose size is an
+    // exact multiple of the page fetches one empty page to learn it has
+    // stopped — the standard offset-paging cost.)
+    getNextPageParam: (lastPage, allPages) =>
+      lastPage.length === FILE_PAGE_SIZE
+        ? allPages.length * FILE_PAGE_SIZE
+        : undefined,
+  });
+  if (query.isError) return <ErrorBox error={query.error} />;
   // The column appears only for a partitioned table: on an unpartitioned
   // one it would be a column of dashes.
   const partitioned = (spec?.fields.length ?? 0) > 0;
@@ -704,116 +645,106 @@ function FilesTab({
   // toggle column. Drives the skeleton and the empty-state colSpan, so a
   // wrong count shows as a short row rather than an error.
   const cols = partitioned ? 9 : 8;
-  // Sorting is over the WHOLE table: GET /files returns every live file
-  // at the snapshot, so "largest file" here is the largest file, not the
-  // largest of a page.
-  const rows = applySort(
-    (data ?? []).map((file) => ({
-      file,
-      partition: decodePartition(file, spec, columns),
-    })),
-    sort,
-    FILE_COMPARATORS,
-  );
+  // Decoded once per row for display; ordering is the server's.
+  const rows = (query.data?.pages ?? [])
+    .flat()
+    .map((file) => ({ file, partition: decodePartition(file, spec, columns) }));
   return (
-    <table className="data-table">
-      <thead>
-        <tr>
-          <SortableTh label="id" sortKey="id" sort={sort} onSort={onSort} numeric />
-          {partitioned && (
+    <>
+      <table className="data-table">
+        <thead>
+          <tr>
+            <SortableTh label="id" sortKey="id" sort={sort} onSort={onSort} numeric />
+            {/* Partition is decoded client-side from a text[] of ordinals;
+                no SQL column's order matches it, so under server paging it
+                is shown but not sortable. */}
+            {partitioned && <th>partition</th>}
+            <SortableTh label="path" sortKey="path" sort={sort} onSort={onSort} />
             <SortableTh
-              label="partition"
-              sortKey="partition"
+              label="record_count"
+              sortKey="records"
               sort={sort}
               onSort={onSort}
+              numeric
             />
-          )}
-          <SortableTh label="path" sortKey="path" sort={sort} onSort={onSort} />
-          <SortableTh
-            label="record_count"
-            sortKey="records"
-            sort={sort}
-            onSort={onSort}
-            numeric
-          />
-          <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
-          <SortableTh
-            label={`${keyName} min`}
-            sortKey="keyMin"
-            sort={sort}
-            onSort={onSort}
-            numeric
-          />
-          <SortableTh
-            label={`${keyName} max`}
-            sortKey="keyMax"
-            sort={sort}
-            onSort={onSort}
-            numeric
-          />
-          <SortableTh label="stats" sortKey="stats" sort={sort} onSort={onSort} />
-          <SortableTh
-            label="begin_snapshot"
-            sortKey="snapshot"
-            sort={sort}
-            onSort={onSort}
-            numeric
-          />
-        </tr>
-      </thead>
-      {isPending ? (
-        <SkeletonRows rows={5} cols={cols} />
-      ) : (
-        <tbody>
-          {rows.length === 0 && (
-            <tr>
-              <td colSpan={cols} className="empty">
-                No data files at this snapshot.
-              </td>
-            </tr>
-          )}
-          {rows.map(({ file: f, partition }) => (
-            <Fragment key={f.data_file_id}>
+            <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
+            {/* Ordering-key bounds are decoded from encoded bytes, not a
+                sortable SQL column — plain headers, not sortable. */}
+            <th className="num">{`${keyName} min`}</th>
+            <th className="num">{`${keyName} max`}</th>
+            <SortableTh label="stats" sortKey="stats" sort={sort} onSort={onSort} />
+            <SortableTh
+              label="begin_snapshot"
+              sortKey="snapshot"
+              sort={sort}
+              onSort={onSort}
+              numeric
+            />
+          </tr>
+        </thead>
+        {query.isPending ? (
+          <SkeletonRows rows={5} cols={cols} />
+        ) : (
+          <tbody>
+            {rows.length === 0 && (
               <tr>
-                <td className="num mono">{f.data_file_id}</td>
-                {partitioned && <PartitionCell decoded={partition} />}
-                <PathCell path={f.path} />
-                <td className="num mono">{formatCount(f.record_count)}</td>
-                <td className="num mono" title={`${f.file_size_bytes}`}>
-                  {formatBytes(f.file_size_bytes)}
+                <td colSpan={cols} className="empty">
+                  No data files at this snapshot.
                 </td>
-                <OrderingBoundCell file={f} end="lower" />
-                <OrderingBoundCell file={f} end="upper" />
-                <StatsCell
-                  state={f.stats_state}
-                  expanded={expanded === f.data_file_id}
-                  onToggle={() =>
-                    setExpanded(
-                      expanded === f.data_file_id ? null : f.data_file_id,
-                    )
-                  }
-                  fileId={f.data_file_id}
-                />
-                <td className="num mono">{f.begin_snapshot}</td>
               </tr>
-              {expanded === f.data_file_id && (
-                <tr className="detail-row">
-                  <td colSpan={cols}>
-                    <FileStatsPanel
-                      catalog={catalog}
-                      namespace={namespace}
-                      table={table}
-                      fileId={f.data_file_id}
-                      snapshot={snapshot}
-                    />
+            )}
+            {rows.map(({ file: f, partition }) => (
+              <Fragment key={f.data_file_id}>
+                <tr>
+                  <td className="num mono">{f.data_file_id}</td>
+                  {partitioned && <PartitionCell decoded={partition} />}
+                  <PathCell path={f.path} />
+                  <td className="num mono">{formatCount(f.record_count)}</td>
+                  <td className="num mono" title={`${f.file_size_bytes}`}>
+                    {formatBytes(f.file_size_bytes)}
                   </td>
+                  <OrderingBoundCell file={f} end="lower" />
+                  <OrderingBoundCell file={f} end="upper" />
+                  <StatsCell
+                    state={f.stats_state}
+                    expanded={expanded === f.data_file_id}
+                    onToggle={() =>
+                      setExpanded(
+                        expanded === f.data_file_id ? null : f.data_file_id,
+                      )
+                    }
+                    fileId={f.data_file_id}
+                  />
+                  <td className="num mono">{f.begin_snapshot}</td>
                 </tr>
-              )}
-            </Fragment>
-          ))}
-        </tbody>
+                {expanded === f.data_file_id && (
+                  <tr className="detail-row">
+                    <td colSpan={cols}>
+                      <FileStatsPanel
+                        catalog={catalog}
+                        namespace={namespace}
+                        table={table}
+                        fileId={f.data_file_id}
+                        snapshot={snapshot}
+                      />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+          </tbody>
+        )}
+      </table>
+      {query.hasNextPage && (
+        <button
+          type="button"
+          disabled={query.isFetchingNextPage}
+          onClick={() => void query.fetchNextPage()}
+        >
+          {query.isFetchingNextPage ? "Loading…" : "Load more"}
+        </button>
       )}
-    </table>
+    </>
   );
 }
 

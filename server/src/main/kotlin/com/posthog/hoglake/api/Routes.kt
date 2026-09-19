@@ -4,6 +4,7 @@ import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
+import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.ScanService
 import io.ktor.http.HttpStatusCode
@@ -131,6 +132,44 @@ fun Application.installApiRoutes(
                                 )
                             }
                             get("/files") {
+                                val sort =
+                                    call.request.queryParameters["sort"]?.let {
+                                        FileRepo.FileSortColumn.fromWire(it)
+                                            ?: throw BadRequestException(
+                                                "query parameter 'sort' must be one of " +
+                                                    FileRepo.FileSortColumn.entries.joinToString(", ") { c -> c.wire } +
+                                                    ", got '$it'",
+                                            )
+                                    }
+                                val desc =
+                                    when (val o = call.request.queryParameters["order"]) {
+                                        null, "asc" -> false
+                                        "desc" -> true
+                                        else ->
+                                            throw BadRequestException(
+                                                "query parameter 'order' must be 'asc' or 'desc', got '$o'",
+                                            )
+                                    }
+                                // No 'limit' -> unbounded, the historical
+                                // behavior every non-webui caller and the
+                                // existing tests rely on. The webui always
+                                // sends one.
+                                val limit =
+                                    call.intQuery("limit")?.also {
+                                        if (it < 1) {
+                                            throw BadRequestException(
+                                                "query parameter 'limit' must be positive, got '$it'",
+                                            )
+                                        }
+                                    }?.coerceAtMost(FILES_MAX_LIMIT)
+                                val offset =
+                                    call.intQuery("offset")?.also {
+                                        if (it < 0) {
+                                            throw BadRequestException(
+                                                "query parameter 'offset' must be >= 0, got '$it'",
+                                            )
+                                        }
+                                    } ?: 0
                                 call.respond(
                                     catalogs.listFiles(
                                         call.catalog(),
@@ -138,6 +177,10 @@ fun Application.installApiRoutes(
                                         call.table(),
                                         call.longQuery("snapshot"),
                                         call.instantQuery("at_timestamp"),
+                                        sort = sort,
+                                        desc = desc,
+                                        limit = limit,
+                                        offset = offset,
                                     ).map { it.toDto() },
                                 )
                             }
@@ -286,6 +329,9 @@ private fun ApplicationCall.uuidPath(name: String): UUID {
         throw BadRequestException("path parameter '$name' must be a UUID, got '$raw'")
     }
 }
+
+/** Hard cap on a single file page, matching the snapshots endpoint's cap. */
+private const val FILES_MAX_LIMIT = 10_000
 
 private fun ApplicationCall.longQuery(name: String): Long? =
     request.queryParameters[name]?.let {

@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import {
@@ -9,10 +9,7 @@ import {
   sortedTableFixture,
   tableFixture,
 } from "./fixtures";
-import {
-  bigIntFilesWireBody,
-  closeBigIntFilesWireBody,
-} from "./fixtures.adversarial";
+import { bigIntFilesWireBody } from "./fixtures.adversarial";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
 const base = "/v1/catalogs/analytics/namespaces/events/tables/pageviews";
@@ -135,14 +132,16 @@ describe("TablePage", () => {
     // No sort spec means the row id IS the ordering key, and the
     // headers say so by naming it. row_id_start alone is gone: a start
     // with no end never said which files overlap.
+    // The key-bound columns are shown but not sortable (decoded from
+    // encoded bytes, no SQL column to sort by), so plain headers.
     expect(
-      screen.getByRole("button", { name: /^_hog_row_id min/ }),
+      screen.getByRole("columnheader", { name: /_hog_row_id min/ }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /^_hog_row_id max/ }),
+      screen.getByRole("columnheader", { name: /_hog_row_id max/ }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /^row_id_start/ }),
+      screen.queryByRole("columnheader", { name: /row_id_start/ }),
     ).not.toBeInTheDocument();
 
     // Both ends of every file's span, the pending and failed files
@@ -170,13 +169,13 @@ describe("TablePage", () => {
     // tiebreaker and not the row id, which a sorted rewrite remaps and
     // which therefore describes nothing here.
     expect(
-      screen.getByRole("button", { name: /^user_id min/ }),
+      screen.getByRole("columnheader", { name: /user_id min/ }),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: /^user_id max/ }),
+      screen.getByRole("columnheader", { name: /user_id max/ }),
     ).toBeInTheDocument();
     expect(
-      screen.queryByRole("button", { name: /^_hog_row_id/ }),
+      screen.queryByRole("columnheader", { name: /_hog_row_id/ }),
     ).not.toBeInTheDocument();
 
     expect(fileRowCells("201")).toContain("1000");
@@ -229,8 +228,9 @@ describe("TablePage", () => {
     // Files tab inherits the snapshot.
     await user.click(screen.getByRole("tab", { name: "files" }));
     await screen.findByText("500,000");
+    // The files request carries the snapshot (plus the page params).
     expect(fetchMock).toHaveBeenCalledWith(
-      `${base}/files?snapshot=4100`,
+      expect.stringContaining(`${base}/files?snapshot=4100`),
       expect.anything(),
     );
   });
@@ -330,73 +330,109 @@ describe("TablePage", () => {
   });
 
   /** The id cell of every file row, in render order. */
-  function fileIdOrder(): string[] {
-    return screen
-      .getAllByRole("row")
-      .slice(1) // drop the header
-      .map((r) => r.querySelector("td:first-child")?.textContent ?? "")
-      .filter((t) => t !== "");
+  // The most recent GET .../files URL the app issued. The listing is
+  // paginated server-side, so the request — not the rendered order of a
+  // fixed mock — is where the sort lives now.
+  function lastFilesUrl(mock: ReturnType<typeof mockFetch>): string {
+    const calls = mock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.split("?")[0].endsWith("/files"));
+    return calls[calls.length - 1] ?? "";
   }
 
-  it("sorts the files table by any column, and back to the server's order", async () => {
+  it("sorts server-side: each header drives the query with sort, order, and offset 0", async () => {
+    // Ordering moved to the server with pagination — a client sort would
+    // only order the loaded page. So clicking a header must REQUEST the
+    // sort (from the first page), not reshuffle what is on screen.
+    const fetchMock = mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("101");
+
+    // Initial load: manifest order (no sort), and paged.
+    expect(lastFilesUrl(fetchMock)).not.toContain("sort=");
+    expect(lastFilesUrl(fetchMock)).toContain("limit=100");
+    expect(lastFilesUrl(fetchMock)).toContain("offset=0");
+
+    // First click is DESCENDING — "which are the big ones" in one click —
+    // and pages from the top again.
+    const size = screen.getByRole("button", { name: /^size/ });
+    await user.click(size);
+    await waitFor(() => expect(lastFilesUrl(fetchMock)).toContain("sort=size"));
+    expect(lastFilesUrl(fetchMock)).toContain("order=desc");
+    expect(lastFilesUrl(fetchMock)).toContain("offset=0");
+    expect(size.closest("th")).toHaveAttribute("aria-sort", "descending");
+
+    // Second click flips direction.
+    await user.click(size);
+    await waitFor(() => expect(lastFilesUrl(fetchMock)).toContain("order=asc"));
+    expect(size.closest("th")).toHaveAttribute("aria-sort", "ascending");
+
+    // The header label maps to the server's column name.
+    await user.click(screen.getByRole("button", { name: /^record_count/ }));
+    await waitFor(() =>
+      expect(lastFilesUrl(fetchMock)).toContain("sort=record_count"),
+    );
+    // Only one column is ever the active sort.
+    expect(size.closest("th")).toHaveAttribute("aria-sort", "none");
+  });
+
+  it("shows the decoded columns but does not offer sort on them", async () => {
+    // partition and the ordering-key min/max are decoded client-side (a
+    // text[] of ordinals; encoded bound bytes) and match no SQL column's
+    // order, so under server paging they render as plain, unsortable
+    // headers while the raw columns stay sortable.
     mockFetch(happyHandler);
     renderApp(route);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("101");
 
-    // Opens in the server's order, which is the manifest's: by
-    // begin_snapshot, then row_id_start, then id.
-    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
-
-    // First click is DESCENDING: "which are the big ones" in one click.
-    const size = screen.getByRole("button", { name: /^size/ });
-    await user.click(size);
-    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
-    expect(size.closest("th")).toHaveAttribute("aria-sort", "descending");
-
-    await user.click(size);
-    expect(fileIdOrder()).toEqual(["103", "102", "101"]);
-    expect(size.closest("th")).toHaveAttribute("aria-sort", "ascending");
-
-    // record_count and the ordering-key bounds order numerically, not as
-    // text.
-    await user.click(screen.getByRole("button", { name: /^record_count/ }));
-    expect(fileIdOrder()).toEqual(["101", "102", "103"]);
-
-    // A different column starts descending again, and only one column
-    // is ever marked as the sort. The table is unsorted, so its ordering
-    // key is the row id.
-    const keyMin = screen.getByRole("button", { name: /^_hog_row_id min/ });
-    await user.click(keyMin);
-    expect(fileIdOrder()).toEqual(["103", "102", "101"]);
-    expect(keyMin.closest("th")).toHaveAttribute("aria-sort", "descending");
-    expect(
-      screen.getByRole("button", { name: /^record_count/ }).closest("th"),
-    ).toHaveAttribute("aria-sort", "none");
+    for (const label of [/^partition/, /_hog_row_id min/, /_hog_row_id max/]) {
+      expect(screen.queryByRole("button", { name: label })).not.toBeInTheDocument();
+      expect(screen.getByRole("columnheader", { name: label })).toBeInTheDocument();
+    }
+    for (const label of [/^size/, /^record_count/, /^id/, /^path/]) {
+      expect(screen.getByRole("button", { name: label })).toBeInTheDocument();
+    }
   });
 
-  it("sorts file sizes that are the same double exactly", async () => {
-    // Three sizes one apart above 2^53. Through Number they all compare
-    // equal, so a lossy sort returns them untouched — and untouched is
-    // indistinguishable from a correct descending sort unless the input
-    // is ASCENDING, as it is here.
-    mockFetch((url) => {
-      const [path] = url.split("?");
+  it("pages the files with Load more, fetching the next offset", async () => {
+    // A full first page means there may be more; a short second page ends
+    // it. Rows accumulate across pages.
+    const oneFile = (id: number) => ({ ...filesFixture[0], data_file_id: String(id) });
+    const fetchMock = mockFetch((url) => {
+      const [path, qs] = url.split("?");
       if (path === base) return jsonResponse(tableFixture);
-      if (path === `${base}/files`)
-        return new Response(closeBigIntFilesWireBody, {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        });
+      if (path === `${base}/files`) {
+        const offset = Number(new URLSearchParams(qs).get("offset") ?? "0");
+        return jsonResponse(
+          offset === 0
+            ? Array.from({ length: 100 }, (_, i) => oneFile(1000 + i))
+            : [oneFile(2000), oneFile(2001)],
+        );
+      }
       return undefined;
     });
     renderApp(route);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("1000"); // first page landed
 
-    expect(fileIdOrder()).toEqual(["1", "2", "3"]);
-    await user.click(screen.getByRole("button", { name: /^size/ }));
-    expect(fileIdOrder()).toEqual(["3", "2", "1"]);
+    // The first page was full, so Load more is offered.
+    const more = await screen.findByRole("button", { name: /load more/i });
+    await user.click(more);
+
+    // The second page is fetched at the next offset and appended.
+    await waitFor(() => expect(lastFilesUrl(fetchMock)).toContain("offset=100"));
+    await screen.findByText("2000");
+    expect(screen.getByText("1000")).toBeInTheDocument(); // page 1 still there
+
+    // The short page ends paging: no more button.
+    expect(
+      screen.queryByRole("button", { name: /load more/i }),
+    ).not.toBeInTheDocument();
   });
 
   it("sorts the scan table, keeping files without a deletion vector last", async () => {

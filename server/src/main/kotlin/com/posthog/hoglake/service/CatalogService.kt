@@ -393,6 +393,10 @@ class CatalogService(private val jdbi: Jdbi) {
         table: String,
         snapshot: Long? = null,
         atTimestamp: Instant? = null,
+        sort: FileRepo.FileSortColumn? = null,
+        desc: Boolean = false,
+        limit: Int? = null,
+        offset: Int = 0,
     ): List<DataFile> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
@@ -403,12 +407,15 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
                     )
+            // Ordering bounds are attached to the RETURNED page only, so a
+            // paged request pays the bound decode for its page, not the
+            // whole manifest.
             withOrderingBounds(
                 h,
                 cat.catalogId,
                 t.tableId,
                 at,
-                FileRepo.listAt(h, cat.catalogId, t.tableId, at),
+                FileRepo.listAt(h, cat.catalogId, t.tableId, at, sort, desc, limit, offset),
             )
         }
 
