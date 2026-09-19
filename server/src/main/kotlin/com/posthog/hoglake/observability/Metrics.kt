@@ -151,6 +151,18 @@ object Metrics {
         }
     }
 
+    /**
+     * hoglake_multipart_abort_failures_total — aborts of a compaction
+     * output's multipart upload that themselves failed.
+     *
+     * Worth a series of its own because nothing else can see the
+     * consequence: unfinished parts are not objects, so the removal
+     * ledger and the cleanup drain cannot reach them, and they are
+     * billed until a bucket lifecycle rule reaps them. Any sustained
+     * nonzero value here is storage growing silently.
+     */
+    fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
+
     /** hoglake_background_loop_failures_total{loop} — iterations that threw (loop continued). */
     fun backgroundLoopFailure(loop: String) = increment("hoglake_background_loop_failures_total", 1.0, "loop", loop)
 

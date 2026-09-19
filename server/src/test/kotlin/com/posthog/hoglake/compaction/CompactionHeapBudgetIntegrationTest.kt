@@ -334,6 +334,35 @@ class CompactionHeapBudgetIntegrationTest {
         assertVerifyPasses(fx)
     }
 
+    @Test
+    fun `a read fault on an UNSORTED table leaves no object behind`() {
+        // The case the rest of this class cannot reach. On the streaming
+        // path the writer — and therefore the multipart upload — is open
+        // before the first input is read, so a read-side failure has a
+        // live upload to leave behind. It must be discarded, not
+        // completed: completion is atomic, and parquet writes a valid
+        // footer while closing even on the exception path, so a
+        // truncated-but-well-formed object is exactly what an
+        // insufficiently careful implementation publishes here.
+        val cfg = smallFileConfig()
+        val fx = unsortedRealTable("oom-unsorted")
+        val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
+        val headBefore = headSnapshot(fx)
+
+        val result = svc.runOnce(fx, cfg, MaintenanceTrigger.LOOP)
+
+        assertThat(result.groupsCompacted).isZero()
+        assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
+        assertThat(liveFileCount(fx)).isEqualTo(3)
+
+        val staged = removalRows(fx).filter { it.reason == "compaction_staging" }
+        assertThat(staged).describedAs("the path is claimed").hasSize(1)
+        assertThat(objectExists(staged.single().path))
+            .describedAs("nothing may be published at %s", staged.single().path)
+            .isFalse()
+        assertVerifyPasses(fx)
+    }
+
     /**
      * An ObjectStore that exhausts the heap while UPLOADING — after the
      * claim ticket.
@@ -408,6 +437,40 @@ class CompactionHeapBudgetIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         return cat
     }
+
+    /**
+     * The UNSORTED twin of [realTable], which matters more than it
+     * sounds. Every other failure test here sets a sort order, and the
+     * sorted rewrite materialises all its inputs BEFORE opening the
+     * writer — so the upload never starts and a failure cannot leave an
+     * object behind whatever the code does. The streaming path opens
+     * the writer first, which is where a failure genuinely can publish
+     * something, and it had no failure coverage at all.
+     */
+    private fun unsortedRealTable(label: String): String {
+        val cat = "heap-$label-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        val regs =
+            (0 until 3).map { i ->
+                val bytes = parquetBytes((0 until 4).map { it + i * 4L })
+                val path = "s3://$BUCKET/$cat/data/ns/t/r$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 4, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        return cat
+    }
+
+    /** Does the object actually exist in MinIO? */
+    private fun objectExists(pathUri: String): Boolean =
+        try {
+            store.get(pathUri)
+            true
+        } catch (_: Exception) {
+            false
+        }
 
     /** A sorted table with three REAL small parquet objects behind it. */
     private fun realTable(label: String): String {

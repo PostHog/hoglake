@@ -1,6 +1,8 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.observability.Metrics
+import io.github.oshai.kotlinlogging.KotlinLogging
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider
 import software.amazon.awssdk.core.sync.RequestBody
@@ -59,6 +61,8 @@ open class ObjectStore(
             .forcePathStyle(pathStyle)
             .build()
 
+    private val log = KotlinLogging.logger {}
+
     data class Location(val bucket: String, val key: String)
 
     /** Fetch the whole object at [pathUri] (`s3://bucket/key`). */
@@ -102,13 +106,17 @@ open class ObjectStore(
         range: String,
     ): ByteArray {
         val loc = parse(pathUri)
+        // Unsafe = "no defensive copy". Correct here: the response
+        // object is discarded on the next line and nothing else can see
+        // the array, and at one 8 MiB readahead fill per call the copy
+        // asByteArray() makes is a second 8 MiB allocation for nothing.
         return s3.getObjectAsBytes(
             GetObjectRequest.builder()
                 .bucket(loc.bucket)
                 .key(loc.key)
                 .range(range)
                 .build(),
-        ).asByteArray()
+        ).asByteArrayUnsafe()
     }
 
     open fun put(
@@ -194,8 +202,17 @@ open class ObjectStore(
     /**
      * Discard an upload and its parts. Best effort by design: this runs
      * on the failure path, where the original exception is the one worth
-     * propagating, and a failed abort leaves storage that S3 lifecycle
-     * rules are the right tool for.
+     * propagating.
+     *
+     * Best effort is not the same as silent. An abort that keeps failing
+     * — IAM without `s3:AbortMultipartUpload` is the obvious way — leaks
+     * parts that are billed and invisible, and nothing else in the
+     * system can notice: parts are not objects, so neither
+     * `hog_file_removal` nor the cleanup drain can see or reach them.
+     * The only backstop is a bucket lifecycle rule with
+     * AbortIncompleteMultipartUpload, which this repo does not configure
+     * (see server/README.md). So the failure is logged and counted even
+     * though it is not raised.
      */
     open fun abortMultipartUpload(
         pathUri: String,
@@ -207,6 +224,12 @@ open class ObjectStore(
                 AbortMultipartUploadRequest.builder()
                     .bucket(loc.bucket).key(loc.key).uploadId(uploadId).build(),
             )
+        }.onFailure { e ->
+            Metrics.multipartAbortFailed()
+            log.warn(e) {
+                "failed to abort multipart upload $uploadId for $pathUri; its parts are " +
+                    "billed and invisible until a bucket lifecycle rule reaps them"
+            }
         }
     }
 

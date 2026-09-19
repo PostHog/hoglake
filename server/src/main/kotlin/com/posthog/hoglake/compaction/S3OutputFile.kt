@@ -1,7 +1,6 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.hydrator.ObjectStore
-import org.apache.parquet.io.OutputFile
 import org.apache.parquet.io.PositionOutputStream
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -47,7 +46,7 @@ class S3OutputFile(
     private val store: ObjectStore,
     private val path: String,
     private val partSizeBytes: Int = DEFAULT_PART_SIZE_BYTES,
-) : OutputFile {
+) : DiscardableOutputFile {
     init {
         require(partSizeBytes >= MIN_PART_SIZE_BYTES) {
             "part size $partSizeBytes is below S3's $MIN_PART_SIZE_BYTES minimum for $path"
@@ -85,7 +84,22 @@ class S3OutputFile(
     private fun requireClosed(): S3MultipartOutputStream {
         val s = stream ?: error("no output stream was created for $path")
         check(s.isClosed) { "output stream for $path has not been closed" }
+        // Refuse rather than return zero. A stream that aborted still
+        // closes, and these used to answer 0/0 for it — which a caller
+        // would register as file_size_bytes=0, footer_size=0 against a
+        // path holding no object. Silence is the wrong failure here.
+        check(s.isCompleted) { "output stream for $path did not complete; it was discarded" }
         return s
+    }
+
+    /**
+     * Throw the upload away. Idempotent, and safe to call before the
+     * writer has been closed — which is exactly when the rewriter calls
+     * it, because parquet's own close() would otherwise write a valid
+     * footer over a partial row set and satisfy the trailer gate below.
+     */
+    override fun discard() {
+        stream?.discard()
     }
 
     override fun toString(): String = path
@@ -125,6 +139,10 @@ private class S3MultipartOutputStream(
     /** A part upload failed; the object can never be completed. */
     private var failed = false
     var footerSize: Long = 0
+        private set
+
+    /** True only after completeMultipartUpload returned. */
+    var isCompleted: Boolean = false
         private set
 
     override fun getPos(): Long = written
@@ -197,6 +215,13 @@ private class S3MultipartOutputStream(
         buffered = 0
     }
 
+    /** See [S3OutputFile.discard]. */
+    fun discard() {
+        if (failed) return
+        failed = true
+        store.abortMultipartUpload(path, uploadId)
+    }
+
     override fun close() {
         if (isClosed) return
         isClosed = true
@@ -208,12 +233,28 @@ private class S3MultipartOutputStream(
                 "refusing to complete $path: the stream ended without a parquet trailer " +
                     "after $written bytes, so the rewrite did not finish"
             }
-            footerSize =
+            val claimed =
                 ByteBuffer.wrap(trailer, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong()
+            // The magic alone is a weak gate: a trailer reading
+            // (-1, PAR1) passes it, and -1 would go straight into
+            // hog_data_file.footer_size — the column the hydrator's
+            // ranged tail read runs on, and now this reader's prefetch
+            // hint too. Check the length is one this file could hold.
+            require(claimed in 1 until written - TRAILER_BYTES) {
+                "refusing to complete $path: its trailer claims a footer of $claimed bytes, " +
+                    "which does not fit $written bytes of output"
+            }
+            footerSize = claimed
             flushPart()
             store.completeMultipartUpload(path, uploadId, etags)
+            isCompleted = true
         } catch (e: Throwable) {
-            store.abortMultipartUpload(path, uploadId)
+            // flushPart aborts at the point of failure and sets the
+            // flag, so only abort here if it was not already done.
+            if (!failed) {
+                failed = true
+                store.abortMultipartUpload(path, uploadId)
+            }
             if (e is IllegalArgumentException) throw IOException(e.message, e)
             throw e
         }

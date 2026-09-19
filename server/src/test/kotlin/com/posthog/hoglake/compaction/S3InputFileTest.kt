@@ -148,6 +148,47 @@ class S3InputFileTest {
     }
 
     @Test
+    fun `an oversized footer hint is ignored rather than pulling the object onto the heap`() {
+        // The hazardous band the first version of this test missed: a
+        // hint bigger than the readahead but no bigger than the object.
+        // Commit-time validation only rejects footer_size >
+        // file_size - 8 (FileValidation.kt), so a writer can register a
+        // hint of almost the whole object — and an uncapped prefetch
+        // would fetch all of it in one heap array, reinstating exactly
+        // the whole-object GET this class removes.
+        val bytes = ByteArray(4_000_000) { (it % 251).toByte() }
+        val cap = 64 * 1024
+
+        for (hint in listOf(cap.toLong() + 1, 1_000_000L, bytes.size.toLong() - 8)) {
+            val store = FakeStore(bytes)
+            S3InputFile(
+                store,
+                "s3://b/k",
+                bytes.size.toLong(),
+                footerSizeHint = hint,
+                readaheadBytes = 8 * 1024,
+                maxPrefetchBytes = cap,
+            ).newStream().use { }
+            assertThat(store.ranges)
+                .describedAs("hint=%s must not prefetch", hint)
+                .isEmpty()
+        }
+
+        // And a hint under the cap is still taken.
+        val store = FakeStore(bytes)
+        S3InputFile(
+            store,
+            "s3://b/k",
+            bytes.size.toLong(),
+            footerSizeHint = 1024L,
+            readaheadBytes = 8 * 1024,
+            maxPrefetchBytes = cap,
+        ).newStream().use { }
+        assertThat(store.ranges).hasSize(1)
+        assertThat(store.ranges.single().second).isEqualTo(1024 + 8)
+    }
+
+    @Test
     fun `seeking backwards and forwards reads the right bytes`() {
         val bytes = ByteArray(5000) { (it % 251).toByte() }
         val store = FakeStore(bytes)

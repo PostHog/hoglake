@@ -1,11 +1,16 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.io.api.Binary
+import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Type
@@ -15,6 +20,8 @@ import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.nio.file.Files
+import java.nio.file.Path
 
 /**
  * [S3OutputFile] against an in-memory multipart store.
@@ -25,11 +32,23 @@ import java.io.IOException
  * `close()` runs on the exception path too.
  */
 class S3OutputFileTest {
+    private val tmp: Path = Files.createTempDirectory("hoglake-s3-output")
+
     /** Records the multipart protocol and assembles the finished object. */
     private class FakeStore(
         /** Part number to fail on, or null to accept every part. */
         private val failOnPart: Int? = null,
+        /**
+         * Nth uploadPart CALL to fail on, counting attempts rather than
+         * part numbers. The difference matters: flushPart numbers parts
+         * `etags.size + 1`, so a failed part is not appended and a retry
+         * re-attempts the same NUMBER — meaning failOnPart cannot tell a
+         * stream that refused to continue from one that retried and
+         * failed again.
+         */
+        private val failOnCall: Int? = null,
     ) : ObjectStore(null, "us-east-1", "k", "s", true) {
+        var uploadCalls = 0
         val parts = mutableListOf<ByteArray>()
         var started = 0
         var completed: ByteArray? = null
@@ -47,7 +66,9 @@ class S3OutputFileTest {
             bytes: ByteArray,
             length: Int,
         ): String {
+            uploadCalls++
             if (partNumber == failOnPart) throw IOException("injected part failure")
+            if (uploadCalls == failOnCall) throw IOException("injected part failure on call $uploadCalls")
             parts += bytes.copyOfRange(0, length)
             return "etag-$partNumber"
         }
@@ -167,6 +188,95 @@ class S3OutputFileTest {
 
         assertThat(store.aborted).isTrue()
         assertThat(store.completed).isNull()
+    }
+
+    @Test
+    fun `a rewrite that fails mid-file discards the upload instead of publishing it`() {
+        // The test the first version of this file did not have, and the
+        // reason a real defect shipped: the sibling above fakes a
+        // failure by writing raw bytes and closing without a trailer,
+        // which is NOT how the rewriter fails. Drive the production
+        // entry point and let it break on its own.
+        //
+        // What makes this sharp: on the exception path parquet's own
+        // close() flushes the pending row group and writes a valid
+        // footer and PAR1. The trailer gate alone is satisfied by that,
+        // so unless the sink is discarded FIRST the upload completes and
+        // a well-formed file with a truncated row set is published.
+        //
+        // This is the S3 twin of ParquetRewriterTest's `assertThat(out)
+        // .doesNotExist()`, which is the assertion the local sink has
+        // had all along.
+        val store = FakeStore()
+        val out = S3OutputFile(store, "s3://b/out.parquet", partSizeBytes = S3OutputFile.MIN_PART_SIZE_BYTES)
+
+        // A DECIMAL(10,2)-annotated INT64 read as DECIMAL(10,2): the
+        // copy plan accepts it, so rows flow — until one value will not
+        // fit the precision, which is a DATA refusal thrown mid-write
+        // with 20,000 rows already handed to the writer. That is the
+        // shape that matters: a plan-time refusal would never have
+        // written anything.
+        val src = tmp.resolve("overflow.parquet")
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optional(PrimitiveTypeName.INT64)
+                        .`as`(LogicalTypeAnnotation.decimalType(2, 10)).id(1).named("amount"),
+                )
+                .named("row")
+        val factory = SimpleGroupFactory(schema)
+        ExampleParquetWriter.builder(LocalOutputFile(src))
+            .withType(schema)
+            .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+            .build()
+            .use { w ->
+                repeat(20_000) { w.write(factory.newGroup().append("amount", 1L)) }
+                w.write(factory.newGroup().append("amount", 10_000_000_000L))
+            }
+
+        assertThatThrownBy {
+            ParquetRewriter.rewrite(
+                listOf(localInput(src, 0L)),
+                listOf(
+                    Column(
+                        1,
+                        0,
+                        ColumnDef("amount", ColType.DECIMAL, mapOf("precision" to 10, "scale" to 2)),
+                    ),
+                ),
+                emptyList(),
+                out,
+            )
+        }.isInstanceOf(InvalidDataException::class.java)
+
+        assertThat(store.completed).describedAs("nothing may be published").isNull()
+        assertThat(store.aborted).describedAs("the upload must be discarded").isTrue()
+    }
+
+    @Test
+    fun `a stream whose part upload failed refuses to continue or complete`() {
+        // Pins the `failed` flag, which nothing else does: fail the
+        // FIRST upload call and accept everything after, so a stream
+        // that merely retried would sail on and complete a file with a
+        // hole in it. Only refusing outright produces these assertions.
+        val store = FakeStore(failOnCall = 1)
+        val out = S3OutputFile(store, "s3://b/k", partSizeBytes = S3OutputFile.MIN_PART_SIZE_BYTES)
+        val stream = out.create(0)
+        val chunk = ByteArray(1_000_000) { 5 }
+
+        assertThatThrownBy { repeat(8) { stream.write(chunk, 0, chunk.size) } }
+            .isInstanceOf(IOException::class.java)
+        assertThat(store.aborted).isTrue()
+
+        // Poisoned: no further writes, and close() must not complete.
+        assertThatThrownBy { stream.write(chunk, 0, chunk.size) }
+            .isInstanceOf(IllegalStateException::class.java)
+        stream.close()
+        assertThat(store.completed).isNull()
+
+        // And the accessors refuse rather than reporting zeroes.
+        assertThatThrownBy { out.bytesWritten }.isInstanceOf(IllegalStateException::class.java)
+        assertThatThrownBy { out.footerSize }.isInstanceOf(IllegalStateException::class.java)
     }
 
     @Test

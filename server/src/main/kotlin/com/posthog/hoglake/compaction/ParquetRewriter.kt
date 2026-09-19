@@ -136,6 +136,59 @@ object ParquetRewriter {
     const val ROW_ID_COLUMN = "_hog_row_id"
 
     /**
+     * Run [body] against a writer on [output], and make sure a failure
+     * DISCARDS the destination rather than finishing it.
+     *
+     * The ordering is the whole point, and `use {}` cannot express it.
+     * On the exception path `use` calls `ParquetWriter.close()` before
+     * the exception reaches any catch of ours — and close() flushes the
+     * pending row group and writes a valid footer and `PAR1`. For a
+     * streaming sink that is indistinguishable from success: the trailer
+     * is there, so the multipart upload completes and a truncated-but-
+     * well-formed parquet file is published. The rows are simply missing.
+     *
+     * So the sink is poisoned FIRST and closed afterwards, at which point
+     * its close() has been told not to complete. Closing at all is still
+     * worth doing — it releases the writer's buffers — but it can only
+     * fail now, so its outcome is discarded along with the object.
+     */
+    private inline fun <T> writingTo(
+        output: OutputFile,
+        outputSchema: MessageType,
+        codec: OutputCodec,
+        body: (ParquetWriter<Group>) -> T,
+    ): T {
+        // Inside the guard too: newWriter calls output.createOrOverwrite,
+        // which for a streaming sink STARTS the upload — so a throw
+        // between that and the first write would leave one dangling.
+        val writer =
+            try {
+                newWriter(outputSchema, output, codec)
+            } catch (e: Throwable) {
+                (output as? DiscardableOutputFile)?.discard()
+                throw e
+            }
+        val result =
+            try {
+                body(writer)
+            } catch (e: Throwable) {
+                (output as? DiscardableOutputFile)?.discard()
+                runCatching { writer.close() }
+                throw e
+            }
+        // NOT inside the try: close() is what completes the upload, so a
+        // failure here means the object never landed whole, and it must
+        // discard for the same reason a write failure does.
+        try {
+            writer.close()
+        } catch (e: Throwable) {
+            (output as? DiscardableOutputFile)?.discard()
+            throw e
+        }
+        return result
+    }
+
+    /**
      * Reserved parquet field id for [ROW_ID_COLUMN] (documented in
      * V1__init.sql on hog_data_file.explicit_row_ids and in AGENT.md):
      * Int.MAX_VALUE - 1, far outside hog_table.next_field_id's reach.
@@ -582,7 +635,7 @@ object ParquetRewriter {
             // worst case is one counted invalid_data skip.
             var written = 0L
             var minRowId: Long? = null
-            newWriter(outputSchema, output, codec).use { writer ->
+            writingTo(output, outputSchema, codec) { writer ->
                 for (input in inputs) {
                     forEachSurvivor(
                         input,
@@ -630,7 +683,7 @@ object ParquetRewriter {
             }
         }
         val ordered = rows.sortedWith(comparator(outputSchema, sortFields))
-        newWriter(outputSchema, output, codec).use { writer -> for (row in ordered) writer.write(row.group) }
+        writingTo(output, outputSchema, codec) { writer -> for (row in ordered) writer.write(row.group) }
         return RewriteResult(ordered.size.toLong(), minRowId)
     }
 

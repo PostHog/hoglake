@@ -119,10 +119,15 @@ data class CompactionConfig(
      *    never verifies file sortedness. But tier-1 files are the
      *    SMALLEST ones by construction, and sorting one file alone is
      *    bounded by that one file rather than by the group. Sort each
-     *    tier-1 input on its own, spill it as a temp run to the scratch
-     *    directory the rewrite already uses (`compactGroup` creates one
-     *    per group; the Dockerfile notes compaction spills under
-     *    `java.io.tmpdir`), and stream-merge the runs like any other.
+     *    tier-1 input on its own, spill it as a temp run, and
+     *    stream-merge the runs like any other.
+     *
+     *    NOTE the spill now needs a scratch directory of its own.
+     *    `compactGroup` used to create one per group and this plan was
+     *    written to borrow it; compaction streams both ends now and
+     *    touches no local disk, so whoever builds the external sort owns
+     *    that decision — including whether spilling to an emptyDir whose
+     *    overrun EVICTS the pod is the right place for it.
      *
      * Do that and group size stops being a heap question entirely — this
      * knob, [sortedRowCeiling], and the `heap_budget` skip all go away.
@@ -134,11 +139,18 @@ data class CompactionConfig(
      * 1 GiB, which is the LARGEST value that is safe on the maintenance
      * pod as it exists today: 4 GiB, so ~2.8 GiB of heap at the image's
      * `MaxRAMPercentage=70` (server/build.gradle.kts). Worst-case peak
-     * at 1 GiB is ~1260 MiB — the sort buffer's measured ~0.79x of the
+     * at 1 GiB is ~1130 MiB — the sort buffer's measured ~0.79x of the
      * declared budget (the 192 B/node constant rounds up from 151.6),
-     * plus the group's input and output byte arrays, plus parquet-java's
-     * 128 MiB row-group block, plus the hydrator's 256 MiB whole-object
-     * ceiling if it fires in the same tick — which is 44% of that heap.
+     * plus parquet-java's 128 MiB row-group block, plus the hydrator's
+     * 256 MiB whole-object ceiling if it fires in the same tick — which
+     * is 39% of that heap.
+     *
+     * This figure USED to include the group's input and output byte
+     * arrays, which scaled with the data. They are gone: compaction
+     * streams both ends (S3InputFile / S3OutputFile), so its transport
+     * costs one 8 MiB readahead buffer and one 16 MiB part buffer,
+     * flat, whatever the group holds. The headroom that frees is
+     * unclaimed — this knob was not raised with it.
      * Going higher on a 4 GiB pod spends margin this process does not
      * have.
      *
@@ -998,156 +1010,165 @@ class CompactionService(
         ctx: TableContext,
         group: CompactionGroup,
     ): GroupOutcome {
-        run {
-            val inputs =
-                group.files.map { f ->
-                    // Read the object IN PLACE. This used to fetch the
-                    // whole thing into a heap array and write it to
-                    // java.io.tmpdir first — three passes over every
-                    // input byte before the rewrite began, and a staging
-                    // footprint that scaled with the group against an
-                    // emptyDir whose overrun EVICTS the pod.
-                    val source =
-                        S3InputFile(store, f.path, f.fileSizeBytes, f.footerSize)
-                    val dv =
-                        f.dv?.let { planned ->
-                            // The FETCH stays outside: an object-store error is
-                            // transient and belongs in the retryable channel.
-                            // What the decoder says about bytes it already has
-                            // is durable — a registered .dv never changes — so
-                            // a refusal from it (PuffinDeletionVector's own
-                            // requires, and the containment around the roaring
-                            // library) is invalid_data, not a group re-planned
-                            // and re-refused every sweep forever.
-                            val raw = store.get(planned.path)
-                            val decoded =
-                                try {
-                                    PuffinDeletionVector.read(raw)
-                                } catch (e: IllegalArgumentException) {
-                                    if (e is InvalidDataException) throw e
-                                    throw InvalidDataException(
-                                        "DV ${planned.path} does not decode: ${e.message}",
-                                    )
-                                }
-                            if (decoded.cardinality != planned.deleteCount) {
+        val inputs =
+            group.files.map { f ->
+                // Read the object IN PLACE. This used to fetch the
+                // whole thing into a heap array and write it to
+                // java.io.tmpdir first — three passes over every
+                // input byte before the rewrite began, and a staging
+                // footprint that scaled with the group against an
+                // emptyDir whose overrun EVICTS the pod.
+                val source =
+                    S3InputFile(store, f.path, f.fileSizeBytes, f.footerSize)
+                val dv =
+                    f.dv?.let { planned ->
+                        // The FETCH stays outside: an object-store error is
+                        // transient and belongs in the retryable channel.
+                        // What the decoder says about bytes it already has
+                        // is durable — a registered .dv never changes — so
+                        // a refusal from it (PuffinDeletionVector's own
+                        // requires, and the containment around the roaring
+                        // library) is invalid_data, not a group re-planned
+                        // and re-refused every sweep forever.
+                        val raw = store.get(planned.path)
+                        val decoded =
+                            try {
+                                PuffinDeletionVector.read(raw)
+                            } catch (e: IllegalArgumentException) {
+                                if (e is InvalidDataException) throw e
                                 throw InvalidDataException(
-                                    "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
-                                        "but is registered with delete_count ${planned.deleteCount} — " +
-                                        "refusing to compact on inconsistent metadata",
+                                    "DV ${planned.path} does not decode: ${e.message}",
                                 )
                             }
-                            decoded
+                        if (decoded.cardinality != planned.deleteCount) {
+                            throw InvalidDataException(
+                                "DV ${planned.path} decodes to ${decoded.cardinality} positions " +
+                                    "but is registered with delete_count ${planned.deleteCount} — " +
+                                    "refusing to compact on inconsistent metadata",
+                            )
                         }
-                    ParquetRewriter.Input(source, f.path, f.rowIdStart, dv, f.explicitRowIds)
-                }
-            // Bare UUID, deliberately indistinguishable from an ingested
-            // file (the pyhoglake writer's shape). A `compacted-` prefix
-            // used to sit here; it told readers nothing the catalog does
-            // not already say — explicit_row_ids is the flag that decides
-            // how a file's row ids are read, and no reader may infer that
-            // from a path — while giving every compaction output in a
-            // table the same 10-character lead-in.
-            val outputPath =
-                "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
-                    "${UUID.randomUUID()}.parquet"
-
-            // Claim ticket BEFORE the rewrite (its own committed
-            // transaction): if this group never commits — skip, crash,
-            // failed upload — the undrained row hands the object to the
-            // normal cleanup drain. The group commit settles it.
-            //
-            // ORDERING CHANGED when the rewrite began streaming, and the
-            // consequence is worth stating because it relaxed an
-            // invariant the tests used to pin. The old sequence was
-            // fetch -> rewrite to local disk -> claim -> upload, so a
-            // rewrite that failed had touched nothing and left no row.
-            // The output now streams to its final path, so bytes can
-            // land the moment parquet flushes its first part, and the
-            // claim has to come first.
-            //
-            // So for a DV-free group there is no longer any point at
-            // which compaction can fail WITHOUT having claimed a ticket.
-            // Every failure leaves one removal row for a path that holds
-            // no object — S3OutputFile aborts its multipart upload — and
-            // the cleanup drain reclaims it, counting it `missing`,
-            // which it already handles.
-            //
-            // The trade: one extra removal row per failed group, against
-            // a claim that now covers the WHOLE window in which bytes
-            // could exist rather than starting after it. Taken
-            // deliberately; the alternative is to have the sink claim
-            // the ticket on its first part upload, which preserves the
-            // old invariant exactly but threads a side effect into the
-            // writer and makes the claim's timing invisible at this call
-            // site. Revisit if the `missing` rows ever become noise.
-            val stagingId = stageOutputPath(ctx.catalogId, outputPath)
-
-            // The rewrite streams STRAIGHT to the output path, so the
-            // ticket above must already be claimed: bytes begin landing
-            // the moment parquet flushes its first part, not after. That
-            // is the whole reason the path is minted before the rewrite
-            // rather than after it.
-            //
-            // Nothing is written locally and nothing is read back: the
-            // stream reports its own size and footer length, which used
-            // to cost two more full passes over the output.
-            val sink = S3OutputFile(store, outputPath)
-            val rewritten =
-                ParquetRewriter.rewrite(
-                    inputs,
-                    ctx.columns,
-                    ctx.sortFields,
-                    sink,
-                    ctx.maxNodesPerRow,
-                    ctx.codec,
-                )
-            check(rewritten.rowsWritten == group.survivingRecords) {
-                "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
-                    "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
-            }
-            val outputBytes = sink.bytesWritten
-            val footerSize = sink.footerSize
-
-            val stats =
-                if (group.files.all { it.statsProvided && it.dv == null }) {
-                    aggregateStats(group.files.map { it.dataFileId }, ctx)
-                } else {
-                    // A DV'd input's registered counts describe pre-delete
-                    // rows; honest 'pending' beats wrong 'provided'.
-                    null
-                }
-            val outcome =
-                commitGroup(
-                    ctx, group, outputPath, outputBytes, footerSize, stats,
-                    survivors = rewritten.rowsWritten,
-                    rowIdStart = rewritten.minRowId ?: group.files.minOf { it.rowIdStart },
-                    stagingId = stagingId,
-                )
-            when (outcome) {
-                is GroupOutcome.Committed ->
-                    log.info {
-                        "compacted ${group.files.size} files (${group.totalBytes} B, " +
-                            "${group.totalRecords} rows, ${rewritten.rowsWritten} survivors) of " +
-                            "${ctx.namespace}.${ctx.table} into $outputPath ($outputBytes B) " +
-                            "at snapshot ${outcome.snapshotId}"
+                        decoded
                     }
-                GroupOutcome.SkippedConflict, GroupOutcome.SkippedDvSuperseded ->
-                    log.warn {
-                        "compaction group for ${ctx.namespace}.${ctx.table} lost a " +
-                            "plan-to-commit race ($outcome); skipping — staged output " +
-                            "$outputPath stays queued for the cleanup drain to reclaim"
-                    }
+                ParquetRewriter.Input(source, f.path, f.rowIdStart, dv, f.explicitRowIds)
             }
-            return outcome
+        // Bare UUID, deliberately indistinguishable from an ingested
+        // file (the pyhoglake writer's shape). A `compacted-` prefix
+        // used to sit here; it told readers nothing the catalog does
+        // not already say — explicit_row_ids is the flag that decides
+        // how a file's row ids are read, and no reader may infer that
+        // from a path — while giving every compaction output in a
+        // table the same 10-character lead-in.
+        val outputPath =
+            "${ctx.dataPath.trimEnd('/')}/data/${ctx.namespace}/${ctx.table}/" +
+                "${UUID.randomUUID()}.parquet"
+
+        // Claim ticket BEFORE the rewrite (its own committed
+        // transaction): if this group never commits — skip, crash,
+        // failed upload — the undrained row hands the object to the
+        // normal cleanup drain. The group commit settles it.
+        //
+        // ORDERING CHANGED when the rewrite began streaming, and the
+        // consequence is worth stating because it relaxed an
+        // invariant the tests used to pin. The old sequence was
+        // fetch -> rewrite to local disk -> claim -> upload, so a
+        // rewrite that failed had touched nothing and left no row.
+        // The output now streams to its final path, so bytes can
+        // land the moment parquet flushes its first part, and the
+        // claim has to come first.
+        //
+        // So for a DV-free group there is no longer any point at
+        // which compaction can fail WITHOUT having claimed a ticket.
+        // Every failure leaves one removal row for a path that holds
+        // no object — S3OutputFile aborts its multipart upload — and
+        // the cleanup drain reclaims it, counting it `missing`,
+        // which it already handles.
+        //
+        // The trade: one extra removal row per failed group, against
+        // a claim that now covers the WHOLE window in which bytes
+        // could exist rather than starting after it. Taken
+        // deliberately; the alternative is to have the sink claim
+        // the ticket on its first part upload, which preserves the
+        // old invariant exactly but threads a side effect into the
+        // writer and makes the claim's timing invisible at this call
+        // site. Revisit if the `missing` rows ever become noise.
+        val stagingId = stageOutputPath(ctx.catalogId, outputPath)
+
+        // The rewrite streams STRAIGHT to the output path, so the
+        // ticket above must already be claimed: bytes begin landing
+        // the moment parquet flushes its first part, not after. That
+        // is the whole reason the path is minted before the rewrite
+        // rather than after it.
+        //
+        // Nothing is written locally and nothing is read back: the
+        // stream reports its own size and footer length, which used
+        // to cost two more full passes over the output.
+        val sink = S3OutputFile(store, outputPath)
+        val rewritten =
+            ParquetRewriter.rewrite(
+                inputs,
+                ctx.columns,
+                ctx.sortFields,
+                sink,
+                ctx.maxNodesPerRow,
+                ctx.codec,
+            )
+        check(rewritten.rowsWritten == group.survivingRecords) {
+            "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
+                "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
         }
+        val outputBytes = sink.bytesWritten
+        val footerSize = sink.footerSize
+
+        val stats =
+            if (group.files.all { it.statsProvided && it.dv == null }) {
+                aggregateStats(group.files.map { it.dataFileId }, ctx)
+            } else {
+                // A DV'd input's registered counts describe pre-delete
+                // rows; honest 'pending' beats wrong 'provided'.
+                null
+            }
+        val outcome =
+            commitGroup(
+                ctx, group, outputPath, outputBytes, footerSize, stats,
+                survivors = rewritten.rowsWritten,
+                rowIdStart = rewritten.minRowId ?: group.files.minOf { it.rowIdStart },
+                stagingId = stagingId,
+            )
+        when (outcome) {
+            is GroupOutcome.Committed ->
+                log.info {
+                    "compacted ${group.files.size} files (${group.totalBytes} B, " +
+                        "${group.totalRecords} rows, ${rewritten.rowsWritten} survivors) of " +
+                        "${ctx.namespace}.${ctx.table} into $outputPath ($outputBytes B) " +
+                        "at snapshot ${outcome.snapshotId}"
+                }
+            GroupOutcome.SkippedConflict, GroupOutcome.SkippedDvSuperseded ->
+                log.warn {
+                    "compaction group for ${ctx.namespace}.${ctx.table} lost a " +
+                        "plan-to-commit race ($outcome); skipping — staged output " +
+                        "$outputPath stays queued for the cleanup drain to reclaim"
+                }
+        }
+        return outcome
     }
 
     /** Insert the output path's compaction_staging claim ticket; returns removal_id. */
     private fun stageOutputPath(
         catalogId: Long,
         outputPath: String,
+    ): Long = jdbi.withHandleUnchecked { h -> stageOutputPath(h, catalogId, outputPath) }
+
+    /**
+     * Same, on a caller-supplied handle — so the commit path can
+     * re-stage inside its own transaction instead of taking a second
+     * connection from the pool while holding one under the catalog lock.
+     */
+    private fun stageOutputPath(
+        h: Handle,
+        catalogId: Long,
+        outputPath: String,
     ): Long =
-        jdbi.withHandleUnchecked { h ->
+        run {
             h.createQuery(
                 """
                 INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
@@ -1183,8 +1204,7 @@ class CompactionService(
 
             // Re-claim the staging ticket under the lock: cleanup drains
             // under the SAME lock, so "still undrained" here means the
-            // uploaded object still exists and is ours to register. If
-            // cleanup got there first the object is gone — abort.
+            // uploaded object still exists and is ours to register.
             val ticketLive =
                 h.createQuery(
                     """
@@ -1198,9 +1218,32 @@ class CompactionService(
                     .findOne()
                     .orElse(false)
             if (!ticketLive) {
+                // The object is NOT necessarily gone, and that is a
+                // consequence of streaming the output. The old ordering
+                // claimed the ticket immediately before a single PUT, so
+                // a drain that beat the commit almost always beat the
+                // object's existence too. Now the claim precedes the
+                // whole rewrite, and the drain window is the entire
+                // rewrite: cleanup can find nothing, mark the ticket
+                // absent, and the upload can complete afterwards.
+                //
+                // At that point the object exists with no catalog row
+                // and a ticket that says it was already handled — which
+                // is a leak nothing else can see, because the removal
+                // ledger is the only thing that knows the path. So
+                // re-stage it: a fresh undrained ticket for the same
+                // path puts it back in front of the drain.
+                //
+                // Unconditional rather than conditional on a HEAD: a
+                // ticket for an object that does not exist costs one
+                // `missing` on the next drain, which cleanup already
+                // counts, and probing would add a round trip inside the
+                // commit lock to save nothing.
+                stageOutputPath(h, ctx.catalogId, outputPath)
                 log.warn {
                     "compaction staging ticket $stagingId for $outputPath was drained by " +
-                        "cleanup before the group committed; aborting the group"
+                        "cleanup before the group committed; aborting the group and " +
+                        "re-staging the path so the object cannot outlive its ticket"
                 }
                 return@inTransactionUnchecked GroupOutcome.SkippedConflict
             }

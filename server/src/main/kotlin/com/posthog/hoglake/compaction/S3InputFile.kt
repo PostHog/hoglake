@@ -60,6 +60,7 @@ class S3InputFile(
     private val length: Long,
     private val footerSizeHint: Long? = null,
     private val readaheadBytes: Int = DEFAULT_READAHEAD_BYTES,
+    private val maxPrefetchBytes: Int = DEFAULT_MAX_PREFETCH_BYTES,
 ) : InputFile {
     init {
         require(length >= 0) { "negative length $length for $path" }
@@ -69,7 +70,7 @@ class S3InputFile(
     override fun getLength(): Long = length
 
     override fun newStream(): SeekableInputStream =
-        S3SeekableInputStream(store, path, length, footerSizeHint, readaheadBytes)
+        S3SeekableInputStream(store, path, length, footerSizeHint, readaheadBytes, maxPrefetchBytes)
 
     /**
      * The object URI: parquet-java and this package's error messages
@@ -86,6 +87,23 @@ class S3InputFile(
          */
         const val DEFAULT_READAHEAD_BYTES: Int = 8 * 1024 * 1024
 
+        /**
+         * Ceiling on the footer prefetch. 64 MiB: real footers get large
+         * — a 200-column file with hundreds of row groups runs to single
+         * -digit MB — but they do not approach this, so a hint that asks
+         * for more is wrong rather than unusual.
+         *
+         * The cap is the difference between trusting the hint and merely
+         * taking it. `footer_size` is writer-supplied and commit-time
+         * validation only rejects `footer > file_size - 8`
+         * (FileValidation.kt), so without a ceiling a hint of
+         * `file_size - 8` pulls the ENTIRE object into one heap array —
+         * reinstating both the whole-object fetch this class exists to
+         * remove and the int-indexed 2 GiB limit. The hydrator caps the
+         * same risk with HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES.
+         */
+        const val DEFAULT_MAX_PREFETCH_BYTES: Int = 64 * 1024 * 1024
+
         /** Parquet's trailer: 4 bytes of footer length, then "PAR1". */
         const val FOOTER_SUFFIX_BYTES: Int = 8
     }
@@ -97,6 +115,7 @@ private class S3SeekableInputStream(
     private val length: Long,
     footerSizeHint: Long?,
     private val readaheadBytes: Int,
+    maxPrefetchBytes: Int,
 ) : SeekableInputStream() {
     private var pos: Long = 0
 
@@ -105,7 +124,7 @@ private class S3SeekableInputStream(
     private var bufferStart: Long = 0
 
     init {
-        prefetchFooter(footerSizeHint)
+        prefetchFooter(footerSizeHint, maxPrefetchBytes)
     }
 
     /**
@@ -113,11 +132,17 @@ private class S3SeekableInputStream(
      * twice. Best effort by construction: any reason to doubt the hint
      * simply leaves the buffer empty.
      */
-    private fun prefetchFooter(hint: Long?) {
+    private fun prefetchFooter(
+        hint: Long?,
+        maxPrefetchBytes: Int,
+    ) {
         if (hint == null || hint <= 0) return
         val tailBytes = hint + S3InputFile.FOOTER_SUFFIX_BYTES
-        // An out-of-range hint is a wrong hint, not an error to raise.
-        if (tailBytes <= 0 || tailBytes > length || tailBytes > Int.MAX_VALUE) return
+        // An out-of-range hint is a wrong hint, not an error to raise —
+        // and "larger than the cap" is out of range for the same reason
+        // "larger than the object" is. Skipping costs one round trip;
+        // believing it costs the whole object on the heap.
+        if (tailBytes <= 0 || tailBytes > length || tailBytes > maxPrefetchBytes) return
         val start = length - tailBytes
         runCatching { store.getRange(path, start, tailBytes.toInt()) }
             .onSuccess {

@@ -449,9 +449,10 @@ unusually well placed for one:
   `schema.sql` says so, and the server never verifies file sortedness.
   But tier-1 files are the smallest by construction, so sorting one is
   bounded by that one file: sort each tier-1 input alone, spill it as a
-  temp run to the scratch directory the rewrite already creates per
-  group (the image notes compaction spills under `java.io.tmpdir`), and
-  stream-merge the runs like any other.
+  temp run, and stream-merge the runs like any other. Note the spill
+  needs a scratch directory of its own — compaction streams both ends
+  now (`S3InputFile` / `S3OutputFile`) and touches no local disk, so the
+  per-group temp dir this plan was written to borrow no longer exists.
 
 That removes the heap bound on group size entirely, and with it this
 knob, the row ceiling and the `heap_budget` skip. Until it lands, the
@@ -462,12 +463,19 @@ moves it to the streaming path, where group size costs no heap at all).
 
 The default is the largest value that is safe on the maintenance pod
 **as it exists today** — 4 GiB, so ~2.8 GiB of heap at the image's
-`MaxRAMPercentage=70`. Worst-case peak at 1 GiB is ~1260 MiB (the sort
-buffer's measured 0.79x of the declared budget, plus the group's input
-and output byte arrays, plus parquet-java's 128 MiB row-group block,
-plus the hydrator's 256 MiB whole-object ceiling if it fires in the same
-tick) — 44% of that heap. Raising the knob without raising the pod turns
-a counted refusal back into the OOM it replaced.
+`MaxRAMPercentage=70`. Worst-case peak at 1 GiB is ~1130 MiB (the sort
+buffer's measured 0.79x of the declared budget, plus parquet-java's
+128 MiB row-group block, plus the hydrator's 256 MiB whole-object
+ceiling if it fires in the same tick) — 39% of that heap. Raising the
+knob without raising the pod turns a counted refusal back into the OOM
+it replaced.
+
+This figure used to include the group's input and output byte arrays.
+Compaction streams both ends now (`S3InputFile` / `S3OutputFile`), so
+its transport costs one 8 MiB readahead buffer and one 16 MiB part
+buffer — flat, whatever the group holds. The table below still assumes
+the old peak, so every row is conservative by roughly 130 MiB; nobody
+has re-derived it or claimed the headroom.
 
 Bigger pods buy proportionally bigger groups. Holding peak at ~45% of a
 heap that is 70% of the pod, for a ten-column event table:
@@ -479,6 +487,27 @@ heap that is 70% of the pod, for a ten-column event table:
 | 16 GiB | 11.2 GiB | 4 GiB | 3890 MiB, 34% | 230.8 MiB | 135.8 MiB |
 | 32 GiB | 22.4 GiB | 8 GiB | 7395 MiB, 32% | 461.6 MiB | 271.5 MiB |
 | 64 GiB | 44.8 GiB | 16 GiB | 14407 MiB, 31% | 512 MiB (cap stops binding) | 512 MiB |
+
+### The multipart upload needs a lifecycle rule
+
+Compaction's output goes up as a multipart upload. Parts that are
+neither completed nor aborted are **billed and invisible**: they are not
+objects, so `hog_file_removal` cannot address them and the cleanup drain
+cannot see them. Nothing in this repo reclaims them.
+
+The server aborts on every failure path it controls, and counts the
+aborts that themselves fail
+(`hoglake_multipart_abort_failures_total` — a sustained nonzero value
+means storage is growing silently, usually IAM missing
+`s3:AbortMultipartUpload`). What it cannot cover is a process that dies
+between starting an upload and aborting it: a kill, an OOM-kill, a node
+eviction. Under a crash loop the ceiling is one dangling upload per
+process lifetime, bounded by the compaction target.
+
+**Every bucket hoglake compacts into wants an
+`AbortIncompleteMultipartUpload` lifecycle rule** — a few days is
+plenty, since a live upload finishes in minutes. Without one the leak is
+permanent and unobservable.
 
 Group bytes are close to column-count independent: the budget divides by
 node count and multiplies by bytes-per-row, and both scale with the
