@@ -49,7 +49,7 @@ describe("TablePage", () => {
     expect(screen.getByText("bucket(16, url)")).toBeInTheDocument();
   });
 
-  it("shows data files with color-coded stats_state badges on the Files tab", async () => {
+  it("shows data files with a stats marker per state on the Files tab", async () => {
     mockFetch(happyHandler);
     renderApp(route);
     const user = userEvent.setup();
@@ -62,12 +62,33 @@ describe("TablePage", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("500,000")).toBeInTheDocument();
 
-    const provided = screen.getByText("provided");
-    const pending = screen.getByText("pending");
-    const failed = screen.getByText("failed");
-    expect(provided).toHaveClass("stats-provided");
-    expect(pending).toHaveClass("stats-pending");
-    expect(failed).toHaveClass("stats-failed");
+    // The stats state is the SHAPE now, not a pill spending a column's
+    // width on the word "provided": a file with statistics gets a
+    // triangle that opens them, one without gets a circle that does not
+    // pretend to be clickable.
+    const withStats = screen.getByRole("button", {
+      name: "toggle stats for file 101",
+    });
+    expect(withStats).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /toggle stats for file 102/ }),
+    ).not.toBeInTheDocument();
+
+    // Pending and failed both get a circle, in their own colours —
+    // failed is not deferred, and must not read as if it were.
+    const pendingMark = screen.getByLabelText(
+      "pending: no column statistics for file 102",
+    );
+    const failedMark = screen.getByLabelText(
+      "failed: no column statistics for file 103",
+    );
+    expect(pendingMark).toHaveClass("stats-pending");
+    expect(failedMark).toHaveClass("stats-failed");
+    expect(pendingMark.tagName).not.toBe("BUTTON");
+    expect(failedMark.tagName).not.toBe("BUTTON");
+
+    // The word the pill used to carry is gone from the table.
+    expect(screen.queryByText("provided")).not.toBeInTheDocument();
 
     // partition_values render when present, em-dash when absent.
     // Decoded against the spec rather than shown as a raw tuple: the day
@@ -221,7 +242,7 @@ describe("TablePage", () => {
     return screen
       .getAllByRole("row")
       .slice(1) // drop the header
-      .map((r) => r.querySelector("td:nth-child(2)")?.textContent ?? "")
+      .map((r) => r.querySelector("td:first-child")?.textContent ?? "")
       .filter((t) => t !== "");
   }
 
@@ -417,32 +438,32 @@ describe("TablePage", () => {
     expect(screen.queryByText("aardvark")).not.toBeInTheDocument();
   });
 
-  it("shows the no-stats reason for a pending file", async () => {
+  it("gives the no-stats reason without a click, and asks the server for nothing", async () => {
+    // It used to take a click and a round trip to learn why a file has
+    // no statistics. The answer is a property of the STATE — every
+    // pending file has the same one — so it now rides the marker's
+    // tooltip, and the stats endpoint is never called for a file that
+    // has none to give.
+    const seen: string[] = [];
     mockFetch((url) => {
-      const [path] = url.split("?");
-      if (path === `${base}/files/102/stats`)
-        return jsonResponse({
-          data_file_id: "102",
-          stats_state: "pending",
-          columns: [],
-          no_stats_reason:
-            "stats_state is 'pending': column statistics have not been " +
-            "hydrated yet, so no per-column rows exist; with no bounds, " +
-            "callers must not prune this file",
-        });
+      seen.push(url);
       return happyHandler(url);
     });
     renderApp(route);
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("tab", { name: "files" }));
-    await user.click(
-      await screen.findByRole("button", { name: "toggle stats for file 102" }),
-    );
+    await screen.findByText("101");
 
     expect(
-      await screen.findByText(/callers must not prune this file/),
-    ).toBeInTheDocument();
+      screen.getByLabelText("pending: no column statistics for file 102"),
+    ).toHaveAttribute("title", expect.stringContaining("not been hydrated yet"));
+    expect(
+      screen.getByLabelText("failed: no column statistics for file 103"),
+    ).toHaveAttribute("title", expect.stringContaining("rehydrate"));
+
+    // Both reasons are on screen, and neither cost a request.
+    expect(seen.filter((u) => u.includes("/stats"))).toEqual([]);
   });
 
   it("shows the 404 detail when the table does not exist", async () => {
