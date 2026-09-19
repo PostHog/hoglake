@@ -47,7 +47,7 @@ dependencies {
 
     // Persistence
     implementation("org.postgresql:postgresql:42.7.13")
-    implementation("com.zaxxer:HikariCP:6.3.0")
+    implementation("com.zaxxer:HikariCP:7.1.0")
     implementation("org.jdbi:jdbi3-core:$jdbiVersion")
     implementation("org.jdbi:jdbi3-kotlin:$jdbiVersion")
     implementation("org.jdbi:jdbi3-postgres:$jdbiVersion")
