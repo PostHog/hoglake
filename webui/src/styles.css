@@ -860,6 +860,17 @@ button.expand-toggle {
 button.expand-toggle:hover {
   color: var(--text);
 }
+/* The stats marker that replaces the state pill in the files table: a
+   filled circle where there is nothing to expand. Sized to sit on the
+   same baseline as the ▸ triangle it stands in for, so the column does
+   not jump between rows. Cursor stays default — it is not a control. */
+.stats-marker {
+  display: inline-block;
+  padding: 0 4px;
+  font-size: 11px;
+  line-height: inherit;
+}
+
 .detail-row > td {
   background: var(--bg-inset, transparent);
   padding: 8px 12px 12px 28px;

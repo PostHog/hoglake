@@ -11,6 +11,7 @@ import type {
   Int64,
   PartitionSpec,
   ScanFile,
+  StatsState,
   Table,
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
@@ -349,6 +350,90 @@ function FileStatsPanel({
  * evolution needs the exact stored values, and they are the one audience
  * for whom the decoded form is the wrong answer.
  */
+/**
+ * What each stats marker means. EVERY state gets one: the shape alone
+ * says whether a row opens, not what the state is or what it costs the
+ * reader, and the triangle needs explaining as much as the circle does.
+ *
+ * All three answer the same three things in the same order — what the
+ * state is, what it means for a reader planning a scan, and what to do
+ * about it — so hovering any two rows compares like with like.
+ *
+ * For the states with no statistics this is the ground the server gives
+ * in FileStats.no_stats_reason, said in the space a tooltip has. It is
+ * carried here rather than fetched because the reason belongs to the
+ * STATE, not the file: every pending file has the same one. That is
+ * also what makes the circle safe to leave unclickable — expanding one
+ * of those rows only ever produced this sentence.
+ */
+const STATS_TOOLTIP: Record<StatsState, string> = {
+  provided:
+    "Column statistics are hydrated: per-column bounds, null counts and " +
+    "sizes are recorded, so a reader can prune this file. Click to see them.",
+  pending:
+    "Column statistics have not been hydrated yet, so this file carries no " +
+    "bounds and a reader cannot prune it. The hydrator sweep will claim it.",
+  failed:
+    "Stats hydration failed, so this file carries no bounds and a reader " +
+    "cannot prune it. Requeue with POST .../maintenance/rehydrate.",
+};
+
+/**
+ * The stats cell, which is also the row's expander.
+ *
+ * A file WITH statistics gets a triangle that opens them. A file without
+ * gets a circle that does nothing, because there is nothing to open —
+ * and a control that does nothing when clicked is worse than one that
+ * never invites the click. The shape carries the state, which is what
+ * the "provided" pill used to spend a column's width saying.
+ *
+ * Failed keeps its own colour. It is not deferred — nothing will arrive
+ * on its own — and collapsing it into the pending circle would hide the
+ * one stats state an operator has to act on.
+ */
+function StatsCell({
+  state,
+  expanded,
+  onToggle,
+  fileId,
+}: {
+  state: StatsState;
+  expanded: boolean;
+  onToggle: () => void;
+  fileId: Int64;
+}) {
+  if (state === "provided") {
+    return (
+      <td>
+        <button
+          type="button"
+          className="expand-toggle"
+          aria-label={`toggle stats for file ${fileId}`}
+          aria-expanded={expanded}
+          onClick={onToggle}
+          title={STATS_TOOLTIP.provided}
+        >
+          {expanded ? "▾" : "▸"}
+        </button>
+      </td>
+    );
+  }
+  return (
+    <td>
+      {/* Not a button: there is nothing behind it. The title carries
+          what a click would have revealed. */}
+      <span
+        className={`stats-marker stats-${state}`}
+        role="img"
+        aria-label={`${state}: no column statistics for file ${fileId}`}
+        title={STATS_TOOLTIP[state]}
+      >
+        ●
+      </span>
+    </td>
+  );
+}
+
 function PartitionCell({ decoded }: { decoded: PartitionDecode }) {
   if (decoded.kind === "unpartitioned") {
     return <td className="subtle">—</td>;
@@ -489,11 +574,12 @@ function FilesTab({
   // The column appears only for a partitioned table: on an unpartitioned
   // one it would be a column of dashes.
   const partitioned = (spec?.fields.length ?? 0) > 0;
-  // Fixed columns: expand toggle, id, path, record_count, size,
-  // row_id_start, stats, begin_snapshot — plus partition when there is
-  // one. Drives the skeleton and the empty-state colSpan, so a wrong
-  // count shows as a short row rather than an error.
-  const cols = partitioned ? 9 : 8;
+  // Fixed columns: id, path, record_count, size, row_id_start, stats,
+  // begin_snapshot — plus partition when there is one. The stats column
+  // doubles as the expander, so there is no separate toggle column.
+  // Drives the skeleton and the empty-state colSpan, so a wrong count
+  // shows as a short row rather than an error.
+  const cols = partitioned ? 8 : 7;
   // Sorting is over the WHOLE table: GET /files returns every live file
   // at the snapshot, so "largest file" here is the largest file, not the
   // largest of a page.
@@ -509,7 +595,6 @@ function FilesTab({
     <table className="data-table">
       <thead>
         <tr>
-          <th />
           <SortableTh label="id" sortKey="id" sort={sort} onSort={onSort} numeric />
           {partitioned && (
             <SortableTh
@@ -559,21 +644,6 @@ function FilesTab({
           {rows.map(({ file: f, partition }) => (
             <Fragment key={f.data_file_id}>
               <tr>
-                <td>
-                  <button
-                    type="button"
-                    className="expand-toggle"
-                    aria-label={`toggle stats for file ${f.data_file_id}`}
-                    aria-expanded={expanded === f.data_file_id}
-                    onClick={() =>
-                      setExpanded(
-                        expanded === f.data_file_id ? null : f.data_file_id,
-                      )
-                    }
-                  >
-                    {expanded === f.data_file_id ? "▾" : "▸"}
-                  </button>
-                </td>
                 <td className="num mono">{f.data_file_id}</td>
                 {partitioned && <PartitionCell decoded={partition} />}
                 <PathCell path={f.path} />
@@ -582,9 +652,16 @@ function FilesTab({
                   {formatBytes(f.file_size_bytes)}
                 </td>
                 <td className="num mono">{f.row_id_start}</td>
-                <td>
-                  <StatsStateBadge state={f.stats_state} />
-                </td>
+                <StatsCell
+                  state={f.stats_state}
+                  expanded={expanded === f.data_file_id}
+                  onToggle={() =>
+                    setExpanded(
+                      expanded === f.data_file_id ? null : f.data_file_id,
+                    )
+                  }
+                  fileId={f.data_file_id}
+                />
                 <td className="num mono">{f.begin_snapshot}</td>
               </tr>
               {expanded === f.data_file_id && (
