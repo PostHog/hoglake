@@ -12,6 +12,30 @@ import org.jdbi.v3.core.mapper.RowMapper
  * service, not here.
  */
 object FileRepo {
+    /**
+     * The columns a client may sort the file listing by, each mapped to
+     * its SQL column. A CLOSED set, because the value is interpolated
+     * into ORDER BY — only the raw stored columns are here. The decoded,
+     * polymorphic columns the webui also shows (partition, and the
+     * ordering-key min/max) are absent on purpose: their display order is
+     * computed from encoded bytes / a text[] of ordinals and does not
+     * match any single SQL column's order, so they cannot be sorted
+     * server-side and are not offered.
+     */
+    enum class FileSortColumn(val wire: String, val sql: String) {
+        ID("id", "data_file_id"),
+        PATH("path", "path"),
+        RECORD_COUNT("record_count", "record_count"),
+        SIZE("size", "file_size_bytes"),
+        STATS("stats", "stats_state"),
+        BEGIN_SNAPSHOT("begin_snapshot", "begin_snapshot"),
+        ;
+
+        companion object {
+            fun fromWire(s: String): FileSortColumn? = entries.firstOrNull { it.wire == s }
+        }
+    }
+
     private val fileMapper =
         RowMapper { rs, _ ->
             DataFile(
@@ -43,28 +67,63 @@ object FileRepo {
             WHERE pv.catalog_id = f.catalog_id
               AND pv.data_file_id = f.data_file_id) AS partition_values"""
 
-    /** Files visible at [snapshot], in row-id order. */
+    /**
+     * Files visible at [snapshot].
+     *
+     * Default ([sort] null): manifest order (begin_snapshot, row_id_start,
+     * data_file_id) — the order every existing caller and the unpaged
+     * listing rely on. A [sort] orders by that column with a fixed
+     * data_file_id tiebreak, so the total order is deterministic across
+     * offset pages (two files with the same value never swap between
+     * pages). [limit] null returns everything (the historical, unbounded
+     * behavior); a non-null [limit]/[offset] pages the result.
+     *
+     * [sort.sql] is a controlled literal from a closed enum, never client
+     * text, so interpolating it into ORDER BY carries no injection.
+     */
     fun listAt(
         handle: Handle,
         catalogId: Long,
         tableId: Long,
         snapshot: Long,
-    ): List<DataFile> =
-        handle.createQuery(
+        sort: FileSortColumn? = null,
+        desc: Boolean = false,
+        limit: Int? = null,
+        offset: Int = 0,
+    ): List<DataFile> {
+        val dir = if (desc) "DESC" else "ASC"
+        val orderBy =
+            if (sort == null) {
+                "begin_snapshot, row_id_start, data_file_id"
+            } else {
+                // Fixed ascending id tiebreak: a stable total order under
+                // paging regardless of the primary direction.
+                "${sort.sql} $dir, data_file_id ASC"
+            }
+        val paging = if (limit == null) "" else "LIMIT :limit OFFSET :offset"
+        return handle.createQuery(
             """
             SELECT $COLUMNS
             FROM hog_data_file f
             WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
               AND f.begin_snapshot <= :snapshot
               AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)
-            ORDER BY begin_snapshot, row_id_start, data_file_id
+            ORDER BY $orderBy
+            $paging
             """,
         )
             .bind("catalogId", catalogId)
             .bind("tableId", tableId)
             .bind("snapshot", snapshot)
+            .apply {
+                if (limit != null) {
+                    bind("limit", limit)
+                    bind("offset", offset)
+                }
+            }
             .map(fileMapper)
             .list()
+    }
 
     /**
      * One file by id, IF it belongs to [tableId] and is visible at

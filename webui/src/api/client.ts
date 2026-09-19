@@ -160,11 +160,25 @@ export function listFiles(
   namespace: string,
   table: string,
   snapshot?: Int64,
+  opts?: {
+    sort?: string;
+    order?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+  },
 ): Promise<DataFile[]> {
+  // The endpoint returns a bare array; a page is just one such array, and
+  // the caller reads has-more from its length (received === limit).
   return request(
     buildUrl(
       `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/files`,
-      { snapshot },
+      {
+        snapshot,
+        sort: opts?.sort,
+        order: opts?.order,
+        limit: opts?.limit,
+        offset: opts?.offset,
+      },
     ),
   );
 }
