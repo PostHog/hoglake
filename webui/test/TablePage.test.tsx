@@ -213,6 +213,15 @@ describe("TablePage", () => {
     expect(sizeCell.textContent).not.toContain("NaN");
   });
 
+  // 300-odd characters, the shape a $properties column's bounds actually
+  // take: long enough that an untruncated cell pushes the bound columns
+  // off the viewport.
+  const LONG_BOUND =
+    '{"$lib":"web","$lib_version":"1.4.0","$screen":"1440x900",' +
+    '"$payload":"0010528486358554e5f1a4aa5242fafd2a4da0502be3cf9c3dcdafdf' +
+    '007c9195673777557b8266051f97fd3b24e73dce83a5b19a5570d78376e7a03bb717' +
+    'ee4a15b37b8053"}';
+
   it("expands a file row into decoded per-column stats", async () => {
     // RAW wire body: the decoded bounds are JSON numbers on the wire, and
     // long/uint64/decimal must reach the screen digit-for-digit (never
@@ -240,7 +249,13 @@ describe("TablePage", () => {
       `{"field_id":17,"name":"seen_at","path":"seen_at","type":"timestamptz",` +
       `"value_count":500000,"null_count":0,` +
       `"lower_bound":"1970-01-01T00:00:00Z",` +
-      `"upper_bound":"2026-09-05T12:00:00Z"}]}`;
+      `"upper_bound":"2026-09-05T12:00:00Z"},` +
+      // A properties blob: min and max are whole JSON payloads, which is
+      // what blew the table's width open on a real stream table.
+      `{"field_id":18,"name":"properties","path":"properties","type":"string",` +
+      `"value_count":500000,"null_count":0,` +
+      `"lower_bound":${JSON.stringify(LONG_BOUND)},` +
+      `"upper_bound":${JSON.stringify(LONG_BOUND)}}]}`;
     mockFetch((url) => {
       const [path] = url.split("?");
       if (path === `${base}/files/101/stats`)
@@ -272,6 +287,18 @@ describe("TablePage", () => {
     expect(screen.getAllByTitle(/no bound stored/)).toHaveLength(2);
     // Boolean bounds render their JSON tokens, never a placeholder.
     expect(screen.getByText("false")).toBeInTheDocument();
+
+    // A blob bound renders truncated rather than at full width — the
+    // cell keeps the whole value in its tooltip, so nothing is lost,
+    // and the bound columns stay on screen.
+    const blobs = screen.getAllByTitle(LONG_BOUND);
+    expect(blobs).toHaveLength(2);
+    for (const blob of blobs) {
+      expect(blob).toHaveClass("bound-text");
+      expect(blob.textContent).toBe(LONG_BOUND);
+    }
+    // Short bounds keep the plain numeric cell: no truncation wrapper.
+    expect(screen.getByText("aardvark")).not.toHaveClass("bound-text");
     expect(screen.getByText("true")).toBeInTheDocument();
     // The Infinity sentinel STRING reaches the cell verbatim.
     expect(screen.getByText("Infinity")).toBeInTheDocument();

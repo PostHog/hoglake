@@ -209,6 +209,14 @@ function SchemaTab({ table }: { table: Table }) {
 }
 
 /**
+ * Longest bound rendered inline. A uuid is 36 characters and a
+ * microsecond timestamp 27, so everything with a fixed width stays
+ * whole; past this the value is a blob and the column is better served
+ * by a stable table than by the rest of the payload.
+ */
+const BOUND_INLINE_MAX_CHARS = 48;
+
+/**
  * One decoded bound cell. The server ships bounds already decoded
  * (GET .../files/{fileId}/stats — the webui carries no codec): strings
  * and booleans verbatim, numbers as their exact raw tokens (int64.ts),
@@ -224,7 +232,25 @@ function BoundCell({ bound }: { bound: DecodedBound }) {
       </td>
     );
   }
-  return <td className="num mono">{String(bound)}</td>;
+  const text = String(bound);
+  // Numbers, timestamps and ordinary strings are short, and right-aligned
+  // they read as a range. A bound over a text column holding JSON is not
+  // short — a properties blob's min and max are whole payloads, and left
+  // unconstrained one cell pushes both bound columns off the viewport and
+  // squeezes every column before them. Past this width the cell truncates
+  // and keeps its full value in the tooltip.
+  if (text.length <= BOUND_INLINE_MAX_CHARS) {
+    return <td className="num mono">{text}</td>;
+  }
+  return (
+    <td className="mono bound-cell">
+      {/* Truncated from the RIGHT, unlike a path: an object path is
+          distinguished by its end, a bound by its beginning. */}
+      <span className="bound-text" title={text}>
+        {text}
+      </span>
+    </td>
+  );
 }
 
 /** The expanded stats panel for one file: its per-column decoded stats. */
