@@ -103,7 +103,7 @@ dependencies {
 
     // Logging + observability
     implementation("ch.qos.logback:logback-classic:1.6.3")
-    implementation("io.github.oshai:kotlin-logging-jvm:7.0.7")
+    implementation("io.github.oshai:kotlin-logging-jvm:8.0.4")
     implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")
     implementation("io.micrometer:micrometer-registry-prometheus:1.17.1")
@@ -169,7 +169,19 @@ application {
     // (CompactionService), and the dump hook fires on the throw, not on
     // an uncaught one — so a contained, counted skip would write a
     // multi-gigabyte dump into the pod's ephemeral disk every sweep.
-    applicationDefaultJvmArgs = listOf("-XX:MaxRAMPercentage=70.0")
+    // kotlin-logging 8 prints "kotlin-logging: initializing... active
+    // logger factory: ..." to STDOUT from a static initializer, before
+    // logback configures anything. stdout is this service's log
+    // transport — logback.xml sends both the pattern console stream and
+    // the audit LogstashEncoder's JSON to ConsoleAppender — so the
+    // banner lands in the middle of a stream a downstream consumer
+    // parses, once per process start, as neither a pattern line nor a
+    // JSON object. No test can see it; only the collector can.
+    applicationDefaultJvmArgs =
+        listOf(
+            "-XX:MaxRAMPercentage=70.0",
+            "-Dkotlin-logging.logStartupMessage=false",
+        )
 }
 
 tasks.test {
