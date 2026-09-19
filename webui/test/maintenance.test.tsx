@@ -3,7 +3,14 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { isLoopDisabled, isQuietRun, RunOutcomeBadge, RunsTable, RunSummary } from "../src/components/maintenance";
+import {
+  isQuietRun,
+  loopCadence,
+  noRunningLoop,
+  RunOutcomeBadge,
+  RunsTable,
+  RunSummary,
+} from "../src/components/maintenance";
 import type { MaintenanceRun } from "../src/api/types";
 import { maintenanceRunsFixture } from "./fixtures";
 import { jsonResponse, mockFetch } from "./helpers";
@@ -64,10 +71,65 @@ describe("maintenance outcome and history", () => {
     expect(screen.getByText(/invalid-data 3/)).toBeInTheDocument();
   });
 
-  it.each(["0", "-1", "-9223372036854775808"])("treats interval %s as disabled", (interval) => {
-    expect(isLoopDisabled(interval)).toBe(true);
-    expect(isLoopDisabled("1")).toBe(false);
-    expect(isLoopDisabled(undefined)).toBe(false);
+  describe("loopCadence", () => {
+    /**
+     * The header's whole job is answering "is this task running?" from
+     * the ledger. Each of these is a DIFFERENT state that the old
+     * config-derived header collapsed into "disabled" or a cadence it
+     * could not know (#114).
+     */
+    beforeEach(() => {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      vi.setSystemTime(new Date("2026-09-11T10:00:00Z"));
+    });
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it("reports the observed cadence, rounded", () => {
+      // A loop sleeps AFTER its body, so a 60s loop with an 8.8s sweep
+      // is measured at 68.8s. Rounding it keeps the header readable
+      // without claiming a precision the measurement does not have.
+      expect(loopCadence({ observed_interval_ms: "68800" })).toBe("every ~69s");
+      expect(loopCadence({ observed_interval_ms: "3630000" })).toBe("every ~61m");
+      expect(loopCadence({ observed_interval_ms: "450" })).toBe("every ~450ms");
+    });
+
+    it("falls back to the last run when no cadence can be derived", () => {
+      expect(loopCadence({ last_run_at: "2026-09-11T09:58:00Z" })).toBe(
+        "last loop run 2m ago",
+      );
+    });
+
+    it("reads an empty ledger the way the response says to", () => {
+      // For a task that records every sweep, no rows means nothing is
+      // running it.
+      expect(loopCadence({ records_every_sweep: true })).toBe("no loop runs");
+      // For the hydrator it means no work arrived here. Its loop may be
+      // perfectly healthy, so saying "no loop runs" would be the bug
+      // this change exists to remove, moved to a new place.
+      expect(loopCadence({ records_every_sweep: false })).toBe("nothing to do here");
+    });
+
+    it("distinguishes a task with no loop from a server that did not answer", () => {
+      // null = verify, which has no loop at all. undefined = an older
+      // server. Rendering the second as the first would put a claim on
+      // screen that the response never made.
+      expect(loopCadence(null)).toBe("manual only");
+      expect(loopCadence(undefined)).toBeNull();
+    });
+  });
+
+  describe("noRunningLoop", () => {
+    it("is true only on positive evidence that nothing is running", () => {
+      expect(noRunningLoop({})).toBe(true);
+      expect(noRunningLoop({ last_run_at: "2026-09-11T08:00:00Z" })).toBe(true);
+      expect(noRunningLoop({ observed_interval_ms: "60000" })).toBe(false);
+      // Neither an absent observation nor a task that has no loop is
+      // evidence of an unattended queue, so neither may raise a warning.
+      expect(noRunningLoop(undefined)).toBe(false);
+      expect(noRunningLoop(null)).toBe(false);
+    });
   });
 
   function table() {

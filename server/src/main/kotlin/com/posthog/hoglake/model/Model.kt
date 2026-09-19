@@ -1020,12 +1020,23 @@ data class CleanupResult(
 // ---- the maintenance run ledger (hog_maintenance_run) ---------------------
 
 /** The maintenance-task vocabulary (hog_maintenance_run.task's CHECK). */
-enum class MaintenanceTask {
-    HYDRATOR,
-    EXPIRY,
-    CLEANUP,
-    COMPACTION,
-    VERIFY,
+enum class MaintenanceTask(
+    /** False for the manual-only task: no background loop ever drives it. */
+    val hasLoop: Boolean,
+    /**
+     * True when EVERY loop sweep records a run row, which is what makes
+     * the gaps between recorded runs the loop's cadence. The hydrator's
+     * sweep is instance-wide and records only for the catalogs it
+     * claimed files for (V2__maintenance.sql), so its gaps measure when
+     * work arrived, not how often the loop ran.
+     */
+    val loopRecordsEverySweep: Boolean,
+) {
+    HYDRATOR(hasLoop = true, loopRecordsEverySweep = false),
+    EXPIRY(hasLoop = true, loopRecordsEverySweep = true),
+    CLEANUP(hasLoop = true, loopRecordsEverySweep = true),
+    COMPACTION(hasLoop = true, loopRecordsEverySweep = true),
+    VERIFY(hasLoop = false, loopRecordsEverySweep = false),
     ;
 
     val wire: String get() = name.lowercase()
@@ -1121,13 +1132,47 @@ sealed interface MaintenanceBacklog {
     data object VerifyBacklog : MaintenanceBacklog
 }
 
+/**
+ * What the run ledger says about a task's background loop. Read from
+ * hog_maintenance_run, so it describes the FLEET: the loop may live in a
+ * different deployment from the one answering the request (gigahog runs
+ * compaction only on gigahog-maintenance), and that process's local
+ * config cannot answer "is this task running".
+ */
+data class LoopObservation(
+    /**
+     * The gap the loop is currently keeping, or null when the ledger
+     * cannot say: fewer than two recorded loop runs, a task whose sweeps
+     * are not all recorded ([MaintenanceTask.loopRecordsEverySweep]), or
+     * a loop that has since stopped — a cadence is a claim about now, so
+     * a dead loop must not keep advertising the rhythm it used to keep.
+     */
+    val intervalMs: Long?,
+    /** Most recent loop run; null = none inside the ledger's retention. */
+    val lastRunAt: Instant?,
+    /**
+     * [MaintenanceTask.loopRecordsEverySweep], carried so a reader knows
+     * how to read SILENCE here. Where it is true, no runs means no loop
+     * is running the task; where it is false, it only means no work
+     * arrived for this catalog, and the loop may be perfectly healthy.
+     */
+    val recordsEverySweep: Boolean,
+)
+
 data class MaintenanceTaskStatus(
     val task: MaintenanceTask,
-    /** Background loop cadence; 0 = disabled; null = the task has no loop (verify). */
+    /**
+     * The RESPONDING PROCESS's configured cadence; 0 = disabled here,
+     * null = the task has no loop at all (verify). Says nothing about
+     * any other process, so it must not be read as "the task is
+     * disabled" — [loop] is the fleet-wide answer.
+     */
     val loopIntervalMs: Long?,
     /** The task's most recent recorded run; null = never recorded. */
     val lastRun: MaintenanceRun?,
     val backlog: MaintenanceBacklog,
+    /** Ledger evidence about the loop; null for a task with no loop. */
+    val loop: LoopObservation? = null,
 )
 
 data class MaintenanceStatus(

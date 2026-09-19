@@ -12,9 +12,9 @@ import {
   LedgerUnavailableNotice,
   RunOutcomeBadge,
   RunsTable,
-  formatInterval,
   isLedgerUnavailable,
-  isLoopDisabled,
+  loopCadence,
+  noRunningLoop,
 } from "../components/maintenance";
 import { formatCount, formatTime } from "../lib/format";
 
@@ -61,14 +61,21 @@ function taskCell(t: MaintenanceTaskStatus): {
           : "Snapshots retained between the expiry floor and head",
       };
     }
-    case "cleanup":
+    case "cleanup": {
+      // Queued entries only matter if nothing is draining them, and the
+      // ledger is the only thing here that knows whether anything is.
+      const unattended = noRunningLoop(t.loop);
       return {
         number: `${formatCount(t.backlog.queued_removals)} queued`,
-        warn: t.backlog.queued_removals !== undefined && t.backlog.queued_removals !== "0" && isLoopDisabled(t.loop_interval_ms),
+        warn:
+          t.backlog.queued_removals !== undefined &&
+          t.backlog.queued_removals !== "0" &&
+          unattended,
         title:
           "Undrained removal-queue entries" +
-          (isLoopDisabled(t.loop_interval_ms) ? " (the cleanup loop is disabled)" : ""),
+          (unattended ? " (no running cleanup loop observed)" : ""),
       };
+    }
     case "compaction":
       return {
         number: `${formatCount(t.backlog.small_files)} small files`,
@@ -138,13 +145,18 @@ export function CentralMaintenancePage() {
 
   const ledgerUnavailable = status.isError && isLedgerUnavailable(status.error);
 
-  // Column cadences come from any catalog's task entry (loop config is
-  // instance-wide): "hydrator · every 5s".
+  // One cadence per column, from the ledger. A sweep visits every
+  // catalog, so the loop keeps the same rhythm for all of them, and the
+  // first catalog with a measured one speaks for the column — a catalog
+  // too new to have two runs yet does not blank it.
+  //
+  // Only a CADENCE belongs in a column head. The per-catalog phrasings
+  // ("last loop run 2m ago", "nothing to do here") are claims about one
+  // row, and a header is the wrong place to make them about all of them.
   const cadence = (task: MaintenanceTask): string => {
-    const t = catalogs[0]?.tasks.find((x) => x.task === task);
-    if (!t || t.loop_interval_ms === undefined) return "manual";
-    if (isLoopDisabled(t.loop_interval_ms)) return "disabled";
-    return `every ${formatInterval(t.loop_interval_ms)}`;
+    const observed = catalogs.map((c) => c.tasks.find((x) => x.task === task)?.loop);
+    if (observed.some((loop) => loop === null)) return "manual only";
+    return observed.map(loopCadence).find((text) => text?.startsWith("every")) ?? "";
   };
 
   return (

@@ -493,11 +493,35 @@ export interface CompactionBacklog {
 
 export type VerifyBacklog = Record<string, never>;
 
+/** Ledger-derived, so fleet-wide — see `loop` below. */
+export interface LoopObservation {
+  /** The gap the loop keeps now; absent when the ledger cannot say. */
+  observed_interval_ms?: Int64;
+  /** Start of the most recent loop run; absent when there is none. */
+  last_run_at?: string;
+  /**
+   * How to read silence: true = no runs means no loop is running this
+   * task; false (the hydrator) = no runs only means no work arrived for
+   * this catalog. Absent on a server predating the field.
+   */
+  records_every_sweep?: boolean;
+}
+
 interface MaintenanceTaskStatusBase {
-  /** 0 = loop disabled; absent = the task has no loop (verify). */
+  /**
+   * The RESPONDING process's own config; 0 = the loop is off THERE.
+   * Never a fleet fact — a deployment can run the loop in another pod —
+   * so nothing may render "disabled" from it.
+   */
   loop_interval_ms?: Int64;
   /** Always present; null = no recorded run yet. */
   last_run: MaintenanceRun | null;
+  /**
+   * Always present on a server that reports it; null = the task has no
+   * loop (verify). Absent means an OLDER server, which is a different
+   * claim from "no loop runs" and must not render as one.
+   */
+  loop?: LoopObservation | null;
 }
 
 export type MaintenanceTaskStatus =

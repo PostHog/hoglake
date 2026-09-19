@@ -208,9 +208,28 @@ private fun normalizeLedgerResult(
  */
 private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data", "heap_budget_exceeded")
 
+/**
+ * What the run ledger observed about a task's loop — fleet-wide, unlike
+ * [MaintenanceTaskStatusDto.loopIntervalMs].
+ */
+data class LoopObservationDto(
+    /** Absent under NON_NULL when the ledger cannot state a cadence. */
+    val observedIntervalMs: Long?,
+    /** Absent under NON_NULL when no loop run is inside the retention window. */
+    val lastRunAt: Instant?,
+    /** How to read silence here — see the spec's LoopObservation. */
+    val recordsEverySweep: Boolean,
+)
+
 data class MaintenanceTaskStatusDto(
     val task: String,
-    /** Absent under NON_NULL for manual-only tasks (verify); 0 = loop disabled. */
+    /**
+     * The RESPONDING PROCESS's configured cadence (absent under NON_NULL
+     * for manual-only tasks; 0 = the loop is off IN THIS PROCESS). A
+     * deployment may run a task's loop in a different pod from the one
+     * serving the API, so a reader must never turn this into "the task
+     * is not running" — that is [loop]'s job.
+     */
     val loopIntervalMs: Long?,
     /** ALWAYS included: null = the task has no recorded run. */
     @get:JsonInclude(JsonInclude.Include.ALWAYS)
@@ -222,6 +241,15 @@ data class MaintenanceTaskStatusDto(
      * matching the spec's "absent when disabled" contract).
      */
     val backlog: MaintenanceBacklog,
+    /**
+     * ALWAYS included, so a client can tell "this task has no loop"
+     * (null) from "an older server did not report" (the key is missing)
+     * — the two must not collapse into the same silence during a
+     * rollout, where the webui runs ahead of the server for a few
+     * minutes.
+     */
+    @get:JsonInclude(JsonInclude.Include.ALWAYS)
+    val loop: LoopObservationDto?,
 )
 
 fun MaintenanceTaskStatus.toDto() =
@@ -230,6 +258,7 @@ fun MaintenanceTaskStatus.toDto() =
         loopIntervalMs = loopIntervalMs,
         lastRun = lastRun?.toDto(),
         backlog = backlog,
+        loop = loop?.let { LoopObservationDto(it.intervalMs, it.lastRunAt, it.recordsEverySweep) },
     )
 
 data class MaintenanceStatusDto(
