@@ -3,6 +3,7 @@
 // outcome summaries, run-table formatting, and the paged runs table that
 // serves both scopes (per-catalog and instance-wide).
 
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import {
@@ -250,6 +251,20 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
 const RUNS_PAGE_SIZE = 20;
 
 /**
+ * How many rows the quiet filter tries to put on screen before it stops
+ * following the `before` cursor, and how many extra requests it may spend
+ * doing so. The product is the worst case a single filter activation can
+ * cost the server: 10 x 20 = 200 rows walked, then it gives up and says so.
+ *
+ * The bound is not a nicety. A catalog whose loops are all idle records
+ * nothing BUT quiet runs, so "keep paging until enough rows are visible"
+ * has no natural end — it would walk the whole retention window, one
+ * request per 20 rows, every time someone opened the page.
+ */
+const RUNS_AUTOPAGE_TARGET = RUNS_PAGE_SIZE;
+const RUNS_AUTOPAGE_MAX_REQUESTS = 10;
+
+/**
  * The runs table's task filter: the spec's MaintenanceTask vocabulary, plus
  * the "all" default the table opens on.
  */
@@ -276,33 +291,51 @@ const HIDE_QUIET_TITLE =
   "for every sweep of every catalog, so most rows are no-ops. A failed run " +
   "is never hidden, and neither is one carrying a warning — compaction " +
   "failures or skips, still-referenced cleanup entries, an expiry floored " +
-  "by a consumer — even when its counts are all zero.";
+  "by a consumer — even when its counts are all zero. The table pages back " +
+  "through the ledger to fill a screen, up to a fixed number of requests, " +
+  "then says how far back it looked.";
 
 /**
  * The paged run ledger, newest first ("Load more" pages down via the
  * `before` cursor). With `catalog` it reads the per-catalog endpoint;
  * without it the instance-wide feed, adding a catalog column that links
  * to the catalog's own maintenance page.
+ *
+ * The two filters sit on opposite sides of the wire, and deliberately so.
+ *
+ * The TASK filter is the endpoint's own `?task=` parameter, so it is part
+ * of the query key: the server returns 20 rows OF THAT TASK per page, and
+ * the `before` cursor pages within them. Filtering an already-fetched page
+ * by task instead (what this table did first) makes the page size mean
+ * "20 runs of any task", so a task that runs rarely can be absent from
+ * every window the table ever holds.
+ *
+ * "Hide quiet" stays CLIENT-side, and the table follows the cursor itself
+ * until enough rows survive it. isQuietRun is a subtle predicate — per-task
+ * warning counters, the never-hide rules for failures and null results,
+ * fields the row renderer does not even show — and a second implementation
+ * of it in Kotlin would be free to drift from this one with nothing to red
+ * when it did. One predicate, in the language that also renders the rows.
  */
 export function RunsTable({ catalog }: { catalog?: string }) {
-  // Filter state lives outside the query key on purpose: filtering is a
-  // view over the pages already fetched, so changing it refetches nothing
-  // and a poll refresh cannot reset it.
   const [taskFilter, setTaskFilter] = useStoredPref(
     TASK_FILTER_KEY,
     RUN_TASK_FILTERS,
     "all",
   );
   const [hideQuiet, setHideQuiet] = useStoredPref(HIDE_QUIET_KEY, SWITCH, "off");
+  const task = taskFilter === "all" ? undefined : taskFilter;
   const query = useInfiniteQuery({
-    queryKey: ["maintenance-runs", catalog ?? "<instance>"],
+    queryKey: ["maintenance-runs", catalog ?? "<instance>", taskFilter],
     queryFn: ({ pageParam }) =>
       catalog
         ? listMaintenanceRuns(catalog, {
+            task,
             before: pageParam,
             limit: RUNS_PAGE_SIZE,
           })
         : listInstanceMaintenanceRuns({
+            task,
             before: pageParam,
             limit: RUNS_PAGE_SIZE,
           }),
@@ -315,19 +348,44 @@ export function RunsTable({ catalog }: { catalog?: string }) {
         : undefined,
   });
 
-  // Both filters are client-side over the pages already loaded — the
-  // /maintenance/runs endpoint has no task or outcome parameter. "Load
-  // more" therefore still pages 20 RAW runs at a time, of which a narrow
-  // filter may keep few; that is the honest behaviour (the pager reflects
-  // the ledger, not the view) and the hidden count below says so.
   const fetched = (query.data?.pages ?? []).flatMap((p) => p.runs);
-  const byTask =
-    taskFilter === "all"
-      ? fetched
-      : fetched.filter((run) => run.task === taskFilter);
-  const runs = hideQuiet === "on" ? byTask.filter((r) => !isQuietRun(r)) : byTask;
-  const quietHidden = byTask.length - runs.length;
+  const runs = hideQuiet === "on" ? fetched.filter((r) => !isQuietRun(r)) : fetched;
+  const quietHidden = fetched.length - runs.length;
   const cols = catalog ? 7 : 8;
+
+  // The auto-pager's request budget. It is spent following the cursor while
+  // the quiet filter has nothing to show, and it re-arms only when the
+  // search SETTLES — enough rows visible, or the ledger exhausted. A poll
+  // refresh therefore cannot re-arm it: on a catalog that is quiet all the
+  // way down, the search runs once and then stays stopped.
+  const searchKey = `${catalog ?? ""} ${taskFilter} ${hideQuiet}`;
+  const [armedFor, setArmedFor] = useState(searchKey);
+  const [spent, setSpent] = useState(0);
+  if (armedFor !== searchKey) {
+    // Changing a filter is the user asking again; re-arm before this render
+    // commits (React's documented adjust-state-on-change pattern).
+    setArmedFor(searchKey);
+    setSpent(0);
+  }
+  const searching = hideQuiet === "on" && runs.length < RUNS_AUTOPAGE_TARGET;
+  const { fetchNextPage, hasNextPage, isFetching } = query;
+  useEffect(() => {
+    if (!searching || isFetching) return;
+    if (!hasNextPage) {
+      if (spent !== 0) setSpent(0);
+      return;
+    }
+    if (spent >= RUNS_AUTOPAGE_MAX_REQUESTS) return;
+    setSpent((n) => n + 1);
+    void fetchNextPage();
+  }, [searching, isFetching, hasNextPage, spent, fetchNextPage]);
+  useEffect(() => {
+    // Settled with a full screen: give the budget back for the next time
+    // arrivals push the interesting rows off the bottom of the window.
+    if (hideQuiet === "on" && !searching && spent !== 0) setSpent(0);
+  }, [hideQuiet, searching, spent]);
+  const gaveUp =
+    searching && hasNextPage && !isFetching && spent >= RUNS_AUTOPAGE_MAX_REQUESTS;
 
   return (
     <section className="panel runs-panel">
@@ -356,10 +414,16 @@ export function RunsTable({ catalog }: { catalog?: string }) {
           </select>
         </label>
         {hideQuiet === "on" && (
-          // Say what was removed rather than silently shrinking the list:
-          // a short table under a filter must not read as "the loops stopped".
+          // Say what was removed rather than silently shrinking the list: a
+          // short table under a filter must not read as "the loops stopped".
+          // And say what the number COVERS whenever older runs remain
+          // unread — a bare "20 quiet runs hidden" over an empty table
+          // claims the filter found nothing interesting in the ledger, when
+          // all it found was nothing interesting in the last 20 rows.
           <span className="subtle runs-hidden-count">
             {quietHidden} quiet run{quietHidden === 1 ? "" : "s"} hidden
+            {hasNextPage && ` of the newest ${fetched.length} runs searched`}
+            {gaveUp && " — Load more to look further back"}
           </span>
         )}
       </div>
@@ -428,7 +492,12 @@ export function RunsTable({ catalog }: { catalog?: string }) {
             <button
               type="button"
               className="load-more"
-              onClick={() => void query.fetchNextPage()}
+              onClick={() => {
+                // An explicit click re-arms the auto-pager: the operator is
+                // asking again, so the search may spend its budget again.
+                setSpent(0);
+                void query.fetchNextPage();
+              }}
               disabled={query.isFetchingNextPage}
             >
               {query.isFetchingNextPage ? "Loading…" : query.isFetchNextPageError ? "Retry loading more" : "Load more"}
