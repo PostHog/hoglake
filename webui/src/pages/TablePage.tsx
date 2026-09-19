@@ -11,6 +11,7 @@ import type {
   Int64,
   PartitionSpec,
   ScanFile,
+  SortField,
   SortSpec,
   StatsState,
   Table,
@@ -52,6 +53,18 @@ function PathCell({ path, label }: { path: string; label?: string }) {
   );
 }
 
+/**
+ * One sort-spec field as `path dir nulls`, e.g. `ts asc nulls last`. The
+ * column resolves to its dotted path for the same reason the partition
+ * key does: two structs may each hold a `zip`, and a header that read
+ * "zip desc" would sort by the wrong one.
+ */
+function formatSortField(f: SortField, columns?: Column[]): string {
+  const source = columnPath(columns, f.source_field_id) ?? `field ${f.source_field_id}`;
+  const nulls = f.null_order === "nulls_first" ? "nulls first" : "nulls last";
+  return `${source} ${f.direction} ${nulls}`;
+}
+
 function StatsHeader({ table }: { table: Table }) {
   return (
     <dl className="stats-header">
@@ -73,6 +86,26 @@ function StatsHeader({ table }: { table: Table }) {
         <dt>table_uuid</dt>
         <dd className="mono">
           {table.table_uuid} <CopyButton text={table.table_uuid} label="table_uuid" />
+        </dd>
+      </div>
+      <div>
+        <dt>partition_keys</dt>
+        <dd className="mono">
+          {table.partition_spec && table.partition_spec.fields.length > 0
+            ? table.partition_spec.fields
+                .map((f) => formatPartitionField(f, table.columns))
+                .join(", ")
+            : "—"}
+        </dd>
+      </div>
+      <div>
+        <dt>sort_order</dt>
+        <dd className="mono">
+          {table.sort_spec && table.sort_spec.fields.length > 0
+            ? table.sort_spec.fields
+                .map((f) => formatSortField(f, table.columns))
+                .join(", ")
+            : "—"}
         </dd>
       </div>
     </dl>

@@ -51,6 +51,27 @@ describe("TablePage", () => {
     // Partition spec rendering, source field resolved to column names.
     expect(screen.getByText("day(ts)")).toBeInTheDocument();
     expect(screen.getByText("bucket(16, url)")).toBeInTheDocument();
+
+    // The header surfaces the partition keys themselves (tableFixture is
+    // unsorted, so sort_order falls back to the em dash).
+    expect(screen.getByText("partition_keys")).toBeInTheDocument();
+    expect(screen.getByText("day(ts), bucket(16, url)")).toBeInTheDocument();
+    expect(screen.getByText("sort_order")).toBeInTheDocument();
+    expect(screen.getByText("sort_order").nextElementSibling).toHaveTextContent("—");
+  });
+
+  it("shows the sort order in the stats header for a sorted table", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(sortedTableFixture);
+      return undefined;
+    });
+    renderApp(route);
+
+    // Both sort fields, each resolved to its column, leading key first.
+    expect(
+      await screen.findByText("user_id asc nulls last, ts desc nulls first"),
+    ).toBeInTheDocument();
   });
 
   it("shows data files with a stats marker per state on the Files tab", async () => {
