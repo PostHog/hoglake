@@ -85,6 +85,31 @@ export function textColumn<T>(
   return { compare: (a, b) => cmpText(get(a), get(b)) };
 }
 
+/**
+ * A column of ISO timestamps shown as an AGE, ordered so the first
+ * (descending) click surfaces the OLDEST — the largest age — the way a
+ * magnitude column surfaces the biggest.
+ *
+ * Age is `now - t`, and `now` cancels out of any age comparison
+ * (`(now-ta) - (now-tb) == tb - ta`), so ordering by age needs no clock:
+ * ascending age is descending timestamp. The base comparator is
+ * therefore the reversed timestamp compare, which `applySort` then flips
+ * for the descending click into oldest-first. A row with no timestamp
+ * (unsampled) is `absent`, so it sorts last in both directions rather
+ * than riding to the top of "oldest first".
+ */
+export function ageColumn<T>(
+  get: (row: T) => string | null | undefined,
+): ColumnSort<T> {
+  return {
+    compare: (a, b) => cmpText(get(b), get(a)),
+    absent: (row) => {
+      const v = get(row);
+      return v === null || v === undefined;
+    },
+  };
+}
+
 export interface SortState<K extends string> {
   key: K;
   desc: boolean;

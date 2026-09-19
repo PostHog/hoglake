@@ -32,10 +32,14 @@ export const catalogsFixture: Catalog[] = [
     table_count: "42",
     live_rows: "9007199254740993",
     live_size_bytes: "5368709120",
+    // Oldest retained snapshot, from the same sample. An instant, not a
+    // pre-computed age — the page renders the elapsed time.
+    oldest_snapshot_time: "2026-09-16T00:00:00Z",
   },
   {
     // NOT sampled: the totals are absent rather than zero, which is the
-    // case the page has to render as an em dash.
+    // case the page has to render as an em dash. oldest_snapshot_time is
+    // absent too, so its age cell is an em dash, not "0s".
     name: "scratch",
     data_path: "s3://hog-lake/scratch",
     head_snapshot_id: "12",

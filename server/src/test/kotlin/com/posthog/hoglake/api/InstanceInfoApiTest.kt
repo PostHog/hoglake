@@ -25,6 +25,7 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.time.Instant
 
 /**
  * Wire-level pinning for GET /v1/info — the webui header builds against
@@ -159,6 +160,34 @@ class InstanceInfoApiTest {
             assertThat(after["table_count"].asLong()).isEqualTo(1)
             assertThat(after["live_rows"].asLong()).isEqualTo(15)
             assertThat(after["live_size_bytes"].asLong()).isEqualTo(1_050_624)
+            // The oldest-snapshot time rides the SAME sample: absent
+            // before, present after, and an ISO instant the client can
+            // turn into an age — never a pre-computed duration.
+            assertThat(before.has("oldest_snapshot_time")).isFalse()
+            assertThat(after.has("oldest_snapshot_time")).isTrue()
+            assertThat(Instant.parse(after["oldest_snapshot_time"].asText()))
+                .isBeforeOrEqualTo(Instant.now())
+        }
+
+    @Test
+    fun `oldest snapshot time is the earliest retained, not the expiry floor`() =
+        api { client ->
+            // A catalog that has never expired: earliest_snapshot_time
+            // (the floor) is still null, but the catalog plainly retains
+            // its first snapshot. oldest_snapshot_time must report that
+            // one, so the column reads an age rather than a dash exactly
+            // where the snapshot is OLDEST.
+            val cat = "info-oldest-never-expired"
+            seed(cat)
+            app.catalogMetrics.sampleOnce()
+
+            val row = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(row.has("earliest_snapshot_time"))
+                .describedAs("expiry has not run, so the floor time is absent")
+                .isFalse()
+            assertThat(row.has("oldest_snapshot_time"))
+                .describedAs("but the first snapshot is retained and dated")
+                .isTrue()
         }
 
     @Test

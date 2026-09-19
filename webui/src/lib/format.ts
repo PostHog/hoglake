@@ -71,6 +71,31 @@ export function formatTime(iso: string): string {
 }
 
 /**
+ * Elapsed time since `iso`, to a SINGLE rounded unit: "8s", "12min",
+ * "19h", "3d". An age here places a snapshot in time — the difference
+ * between 19h and 19h 11min never matters, and the second unit is just
+ * noise. Computed from `Date.now()` at render, so it stays live between
+ * refetches. `—` for a missing or unparseable instant.
+ *
+ * Units and 2x thresholds match the maintenance page's formatSeconds
+ * (up to 119min before switching to hours, 47h before days): "min", not
+ * a bare "m" that reads as mega. A future instant (client clock skew)
+ * clamps to "0s" rather than a negative age.
+ */
+export function formatAge(iso: string | null | undefined): string {
+  if (iso === null || iso === undefined) return "—";
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return "—";
+  const secs = Math.max(0, (Date.now() - t) / 1000);
+  if (secs < 120) return `${Math.round(secs)}s`;
+  const mins = secs / 60;
+  if (mins < 120) return `${Math.round(mins)}min`;
+  const hours = mins / 60;
+  if (hours < 48) return `${Math.round(hours)}h`;
+  return `${Math.round(hours / 24)}d`;
+}
+
+/**
  * The DOTTED PATH of the column carrying `fieldId`, searched through
  * nested children, or undefined when the schema does not hold it.
  *

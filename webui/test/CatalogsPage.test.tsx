@@ -1,6 +1,6 @@
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { catalogsFixture, notFoundError } from "./fixtures";
 import { bigIntCatalogsWireBody } from "./fixtures.adversarial";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
@@ -108,6 +108,74 @@ describe("catalog totals", () => {
     // otherwise be its natural home.
     await user.click(size);
     expect(names()).toEqual(["analytics", "scratch"]);
+  });
+
+  it("renders the oldest snapshot as a live age, em dash until sampled", async () => {
+    // Pinned so the fixture's 2026-09-16 instant reads as a clean single
+    // unit (3d 5h → "3d"). shouldAdvanceTime lets React Query's async
+    // polling still run under fake timers (otherwise findByText never
+    // resolves); the clock advances only by the test's real ms.
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-09-19T05:00:00Z"));
+    try {
+      mockFetch((url) =>
+        url === "/v1/catalogs" ? jsonResponse(catalogsFixture) : undefined,
+      );
+      renderApp("/");
+
+      const analytics = (await screen.findByText("analytics")).closest("tr")!;
+      // The oldest-snapshot cell (second-to-last, before schema_version)
+      // shows a single rounded unit — no finer part after it.
+      const cells = analytics.querySelectorAll("td");
+      const ageCell = cells[cells.length - 2];
+      expect(ageCell.textContent).toBe("3d");
+      // The exact instant is in that cell's title, for the operator who
+      // wants it.
+      expect(ageCell.getAttribute("title")).toBe("2026-09-16T00:00:00Z");
+
+      // Unsampled: an unknown age is an em dash, never "0s".
+      const scratch = screen.getByText("scratch").closest("tr")!;
+      const lastCells = scratch.querySelectorAll("td");
+      // second-to-last cell is the oldest-snapshot column
+      expect(lastCells[lastCells.length - 2].textContent).toBe("—");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("sorts by oldest snapshot: first click surfaces the oldest, unsampled last", async () => {
+    mockFetch((url) =>
+      url === "/v1/catalogs"
+        ? jsonResponse([
+            {
+              name: "newer",
+              data_path: "s3://hog-lake/newer",
+              head_snapshot_id: "3",
+              schema_version: "1",
+              table_count: "1",
+              live_rows: "1",
+              live_size_bytes: "1",
+              oldest_snapshot_time: "2026-09-18T00:00:00Z",
+            },
+            ...catalogsFixture, // analytics (older) + scratch (unsampled)
+          ])
+        : undefined,
+    );
+    renderApp("/");
+    const user = userEvent.setup();
+    await screen.findByText("newer");
+
+    const names = () =>
+      screen
+        .getAllByRole("row")
+        .slice(1)
+        .map((r) => r.querySelector("td:first-child")?.textContent ?? "")
+        .filter((t) => t !== "");
+
+    await user.click(screen.getByRole("button", { name: /^oldest_snapshot/ }));
+    // analytics (2026-09-16) is older than newer (2026-09-18); scratch
+    // has no snapshot time and stays last, not at the "oldest" top.
+    expect(names()).toEqual(["analytics", "newer", "scratch"]);
   });
 
   it("sorts row counts that are the same double, in the order the data says", async () => {

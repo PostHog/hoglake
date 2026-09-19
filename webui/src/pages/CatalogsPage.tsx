@@ -5,12 +5,20 @@ import { createCatalog, listCatalogs } from "../api/client";
 import type { Catalog } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
-import { formatBytes, formatCount } from "../lib/format";
-import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
+import { formatAge, formatBytes, formatCount } from "../lib/format";
+import { ageColumn, applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
 
-type SortKey = "name" | "path" | "tables" | "rows" | "size" | "head" | "schema";
+type SortKey =
+  | "name"
+  | "path"
+  | "tables"
+  | "rows"
+  | "size"
+  | "head"
+  | "oldest"
+  | "schema";
 
 const COMPARATORS: Record<SortKey, ColumnSort<Catalog>> = {
   name: textColumn((c) => c.name),
@@ -22,6 +30,9 @@ const COMPARATORS: Record<SortKey, ColumnSort<Catalog>> = {
   rows: int64Column((c) => c.live_rows),
   size: int64Column((c) => c.live_size_bytes),
   head: int64Column((c) => c.head_snapshot_id),
+  // Descending-first surfaces the oldest snapshot; unsampled catalogs
+  // (no timestamp) sort last, not to the top.
+  oldest: ageColumn((c) => c.oldest_snapshot_time),
   schema: int64Column((c) => c.schema_version),
 };
 
@@ -130,6 +141,14 @@ export function CatalogsPage() {
                 numeric
               />
               <SortableTh
+                label="oldest_snapshot"
+                sortKey="oldest"
+                sort={sort}
+                onSort={onSort}
+                numeric
+                tooltip="Age of the oldest snapshot the catalog still retains"
+              />
+              <SortableTh
                 label="schema_version"
                 sortKey="schema"
                 sort={sort}
@@ -139,12 +158,12 @@ export function CatalogsPage() {
             </tr>
           </thead>
           {isPending ? (
-            <SkeletonRows rows={4} cols={7} />
+            <SkeletonRows rows={4} cols={8} />
           ) : (
             <tbody>
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="empty">
+                  <td colSpan={8} className="empty">
                     No catalogs yet.
                   </td>
                 </tr>
@@ -172,6 +191,18 @@ export function CatalogsPage() {
                     {c.live_size_bytes === undefined ? "—" : formatBytes(c.live_size_bytes)}
                   </td>
                   <td className="num mono">{c.head_snapshot_id}</td>
+                  {/* An em dash until the catalog has been sampled, like
+                      the totals: an unknown age is not a zero age. */}
+                  <td
+                    className="num mono"
+                    title={
+                      c.oldest_snapshot_time === undefined
+                        ? undefined
+                        : c.oldest_snapshot_time
+                    }
+                  >
+                    {formatAge(c.oldest_snapshot_time)}
+                  </td>
                   <td className="num mono">{c.schema_version}</td>
                 </tr>
               ))}

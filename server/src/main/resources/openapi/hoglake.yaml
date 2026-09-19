@@ -1550,6 +1550,17 @@ components:
             sampler has not covered yet (the boot window, or one created
             since the last pass): an unsampled catalog and an empty one
             are different facts.
+        oldest_snapshot_time:
+          type: string
+          format: date-time
+          description: >
+            Commit time of the oldest RETAINED snapshot
+            (MIN(snapshot_time)), from the same sample as the totals and
+            OMITTED under the same rule until first sampled. Unlike
+            earliest_snapshot_time this does not wait on expiry: a
+            never-expired catalog still retains its first snapshot, and
+            this reports it. An instant, not an age — clients render the
+            elapsed time so it stays live between samples.
 
     CreateCatalogRequest:
       type: object
