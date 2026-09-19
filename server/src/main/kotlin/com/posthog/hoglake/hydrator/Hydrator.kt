@@ -142,8 +142,11 @@ class Hydrator(
      * recorded AFTER the sweep transaction commits (a no-claim sweep
      * records nothing — a catalog's waiting work is the stats_state
      * backlog, not a run).
+     *
+     * [limit] defaults to [DEFAULT_SWEEP_LIMIT] — see that constant for
+     * why it is not 100.
      */
-    fun runOnce(limit: Int = 100): Int {
+    fun runOnce(limit: Int = DEFAULT_SWEEP_LIMIT): Int {
         val startedAt = Instant.now()
         // Per-catalog outcome tallies, accumulated inside the sweep
         // transaction and recorded after it commits.
@@ -670,6 +673,37 @@ class Hydrator(
     }
 
     companion object {
+        /**
+         * Files claimed per sweep.
+         *
+         * 100 was a placeholder that outlived its assumption. Hydration
+         * is a backfill for files registered WITHOUT stats, and the
+         * steady-state queue is empty because every writer in the fleet
+         * ships its own footer — so the batch size never mattered and a
+         * small one looked prudent.
+         *
+         * A writer that defers stats breaks that assumption, and then
+         * the arithmetic is unforgiving: the loop takes its batch and
+         * sleeps the whole interval whether one file waited or ten
+         * thousand did. At 100 per sweep on a 15-minute loop that is
+         * ~400 files/hour per deployment, against a deferred-stats
+         * writer producing them far faster. Measured on gigahog-dev: a
+         * 13,224-file backlog draining at ~800/hour while still growing.
+         *
+         * A pending file is unprunable on EVERY column until it is
+         * hydrated, so the backlog is not just a queue — it is files no
+         * reader can skip.
+         *
+         * 10,000 is sized off the per-file cost rather than a guess:
+         * ~150ms each (a ranged footer read plus a catalog write, from
+         * the same dev measurement), so a full batch is minutes of work
+         * and only ever runs when that much has genuinely accumulated.
+         * The sweep is one transaction, claimed FOR UPDATE SKIP LOCKED,
+         * so a larger batch holds it longer — which is the cost to watch
+         * if this is raised again.
+         */
+        const val DEFAULT_SWEEP_LIMIT = 10_000
+
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
         private const val FOOTER_SUFFIX = 8L
 
