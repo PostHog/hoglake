@@ -13,22 +13,12 @@ import {
   RunOutcomeBadge,
   RunSummary,
   RunsTable,
-  formatInterval,
   formatRunDuration,
+  formatSeconds,
   isLedgerUnavailable,
-  isLoopDisabled,
+  loopCadence,
 } from "../components/maintenance";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
-
-/** Wall-clock seconds for display: "45s", "30m", "2h", "3d". */
-function formatSeconds(seconds: number): string {
-  if (seconds < 120) return `${Math.round(seconds)}s`;
-  const m = seconds / 60;
-  if (m < 120) return `${Math.round(m)}m`;
-  const h = m / 60;
-  if (h < 48) return `${Math.round(h)}h`;
-  return `${Math.round(h / 24)}d`;
-}
 
 /** Retention seconds are int64 strings; only the magnitude is displayed. */
 function formatRetention(seconds: Int64): string {
@@ -160,14 +150,7 @@ function TaskPanel({
   return (
     <section className="panel task-panel" data-task={status.task}>
       <h3>
-        {status.task}{" "}
-        <span className="subtle">
-          {status.loop_interval_ms === undefined
-            ? "manual only"
-            : isLoopDisabled(status.loop_interval_ms)
-              ? "loop disabled"
-              : `every ${formatInterval(status.loop_interval_ms)}`}
-        </span>
+        {status.task} <span className="subtle">{loopCadence(status.loop)}</span>
       </h3>
       <Backlog status={status} catalog={catalog} />
       <LastRun run={status.last_run} />

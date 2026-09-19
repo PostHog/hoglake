@@ -1,6 +1,6 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   maintenanceRunPageFixture,
   maintenanceRunsFixture,
@@ -33,12 +33,22 @@ function mockMaintenance(
 }
 
 describe("MaintenancePage", () => {
+  // The ages in the loop observations are relative to now, so the clock
+  // is pinned just after the fixture's newest run.
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-09-11T10:00:30Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("renders every task panel with loop state, backlog, and last run", async () => {
     mockMaintenance();
     renderApp("/catalogs/analytics/maintenance");
 
     // Wait for the status query to land (the runs table's h3 renders first).
-    await screen.findByText("every 5s");
+    await screen.findByText("every ~69s");
 
     // All five tasks, in the server's fixed order.
     const panels = screen
@@ -57,7 +67,11 @@ describe("MaintenancePage", () => {
     const hydrator = screen
       .getByRole("heading", { name: /hydrator/ })
       .closest(".task-panel")!;
-    expect(within(hydrator as HTMLElement).getByText("every 5s")).toBeInTheDocument();
+    // The hydrator records work, not sweeps, so it reports when it last
+    // ran here and never claims a cadence.
+    expect(
+      within(hydrator as HTMLElement).getByText("last loop run 30s ago"),
+    ).toBeInTheDocument();
     expect(within(hydrator as HTMLElement).getByText("4")).toBeInTheDocument(); // pending
     expect(within(hydrator as HTMLElement).getByText("1")).toBeInTheDocument(); // failed
 
@@ -73,9 +87,15 @@ describe("MaintenancePage", () => {
     const compaction = screen
       .getByRole("heading", { name: /compaction/ })
       .closest(".task-panel")!;
+    // THE BUG (#114): this process runs with the compaction loop off
+    // (loop_interval_ms "0" in the fixture) while another one sweeps
+    // every ~69s. The header must report the sweeps, not the config.
     expect(
-      within(compaction as HTMLElement).getByText("loop disabled"),
+      within(compaction as HTMLElement).getByText("every ~69s"),
     ).toBeInTheDocument();
+    expect(
+      within(compaction as HTMLElement).queryByText(/disabled/),
+    ).not.toBeInTheDocument();
     expect(within(compaction as HTMLElement).getByText("42")).toBeInTheDocument();
     // The panel links through to the debt page.
     expect(
@@ -88,6 +108,24 @@ describe("MaintenancePage", () => {
       .getByRole("heading", { name: /verify/ })
       .closest(".task-panel")!;
     expect(within(verify as HTMLElement).getByText("manual only")).toBeInTheDocument();
+  });
+
+  it("says nothing about the loop when the server did not report one", async () => {
+    // The rollout window: the webui image rolls before the server one,
+    // so for a few minutes the page talks to a build with no `loop` in
+    // the response. Silence is the only honest render — "no loop runs"
+    // would be a claim that response never made.
+    const older = {
+      ...maintenanceStatusFixture,
+      tasks: maintenanceStatusFixture.tasks.map(({ loop: _loop, ...t }) => t),
+    };
+    mockMaintenance({ status: older });
+    renderApp("/catalogs/analytics/maintenance");
+
+    await screen.findByText("42"); // the compaction backlog still renders
+    for (const text of [/disabled/, /no loop runs/, /every ~/, /last loop run/]) {
+      expect(screen.queryByText(text)).not.toBeInTheDocument();
+    }
   });
 
   it("renders the runs table newest-first with outcomes and failures", async () => {
@@ -195,7 +233,7 @@ describe("MaintenancePage", () => {
     });
     renderApp("/catalogs/analytics/maintenance");
 
-    await screen.findByText("every 5s");
+    await screen.findByText("every ~69s");
     expect(screen.getAllByText("No recorded run yet.")).toHaveLength(5);
     expect(
       await screen.findByText("No runs recorded yet."),

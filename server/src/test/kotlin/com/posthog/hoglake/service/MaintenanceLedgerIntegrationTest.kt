@@ -500,4 +500,173 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(expiryOnly.runs.map { it.catalog })
             .noneMatch { it in setOf("led-feed-a", "led-feed-b") }
     }
+
+    // ---- the observed loop cadence (#114) -----------------------------------
+
+    /**
+     * Ledger rows at chosen ages, newest first: [agesSeconds] is how long
+     * ago each run started. Written as SQL rather than through a service
+     * because the point is the SHAPE of the history, not the work.
+     */
+    private fun seedRunsAgo(
+        catalogId: Long,
+        task: MaintenanceTask,
+        trigger: MaintenanceTrigger,
+        vararg agesSeconds: Long,
+    ) = jdbi.useHandleUnchecked { h ->
+        for (age in agesSeconds) {
+            h.execute(
+                """
+                INSERT INTO hog_maintenance_run
+                    (catalog_id, task, run_trigger, started_at, finished_at, status)
+                VALUES (?, ?, ?, now() - (? * interval '1 second'),
+                        now() - (? * interval '1 second'), 'ok')
+                """,
+                catalogId,
+                task.wire,
+                trigger.wire,
+                age,
+                age,
+            )
+        }
+    }
+
+    private fun taskOf(
+        catalog: String,
+        task: MaintenanceTask,
+    ) = statusSvc().status(catalog).tasks.single { it.task == task }
+
+    @Test
+    fun `compaction cadence comes from the ledger, not the config of the process answering`() {
+        val id = seedCatalog("led-cad-split")
+        // The gigahog shape: a maintenance deployment sweeps every
+        // minute while the API pod runs with the compaction loop off.
+        seedRunsAgo(id, MaintenanceTask.COMPACTION, MaintenanceTrigger.LOOP, 5, 65, 125, 185, 245)
+
+        val task = taskOf("led-cad-split", MaintenanceTask.COMPACTION)
+        // statusSvc() is built with compactionIntervalMs = 0, so the
+        // responder's own config really does say "off" — this is the
+        // page that read COMPACTION DISABLED over a healthy loop (#114).
+        assertThat(task.loopIntervalMs).isZero()
+        assertThat(task.loop?.intervalMs)
+            .describedAs("the gaps the ledger recorded, not the responder's config")
+            .isBetween(59_000L, 61_000L)
+        assertThat(task.loop?.lastRunAt).isNotNull()
+    }
+
+    @Test
+    fun `one slow sweep does not move the cadence`() {
+        val id = seedCatalog("led-cad-slow")
+        // Gaps of 60, 60, 600 (a stalled sweep), 60, 60. A mean would
+        // read 168s and invite someone to go looking for a problem.
+        seedRunsAgo(id, MaintenanceTask.COMPACTION, MaintenanceTrigger.LOOP, 5, 65, 125, 725, 785, 845)
+
+        assertThat(taskOf("led-cad-slow", MaintenanceTask.COMPACTION).loop?.intervalMs)
+            .isBetween(59_000L, 61_000L)
+    }
+
+    @Test
+    fun `a loop that stopped reports its last run and no cadence`() {
+        val id = seedCatalog("led-cad-stopped")
+        // A minute apart, but nothing for the last hour.
+        seedRunsAgo(id, MaintenanceTask.COMPACTION, MaintenanceTrigger.LOOP, 3600, 3660, 3720, 3780)
+
+        val task = taskOf("led-cad-stopped", MaintenanceTask.COMPACTION)
+        assertThat(task.loop?.intervalMs)
+            .describedAs("a cadence is a claim about now; this loop is not keeping one")
+            .isNull()
+        assertThat(task.loop?.lastRunAt).isNotNull()
+    }
+
+    @Test
+    fun `the hydrator reports its last run but never a cadence`() {
+        val id = seedCatalog("led-cad-hydrator")
+        // Evenly spaced rows that are NOT evenly spaced sweeps: the
+        // hydrator's sweep is instance-wide and records only for the
+        // catalogs it claimed files for, so these gaps measure when work
+        // arrived here. Reading them as a cadence would be a guess.
+        seedRunsAgo(id, MaintenanceTask.HYDRATOR, MaintenanceTrigger.LOOP, 5, 10, 15, 20)
+
+        val task = taskOf("led-cad-hydrator", MaintenanceTask.HYDRATOR)
+        assertThat(task.loop?.intervalMs).isNull()
+        assertThat(task.loop?.lastRunAt).isNotNull()
+        // And it says so, so a reader knows that silence here is not
+        // evidence of a stopped loop.
+        assertThat(task.loop?.recordsEverySweep).isFalse()
+    }
+
+    @Test
+    fun `the response says how to read its own silence`() {
+        seedCatalog("led-cad-silence")
+        val byTask = statusSvc().status("led-cad-silence").tasks.associateBy { it.task }
+        // Same empty ledger, two meanings: nothing is compacting, versus
+        // the hydrator found no work here. Without this flag a client
+        // has to hardcode which tasks are which, and will be wrong the
+        // first time another task joins the hydrator's pattern.
+        assertThat(byTask.getValue(MaintenanceTask.COMPACTION).loop?.recordsEverySweep).isTrue()
+        assertThat(byTask.getValue(MaintenanceTask.HYDRATOR).loop?.recordsEverySweep).isFalse()
+        assertThat(byTask.getValue(MaintenanceTask.HYDRATOR).loop?.lastRunAt).isNull()
+    }
+
+    @Test
+    fun `manual triggers are not a loop`() {
+        val id = seedCatalog("led-cad-manual")
+        seedRunsAgo(id, MaintenanceTask.COMPACTION, MaintenanceTrigger.MANUAL, 5, 65, 125, 185)
+
+        val task = taskOf("led-cad-manual", MaintenanceTask.COMPACTION)
+        assertThat(task.lastRun).describedAs("the runs happened").isNotNull()
+        assertThat(task.loop?.intervalMs).isNull()
+        assertThat(task.loop?.lastRunAt)
+            .describedAs("an operator clicking the button is not a running loop")
+            .isNull()
+    }
+
+    @Test
+    fun `verify has no loop at all, which is not the same as a silent one`() {
+        seedCatalog("led-cad-verify")
+        val tasks = statusSvc().status("led-cad-verify").tasks
+        assertThat(tasks.single { it.task == MaintenanceTask.VERIFY }.loop).isNull()
+        // Every looping task reports an observation even with an empty
+        // ledger, so "null" can only ever mean "no loop exists".
+        assertThat(tasks.filter { it.task != MaintenanceTask.VERIFY })
+            .allSatisfy { assertThat(it.loop).isNotNull() }
+    }
+
+    @Test
+    fun `the instance rollup observes each catalog's own loop`() {
+        val busy = seedCatalog("led-cad-inst-busy")
+        seedCatalog("led-cad-inst-idle")
+        seedRunsAgo(busy, MaintenanceTask.CLEANUP, MaintenanceTrigger.LOOP, 5, 65, 125, 185)
+
+        val byName =
+            statusSvc().instanceStatus(limit = 100).catalogs
+                .filter { it.catalog.startsWith("led-cad-inst-") }
+                .associateBy { it.catalog }
+
+        fun cleanup(name: String) = byName.getValue(name).tasks.single { it.task == MaintenanceTask.CLEANUP }
+        assertThat(cleanup("led-cad-inst-busy").loop?.intervalMs).isBetween(59_000L, 61_000L)
+        val idle = cleanup("led-cad-inst-idle").loop
+        assertThat(idle).isNotNull()
+        assertThat(idle?.intervalMs).isNull()
+        assertThat(idle?.lastRunAt).isNull()
+    }
+
+    @Test
+    fun `the wire always carries the loop key, so absent means an older server`() {
+        seedCatalog("led-cad-wire")
+        val wire =
+            wireObjectMapper().valueToTree<JsonNode>(
+                statusSvc().status("led-cad-wire").toDto(),
+            )
+        val byTask = wire["tasks"].associateBy { it["task"].asText() }
+        // Present-and-null for the task with no loop, present-and-object
+        // for the rest. A client that sees NEITHER is talking to a build
+        // from before this existed, which is a different claim from "no
+        // loop runs" and must not render as one.
+        assertThat(byTask.getValue("verify").has("loop")).isTrue()
+        assertThat(byTask.getValue("verify")["loop"].isNull).isTrue()
+        assertThat(byTask.getValue("compaction")["loop"].isObject).isTrue()
+        assertThat(byTask.getValue("compaction")["loop"]["records_every_sweep"].asBoolean()).isTrue()
+        assertThat(byTask.getValue("hydrator")["loop"]["records_every_sweep"].asBoolean()).isFalse()
+    }
 }

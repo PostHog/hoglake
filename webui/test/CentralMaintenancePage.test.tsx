@@ -1,6 +1,6 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   instanceMaintenanceStatusFixture,
   maintenanceRunPageFixture,
@@ -28,6 +28,16 @@ function mockCentral(
 }
 
 describe("CentralMaintenancePage", () => {
+  // Loop observations are ages, so the clock is pinned just after the
+  // fixture's newest run.
+  beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-09-11T10:00:30Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("renders a warming summary as unknown and pages catalog summaries", async () => {
     const first = {
       ...instanceMaintenanceStatusFixture.catalogs[0],
@@ -60,11 +70,19 @@ describe("CentralMaintenancePage", () => {
     // Wait for the matrix to land (the runs table renders immediately).
     const scratchLink = await screen.findByRole("link", { name: "scratch" });
 
-    // Column headers carry the instance-wide cadence.
+    // Column headers carry the cadence the LEDGER observed. The fixture's
+    // compaction has loop_interval_ms "0" — the process answering does not
+    // compact — so a header built from config would read "disabled" over a
+    // loop sweeping every ~69s (#114).
     const headerRow = screen.getAllByRole("row")[0];
-    expect(within(headerRow).getByText(/every 5s/)).toBeInTheDocument();
-    expect(within(headerRow).getByText(/manual/)).toBeInTheDocument(); // verify
-    expect(within(headerRow).getByText(/disabled/)).toBeInTheDocument(); // compaction
+    expect(within(headerRow).getByText(/every ~69s/)).toBeInTheDocument();
+    expect(within(headerRow).getByText(/manual only/)).toBeInTheDocument(); // verify
+    expect(within(headerRow).queryByText(/disabled/)).not.toBeInTheDocument();
+    // The hydrator's cadence is not derivable from a ledger that records
+    // work rather than sweeps, and a column head must not borrow one
+    // row's phrasing to describe every row — so it says nothing.
+    const hydratorHead = within(headerRow).getByText(/hydrator/);
+    expect(hydratorHead.textContent?.trim()).toBe("hydrator");
 
     // analytics row: last-run badges + backlog numbers from the fixture.
     const matrix = screen.getAllByRole("table")[0];
@@ -88,6 +106,43 @@ describe("CentralMaintenancePage", () => {
         (l) => l.getAttribute("href") === "/catalogs/analytics/maintenance",
       ),
     ).toBe(true);
+  });
+
+  it("flags a queued cleanup backlog only when no loop is draining it", async () => {
+    const withQueue = (loop: unknown) => ({
+      catalogs: [
+        {
+          ...instanceMaintenanceStatusFixture.catalogs[0],
+          tasks: instanceMaintenanceStatusFixture.catalogs[0].tasks.map((t) =>
+            t.task === "cleanup"
+              ? { ...t, backlog: { queued_removals: "1200" }, loop }
+              : t,
+          ),
+        },
+      ],
+      has_more: false,
+    });
+
+    // Draining: a queue is normal while something is working it off.
+    mockCentral({ status: withQueue({ observed_interval_ms: "60000" }) });
+    const { unmount } = renderApp("/maintenance");
+    const draining = await screen.findByText("1,200 queued");
+    expect(draining).toHaveClass("subtle");
+    expect(draining.closest("td")).toHaveAttribute(
+      "title",
+      expect.not.stringContaining("no running cleanup loop"),
+    );
+    unmount();
+
+    // Unattended: the same queue with nothing running it.
+    mockCentral({ status: withQueue({}) });
+    renderApp("/maintenance");
+    const stuck = await screen.findByText("1,200 queued");
+    expect(stuck).toHaveClass("backlog-bad");
+    expect(stuck.closest("td")).toHaveAttribute(
+      "title",
+      expect.stringContaining("no running cleanup loop observed"),
+    );
   });
 
   it("renders the instance-wide run feed with catalog links", async () => {

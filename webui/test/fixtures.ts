@@ -345,6 +345,12 @@ export const maintenanceRunsFixture: MaintenanceRun[] = [
   },
 ];
 
+/**
+ * The deployment shape that made #114 visible: compaction's loop runs in
+ * ANOTHER process, so this one's loop_interval_ms is "0" while the ledger
+ * shows sweeps arriving every ~69s. Anything rendering the config would
+ * call the busiest task disabled.
+ */
 export const maintenanceStatusFixture: MaintenanceStatus = {
   catalog: "analytics",
   tasks: [
@@ -353,6 +359,9 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       loop_interval_ms: "5000",
       last_run: maintenanceRunsFixture[2],
       backlog: { pending_files: "4", failed_files: "1" },
+      // Records only the catalogs it claimed files for, so it has a last
+      // run and no derivable cadence.
+      loop: { last_run_at: "2026-09-11T10:00:00Z", records_every_sweep: false },
     },
     {
       task: "expiry",
@@ -364,23 +373,27 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
         earliest_snapshot_id: "4099",
         head_snapshot_id: "4211",
       },
+      loop: { observed_interval_ms: "60000", last_run_at: "2026-09-11T10:00:00Z", records_every_sweep: true },
     },
     {
       task: "cleanup",
       loop_interval_ms: "60000",
       last_run: maintenanceRunsFixture[1],
       backlog: { queued_removals: "0" },
+      loop: { observed_interval_ms: "45300", last_run_at: "2026-09-11T09:59:00Z", records_every_sweep: true },
     },
     {
       task: "compaction",
       loop_interval_ms: "0",
       last_run: maintenanceRunsFixture[3],
       backlog: { small_files: "42", target_bytes: "536870912" },
+      loop: { observed_interval_ms: "68800", last_run_at: "2026-09-11T09:59:30Z", records_every_sweep: true },
     },
     {
       task: "verify",
       last_run: maintenanceRunsFixture[4],
       backlog: {},
+      loop: null,
     },
   ],
 };
@@ -405,6 +418,7 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
           loop_interval_ms: "5000",
           last_run: null,
           backlog: { pending_files: "0", failed_files: "0" },
+          loop: { records_every_sweep: false },
         },
         {
           task: "expiry",
@@ -415,20 +429,23 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
             earliest_snapshot_id: "0",
             head_snapshot_id: "12",
           },
+          loop: { records_every_sweep: true },
         },
         {
           task: "cleanup",
           loop_interval_ms: "60000",
           last_run: null,
           backlog: { queued_removals: "0" },
+          loop: { records_every_sweep: true },
         },
         {
           task: "compaction",
           loop_interval_ms: "0",
           last_run: null,
           backlog: { small_files: "0", target_bytes: "536870912" },
+          loop: { records_every_sweep: true },
         },
-        { task: "verify", last_run: null, backlog: {} },
+        { task: "verify", last_run: null, backlog: {}, loop: null },
       ],
     },
   ],

@@ -11,19 +11,75 @@ import {
   listInstanceMaintenanceRuns,
   listMaintenanceRuns,
 } from "../api/client";
-import type { Int64, MaintenanceRun } from "../api/types";
+import type { Int64, LoopObservation, MaintenanceRun } from "../api/types";
 import { ErrorBox } from "./ErrorBox";
 import { SkeletonRows } from "./Skeleton";
 import { formatBytes, formatCount, formatTime } from "../lib/format";
 import { useStoredPref } from "../lib/prefs";
 
-/** Loop cadence for display: "500ms", "5s", "1m". Small values only. */
-export function formatInterval(ms: Int64): string {
+/** Coarse duration: "45s", "12m", "3h", "2d". Rounded, never exact. */
+export function formatSeconds(seconds: number): string {
+  if (seconds < 120) return `${Math.round(seconds)}s`;
+  const m = seconds / 60;
+  if (m < 120) return `${Math.round(m)}m`;
+  const h = m / 60;
+  if (h < 48) return `${Math.round(h)}h`;
+  return `${Math.round(h / 24)}d`;
+}
+
+/**
+ * An OBSERVED interval is never a round number — a loop sleeps its
+ * interval after the body, so a 60s loop with an 8s sweep is measured
+ * at 68s — so it is rounded for display rather than printed exactly
+ * (a configured value would print exactly).
+ */
+function formatObservedInterval(ms: Int64): string {
   const v = Number(ms);
-  if (v < 1000) return `${v}ms`;
-  const s = v / 1000;
-  if (s % 60 === 0) return `${s / 60}m`;
-  return `${s}s`;
+  return v < 1000 ? `${Math.round(v)}ms` : formatSeconds(v / 1000);
+}
+
+function ageSeconds(iso: string): number {
+  return Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+}
+
+/**
+ * The header's answer to "is this task running?", taken from the run
+ * ledger and therefore true of the whole fleet.
+ *
+ * NEVER derive this from loop_interval_ms. That is the config of
+ * whichever process answered the request, and a deployment may run the
+ * loop somewhere else — gigahog runs compaction only on its maintenance
+ * pod, so the API pod's config reads "disabled" for a task that is
+ * succeeding every minute (#114).
+ *
+ * Returns null when the server did not report an observation at all (an
+ * older build): there is then nothing honest to say, and "no loop runs"
+ * would be a claim the response never made.
+ */
+export function loopCadence(loop: LoopObservation | null | undefined): string | null {
+  if (loop === undefined) return null;
+  if (loop === null) return "manual only";
+  if (loop.observed_interval_ms !== undefined) {
+    return `every ~${formatObservedInterval(loop.observed_interval_ms)}`;
+  }
+  if (loop.last_run_at !== undefined) {
+    return `last loop run ${formatSeconds(ageSeconds(loop.last_run_at))} ago`;
+  }
+  // Silence means different things per task, and the response says
+  // which. The hydrator records the catalogs it claimed files for, not
+  // its sweeps, so an idle catalog has no rows while the loop is
+  // perfectly healthy — calling that "no loop runs" would repeat the
+  // bug in a new place.
+  return loop.records_every_sweep === false ? "nothing to do here" : "no loop runs";
+}
+
+/**
+ * True when the ledger cannot show a loop currently running this task.
+ * An absent observation (older server) is not evidence of anything and
+ * must not raise a warning.
+ */
+export function noRunningLoop(loop: LoopObservation | null | undefined): boolean {
+  return loop !== undefined && loop !== null && loop.observed_interval_ms === undefined;
 }
 
 /** Run duration from the ledger timestamps: "120ms", "1.2s". */
@@ -42,10 +98,6 @@ export function RunStateBadge({ status }: { status: "ok" | "failed" }) {
       {status}
     </span>
   );
-}
-
-export function isLoopDisabled(interval: Int64 | undefined): boolean {
-  return interval !== undefined && BigInt(interval) <= 0n;
 }
 
 function positive(value: Int64 | undefined): boolean {

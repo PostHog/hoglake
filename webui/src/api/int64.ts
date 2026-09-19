@@ -56,6 +56,7 @@ const INT64_FIELDS = new Set([
   "run_id",
   "sampled_snapshot_id",
   "loop_interval_ms",
+  "observed_interval_ms",
   "pending_files",
   "failed_files",
   "queued_removals",
