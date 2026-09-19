@@ -74,6 +74,16 @@ data class CatalogDto(
     val tableCount: Long? = null,
     val liveRows: Long? = null,
     val liveSizeBytes: Long? = null,
+    /**
+     * Commit time of the oldest RETAINED snapshot, from the same sample
+     * as the totals above (so OMITTED, not zeroed, until first sampled).
+     * Distinct from [earliestSnapshotTime]: that is the expiry floor and
+     * stays null until expiry advances it, which would read a never-
+     * expired catalog — the one that retains its FIRST snapshot — as
+     * having none. This is MIN(snapshot_time) and is right either way.
+     * An instant, not an age: the client renders "3 days ago" live.
+     */
+    val oldestSnapshotTime: Instant? = null,
 )
 
 fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
@@ -86,6 +96,7 @@ fun CatalogInfo.toDto(totals: CatalogTotals? = null) =
         tableCount = totals?.tableCount,
         liveRows = totals?.liveRows,
         liveSizeBytes = totals?.liveBytes,
+        oldestSnapshotTime = totals?.oldestSnapshotTime,
     )
 
 data class CreateCatalogRequestDto(val name: String, val dataPath: String)

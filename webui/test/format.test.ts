@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  formatAge,
   formatBytes,
   formatCompactCount,
   formatCount,
@@ -88,5 +89,64 @@ describe("formatCompactCount", () => {
   it("guards non-integers like the other humanizers", () => {
     expect(formatCompactCount(undefined)).toBe("—");
     expect(formatCompactCount("12.5")).toBe("—");
+  });
+});
+
+describe("formatAge", () => {
+  // Pinned so "now" is fixed; ages below are measured back from here.
+  const NOW = new Date("2026-09-19T12:00:00Z");
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const ago = (ms: number) => new Date(NOW.getTime() - ms).toISOString();
+  const S = 1000;
+  const MIN = 60 * S;
+  const H = 60 * MIN;
+  const D = 24 * H;
+
+  it("shows a single rounded unit — approximate on purpose", () => {
+    // "19h", never "19h 11min": the finer unit is noise for placing a
+    // snapshot in time.
+    expect(formatAge(ago(19 * H + 11 * MIN))).toBe("19h");
+    expect(formatAge(ago(3 * D + 12 * H))).toBe("4d"); // 3.5d rounds up
+    expect(formatAge(ago(3 * D + 2 * H))).toBe("3d");
+    expect(formatAge(ago(34 * MIN + 40 * S))).toBe("35min");
+    expect(formatAge(ago(8 * S))).toBe("8s");
+  });
+
+  it("switches unit at 2x thresholds, like the maintenance page", () => {
+    // Up to 119min stays minutes; 120min becomes hours. Up to 47h stays
+    // hours; 48h becomes days.
+    expect(formatAge(ago(119 * MIN))).toBe("119min");
+    expect(formatAge(ago(120 * MIN))).toBe("2h");
+    expect(formatAge(ago(47 * H))).toBe("47h");
+    expect(formatAge(ago(48 * H))).toBe("2d");
+  });
+
+  it("says min, never a bare m", () => {
+    // Consistency with the maintenance page: 'm' next to counts reads
+    // as mega. Checked across the minutes band, not one value.
+    for (const mins of [2, 5, 59, 119]) {
+      expect(formatAge(ago(mins * MIN))).toMatch(/^\d+min$/);
+    }
+  });
+
+  it("clamps a future instant to 0s instead of a negative age", () => {
+    // Client clock skew, or a snapshot dated slightly ahead. The offset
+    // is deliberately NOT a whole minute: at an exact minute the seconds
+    // term is -0 and prints "0s" even without the clamp, so a round
+    // offset would pass whether or not the clamp exists.
+    expect(formatAge(new Date(NOW.getTime() + 90 * S).toISOString())).toBe("0s");
+  });
+
+  it("is an em dash for a missing or unparseable instant", () => {
+    expect(formatAge(undefined)).toBe("—");
+    expect(formatAge(null)).toBe("—");
+    expect(formatAge("not-a-date")).toBe("—");
   });
 });

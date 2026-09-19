@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.MultiGauge
 import io.micrometer.core.instrument.Tags
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
+import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
 /** Instance-wide live-data totals, refreshed by the metrics sampler. */
@@ -30,6 +31,14 @@ data class CatalogTotals(
     val tableCount: Long,
     val liveRows: Long,
     val liveBytes: Long,
+    /**
+     * Commit time of the oldest RETAINED snapshot — MIN(snapshot_time),
+     * not the stored expiry floor (which is null until expiry first
+     * advances it). Null only when the catalog has no snapshot at all.
+     * The listing sends the instant and lets the client render the age,
+     * so "3 days ago" stays live without the sampler re-running.
+     */
+    val oldestSnapshotTime: Instant?,
 )
 
 /**
@@ -145,6 +154,7 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
         val tables: Long,
         val liveRows: Long,
         val liveBytes: Long,
+        val oldestSnapshotTime: Instant?,
     )
 
     /** One sample: refresh every gauge from the catalog. Safe to call concurrently with traffic. */
@@ -186,7 +196,8 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
         // mixture of two samples.
         latestByCatalog =
             rows.associate {
-                it.name to CatalogTotals(it.tables, it.liveRows, it.liveBytes)
+                it.name to
+                    CatalogTotals(it.tables, it.liveRows, it.liveBytes, it.oldestSnapshotTime)
             }
 
         val headByCatalog = rows.associate { it.name to it.head }
@@ -226,6 +237,8 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
                           FROM hog_snapshot s
                          WHERE s.catalog_id = c.catalog_id
                            AND s.snapshot_id = c.last_snapshot_id) AS head_age_seconds,
+                       (SELECT min(s.snapshot_time) FROM hog_snapshot s
+                         WHERE s.catalog_id = c.catalog_id) AS oldest_snapshot_time,
                        (SELECT count(*) FROM hog_file_removal r
                          WHERE r.catalog_id = c.catalog_id
                            AND r.drained_at IS NULL) AS removal_depth,
@@ -267,6 +280,11 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
                             tables = rs.getLong("table_count"),
                             liveRows = rs.getLong("live_rows"),
                             liveBytes = rs.getLong("live_bytes"),
+                            oldestSnapshotTime =
+                                rs.getObject(
+                                    "oldest_snapshot_time",
+                                    java.time.OffsetDateTime::class.java,
+                                )?.toInstant(),
                         )
                     }
                     .list()

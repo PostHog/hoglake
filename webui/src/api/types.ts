@@ -26,6 +26,11 @@ export interface Catalog {
   table_count?: Int64;
   live_rows?: Int64;
   live_size_bytes?: Int64;
+  // Commit time of the oldest retained snapshot, from the same sample as
+  // the totals — an ISO instant, absent until sampled. The page renders
+  // it as a live age; it is not the expiry-floor time (which waits on
+  // expiry and would read a never-expired catalog as having none).
+  oldest_snapshot_time?: string;
 }
 
 export interface CreateCatalogRequest {

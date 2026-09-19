@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  ageColumn,
   applySort,
   cmpInt64,
   cmpText,
@@ -158,5 +159,50 @@ describe("nextSort", () => {
       key: "id",
       desc: true,
     });
+  });
+});
+
+describe("ageColumn", () => {
+  interface Row {
+    id: string;
+    t?: string;
+  }
+  const rows: Row[] = [
+    { id: "mid", t: "2026-09-10T00:00:00Z" },
+    { id: "oldest", t: "2026-01-01T00:00:00Z" },
+    { id: "unsampled" }, // no timestamp
+    { id: "newest", t: "2026-09-18T00:00:00Z" },
+  ];
+  const columns = { age: ageColumn<Row>((r) => r.t) };
+
+  it("puts the OLDEST first on the first (descending) click", () => {
+    // The column reads as an age: descending age == oldest snapshot,
+    // the way a size column's first click is the biggest. Independent
+    // of the clock, because now cancels out of an age comparison.
+    const desc = applySort(rows, { key: "age", desc: true }, columns);
+    expect(desc.map((r) => r.id)).toEqual([
+      "oldest",
+      "mid",
+      "newest",
+      "unsampled",
+    ]);
+  });
+
+  it("puts the youngest first when ascending, unsampled still last", () => {
+    const asc = applySort(rows, { key: "age", desc: false }, columns);
+    expect(asc.map((r) => r.id)).toEqual([
+      "newest",
+      "mid",
+      "oldest",
+      "unsampled",
+    ]);
+  });
+
+  it("keeps the unsampled row out of the top of oldest-first", () => {
+    // A missing timestamp is not an infinitely old snapshot: it is an
+    // unknown one, and must never occupy the "oldest" slot.
+    const desc = applySort(rows, { key: "age", desc: true }, columns);
+    expect(desc[0].id).not.toBe("unsampled");
+    expect(desc.at(-1)?.id).toBe("unsampled");
   });
 });
