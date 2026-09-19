@@ -312,6 +312,7 @@ export const maintenanceRunsFixture: MaintenanceRun[] = [
       dv_superseded: "0",
       unconvertible_schema: "0",
       invalid_data: "0",
+      heap_budget_exceeded: "0",
       failed_groups: "0",
     },
   },

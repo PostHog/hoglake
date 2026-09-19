@@ -83,6 +83,7 @@ data class CompactionResultDto(
     val dvSuperseded: Long,
     val unconvertibleSchema: Long,
     val invalidData: Long,
+    val heapBudgetExceeded: Long,
     val failedGroups: Long,
 )
 
@@ -97,6 +98,7 @@ fun CompactionResult.toDto() =
         dvSuperseded = dvSuperseded,
         unconvertibleSchema = unconvertibleSchema,
         invalidData = invalidData,
+        heapBudgetExceeded = heapBudgetExceeded,
         failedGroups = failedGroups,
     )
 
@@ -204,7 +206,7 @@ private fun normalizeLedgerResult(
  * Append-only: a counter joins this list in the same change that adds
  * it to CompactionResult, and never leaves.
  */
-private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data")
+private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data", "heap_budget_exceeded")
 
 data class MaintenanceTaskStatusDto(
     val task: String,

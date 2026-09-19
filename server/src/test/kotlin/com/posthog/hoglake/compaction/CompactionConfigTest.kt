@@ -258,6 +258,268 @@ class CompactionConfigTest {
         ).isEqualTo(target)
     }
 
+    // ---- sortedHeapBytes: the bound targetBytes was standing in for ----
+    //
+    // Same four checks again (default, env parity, App wiring, docs),
+    // because the same hole is here: this knob has a default on both
+    // sides and a wiring line in App, and every one of them can go
+    // quiet. What is NEW is the arithmetic below it — the budget is now
+    // derived from a row ceiling and the table's density, and the thing
+    // that must never regress is that DENSER INPUTS BUY FEWER BYTES.
+
+    /** Ten thousand rows of [flatColumns] (one data node + the row-id carrier). */
+    private fun heapForTenThousandFlatRows() = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * 2 * 10_000
+
+    @Test
+    fun `a denser table is planned under a smaller byte budget`() {
+        // The #118 regression in one assertion. Group selection reads
+        // BYTES; the sorted path holds ROWS. #115 made every tier-2+
+        // input compaction's own zstd rather than a client's snappy —
+        // 1.70x denser on event data — so the same byte budget started
+        // admitting 1.70x the rows with nothing anywhere noticing.
+        //
+        // Deriving the budget from a row ceiling makes that
+        // self-correcting: double the rows per byte and the budget
+        // halves, exactly.
+        val cfg =
+            CompactionConfig(
+                targetBytes = target,
+                tierTarget = 8,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapForTenThousandFlatRows(),
+            )
+        val sparse = cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity(1_000_000, 10_000))
+        val dense = cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity(1_000_000, 20_000))
+
+        assertThat(sparse).describedAs("100 B/row x a 10,000-row ceiling").isEqualTo(1_000_000)
+        assertThat(dense)
+            .describedAs("twice the rows per byte, half the bytes — the budget follows the density")
+            .isEqualTo(sparse / 2)
+    }
+
+    @Test
+    fun `whatever the density, the budget encodes the same row ceiling`() {
+        // The invariant underneath the test above, stated directly: the
+        // byte budget is a ROW budget in the ladder's own currency, so
+        // budget / bytesPerRow is the ceiling at every density.
+        val cfg =
+            CompactionConfig(
+                targetBytes = target,
+                tierTarget = 8,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapForTenThousandFlatRows(),
+            )
+        val ceiling = cfg.sortedRowCeiling(flatColumns)
+        assertThat(ceiling).isEqualTo(10_000)
+        for (bytesPerRow in listOf(7L, 64L, 119L, 512L)) {
+            val density = InputDensity(bytesPerRow * 1_000_000, 1_000_000)
+            val budget = cfg.effectiveTargetBytes(flatColumns, sorted = true, density)
+            assertThat(budget / bytesPerRow)
+                .describedAs("budget at %d B/row must still be %d rows", bytesPerRow, ceiling)
+                .isEqualTo(ceiling)
+        }
+    }
+
+    @Test
+    fun `the density bound and the nested derate compose`() {
+        // Two different blindnesses, and neither replaces the other. The
+        // per-node accounting is exact for a flat row and a FLOOR for a
+        // nested one (list lengths are data, not schema), so a nested
+        // table's ceiling is divided again — and the density conversion
+        // then applies to that smaller ceiling, not around it.
+        val cfg =
+            CompactionConfig(
+                targetBytes = target,
+                tierTarget = 8,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapForTenThousandFlatRows(),
+            )
+        val density = InputDensity(1_000_000, 10_000) // 100 B/row
+        val flat = cfg.effectiveTargetBytes(flatColumns, sorted = true, density)
+        val nested = cfg.effectiveTargetBytes(nestedColumns, sorted = true, density)
+
+        assertThat(cfg.sortedRowCeiling(nestedColumns))
+            .describedAs("nested: fewer nodes-per-row known, so the expansion divides the ceiling")
+            .isLessThan(cfg.sortedRowCeiling(flatColumns) / cfg.nestedSortExpansion + 1)
+        assertThat(nested)
+            .describedAs("a nested sorted table is planned far under the flat bound, not beside it")
+            .isLessThan(flat)
+    }
+
+    @Test
+    fun `an unmeasurable density falls back to the pre-118 budget`() {
+        // A table with candidates but no rows in them has nothing to
+        // materialize and nothing to measure. Falling back must never be
+        // LOOSER than what shipped before: flat keeps the target, nested
+        // keeps the nested derate.
+        val cfg = defaulted()
+        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity.UNKNOWN))
+            .isEqualTo(target)
+        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = true, InputDensity.UNKNOWN))
+            .isEqualTo(target / cfg.nestedSortExpansion)
+    }
+
+    @Test
+    fun `the unsorted path is never derated, at any density`() {
+        // It streams one record at a time. Shrinking its groups would be
+        // a permanent throughput tax for a heap cost it does not pay.
+        val cfg = defaulted()
+        val absurd = InputDensity(1_000_000, 1_000_000_000)
+        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false, absurd)).isEqualTo(target)
+        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = false, absurd)).isEqualTo(target)
+    }
+
+    @Test
+    fun `a config with NO override carries the sorted heap budget`() {
+        assertThat(defaulted().sortedHeapBytes).isEqualTo(CompactionConfig.DEFAULT_SORTED_HEAP_BYTES)
+    }
+
+    @Test
+    fun `the env-backed Config defaults to the same sorted heap budget the planner does`() {
+        assertThat(Config().compactionSortedHeapBytes)
+            .isEqualTo(CompactionConfig.DEFAULT_SORTED_HEAP_BYTES)
+    }
+
+    @Test
+    fun `App wires the sorted heap budget into the planner's config`() {
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .describedAs("App must pass Config.compactionSortedHeapBytes into CompactionConfig")
+            .containsPattern("""sortedHeapBytes\s*=\s*cfg\.compactionSortedHeapBytes""")
+    }
+
+    @Test
+    fun `a sorted heap budget of zero or less is refused at construction`() {
+        for (bad in listOf(0L, -1L)) {
+            assertThatThrownBy {
+                CompactionConfig(
+                    targetBytes = target,
+                    tierTarget = 8,
+                    maxGroupsPerRun = 1,
+                    sortedHeapBytes = bad,
+                )
+            }
+                .describedAs("sortedHeapBytes=%d", bad)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("sorted heap bytes")
+        }
+    }
+
+    @Test
+    fun `the documented sorted heap default is the one the code uses`() {
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must document HOGLAKE_COMPACTION_SORTED_HEAP_BYTES's real default", doc)
+                .contains("HOGLAKE_COMPACTION_SORTED_HEAP_BYTES")
+                .contains("1 GiB")
+        }
+        assertThat(CompactionConfig.DEFAULT_SORTED_HEAP_BYTES).isEqualTo(1024L * 1024 * 1024)
+    }
+
+    @Test
+    fun `the default is sized for the pod the maintenance deployment actually has`() {
+        // The knob is only honest if its default is safe on the pod that
+        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap, and
+        // the worst-case peak is the sort buffer (measured 0.79x of the
+        // DECLARED budget, since 192 B/node rounds 151.6 up) plus the
+        // group's input and output byte arrays, plus parquet-java's
+        // 128 MiB row-group block, plus the hydrator's 256 MiB
+        // whole-object ceiling firing in the same tick.
+        //
+        // Pinned as an inequality against the REAL heap rather than as
+        // an equality on the constant: the failure this guards is
+        // someone raising the default because bigger groups would be
+        // nice, without the charts change that makes it survivable.
+        val podBytes = 4.0 * 1024 * 1024 * 1024
+        val heap = podBytes * 0.70
+        val declared = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
+        val sortBuffer = declared * (151.6 / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE)
+        // Group bytes at the measured zstd density, which is the denser
+        // of the two and therefore the smaller group — but the input and
+        // output arrays are the group's, so use snappy's larger number.
+        val groupBytes = declared * (119.0 / 11.0) / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE
+        val peak = sortBuffer + 2 * groupBytes + (128 + 256) * 1024 * 1024
+        assertThat(peak / heap)
+            .describedAs(
+                "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
+                peak / 1024 / 1024,
+                heap / 1024 / 1024,
+            )
+            .isLessThan(0.5)
+    }
+
+    @Test
+    fun `the sorted heap cap is labelled temporary with its replacement named`() {
+        // The cap costs real throughput — sorted tables compact to tens
+        // of megabytes instead of the 512 MiB the ladder is designed
+        // around — and it ships anyway because it converts an OOM into a
+        // counted refusal. What must not happen is it quietly becoming
+        // the permanent answer because nobody wrote down that a real fix
+        // exists. The fix is an external merge sort: tier-2+ inputs are
+        // compaction's own outputs and therefore already-sorted runs, so
+        // a k-way merge holds one row per input instead of the group.
+        //
+        // Pinned in the two places someone hitting the ceiling lands:
+        // the knob's own doc comment, and the operator-facing docs.
+        val source = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/compaction/CompactionService.kt"))
+        assertThat(source)
+            .describedAs("CompactionConfig.sortedHeapBytes must say the bound is temporary")
+            .containsIgnoringCase("TEMPORARY")
+            .describedAs("...and must name the way out, not just that one exists")
+            .containsIgnoringCase("external merge sort")
+            .containsIgnoringCase("already-sorted")
+        // And the refusal itself, since a log line is what an operator
+        // reads before they ever open the source.
+        assertThat(source)
+            .describedAs("the heap_budget refusal must point at the same argument")
+            .containsPattern("""(?s)compaction refused .{0,2000}external merge sort""")
+
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must mark the sorted cap temporary and name the replacement", doc)
+                .containsIgnoringCase("external merge sort")
+                .containsIgnoringCase("advisory")
+        }
+    }
+
+    @Test
+    fun `the image sizes the heap for the container it was given`() {
+        // The other half of #118, and the half no runtime assertion can
+        // reach: with no flag at all the JVM takes its container default
+        // of 25%, so the 4 GiB maintenance pod ran compaction on ~1 GiB
+        // of heap. Read off disk, like the App wiring checks above —
+        // build.gradle.kts is what generates the start script the image's
+        // ENTRYPOINT runs, and the failure mode is the line going away
+        // with every test still green.
+        val build = Files.readString(Path.of("build.gradle.kts"))
+        val args =
+            Regex("""applicationDefaultJvmArgs\s*=\s*listOf\(([^)]*)\)""")
+                .find(build)
+                ?.groupValues
+                ?.get(1)
+        assertThat(args)
+            .describedAs("build.gradle.kts must set applicationDefaultJvmArgs")
+            .isNotNull()
+        val percent =
+            Regex("""-XX:MaxRAMPercentage=(\d+(?:\.\d+)?)""").find(args!!)?.groupValues?.get(1)?.toDouble()
+        assertThat(percent)
+            .describedAs("the container heap percentage must be set, and be neither the 25% default nor 100%")
+            .isNotNull()
+        assertThat(percent!!).isGreaterThan(50.0).isLessThanOrEqualTo(80.0)
+        // The image must not duplicate it: two sources for one number is
+        // how they drift, and ENV JAVA_OPTS in the Dockerfile would be
+        // replaced wholesale by any deploy that sets JAVA_OPTS.
+        val dockerDirectives =
+            Files.readString(Path.of("Dockerfile"))
+                .lines()
+                .filterNot { it.trimStart().startsWith("#") }
+                .joinToString("\n")
+        assertThat(dockerDirectives)
+            .describedAs("JVM flags belong in applicationDefaultJvmArgs, not in the image's env")
+            .doesNotContain("JAVA_OPTS")
+            .doesNotContain("MaxRAMPercentage")
+    }
+
     @Test
     fun `the derated budget never falls below the tier ladder's floor`() {
         // A tiny target divided by 64 must still build a tier ladder —

@@ -53,29 +53,107 @@ data class CompactionConfig(
      * The sorted path materializes every survivor of a group as
      * parquet-java `Group` objects so it can sort them — that is what
      * makes sorting safe at all, since the row ids are explicit data
-     * rather than position. For FLAT rows the object graph is a few
-     * boxed values per row and [targetBytes] is a fair proxy for the
-     * heap. For NESTED rows it is not, and not by a little: a measured
-     * `list<long>` table with five elements per row peaked at 343 MiB of
-     * heap from a 4.6 MiB compressed input — **70x** — because every
-     * element becomes its own `SimpleGroup` with its own object header,
-     * field array and boxed value, and compression that packs an int64
-     * column 10:1 does nothing for object headers.
+     * rather than position. For NESTED rows the object graph runs far
+     * ahead of the bytes: a measured `list<long>` table with five
+     * elements per row peaked at 343 MiB of heap from a 4.6 MiB
+     * compressed input — **70x** — because every element becomes its own
+     * `SimpleGroup` with its own object header, field array and boxed
+     * value, and compression that packs an int64 column 10:1 does
+     * nothing for object headers.
      *
-     * So the planner derates: for a table that has BOTH nested columns
-     * and a live sort order, the effective group budget is
-     * `targetBytes / expansion`, which brings the materialized heap back
-     * under roughly targetBytes. 64 is deliberately near the top of the
+     * A nested row's node count is not knowable from the catalog (list
+     * lengths are data), so [sortedHeapBytes]'s per-node accounting
+     * cannot see it. This expansion is what covers the gap: for a table
+     * with BOTH nested columns and a live sort order the sorted ROW
+     * CEILING is divided by it. 64 is deliberately near the top of the
      * measured 30-70x range — erring large costs smaller compaction
      * groups, erring small costs an OOM in a background loop.
+     *
+     * It used to divide [targetBytes] directly, on the stated assumption
+     * that "for FLAT rows the object graph is a few boxed values per row
+     * and targetBytes is a fair proxy for the heap". That assumption was
+     * measured in #118 and is false by an order of magnitude
+     * (`SortedHeapMeasurement`): a flat 11-column event row costs ~1.7 KiB
+     * of materialized heap against ~119 bytes of snappy input, so the
+     * "proxy" was already 14x optimistic before #115 made compaction's
+     * own zstd output — 1.70x denser — the input at every tier above the
+     * first, taking it to 24x. [sortedHeapBytes] is the real bound now;
+     * this is the nested multiplier on top of it.
      *
      * NOT a spill implementation, and not a promise. It bounds the
      * SORTED path only, and only per GROUP: one pathological ROW (a
      * million-element list) still materializes whole on either path, and
-     * nothing here changes that — a per-row bound would need a limit the
-     * commit path does not have.
+     * nothing here changes that — that is [maxNodesPerRow]'s job.
      */
     val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
+    /**
+     * How much HEAP one group's sorted-path materialization may take
+     * (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES).
+     *
+     * This is the quantity [targetBytes] was being used as a proxy for,
+     * and the two are not the same thing at all: [targetBytes] is how
+     * big an OUTPUT FILE should be, measured in compressed bytes on
+     * object storage, while this is how much of the JVM heap the sort
+     * buffer may occupy. Nothing relates them but the input's density,
+     * which is why the conversion between them ([effectiveTargetBytes])
+     * has to consult it.
+     *
+     * # THIS BOUND IS TEMPORARY, AND THE WAY OUT IS KNOWN
+     *
+     * It exists because the sorted rewrite reads the WHOLE group into an
+     * `ArrayList<Group>` and calls `sortedWith`. That is an in-memory
+     * sort, so the group has to fit in memory, so the group has to be
+     * small — measured, about 34 MiB of zstd input per GiB of sort
+     * buffer for a ten-column table. Capping a 512 MiB compaction target
+     * at tens of megabytes is a real cost: sorted tables stop being
+     * compacted to the size the ladder was designed around, and no
+     * setting of this knob fixes that, it only moves it.
+     *
+     * The fix is an EXTERNAL MERGE SORT, and compaction is unusually
+     * well set up for one:
+     *
+     *  - **Tier 2 and above need no sort at all.** Every input to those
+     *    groups is a previous compaction OUTPUT, and this rewriter sorts
+     *    what it writes (`ParquetRewriter.rewriteInto`, and
+     *    schema.sql's sort-spec comment: the spec is BINDING for
+     *    compaction rewrites). So each input is an already-sorted RUN,
+     *    and merging k sorted runs needs one row per run in a priority
+     *    queue — O(files) live rows, not O(group). The tier ladder means
+     *    this is where almost all the bytes are.
+     *  - **Tier 1 cannot assume it**, because a client's sort order is
+     *    ADVISORY — `schema.sql` says so in as many words, and the server
+     *    never verifies file sortedness. But tier-1 files are the
+     *    SMALLEST ones by construction, and sorting one file alone is
+     *    bounded by that one file rather than by the group. Sort each
+     *    tier-1 input on its own, spill it as a temp run to the scratch
+     *    directory the rewrite already uses (`compactGroup` creates one
+     *    per group; the Dockerfile notes compaction spills under
+     *    `java.io.tmpdir`), and stream-merge the runs like any other.
+     *
+     * Do that and group size stops being a heap question entirely — this
+     * knob, [sortedRowCeiling], and the `heap_budget` skip all go away.
+     * Until then this is the bound that converts an OOM into a counted
+     * refusal (hoglake#118).
+     *
+     * # The default, and the pod it assumes
+     *
+     * 1 GiB, which is the LARGEST value that is safe on the maintenance
+     * pod as it exists today: 4 GiB, so ~2.8 GiB of heap at the image's
+     * `MaxRAMPercentage=70` (server/build.gradle.kts). Worst-case peak
+     * at 1 GiB is ~1260 MiB — the sort buffer's measured ~0.79x of the
+     * declared budget (the 192 B/node constant rounds up from 151.6),
+     * plus the group's input and output byte arrays, plus parquet-java's
+     * 128 MiB row-group block, plus the hydrator's 256 MiB whole-object
+     * ceiling if it fires in the same tick — which is 44% of that heap.
+     * Going higher on a 4 GiB pod spends margin this process does not
+     * have.
+     *
+     * Bigger pods buy proportionally bigger groups, and the arithmetic
+     * is linear (server/README.md carries the table). Raising this knob
+     * WITHOUT raising the pod converts the counted refusal back into the
+     * OOM it replaced.
+     */
+    val sortedHeapBytes: Long = DEFAULT_SORTED_HEAP_BYTES,
     /**
      * Per-ROW node budget for the rewrite
      * (HOGLAKE_COMPACTION_MAX_NODES_PER_ROW). [nestedSortExpansion]
@@ -100,22 +178,100 @@ data class CompactionConfig(
         CompactionTiers.of(targetBytes, tierTarget)
         require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
         require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
+        require(sortedHeapBytes >= 1) { "sorted heap bytes must be at least 1" }
     }
 
     /**
-     * The group byte budget to plan [table] under: [targetBytes] unless
-     * the table both nests and sorts, in which case the sorted path's
-     * materialization forces the derate. Never below 2 — the tier ladder
-     * refuses a smaller target, and a table whose target derated to
-     * nothing would stop compacting entirely.
+     * How many ROWS of [columns] the sorted path may materialize inside
+     * [sortedHeapBytes] — the bound the group budget exists to respect,
+     * in the unit the heap actually holds.
+     *
+     * A materialized row is not its bytes; it is a `SimpleGroup`, a
+     * `List<Object>[]` field array, and then an `ArrayList` plus that
+     * list's backing `Object[]` plus one boxed value for every populated
+     * field. Measured at **151.6 bytes per node** for the flat event
+     * shape this catalog holds (`SortedHeapMeasurement`, steady-state
+     * retained heap over 200k rows);
+     * [SORTED_HEAP_BYTES_PER_NODE] rounds that up, because erring large
+     * costs smaller groups and erring small costs an OOM in a background
+     * loop — the same asymmetry [nestedSortExpansion] is calibrated on.
+     *
+     * Nodes are counted off the LIVE schema (every node of the forest,
+     * plus one for the `_hog_row_id` carrier every output writes), which
+     * is exact for flat tables and a floor for nested ones — hence the
+     * [nestedSortExpansion] division, which is the only thing standing in
+     * for list lengths the catalog cannot know.
+     */
+    fun sortedRowCeiling(columns: List<Column>): Long {
+        val nodes = columns.allNodes().size + 1L // + the _hog_row_id carrier
+        val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
+        val ceiling = sortedHeapBytes / perRow
+        val nested = columns.allNodes().any { it.def.type.isNested }
+        return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
+    }
+
+    /**
+     * The group byte budget to plan a table under.
+     *
+     * [targetBytes] for the UNSORTED path, which streams one `Group` at
+     * a time and whose heap is therefore flat in group size. For the
+     * SORTED path it is the byte size of [sortedRowCeiling] rows AT THIS
+     * TABLE'S OBSERVED DENSITY, capped at [targetBytes] — rows are what
+     * the heap holds, bytes are what the tier ladder is anchored in, and
+     * [density] is the only thing that converts between them.
+     *
+     * Density is why this changed (#118). Group selection reads input
+     * file BYTES, and since #115 a tier-2-and-above input is compaction's
+     * own zstd output rather than a client's snappy: measured 1.70x
+     * denser on event data, so the same byte budget started admitting
+     * 1.70x the rows, and rows are what become `Group` objects. Deriving
+     * the budget FROM the row ceiling makes that self-correcting — denser
+     * inputs buy fewer bytes per group, automatically, per table, with no
+     * guessed ratio anywhere.
+     *
+     * It stays a BYTE budget rather than becoming a row budget because
+     * the tier ladder is byte-anchored (CompactionTiers quotas, tier
+     * classification, promotion estimates). A row cap bolted onto a byte
+     * ladder produces groups that cannot reach their tier's floor, which
+     * means merging the same rows every sweep without ever promoting
+     * them; scaling the ladder keeps it self-consistent.
+     *
+     * Never below 2 — the tier ladder refuses a smaller target, and a
+     * table whose target derated to nothing would stop compacting.
+     * [InputDensity.UNKNOWN] (a table with no candidate rows to measure)
+     * falls back to the pre-#118 shape, which is never looser.
      */
     fun effectiveTargetBytes(
         columns: List<Column>,
         sorted: Boolean,
+        density: InputDensity = InputDensity.UNKNOWN,
     ): Long {
-        if (!sorted || nestedSortExpansion == 1) return targetBytes
-        if (columns.allNodes().none { it.def.type.isNested }) return targetBytes
-        return maxOf(2L, targetBytes / nestedSortExpansion)
+        if (!sorted) return targetBytes
+        // Two bounds, both enforced, tightest wins — they are estimates
+        // of the same heap by different routes and neither subsumes the
+        // other. The NESTED one is a statement about BYTES (a nested
+        // group's graph measured 30-70x its compressed size) and is the
+        // only thing that sees list lengths at all. The DENSITY one is a
+        // statement about ROWS and is exact for a flat schema. Take the
+        // nested bound away and a nested table with few, fat rows plans
+        // at the raw target again; take the density bound away and #118
+        // comes back.
+        val nestedBound =
+            if (nestedSortExpansion == 1 || columns.allNodes().none { it.def.type.isNested }) {
+                targetBytes
+            } else {
+                targetBytes / nestedSortExpansion
+            }
+        val densityBound =
+            density.bytesPerRow?.let { bytesPerRow ->
+                // Through Double deliberately: ceiling * bytesPerRow is a
+                // row count times a per-row size and overflows Long for a
+                // sparse table long before it means anything.
+                (sortedRowCeiling(columns).toDouble() * bytesPerRow)
+                    .coerceIn(0.0, targetBytes.toDouble())
+                    .toLong()
+            } ?: targetBytes
+        return maxOf(2L, minOf(targetBytes, nestedBound, densityBound))
     }
 
     companion object {
@@ -124,6 +280,58 @@ data class CompactionConfig(
          * [nestedSortExpansion].
          */
         const val DEFAULT_NESTED_SORT_EXPANSION = 64
+
+        /**
+         * Heap cost of one materialized parquet-java node, for
+         * [sortedRowCeiling].
+         *
+         * Measured 151.6 B/node (`SortedHeapMeasurement`: 200k flat
+         * 11-field event rows retained 333.5 MB, 1667 B/row); 192 rounds
+         * up by a quarter to cover the less-settled samples, allocator
+         * variance and the reference array `sortedWith` copies. A node is
+         * one populated field: its `ArrayList`, that list's backing array
+         * and one boxed value.
+         */
+        const val SORTED_HEAP_BYTES_PER_NODE = 192L
+
+        /**
+         * See [sortedHeapBytes] — including why this bound is TEMPORARY
+         * and what replaces it (an external merge sort, which tier 2+
+         * barely needs since its inputs are already sorted runs).
+         *
+         * 1 GiB: the largest value whose worst-case peak (~1260 MiB)
+         * still fits the 4 GiB maintenance pod's ~2.8 GiB heap with
+         * margin. Bigger pods take a bigger value; the knob is linear in
+         * the group bytes it buys and server/README.md has the ladder.
+         */
+        const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
+    }
+}
+
+/**
+ * The two catalog-known quantities the sorted path's heap depends on,
+ * summed over a table's compaction candidates: registered file bytes and
+ * registered rows.
+ *
+ * Both are already columns of `hog_data_file` (`file_size_bytes`,
+ * `record_count`), so measuring a table's density costs one metadata
+ * aggregate and NO object-store IO — which is the reason this rather
+ * than the parquet footer's `total_uncompressed_size`. The footer
+ * carries the exact ratio per file, but reading it means opening every
+ * candidate over S3 on every sweep, and compaction planning is
+ * metadata-only by design.
+ */
+data class InputDensity(val totalBytes: Long, val totalRecords: Long) {
+    /**
+     * Registered bytes per registered row, or null when the candidates
+     * hold no rows (nothing to materialize, so nothing to bound).
+     */
+    val bytesPerRow: Double?
+        get() = if (totalRecords > 0 && totalBytes > 0) totalBytes.toDouble() / totalRecords else null
+
+    companion object {
+        /** No candidates measured — callers fall back to the un-derated budget. */
+        val UNKNOWN = InputDensity(0, 0)
     }
 }
 
@@ -180,6 +388,18 @@ data class CompactionPlan(
     val namespace: String,
     val table: String,
     val groups: List<CompactionGroup>,
+    /**
+     * Tier-eligible groups this plan REFUSED because their registered
+     * survivor count is above the table's sorted-path row ceiling
+     * (CompactionConfig.sortedRowCeiling) — they would not fit the heap.
+     *
+     * Refused HERE, in metadata, rather than discovered by an
+     * OutOfMemoryError ninety seconds into a rewrite: record_count is
+     * already in the catalog, so the check is exact and free, and a
+     * group that cannot fit never spends the IO to find out. The count
+     * reaches the run outcome as CompactionResult.heapBudgetExceeded.
+     */
+    val heapRefusedGroups: Long = 0,
 )
 
 /**
@@ -370,33 +590,47 @@ class CompactionService(
                 maxNodesPerRow = cfg.maxNodesPerRow,
                 codec = cfg.codec,
             )
-        return PlanWithContext(ctx, CompactionPlan(t.tableId, ns.name, t.name, groups(h, ctx, cfg)))
+        val planned = groups(h, ctx, cfg)
+        return PlanWithContext(
+            ctx,
+            CompactionPlan(t.tableId, ns.name, t.name, planned.groups, planned.heapRefused),
+        )
     }
+
+    /** What [groups] produced: what will be attempted, and what the heap ceiling refused. */
+    private data class PlannedGroups(
+        val groups: List<CompactionGroup>,
+        val heapRefused: Long,
+    )
 
     private fun groups(
         h: Handle,
         ctx: TableContext,
         cfg: CompactionConfig,
-    ): List<CompactionGroup> {
+    ): PlannedGroups {
         // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
         // work that could drop payloads or repeatedly fail the maintenance loop.
         // allNodes, not the top level: a variant nested inside a struct
         // is still a variant the rewriter cannot write, and `struct{v:
         // variant}` has no top-level one. #77's check predates
         // containers, where the two were the same question.
-        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return emptyList()
+        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) {
+            return PlannedGroups(emptyList(), 0)
+        }
 
         data class Bucket(val specId: Long?, val values: List<String?>?)
 
         data class Row(val candidate: CompactionCandidate, val bucket: Bucket)
 
-        // The DERATED budget, not the raw one: a nested+sorted table's
-        // group has to stay small enough that materializing it to sort
-        // fits in heap (CompactionConfig.nestedSortExpansion). It
-        // narrows the candidate filter too — a file above the derated
-        // target can never reach a tier quota under it, so fetching it
-        // would only be work.
-        val budget = cfg.effectiveTargetBytes(ctx.columns, ctx.sortFields.isNotEmpty())
+        val sorted = ctx.sortFields.isNotEmpty()
+        // The DERATED budget, not the raw one: a sorted table's group has
+        // to stay small enough that materializing it to sort fits in heap
+        // (CompactionConfig.effectiveTargetBytes), which depends on how
+        // many ROWS its bytes carry — so the density is measured first,
+        // from the same MVCC snapshot, in metadata. It narrows the
+        // candidate filter too: a file above the derated target can never
+        // reach a tier quota under it, so fetching it would only be work.
+        val budget = cfg.effectiveTargetBytes(ctx.columns, sorted, density(h, ctx, cfg))
 
         val rows =
             h.createQuery(
@@ -459,11 +693,72 @@ class CompactionService(
                 out += tier to CompactionGroup(take, bucket.specId, bucket.values)
             }
         }
+        // The EXACT check, after the estimate. The budget above scales the
+        // ladder by the table's AVERAGE density, which is an estimate;
+        // hog_data_file.record_count is not, so a group whose registered
+        // survivors are above the ceiling is refused here on the true
+        // number rather than attempted and discovered by an OOM. Only the
+        // sorted path materializes, so only it has a ceiling.
+        val ceiling = if (sorted) cfg.sortedRowCeiling(ctx.columns) else Long.MAX_VALUE
+        val (fits, refused) = out.partition { it.second.survivingRecords <= ceiling }
+        if (refused.isNotEmpty()) {
+            log.warn {
+                "compaction refused ${refused.size} tier-eligible group(s) of " +
+                    "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +
+                    "${refused.maxOf { it.second.survivingRecords }} rows against a ceiling of " +
+                    "$ceiling (heap budget ${cfg.sortedHeapBytes} B). The table keeps its debt. " +
+                    "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
+                    "pod's memory (the default is sized for a 4 GiB pod), or drop the table's " +
+                    "sort order to move it to the streaming path, whose heap is flat in group " +
+                    "size. This ceiling is TEMPORARY: the sorted rewrite sorts the whole group " +
+                    "in memory, and replacing that with an external merge sort removes it — " +
+                    "tier-2-and-above inputs are already-sorted compaction outputs, so merging " +
+                    "them needs one row per input rather than all of them. See " +
+                    "CompactionConfig.sortedHeapBytes"
+            }
+        }
         // Most-fragmented tier first, then row-id order within the tier.
-        return out
-            .sortedWith(compareBy({ it.first }, { it.second.files.first().rowIdStart }))
-            .map { it.second }
+        return PlannedGroups(
+            fits
+                .sortedWith(compareBy({ it.first }, { it.second.files.first().rowIdStart }))
+                .map { it.second },
+            refused.size.toLong(),
+        )
     }
+
+    /**
+     * Registered bytes and rows over the table's candidate population —
+     * one metadata aggregate on the same REPEATABLE READ snapshot as the
+     * candidate read, no object-store IO.
+     *
+     * Filtered by the RAW [CompactionConfig.targetBytes], not the derated
+     * budget, because the derate is what this is being measured to
+     * compute. It is a superset of the eventual candidate set, which
+     * makes the density a whole-table average: a table holding both
+     * client snappy (first tier) and compaction zstd (every tier above)
+     * measures between the two, and the exact per-group row check in
+     * [groups] is what covers the residual.
+     */
+    private fun density(
+        h: Handle,
+        ctx: TableContext,
+        cfg: CompactionConfig,
+    ): InputDensity =
+        h.createQuery(
+            """
+            SELECT COALESCE(SUM(f.file_size_bytes), 0) AS total_bytes,
+                   COALESCE(SUM(f.record_count), 0) AS total_records
+            FROM hog_data_file f
+            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+              AND f.end_snapshot IS NULL
+              AND f.file_size_bytes < :targetBytes
+            """,
+        )
+            .bind("catalogId", ctx.catalogId)
+            .bind("tableId", ctx.tableId)
+            .bind("targetBytes", cfg.targetBytes)
+            .map { rs, _ -> InputDensity(rs.getLong("total_bytes"), rs.getLong("total_records")) }
+            .one()
 
     // ---- one run ---------------------------------------------------------
 
@@ -504,7 +799,8 @@ class CompactionService(
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
-                    "invalid_data=${r.invalidData} failed_groups=${r.failedGroups}"
+                    "invalid_data=${r.invalidData} heap_budget_exceeded=${r.heapBudgetExceeded} " +
+                    "failed_groups=${r.failedGroups}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -517,6 +813,7 @@ class CompactionService(
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
             Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
             Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
+            Metrics.compactionSkipped(catalog, "heap_budget", result.heapBudgetExceeded)
             // The red-flag outcome, and it had no series either.
             Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
             result
@@ -535,6 +832,7 @@ class CompactionService(
         var dvSuperseded = 0L
         var unconvertible = 0L
         var invalidData = 0L
+        var heapBudgetExceeded = 0L
         var failed = 0L
 
         fun budgetSpent() =
@@ -543,6 +841,13 @@ class CompactionService(
         outer@ for ((namespace, table) in tables) {
             if (budgetSpent()) break
             val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
+            // Groups the heap ceiling refused in METADATA. Counted but
+            // deliberately NOT charged to maxGroupsPerRun: every other
+            // skip flavor spends the group's IO before it resolves, and
+            // this one spends none, so letting it consume the run's one
+            // slot would let a single un-compactable table starve every
+            // other table of the sweep forever.
+            heapBudgetExceeded += plan.heapRefusedGroups
             for (group in plan.groups) {
                 if (budgetSpent()) break@outer
                 try {
@@ -580,6 +885,37 @@ class CompactionService(
                             "(${e.message}); skipping"
                     }
                     invalidData++
+                } catch (e: OutOfMemoryError) {
+                    // The ceiling in `groups` is supposed to make this
+                    // unreachable; reaching it means the per-node heap
+                    // estimate is wrong for this table's shape, which is
+                    // an operator signal, not a retry.
+                    //
+                    // Caught at the GROUP boundary because nothing else
+                    // caught it at all: `catch (e: Exception)` below does
+                    // not match an Error, so the OOM used to unwind the
+                    // whole sweep — losing every other table's accounting
+                    // and leaving the run ledger a bare "Java heap space"
+                    // with no counters (hoglake#118). Catching an OOM is
+                    // only defensible because the allocation it aborts is
+                    // one ArrayList of Groups that is unreachable the
+                    // instant this frame unwinds.
+                    //
+                    // And then the sweep STOPS. Continuing would allocate
+                    // the next group's inputs into a heap that just
+                    // proved it has none to spare.
+                    heapBudgetExceeded++
+                    log.error(e) {
+                        "compaction group of ${group.files.size} files " +
+                            "(${group.survivingRecords} survivors) exhausted the heap for " +
+                            "$catalog/$namespace.$table despite a row ceiling of " +
+                            "${cfg.sortedRowCeiling(ctx.columns)}; ending the sweep. The " +
+                            "per-node heap estimate is too small for this table's shape — " +
+                            "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or raise the heap. " +
+                            "Both are workarounds for an in-memory group sort that should be " +
+                            "an external merge sort; see CompactionConfig.sortedHeapBytes"
+                    }
+                    break@outer
                 } catch (e: Exception) {
                     // One bad group (unreadable input, corrupt DV, S3
                     // hiccup) never wedges the sweep — but it IS counted:
@@ -603,6 +939,7 @@ class CompactionService(
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertible,
             invalidData = invalidData,
+            heapBudgetExceeded = heapBudgetExceeded,
             failedGroups = failed,
         )
     }

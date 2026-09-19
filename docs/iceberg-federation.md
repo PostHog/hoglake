@@ -329,13 +329,38 @@ group to sort it, and a nested group's object graph is **not** its byte
 size: a measured `list<long>` table with five elements per row peaked at
 343 MiB of heap from a 4.6 MiB compressed input — 70x — because every
 element carries an object header, a field array and a boxed value, none
-of which compression touches. `compaction_target_bytes` is therefore not
-a heap bound for such a table, and the planner derates instead: a table
-with BOTH nested columns and a live sort order is planned under
-`target / HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near
-the top of the measured 30-70x range), which puts the materialized graph
-back under roughly the target. That is a bounded mitigation per GROUP,
-not spilling; the per-ROW bound is the node budget above.
+of which compression touches. `compaction_target_bytes` is not
+a heap bound for a nested table, and — measured — it was never one for a
+flat table either: a flat 11-column event row costs about 1.7 KiB of
+materialized heap against 119 bytes of snappy input (14x), and
+compaction's own zstd outputs are 1.70x denser again (24x).
+
+So the sorted path is bounded in ROWS.
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default 1 GiB — the largest
+value safe on today's 4 GiB maintenance pod; bigger pods take
+proportionally more, see server/README.md) divided by the
+live schema's node count (~192 B per node, measured) gives a row
+ceiling; the table's registered bytes-per-row — catalog metadata, never
+a footer read — converts that ceiling into the byte budget the tier
+ladder is planned under, capped at the target. A nested table divides
+the ceiling again by
+`HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near the top of
+the measured 30-70x range), because a nested row's node count is data
+rather than schema and the per-node accounting cannot see it. A group
+that is still above the ceiling on its registered counts is refused in
+metadata as `heap_budget_exceeded`, before any IO. That is a bounded
+mitigation per GROUP, not spilling; the per-ROW bound is the node budget
+above.
+
+The group bound is explicitly TEMPORARY. It exists only because the
+sorted rewrite sorts a whole group in memory, and the replacement is an
+external merge sort: at tier 2 and above every input is a previous
+compaction output and therefore an already-sorted run, so a k-way merge
+holds one row per input rather than the whole group, while tier-1 client
+files — whose sort order is advisory and never verified by the server —
+are the smallest and can each be sorted alone and spilled as a temp run
+to the scratch directory the rewrite already uses. That removes the heap
+bound on group size, and with it the knob, the ceiling and the skip.
 A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
 **zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
 gzip, lz4_raw and uncompressed are the other legal names, and an

@@ -100,20 +100,44 @@ data class Config(
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
     /**
-     * Sorted-path heap derate for NESTED tables: the group byte budget a
-     * table with both nested columns and a live sort order is planned
-     * under is compaction_target_bytes / this. The sorted path
-     * materializes a whole group to sort it, and a nested row's object
-     * graph measured 30-70x its compressed bytes, so the raw target is
-     * not a heap bound for such a table. 1 disables the derate — which
-     * is the setting to reach for only with a heap sized for it.
-     * See CompactionConfig.nestedSortExpansion.
+     * Sorted-path heap derate for NESTED tables: the sorted ROW CEILING
+     * of a table with both nested columns and a live sort order is
+     * divided by this. The sorted path materializes a whole group to
+     * sort it, and a nested row's node count is not knowable from the
+     * catalog (list lengths are data) — measured at 30-70x its
+     * compressed bytes — so the per-node accounting below cannot see it.
+     * 1 disables the derate, which is the setting to reach for only with
+     * a heap sized for it. See CompactionConfig.nestedSortExpansion.
      */
     val compactionNestedSortExpansion: Int =
         env(
             "HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION",
             "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_NESTED_SORT_EXPANSION}",
         ).toInt(),
+    /**
+     * How much HEAP one group's sorted-path materialization may take,
+     * default 1 GiB. This — not compaction_target_bytes — is the
+     * sorted path's bound: the planner converts it to a row ceiling
+     * using the live schema's node count, and converts THAT back to a
+     * group byte budget using the table's own observed bytes-per-row.
+     *
+     * The default is the largest value that is safe on the maintenance
+     * pod AS IT IS TODAY (4 GiB, so ~2.8 GiB of heap at the image's
+     * MaxRAMPercentage=70): worst-case peak ~1260 MiB, 44% of that heap.
+     * Raise it only together with the pod's memory — on a bigger pod the
+     * group bytes it buys scale linearly (server/README.md has the
+     * ladder), and raising it WITHOUT the pod turns a counted refusal
+     * back into the OOM it replaced.
+     *
+     * TEMPORARY. The bound exists only because the sorted rewrite sorts
+     * a whole group in memory; an external merge sort removes it
+     * entirely. See CompactionConfig.sortedHeapBytes.
+     */
+    val compactionSortedHeapBytes: Long =
+        env(
+            "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_SORTED_HEAP_BYTES}",
+        ).toLong(),
     /**
      * Per-ROW node budget for the compaction rewrite. Bounds one row's
      * materialized object graph, which no group-level budget can; a row

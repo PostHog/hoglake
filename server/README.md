@@ -396,6 +396,98 @@ pinned rather than inherited because the sweep is CPU-bound on a shared
 maintenance pod and a parquet-java bump must not move that budget
 without a diff. parquet-java's zstd workers stay at 0 (in-thread).
 
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default **1 GiB**) bounds one
+GROUP's materialized object graph on the SORTED path, which is the only
+path that materializes one: the unsorted path streams a record at a time
+and its heap is flat in group size. `HOGLAKE_COMPACTION_TARGET_BYTES`
+used to stand in for this, on the stated assumption that a flat row's
+object graph is near its byte size. Measured, it is not: a flat
+11-column event row costs about **1.7 KiB** of heap against **119
+bytes** of snappy input — 14x — and since compaction started writing
+zstd its own outputs are **1.70x** denser again, so the same byte budget
+was admitting 24x the rows a heap could hold. A 512 MiB group of zstd
+event data would want roughly 13 GiB.
+
+So the planner works in ROWS and converts. The heap budget divides by
+the live schema's node count (~192 B per materialized node, measured) to
+give a row ceiling; the table's own registered bytes-per-row — from
+`hog_data_file.file_size_bytes` and `record_count`, metadata only, no
+footer reads — converts that ceiling back into the byte budget the tier
+ladder is planned under, capped at the target. Denser inputs therefore
+buy fewer bytes per group, automatically and per table, with no guessed
+compression ratio anywhere. One consequence is worth stating plainly: a
+file that alone holds more rows than the ceiling stops being a compaction
+candidate, because merging it could not fit the sort buffer.
+
+The ladder's scaling is an average, so the exact check happens per
+group: a planned group whose registered survivor count is above the
+ceiling is refused in METADATA, counted as `heap_budget_exceeded` and
+exported as `hoglake_compaction_skipped_total{reason="heap_budget"}`. It
+costs no object-store IO, unlike the `java.lang.OutOfMemoryError` ninety
+seconds into a rewrite that it replaces (hoglake#118), and it does not
+consume the run's group budget — a table that cannot compact must not
+starve the ones that can.
+
+### The sorted cap is temporary
+
+Capping a 512 MiB target at tens of megabytes is a real cost, and no
+value of the knob fixes it — it only moves it. The cap exists for one
+reason: `ParquetRewriter` reads the whole group into an
+`ArrayList<Group>` and calls `sortedWith`. An in-memory sort needs the
+group in memory.
+
+The replacement is an **external merge sort**, and compaction is
+unusually well placed for one:
+
+- **Tier 2 and above need no sort at all.** Every input to those groups
+  is a previous compaction OUTPUT, and this rewriter sorts what it
+  writes — the sort spec is *binding for compaction rewrites*
+  (`schema.sql`). So each input is an already-sorted RUN, and merging k
+  runs needs one row per run in a priority queue: **O(files)** live
+  rows, not O(group). The tier ladder puts almost all the bytes here.
+- **Tier 1 cannot assume it.** A client's sort order is **advisory** —
+  `schema.sql` says so, and the server never verifies file sortedness.
+  But tier-1 files are the smallest by construction, so sorting one is
+  bounded by that one file: sort each tier-1 input alone, spill it as a
+  temp run to the scratch directory the rewrite already creates per
+  group (the image notes compaction spills under `java.io.tmpdir`), and
+  stream-merge the runs like any other.
+
+That removes the heap bound on group size entirely, and with it this
+knob, the row ceiling and the `heap_budget` skip. Until it lands, the
+levers are the pod ladder above and dropping a table's sort order (which
+moves it to the streaming path, where group size costs no heap at all).
+
+### Sizing it against the pod
+
+The default is the largest value that is safe on the maintenance pod
+**as it exists today** — 4 GiB, so ~2.8 GiB of heap at the image's
+`MaxRAMPercentage=70`. Worst-case peak at 1 GiB is ~1260 MiB (the sort
+buffer's measured 0.79x of the declared budget, plus the group's input
+and output byte arrays, plus parquet-java's 128 MiB row-group block,
+plus the hydrator's 256 MiB whole-object ceiling if it fires in the same
+tick) — 44% of that heap. Raising the knob without raising the pod turns
+a counted refusal back into the OOM it replaced.
+
+Bigger pods buy proportionally bigger groups. Holding peak at ~45% of a
+heap that is 70% of the pod, for a ten-column event table:
+
+| pod | heap | `SORTED_HEAP_BYTES` | peak | group (snappy) | group (zstd) |
+|---|---|---|---|---|---|
+| 4 GiB (today) | 2.8 GiB | **1 GiB** (default) | 1260 MiB, 44% | 57.7 MiB | 33.9 MiB |
+| 8 GiB | 5.6 GiB | 2 GiB | 2137 MiB, 37% | 115.4 MiB | 67.9 MiB |
+| 16 GiB | 11.2 GiB | 4 GiB | 3890 MiB, 34% | 230.8 MiB | 135.8 MiB |
+| 32 GiB | 22.4 GiB | 8 GiB | 7395 MiB, 32% | 461.6 MiB | 271.5 MiB |
+| 64 GiB | 44.8 GiB | 16 GiB | 14407 MiB, 31% | 512 MiB (cap stops binding) | 512 MiB |
+
+Group bytes are close to column-count independent: the budget divides by
+node count and multiplies by bytes-per-row, and both scale with the
+number of columns. A 20-column table whose rows really do carry twice
+the bytes lands in the same 34-58 MiB band. The exception is a wide
+table whose extra columns are nearly free (low-cardinality, dictionary
+encoded): those add nodes without adding bytes, and the same 1 GiB
+budget yields 17.8 MiB (zstd) / 30.2 MiB (snappy).
+
 `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default **1,000,000**) bounds
 one ROW's materialized object graph, which no group-level budget can:
 both rewrite paths materialize a row whole, so a single row holding a

@@ -41,4 +41,14 @@ USER 10001
 EXPOSE 8080
 # All configuration via HOGLAKE_* env vars (Config.kt defaults are
 # dev-stack values; every real deploy overrides JDBC/S3/credentials).
+#
+# JVM flags are NOT set here. `bin/hoglake-server` is the gradle
+# application start script and it already carries them as
+# DEFAULT_JVM_OPTS, from `applicationDefaultJvmArgs` in build.gradle.kts
+# — one place, and it covers `just server run` and the compose stack too,
+# not only this image. Setting ENV JAVA_OPTS here would instead be
+# clobbered wholesale by any deploy that sets JAVA_OPTS for its own
+# reason, silently taking the heap sizing with it. To ADD a flag at run
+# time, set JAVA_OPTS or HOGLAKE_SERVER_OPTS: the script appends both
+# after DEFAULT_JVM_OPTS, so they override rather than replace.
 ENTRYPOINT ["/app/bin/hoglake-server"]
