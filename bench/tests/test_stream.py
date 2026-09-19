@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import signal
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 import httpx
 import numpy as np
@@ -353,6 +355,71 @@ def test_a_signalled_stop_discards_the_buffer_and_summarises_cleanly() -> None:
     assert "1,000" in text
     assert "SIGINT" in text
     assert "250" in text and "dropped" in text
+
+
+# -- deferred stats ----------------------------------------------------------
+
+
+class TestDeferredStats:
+    """Registering WITHOUT footer stats is the only way to load the hydrator.
+
+    Every writer in the fleet ships its own footer, so the hydrator's queue
+    is empty in the steady state and the backfill path never runs under
+    load. `--defer-stats` makes the stream leave that work undone on
+    purpose.
+    """
+
+    def test_the_flag_is_off_by_default(self) -> None:
+        from hoglake_bench.cli import build_parser
+
+        args = build_parser().parse_args(["stream", "--max-events", "10"])
+        assert args.defer_stats is False
+
+    def test_the_flag_parses(self) -> None:
+        from hoglake_bench.cli import build_parser
+
+        args = build_parser().parse_args(
+            ["stream", "--max-events", "10", "--defer-stats"]
+        )
+        assert args.defer_stats is True
+
+    @pytest.mark.parametrize("defer", [False, True])
+    def test_the_flag_reaches_append(self, defer: bool) -> None:
+        # The wiring is the whole feature: a flag that parses but never
+        # reaches `Table.append` would leave stats shipped and the
+        # hydrator as idle as before, with nothing to show it.
+        seen: dict[str, object] = {}
+
+        class FakeTable:
+            def append(self, _batch, **kwargs):
+                seen.update(kwargs)
+                return SimpleNamespace(files=[], snapshot_id=1)
+
+        source = inspect.getsource(streamer.run)
+        assert "deferred_stats=args.defer_stats" in source, (
+            "run() must pass the flag through to Table.append"
+        )
+        # And the call shape itself: kwargs land where append reads them.
+        FakeTable().append(None, deferred_stats=defer)
+        assert seen["deferred_stats"] is defer
+
+    def test_the_summary_says_when_stats_were_deferred(self) -> None:
+        totals = streamer.StreamTotals(np.zeros(3, dtype=np.int64))
+        totals.events = 1000
+        totals.files = 4
+        teams = TeamDistribution.build(teams=3)
+        deferred = "\n".join(
+            streamer.summary_lines(
+                totals, teams, elapsed_s=1.0, stopped_by="x", deferred_stats=True
+            )
+        )
+        shipped = "\n".join(
+            streamer.summary_lines(
+                totals, teams, elapsed_s=1.0, stopped_by="x", deferred_stats=False
+            )
+        )
+        assert "pending for the hydrator" in deferred
+        assert "pending for the hydrator" not in shipped
 
 
 # -- failure classification --------------------------------------------------

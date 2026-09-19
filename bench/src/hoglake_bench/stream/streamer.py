@@ -323,6 +323,7 @@ def summary_lines(
     stopped_by: str,
     parquet_bytes: int | None = None,
     target_rate: float | None = None,
+    deferred_stats: bool = False,
     top: int = 10,
 ) -> list[str]:
     """The end-of-run report. Pure, so it is testable without a server."""
@@ -341,7 +342,14 @@ def summary_lines(
             f"({_rate(totals.arrow_bytes, elapsed_s) / 1e6:.2f} MB/s)"
         ),
         f"  flushes              {totals.flushes} ({reasons})",
-        f"  files written        {totals.files}",
+        (
+            f"  files written        {totals.files}"
+            + (
+                " (stats deferred — left pending for the hydrator)"
+                if deferred_stats
+                else ""
+            )
+        ),
         f"  hour partitions      {len(totals.hours_seen)}",
         (
             f"  retries              {totals.retries} "
@@ -568,6 +576,11 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
                 batch,
                 author="hoglake-bench",
                 message=f"stream flush {totals.flushes + 1} ({reason})",
+                # With stats deferred the commit carries no column
+                # statistics, so every file lands `pending` and the
+                # hydrator has to fetch and parse the footer it would
+                # otherwise have been handed.
+                deferred_stats=args.defer_stats,
             ),
             totals=totals,
             max_retries=args.max_flush_retries,
@@ -665,6 +678,7 @@ def run(bench: Bench, args: argparse.Namespace) -> None:
         stopped_by=stopped_by,
         parquet_bytes=parquet_bytes,
         target_rate=rate if rate > 0 else None,
+        deferred_stats=args.defer_stats,
     ):
         print(line, flush=True)
 
@@ -795,6 +809,13 @@ def add_args(p: argparse.ArgumentParser) -> None:
         type=float,
         default=DEFAULT_ZIPF_S,
         help=f"power-law exponent over the non-whale tail (default {DEFAULT_ZIPF_S:g})",
+    )
+    p.add_argument(
+        "--defer-stats",
+        action="store_true",
+        help="register files WITHOUT footer stats, leaving them pending for "
+        "the hydrator to backfill — the only way to put the hydrator under "
+        "real load, since every writer in the fleet ships its own footer",
     )
     p.add_argument(
         "--properties-bytes",

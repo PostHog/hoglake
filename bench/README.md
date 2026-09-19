@@ -212,6 +212,29 @@ properties stay VARCHAR, as they do in millpond's string-only mode, and
   actually held. That is the production shape, and it is what makes the
   per-file bounds worth reading.
 
+### Putting the hydrator under load
+
+Every writer in the fleet ships its own footer, so files arrive with
+stats already attached and the hydrator's queue is empty in the steady
+state — its backfill path has never run under real load. `--defer-stats`
+registers files **without** column statistics, so each one lands
+`pending` and the hydrator has to fetch the object and parse the footer
+it would otherwise have been handed:
+
+```sh
+hoglake-bench stream --rate 20000 --defer-stats --bucket posthog-gigahog-mw-dev
+```
+
+The summary says so (`files written N (stats deferred — left pending for
+the hydrator)`), and the maintenance page's hydrator backlog stops
+reading `0 pending`. Note the hydrator polls every fifteen minutes by
+default, so a queue builds before it drains — which is the point.
+
+Files registered this way carry no bounds until the hydrator fills them
+in, so anything reading the table cannot prune those files in the
+meantime. That is the documented meaning of `pending`, not a side effect
+of this flag.
+
 ### What the default distribution is, and is not
 
 Teams are drawn from a **whale plus a Zipf tail**: one team takes
