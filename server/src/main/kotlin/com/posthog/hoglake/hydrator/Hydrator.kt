@@ -694,15 +694,24 @@ class Hydrator(
          * hydrated, so the backlog is not just a queue — it is files no
          * reader can skip.
          *
-         * 10,000 is sized off the per-file cost rather than a guess:
+         * 10,000 was sized off the per-file cost rather than a guess:
          * ~150ms each (a ranged footer read plus a catalog write, from
          * the same dev measurement), so a full batch is minutes of work
          * and only ever runs when that much has genuinely accumulated.
-         * The sweep is one transaction, claimed FOR UPDATE SKIP LOCKED,
-         * so a larger batch holds it longer — which is the cost to watch
-         * if this is raised again.
+         * In practice that sized the wrong thing. The sweep is ONE
+         * transaction, claimed FOR UPDATE SKIP LOCKED, so 10,000 files
+         * is minutes of row locks and one commit's worth of WAL held
+         * open on the catalog database — and any failure rolls the
+         * whole sweep back, not one file.
+         *
+         * 1,000 keeps the drain rate that matters: at ~150ms each a
+         * full batch is ~2.5 minutes against a 15-minute interval, so
+         * a backlog still drains at ~4,000/hour — five times the rate
+         * that let the 13,224-file backlog grow under 100 — while the
+         * worst-case transaction is a tenth the length and a failure
+         * loses a tenth the work.
          */
-        const val DEFAULT_SWEEP_LIMIT = 10_000
+        const val DEFAULT_SWEEP_LIMIT = 1_000
 
         /** 4-byte footer length + 4-byte "PAR1" magic at the end of the file. */
         private const val FOOTER_SUFFIX = 8L
