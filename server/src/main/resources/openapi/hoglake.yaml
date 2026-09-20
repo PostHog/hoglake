@@ -158,6 +158,23 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Namespace" }
         "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      operationId: dropNamespace
+      summary: Drop a namespace (DDL commit; produces a snapshot)
+      description: Emptiness precondition, no CASCADE — a namespace with live
+        tables or views is refused with 409, matching dropTable's no-CASCADE
+        position.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+      responses:
+        "200":
+          description: Dropped; returns the snapshot that recorded it
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:

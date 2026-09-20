@@ -1277,4 +1277,11 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * NULL their history in readers -> HTTP 409.
      */
     class IdlessFilesPresent(detail: String) : HoglakeException(detail)
+
+    /**
+     * A namespace drop was refused because live tables or views remain
+     * (the emptiness precondition — no CASCADE, matching DROP TABLE's
+     * no-CASCADE position) -> HTTP 409.
+     */
+    class NamespaceNotEmpty(detail: String) : HoglakeException(detail)
 }

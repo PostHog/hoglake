@@ -25,6 +25,7 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - CommitConflict      -> 409
  * - OffsetRegression    -> 409
  * - IdlessFilesPresent  -> 409
+ * - NamespaceNotEmpty   -> 409
  * - Validation          -> 422
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
@@ -49,6 +50,7 @@ fun StatusPagesConfig.installErrorMapping() {
                 is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to "commit_conflict"
                 is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
                 is HoglakeException.IdlessFilesPresent -> HttpStatusCode.Conflict to "idless_files_present"
+                is HoglakeException.NamespaceNotEmpty -> HttpStatusCode.Conflict to "namespace_not_empty"
                 is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to "validation"
                 is HoglakeException.Expired -> HttpStatusCode.Gone to "expired"
                 is HoglakeException.CommitQueueTimeout -> {

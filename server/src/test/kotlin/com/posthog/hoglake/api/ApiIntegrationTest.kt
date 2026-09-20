@@ -346,6 +346,172 @@ class ApiIntegrationTest {
             assertThat(body(client.get("/v1/catalogs/tt/namespaces/ns/tables"))).isEmpty()
         }
 
+    // ---- namespace drop ----------------------------------------------------
+
+    @Test
+    fun `namespace drop - empty namespace drops, non-empty is 409, recreate is a new incarnation`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "nsdrop", "data_path": "s3://hog/nsdrop"}""")
+            client.postJson("/v1/catalogs/nsdrop/namespaces", """{"name": "doomed"}""") // snapshot 1
+
+            // A namespace holding a live table cannot be dropped.
+            client.postJson(
+                "/v1/catalogs/nsdrop/namespaces/doomed/tables",
+                """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
+            ) // snapshot 2
+            assertApiError(
+                client.delete("/v1/catalogs/nsdrop/namespaces/doomed"),
+                HttpStatusCode.Conflict,
+                "namespace_not_empty",
+            )
+
+            // Emptiness follows the table: once the table is gone, the
+            // namespace drops and returns the snapshot that recorded it.
+            client.delete("/v1/catalogs/nsdrop/namespaces/doomed/tables/t") // snapshot 3
+            val dropped = client.delete("/v1/catalogs/nsdrop/namespaces/doomed") // snapshot 4
+            assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
+            body(dropped).let { r ->
+                assertThat(r["snapshot_id"].asLong()).isEqualTo(4)
+                assertThat(r["schema_version"].asLong()).isEqualTo(4)
+            }
+
+            // Gone at head: not found, not listed.
+            assertApiError(
+                client.get("/v1/catalogs/nsdrop/namespaces/doomed"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+            assertThat(body(client.get("/v1/catalogs/nsdrop/namespaces"))).isEmpty()
+            // Re-drop is a 404, not a silent success.
+            assertApiError(
+                client.delete("/v1/catalogs/nsdrop/namespaces/doomed"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+
+            // Recreating the name is a NEW incarnation, not a resurrection:
+            // a new snapshot, and the namespace drops cleanly a second time.
+            client.postJson("/v1/catalogs/nsdrop/namespaces", """{"name": "doomed"}""") // snapshot 5
+            assertThat(body(client.get("/v1/catalogs/nsdrop/namespaces")).map { it["name"].asText() })
+                .containsExactly("doomed")
+            val redropped = client.delete("/v1/catalogs/nsdrop/namespaces/doomed")
+            assertThat(redropped.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(redropped)["snapshot_id"].asLong()).isEqualTo(6)
+
+            // Dropping a namespace that never existed is a 404.
+            assertApiError(
+                client.delete("/v1/catalogs/nsdrop/namespaces/neverthere"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
+    @Test
+    fun `namespace drop - a namespace holding a live view is 409`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "nsdropv", "data_path": "s3://hog/nsdropv"}""")
+            client.postJson("/v1/catalogs/nsdropv/namespaces", """{"name": "ns"}""")
+            client.postJson(
+                "/v1/catalogs/nsdropv/namespaces/ns/tables",
+                """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+            client.postJson(
+                "/v1/catalogs/nsdropv/namespaces/ns/views",
+                """{"name": "v", "dialect": "duckdb", "sql": "SELECT 1"}""",
+            )
+            // The view alone (even with the table dropped) blocks the drop.
+            client.delete("/v1/catalogs/nsdropv/namespaces/ns/tables/t")
+            assertApiError(
+                client.delete("/v1/catalogs/nsdropv/namespaces/ns"),
+                HttpStatusCode.Conflict,
+                "namespace_not_empty",
+            )
+        }
+
+    @Test
+    fun `namespace drop - drop commits a snapshot that advances head`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "nsdrophead", "data_path": "s3://hog/nsdrophead"}""")
+            assertThat(body(client.get("/v1/catalogs/nsdrophead"))["head_snapshot_id"].asLong()).isEqualTo(0)
+            client.postJson("/v1/catalogs/nsdrophead/namespaces", """{"name": "a"}""") // snapshot 1
+            assertThat(body(client.get("/v1/catalogs/nsdrophead"))["head_snapshot_id"].asLong()).isEqualTo(1)
+
+            val dropped = client.delete("/v1/catalogs/nsdrophead/namespaces/a") // snapshot 2
+            assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
+            body(dropped).let { r ->
+                assertThat(r["snapshot_id"].asLong()).isEqualTo(2)
+                assertThat(r["schema_version"].asLong()).isEqualTo(2)
+            }
+            // The drop is a real commit: head advances to the drop snapshot.
+            assertThat(body(client.get("/v1/catalogs/nsdrophead"))["head_snapshot_id"].asLong()).isEqualTo(2)
+        }
+
+    @Test
+    fun `namespace drop - dropped namespace leaves its orphaned tables invisible, sibling namespaces untouched`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "nsdroporph", "data_path": "s3://hog/nsdroporph"}""")
+            // Two namespaces, each with a table; then empty ns1 of its table
+            // so it can be dropped while ns2 keeps its own.
+            client.postJson("/v1/catalogs/nsdroporph/namespaces", """{"name": "ns1"}""")
+            client.postJson("/v1/catalogs/nsdroporph/namespaces", """{"name": "ns2"}""")
+            client.postJson(
+                "/v1/catalogs/nsdroporph/namespaces/ns1/tables",
+                """{"name": "t1", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+            client.postJson(
+                "/v1/catalogs/nsdroporph/namespaces/ns2/tables",
+                """{"name": "t2", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+            client.delete("/v1/catalogs/nsdroporph/namespaces/ns1/tables/t1")
+
+            val dropped = client.delete("/v1/catalogs/nsdroporph/namespaces/ns1")
+            assertThat(dropped.status).isEqualTo(HttpStatusCode.OK)
+
+            // Only ns2 survives; its table is still readable.
+            assertThat(body(client.get("/v1/catalogs/nsdroporph/namespaces")).map { it["name"].asText() })
+                .containsExactly("ns2")
+            assertThat(
+                body(client.get("/v1/catalogs/nsdroporph/namespaces/ns2/tables")).map { it["name"].asText() },
+            ).containsExactly("t2")
+        }
+
+    @Test
+    fun `namespace drop - after re-creation, objects land in the new incarnation and the old one stays dropped`() =
+        api { client ->
+            client.postJson("/v1/catalogs", """{"name": "nsdropinc", "data_path": "s3://hog/nsdropinc"}""")
+            client.postJson("/v1/catalogs/nsdropinc/namespaces", """{"name": "ns"}""") // incarnation 1
+            client.delete("/v1/catalogs/nsdropinc/namespaces/ns")
+            client.postJson("/v1/catalogs/nsdropinc/namespaces", """{"name": "ns"}""") // incarnation 2
+
+            // A table created now lives in the NEW incarnation and is readable.
+            client.postJson(
+                "/v1/catalogs/nsdropinc/namespaces/ns/tables",
+                """{"name": "t", "columns": [{"name": "id", "type": "long"}]}""",
+            )
+            assertThat(
+                body(client.get("/v1/catalogs/nsdropinc/namespaces/ns/tables")).map { it["name"].asText() },
+            ).containsExactly("t")
+
+            // The table pins incarnation 2 the same as any other: a drop with
+            // a live table is still a 409.
+            assertApiError(
+                client.delete("/v1/catalogs/nsdropinc/namespaces/ns"),
+                HttpStatusCode.Conflict,
+                "namespace_not_empty",
+            )
+
+            // Once the table is gone the new incarnation drops cleanly — the
+            // dropped flag did not leak across from incarnation 1.
+            client.delete("/v1/catalogs/nsdropinc/namespaces/ns/tables/t")
+            val redropped = client.delete("/v1/catalogs/nsdropinc/namespaces/ns")
+            assertThat(redropped.status).isEqualTo(HttpStatusCode.OK)
+            assertApiError(
+                client.get("/v1/catalogs/nsdropinc/namespaces/ns"),
+                HttpStatusCode.NotFound,
+                "not_found",
+            )
+        }
+
     // ---- commit conflicts + validation -----------------------------------
 
     @Test
