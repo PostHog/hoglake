@@ -186,7 +186,7 @@ export function PartitionsPage() {
                   sortKey="debt"
                   sort={sort}
                   onSort={onSort}
-                  tooltip="The share of this partition's files below the final target. Small files can still be below their tier's merge quota; the score counts only complete groups."
+                  tooltip="The share of this partition's files below the compaction target. A small file still contributes no debt when its partition holds too few of them to be worth a rewrite."
                 />
                 <SortableTh
                   label="total size"
@@ -216,7 +216,7 @@ export function PartitionsPage() {
                   sort={sort}
                   onSort={onSort}
                   numeric
-                  tooltip="Files selected into complete geometric-tier compaction groups, before the per-run budget. Each group takes the fewest files reaching the next byte boundary (up to T=8 by default). Short remainders do not count. Ordered by score, ties by small-file bytes."
+                  tooltip="Files compaction would put in a group, before the per-run budget. Files are sorted by size and packed until they reach the target size or the fan-in cap, and the trailing remainder counts too — unless the group holds too few files to be worth rewriting. Ordered by score, ties by small-file bytes."
                 />
               </tr>
             </thead>

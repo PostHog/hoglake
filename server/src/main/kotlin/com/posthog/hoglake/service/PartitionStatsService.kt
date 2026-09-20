@@ -1,6 +1,6 @@
 package com.posthog.hoglake.service
 
-import com.posthog.hoglake.compaction.CompactionTiers
+import com.posthog.hoglake.compaction.CompactionGrouping
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
 import com.posthog.hoglake.model.PartitionDebt
@@ -33,11 +33,27 @@ import java.util.UUID
  *  - "Small" = file_size_bytes < [smallFileThresholdBytes], the SAME
  *    strict-less-than CompactionService applies to candidate inputs
  *    (App wires both from Config.compactionTargetBytes). debt_score is
- *    the ACTIONABLE debt under the tiered planner (CompactionTiers):
- *    count only files selected into complete minimal-prefix groups,
- *    repeating within each tier. Short remainders keep their raw counts
- *    in small_file_count but contribute no debt. The execution budget
+ *    the ACTIONABLE debt under the one-pass planner
+ *    (CompactionGrouping): count only files the planner would put in a
+ *    group — bin-packed BY SIZE to the target or the fan-in cap,
+ *    trailing remainder included, and only where the group clears its
+ *    scaled minimum. A group under that minimum keeps its files in
+ *    small_file_count and contributes no debt. The execution budget
  *    limits work per run, not reported backlog.
+ *
+ *    EXACT for ordinary unsorted scalar tables, and OVER-REPORTING for
+ *    three cases the sampler cannot see, all of which predate the
+ *    one-pass change:
+ *      - SORTED (and nested) tables, where the planner runs against
+ *        CompactionConfig.effectiveTargetBytes — derated to fit the sort
+ *        buffer in heap — while the sampler uses the raw target. Files
+ *        between the derated budget and the raw target are debt here and
+ *        invisible to the planner.
+ *      - VARIANT tables, which CompactionService refuses to plan at all.
+ *      - Groups the row ceiling refuses (heap_budget_exceeded).
+ *    Closing these means teaching a bounded streaming scan the schema,
+ *    sort spec and per-table density; until then, read a sorted or
+ *    variant table's debt as an upper bound.
  *  - dv_count counts live DVs over the group's files (at most one per
  *    file by the unique partial index).
  *  - Ordered by debt_score desc, ties by small_file_bytes desc, then a
@@ -49,12 +65,11 @@ import java.util.UUID
  */
 class PartitionStatsService(
     private val jdbi: Jdbi,
-    /** Compaction target size = the small-file threshold (strict <); the tier ladder derives from it. */
+    /** Compaction target size, which is also the small-file threshold (strict <). */
     private val smallFileThresholdBytes: Long,
-    tierTarget: Int = CompactionTiers.DEFAULT_TIER_TARGET,
+    private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+    private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
 ) {
-    private val tiers = CompactionTiers.of(smallFileThresholdBytes, tierTarget)
-
     fun partitionStats(
         catalog: String,
         namespace: String?,
@@ -86,7 +101,11 @@ class PartitionStatsService(
             val published =
                 MaintenanceSummarySampler.read(h, listOf(cat.catalogId))[cat.catalogId]
                     ?.takeIf {
-                        it.sample.targetBytes == smallFileThresholdBytes && it.sample.tierTarget == tiers.tierTarget
+                        // Only a sample computed under the policy running
+                        // NOW is usable — see MaintenanceStatusService.
+                        it.sample.targetBytes == smallFileThresholdBytes &&
+                            it.sample.minInputFiles == minInputFiles &&
+                            it.sample.maxInputFiles == maxInputFiles
                     }
             val rows =
                 if (published == null) {
@@ -126,7 +145,7 @@ class PartitionStatsService(
         val totalBytes: Long,
         val smallFileBytes: Long,
         val dvCount: Long,
-        /** Actionable debt from the tier_groups sub-aggregation (SQL-computed). */
+        /** Actionable debt from the per-bucket sub-aggregation (SQL-computed). */
         val debtScore: Long,
         val totalGroups: Long,
         val staleSpecGroups: Long,

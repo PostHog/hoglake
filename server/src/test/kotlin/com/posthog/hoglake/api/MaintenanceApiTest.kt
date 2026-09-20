@@ -92,7 +92,11 @@ class MaintenanceApiTest {
                     CompactionService(
                         db.jdbi,
                         compactionStore,
-                        CompactionConfig(targetBytes = 512L * 1024 * 1024, tierTarget = 8, maxGroupsPerRun = 1),
+                        CompactionConfig(
+                            targetBytes = 512L * 1024 * 1024,
+                            minInputFiles = 2,
+                            maxGroupsPerRun = 1,
+                        ),
                     ),
                     VerifyService(db.jdbi),
                     // Rehydrate is metadata-only (a stats_state flip); the

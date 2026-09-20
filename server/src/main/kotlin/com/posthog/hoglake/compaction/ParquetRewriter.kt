@@ -275,14 +275,14 @@ object ParquetRewriter {
      * The compression codec a compaction output is written with.
      *
      * The default is ZSTD, and the reason is that compaction is the one
-     * writer in this system that rewrites the SAME rows repeatedly. A
-     * table's hot bytes pass through the tier ladder four times
-     * (…1 MiB -> 8 MiB -> 64 MiB -> 512 MiB), each pass writing what the
-     * next pass reads, so an output codec is not a per-file choice: it
-     * is the codec a fully compacted table is stored and scanned under
-     * forever. UNCOMPRESSED — which is what this used to be, inherited
-     * from `ExampleParquetWriter`'s default rather than chosen — made
-     * that ladder a one-way decompressor: clients write snappy
+     * writer in this system that rewrites rows it did not write. Every
+     * byte a client ingests is decoded and re-encoded here on its way to
+     * a target-sized file, and stays in that encoding for the rest of
+     * its life, so an output codec is not a per-file choice: it is the
+     * codec a compacted table is stored and scanned under. UNCOMPRESSED
+     * — which is what this used to be, inherited from
+     * `ExampleParquetWriter`'s default rather than chosen — made
+     * compaction a one-way decompressor: clients write snappy
      * (pyarrow's default, and DuckDB's, which is what pyhoglake and the
      * duckdb-client produce) or zstd (hedgerow's explicit COPY option),
      * and every merge threw that away permanently. A dev-catalog run
@@ -290,10 +290,10 @@ object ParquetRewriter {
      *
      * ZSTD over SNAPPY because the cost sits on the side that is paid
      * once. Compression happens once per rewrite; the output is then
-     * read by every scan, by the next tier's rewrite, and paid for in
+     * read by every scan, by any later rewrite, and paid for in
      * S3 storage until expiry. zstd at level 3 lands well under snappy's
      * size on the text-heavy event shapes this catalog holds, and its
-     * DEcompression — what readers and the next tier actually spend —
+     * DEcompression — what readers and later rewrites actually spend —
      * is in snappy's league. The compaction sweep is CPU-bound on a
      * shared maintenance pod, so the level is pinned rather than
      * inherited: [DEFAULT_ZSTD_LEVEL] is parquet-java's own default

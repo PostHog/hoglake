@@ -44,7 +44,7 @@ import kotlin.io.path.fileSize
  *
  *  2. **Compressed bytes per row** under SNAPPY (what every client
  *     writer here produces) and under ZSTD (what compaction itself
- *     writes since #115, and therefore what every tier-2-and-above
+ *     writes since #115, and therefore what any compaction-output
  *     input is). The RATIO between them is the amount by which the same
  *     byte budget started admitting more rows — i.e. exactly how much
  *     #115 degraded `targetBytes` as a heap proxy.

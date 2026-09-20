@@ -1,6 +1,6 @@
 package com.posthog.hoglake.service
 
-import com.posthog.hoglake.compaction.CompactionTiers
+import com.posthog.hoglake.compaction.CompactionGrouping
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.InstanceMaintenanceStatus
@@ -31,8 +31,9 @@ class MaintenanceStatusService(
     private val cleanupIntervalMs: Long,
     private val compactionIntervalMs: Long,
     private val smallFileThresholdBytes: Long,
+    private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+    private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     private val runStore: MaintenanceRunStore = MaintenanceRunStore(jdbi),
-    private val tierTarget: Int = CompactionTiers.DEFAULT_TIER_TARGET,
 ) {
     fun status(catalog: String): MaintenanceStatus =
         jdbi.inTransactionUnchecked { h ->
@@ -121,9 +122,19 @@ class MaintenanceStatusService(
         runs: Map<MaintenanceTask, MaintenanceRun>,
         loopRuns: Map<MaintenanceTask, List<Instant>>,
     ): MaintenanceStatus {
+        /**
+         * A published sample is only usable if it was computed under the
+         * policy that is running NOW. The ladder's predecessor compared the
+         * tier ratio here; the bin-packing bounds are its replacement, and
+         * `Sample` carries both for exactly this check. Without it, changing
+         * a bound leaves both endpoints serving debt from the old policy
+         * until the next full scan republishes.
+         */
         val valid =
             published?.takeIf {
-                it.sample.targetBytes == smallFileThresholdBytes && it.sample.tierTarget == tierTarget
+                it.sample.targetBytes == smallFileThresholdBytes &&
+                    it.sample.minInputFiles == minInputFiles &&
+                    it.sample.maxInputFiles == maxInputFiles
             }
         val sample = valid?.sample
         val now = Instant.now()

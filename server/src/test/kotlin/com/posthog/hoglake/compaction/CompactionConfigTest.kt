@@ -43,7 +43,12 @@ class CompactionConfigTest {
     private val target = 512L * 1024 * 1024
 
     /** A config built the way production builds one: no derate argument. */
-    private fun defaulted() = CompactionConfig(targetBytes = target, tierTarget = 8, maxGroupsPerRun = 1)
+    private fun defaulted() =
+        CompactionConfig(
+            targetBytes = target,
+            minInputFiles = 2,
+            maxGroupsPerRun = 1,
+        )
 
     @Test
     fun `a config with NO override derates a nested sorted table`() {
@@ -148,7 +153,6 @@ class CompactionConfigTest {
             assertThatThrownBy {
                 CompactionConfig(
                     targetBytes = target,
-                    tierTarget = 8,
                     maxGroupsPerRun = 1,
                     maxNodesPerRow = bad,
                 )
@@ -216,7 +220,6 @@ class CompactionConfigTest {
         assertThatThrownBy {
             CompactionConfig(
                 targetBytes = target,
-                tierTarget = 8,
                 maxGroupsPerRun = 1,
                 codec = ParquetRewriter.OutputCodec.parse("lzo"),
             )
@@ -244,7 +247,12 @@ class CompactionConfigTest {
         // first sweep of a nested table.
         for (bad in listOf(0, -1)) {
             assertThatThrownBy {
-                CompactionConfig(targetBytes = target, tierTarget = 8, maxGroupsPerRun = 1, nestedSortExpansion = bad)
+                CompactionConfig(
+                    targetBytes = target,
+                    minInputFiles = 2,
+                    maxGroupsPerRun = 1,
+                    nestedSortExpansion = bad,
+                )
             }
                 .describedAs("nestedSortExpansion=%d", bad)
                 .isInstanceOf(IllegalArgumentException::class.java)
@@ -253,7 +261,12 @@ class CompactionConfigTest {
         // 1 is legal and documented: it disables the derate for an
         // operator who has sized the heap for it.
         assertThat(
-            CompactionConfig(targetBytes = target, tierTarget = 8, maxGroupsPerRun = 1, nestedSortExpansion = 1)
+            CompactionConfig(
+                targetBytes = target,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                nestedSortExpansion = 1,
+            )
                 .effectiveTargetBytes(nestedColumns, sorted = true),
         ).isEqualTo(target)
     }
@@ -273,7 +286,7 @@ class CompactionConfigTest {
     @Test
     fun `a denser table is planned under a smaller byte budget`() {
         // The #118 regression in one assertion. Group selection reads
-        // BYTES; the sorted path holds ROWS. #115 made every tier-2+
+        // BYTES; the sorted path holds ROWS. #115 made every compaction
         // input compaction's own zstd rather than a client's snappy —
         // 1.70x denser on event data — so the same byte budget started
         // admitting 1.70x the rows with nothing anywhere noticing.
@@ -284,7 +297,6 @@ class CompactionConfigTest {
         val cfg =
             CompactionConfig(
                 targetBytes = target,
-                tierTarget = 8,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapForTenThousandFlatRows(),
             )
@@ -300,12 +312,11 @@ class CompactionConfigTest {
     @Test
     fun `whatever the density, the budget encodes the same row ceiling`() {
         // The invariant underneath the test above, stated directly: the
-        // byte budget is a ROW budget in the ladder's own currency, so
+        // byte budget is a ROW budget in the target's own currency, so
         // budget / bytesPerRow is the ceiling at every density.
         val cfg =
             CompactionConfig(
                 targetBytes = target,
-                tierTarget = 8,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapForTenThousandFlatRows(),
             )
@@ -330,7 +341,6 @@ class CompactionConfigTest {
         val cfg =
             CompactionConfig(
                 targetBytes = target,
-                tierTarget = 8,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapForTenThousandFlatRows(),
             )
@@ -394,7 +404,6 @@ class CompactionConfigTest {
             assertThatThrownBy {
                 CompactionConfig(
                     targetBytes = target,
-                    tierTarget = 8,
                     maxGroupsPerRun = 1,
                     sortedHeapBytes = bad,
                 )
@@ -451,13 +460,13 @@ class CompactionConfigTest {
     @Test
     fun `the sorted heap cap is labelled temporary with its replacement named`() {
         // The cap costs real throughput — sorted tables compact to tens
-        // of megabytes instead of the 512 MiB the ladder is designed
-        // around — and it ships anyway because it converts an OOM into a
+        // of megabytes instead of the 512 MiB target — and it ships
+        // anyway because it converts an OOM into a
         // counted refusal. What must not happen is it quietly becoming
         // the permanent answer because nobody wrote down that a real fix
-        // exists. The fix is an external merge sort: tier-2+ inputs are
-        // compaction's own outputs and therefore already-sorted runs, so
-        // a k-way merge holds one row per input instead of the group.
+        // exists. The fix is an external merge sort: compaction's own
+        // outputs are already-sorted runs, so a k-way merge holds one
+        // row per input instead of the whole group.
         //
         // Pinned in the two places someone hitting the ceiling lands:
         // the knob's own doc comment, and the operator-facing docs.
@@ -521,13 +530,43 @@ class CompactionConfigTest {
     }
 
     @Test
-    fun `the derated budget never falls below the tier ladder's floor`() {
-        // A tiny target divided by 64 must still build a tier ladder —
-        // CompactionTiers refuses a target below 2, and a table whose
+    fun `the derated budget never falls below the smallest legal target`() {
+        // A tiny target divided by 64 must still be a usable target —
+        // CompactionGrouping refuses one below 2, and a table whose
         // budget derated to nothing would silently stop compacting.
-        val cfg = CompactionConfig(targetBytes = 10, tierTarget = 2, maxGroupsPerRun = 1)
+        val cfg = CompactionConfig(targetBytes = 10, minInputFiles = 2, maxGroupsPerRun = 1)
         val budget = cfg.effectiveTargetBytes(nestedColumns, sorted = true)
         assertThat(budget).isGreaterThanOrEqualTo(2)
-        CompactionTiers.of(budget, cfg.tierTarget) // must not throw
+        CompactionGrouping.of(budget) // must not throw
+    }
+
+    @Test
+    fun `the group bounds are rejected at CONSTRUCTION, not at plan time`() {
+        // Construction is boot. The same `require`s also live in
+        // CompactionGrouping.groups, but that runs once per bucket per
+        // table per sweep, inside planSnapshot -- which sits OUTSIDE the
+        // per-group catch, so a bad value there kills the whole sweep for
+        // every catalog on every interval while the process still looks
+        // healthy. Catching it here turns that into a boot failure.
+        for (bad in listOf(1, 0, -1)) {
+            assertThatThrownBy {
+                CompactionConfig(targetBytes = 1024, minInputFiles = bad, maxGroupsPerRun = 1)
+            }.describedAs("minInputFiles=%d", bad)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_MIN_INPUT_FILES")
+        }
+        assertThatThrownBy {
+            CompactionConfig(
+                targetBytes = 1024,
+                minInputFiles = 5,
+                maxInputFiles = 4,
+                maxGroupsPerRun = 1,
+            )
+        }.isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_MAX_INPUT_FILES")
+        // And the defaults are the documented ones.
+        val cfg = CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1)
+        assertThat(cfg.minInputFiles).isEqualTo(CompactionGrouping.DEFAULT_MIN_INPUT_FILES)
+        assertThat(cfg.maxInputFiles).isEqualTo(CompactionGrouping.DEFAULT_MAX_INPUT_FILES)
     }
 }

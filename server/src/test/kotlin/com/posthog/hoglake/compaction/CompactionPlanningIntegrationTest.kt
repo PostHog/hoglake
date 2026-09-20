@@ -22,6 +22,7 @@ import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -32,12 +33,11 @@ import java.util.concurrent.atomic.AtomicInteger
  * Compaction PLANNING is metadata-only: no object-store contact
  * happens here (the store below points at a dead endpoint). Covers
  * candidate selection (live, below target, DV-bearing), bucketing by
- * (spec_id, partition_values, size TIER), the tier floors (aggregate
- * bytes must reach the next tier or the bucket is skipped), the
- * minimal row-id-ordered prefix (never more files than the floor
- * needs), and the max_input_files fan-in cap.
+ * (spec_id, partition_values), packing in row-id order to the target,
+ * the min_input_files floor that drops a short remainder, and the
+ * max_input_files fan-in cap.
  *
- * The ladder for these tests: T=4, target=1000 -> 1/4/16/63/250/1000.
+ * These tests run at target=1000 with a two-file minimum.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -57,7 +57,7 @@ class CompactionPlanningIntegrationTest {
             pathStyle = true,
         )
 
-    private val cfg = CompactionConfig(targetBytes = 1000, tierTarget = 4, maxGroupsPerRun = 10)
+    private val cfg = CompactionConfig(targetBytes = 1000, minInputFiles = 2, maxGroupsPerRun = 10)
     private val svc = CompactionService(db.jdbi, deadStore, cfg)
 
     @AfterAll
@@ -104,13 +104,14 @@ class CompactionPlanningIntegrationTest {
     )
 
     @Test
-    fun `small live files group by minimal prefix to the next tier, files at or over target are excluded`() {
+    fun `small live files pack to the target, files at or over it are excluded`() {
         val cat = fixture()
         append(cat, file("a", 600), file("b", 600), file("big", 1000), file("c", 600))
         val plan = svc.planTable(cat, "ns", "t", cfg)
-        // All three small files are in [250,1000); a+b reaches 1000,
-        // so c is NOT taken: the group
-        // is the minimal prefix, and c waits for the next run.
+        // a+b reaches the 1000B target, so the group closes there and c
+        // is not taken; c is then a one-file remainder, under the
+        // minimum, so it waits for more appends. `big` is at the target
+        // already and is never a candidate.
         assertThat(plan.groups).hasSize(1)
         assertThat(plan.groups.single().files.map { it.path })
             .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/b.parquet")
@@ -118,11 +119,12 @@ class CompactionPlanningIntegrationTest {
     }
 
     @Test
-    fun `a run repeats minimal prefixes in each tier until the remainder is short`() {
+    fun `a run keeps packing groups until the remainder is too short`() {
         val cat = fixture()
         append(cat, file("a", 600), file("b", 600), file("c", 600), file("d", 600), file("e", 600))
         val plan = svc.planTable(cat, "ns", "t", cfg)
-        // Two complete pairs reach 1000; e alone cannot.
+        // Two pairs reach the 1000B target; e is a remainder of one,
+        // under this config's minimum of two.
         assertThat(plan.groups).hasSize(2)
         assertThat(plan.groups[0].files.map { it.path })
             .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/b.parquet")
@@ -131,35 +133,59 @@ class CompactionPlanningIntegrationTest {
     }
 
     @Test
-    fun `a bucket that cannot reach its tier floor is skipped, exactly reaching it merges`() {
+    fun `a remainder under the file minimum is skipped, one at the minimum merges`() {
         val short = fixture()
-        append(short, file("a", 100), file("b", 100))
-        // Files in [63,250) must reach 250; 200 < 250: waits for more appends.
+        append(short, file("a", 100))
+        // What holds a remainder back is the file COUNT, not its bytes:
+        // one file is a copy, not a compaction, however far under target.
         assertThat(svc.planTable(short, "ns", "t", cfg).groups).isEmpty()
 
         val exact = fixture()
         append(exact, file("a", 100), file("b", 150))
-        // 250 = the floor exactly: the merge is on (floors are inclusive).
+        // 250 bytes against a 1000 target, and it merges anyway: two
+        // files is this config's minimum. Under the ladder this bucket
+        // sat forever, because 250 never reached the next rung — which
+        // is how a partition that stopped receiving writes stayed
+        // uncompacted permanently.
         assertThat(svc.planTable(exact, "ns", "t", cfg).groups).hasSize(1)
+
+        val belowMin = fixture()
+        append(belowMin, file("a", 100), file("b", 150))
+        assertThat(svc.planTable(belowMin, "ns", "t", cfg.copy(minInputFiles = 3)).groups).isEmpty()
     }
 
     @Test
-    fun `eight files at the lower bound promote and changing T changes the ladder`() {
+    fun `a group packs to the target, and changing the target repacks it`() {
         val cat = fixture()
         append(cat, *(0..7).map { file("f$it", 128) }.toTypedArray())
-        val eight = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024, tierTarget = 8))
-        assertThat(eight.groups.single().files).hasSize(8)
-        val four = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024, tierTarget = 4))
-        assertThat(four.groups).hasSize(4)
-        assertThat(four.groups.map { it.files.size }).containsOnly(2)
+        // Eight 128B files against a 1024B target: ONE group, one
+        // rewrite. The ladder took the same eight files up four rungs,
+        // rewriting the same bytes each time.
+        val whole = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024))
+        assertThat(whole.groups.single().files).hasSize(8)
+
+        // The target is the only thing deciding where a group closes.
+        val quarter = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 256))
+        assertThat(quarter.groups).hasSize(4)
+        assertThat(quarter.groups.map { it.files.size }).containsOnly(2)
+
+        // And the fan-in cap closes a group the bytes never would. The
+        // trailing 2 is a group in its own right: it clears this
+        // config's minimum of two files.
+        val capped = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024, maxInputFiles = 3))
+        assertThat(capped.groups.map { it.files.size }).containsExactly(3, 3, 2)
     }
 
     @Test
-    fun `groups never mix tiers`() {
+    fun `a size difference does not keep comparable files apart`() {
+        // A 600B file against a single 100B one is NOT a group: 600 is
+        // more than twice the 100 held, so it starts its own group
+        // instead of being carried. Rewriting 700B to retire one 100B
+        // file is the trickle pathology, and the 100B file is better off
+        // waiting for other small files. This is not the old tier
+        // segregation — see the five-file case below, where the same two
+        // sizes DO share a group once the small side carries its weight.
         val cat = fixture()
-        // One 100B file that can't reach 250 alone, one 600B file that
-        // can't reach 1000 alone: NO cross-tier merge
-        // rescue — both sit until their own tier can form a group.
         append(cat, file("small", 100), file("mid", 600))
         assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
 
@@ -172,17 +198,20 @@ class CompactionPlanningIntegrationTest {
             file("m1", 600),
             file("m2", 600),
         )
+        // Now the small side holds 300B, and 600 is not more than twice
+        // that, so m1 joins rather than splitting off: 100+100+100+600 =
+        // 900, and m2's 600 takes it past 1000, so the group closes
+        // holding all five — in row_id order, mixed sizes and all. The
+        // ladder made this two groups and two rewrites.
         val groups = svc.planTable(cat2, "ns", "t", cfg).groups
-        assertThat(groups).hasSize(2)
-        // Lower tier first, each group homogeneous.
-        assertThat(groups[0].files.map { it.path })
+        assertThat(groups.single().files.map { it.path })
             .containsExactly(
                 "s3://bucket/x/s1.parquet",
                 "s3://bucket/x/s2.parquet",
                 "s3://bucket/x/s3.parquet",
+                "s3://bucket/x/m1.parquet",
+                "s3://bucket/x/m2.parquet",
             )
-        assertThat(groups[1].files.map { it.path })
-            .containsExactly("s3://bucket/x/m1.parquet", "s3://bucket/x/m2.parquet")
     }
 
     @Test
@@ -306,6 +335,12 @@ class CompactionPlanningIntegrationTest {
         assertThat(planner.planTable(cat, "ns", "t").groups.single().files).hasSize(2)
     }
 
+    private fun catalogId(cat: String): Long =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = :n")
+                .bind("n", cat).mapTo(Long::class.java).one()
+        }
+
     @Test
     fun `planner and both debt endpoints agree across vintages null partitions and remainders`() {
         val cat = fixture(listOf(ColumnDef("id", ColType.LONG), ColumnDef("bucket", ColType.STRING)))
@@ -319,15 +354,50 @@ class CompactionPlanningIntegrationTest {
         append(cat, *(0..16).map { file("a$it", 128, values = listOf("a")) }.toTypedArray())
         append(cat, *(0..6).map { file("b$it", 16, values = listOf("b")) }.toTypedArray())
         append(cat, *(0..7).map { file("null$it", 16, values = listOf(null)) }.toTypedArray())
-        val policy = cfg.copy(targetBytes = 1024, tierTarget = 8)
+        val policy = cfg.copy(targetBytes = 1024)
         val planned = svc.planTable(cat, "ns", "t", policy).groups.sumOf { it.files.size.toLong() }
-        assertThat(planned).isEqualTo(32) // 8 old + 16 a + 0 b + 8 null
-        val sampler = MaintenanceSummarySampler(db.jdbi, 1024, 8, 3600)
-        while (sampler.runOnce()) { /* drain bounded checkpoints in this test */ }
-        val stats = PartitionStatsService(db.jdbi, 1024, tierTarget = 8).partitionStats(cat, null, null, 50)
+        // 9 old + 16 a + 7 b + 8 null. Every bucket's remainder counts
+        // now, so `b` — seven 16-byte files that could never reach a
+        // rung — is debt rather than a bucket the ladder ignored. Only
+        // a's 17th file is left out, as a remainder of one.
+        assertThat(planned).isEqualTo(40)
+        // Drain at SEVERAL page sizes. This is the only parity test with
+        // more than one live bucket, and the only place a bucket's
+        // partial group -- its `pending`, `pending_max_bytes` and
+        // `remaining` -- has to survive a checkpoint while OTHER buckets
+        // are mid-flight on the same page. `pending_max_bytes` exists for
+        // exactly that, and at the default batch it is never exercised,
+        // because the whole table fits in one page.
+        for (batch in listOf(1, 3, 7, 10_000)) {
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_maintenance_summary SET generation = generation + 1, " +
+                        "scan_state = NULL, sample = NULL, sampled_at = NULL, next_batch_at = now()",
+                )
+            }
+            val sampler =
+                MaintenanceSummarySampler(db.jdbi, 1024, policy.minInputFiles, policy.maxInputFiles, 3600)
+            var steps = 0
+            while (sampler.runOnce(batch)) check(++steps < 100_000)
+            val paged =
+                db.jdbi.withHandleUnchecked { h ->
+                    MaintenanceSummarySampler.read(h, listOf(catalogId(cat))).values.single()
+                }
+            assertThat(paged.sample.smallFiles)
+                .describedAs("sampler debt at page size %d", batch)
+                .isEqualTo(planned)
+        }
+        val stats =
+            PartitionStatsService(
+                db.jdbi,
+                1024,
+                policy.minInputFiles,
+                policy.maxInputFiles,
+            ).partitionStats(cat, null, null, 50)
         assertThat(stats.partitions.sumOf { it.debtScore }).isEqualTo(planned)
         assertThat(stats.partitions.sumOf { it.smallFileCount }).isEqualTo(41)
-        val maintenance = MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 1024, tierTarget = 8)
+        val maintenance =
+            MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 1024, policy.minInputFiles, policy.maxInputFiles)
 
         fun count(status: com.posthog.hoglake.model.MaintenanceStatus): Long? =
             (

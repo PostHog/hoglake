@@ -610,7 +610,10 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
         ]
     )
     counts = {(7, 1): 3, (8, 1): 3}
-    for _ in range(8):  # server default HOGLAKE_COMPACTION_TIER_TARGET=8
+    # Comfortably over the server's default
+    # HOGLAKE_COMPACTION_MIN_INPUT_FILES=5, so each partition's files
+    # are a group the planner will take.
+    for _ in range(8):
         table.append(_part_batch(counts))
     assert sum(f.record_count for f in table.files()) == 48
 

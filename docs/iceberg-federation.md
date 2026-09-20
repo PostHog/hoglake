@@ -341,8 +341,11 @@ value safe on today's 4 GiB maintenance pod; bigger pods take
 proportionally more, see server/README.md) divided by the
 live schema's node count (~192 B per node, measured) gives a row
 ceiling; the table's registered bytes-per-row — catalog metadata, never
-a footer read — converts that ceiling into the byte budget the tier
-ladder is planned under, capped at the target. A nested table divides
+a footer read — converts that ceiling into the byte budget grouping is
+planned under, capped at the target. That derate is also why the group
+minimum scales with file size: it can put the effective target at tens
+of megabytes, where a fixed five-file minimum would mean no group ever
+forms. A nested table divides
 the ceiling again by
 `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near the top of
 the measured 30-70x range), because a nested row's node count is data
@@ -354,12 +357,12 @@ above.
 
 The group bound is explicitly TEMPORARY. It exists only because the
 sorted rewrite sorts a whole group in memory, and the replacement is an
-external merge sort: at tier 2 and above every input is a previous
-compaction output and therefore an already-sorted run, so a k-way merge
-holds one row per input rather than the whole group, while tier-1 client
-files — whose sort order is advisory and never verified by the server —
-are the smallest and can each be sorted alone and spilled as a temp run
-to the scratch directory the rewrite already uses. That removes the heap
+external merge sort: an input that is itself a compaction output is an
+already-sorted run, so a k-way merge holds one row per input rather than
+the whole group, while a client-written file — whose sort order is
+advisory and never verified by the server — is bounded by the ingest
+flush size and can be sorted alone and spilled as a temp run of its
+own. That removes the heap
 bound on group size, and with it the knob, the ceiling and the skip.
 A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
 **zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
@@ -367,10 +370,10 @@ gzip, lz4_raw and uncompressed are the other legal names, and an
 unknown one is refused at boot). An input's own codec is never an
 instruction — the rewrite decodes and re-encodes, so a group of mixed
 snappy, zstd and uncompressed inputs produces one output under the
-configured codec. The choice is not per-file: the tier ladder rewrites
-a table's hot rows once per tier and every output is the next tier's
-input, so this is the codec a fully compacted table is stored and
-scanned under. The writer previously took parquet-java's UNCOMPRESSED
+configured codec. The choice is not per-file: compaction rewrites a
+table's rows into target-sized files and then leaves them alone, so this
+is the codec a compacted table is stored and scanned under from then
+on. The writer previously took parquet-java's UNCOMPRESSED
 default, which made each merge a permanent decompression — measured on
 event-shaped data, an uncompressed merge of snappy inputs is 1.4-1.8x
 the input bytes, zstd 0.6-0.84x, and zstd is 0.43-0.45x of the

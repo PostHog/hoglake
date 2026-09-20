@@ -571,6 +571,10 @@ CREATE TABLE hog_maintenance_summary_tier (
     remaining bigint NOT NULL CHECK (remaining > 0),
     pending integer NOT NULL CHECK (pending >= 0),
     selected bigint NOT NULL DEFAULT 0,
+    -- Largest file in the partial group carried across scan pages: the
+    -- scan walks a bucket smallest-first, so a group's largest file is
+    -- its last, and the group minimum scales with it.
+    pending_max_bytes bigint NOT NULL DEFAULT 0,
     file_count bigint NOT NULL DEFAULT 0,
     small_count bigint NOT NULL DEFAULT 0,
     total_bytes bigint NOT NULL DEFAULT 0,
@@ -580,6 +584,10 @@ CREATE TABLE hog_maintenance_summary_tier (
 );
 CREATE INDEX hog_data_file_maintenance_scan
     ON hog_data_file (catalog_id, table_id, row_id_start, data_file_id);
+-- The maintenance summary scan walks each bucket smallest-file-first,
+-- because that is the order compaction bin-packs in.
+CREATE INDEX hog_data_file_maintenance_size_scan
+    ON hog_data_file (catalog_id, table_id, file_size_bytes, data_file_id);
 CREATE INDEX hog_delete_file_data_lookup
     ON hog_delete_file (catalog_id, data_file_id);
 

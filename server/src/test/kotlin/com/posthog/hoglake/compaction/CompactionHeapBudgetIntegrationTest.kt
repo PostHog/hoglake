@@ -48,7 +48,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * as a parquet-java `Group`, so what it holds is ROWS. As long as every
  * writer produced the same bytes per row the byte budget tracked the row
  * count well enough to survive; #115 made compaction's own zstd output
- * the input at every tier above the first — 1.70x denser on event data
+ * an input in its own right — 1.70x denser on event data
  * (`SortedHeapMeasurement`) — and the same byte budget started admitting
  * 1.70x the rows.
  *
@@ -124,12 +124,12 @@ class CompactionHeapBudgetIntegrationTest {
         // snappy -> zstd; 4x keeps the arithmetic exact).
         //
         // Selecting on bytes, both tables plan the same group: eight
-        // files, 1 MiB, the top of the ladder. For the dense one that
+        // files, 1 MiB, the full target. For the dense one that
         // group is 32,768 rows against a sort buffer sized for 8,192 —
         // four times over, which on the dev pod is ninety seconds of IO
         // ending in `java.lang.OutOfMemoryError: Java heap space`.
         //
-        // Selecting on rows, the dense table's whole LADDER scales down
+        // Selecting on rows, the dense table's whole TARGET scales down
         // by its density, and the two tables' groups come out holding the
         // SAME NUMBER OF ROWS out of different numbers of bytes. That
         // equality is the assertion: it is true only if the budget is
@@ -137,7 +137,10 @@ class CompactionHeapBudgetIntegrationTest {
         val cfg =
             CompactionConfig(
                 targetBytes = 1024 * 1024,
-                tierTarget = 8,
+                // Two files is a group here: the derated dense target is
+                // reached by two, and what this test measures is where
+                // the target lands, not the file minimum.
+                minInputFiles = 2,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapBytesFor(8192),
             )
@@ -185,7 +188,6 @@ class CompactionHeapBudgetIntegrationTest {
         val cfg =
             CompactionConfig(
                 targetBytes = 1024 * 1024,
-                tierTarget = 8,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapBytesFor(8192),
             )
@@ -201,10 +203,10 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `a group above the row ceiling is refused in metadata and spends no IO`() {
-        // The density derate scales the ladder by the table's AVERAGE
+        // The density derate scales the target by the table's AVERAGE
         // bytes-per-row, which is an estimate; record_count is not. A
         // group whose registered survivors land above the ceiling anyway
-        // — the minimal prefix reaching a tier quota can overshoot, and a
+        // — the file that closes a group can overshoot it, and a
         // table mixing client snappy with compaction zstd has no single
         // density — is refused on the true number.
         //
@@ -216,7 +218,7 @@ class CompactionHeapBudgetIntegrationTest {
         val cfg =
             CompactionConfig(
                 targetBytes = 65536,
-                tierTarget = 2,
+                minInputFiles = 2,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapBytesFor(ceiling),
             )
@@ -496,14 +498,18 @@ class CompactionHeapBudgetIntegrationTest {
     }
 
     /**
-     * A config whose ladder takes the whole of [realTable] as one group
+     * A config whose target takes the whole of [realTable] as one group
      * and whose heap ceiling is far above it: these tests are about what
      * happens when a group blows up mid-flight, not about the ceiling.
      */
     private fun smallFileConfig() =
         CompactionConfig(
             targetBytes = 65536,
-            tierTarget = 4,
+            // These fixtures are three small files: they are exercising
+            // the heap ceiling and the failure paths, not the grouping
+            // policy, so they pin a grouping that yields one group.
+            minInputFiles = 2,
+            maxInputFiles = 3,
             maxGroupsPerRun = 1,
             sortedHeapBytes = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES,
         )

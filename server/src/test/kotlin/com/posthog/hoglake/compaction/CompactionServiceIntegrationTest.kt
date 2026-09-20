@@ -72,10 +72,10 @@ class CompactionServiceIntegrationTest {
     private val verify = VerifyService(db.jdbi)
     private val counter = AtomicInteger(0)
 
-    // KB-scale ladder for the test fixtures' parquet files (~0.7-1 KiB
+    // KB-scale target for the test fixtures' parquet files (~0.7-1 KiB
     // each): T=4 includes 512/2048/8192. The 2048 quota needs THREE files
     // (2 x ~800B < 2048 < 3 x ~800B), so groups still contain all three.
-    private val cfg = CompactionConfig(targetBytes = 8192, tierTarget = 4, maxGroupsPerRun = 10)
+    private val cfg = CompactionConfig(targetBytes = 8192, minInputFiles = 2, maxGroupsPerRun = 10)
     private val svc by lazy { CompactionService(db.jdbi, store, cfg) }
     private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
 
@@ -140,10 +140,10 @@ class CompactionServiceIntegrationTest {
      * [codec] is UNCOMPRESSED for the fixtures whose sizes are arbitrary,
      * and the rewriter's own default for the two tests that compare an
      * INPUT's bytes against an OUTPUT's. Those two are the only ones for
-     * which it matters, and for them it matters absolutely: a tier is a
-     * byte band, so an uncompressed input and a compressed output of the
-     * same rows are not in it together, and the test would be asserting
-     * the writer's codec rather than the ladder.
+     * which it matters, and for them it matters absolutely: group
+     * packing is arithmetic on bytes, so an uncompressed input measured
+     * against a compressed output of the same rows would be asserting
+     * the writer's codec rather than the packing rule.
      */
     private fun parquetBytes(
         rows: List<TestRow>,
@@ -1259,7 +1259,7 @@ class CompactionServiceIntegrationTest {
         registerDv(cat, fileIds[0], "s3://$BUCKET/$cat/dv/e0.puffin", listOf(0L, 1L))
         registerDv(cat, fileIds[1], "s3://$BUCKET/$cat/dv/e1.puffin", listOf(0L))
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()
@@ -1312,7 +1312,7 @@ class CompactionServiceIntegrationTest {
         // reaches the decoder at all.
         store.put(dvPath, corruptDvBytes())
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.invalidData).describedAs("durable, counted once").isEqualTo(1)
         assertThat(result.failedGroups).describedAs("not a retryable failure").isZero()
         assertThat(result.groupsCompacted).isZero()
@@ -1380,7 +1380,7 @@ class CompactionServiceIntegrationTest {
             ),
         )
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.failedGroups).isEqualTo(1)
         // The phantom stays live (nothing was end-snapshotted): the
@@ -1442,7 +1442,7 @@ class CompactionServiceIntegrationTest {
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.failedGroups).isEqualTo(0)
 
@@ -1474,10 +1474,10 @@ class CompactionServiceIntegrationTest {
             name: String,
             rows: List<TestRow>,
         ) {
-            // Written with the codec compaction writes, because this test
-            // compares an OUTPUT's tier against an INPUT's (see
+            // Written with the codec compaction writes, because this
+            // test measures an OUTPUT's bytes against an INPUT's (see
             // parquetBytes): uncompressed inputs and a compressed output
-            // of the same rows are never tier peers.
+            // of the same rows are not on the same scale.
             val bytes = parquetBytes(rows, ParquetRewriter.DEFAULT_CODEC)
             val path = "s3://$BUCKET/$cat/data/ns/t/$name.parquet"
             store.put(path, bytes)
@@ -1496,16 +1496,15 @@ class CompactionServiceIntegrationTest {
             )
         }
 
-        // Row sizes are DELIBERATE: a+b clear a tier floor of the
-        // target=65536 ladder, their output lands one tier up, and
-        // output+c clear THAT tier's floor so the second run has a group.
-        // Inputs and outputs are written with the same codec (above), so
-        // the bands hold whatever the codec is.
+        // Row sizes are DELIBERATE: a+b reach the target=65536 group
+        // quota, and their output plus c reach it again so the second
+        // run has a group. Inputs and outputs are written with the same
+        // codec (above), so the arithmetic holds whatever the codec is.
         //
         // The padding is genuinely high-entropy. An earlier version
         // called a `(id * 31 + it * 17) % 26` cycle "incompressible"; 17
         // and 26 are coprime, so it is a repeating 26-character string
-        // that any LZ77 codec collapses ~100x, and the tier arithmetic
+        // that any LZ77 codec collapses ~100x, and the size arithmetic
         // above was only ever true because the writer happened not to
         // compress at all.
         fun paddedRows(
@@ -1524,7 +1523,7 @@ class CompactionServiceIntegrationTest {
             }
         appendRows("a", paddedRows(100, 3, 5000)) // row ids 0..2
         appendRows("b", paddedRows(200, 2, 5000)) // row ids 3..4
-        val ladder = cfg.copy(targetBytes = 65536, tierTarget = 2)
+        val policy = cfg.copy(targetBytes = 65536)
 
         // A DV on `a` BEFORE the first compaction, so the first output's
         // ids come out NON-CONTIGUOUS. That is what makes the second
@@ -1537,7 +1536,7 @@ class CompactionServiceIntegrationTest {
         registerDv(cat, fileA.dataFileId, "s3://$BUCKET/$cat/dv/a.puffin", listOf(1L))
 
         // First compaction: unsorted table -> physical order = row-id order.
-        assertThat(svc.runOnce(cat, ladder).groupsCompacted).isEqualTo(1)
+        assertThat(svc.runOnce(cat, policy).groupsCompacted).isEqualTo(1)
         val first = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(first.explicitRowIds).isTrue()
         assertThat(first.rowIdStart).isEqualTo(0)
@@ -1548,15 +1547,17 @@ class CompactionServiceIntegrationTest {
         // A DV lands on the compacted output: physical positions 0 and
         // 3, i.e. row ids 0 and 4 die. Then more data arrives.
         registerDv(cat, first.dataFileId, "s3://$BUCKET/$cat/dv/first.puffin", listOf(0L, 3L))
-        // c is a peer of the first output, not a fresh lower-tier file.
+        // c is a peer of the first output: both are still under the
+        // target, so both are candidates for the next group. (This used
+        // to assert they shared a size tier; there are no tiers now, and
+        // "is it a candidate" is what the planner actually asks.)
         appendRows("c", paddedRows(300, 2, 10000)) // row ids 5..6
         val peers = catalogs.listFiles(cat, "ns", "t")
-        assertThat(peers.map { CompactionTiers.of(ladder.targetBytes, ladder.tierTarget).tierOf(it.fileSizeBytes) })
-            .containsOnly(CompactionTiers.of(ladder.targetBytes, ladder.tierTarget).tierOf(first.fileSizeBytes))
+        assertThat(peers.map { it.fileSizeBytes < policy.targetBytes }).containsOnly(true)
 
         // Second compaction: the explicit-id input's DV drops by POSITION,
         // survivors keep the ids their _hog_row_id column carries.
-        val second = svc.runOnce(cat, ladder)
+        val second = svc.runOnce(cat, policy)
         assertThat(second.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.recordCount).isEqualTo(4)
@@ -1586,7 +1587,7 @@ class CompactionServiceIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         // Exact lower-bound inputs need all eight; bytes come from real
         // parquet, not synthetic size metadata. Both groups must execute.
-        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 8, tierTarget = 8, maxGroupsPerRun = 20)
+        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 8, maxGroupsPerRun = 20)
         val result = svc.runOnce(cat, policy)
         assertThat(result.groupsCompacted).isEqualTo(2)
         assertThat(result.filesIn).isEqualTo(16)
@@ -1610,7 +1611,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `newly promoted files wait for the next run even when they could fill the next tier`() {
+    fun `a freshly written output waits for the next run rather than being re-consumed`() {
         val cat = "compact-no-cascade-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
@@ -1636,21 +1637,34 @@ class CompactionServiceIntegrationTest {
                     val id = nextId++
                     TestRow(id, String(CharArray(64) { ('a'.code + random.nextInt(26)).toChar() }), random.nextDouble())
                 }
-            // Same-codec inputs and outputs: this test asserts the tier
-            // a compaction OUTPUT lands in against the tier its INPUTS
-            // came from, which is a comparison between byte bands.
+            // Same codec for inputs and output: this test compares the
+            // output's size against the target the inputs were sized
+            // to, so the two must be measured on the same scale.
             val bytes = parquetBytes(rows, ParquetRewriter.DEFAULT_CODEC)
             val path = "s3://$BUCKET/$cat/$name.parquet"
             store.put(path, bytes)
             return FileRegistration(path, count.toLong(), bytes.size.toLong())
         }
-        val inputs = listOf(input("a", 1000), input("b", 1000), input("peer", 2200))
-        val policy = cfg.copy(targetBytes = 1024 * 1024, tierTarget = 2, maxGroupsPerRun = 20)
-        val tiers = CompactionTiers.of(policy.targetBytes, policy.tierTarget)
-        val low = tiers.tierOf(inputs[0].fileSizeBytes)!!
-        // Pin actual parquet sizes to the intended tiers; no fabricated metadata.
-        assertThat(tiers.tierOf(inputs[1].fileSizeBytes)).isEqualTo(low)
-        assertThat(tiers.tierOf(inputs[2].fileSizeBytes)).isEqualTo(low + 1)
+        // `peer` is twice the size of `a` and `b` DELIBERATELY. With all
+        // three near-identical, the run-2 group is decided by a coin-flip
+        // between near-tied parquet byte sizes, and the dominance split
+        // (a file more than twice the bytes held starts its own group)
+        // sits right on that boundary. At 2x, run 1's output and `peer`
+        // are comparable, so neither can dominate the other and the
+        // grouping is deterministic.
+        val inputs = listOf(input("a", 1000), input("b", 1000), input("peer", 2000))
+        // Close groups on the fan-in cap, not on bytes: a target every
+        // file stays under keeps all of them candidates, so the only
+        // thing that can hold `peer` back is the rule under test. Sizing
+        // the target to `a + b` instead would leave the OUTPUT'S size
+        // deciding whether run two has anything to do, which is a
+        // compression measurement, not this property.
+        val policy =
+            cfg.copy(
+                targetBytes = inputs.sumOf { it.fileSizeBytes } * 4,
+                maxInputFiles = 2,
+                maxGroupsPerRun = 20,
+            )
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", inputs))))
         val before = catalogs.getCatalog(cat).headSnapshotId
         val first = svc.runOnce(cat, policy)
@@ -1660,9 +1674,9 @@ class CompactionServiceIntegrationTest {
         val live = catalogs.listFiles(cat, "ns", "t")
         assertThat(live).hasSize(2)
         val promoted = live.single { it.explicitRowIds }
-        assertThat(tiers.tierOf(promoted.fileSizeBytes)).isEqualTo(low + 1)
-        // There IS enough to promote again, proving this wasn't just a
-        // sub-quota no-op. It must nevertheless wait for run number two.
+        // There IS enough to group again, proving this wasn't just an
+        // under-target no-op. It must nevertheless wait for run two: an
+        // output cannot be an input to the run that produced it.
         val next = svc.planTable(cat, "ns", "t", policy)
         assertThat(next.groups).hasSize(1)
         assertThat(next.groups.single().files.map { it.dataFileId }).contains(promoted.dataFileId)
@@ -1670,15 +1684,15 @@ class CompactionServiceIntegrationTest {
         assertThat(second.groupsCompacted).isEqualTo(1)
         assertThat(second.filesIn).isEqualTo(2)
         val output = catalogs.listFiles(cat, "ns", "t").single()
-        assertThat(output.recordCount).isEqualTo(4200)
-        assertThat(readRowIds(store.get(output.path))).containsExactlyElementsOf((0L until 4200).toList())
+        assertThat(output.recordCount).isEqualTo(4000)
+        assertThat(readRowIds(store.get(output.path))).containsExactlyElementsOf((0L until 4000).toList())
         assertThat(catalogs.listFiles(cat, "ns", "t", before).map { it.path })
             .containsExactlyInAnyOrderElementsOf(inputs.map { it.path })
         assertVerifyPasses(cat)
     }
 
     @Test
-    fun `multiple groups in one tier execute up to budget including failed attempts`() {
+    fun `multiple groups in one bucket execute up to budget including failed attempts`() {
         val cat = "compact-budget-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
@@ -1692,7 +1706,7 @@ class CompactionServiceIntegrationTest {
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         // Choose a quota between one and two actual file sizes, T=2.
-        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 2, tierTarget = 2, maxGroupsPerRun = 2)
+        val policy = cfg.copy(targetBytes = bytes.size.toLong() * 2, maxGroupsPerRun = 2)
         assertThat(svc.planTable(cat, "ns", "t", policy).groups).hasSize(3)
         val result = svc.runOnce(cat, policy)
         assertThat(result.failedGroups).isEqualTo(1)
@@ -1790,7 +1804,7 @@ class CompactionServiceIntegrationTest {
             ),
         )
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isEqualTo(1)
         assertThat(result.unconvertibleSchema).isZero()
 
@@ -1851,7 +1865,7 @@ class CompactionServiceIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         val headBefore = catalogs.getCatalog(cat).headSnapshotId
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isZero()
         assertThat(result.unconvertibleSchema).isEqualTo(1)
         assertThat(result.skippedConflicts).isZero()
@@ -1938,7 +1952,7 @@ class CompactionServiceIntegrationTest {
                 FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048, tierTarget = 2))
+        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
         assertThat(result.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()

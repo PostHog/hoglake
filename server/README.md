@@ -341,8 +341,8 @@ A table may carry a versioned **sort order** (`hog_sort_spec` /
 writers (the server never verifies file sortedness), binding for
 compaction. **Compaction** (`compaction/CompactionService.kt`,
 `POST /maintenance/compact` + an off-by-default loop) merges small live
-files: candidates share (spec_id, partition_values, size tier) and group
-by byte quota — row-id adjacency is NOT required, which is why
+files: candidates share (spec_id, partition_values) and pack to a byte
+target — row-id adjacency is NOT required, which is why
 outputs materialize their row ids as an explicit `_hog_row_id` int64
 column (reserved field id 2147483646, flagged by
 `data_file.explicit_row_ids`) instead of relying on position. That
@@ -357,25 +357,71 @@ typed decoded bounds — treating an undecodable bound as absent, never
 wedging on it — and the changefeed excludes compacted outputs so
 consumers never see merged rows re-appear as fresh appends.
 
-`HOGLAKE_COMPACTION_TIER_TARGET` (default **8**, minimum 2) controls
-both geometric tier spacing and maximum fan-in. Starting at
-`HOGLAKE_COMPACTION_TARGET_BYTES` (512 MiB), divide downward by T with
-integer ceiling rounding: …128 KiB → 1 MiB → 8 MiB → 64 MiB → 512 MiB.
-For each partition/spec/tier, consume files in `(row_id_start, file_id)`
-order, stopping each group as soon as its input bytes reach the next
-boundary. Repeat on the remaining files until less than a quota remains.
-The existing `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps
-executed attempts per catalog, including failures and skips. There is
-no separate minimum-file-count knob.
+Grouping is ONE PASS of ordinary **bin packing**, the shape Iceberg's
+`rewrite_data_files` uses. For each partition/spec bucket, sort the
+candidates by size and close a group as soon as its input bytes reach
+`HOGLAKE_COMPACTION_TARGET_BYTES` (512 MiB) **or** it holds
+`HOGLAKE_COMPACTION_MAX_INPUT_FILES` (default **64**); carry on with the
+rest, and emit the trailing remainder as a group as well.
+
+**By size, not by row id**, and that is load-bearing. A compaction
+output takes `row_id_start = min surviving id` of its inputs, so it
+sorts in front of the newer, smaller files. Packed in row-id order, a
+large output ate most of the group's quota, the group closed a file or
+two later, and the whole group was then discarded for holding too few
+files — permanently, because row-id order never changes. Simulated over
+300 ticks of steady ingest and a full drain, 100 MiB ingest files left
+373 small files stranded forever; size-ordered, the same workload drains
+to none. Row-id adjacency is not required (outputs carry explicit row
+ids), so nothing else depends on the old order.
+
+A group is then dropped unless it holds
+`min(HOGLAKE_COMPACTION_MIN_INPUT_FILES, target / its largest file)`
+files, floored at 2. **The minimum scales with the files it judges**,
+because a fixed file count cannot judge a byte target: no group can hold
+five files that are each over a fifth of the target, so a fixed 5
+silently means "never compact this bucket" for any bucket with files
+that big — including every SORTED table, whose effective target is
+derated to fit its sort buffer in heap. Silently, because no group forms,
+so nothing is refused and nothing is logged.
+
+The minimum is a **write-amplification** knob, not a termination
+condition: compaction terminates at any value >= 2, since a group turns
+N >= 2 files into exactly one and the bucket's file count strictly
+decreases. What a low value costs is repeated rewriting — compression
+puts every output back under the target, so at 2 it converges on the
+target from below one rewrite at a time, roughly 4x the bytes moved.
+That is the ladder by another name.
+
+Measured at the default of 5, two ways, because they disagree:
+*draining* a static backlog costs about **2x** the input bytes against
+the ladder's **4x** — ingest-sized files reach the target band in one
+rewrite, and the outputs consolidate pairwise from there. But *steady
+state*, a trickle arriving on an already-compacted partition, is about
+**2.4x** against the ladder's **2.5x** — barely a win, and a 5.6x LOSS
+without the dominance split described above. So the claim is one rewrite
+to reach the target band, not one rewrite per file for all time.
+
+This replaced a geometric ladder of size tiers, which packed each file
+against its own tier's floor and promoted it a rung at a time. The
+consequence was that the same bytes were rewritten once per rung — four
+passes to reach 512 MiB from ~53 MiB ingest — and every rung above the
+first saved nothing, because the compression had already happened on
+the first pass. In production that read as `2 -> 1 files, 121 MiB ->
+121 MiB`, fifteen seconds of decompress-and-recompress, repeating on a
+catalog with no ingest at all.
+
+`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps executed
+attempts per catalog, including failures and skips.
 
 `HOGLAKE_COMPACTION_CODEC` (default **zstd**, with
 `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**) is the compression the
 rewrite writes its OUTPUT with; the legal set is zstd, snappy, gzip,
 lz4_raw and uncompressed, case-insensitive, and an unknown name is
-refused at boot. It is not a per-file detail. The tier ladder rewrites a
-table's hot rows once per tier and every output is the next tier's
-input, so this is the codec a fully compacted table is stored and
-scanned under — permanently. The writer used to take
+refused at boot. It is not a per-file detail. Compaction rewrites a
+table's rows into target-sized files and then leaves them alone, so
+this is the codec a compacted table is stored and scanned under —
+permanently. The writer used to take
 `ExampleParquetWriter`'s UNCOMPRESSED default, which made every merge a
 one-way decompression of clients that all write snappy (pyarrow's and
 DuckDB's default, so pyhoglake and the duckdb-client) or zstd
@@ -412,8 +458,8 @@ So the planner works in ROWS and converts. The heap budget divides by
 the live schema's node count (~192 B per materialized node, measured) to
 give a row ceiling; the table's own registered bytes-per-row — from
 `hog_data_file.file_size_bytes` and `record_count`, metadata only, no
-footer reads — converts that ceiling back into the byte budget the tier
-ladder is planned under, capped at the target. Denser inputs therefore
+footer reads — converts that ceiling back into the byte budget grouping
+runs under, capped at the target. Denser inputs therefore
 buy fewer bytes per group, automatically and per table, with no guessed
 compression ratio anywhere. One consequence is worth stating plainly: a
 file that alone holds more rows than the ceiling stops being a compaction
@@ -439,17 +485,24 @@ group in memory.
 The replacement is an **external merge sort**, and compaction is
 unusually well placed for one:
 
-- **Tier 2 and above need no sort at all.** Every input to those groups
-  is a previous compaction OUTPUT, and this rewriter sorts what it
-  writes — the sort spec is *binding for compaction rewrites*
-  (`schema.sql`). So each input is an already-sorted RUN, and merging k
-  runs needs one row per run in a priority queue: **O(files)** live
-  rows, not O(group). The tier ladder puts almost all the bytes here.
-- **Tier 1 cannot assume it.** A client's sort order is **advisory** —
-  `schema.sql` says so, and the server never verifies file sortedness.
-  But tier-1 files are the smallest by construction, so sorting one is
-  bounded by that one file: sort each tier-1 input alone, spill it as a
-  temp run, and stream-merge the runs like any other. Note the spill
+- **A compaction OUTPUT needs no sort at all.** This rewriter sorts
+  what it writes — the sort spec is *binding for compaction rewrites*
+  (`schema.sql`) — so such an input is an already-sorted RUN, and
+  merging k runs needs one row per run in a priority queue:
+  **O(files)** live rows, not O(group).
+- **A CLIENT-WRITTEN file cannot assume it.** A client's sort order is
+  **advisory** — `schema.sql` says so, and the server never verifies
+  file sortedness. But such a file is bounded by the ingest flush size,
+  so sorting one is bounded by that one file: sort each alone, spill it
+  as a temp run, and stream-merge the runs like any other.
+
+  Note which case carries the bytes now. Under the ladder most input
+  was a previous output being carried up a rung, so most groups were
+  free merges; one-pass compaction consumes each file once, so nearly
+  every input is client-written and the spill path is the ordinary one.
+  The external sort is more work to build than it was, and worth more:
+  it is the only thing that lets a SORTED table reach the target in one
+  rewrite. Note also that the spill
   needs a scratch directory of its own — compaction streams both ends
   now (`S3InputFile` / `S3OutputFile`) and touches no local disk, so the
   per-group temp dir this plan was written to borrow no longer exists.
@@ -563,20 +616,20 @@ wrote the file. The axis separating the last two is DURABILITY AND
 FAULT, not values-versus-schema: an `invalid_data` group is re-planned
 and re-refused every sweep, because nothing about it will change.
 
-Each table's candidate list is fixed before rewriting starts. Promoted
-outputs cannot feed another group in the **same run**. Input bytes are
-only a promotion estimate: encoding, schema changes and DV removal can
-change the output size; the next run classifies its measured size anew.
-Files at or above the final target are excluded; zero-byte inputs cannot
-satisfy a byte quota. Unsorted rewrites stream; sorted rewrites still
-materialize survivors in memory.
+Each table's candidate list is fixed before rewriting starts, so an
+output cannot feed another group in the **same run**. Input bytes only
+estimate the output size: encoding, schema changes and DV removal all
+move it. Files at or above the target are excluded. Zero-byte inputs are
+candidates like any other — they can never close a group on bytes, so
+they ride along until the fan-in cap closes one. Unsorted rewrites
+stream; sorted rewrites still materialize survivors in memory.
 
-Both debt endpoints read persisted asynchronous summaries of files selected
-into complete groups (before the execution budget). A short leftover suffix
-contributes zero debt; raw small-file counts remain visible on the partition
-page. Neither endpoint scans the manifest. `sampled_at` exposes freshness;
+Both debt endpoints read persisted asynchronous summaries of the files
+the planner would group (before the execution budget), trailing
+remainders included. A group under its scaled minimum contributes zero
+debt; raw small-file counts remain visible on the partition page. Neither endpoint scans the manifest. `sampled_at` exposes freshness;
 before the first sample, counts are unknown. `MaintenanceSummarySampler`
-checkpoints indexed keyset pages and tier accumulators in Postgres, so a
+checkpoints indexed keyset pages and per-bucket accumulators in Postgres, so a
 restart resumes progress. It scans files at a captured catalog snapshot;
 if expiry overtakes that snapshot it restarts without publishing partial
 counts. Hydration and removal counts are observations over the sampling

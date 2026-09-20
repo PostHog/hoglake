@@ -275,8 +275,9 @@ there would break that gate on every build.
   (MaintenanceStatusService; batched reads independent of catalog count).
   Dashboard and partition-debt requests read persisted asynchronous
   summaries, NEVER the manifest. `MaintenanceSummarySampler` checkpoints
-  keyset pages in `(catalog, table, row_id_start, file_id)` order, carrying
-  tier quotas across pages. Default row budget 10,000/tick, interval 1s,
+  keyset pages in `(catalog, table, file_size_bytes, file_id)` order —
+  the order compaction bin-packs in (V10 indexes it) — carrying each
+  bucket's partial group across pages in `pending_max_bytes`. Default row budget 10,000/tick, interval 1s,
   refresh delay 60s after a completed scan (`HOGLAKE_MAINTENANCE_SUMMARY_*`).
   Incomplete generations are never published; old samples remain visible
   with freshness timestamps. Expiry overtaking a scan restarts it. The
@@ -369,27 +370,35 @@ there would break that gate on every build.
 ## Known deferrals / open items
 
 - **Compaction (M4) — 100% implemented**: `server/compaction/` —
-  planning is metadata-only (live, same spec + partition values + size
-  tier; adjacency NOT required). `HOGLAKE_COMPACTION_TIER_TARGET` (T=8,
-  minimum 2) sets both geometric tier spacing and max fan-in. Divide
-  the final target downward by T (ceiling-rounded integer bytes), consume
-  minimal row-id-ordered prefixes reaching each tier's quota, and repeat
-  until the remainder is short. Output compression is
+  planning is metadata-only (live, same spec + partition values;
+  adjacency NOT required) and ONE-PASS BIN PACKING. Sort a bucket's
+  candidates by SIZE, pack until their bytes reach
+  `HOGLAKE_COMPACTION_TARGET_BYTES` or the group holds
+  `HOGLAKE_COMPACTION_MAX_INPUT_FILES` (64), close, carry on; the
+  trailing remainder is a group too. A group is dropped unless it holds
+  `min(HOGLAKE_COMPACTION_MIN_INPUT_FILES, target / its largest file)`
+  files, floored at 2 — the minimum SCALES, because a fixed file count
+  cannot judge a byte target and a fixed 5 silently means "never
+  compact" for any bucket whose files exceed a fifth of the target
+  (every sorted table, whose target is derated for heap). Size order is
+  load-bearing: outputs inherit `min` row id, so in row-id order a big
+  output blocked the small files behind it forever. Output compression is
   `HOGLAKE_COMPACTION_CODEC` (default **zstd** at
   `HOGLAKE_COMPACTION_ZSTD_LEVEL` 3; snappy/gzip/lz4_raw/uncompressed
   also legal, an unknown name refused at boot). Not a per-file detail:
-  the ladder rewrites hot rows once per tier and every output is the
-  next tier's input, so it is the codec a fully compacted table is
-  stored and scanned under. It was UNCOMPRESSED — inherited from
+  compaction rewrites a table's rows into target-sized files and then
+  leaves them alone, so it is the codec a compacted table is stored and
+  scanned under from then on. It was UNCOMPRESSED — inherited from
   `ExampleParquetWriter`'s default, never chosen — which made every
   merge a permanent decompression of clients that write snappy (pyarrow
   and DuckDB defaults) or zstd (hedgerow), measured at 1.4-1.8x the
   input bytes. An input's codec is never an instruction; the rewrite
   decodes and re-encodes.
   A table's plan is fixed before execution:
-  outputs are never re-compacted within that run. Input bytes estimate
-  promotion; actual output size determines the next-run tier. The existing
-  max-groups-per-run budget still caps executed attempts. Rewrite via **parquet-java**
+  outputs are never re-compacted within that run, and the file minimum
+  keeps them from being re-compacted in later runs either. Input bytes
+  estimate the output size; encoding and DV removal change it. The
+  existing max-groups-per-run budget still caps executed attempts. Rewrite via **parquet-java**
   (the project's one parquet library — decision 2026-09-05: Hardwood is
   out of main code entirely (the trino test fixtures still use
   hardwood-core to produce id-less parquet — deliberately); parquet-java handles footer reads in the hydrator AND

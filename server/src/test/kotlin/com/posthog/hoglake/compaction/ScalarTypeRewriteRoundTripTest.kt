@@ -297,9 +297,10 @@ class ScalarTypeRewriteRoundTripTest {
         val first = tmp.resolve("$name-out1.parquet")
         rewrite(inPath, type, first)
         assertBounds(bounds(first, type), pre, "$name after one compaction")
-        // Feeding the output back in is the real production sequence: a
-        // tier-1 output becomes a tier-2 input, and the bounds must not
-        // drift a little further on each pass.
+        // Feeding the output back in is not the production sequence —
+        // the file minimum stops an output being re-merged — but it is
+        // the cheap way to prove the bounds do not drift a little
+        // further on each pass.
         val second = tmp.resolve("$name-out2.parquet")
         // `first` is a compaction output: its ids live in the carrier.
         rewrite(first, type, second, explicitRowIds = true)

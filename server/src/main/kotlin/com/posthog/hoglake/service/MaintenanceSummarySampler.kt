@@ -3,7 +3,7 @@ package com.posthog.hoglake.service
 import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
-import com.posthog.hoglake.compaction.CompactionTiers
+import com.posthog.hoglake.compaction.CompactionGrouping
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -14,11 +14,13 @@ import java.time.OffsetDateTime
 /**
  * Durable, bounded dashboard sampling. Each iteration claims ONE catalog
  * checkpoint (SKIP LOCKED), scans at most batchSize indexed metadata rows,
- * and saves the cursor + tier accumulators atomically. No long-lived DB
+ * and saves the cursor + bucket accumulators atomically. No long-lived DB
  * snapshot, no manifest walk on a dashboard request, no work on commits.
  *
- * Files are evaluated at the captured catalog snapshot, traversed in the
- * same table/row-id/file-id order as compaction. If expiry overtakes the
+ * Files are evaluated at the captured catalog snapshot, traversed in
+ * `(table_id, file_size_bytes, data_file_id)` order — the order
+ * compaction BIN-PACKS in, which is why V10 adds an index for it. The
+ * rule mirrored here is only decidable in size order. If expiry overtakes the
  * captured snapshot, restart without publishing a partial sample. Hydration
  * state and the removal queue are mutable: those counts are observations
  * over the sampling window, not a transactional point-in-time guarantee.
@@ -26,10 +28,11 @@ import java.time.OffsetDateTime
 class MaintenanceSummarySampler(
     private val jdbi: Jdbi,
     targetBytes: Long,
-    tierTarget: Int,
+    private val minInputFiles: Int,
+    private val maxInputFiles: Int,
     private val refreshSeconds: Long = 60,
 ) {
-    private val tiers = CompactionTiers.of(targetBytes, tierTarget)
+    private val grouping = CompactionGrouping.of(targetBytes)
     private val target = targetBytes
 
     init {
@@ -45,7 +48,8 @@ class MaintenanceSummarySampler(
         val snapshotId: Long,
         val startedAt: Instant,
         val targetBytes: Long,
-        val tierTarget: Int,
+        val minInputFiles: Int,
+        val maxInputFiles: Int,
     )
 
     data class Published(val sampledAt: Instant, val sample: Sample)
@@ -54,13 +58,14 @@ class MaintenanceSummarySampler(
         val snapshot: Long,
         val startedAt: Instant,
         val upperTable: Long,
-        val upperRow: Long,
+        val upperSize: Long,
         val upperFile: Long,
         val upperRemoval: Long,
         val targetBytes: Long,
-        val tierTarget: Int,
+        val minInputFiles: Int,
+        val maxInputFiles: Int,
         var table: Long = 0,
-        var row: Long = 0,
+        var size: Long = -1,
         var file: Long = 0,
         var removal: Long = 0,
         var phase: String = "files",
@@ -75,7 +80,6 @@ class MaintenanceSummarySampler(
 
     private data class FileRow(
         val table: Long,
-        val row: Long,
         val file: Long,
         val size: Long,
         val stats: String,
@@ -93,6 +97,8 @@ class MaintenanceSummarySampler(
         var remaining: Long,
         var pending: Int,
         var selected: Long = 0,
+        /** Largest file in the partial group — its last, the scan being size-ascending. */
+        var pendingMax: Long = 0,
         var files: Long = 0,
         var small: Long = 0,
         var bytes: Long = 0,
@@ -134,7 +140,14 @@ class MaintenanceSummarySampler(
                 ).map { rs, _ ->
                     Job(
                         rs.getLong("catalog_id"), rs.getLong("generation"), rs.getLong("published_generation"),
-                        rs.getString("scan")?.let { json.readValue(it, Scan::class.java) },
+                        // A scan_state this build cannot parse is a scan
+                        // from a build whose cursor had a different shape
+                        // (the keyset moved from row-id to size order).
+                        // The state is a disposable sample, so drop it and
+                        // start a fresh scan rather than killing the sweep.
+                        rs.getString("scan")?.let {
+                            runCatching { json.readValue(it, Scan::class.java) }.getOrNull()
+                        },
                     )
                 }.findOne().orElse(null) ?: return@inTransactionUnchecked false
 
@@ -144,7 +157,9 @@ class MaintenanceSummarySampler(
                 val earliest =
                     h.createQuery("SELECT earliest_snapshot_id FROM hog_catalog WHERE catalog_id = :id")
                         .bind("id", job.catalogId).mapTo(Long::class.javaObjectType).one()
-                if (earliest > scan.snapshot || scan.targetBytes != target || scan.tierTarget != tiers.tierTarget) {
+                if (earliest > scan.snapshot || scan.targetBytes != target || scan.minInputFiles != minInputFiles ||
+                    scan.maxInputFiles != maxInputFiles
+                ) {
                     checkpoint(h, job.catalogId, generation, null)
                     return@inTransactionUnchecked true
                 }
@@ -191,7 +206,7 @@ class MaintenanceSummarySampler(
                 val rows =
                     h.createQuery(
                         """
-                    SELECT f.table_id, f.row_id_start, f.data_file_id, f.file_size_bytes, f.stats_state, f.spec_id,
+                    SELECT f.table_id, f.data_file_id, f.file_size_bytes, f.stats_state, f.spec_id,
                            EXISTS (SELECT 1 FROM hog_delete_file dv WHERE dv.catalog_id = f.catalog_id
                              AND dv.data_file_id = f.data_file_id AND dv.begin_snapshot <= :snapshot
                              AND (dv.end_snapshot IS NULL OR :snapshot < dv.end_snapshot)) AS has_dv,
@@ -200,20 +215,23 @@ class MaintenanceSummarySampler(
                             WHERE p.catalog_id = f.catalog_id AND p.data_file_id = f.data_file_id) AS vals
                     FROM hog_data_file f
                     WHERE f.catalog_id = :id
-                      AND (f.table_id, f.row_id_start, f.data_file_id) > (:table, :row, :file)
-                      AND (f.table_id, f.row_id_start, f.data_file_id) <= (:upperTable, :upperRow, :upperFile)
-                    ORDER BY f.table_id, f.row_id_start, f.data_file_id LIMIT :batch
+                      AND (f.table_id, f.file_size_bytes, f.data_file_id) > (:table, :size, :file)
+                      AND (f.table_id, f.file_size_bytes, f.data_file_id) <= (:upperTable, :upperSize, :upperFile)
+                    ORDER BY f.table_id, f.file_size_bytes, f.data_file_id LIMIT :batch
                     """,
                     ).bind("id", job.catalogId).bind("snapshot", scan.snapshot)
-                        .bind("table", scan.table).bind("row", scan.row).bind("file", scan.file)
+                        .bind("table", scan.table).bind("size", scan.size).bind("file", scan.file)
                         .bind(
                             "upperTable",
                             scan.upperTable,
-                        ).bind("upperRow", scan.upperRow).bind("upperFile", scan.upperFile)
+                        ).bind("upperSize", scan.upperSize).bind("upperFile", scan.upperFile)
                         .bind("batch", batchSize).map { rs, _ ->
                             FileRow(
-                                rs.getLong("table_id"), rs.getLong("row_id_start"), rs.getLong("data_file_id"),
-                                rs.getLong("file_size_bytes"), rs.getString("stats_state"), rs.getBoolean("visible"),
+                                rs.getLong("table_id"),
+                                rs.getLong("data_file_id"),
+                                rs.getLong("file_size_bytes"),
+                                rs.getString("stats_state"),
+                                rs.getBoolean("visible"),
                                 rs.getObject("spec_id")?.let { (it as Number).toLong() },
                                 (
                                     rs.getArray(
@@ -226,12 +244,13 @@ class MaintenanceSummarySampler(
                 accumulate(h, job.catalogId, generation, scan, rows)
                 rows.lastOrNull()?.let {
                     scan.table = it.table
-                    scan.row = it.row
+                    scan.size = it.size
                     scan.file = it.file
                 }
                 val reachedEnd =
-                    scan.table == scan.upperTable && scan.row == scan.upperRow && scan.file == scan.upperFile
+                    scan.table == scan.upperTable && scan.size == scan.upperSize && scan.file == scan.upperFile
                 if (rows.size < batchSize || reachedEnd) {
+                    flushTails(h, job.catalogId, generation, scan)
                     scan.phase = "removals"
                 }
                 checkpoint(h, job.catalogId, generation, scan)
@@ -258,7 +277,7 @@ class MaintenanceSummarySampler(
                     val sample =
                         Sample(
                             scan.pending, scan.failed, scan.debt, scan.queued, scan.oldest,
-                            scan.snapshot, scan.startedAt, target, tiers.tierTarget,
+                            scan.snapshot, scan.startedAt, target, minInputFiles, maxInputFiles,
                         )
                     h.createUpdate(
                         """
@@ -287,11 +306,11 @@ class MaintenanceSummarySampler(
         val upper =
             h.createQuery(
                 """
-            SELECT table_id, row_id_start, data_file_id FROM hog_data_file WHERE catalog_id = :id
-            ORDER BY table_id DESC, row_id_start DESC, data_file_id DESC LIMIT 1
+            SELECT table_id, file_size_bytes, data_file_id FROM hog_data_file WHERE catalog_id = :id
+            ORDER BY table_id DESC, file_size_bytes DESC, data_file_id DESC LIMIT 1
             """,
             ).bind("id", catalogId).map { rs, _ -> Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) }
-                .findOne().orElse(Triple(0L, 0L, 0L))
+                .findOne().orElse(Triple(0L, -1L, 0L))
         val removal =
             h.createQuery(
                 """
@@ -299,7 +318,48 @@ class MaintenanceSummarySampler(
                 WHERE catalog_id = :id AND drained_at IS NULL ORDER BY removal_id DESC LIMIT 1
                 """,
             ).bind("id", catalogId).mapTo(Long::class.javaObjectType).findOne().orElse(0L)
-        return Scan(snapshot, Instant.now(), upper.first, upper.second, upper.third, removal, target, tiers.tierTarget)
+        return Scan(
+            snapshot, Instant.now(), upper.first, upper.second, upper.third, removal,
+            target, minInputFiles, maxInputFiles,
+        )
+    }
+
+    /**
+     * Saturating, not checked, addition for the DISPLAY byte counters.
+     *
+     * `file_size_bytes` is writer-supplied and validated only as
+     * non-negative, so a registration near Long.MAX_VALUE is reachable.
+     * `Math.addExact` threw on it, and a throw here is not confined to
+     * the offending catalog: `runOnce` rolls back, so `next_batch_at` is
+     * never advanced, so `ORDER BY next_batch_at, catalog_id LIMIT 1`
+     * re-picks the same catalog on the next tick — and `tick` abandons
+     * the whole round on the first failure. One bad row stopped the
+     * sampler for EVERY catalog on the instance, which a burn-in
+     * confirmed: an innocent catalog stopped publishing entirely.
+     *
+     * These two fields are a dashboard total. Saturating is honest
+     * enough at that magnitude and cannot take the sampler down.
+     */
+    private fun satAdd(
+        a: Long,
+        b: Long,
+    ): Long {
+        val sum = a + b
+        // Overflow iff the operands share a sign that the result does not.
+        return if (((a xor sum) and (b xor sum)) < 0) Long.MAX_VALUE else sum
+    }
+
+    /**
+     * Files a group holding a largest-file of [largest] must have to be
+     * worth rewriting — `min(minInputFiles, target / largest)`, floored
+     * at 2. The mirror of the same expression in
+     * `CompactionGrouping.groups`; the two must not drift, or the debt
+     * this reports is debt from a policy the planner does not run.
+     */
+
+    private fun needFor(largest: Long): Int {
+        val fit = if (largest <= 0) minInputFiles.toLong() else target / largest
+        return maxOf(2L, minOf(minInputFiles.toLong(), fit)).toInt()
     }
 
     private fun accumulate(
@@ -313,7 +373,10 @@ class MaintenanceSummarySampler(
             rows.filter { it.visible }.map { f ->
                 if (f.stats == "pending") scan.pending++
                 if (f.stats == "failed") scan.failed++
-                val quota = tiers.tierOf(f.size)?.let { tiers.reachFloor(it) } ?: 0L
+                // One quota now, not one per size band: every group
+                // packs to the compaction target. The pool key keeps the
+                // field so the checkpoint schema is unchanged.
+                val quota = grouping.targetBytes
                 val bytes = json.writeValueAsBytes(listOf(f.table, f.spec, f.values, quota))
                 val key = java.util.HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(bytes))
                 Triple(key, quota, f)
@@ -333,6 +396,7 @@ class MaintenanceSummarySampler(
                             rs.getLong("table_id"), rs.getObject("spec_id")?.let { (it as Number).toLong() },
                             (rs.getArray("partition_values")?.array as? Array<*>)?.map { it as String? },
                             rs.getLong("quota"), rs.getLong("remaining"), rs.getInt("pending"), rs.getLong("selected"),
+                            rs.getLong("pending_max_bytes"),
                             rs.getLong("file_count"), rs.getLong("small_count"), rs.getLong("total_bytes"),
                             rs.getLong("small_bytes"), rs.getLong("dv_count"),
                         )
@@ -341,21 +405,56 @@ class MaintenanceSummarySampler(
         for ((key, quota, f) in keyed) {
             val pool = pools.getOrPut(key) { Pool(f.table, f.spec, f.values, quota, maxOf(1, quota), 0) }
             pool.files++
-            pool.bytes = Math.addExact(pool.bytes, f.size)
+            pool.bytes = satAdd(pool.bytes, f.size)
             if (f.hasDv) pool.dvs++
             if (f.size < target) {
                 pool.small++
-                pool.smallBytes = Math.addExact(pool.smallBytes, f.size)
+                pool.smallBytes = satAdd(pool.smallBytes, f.size)
             }
-            if (quota == 0L || f.size == 0L) continue
-            if (f.size >= pool.remaining) {
-                scan.debt += pool.pending + 1
-                pool.selected += pool.pending + 1
+            // A file already at the target is not a candidate — the
+            // planner's own query says `file_size_bytes < :targetBytes`
+            // — so it must not join a group here either. It still counts
+            // in file_count and total_bytes above: the dashboard reports
+            // it, compaction leaves it alone.
+            if (f.size >= target) continue
+            // Mirror CompactionGrouping.groups exactly, or the debt this
+            // reports is debt from a policy the planner no longer runs.
+            // Close on EITHER bound, and only count a group the planner
+            // would actually take.
+            // Mirror CompactionGrouping's split: close before a file
+            // that outweighs everything the pool holds, so a near-target
+            // file never gets counted as debt merely for absorbing a
+            // trickle -- and so the smalls behind it are not stranded.
+            if (pool.pending > 0 &&
+                (quota - pool.remaining) * CompactionGrouping.DOMINANCE_FACTOR < f.size
+            ) {
+                if (pool.pending >= needFor(pool.pendingMax)) {
+                    scan.debt += pool.pending
+                    pool.selected += pool.pending
+                }
                 pool.pending = 0
+                pool.pendingMax = 0
+                pool.remaining = quota
+            }
+            val held = pool.pending + 1
+            if (f.size >= pool.remaining || held >= maxInputFiles) {
+                // The closing file is the group's LARGEST, the scan being
+                // size-ascending — so the same per-group rule the planner
+                // applies is decidable right here, with no lookahead. The
+                // group's bytes come back the same way the planner
+                // recovers them: everything held before this file is
+                // `quota - remaining`.
+                if (held >= needFor(f.size)) {
+                    scan.debt += held
+                    pool.selected += held
+                }
+                pool.pending = 0
+                pool.pendingMax = 0
                 pool.remaining = quota
             } else {
                 pool.remaining -= f.size
                 pool.pending++
+                pool.pendingMax = maxOf(pool.pendingMax, f.size)
             }
         }
         val batch =
@@ -363,14 +462,15 @@ class MaintenanceSummarySampler(
                 """
             INSERT INTO hog_maintenance_summary_tier
                 (catalog_id, generation, bucket_key, table_id, spec_id, partition_values, quota, remaining, pending,
-                 selected, file_count, small_count, total_bytes, small_bytes, dv_count)
+                 selected, pending_max_bytes, file_count, small_count, total_bytes, small_bytes, dv_count)
             VALUES (:id, :generation, :key, :table, :spec,
                     CASE WHEN :vals::jsonb = 'null'::jsonb THEN NULL
                          ELSE ARRAY(SELECT jsonb_array_elements_text(:vals::jsonb)) END,
                     :quota, :remaining, :pending,
-                    :selected, :files, :small, :bytes, :smallBytes, :dvs)
+                    :selected, :pendingMax, :files, :small, :bytes, :smallBytes, :dvs)
             ON CONFLICT (catalog_id, generation, bucket_key) DO UPDATE
             SET remaining = excluded.remaining, pending = excluded.pending, selected = excluded.selected,
+                pending_max_bytes = excluded.pending_max_bytes,
                 file_count = excluded.file_count, small_count = excluded.small_count, total_bytes = excluded.total_bytes,
                 small_bytes = excluded.small_bytes, dv_count = excluded.dv_count
             """,
@@ -380,10 +480,67 @@ class MaintenanceSummarySampler(
                 .bind("table", pool.table).bindBySqlType("spec", pool.spec, java.sql.Types.BIGINT)
                 .bind("vals", json.writeValueAsString(pool.values))
                 .bind("remaining", pool.remaining).bind("pending", pool.pending).bind("selected", pool.selected)
+                .bind("pendingMax", pool.pendingMax)
                 .bind("files", pool.files).bind("small", pool.small).bind("bytes", pool.bytes)
                 .bind("smallBytes", pool.smallBytes).bind("dvs", pool.dvs).add()
         }
         batch.execute()
+    }
+
+    /**
+     * Count every bucket's trailing remainder, once the file phase has
+     * seen the last file.
+     *
+     * [accumulate] can only close a group when a file arrives that fills
+     * the quota or the fan-in, so when the scan runs out of files each
+     * bucket is left holding a partial group in `pending`. The planner
+     * emits that tail — see the tail paragraph in
+     * `CompactionGrouping.groups` — so debt that ignored it would report
+     * zero for exactly the tables the planner is about to rewrite: a
+     * partition that stopped receiving writes is ALL tail.
+     *
+     * Under the ladder this function had no counterpart, and correctly
+     * so: a bucket that could not reach its tier floor was skipped, so a
+     * remainder was not debt. That is the single behavioural difference
+     * between the two accounting rules.
+     *
+     * Runs inside the scan's transaction and zeroes what it counts, so a
+     * retry after the checkpoint cannot count a tail twice.
+     */
+    private fun flushTails(
+        h: Handle,
+        catalogId: Long,
+        generation: Long,
+        scan: Scan,
+    ) {
+        // `need` is computed in SQL from each bucket's own carried max,
+        // so this stays one statement per phase rather than a read of
+        // every bucket into the JVM. greatest(2, least(min, target/max))
+        // is needFor() transcribed; a bucket that never held a file has
+        // pending_max_bytes 0, and `pending > 0` excludes it anyway.
+        val need =
+            "greatest(2, least(CAST(:min AS bigint), " +
+                "CASE WHEN pending_max_bytes <= 0 THEN CAST(:min AS bigint) " +
+                "ELSE CAST(:target AS bigint) / pending_max_bytes END))"
+        val tail =
+            h.createQuery(
+                """
+                SELECT COALESCE(sum(pending), 0) FROM hog_maintenance_summary_tier
+                WHERE catalog_id = :id AND generation = :generation AND pending >= $need
+                """,
+            ).bind("id", catalogId).bind("generation", generation)
+                .bind("min", minInputFiles).bind("target", target)
+                .mapTo(Long::class.java).one()
+        scan.debt += tail
+        h.createUpdate(
+            """
+            UPDATE hog_maintenance_summary_tier
+            SET selected = selected + CASE WHEN pending >= $need THEN pending ELSE 0 END,
+                pending = 0, pending_max_bytes = 0, remaining = quota
+            WHERE catalog_id = :id AND generation = :generation AND pending > 0
+            """,
+        ).bind("id", catalogId).bind("generation", generation)
+            .bind("min", minInputFiles).bind("target", target).execute()
     }
 
     private fun checkpoint(
@@ -418,12 +575,26 @@ class MaintenanceSummarySampler(
                 WHERE catalog_id = ANY(:ids) AND sample IS NOT NULL
                 """,
             ).bindArray("ids", Long::class.javaObjectType, catalogIds).map { rs, _ ->
-                rs.getLong("catalog_id") to
-                    Published(
-                        rs.getObject("sampled_at", java.time.OffsetDateTime::class.java).toInstant(),
-                        json.readValue(rs.getString("sample"), Sample::class.java),
-                    )
-            }.list().toMap()
+                // A sample this build cannot parse was published by a
+                // build whose Sample had a different shape, and this runs
+                // on the REQUEST path: /maintenance/status and
+                // /stats/partitions both read it. Dropping it degrades
+                // those to the warmup state they already model — absent
+                // sampled_at, empty partitions — for the minute or so
+                // until the sampler republishes. Raising instead would
+                // 500 every dashboard read across the deploy window.
+                val sample =
+                    runCatching {
+                        json.readValue(rs.getString("sample"), Sample::class.java)
+                    }.getOrNull()
+                sample?.let {
+                    rs.getLong("catalog_id") to
+                        Published(
+                            rs.getObject("sampled_at", java.time.OffsetDateTime::class.java).toInstant(),
+                            it,
+                        )
+                }
+            }.list().filterNotNull().toMap()
         }
     }
 }

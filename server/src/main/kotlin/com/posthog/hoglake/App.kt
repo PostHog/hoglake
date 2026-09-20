@@ -76,7 +76,8 @@ class App private constructor(
         PartitionStatsService(
             jdbi,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
-            tierTarget = cfg.compactionTierTarget,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
         )
     private val removalStore = RemovalStore(cfg)
     private val cleanupService =
@@ -98,7 +99,8 @@ class App private constructor(
             objectStore,
             CompactionConfig(
                 targetBytes = cfg.compactionTargetBytes,
-                tierTarget = cfg.compactionTierTarget,
+                minInputFiles = cfg.compactionMinInputFiles,
+                maxInputFiles = cfg.compactionMaxInputFiles,
                 maxGroupsPerRun = cfg.compactionMaxGroupsPerRun,
                 nestedSortExpansion = cfg.compactionNestedSortExpansion,
                 sortedHeapBytes = cfg.compactionSortedHeapBytes,
@@ -116,14 +118,16 @@ class App private constructor(
             cleanupIntervalMs = cfg.cleanupIntervalMs,
             compactionIntervalMs = cfg.compactionIntervalMs,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
-            tierTarget = cfg.compactionTierTarget,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
         )
 
     private val maintenanceSummarySampler =
         MaintenanceSummarySampler(
             jdbi,
             cfg.compactionTargetBytes,
-            cfg.compactionTierTarget,
+            cfg.compactionMinInputFiles,
+            cfg.compactionMaxInputFiles,
             cfg.maintenanceSummaryRefreshSeconds,
         )
 

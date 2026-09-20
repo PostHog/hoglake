@@ -62,11 +62,18 @@ class MigrationLockIntegrationTest {
                         "SELECT indexname FROM pg_indexes WHERE schemaname = 'public'",
                     ).mapTo(String::class.java).list()
                 }
-            // The two indexes built CONCURRENTLY — i.e. the statements
-            // that can only succeed outside a transaction block.
+            // Every index built CONCURRENTLY — i.e. the statements that
+            // can only succeed outside a transaction block. V10's is
+            // listed here for the same reason as V2's and V3's: if the
+            // non-transactional execution ever regresses, the migration
+            // fails and the index is simply absent.
             assertThat(indexes)
                 .describedAs("indexes created by the CONCURRENTLY migrations")
-                .contains("hog_data_file_maintenance_scan", "hog_data_file_changefeed")
+                .contains(
+                    "hog_data_file_maintenance_scan",
+                    "hog_data_file_changefeed",
+                    "hog_data_file_maintenance_size_scan",
+                )
         }
     }
 }

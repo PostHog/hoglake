@@ -31,13 +31,15 @@ import java.util.UUID
 
 /** Per-run compaction knobs (Config's HOGLAKE_COMPACTION_* env surface). */
 data class CompactionConfig(
-    /** Output target size; the tier ladder (CompactionTiers) derives from it. */
+    /** The size a group packs to, in one rewrite. */
     val targetBytes: Long,
     /**
-     * Geometric tier ratio AND maximum fan-in. Consume minimal prefixes
-     * reaching each tier's quota, repeating until the remainder is short.
+     * Files a group must hold to be worth rewriting — the condition that
+     * makes compaction TERMINATE. See CompactionGrouping.groups.
      */
-    val tierTarget: Int,
+    val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+    /** Fan-in cap — see CompactionGrouping.groups. */
+    val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
     /**
@@ -70,8 +72,8 @@ data class CompactionConfig(
      * (`SortedHeapMeasurement`): a flat 11-column event row costs ~1.7 KiB
      * of materialized heap against ~119 bytes of snappy input, so the
      * "proxy" was already 14x optimistic before #115 made compaction's
-     * own zstd output — 1.70x denser — the input at every tier above the
-     * first, taking it to 24x. [sortedHeapBytes] is the real bound now;
+     * own zstd output — 1.70x denser — an input in its own right, taking
+     * it to 24x. [sortedHeapBytes] is the real bound now;
      * this is the nested multiplier on top of it.
      *
      * NOT a spill implementation, and not a promise. It bounds the
@@ -99,28 +101,34 @@ data class CompactionConfig(
      * sort, so the group has to fit in memory, so the group has to be
      * small — measured, about 34 MiB of zstd input per GiB of sort
      * buffer for a ten-column table. Capping a 512 MiB compaction target
-     * at tens of megabytes is a real cost: sorted tables stop being
-     * compacted to the size the ladder was designed around, and no
-     * setting of this knob fixes that, it only moves it.
+     * at tens of megabytes is a real cost: sorted tables stop reaching
+     * the target at all, and no setting of this knob fixes that, it only
+     * moves it.
      *
      * The fix is an EXTERNAL MERGE SORT, and compaction is unusually
      * well set up for one:
      *
-     *  - **Tier 2 and above need no sort at all.** Every input to those
-     *    groups is a previous compaction OUTPUT, and this rewriter sorts
-     *    what it writes (`ParquetRewriter.rewriteInto`, and
+     *  - **A compaction OUTPUT needs no sort at all.** This rewriter
+     *    sorts what it writes (`ParquetRewriter.rewriteInto`, and
      *    schema.sql's sort-spec comment: the spec is BINDING for
-     *    compaction rewrites). So each input is an already-sorted RUN,
-     *    and merging k sorted runs needs one row per run in a priority
-     *    queue — O(files) live rows, not O(group). The tier ladder means
-     *    this is where almost all the bytes are.
-     *  - **Tier 1 cannot assume it**, because a client's sort order is
-     *    ADVISORY — `schema.sql` says so in as many words, and the server
-     *    never verifies file sortedness. But tier-1 files are the
-     *    SMALLEST ones by construction, and sorting one file alone is
-     *    bounded by that one file rather than by the group. Sort each
-     *    tier-1 input on its own, spill it as a temp run, and
+     *    compaction rewrites), so such an input is an already-sorted
+     *    RUN, and merging k sorted runs needs one row per run in a
+     *    priority queue — O(files) live rows, not O(group).
+     *  - **A CLIENT-WRITTEN file cannot assume it**, because a client's
+     *    sort order is ADVISORY — `schema.sql` says so in as many words,
+     *    and the server never verifies file sortedness. But a
+     *    client-written file is bounded by the ingest flush size, and
+     *    sorting one file alone is bounded by that one file rather than
+     *    by the group. Sort each on its own, spill it as a temp run, and
      *    stream-merge the runs like any other.
+     *
+     *    Note which case now carries the bytes. Under the ladder, most
+     *    input was a previous output being carried up a rung, so most
+     *    groups were free merges. One-pass compaction consumes each file
+     *    once, so nearly every input is client-written and the spill
+     *    path is the ordinary one — the external sort is MORE work to
+     *    build than it was, and worth more, because it is the only thing
+     *    that lets a sorted table reach the target in one rewrite.
      *
      *    NOTE the spill now needs a scratch directory of its own.
      *    `compactGroup` used to create one per group and this plan was
@@ -173,15 +181,29 @@ data class CompactionConfig(
      * written with — `HOGLAKE_COMPACTION_CODEC` /
      * `HOGLAKE_COMPACTION_ZSTD_LEVEL`. See
      * [ParquetRewriter.OutputCodec] for why zstd and why the level is
-     * pinned; the short version is that the tier ladder rewrites a
-     * table's hot rows four times, so this is the codec a fully
-     * compacted table is stored and scanned under, not a per-file
-     * detail.
+     * pinned; the short version is that compaction rewrites a table's
+     * rows into target-sized files and then leaves them alone, so this
+     * is the codec a compacted table is stored and scanned under from
+     * then on, not a per-file detail.
      */
     val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
 ) {
     init {
-        CompactionTiers.of(targetBytes, tierTarget)
+        CompactionGrouping.of(targetBytes)
+        // Validated HERE, at construction, which is boot — not in
+        // CompactionGrouping.groups, which is reached once per bucket per
+        // table per sweep. A bad value caught there throws out of
+        // planSnapshot, which is outside the per-group catch, so it kills
+        // the whole sweep for every catalog on every interval while the
+        // process still looks healthy.
+        require(minInputFiles >= 2) {
+            "HOGLAKE_COMPACTION_MIN_INPUT_FILES must be at least 2, got $minInputFiles: " +
+                "a group of one file is a copy, not a compaction"
+        }
+        require(maxInputFiles >= minInputFiles) {
+            "HOGLAKE_COMPACTION_MAX_INPUT_FILES $maxInputFiles is below " +
+                "HOGLAKE_COMPACTION_MIN_INPUT_FILES $minInputFiles: no group could form"
+        }
         require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
         require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
         require(sortedHeapBytes >= 1) { "sorted heap bytes must be at least 1" }
@@ -223,12 +245,12 @@ data class CompactionConfig(
      * a time and whose heap is therefore flat in group size. For the
      * SORTED path it is the byte size of [sortedRowCeiling] rows AT THIS
      * TABLE'S OBSERVED DENSITY, capped at [targetBytes] — rows are what
-     * the heap holds, bytes are what the tier ladder is anchored in, and
+     * the heap holds, bytes are what the target is expressed in, and
      * [density] is the only thing that converts between them.
      *
      * Density is why this changed (#118). Group selection reads input
-     * file BYTES, and since #115 a tier-2-and-above input is compaction's
-     * own zstd output rather than a client's snappy: measured 1.70x
+     * file BYTES, and since #115 an input may be compaction's own zstd
+     * output rather than a client's snappy: measured 1.70x
      * denser on event data, so the same byte budget started admitting
      * 1.70x the rows, and rows are what become `Group` objects. Deriving
      * the budget FROM the row ceiling makes that self-correcting — denser
@@ -236,14 +258,16 @@ data class CompactionConfig(
      * guessed ratio anywhere.
      *
      * It stays a BYTE budget rather than becoming a row budget because
-     * the tier ladder is byte-anchored (CompactionTiers quotas, tier
-     * classification, promotion estimates). A row cap bolted onto a byte
-     * ladder produces groups that cannot reach their tier's floor, which
-     * means merging the same rows every sweep without ever promoting
-     * them; scaling the ladder keeps it self-consistent.
+     * grouping is byte-anchored: the candidate filter and the group
+     * quota are both sizes. Deriving the budget from the row ceiling
+     * keeps the two in one currency instead of bolting a row cap onto a
+     * byte quota, which would form groups and then refuse them.
      *
-     * Never below 2 — the tier ladder refuses a smaller target, and a
+     * Never below 2 — CompactionGrouping refuses a smaller target, and a
      * table whose target derated to nothing would stop compacting.
+     * Note this derate is exactly why the group minimum has to scale
+     * with file size: it can land the effective target at tens of
+     * megabytes, where no five candidate files fit under it.
      * [InputDensity.UNKNOWN] (a table with no candidate rows to measure)
      * falls back to the pre-#118 shape, which is never looser.
      */
@@ -302,8 +326,9 @@ data class CompactionConfig(
 
         /**
          * See [sortedHeapBytes] — including why this bound is TEMPORARY
-         * and what replaces it (an external merge sort, which tier 2+
-         * barely needs since its inputs are already sorted runs).
+         * and what replaces it (an external merge sort, which a group
+         * of compaction outputs barely needs, since those are already
+         * sorted runs).
          *
          * 1 GiB: the largest value whose worst-case peak (~1260 MiB)
          * still fits the 4 GiB maintenance pod's ~2.8 GiB heap with
@@ -402,7 +427,7 @@ data class CompactionPlan(
     val table: String,
     val groups: List<CompactionGroup>,
     /**
-     * Tier-eligible groups this plan REFUSED because their registered
+     * Groups this plan formed and then REFUSED because their registered
      * survivor count is above the table's sorted-path row ceiling
      * (CompactionConfig.sortedRowCeiling) — they would not fit the heap.
      *
@@ -420,22 +445,22 @@ data class CompactionPlan(
  * predecessor never survived in production; README.md §4's
  * commit-storm history is the design constraint here).
  *
- * PLANNING is metadata-only, per table, and TIERED (the DuckLake
- * tiered-merge recommendation; CompactionTiers): candidates are LIVE
- * data files below the target size — DV-bearing ones included, each
- * carrying its live DV's identity ([LiveDv]) so execution can apply it
- * and commit can detect supersession — bucketed by (spec_id, identical
- * partition_values, size TIER), ordered by row_id_start. A bucket's
- * tier is eligible only when its aggregate bytes reach the next tier's
- * floor (otherwise the merge could not produce a next-tier file —
- * skipped until more appends arrive), and the group takes the MINIMAL
- * row-id-ordered prefix reaching that floor, capped at
- * compaction_tier_target (default 8, also the tier ratio). Repeat on
- * the remaining candidates until below quota. Promotion is estimated
- * from input bytes; encoding and DV removal can change output size.
- * A run plans each table before executing any of its groups, so
- * a file compacted this run is never a candidate for
- * the next tier up in the SAME run. UNLIKE the predecessor's
+ * PLANNING is metadata-only, per table, and ONE-PASS
+ * (CompactionGrouping): candidates are LIVE data files below the target
+ * size — DV-bearing ones included, each carrying its live DV's identity
+ * ([LiveDv]) so execution can apply it and commit can detect
+ * supersession — bucketed by (spec_id, identical partition_values),
+ * ordered by row_id_start. A bucket packs its files in that order until
+ * their bytes reach compaction_target_bytes or the group holds
+ * compaction_max_input_files, then closes and starts another; the
+ * trailing remainder is a group too. A group is dropped if it holds
+ * fewer than compaction_min_input_files, which is what makes this
+ * TERMINATE: compression puts every output back under the target, so
+ * without a file minimum outputs would merge with outputs forever.
+ * Output size is estimated from input bytes; encoding and DV removal
+ * can change it. A run plans each table before executing any of its
+ * groups, so a file written this run is never an input in the SAME
+ * run. UNLIKE the predecessor's
  * merge_adjacent_files, row-id ADJACENCY IS NOT REQUIRED — which is
  * exactly why outputs must materialize ids explicitly (ParquetRewriter).
  *
@@ -506,6 +531,15 @@ class CompactionService(
 
     /** The run ledger; records after the sweep resolves, never inside it. */
     private val runStore = MaintenanceRunStore(jdbi)
+
+    /**
+     * Last heap-refusal picture per table, so a permanent condition is
+     * logged when it CHANGES rather than on every sweep. One short string
+     * per table that has ever been refused; the planner is the only
+     * writer, but a manual sweep and the loop can plan concurrently, so
+     * it is a concurrent map.
+     */
+    private val lastHeapRefusal = java.util.concurrent.ConcurrentHashMap<Long, String>()
 
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
@@ -642,7 +676,7 @@ class CompactionService(
         // many ROWS its bytes carry — so the density is measured first,
         // from the same MVCC snapshot, in metadata. It narrows the
         // candidate filter too: a file above the derated target can never
-        // reach a tier quota under it, so fetching it would only be work.
+        // fill a group under it, so fetching it would only be work.
         val budget = cfg.effectiveTargetBytes(ctx.columns, sorted, density(h, ctx, cfg))
 
         val rows =
@@ -700,43 +734,61 @@ class CompactionService(
                 }
                 .list()
 
-        val tiers = CompactionTiers.of(budget, cfg.tierTarget)
-        val out = mutableListOf<Pair<Int, CompactionGroup>>()
+        val grouping = CompactionGrouping.of(budget)
+        val out = mutableListOf<CompactionGroup>()
         for ((bucket, bucketRows) in rows.groupBy { it.bucket }) {
-            for (take in tiers.groups(bucketRows.map { it.candidate }) { it.fileSizeBytes }) {
-                val tier = tiers.tierOf(take.first().fileSizeBytes)!!
-                out += tier to CompactionGroup(take, bucket.specId, bucket.values)
+            val candidates = bucketRows.map { it.candidate }
+            val takes =
+                grouping.groups(
+                    candidates,
+                    cfg.minInputFiles,
+                    cfg.maxInputFiles,
+                ) { it.fileSizeBytes }
+            for (take in takes) {
+                out += CompactionGroup(take, bucket.specId, bucket.values)
             }
         }
         // The EXACT check, after the estimate. The budget above scales the
-        // ladder by the table's AVERAGE density, which is an estimate;
+        // target by the table's AVERAGE density, which is an estimate;
         // hog_data_file.record_count is not, so a group whose registered
         // survivors are above the ceiling is refused here on the true
         // number rather than attempted and discovered by an OOM. Only the
         // sorted path materializes, so only it has a ceiling.
         val ceiling = if (sorted) cfg.sortedRowCeiling(ctx.columns) else Long.MAX_VALUE
-        val (fits, refused) = out.partition { it.second.survivingRecords <= ceiling }
-        if (refused.isNotEmpty()) {
+        val (fits, refused) = out.partition { it.survivingRecords <= ceiling }
+        // A table at the row ceiling is a STATE, not an event: the same
+        // groups are re-planned and re-refused on every sweep, forever,
+        // until an operator raises the heap or drops the sort order.
+        // Logging it per sweep buried a burn-in in 289 identical
+        // warnings -- 235 KB -- in three minutes for a single table. Log
+        // when the picture CHANGES; the metric below carries the rest.
+        if (refused.isEmpty()) {
+            lastHeapRefusal.remove(ctx.tableId)
+        }
+        val signature = "${refused.size}/${refused.maxOfOrNull { it.survivingRecords } ?: 0}/$ceiling"
+        if (refused.isNotEmpty() && lastHeapRefusal.put(ctx.tableId, signature) != signature) {
             log.warn {
-                "compaction refused ${refused.size} tier-eligible group(s) of " +
+                "compaction refused ${refused.size} planned group(s) of " +
                     "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +
-                    "${refused.maxOf { it.second.survivingRecords }} rows against a ceiling of " +
+                    "${refused.maxOf { it.survivingRecords }} rows against a ceiling of " +
                     "$ceiling (heap budget ${cfg.sortedHeapBytes} B). The table keeps its debt. " +
                     "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
                     "pod's memory (the default is sized for a 4 GiB pod), or drop the table's " +
                     "sort order to move it to the streaming path, whose heap is flat in group " +
                     "size. This ceiling is TEMPORARY: the sorted rewrite sorts the whole group " +
                     "in memory, and replacing that with an external merge sort removes it — " +
-                    "tier-2-and-above inputs are already-sorted compaction outputs, so merging " +
+                    "a group of compaction outputs is a merge of already-sorted runs, so merging " +
                     "them needs one row per input rather than all of them. See " +
                     "CompactionConfig.sortedHeapBytes"
             }
         }
-        // Most-fragmented tier first, then row-id order within the tier.
+        // Most files first: every group now targets the same size, so the
+        // one holding the most files buys the largest drop in file count
+        // for the same bytes rewritten. Row-id order breaks ties, which
+        // keeps a group's inputs adjacent in arrival order.
         return PlannedGroups(
             fits
-                .sortedWith(compareBy({ it.first }, { it.second.files.first().rowIdStart }))
-                .map { it.second },
+                .sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
             refused.size.toLong(),
         )
     }
@@ -750,8 +802,8 @@ class CompactionService(
      * budget, because the derate is what this is being measured to
      * compute. It is a superset of the eventual candidate set, which
      * makes the density a whole-table average: a table holding both
-     * client snappy (first tier) and compaction zstd (every tier above)
-     * measures between the two, and the exact per-group row check in
+     * client snappy and compaction zstd measures between the two, and
+     * the exact per-group row check in
      * [groups] is what covers the residual.
      */
     private fun density(
@@ -1113,8 +1165,20 @@ class CompactionService(
                 ctx.codec,
             )
         check(rewritten.rowsWritten == group.survivingRecords) {
+            // Name the FILES, not just the counts. This check is durable
+            // by nature — a mis-registered record_count does not heal —
+            // so the group is re-planned and re-failed every sweep, and
+            // because a failure is charged to maxGroupsPerRun (default 1)
+            // the whole catalog stops compacting behind it. An operator
+            // reading `failed_groups=1` on a loop needs the offending
+            // data_file_id to get anywhere; counts alone give them
+            // nothing to grep for.
             "rewrite produced ${rewritten.rowsWritten} rows but inputs registered " +
-                "${group.survivingRecords} survivors — refusing to commit a lossy compaction"
+                "${group.survivingRecords} survivors — refusing to commit a lossy compaction. " +
+                "Inputs (data_file_id: registered records, live deletes): " +
+                group.files.joinToString(", ") {
+                    "${it.dataFileId}: ${it.recordCount}, ${it.dv?.deleteCount ?: 0}"
+                }
         }
         val outputBytes = sink.bytesWritten
         val footerSize = sink.footerSize
