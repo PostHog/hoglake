@@ -30,6 +30,7 @@ import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
+import com.posthog.hoglake.persistence.ViewRepo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -196,6 +197,59 @@ class CatalogService(private val jdbi: Jdbi) {
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             requireNamespace(h, cat, namespace)
+        }
+
+    /**
+     * Drop a namespace. Emptiness precondition, no CASCADE — matching
+     * dropTable's no-CASCADE position: a namespace with live tables or
+     * views is a 409, never a recursive delete. One transaction taking the
+     * per-catalog commit lock, allocating a snapshot, recording the
+     * namespace_dropped change, and setting the liveness flag; the row
+     * stays (its id is not reused), so a same-named namespace created
+     * later is a new id, not a resurrection.
+     */
+    fun dropNamespace(
+        catalog: String,
+        namespace: String,
+    ): CommitResult =
+        Audit.audited(
+            "namespace_drop",
+            catalog,
+            namespace,
+            detail = { "snapshot=${it.snapshotId}" },
+        ) {
+            jdbi.inTransactionUnchecked { h ->
+                val cat = requireCatalog(h, catalog)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                val ns = requireNamespace(h, cat, namespace)
+                // Emptiness under the commit lock: a concurrent createTable
+                // or createView into this namespace serializes behind the
+                // same lock, so the live sets read here are the live sets
+                // the flag commits against.
+                val liveTables = TableRepo.listLive(h, cat.catalogId, ns.namespaceId)
+                val liveViews = ViewRepo.listLive(h, cat.catalogId, ns.namespaceId, ns.name)
+                if (liveTables.isNotEmpty() || liveViews.isNotEmpty()) {
+                    val what =
+                        buildList {
+                            if (liveTables.isNotEmpty()) add("${liveTables.size} table(s)")
+                            if (liveViews.isNotEmpty()) add("${liveViews.size} view(s)")
+                        }.joinToString(" and ")
+                    throw HoglakeException.NamespaceNotEmpty(
+                        "namespace '$namespace' in catalog '$catalog' is not empty: $what remain",
+                    )
+                }
+                val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                SnapshotRepo.insertChange(
+                    h,
+                    cat.catalogId,
+                    alloc.snapshotId,
+                    ChangeKind.NAMESPACE_DROPPED,
+                    ns.namespaceId,
+                )
+                NamespaceRepo.markDropped(h, cat.catalogId, ns.namespaceId)
+                CommitResult(snapshotId = alloc.snapshotId, schemaVersion = alloc.schemaVersion)
+            }
         }
 
     // ---- tables ----------------------------------------------------------

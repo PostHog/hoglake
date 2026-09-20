@@ -89,6 +89,11 @@ fun Application.installApiRoutes(
                             catalogs.getNamespace(call.catalog(), call.namespace()).toDto(),
                         )
                     }
+                    delete("/{namespace}") {
+                        call.respond(
+                            catalogs.dropNamespace(call.catalog(), call.namespace()).toDto(),
+                        )
+                    }
 
                     route("/{namespace}/tables") {
                         get {

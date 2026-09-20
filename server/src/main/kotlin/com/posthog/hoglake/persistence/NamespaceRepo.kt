@@ -70,4 +70,25 @@ object NamespaceRepo {
             .bind("catalogId", catalogId)
             .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
             .list()
+
+    /**
+     * Drop tail: set the liveness flag. The row itself stays — namespace
+     * ids are not reused, so a dropped namespace keeps its history and a
+     * fresh namespace of the same name is a new id, never a resurrection.
+     */
+    fun markDropped(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+    ) {
+        handle.createUpdate(
+            """
+            UPDATE hog_namespace SET dropped = true
+            WHERE catalog_id = :catalogId AND namespace_id = :namespaceId AND NOT dropped
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("namespaceId", namespaceId)
+            .execute()
+    }
 }
