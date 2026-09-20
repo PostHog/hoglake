@@ -307,7 +307,8 @@ own Arrow-to-parquet ratio and prints it — ~1.7x on this payload, not
 millpond's 3-4x, because a random property blob does not compress),
 i.e. ~20 GB and 72M events per hour into a single hourly partition.
 That is exactly the small-file population compaction exists for: 350
-same-spec, same-partition files per hour, tier after tier.
+same-spec, same-partition files per hour, every one of them a candidate
+for the same bucket.
 
 Under `--hours-per-minute` the arithmetic changes, deliberately: a flush
 that spans N hour cells fans out to N files. At `--hours-per-minute 60`

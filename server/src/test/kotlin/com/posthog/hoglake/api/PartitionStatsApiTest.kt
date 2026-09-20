@@ -69,7 +69,8 @@ class PartitionStatsApiTest {
                     com.posthog.hoglake.service.MaintenanceSummarySampler(
                         db.jdbi,
                         512L * 1024 * 1024,
-                        8,
+                        com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+                        com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
                         3600,
                     )
                 while (sampler.runOnce()) { /* publish before exercising the report */ }
@@ -117,13 +118,20 @@ class PartitionStatsApiTest {
                             "analytics",
                             "events",
                             listOf(
-                                // team 42: four 40 MiB files reach the
-                                // default 64 MiB quota twice (debt 4).
+                                // team 42: five 40 MiB files, one group
+                                // of five (debt 5). Five because the
+                                // endpoint runs the PRODUCTION bounds —
+                                // 40 MiB is far under a fifth of the
+                                // 512 MiB target, so the minimum does not
+                                // scale down and all five are needed. The
+                                // big file is at the target already and is
+                                // not a candidate.
                                 f("t42-big", bigBytes, listOf("42")),
                                 f("t42-s1", smallBytes, listOf("42")),
                                 f("t42-s2", smallBytes, listOf("42")),
                                 f("t42-s3", smallBytes, listOf("42")),
                                 f("t42-s4", smallBytes, listOf("42")),
+                                f("t42-s5", smallBytes, listOf("42")),
                                 // team 7: one small file — raw count 1,
                                 // actionable debt 0 (sub-threshold).
                                 f("t7-s1", smallBytes, listOf("7")),
@@ -169,9 +177,10 @@ class PartitionStatsApiTest {
             assertThat(partitions).hasSize(4)
 
             // Ordering: debt desc, ties by small_file_bytes desc. Only
-            // team 42 has two complete pairs: the rest pin 0.
+            // team 42 has enough files for a group: the rest pin 0,
+            // being single files.
             val first = partitions[0]
-            assertThat(first["debt_score"].asLong()).isEqualTo(4)
+            assertThat(first["debt_score"].asLong()).isEqualTo(5)
             assertThat(partitions[1]["debt_score"].asLong()).isEqualTo(0)
             assertThat(partitions[1]["small_file_count"].asLong()).isEqualTo(1)
             assertThat(partitions[1]["partition_values"][0]["value"].asText()).isEqualTo("7")
@@ -219,12 +228,12 @@ class PartitionStatsApiTest {
                 assertThat(first[field].isIntegralNumber).describedAs(field).isTrue()
                 assertThat(first[field].isTextual).describedAs(field).isFalse()
             }
-            assertThat(first["file_count"].asLong()).isEqualTo(5)
-            assertThat(first["small_file_count"].asLong()).isEqualTo(4)
-            assertThat(first["total_bytes"].asLong()).isEqualTo(bigBytes + 4 * smallBytes)
-            assertThat(first["small_file_bytes"].asLong()).isEqualTo(4 * smallBytes)
+            assertThat(first["file_count"].asLong()).isEqualTo(6)
+            assertThat(first["small_file_count"].asLong()).isEqualTo(5)
+            assertThat(first["total_bytes"].asLong()).isEqualTo(bigBytes + 5 * smallBytes)
+            assertThat(first["small_file_bytes"].asLong()).isEqualTo(5 * smallBytes)
             assertThat(first["avg_file_bytes"].asLong())
-                .isEqualTo((bigBytes + 4 * smallBytes) / 5)
+                .isEqualTo((bigBytes + 5 * smallBytes) / 6)
             assertThat(first["dv_count"].asLong()).isEqualTo(0)
 
             // Unpartitioned entry: empty partition_values, spec_id omitted.

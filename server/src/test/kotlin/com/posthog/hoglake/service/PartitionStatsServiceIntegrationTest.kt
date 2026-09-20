@@ -1,6 +1,7 @@
 package com.posthog.hoglake.service
 
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.compaction.CompactionGrouping
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
@@ -38,8 +39,14 @@ class PartitionStatsServiceIntegrationTest {
     private val alter = AlterService(db.jdbi)
     private val counter = AtomicInteger(0)
 
-    /** T=4, target=1000: quotas 1/4/16/63/250/1000. */
-    private val stats = PartitionStatsService(db.jdbi, smallFileThresholdBytes = 1000, tierTarget = 4)
+    /** target=1000, and a two-file minimum so these small fixtures form groups. */
+    private val stats =
+        PartitionStatsService(
+            db.jdbi,
+            smallFileThresholdBytes = 1000,
+            minInputFiles = 2,
+            maxInputFiles = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+        )
     private val svc =
         object {
             fun partitionStats(
@@ -49,7 +56,8 @@ class PartitionStatsServiceIntegrationTest {
                 limit: Int,
             ): com.posthog.hoglake.model.PartitionStatsReport {
                 db.jdbi.useHandleUnchecked { it.execute("UPDATE hog_maintenance_summary SET next_batch_at = now()") }
-                val sampler = MaintenanceSummarySampler(db.jdbi, 1000, 4, 3600)
+                val sampler =
+                    MaintenanceSummarySampler(db.jdbi, 1000, 2, CompactionGrouping.DEFAULT_MAX_INPUT_FILES, 3600)
                 while (sampler.runOnce()) { /* materialize a complete sample before testing report semantics */ }
                 return stats.partitionStats(catalog, namespace, table, limit)
             }
@@ -142,7 +150,7 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(p1.specId).isEqualTo(1)
         assertThat(p1.fileCount).isEqualTo(4)
         assertThat(p1.smallFileCount).isEqualTo(4)
-        assertThat(p1.debtScore).isEqualTo(3) // shortest prefix reaches 250; the fourth is a remainder
+        assertThat(p1.debtScore).isEqualTo(4) // all four: under target, over the file minimum
         assertThat(p1.totalBytes).isEqualTo(400)
         assertThat(p1.smallFileBytes).isEqualTo(400)
         assertThat(p1.avgFileBytes).isEqualTo(100)
@@ -156,8 +164,9 @@ class PartitionStatsServiceIntegrationTest {
         assertThat(p2.partitionValues).containsExactly(PartitionValue("team", "p2"))
         assertThat(p2.fileCount).isEqualTo(2)
         assertThat(p2.smallFileCount).isEqualTo(1)
-        // One small file cannot fill its tier quota: raw count visible,
-        // actionable debt zero.
+        // One small file is a remainder of one, under the minimum:
+        // raw count visible, actionable debt zero. (p2big is at or over
+        // the target and is not a candidate at all.)
         assertThat(p2.debtScore).isEqualTo(0)
         assertThat(p2.totalBytes).isEqualTo(1600)
         assertThat(p2.smallFileBytes).isEqualTo(100)
@@ -170,26 +179,27 @@ class PartitionStatsServiceIntegrationTest {
     @Test
     fun `worst-case seeded ordering is debt desc with small-byte tiebreak`() {
         val cat = fixture()
-        // Pre-spec vintage: 2 x 600B tier-2 files, sum 1200 >= floor 1000 -> debt 2.
+        // Pre-spec vintage: 2 x 600B, sum 1200 >= the 1000B target -> debt 2.
         append(cat, "t", file("u1", 600), file("u2", 600))
         partitionByTeam(cat)
         append(
             cat,
             "t",
-            // a: 3 x 300B, sum 900 < quota 1000 -> debt 0.
+            // a: 3 x 300B, sum 900 -> a remainder of three -> debt 3.
             file("a1", 300, values = listOf("a")),
             file("a2", 300, values = listOf("a")),
             file("a3", 300, values = listOf("a")),
-            // b: 3 x 100B, sum 300 >= quota 250 -> debt 3.
+            // b: 3 x 100B -> a remainder of three -> debt 3.
             file("b1", 100, values = listOf("b")),
             file("b2", 100, values = listOf("b")),
             file("b3", 100, values = listOf("b")),
-            // c: 4 x 50B, two pairs reaching quota 63 -> debt 4.
+            // c: 4 x 50B -> a remainder of four -> debt 4.
             file("c1", 50, values = listOf("c")),
             file("c2", 50, values = listOf("c")),
             file("c3", 50, values = listOf("c")),
             file("c4", 50, values = listOf("c")),
-            // d: 2 x 400B, sum 800 < quota 1000 -> debt 0.
+            // d: 2 x 400B -> a remainder of two -> debt 2. dbig is over
+            // the target and is not a candidate.
             file("d1", 400, values = listOf("d")),
             file("d2", 400, values = listOf("d")),
             file("dbig", 2000, values = listOf("d")),
@@ -199,28 +209,34 @@ class PartitionStatsServiceIntegrationTest {
 
         val report = svc.partitionStats(cat, null, null, 50)
         assertThat(report.partitions.map { it.partitionValues.map(PartitionValue::value) })
-            .containsExactly(listOf("c"), listOf("b"), emptyList(), listOf("a"), listOf("d"), listOf("e"))
-        assertThat(report.partitions.map { it.debtScore }).containsExactly(4L, 3L, 2L, 0L, 0L, 0L)
-        // c's pairs clear 63; a/d are in [250,1000), short of 1000.
+            .containsExactly(listOf("c"), listOf("a"), listOf("b"), emptyList(), listOf("d"), listOf("e"))
+        assertThat(report.partitions.map { it.debtScore }).containsExactly(4L, 3L, 3L, 2L, 2L, 0L)
+        // Ties break on small_file_bytes desc: a's 900 over b's 300, and
+        // the unpartitioned vintage's 1200 over d's 800.
         val c = report.partitions[0]
         assertThat(c.smallFileCount).isEqualTo(4)
         assertThat(c.debtScore).isEqualTo(4)
     }
 
     @Test
-    fun `tier floor is inclusive - a bucket summing to exactly the floor is debt`() {
+    fun `a remainder is debt on its file count, not on its bytes`() {
         val cat = fixture()
         partitionByTeam(cat)
-        // x: 100 + 150 = exactly the tier-0 floor (250): mergeable.
+        // x and y differ by ten bytes and both sit far under the 1000B
+        // target. Under the ladder that decided everything: 250 was a
+        // floor, so x merged and y did not. Now neither number matters
+        // — both are two-file remainders, and two is the minimum.
         append(cat, "t", file("x1", 100, values = listOf("x")), file("x2", 150, values = listOf("x")))
-        // y: 100 + 140 = 240 < 250: one byte short is no group.
         append(cat, "t", file("y1", 100, values = listOf("y")), file("y2", 140, values = listOf("y")))
+        // z is one file: a copy, not a compaction, whatever its size.
+        append(cat, "t", file("z1", 900, values = listOf("z")))
 
         val by =
             svc.partitionStats(cat, null, null, 50).partitions
                 .associateBy { it.partitionValues.single().value }
         assertThat(by["x"]!!.debtScore).isEqualTo(2)
-        assertThat(by["y"]!!.debtScore).isEqualTo(0)
+        assertThat(by["y"]!!.debtScore).isEqualTo(2)
+        assertThat(by["z"]!!.debtScore).isEqualTo(0)
     }
 
     // ---- partition field naming ------------------------------------------------

@@ -49,8 +49,9 @@ DEFAULT_CATALOG = "seed-warehouse"
 #: Facts/events aim for files in this band — many mid-sized files, not a
 #: few giants, so compaction planning has something real to rank. The
 #: default sits at the floor to produce small-file populations across
-#: the team×month grid. Compaction eligibility is byte-triggered within
-#: geometric size tiers, not a minimum file count.
+#: the team×month grid. Compaction bin-packs a bucket by size, so what
+#: makes a partition eligible is having enough files to clear the group
+#: minimum, not any one file's size.
 MIN_FILE_MB = 20.0
 MAX_FILE_MB = 80.0
 DEFAULT_FILE_MB = 20.0

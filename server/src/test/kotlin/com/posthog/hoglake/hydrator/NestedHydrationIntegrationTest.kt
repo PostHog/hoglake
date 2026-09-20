@@ -75,24 +75,25 @@ class NestedHydrationIntegrationTest {
      * hardcoded target either stops grouping or starts grouping one file
      * the moment the nested fixture's bytes move.
      */
-    private val compactionConfig = CompactionConfig(targetBytes = 65536, tierTarget = 2, maxGroupsPerRun = 4)
+    private val compactionConfig =
+        CompactionConfig(
+            targetBytes = 65536,
+            minInputFiles = 2,
+            maxGroupsPerRun = 4,
+        )
     private val compaction by lazy { CompactionService(db.jdbi, store, compactionConfig) }
 
     /**
      * A config under which the fixture's two files form exactly one
      * group, derived from their real sizes.
      *
-     * Planning partitions candidates BY TIER and only groups within one,
-     * so the two files must land in the same tier and their combined
-     * bytes must reach its quota. Tiers are geometric downward from the
-     * target with spacing [CompactionConfig.tierTarget]: setting the
-     * target to the SUM puts both files in the top tier (each is below
-     * the sum, and with T=4 the next floor down is sum/4, which neither
-     * is below as long as they are within 3x of each other) and makes
-     * the quota exactly the sum, which the pair reaches precisely.
+     * A group closes when its input bytes reach the target, so setting
+     * the target to the pair's SUM closes it on the second file exactly
+     * — and leaves both files under the target, which is what keeps
+     * them candidates at all.
      */
     private fun configFor(sizes: List<Long>) =
-        CompactionConfig(targetBytes = sizes.sum(), tierTarget = 4, maxGroupsPerRun = 4)
+        CompactionConfig(targetBytes = sizes.sum(), minInputFiles = 2, maxGroupsPerRun = 4)
 
     @AfterAll
     fun tearDown() = db.close()
@@ -218,9 +219,10 @@ class NestedHydrationIntegrationTest {
 
         assertBounds(cat, "after compaction")
 
-        // And a re-compaction changes nothing: a tier-1 output is a
-        // tier-2 input in production, and per-pass drift would be
-        // invisible in a single run.
+        // And a re-compaction changes nothing. Production will not
+        // normally do this — the file minimum is what stops an output
+        // being re-merged — but per-pass drift would be invisible in a
+        // single run, and this is the cheap way to rule it out.
         compaction.runOnce(cat, cfg)
         assertBounds(cat, "after re-compaction")
     }
@@ -271,7 +273,7 @@ class NestedHydrationIntegrationTest {
         }
         hydrator.runOnce()
 
-        // The budget at which the pair exactly reaches a tier quota.
+        // The budget at which the pair exactly reaches the target.
         val raw = configFor(sizes.take(2))
 
         // Derate OFF: both tables group, which is the premise — without
@@ -328,7 +330,7 @@ class NestedHydrationIntegrationTest {
         // groups 64-fold for nothing.
         val flat =
             listOf(ColumnDef("id", ColType.LONG, nullable = false), ColumnDef("name", ColType.STRING))
-        val cfg = CompactionConfig(targetBytes = 1_000_000, tierTarget = 4, maxGroupsPerRun = 4)
+        val cfg = CompactionConfig(targetBytes = 1_000_000, minInputFiles = 2, maxGroupsPerRun = 4)
         val cols = flat.mapIndexed { i, d -> com.posthog.hoglake.model.Column(i + 1L, i, d) }
         assertThat(cfg.effectiveTargetBytes(cols, sorted = true)).isEqualTo(1_000_000)
     }

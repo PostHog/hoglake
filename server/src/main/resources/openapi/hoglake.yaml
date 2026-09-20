@@ -508,16 +508,20 @@ paths:
         Run one compaction sweep now (the background loop calls the same
         path; batch bounds group attempts, including failures and skips;
         default HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN, normally 1).
-        Geometric size tiers divide HOGLAKE_COMPACTION_TARGET_BYTES
-        (512 MiB) repeatedly by HOGLAKE_COMPACTION_TIER_TARGET (T=8,
-        minimum 2). Within each partition/spec/tier, take the shortest
-        row-id-ordered prefix reaching the next byte boundary, at most
-        T files; repeat until the remainder is below quota. Zero-byte
-        files cannot meet a quota; files at/above the final target are
-        excluded. Each table is planned before any of its groups execute,
-        so new outputs never participate in this same run. Input bytes
-        estimate promotion; actual output size determines its next-run
-        tier. DV-bearing inputs are supported. Produces one file per group whose
+        Within each partition/spec bucket, candidates are sorted by SIZE
+        and packed until their bytes reach HOGLAKE_COMPACTION_TARGET_BYTES
+        (512 MiB) or the group holds HOGLAKE_COMPACTION_MAX_INPUT_FILES
+        (64); the group then closes and packing continues, and the
+        trailing remainder is a group too. A group is dropped unless it
+        holds min(HOGLAKE_COMPACTION_MIN_INPUT_FILES, target / its
+        largest file) files, never fewer than 2 — the minimum scales with
+        the files it judges, because no group can hold five files that
+        are each over a fifth of the target. Files at/above the target
+        are excluded. Each
+        table is planned before any of its groups execute, so new
+        outputs never participate in this same run. Input bytes estimate
+        the output size; encoding and DV removal change it.
+        DV-bearing inputs are supported. Produces one file per group whose
         rows carry their hoglake row ids in an explicit _hog_row_id
         column (data_file.explicit_row_ids), sorted by the table's live
         sort order when one exists. Inputs are end-snapshotted (time
@@ -726,8 +730,8 @@ paths:
         earliest_snapshot_id, head_snapshot_id; cleanup ->
         queued_removals, oldest_queued_age_seconds (absent on an empty
         queue); compaction -> small_files (ACTIONABLE debt: small files
-        selected into complete geometric-tier prefix groups; incomplete
-        suffixes excluded, before applying the per-run budget), target_bytes;
+        the planner would put in a group, trailing remainders included,
+        before applying the per-run budget), target_bytes;
         verify -> none (empty object).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
@@ -799,11 +803,12 @@ paths:
         spec_id. "Small" means under the compaction target size
         (HOGLAKE_COMPACTION_TARGET_BYTES, strict less-than — the same
         threshold the compaction planner applies to candidate inputs).
-        debt_score counts files selected into complete minimal-prefix
-        groups by the geometric tier planner (T from
-        HOGLAKE_COMPACTION_TIER_TARGET, default 8), before the run's
-        group budget. Incomplete suffixes contribute zero debt, while
-        small_file_count still includes them. Ordered by debt_score desc, ties by
+        debt_score counts the files the one-pass planner would put in a
+        group — sorted by size and packed to the target or to
+        HOGLAKE_COMPACTION_MAX_INPUT_FILES, trailing remainder included
+        — before the run's group budget. A group under its scaled
+        minimum contributes zero debt, while small_file_count still
+        includes its files. Ordered by debt_score desc, ties by
         small_file_bytes desc. Read-only metadata aggregation (one
         REPEATABLE READ snapshot over summary rows). sampled_at is absent
         and partitions empty during first-sample warmup. Names resolve
@@ -2514,8 +2519,8 @@ components:
           description: >
             Groups the SORTED rewrite path declined because
             materializing them to sort would not fit the compaction heap
-            budget: tier-eligible by input bytes, too many rows for the
-            heap. Refused in metadata at planning time from the
+            budget: a group formed on input bytes with too many rows for
+            the heap. Refused in metadata at planning time from the
             registered record counts, before any object-store IO, so a
             group that cannot fit never spends ninety seconds finding
             out.
@@ -2530,12 +2535,11 @@ components:
 
             TEMPORARY. The ceiling exists only because the sorted rewrite
             sorts a whole group in memory. An external merge sort removes
-            it: at tier 2 and above every input is a previous compaction
-            output and therefore an already-sorted run, so merging needs
-            one row per input rather than all of them, and tier-1 client
-            files (whose sort order is advisory and unverified) are the
-            smallest and can each be sorted alone and spilled to the
-            scratch directory the rewrite already uses.
+            it: an input that is a previous compaction output is an
+            already-sorted run, so merging needs one row per input rather
+            than all of them, and a client-written file (whose sort order
+            is advisory and unverified) is bounded by the ingest flush
+            size and can be sorted alone and spilled as a run of its own.
         failed_groups:
           type: integer
           format: int64
@@ -2673,8 +2677,8 @@ components:
             consumer_floor, earliest_snapshot_id, head_snapshot_id;
             cleanup -> queued_removals, oldest_queued_age_seconds
             (absent on an empty queue); compaction -> small_files
-            (files selected into complete geometric-tier prefix groups,
-            excluding incomplete suffixes), target_bytes; verify -> none.
+            (files the planner would put in a group, excluding groups
+            under their scaled minimum), target_bytes; verify -> none.
 
     DatabaseHealth:
       type: object
@@ -2951,10 +2955,12 @@ components:
           type: integer
           format: int64
           description: >
-            Files selected by the geometric tier planner into complete
-            minimal-prefix groups, before applying the per-run budget.
-            Unmergeable suffixes are excluded (including zero-byte files).
-            Uses the same T and final target as compaction. The ranking
+            Files the one-pass planner would put in a group — sorted by
+            size and packed to the compaction target or to
+            HOGLAKE_COMPACTION_MAX_INPUT_FILES, trailing remainder
+            included — before applying the per-run budget. A group under
+            its scaled minimum (see the compaction endpoint) is excluded.
+            Uses the same bounds and target as compaction. The ranking
             key (desc, ties by small_file_bytes desc).
 
     PartitionStatsReport:

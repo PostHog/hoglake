@@ -29,7 +29,8 @@ object HogSchemaColumns {
             "hog_maintenance_summary_tier" to
                 setOf(
                     "catalog_id", "generation", "bucket_key", "table_id", "spec_id", "partition_values",
-                    "quota", "remaining", "pending", "selected", "file_count", "small_count",
+                    "quota", "remaining", "pending", "selected", "pending_max_bytes",
+                    "file_count", "small_count",
                     "total_bytes", "small_bytes", "dv_count",
                 ),
             // CatalogRepo.catalogMapper (the one hog_catalog row mapping;

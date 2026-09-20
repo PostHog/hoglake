@@ -45,10 +45,11 @@ import java.nio.file.Path
  * parquet-java Group API is already a tree (`addGroup`/`getGroup`), so
  * the existing plan-and-copy pipeline extends one level at a time.
  *
- * Idempotence is asserted by feeding the output back in, because that
- * IS the production sequence (a tier-1 output is a tier-2 input) and a
- * per-pass drift — an entry duplicated, an empty list turning into a
- * null, a bound widening — would be invisible in a single pass.
+ * Idempotence is asserted by feeding the output back in. Production
+ * will not do that — the file minimum keeps an output out of later
+ * groups — but it is the cheap way to catch per-pass drift: an entry
+ * duplicated, an empty list turning into a null, a bound widening.
+ * None of those are visible in a single pass.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class NestedTypeRewriteRoundTripTest {

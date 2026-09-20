@@ -15,8 +15,8 @@ Notable surfaces beyond the catalog browser:
   Prometheus endpoint rendered visually — stat tiles, per-label bars,
   histogram bucket strips. Manual refresh only, no polling.
 - **Compaction debt** (`/catalogs/:catalog/partitions`): leaf
-  partitions ranked by `debt_score` (files selected into complete
-  geometric-tier groups; excludes incomplete suffixes), with small-file
+  partitions ranked by `debt_score` (files the planner would bin-pack
+  into a group; excludes groups under their minimum), with small-file
   share bars, filters, and the
   stale-spec-group count — backed by `GET /stats/partitions`.
 - **Maintenance** (`/maintenance` central + `/catalogs/:catalog/maintenance`

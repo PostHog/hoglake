@@ -3,6 +3,7 @@ package com.posthog.hoglake.service
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.api.toDto
+import com.posthog.hoglake.compaction.CompactionGrouping
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.HoglakeException
@@ -365,7 +366,14 @@ class MaintenanceLedgerIntegrationTest {
         val catalogId = seedCatalog("led-status", head = 2, retentionSeconds = 3600)
         seedPendingFile(catalogId)
         ExpiryService(jdbi).runOnce("led-status", 10)
-        val sampler = MaintenanceSummarySampler(jdbi, 512L * 1024 * 1024, 8, 3600)
+        val sampler =
+            MaintenanceSummarySampler(
+                jdbi,
+                512L * 1024 * 1024,
+                CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+                CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+                3600,
+            )
         while (sampler.runOnce()) { /* finish async samples */ }
 
         val status = statusSvc().status("led-status")
@@ -465,7 +473,14 @@ class MaintenanceLedgerIntegrationTest {
         VerifyService(jdbi).runOnce("led-inst-b")
 
         // (The test database is shared per class; narrow to this test's pair.)
-        val sampler = MaintenanceSummarySampler(jdbi, 512L * 1024 * 1024, 8, 3600)
+        val sampler =
+            MaintenanceSummarySampler(
+                jdbi,
+                512L * 1024 * 1024,
+                CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
+                CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+                3600,
+            )
         while (sampler.runOnce()) { /* finish async samples */ }
         val instance = statusSvc().instanceStatus()
         val pair = instance.catalogs.filter { it.catalog.startsWith("led-inst-") }

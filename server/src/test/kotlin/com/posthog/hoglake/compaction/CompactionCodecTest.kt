@@ -31,8 +31,8 @@ import kotlin.io.path.fileSize
  * The bug this pins: [ParquetRewriter] wrote UNCOMPRESSED, which is also
  * `ExampleParquetWriter`'s default, so the value was inherited rather
  * than chosen and no comment said otherwise. Because compaction is a
- * ratchet — the tier ladder rewrites a table's hot rows once per tier
- * and every output is the next tier's input — that made a fully
+ * ratchet — compaction rewrites a table's rows into target-sized files
+ * and then leaves them alone — that made a fully
  * compacted table uncompressed end to end, permanently, against clients
  * that all write snappy or zstd. A dev-catalog run merged 67.6 MiB of
  * inputs into 80.1 MiB of output.

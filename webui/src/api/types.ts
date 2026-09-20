@@ -464,16 +464,16 @@ export interface CompactionResult {
   invalid_data?: Int64;
   /**
    * Groups the SORTED rewrite path declined because materializing them
-   * to sort would not fit the compaction heap budget: tier-eligible by
-   * input bytes, too many rows for the heap. Refused in metadata at
+   * to sort would not fit the compaction heap budget: a group formed on
+   * input bytes with too many rows for the heap. Refused in metadata at
    * planning time, before any object-store IO.
    *
    * Durable like invalid_data, but the fault is neither the writer's nor
    * the schema's — it is a table whose sort order and row width exceed
    * the heap the server was given. TEMPORARY: the ceiling exists only
    * because the sorted rewrite sorts a whole group in memory, and an
-   * external merge sort removes it (tier-2+ inputs are already-sorted
-   * compaction outputs).
+   * external merge sort removes it (an input that is itself a compaction
+   * output is an already-sorted run).
    *
    * OPTIONAL for the same reason invalid_data is: the counter postdates
    * ledger rows a rolling deploy can still serve from an older server.

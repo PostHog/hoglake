@@ -977,7 +977,7 @@ data class CompactionResult(
     val invalidData: Long = 0,
     /**
      * Groups the SORTED path declined because materializing them would
-     * not fit CompactionConfig.sortedHeapBytes — tier-eligible by bytes,
+     * not fit CompactionConfig.sortedHeapBytes — groupable by bytes,
      * too many rows for the heap.
      *
      * Almost always refused in METADATA, at planning, from
@@ -997,7 +997,7 @@ data class CompactionResult(
      * TEMPORARY, and a nonzero count should be read that way. The
      * ceiling exists only because the sorted rewrite sorts a whole group
      * in memory; an external merge sort removes it, and compaction's own
-     * outputs are already sorted runs, so tier 2 and above barely need
+     * outputs are already sorted runs, so a group of them barely needs
      * one. See CompactionConfig.sortedHeapBytes for the full argument.
      */
     val heapBudgetExceeded: Long = 0,

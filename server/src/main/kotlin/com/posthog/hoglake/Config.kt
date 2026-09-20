@@ -89,14 +89,43 @@ data class Config(
      * construction: tiny bites (see the batch knobs), never a storm.
      */
     val compactionIntervalMs: Long = env("HOGLAKE_COMPACTION_INTERVAL_MS", "0").toLong(),
-    /** Final compaction size; intermediate tiers divide this repeatedly by the tier target. */
+    /** The size a compaction group packs to, in one rewrite. */
     val compactionTargetBytes: Long = env("HOGLAKE_COMPACTION_TARGET_BYTES", "${512L * 1024 * 1024}").toLong(),
     /**
-     * Geometric tier ratio and maximum fan-in, >= 2. Default 8 gives
-     * ...128 KiB -> 1 MiB -> 8 MiB -> 64 MiB -> 512 MiB. Merge only
-     * the minimal prefix reaching a quota, then repeat on the remainder.
+     * The MOST files a compaction group is asked to hold to be worth
+     * rewriting — a ceiling on the requirement, not a fixed one. A group
+     * whose files are too large for this many to fit under the target is
+     * judged against what does fit, never fewer than 2.
+     *
+     * A write-amplification knob. Compaction terminates at any value
+     * >= 2, because a group turns N >= 2 files into exactly one and the
+     * bucket's file count strictly decreases. What a low value costs is
+     * rewriting the same bytes repeatedly on the way to the target:
+     * compression puts every output back under the target, so it is a
+     * candidate again, and at 2 that converges on the target from below
+     * one rewrite at a time — roughly 4x the bytes moved, against about
+     * 2x at 5. That is the ladder this replaced, by another name; on
+     * gigahog-dev it read as `2 -> 1 files, 121 MiB -> 121 MiB` every
+     * couple of minutes on a catalog with no ingest at all.
+     *
+     * 5 matches Iceberg's `min-input-files`. See
+     * CompactionGrouping.groups.
      */
-    val compactionTierTarget: Int = env("HOGLAKE_COMPACTION_TIER_TARGET", "8").toInt(),
+    val compactionMinInputFiles: Int =
+        env(
+            "HOGLAKE_COMPACTION_MIN_INPUT_FILES",
+            "${com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MIN_INPUT_FILES}",
+        ).toInt(),
+    /**
+     * Fan-in cap for one group. Closes a group whose bytes would never
+     * reach the target, which is what lets a partition of tiny files
+     * consolidate at all. See CompactionGrouping.groups.
+     */
+    val compactionMaxInputFiles: Int =
+        env(
+            "HOGLAKE_COMPACTION_MAX_INPUT_FILES",
+            "${com.posthog.hoglake.compaction.CompactionGrouping.DEFAULT_MAX_INPUT_FILES}",
+        ).toInt(),
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
     /**
@@ -157,9 +186,10 @@ data class Config(
      * and implemented on the server's runtime classpath; an unknown one
      * is refused at boot.
      *
-     * Not a per-file detail: the tier ladder rewrites a table's hot rows
-     * once per tier, each output feeding the next tier's input, so this
-     * is the codec a fully compacted table is stored and scanned under.
+     * Not a per-file detail: compaction rewrites a table's rows into
+     * target-sized files and then leaves them alone, so this is the
+     * codec a compacted table is stored and scanned under from that
+     * point on.
      * See ParquetRewriter.OutputCodec for the zstd-over-snappy argument.
      */
     val compactionCodec: String =
@@ -180,7 +210,32 @@ data class Config(
     val maintenanceSummaryBatch: Int = env("HOGLAKE_MAINTENANCE_SUMMARY_BATCH", "10000").toInt(),
     val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
+    init {
+        // A knob that was REMOVED must not be silently ignored. `env()`
+        // is getenv-with-a-default and has no notion of an unknown key,
+        // so a values file still pinning HOGLAKE_COMPACTION_TIER_TARGET
+        // would boot clean and quietly run different defaults — the
+        // geometric ladder it configured is gone, and its old value of 8
+        // is now neither the fan-in nor anything else. Fail at boot and
+        // name the replacements instead.
+        REMOVED_ENV.forEach { (key, replacement) ->
+            require(System.getenv(key) == null) {
+                "$key was removed: $replacement"
+            }
+        }
+    }
+
     companion object {
+        /** Env vars that no longer exist, and what replaced them. */
+        private val REMOVED_ENV =
+            mapOf(
+                "HOGLAKE_COMPACTION_TIER_TARGET" to
+                    "compaction no longer uses a geometric size-tier ladder. Use " +
+                    "HOGLAKE_COMPACTION_MIN_INPUT_FILES (default 5) and " +
+                    "HOGLAKE_COMPACTION_MAX_INPUT_FILES (default 64); the old value of 8 " +
+                    "maps to neither.",
+            )
+
         private fun env(
             name: String,
             default: String,
