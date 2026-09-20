@@ -538,8 +538,15 @@ class CompactionService(
      * per table that has ever been refused; the planner is the only
      * writer, but a manual sweep and the loop can plan concurrently, so
      * it is a concurrent map.
+     *
+     * Keyed by (catalog, table), NOT table alone. `table_id` is scoped
+     * per catalog -- every catalog has a table 1 -- so a table-only key
+     * let each non-refusing catalog's sweep `remove` the entry a refusing
+     * catalog had just written. The result in production was the exact
+     * per-sweep warning this map exists to stop: 302 identical lines in
+     * 17 hours for one unchanged refusal.
      */
-    private val lastHeapRefusal = java.util.concurrent.ConcurrentHashMap<Long, String>()
+    private val lastHeapRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
 
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
@@ -763,10 +770,10 @@ class CompactionService(
         // warnings -- 235 KB -- in three minutes for a single table. Log
         // when the picture CHANGES; the metric below carries the rest.
         if (refused.isEmpty()) {
-            lastHeapRefusal.remove(ctx.tableId)
+            lastHeapRefusal.remove(ctx.catalogId to ctx.tableId)
         }
         val signature = "${refused.size}/${refused.maxOfOrNull { it.survivingRecords } ?: 0}/$ceiling"
-        if (refused.isNotEmpty() && lastHeapRefusal.put(ctx.tableId, signature) != signature) {
+        if (refused.isNotEmpty() && lastHeapRefusal.put(ctx.catalogId to ctx.tableId, signature) != signature) {
             log.warn {
                 "compaction refused ${refused.size} planned group(s) of " +
                     "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +

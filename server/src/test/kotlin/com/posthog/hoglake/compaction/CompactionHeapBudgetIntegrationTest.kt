@@ -1,5 +1,9 @@
 package com.posthog.hoglake.compaction
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.LoggerContext
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.AppenderBase
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.AlterOp
@@ -34,8 +38,10 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.slf4j.LoggerFactory
 import org.testcontainers.containers.MinIOContainer
 import java.nio.file.Files
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -409,6 +415,58 @@ class CompactionHeapBudgetIntegrationTest {
      * parquet, so the objects need not exist — and where a group must not
      * execute, their absence is what proves it did not.
      */
+
+    @Test
+    fun `a permanent refusal is logged once, even when other catalogs plan in between`() {
+        // The refusal warning is rate-limited to fire only when a table's
+        // refusal picture CHANGES. That state is keyed by (catalog, table)
+        // — and the catalog half is load-bearing, because table_id is
+        // scoped per catalog: every catalog's first table is table 1.
+        // Keyed by table alone, each OTHER catalog's sweep, finding
+        // nothing refused, cleared the refusing catalog's entry, and the
+        // warning fired on every sweep. Production: 302 identical lines
+        // in 17 hours for one unchanged refusal. This is that sequence.
+        val ceiling = 1024L
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(ceiling),
+            )
+        val svc = CompactionService(db.jdbi, store, cfg)
+        // Refused: two 900-row files per group against a 1024-row ceiling.
+        val refusing = sortedTable("refused-once", files = 4, bytesEach = 1024, recordsEach = 900)
+        // Innocent: same shape, table 1, nothing over the ceiling.
+        val innocent = sortedTable("innocent", files = 4, bytesEach = 1024, recordsEach = 100, sort = false)
+
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(CompactionService::class.java) as Logger
+        logger.addAppender(appender)
+        try {
+            repeat(3) {
+                assertThat(svc.planTable(refusing, "ns", "t", cfg).heapRefusedGroups).isEqualTo(2)
+                assertThat(svc.planTable(innocent, "ns", "t", cfg).heapRefusedGroups).isZero()
+            }
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+        val warnings = events.filter { it.formattedMessage.contains("compaction refused") }
+        assertThat(warnings)
+            .describedAs("one unchanged refusal, planned three times with another catalog in between, logs ONCE")
+            .hasSize(1)
+    }
+
     private fun sortedTable(
         label: String,
         files: Int,
