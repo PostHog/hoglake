@@ -12,6 +12,7 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import pyarrow.parquet as pq
+from pyhoglake import ReconciliationRequiredError
 
 from .buffering import BufferPolicy
 from .discovery import discover_window
@@ -21,7 +22,12 @@ from .duckdb_writer import (
     write_duckdb_event_partition,
 )
 from .events import EventTransform
-from .halts import DataIntegrityError, IncarnationChangedError, SplitBrainError
+from .halts import (
+    DataIntegrityError,
+    DeletesPresentError,
+    IncarnationChangedError,
+    SplitBrainError,
+)
 from .pending import PendingStore, Work
 from .scheduler import FlushScheduler
 from .window import plan_window
@@ -213,7 +219,12 @@ class BufferedIngestion:
         )
         result = None
         if window is not None:
-            plan = self.source.changes(window.from_snapshot, window.to_snapshot)
+            try:
+                plan = self.source.changes(window.from_snapshot, window.to_snapshot)
+            except ReconciliationRequiredError as error:
+                raise DeletesPresentError(
+                    f"source changefeed requires reconciliation: {error}"
+                ) from error
             if (plan.from_snapshot, plan.to_snapshot) != (
                 window.from_snapshot,
                 window.to_snapshot,

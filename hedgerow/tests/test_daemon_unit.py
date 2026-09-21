@@ -720,3 +720,21 @@ def test_metrics_port_zero_is_null_metrics():
     from hedgerow.metrics import NullMetrics, build_metrics
 
     assert isinstance(build_metrics(MetricsConfig(port=0)), NullMetrics)
+
+
+def test_truncate_halts_without_advancing_checkpoint(monkeypatch):
+    from pyhoglake import ReconciliationRequiredError
+
+    env = build_env(files={1: src_data([1])}, head=1)
+    env.daemon.run_once()
+    before = env.offset()
+    env.source_catalog.head_snapshot_id = 2
+
+    def truncated(*args):
+        raise ReconciliationRequiredError("reconciliation_required", status_code=409)
+
+    monkeypatch.setattr(env.source_table, "changes", truncated)
+    with pytest.raises(DeletesPresentError, match="reconciliation"):
+        env.daemon.run_once()
+    assert env.offset() == before
+    assert env.dest_table.total_rows == 1

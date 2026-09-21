@@ -64,6 +64,7 @@ from pyhoglake import (
     HoglakeClient,
     NotFoundError,
     OffsetRegressionError,
+    ReconciliationRequiredError,
     ValidationError,
 )
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
@@ -323,6 +324,10 @@ class Hedgerow:
 
         try:
             plan = source_table.changes(win.from_snapshot, win.to_snapshot)
+        except ReconciliationRequiredError as e:
+            raise DeletesPresentError(
+                f"source changefeed requires reconciliation: {e}"
+            ) from e
         except ExpiredError as e:
             # Lesson #4: never skip a gap silently.
             raise FeedExpiredError(

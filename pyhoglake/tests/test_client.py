@@ -13,6 +13,7 @@ from pyhoglake import (
     HoglakeClient,
     NotFoundError,
     OffsetRegressionError,
+    ReconciliationRequiredError,
     ValidationError,
     ops,
 )
@@ -850,3 +851,16 @@ def test_3xx_is_a_typed_error_never_success(client, httpx_mock):
     assert "302" in str(ei.value)
     assert "redirect" in ei.value.message
     assert "elsewhere.test" in (ei.value.detail or "")
+
+
+def test_changes_truncate_requires_reconciliation(client, httpx_mock):
+    table = _table(client, httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/changes?from_snapshot=3",
+        status_code=409,
+        json={"error": "reconciliation_required", "detail": "Reconcile after truncate"},
+    )
+    with pytest.raises(ReconciliationRequiredError, match="Reconcile") as failure:
+        table.changes(3)
+    assert failure.value.retryable is False

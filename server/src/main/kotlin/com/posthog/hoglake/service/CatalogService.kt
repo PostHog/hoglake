@@ -346,6 +346,7 @@ class CatalogService(private val jdbi: Jdbi) {
         catalog: String,
         namespace: String,
         table: String,
+        expectedTableUuid: UUID? = null,
     ): CommitResult =
         Audit.audited(
             "table_drop",
@@ -360,6 +361,9 @@ class CatalogService(private val jdbi: Jdbi) {
                 val t =
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                         ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
+                if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
+                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
                 SnapshotRepo.insertChange(
@@ -379,6 +383,36 @@ class CatalogService(private val jdbi: Jdbi) {
                 // drop snapshot falls under the retention floor.
                 FileRepo.endLiveDeleteFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
                 FileRepo.endLiveFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
+                CommitResult(snapshotId = alloc.snapshotId, schemaVersion = alloc.schemaVersion)
+            }
+        }
+
+    /** A DDL barrier: stale snapshot-based writers conflict; blind appends follow lock order. */
+    fun truncateTable(
+        catalog: String,
+        namespace: String,
+        table: String,
+        expectedTableUuid: UUID,
+    ): CommitResult =
+        Audit.audited("table_truncate", catalog, "$namespace.$table", detail = { "snapshot=${it.snapshotId}" }) {
+            jdbi.inTransactionUnchecked { h ->
+                val cat = requireCatalog(h, catalog)
+                Locks.acquireCatalogCommitLock(h, cat.catalogId)
+                val ns = requireNamespace(h, cat, namespace)
+                val t =
+                    TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
+                        ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
+                if (t.tableUuid != expectedTableUuid) {
+                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                }
+                val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
+                SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+                // Reuse the DDL conflict barrier, without changing the table's versioned metadata.
+                SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_ALTERED, t.tableId)
+                SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DELETED_FROM, t.tableId)
+                FileRepo.endLiveDeleteFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
+                FileRepo.endLiveFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
+                // Keep the row-id allocator: truncation must never reuse historical row IDs.
                 CommitResult(snapshotId = alloc.snapshotId, schemaVersion = alloc.schemaVersion)
             }
         }
@@ -657,7 +691,9 @@ class CatalogService(private val jdbi: Jdbi) {
         fromSnapshot: Long,
         toSnapshot: Long? = null,
     ): ChangesPlan =
-        jdbi.withHandleUnchecked { h ->
+        jdbi.inTransactionUnchecked { h ->
+            // Keep the retention floor, truncate barriers and file plan on one MVCC snapshot.
+            h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             val cat = requireCatalog(h, catalog)
             val to = resolveSnapshot(cat, toSnapshot)
             if (fromSnapshot < 0) {
@@ -684,6 +720,34 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
+            // TRUNCATE has no newly registered DV to carry its deletion through this
+            // append-oriented feed. The paired change kinds identify its DDL barrier.
+            val truncated =
+                h.createQuery(
+                    """
+                    SELECT c.snapshot_id FROM hog_snapshot_change c
+                    WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
+                      AND c.kind = 'table_deleted_from'
+                      AND c.snapshot_id > :fromSnapshot AND c.snapshot_id <= :toSnapshot
+                      AND EXISTS (
+                        SELECT 1 FROM hog_snapshot_change ddl
+                        WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
+                          AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
+                    ORDER BY c.snapshot_id LIMIT 1
+                    """,
+                ).bind("catalogId", cat.catalogId)
+                    .bind("tableId", t.tableId)
+                    .bind("fromSnapshot", fromSnapshot)
+                    .bind("toSnapshot", to)
+                    .mapTo(Long::class.java)
+                    .findOne()
+            if (truncated.isPresent) {
+                throw HoglakeException.ReconciliationRequired(
+                    "table '$namespace.$table' was truncated at snapshot ${truncated.get()}; " +
+                        "changefeed window ($fromSnapshot, $to] cannot represent this deletion. " +
+                        "Reconcile the destination from a full snapshot before advancing its checkpoint.",
+                )
+            }
             ChangesPlan(
                 tableUuid = t.tableUuid,
                 fromSnapshot = fromSnapshot,

@@ -153,3 +153,53 @@ stays with the CDC machinery that understands lineage.
 - **Conformance testing**: phase 4 grows a two-way suite — hoglake
   writes / Trino reads (v1 gate), and Trino writes-via-adapter /
   hoglake + Trino read-back (gate for enabling 2b in anger).
+
+### Guarded table lifecycle
+
+The `guarded-table-lifecycle-v1` catalog capability advertises an
+`expected_table_uuid` query parameter on table DELETE and POST `/alter`, and
+POST `/truncate` (where the UUID is required). The guard is checked after name
+resolution under the catalog commit lock; a mismatch returns 409. Existing
+clients that omit the optional guard on DELETE/alter retain their old behavior.
+DuckDB and the console need no lifecycle-request changes; they do not
+acquire the guarded guarantee until they send the UUID. Truncate is available
+through REST and the paired Trino connector change.
+
+Same-namespace rename preserves identity, files, schema and retained history.
+Truncate ends live data-file and deletion-vector visibility in one snapshot,
+without recreating the table or changing its UUID, schema, partition/sort specs,
+properties or row-id allocator. DROP and TRUNCATE perform no object-storage
+removal; normal retention/expiry/cleanup policy still applies later.
+
+Truncate records `table_altered` as the existing DDL conflict barrier and
+`table_deleted_from` for change tracking. An INSERT committed before truncate
+is cleared. A snapshot-based INSERT planned before truncate but committed after
+it conflicts; a fresh INSERT can commit normally. Legacy blind appends follow
+catalog commit order. A committed append's durable receipt can still be replayed
+after rename, truncate or drop without appending again or resurrecting a table.
+
+Lifecycle requests have no durable operation receipt. A lost response, malformed
+success response or server failure can leave the outcome unknown. Do not retry
+these operations automatically or infer their outcome from a reused name.
+In particular, replaying TRUNCATE could erase intervening INSERTs. Inspect table
+identity and snapshot history before deciding on a new SQL operation. Append
+receipt recovery does not confer lifecycle idempotency.
+
+Deploy the server capability before enabling the paired Trino connector, which
+refuses lifecycle SQL on servers without it. Cross-schema rename remains unsupported.
+
+
+Changefeed windows `(from_snapshot, to_snapshot]` crossing TRUNCATE return
+HTTP 409 `reconciliation_required`: ending old files creates no new deletion
+vector, so returning an empty append plan would silently lose the deletion.
+The guard uses the paired `table_altered`/`table_deleted_from` snapshot records
+for the resolved table identity. Historical windows ending before truncate and
+windows starting at or after it remain available. A consumer must reconcile its
+destination from a full snapshot before explicitly advancing to that snapshot;
+this is not an instruction to skip the rejected window. Pyhoglake exposes a
+non-retryable `ReconciliationRequiredError`; both Hedgerow modes halt without
+checkpointing the rejected window. Older clients receive an HTTP error rather
+than an apparently successful empty plan. DuckDB and the console do not gain
+new changefeed behavior; any caller of `/changes` must honor this refusal.
+Ship the updated pyhoglake package with the updated Hedgerow package; the server
+refusal also protects older consumers, which receive a permanent HTTP error.

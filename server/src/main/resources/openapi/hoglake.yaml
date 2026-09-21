@@ -240,6 +240,10 @@ paths:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: expected_table_uuid
+          description: Optional incarnation guard, checked under the commit lock; mismatch returns 409.
+          schema: { type: string, format: uuid }
       responses:
         "200":
           description: Dropped; returns the snapshot that recorded it
@@ -247,6 +251,39 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/truncate:
+    post:
+      operationId: truncateTable
+      summary: Atomically end visibility of all live data files and deletion vectors
+      description: >
+        Preserves table UUID, metadata and row-id allocation. Retained snapshots
+        remain readable; no objects are physically deleted by this operation.
+        Serializes with INSERT under the catalog commit lock and records
+        table_altered plus table_deleted_from. Snapshot-based writers planned
+        before truncation conflict if they commit afterward; blind appends follow
+        commit order. This operation is not idempotent: after an ambiguous response,
+        do not automatically retry, because a retry could erase intervening inserts.
+        Advertised by the guarded-table-lifecycle-v1 catalog capability.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: expected_table_uuid
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Truncated; returns the publication snapshot
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "400":
+          description: Missing or invalid expected_table_uuid
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
     post:
@@ -260,6 +297,10 @@ paths:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
+        - in: query
+          name: expected_table_uuid
+          description: Optional incarnation guard, checked under the commit lock; mismatch returns 409.
+          schema: { type: string, format: uuid }
       requestBody:
         required: true
         content:
@@ -447,6 +488,16 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ChangePlan" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            reconciliation_required — the window crosses a TRUNCATE that this
+            append-oriented feed cannot represent. Reconcile the destination
+            from a full snapshot before advancing its checkpoint. Do not retry
+            or skip the window automatically. The lower bound is exclusive:
+            windows starting at the reconciled truncate snapshot are allowed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "410":
           description: >
             from_snapshot falls below the catalog's expiry floor
@@ -1607,7 +1658,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: Includes atomic-table-creation-v1 and idempotent-append-v1 when supported }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1 and guarded-table-lifecycle-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:

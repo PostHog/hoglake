@@ -133,6 +133,20 @@ fun Application.installApiRoutes(
                                         call.catalog(),
                                         call.namespace(),
                                         call.table(),
+                                        call.expectedTableUuid(),
+                                    ).toDto(),
+                                )
+                            }
+                            post("/truncate") {
+                                val expected =
+                                    call.expectedTableUuid()
+                                        ?: throw BadRequestException("expected_table_uuid is required")
+                                call.respond(
+                                    catalogs.truncateTable(
+                                        call.catalog(),
+                                        call.namespace(),
+                                        call.table(),
+                                        expected,
                                     ).toDto(),
                                 )
                             }
@@ -371,4 +385,17 @@ private fun ApplicationCall.instantQuery(name: String): Instant? =
                 "query parameter '$name' must be an ISO-8601 instant, got '$it'",
             )
         }
+    }
+
+/** Optional on legacy DDL endpoints; mandatory for truncate. */
+internal fun ApplicationCall.expectedTableUuid(): UUID? {
+    val raw = request.queryParameters["expected_table_uuid"] ?: return null
+    return parseExpectedTableUuid(raw)
+}
+
+internal fun parseExpectedTableUuid(raw: String): UUID =
+    try {
+        UUID.fromString(raw)
+    } catch (_: IllegalArgumentException) {
+        throw BadRequestException("expected_table_uuid must be a UUID")
     }

@@ -30,6 +30,7 @@ from .errors import (
     IncarnationChangedError,
     NotFoundError,
     OffsetRegressionError,
+    ReconciliationRequiredError,
     ValidationError,
 )
 from .models import (
@@ -296,7 +297,9 @@ class HoglakeClient:
         except Exception:  # noqa: BLE001  # any body-parse failure falls back to raw text
             detail = resp.text[:500] or None
         cls: type[HoglakeError]
-        if resp.status_code == 404:
+        if resp.status_code == 409 and message == "reconciliation_required":
+            cls = ReconciliationRequiredError
+        elif resp.status_code == 404:
             cls = NotFoundError
         elif resp.status_code == 409:
             cls = conflict
@@ -691,7 +694,8 @@ class Table:
         """Changefeed plan for rows appended in (from_snapshot, to_snapshot].
 
         Raises :class:`ExpiredError` (410) when part of the range has been
-        expired — reconcile from a full scan.
+        expired — reconcile from a full scan. A window crossing TRUNCATE raises
+        :class:`ReconciliationRequiredError` (409); reconcile before checkpointing.
         """
         body = self._namespace._catalog._client._request(
             "GET",
