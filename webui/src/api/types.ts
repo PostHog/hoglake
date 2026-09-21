@@ -217,6 +217,12 @@ export interface Table {
   file_size_bytes: Int64;
   partition_spec?: PartitionSpec;
   sort_spec?: SortSpec;
+  /**
+   * The snapshot a create/alter DDL commit just made; absent on reads
+   * (getTable resolves an arbitrary snapshot), so its presence means
+   * "this Table came with a fresh DDL pin".
+   */
+  snapshot_id?: Int64;
 }
 
 export type StatsState = "provided" | "pending" | "failed";

@@ -358,6 +358,7 @@ class CatalogService(private val jdbi: Jdbi) {
             recordCount = 0,
             fileCount = 0,
             fileSizeBytes = 0,
+            snapshotId = alloc.snapshotId,
         )
     }
 

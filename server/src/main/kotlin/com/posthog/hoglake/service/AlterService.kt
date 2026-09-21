@@ -142,6 +142,7 @@ class AlterService(private val jdbi: Jdbi) {
                     fileSizeBytes = agg.fileSizeBytes,
                     partitionSpec = state.spec,
                     sortSpec = state.sortSpec,
+                    snapshotId = alloc.snapshotId,
                 )
             }
         }

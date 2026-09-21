@@ -194,15 +194,23 @@ finding 3). Two rules keep this honest instead of quietly broken:
    in the transaction are freely writable.
 2. **Tables created or altered inside the transaction read at the
    post-DDL snapshot**, not the (older) transaction pin: their entry
-   carries a fixed `read_travel` of the head observed right after the
-   DDL. Without this, SELECT after CREATE in the same transaction
+   carries a fixed `read_travel` of the snapshot the DDL response
+   returned. Without this, SELECT after CREATE in the same transaction
    404s (the pin predates the table). The rest of the transaction
-   keeps the original pin. Because the create/alter wire responses
-   carry no snapshot id (unlike drop — server finding 9), "right
-   after" is a separate GET /catalogs/{c}: a foreign commit landing
-   inside that one-RTT window becomes visible through the DDL-touched
-   entry. Unfixable client-side; the entry's travel already includes
-   every foreign commit between the pin and the DDL by design.
+   keeps the original pin. Because the create/alter responses carry
+   `snapshot_id` (hoglake#35 — drop always did), the pin is the DDL
+   commit's own snapshot: deterministic, not a separate GET
+   /catalogs/{c} head read that a foreign commit could land inside.
+   (Fallback for a pre-#35 server with no `snapshot_id`: the old head
+   read, accepting that race.) The entry's travel already includes
+   every foreign commit between the pin and the DDL by design. One
+   behavior the head read did not have: a pinned DDL snapshot can fall
+   BELOW the expiry floor if the retention sweep advances it between
+   the DDL commit and this transaction's first read, and then the read
+   410s (Expired). The old head read was always >= the floor by
+   construction. That is the intended trade for determinism — a table
+   whose creating snapshot has already expired is not meaningfully
+   readable — but it is a change worth naming here, not just in code.
 
 CREATE TABLE AS works: eager create, then buffered insert committing
 on COMMIT (the CTAS child plan is cast to the wire types first —
@@ -463,11 +471,16 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    preserve row identity (ducklake preserves; hoglake UPDATE assigns
    new row ids). If preserved-rowid updates matter, the commit needs
    the flag (plus the row-id-tiling exemption compaction outputs get).
-8. `POST .../tables/{t}` (create) and `.../alter` responses carry no
+8. ~~`POST .../tables/{t}` (create) and `.../alter` responses carry no
    snapshot_id (drop's CommitResult does): the client cannot learn its
    own DDL commit's snapshot and papers over it with a racy
    GET /catalogs — return CommitResult-style snapshot info on
-   create/alter for a deterministic post-DDL read pin.
+   create/alter for a deterministic post-DDL read pin.~~
+   **CLOSED** (hoglake#35). Both responses now carry `snapshot_id` —
+   the snapshot the DDL commit just allocated — so the client pins
+   post-DDL reads to it directly instead of racing a GET /catalogs
+   head read. `PostDDLTravel` uses the returned snapshot and keeps the
+   head read only as a fallback for a server old enough not to send it.
 9. ~~The server does NOT enforce the `_hog` reserved column prefix~~
    **CLOSED.** `Identifiers.validateColumn` reserves the prefix at
    every nesting level, on create, add_column and rename_column, and

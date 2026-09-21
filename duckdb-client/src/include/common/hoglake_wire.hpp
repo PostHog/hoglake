@@ -74,6 +74,11 @@ struct HoglakeTableInfo {
 	HoglakePartitionSpec partition_spec;
 	bool has_sort_spec = false;
 	HoglakeSortSpec sort_spec;
+	//! The snapshot a create/alter DDL commit just made; absent (-1) on a
+	//! read (GetTable resolves an arbitrary snapshot), so has_snapshot_id
+	//! distinguishes "came with a fresh DDL pin" from a plain read.
+	bool has_snapshot_id = false;
+	int64_t snapshot_id = -1;
 };
 
 struct HoglakeTableSummary {

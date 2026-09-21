@@ -182,10 +182,13 @@ def test_create_table_body_shape(client, httpx_mock):
     cat = _catalog(client, httpx_mock)
     from pyhoglake.client import Namespace
 
+    # A create is a DDL commit: the response names the snapshot it made
+    # (#35), so a post-create read can pin to it.
+    created = dict(TABLE_WIRE, snapshot_id=7)
     httpx_mock.add_response(
         method="POST",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
-        json=TABLE_WIRE,
+        json=created,
         status_code=201,
     )
     schema = pa.schema(
@@ -196,6 +199,7 @@ def test_create_table_body_shape(client, httpx_mock):
         ]
     )
     t = Namespace(cat, "ns1").create_table("events", schema)
+    assert t.snapshot_id == 7  # the create's own snapshot
     body = json.loads(httpx_mock.get_requests()[-1].content)
     assert body == {
         "name": "events",
@@ -329,12 +333,15 @@ def test_create_table_reserved_hog_column_fast_fails(client, httpx_mock):
 
 def test_get_table_time_travel_params(client, httpx_mock):
     t = _table(client, httpx_mock)
+    # TABLE_WIRE carries no snapshot_id: a READ parses it to None, so a
+    # client can tell a plain read apart from a fresh DDL pin (#35).
+    assert t.snapshot_id is None
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events?snapshot=3",
         json=TABLE_WIRE,
     )
-    t.info(snapshot=3)
+    assert t.info(snapshot=3).snapshot_id is None
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events?at_timestamp=2026-09-04T12%3A00%3A00",
@@ -420,6 +427,9 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
             "nullable": True,
         }
     ]
+    # An alter is a DDL commit: the response names the snapshot it made
+    # (#35), so a post-alter read can pin to it.
+    altered["snapshot_id"] = 11
     httpx_mock.add_response(method="POST", url=url, json=altered)
     info = t.alter(
         [
@@ -452,6 +462,19 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
     }
     assert len(info.columns) == 3
     assert t.columns[2].name == "score"  # cached info updated
+    assert info.snapshot_id == 11  # the alter's own snapshot
+    assert t.snapshot_id == 11  # cached TableInfo refreshed by alter()
+
+    # A later info() refresh carries no snapshot_id, but the pin is sticky:
+    # a pin to an earlier snapshot stays valid after a read, so the refresh
+    # must not silently drop it back to a racy head read.
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=TABLE_WIRE,  # no snapshot_id — a plain read
+    )
+    t.info()
+    assert t.snapshot_id == 11  # still pinned, not None
 
     httpx_mock.add_response(
         method="POST", url=url, json={"error": "conflict"}, status_code=409
@@ -469,6 +492,15 @@ def test_alter_wire_shape_and_errors(client, httpx_mock):
 
 def test_drop_table(client, httpx_mock):
     t = _table(client, httpx_mock)
+    # Give the table a DDL pin (via alter), so drop() has something to clear.
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+        json=dict(TABLE_WIRE, snapshot_id=8),
+    )
+    t.alter([ops.rename_column("name", "name2")])
+    assert t.snapshot_id == 8
+
     httpx_mock.add_response(
         method="DELETE",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
@@ -476,6 +508,45 @@ def test_drop_table(client, httpx_mock):
     )
     res = t.drop()
     assert res.snapshot_id == 9
+    # The table is gone; a pin to one of its snapshots would resolve a dead
+    # incarnation. drop() clears it.
+    assert t.snapshot_id is None
+
+
+def test_reads_auto_pin_to_the_ddl_snapshot(client, httpx_mock):
+    t = _table(client, httpx_mock)
+    # A DDL pin from an alter.
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter",
+        json=dict(TABLE_WIRE, snapshot_id=8),
+    )
+    t.alter([ops.rename_column("name", "name2")])
+
+    # files() with no explicit snapshot pins to the DDL snapshot (#35), so
+    # a create/alter followed by a read sees that DDL, not a racing head.
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/files?snapshot=8",
+        json=[DATA_FILE_WIRE],
+    )
+    assert t.files()[0].data_file_id == 10
+
+    # scan_plan() pins the same way.
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/scan?snapshot=8",
+        json=[{"data_file": DATA_FILE_WIRE}],
+    )
+    assert t.scan_plan()[0].data_file.data_file_id == 10
+
+    # An explicit snapshot still wins over the pin.
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/files?snapshot=3",
+        json=[DATA_FILE_WIRE],
+    )
+    assert t.files(snapshot=3)[0].data_file_id == 10
 
 
 # -- views ------------------------------------------------------------------

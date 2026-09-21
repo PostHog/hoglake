@@ -694,6 +694,20 @@ data class TableInfo(
     val sortSpec: SortSpec? = null,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
+    /**
+     * The snapshot this DDL commit just created — set ONLY by createTable
+     * and alterTable, where the snapshot is allocated in the same
+     * transaction. Null on every READ (getTable resolves an arbitrary
+     * snapshot; stamping it here would dress a read up as a commit).
+     *
+     * One producer is not a wire response: the internal createTable behind
+     * TableCreationService.publish also returns a snapshotId-bearing
+     * TableInfo, but publish consumes only its tableId/columns and never
+     * serializes it — so the invariant "snapshotId set ⟺ a create/alter
+     * wire receipt" holds today by construction, not by type. Do not take
+     * a TableInfo from that path and toDto() it.
+     */
+    val snapshotId: Long? = null,
 )
 
 data class Snapshot(

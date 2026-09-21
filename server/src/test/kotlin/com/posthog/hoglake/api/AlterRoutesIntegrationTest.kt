@@ -23,6 +23,7 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
@@ -126,6 +127,9 @@ class AlterRoutesIntegrationTest {
             assertThat(table["name"].asText()).isEqualTo("events")
             assertThat(table["namespace"].asText()).isEqualTo("ns")
             assertThat(table["table_uuid"].asText()).isNotBlank()
+            // An alter is a DDL commit: the response names the snapshot it
+            // just made (#35), so a post-alter read can pin to it.
+            assertThat(table["snapshot_id"].asLong()).isPositive()
             assertThat(table["record_count"].asLong()).isEqualTo(0)
             assertThat(table["file_count"].asLong()).isEqualTo(0)
             assertThat(table["file_size_bytes"].asLong()).isEqualTo(0)
@@ -163,6 +167,53 @@ class AlterRoutesIntegrationTest {
             assertThat(table.has("partition_spec")).isFalse()
             assertThat(table["columns"].map { it["name"].asText() })
                 .containsExactly("id", "occurred_at")
+        }
+
+    @Test
+    fun `alter returns its own snapshot - the new head, and the next alter's is one later`() =
+        api { client ->
+            val url = fixture()
+            val cat = url.split("/")[3]
+
+            // The fixture is at head 3 (catalog, namespace, table). The
+            // alter's snapshot_id must be the NEW head, not just any
+            // positive number — this is the value a client pins reads to.
+            val headBefore = catalogs.getCatalog(cat).headSnapshotId
+            val first = body(client.alterJson(url, """{"ops": [{"op": "rename_column", "from": "ts", "to": "a"}]}"""))
+            assertThat(first["snapshot_id"].asLong()).isEqualTo(headBefore + 1)
+            assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(headBefore + 1)
+
+            // A second alter commits its own snapshot, exactly one later —
+            // not the first's, not a stale head.
+            val second = body(client.alterJson(url, """{"ops": [{"op": "rename_column", "from": "a", "to": "b"}]}"""))
+            assertThat(second["snapshot_id"].asLong()).isEqualTo(headBefore + 2)
+        }
+
+    @Test
+    fun `alter snapshot_id is exact above 2^53`() =
+        api { client ->
+            // snapshot_id is an int64 on the wire; it must round-trip as an
+            // exact integer, not a Number-rounded one. Drive head to just
+            // under 2^53 and alter once, so the returned snapshot is
+            // 2^53 + 1 — the smallest value a JS Number cannot represent
+            // (its even neighbour 2^53 + 2 is representable, so this pins
+            // exactness rather than magnitude).
+            val url = fixture()
+            val cat = url.split("/")[3]
+            val big = 9007199254740992L // 2^53
+            db.jdbi.withHandleUnchecked { h ->
+                h.createUpdate(
+                    "UPDATE hog_catalog SET last_snapshot_id = :big WHERE name = :cat",
+                )
+                    .bind("big", big)
+                    .bind("cat", cat)
+                    .execute()
+            }
+            val altered = body(client.alterJson(url, """{"ops": [{"op": "rename_column", "from": "ts", "to": "a"}]}"""))
+            // 2^53 + 1 as text; asLong() would silently read the rounded
+            // double. The raw node must be integral and exact.
+            assertThat(altered["snapshot_id"].isIntegralNumber).isTrue()
+            assertThat(altered["snapshot_id"].asText()).isEqualTo("9007199254740993")
         }
 
     // ---- error shapes ----------------------------------------------------

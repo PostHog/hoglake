@@ -32,7 +32,7 @@ fun Application.installAlterRoutes(alter: AlterService) {
                     ops,
                     call.expectedTableUuid(),
                     call.longQuery("read_snapshot"),
-                ).toAlteredDto(),
+                ).toDto(),
             )
         }
     }
