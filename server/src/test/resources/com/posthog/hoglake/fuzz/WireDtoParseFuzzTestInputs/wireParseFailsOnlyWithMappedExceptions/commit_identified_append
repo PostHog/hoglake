@@ -1,0 +1,1 @@
+{"read_snapshot":3,"idempotency_key":"12345678-1234-5678-90ab-1234567890ab","appends":[{"namespace":"test","table":"target","expected_table_uuid":"12345678-1234-5678-90ab-1234567890ac","files":[{"path":"s3://synthetic/data/b.parquet","record_count":7,"file_size_bytes":700,"footer_size":80},{"path":"s3://synthetic/data/a.parquet","record_count":3,"file_size_bytes":300}]}]}
