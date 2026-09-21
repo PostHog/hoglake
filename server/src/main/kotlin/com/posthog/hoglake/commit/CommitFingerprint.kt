@@ -11,9 +11,10 @@ internal fun commitFingerprint(request: CommitRequest): String {
             append.copy(
                 files =
                     append.files.map { file ->
-                        file.copy(columnStats = file.columnStats?.sortedBy { it.fieldId })
-                    }.sortedBy { mapper.writeValueAsString(it) },
-            )
-        }.sortedBy { mapper.writeValueAsString(it) }
+                        val canonical = file.copy(columnStats = file.columnStats?.sortedBy { it.fieldId })
+                        mapper.writeValueAsString(canonical) to canonical
+                    }.sortedBy { it.first }.map { it.second },
+            ).let { mapper.writeValueAsString(it) to it }
+        }.sortedBy { it.first }.map { it.second }
     return mapper.writeValueAsString(request.copy(appends = appends))
 }

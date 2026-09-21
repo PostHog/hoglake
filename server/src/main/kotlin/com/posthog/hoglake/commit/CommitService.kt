@@ -99,8 +99,11 @@ class CommitService(
         val deletes = request.deletes.sumOf { it.files.size }
         val result =
             try {
+                // Canonicalizing large registrations needs neither a connection nor
+                // the catalog lock. Receipt comparison and publication stay locked.
+                val requestJson = request.idempotencyKey?.let { commitFingerprint(request) }
                 jdbi.inTransaction<CommitResult, RuntimeException> { handle ->
-                    doCommit(handle, catalog, request)
+                    doCommit(handle, catalog, request, requestJson)
                 }
             } catch (e: HoglakeException) {
                 Metrics.commitFailureResult(e)?.let { Metrics.commitRecorded(catalog, it) }
@@ -224,6 +227,7 @@ class CommitService(
         h: Handle,
         catalogName: String,
         req: CommitRequest,
+        requestJson: String?,
     ): CommitResult {
         // Resolve only the catalog before checking receipts. Replays must not
         // depend on current table, snapshot, or data-path validation.
@@ -238,7 +242,6 @@ class CommitService(
 
         // Under the same catalog lock as publication, so concurrent retries
         // cannot both allocate rows. A receipt is not tied to snapshot expiry.
-        val requestJson = req.idempotencyKey?.let { commitFingerprint(req) }
         req.idempotencyKey?.let { key ->
             val receipt =
                 h.createQuery(
