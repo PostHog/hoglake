@@ -1,5 +1,6 @@
 package com.posthog.hoglake.commit
 
+import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
@@ -137,6 +138,23 @@ class CommitService(
         return result
     }
 
+    /** A missing receipt is not a fence: an in-flight commit may still publish. */
+    fun receipt(
+        catalog: String,
+        operation: UUID,
+    ): CommitResult =
+        jdbi.withHandle<CommitResult, RuntimeException> { h ->
+            h.createQuery(
+                """
+                SELECT r.snapshot_id, r.schema_version FROM hog_commit_receipt r
+                JOIN hog_catalog c USING (catalog_id)
+                WHERE c.name = :catalog AND r.idempotency_key = :operation
+                """,
+            ).bind("catalog", catalog).bind("operation", operation)
+                .map { rs, _ -> CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version")) }
+                .findOne().orElseThrow { HoglakeException.NotFound("commit receipt '$operation'") }
+        }
+
     /** Register initial files in a caller-owned DDL snapshot, under the catalog lock. */
     internal fun registerInitialFiles(
         h: Handle,
@@ -207,38 +225,39 @@ class CommitService(
         catalogName: String,
         req: CommitRequest,
     ): CommitResult {
-        // 1. Resolve catalog, validate registration paths, then serialize
-        // the commit tail. Path validation runs BEFORE the lock: it is a
-        // pure function of the request and the catalog row, and a 422
-        // must not queue behind other writers.
+        // Resolve only the catalog before checking receipts. Replays must not
+        // depend on current table, snapshot, or data-path validation.
         val (catalogId, dataPath) =
             h.createQuery("SELECT catalog_id, data_path FROM hog_catalog WHERE name = ?")
                 .bind(0, catalogName)
                 .map { rs, _ -> rs.getLong(1) to rs.getString(2) }
                 .findOne()
                 .orElseThrow { HoglakeException.NotFound("catalog '$catalogName'") }
-        validatePathsUnderDataPath(dataPath, req)
+        if (req.idempotencyKey == null) validatePathsUnderDataPath(dataPath, req)
         Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
 
         // Under the same catalog lock as publication, so concurrent retries
         // cannot both allocate rows. A receipt is not tied to snapshot expiry.
-        val requestJson = req.idempotencyKey?.let { wireObjectMapper().writeValueAsString(req) }
+        val requestJson = req.idempotencyKey?.let { commitFingerprint(req) }
         req.idempotencyKey?.let { key ->
             val receipt =
                 h.createQuery(
                     """
-                    SELECT snapshot_id, schema_version, request = CAST(:request AS jsonb) AS matches
+                    SELECT snapshot_id, schema_version, request::text AS request
                     FROM hog_commit_receipt WHERE catalog_id = :catalog AND idempotency_key = :key
                     """,
-                ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+                ).bind("catalog", catalogId).bind("key", key)
                     .map { rs, _ ->
-                        if (!rs.getBoolean("matches")) {
+                        val stored = wireObjectMapper().readValue<CommitRequest>(rs.getString("request"))
+                        if (commitFingerprint(stored) != requestJson) {
                             throw HoglakeException.Validation("idempotency_key reused with a different request")
                         }
                         CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version"))
                     }.findOne().orElse(null)
             if (receipt != null) return receipt
         }
+
+        if (req.idempotencyKey != null) validatePathsUnderDataPath(dataPath, req)
 
         val catalogHead =
             h.createQuery(

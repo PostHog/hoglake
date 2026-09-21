@@ -1135,6 +1135,37 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
 
+  /catalogs/{catalog}/commit/receipts/{operation}:
+    get:
+      operationId: getCommitReceipt
+      summary: Look up a durable catalog-scoped commit receipt
+      description: >
+        Available with idempotent-append-v1. Uses the same deployment access
+        boundary as the catalog commit API. A 404 is not proof that an in-flight
+        request has stopped. Receipts survive rename, drop and snapshot expiry
+        and have no expiration. No file paths or request payload are returned.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - name: operation
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Committed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operation_id, snapshot_id, schema_version]
+                properties:
+                  operation_id: { type: string, format: uuid }
+                  snapshot_id: { type: integer, format: int64 }
+                  schema_version: { type: integer, format: int64 }
+        "400":
+          description: Invalid operation UUID
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /catalogs/{catalog}/commit/prepared:
     post:
       operationId: commitPrepared
@@ -1576,7 +1607,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: Includes atomic-table-creation-v1 when supported }
+        capabilities: { type: array, items: { type: string }, description: Includes atomic-table-creation-v1 and idempotent-append-v1 when supported }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1890,7 +1921,11 @@ components:
           type: string
           format: uuid
           description: >
-            Optional catalog-scoped publication identity. Exact request replays
+            Optional catalog-scoped publication identity (operation ID). With
+            idempotent-append-v1, append groups, files and column statistics use
+            canonical ordering; partition value ordering remains significant.
+            The complete payload, including read snapshot, target UUIDs, and all
+            registration fields, is compared. Equivalent request replays
             return the original result without writing, including after snapshot
             expiry. Reusing a key with a different request returns 422. Receipts
             are retained indefinitely. Persist the complete request before sending.

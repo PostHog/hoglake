@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
+import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
@@ -42,7 +43,23 @@ class WireDtoParseFuzzTest {
 
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->
             try {
-                dto.toModel()
+                val request = dto.toModel()
+                val fingerprint = commitFingerprint(request)
+                val reordered =
+                    request.copy(
+                        appends =
+                            request.appends.reversed().map {
+                                it.copy(
+                                    files =
+                                        it.files.reversed().map {
+                                                file ->
+                                            file.copy(columnStats = file.columnStats?.reversed())
+                                        },
+                                )
+                            },
+                    )
+                check(commitFingerprint(reordered) == fingerprint)
+                check(commitFingerprint(request.copy(readSnapshot = (request.readSnapshot ?: 0) xor 1)) != fingerprint)
             } catch (e: Exception) {
                 checkAllowed("CommitRequestDto", e)
             }

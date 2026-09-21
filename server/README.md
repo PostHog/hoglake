@@ -891,3 +891,29 @@ unversioned receipts remain readable and retryable.
 A supplied `footer_size` must be nonnegative and fit within `file_size_bytes - 8`
 for both initial publication and INSERT. Atomic publication requires this field;
 ordinary INSERT retains support for omitted footer metadata.
+
+### Recovering an INSERT response
+
+`idempotent-append-v1` advertises durable commit replay and
+`GET /v1/catalogs/{catalog}/commit/receipts/{operation}`. The operation is the
+existing optional `idempotency_key` UUID on `/commit`. Both the append and its
+full canonical request receipt commit in one PostgreSQL transaction under the
+catalog lock. Reusing a key with another payload returns 422. Receipts have no
+expiry or snapshot/table foreign key, so later writes, rename, drop and snapshot
+expiry cannot cause publication again. Existing receipts remain replayable.
+
+Canonical comparison orders append groups, their files and column statistics;
+partition value order remains significant. The read snapshot, expected table
+UUID, all registration fields, and remaining request metadata are included.
+A missing receipt does not fence an in-flight request. Retry only the identical
+payload with the same key; never infer permission to delete uploaded files.
+
+Deploy this server before enabling connector recovery. Older clients (Python,
+DuckDB, hedgerow and the console) retain their existing behavior and need no wire
+changes. `/commit/prepared` remains supported. Manual SQL reruns, query/task
+retries and orphan collection are outside this guarantee.
+
+The standalone server has no application authentication. Protect this lookup
+with the same authenticated deployment boundary and catalog authorization as
+`/commit`; catalog scoping alone is not authentication. This change does not
+introduce an authentication framework or authorize any deployment.

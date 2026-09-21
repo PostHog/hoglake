@@ -240,6 +240,17 @@ fun Application.installApiRoutes(
                     call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
                 }
 
+                get("/commit/receipts/{operation}") {
+                    val operation =
+                        try {
+                            UUID.fromString(call.parameters["operation"])
+                        } catch (_: IllegalArgumentException) {
+                            throw BadRequestException("invalid operation UUID")
+                        }
+                    val receipt = commits.receipt(call.catalog(), operation)
+                    call.respond(CommitReceiptDto(operation, receipt.snapshotId, receipt.schemaVersion))
+                }
+
                 post("/commit") {
                     val req = call.receive<CommitRequestDto>()
                     call.respond(commits.commit(call.catalog(), req.toModel()).toDto())

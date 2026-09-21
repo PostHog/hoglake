@@ -151,6 +151,84 @@ class CommitServiceTest {
         }
     }
 
+    @Test
+    fun `failed publication has no receipt and can retry unchanged`() {
+        seed()
+        val key = java.util.UUID.randomUUID()
+        val request =
+            CommitRequest(
+                idempotencyKey = key,
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/retry.parquet", 7)))),
+            )
+        jdbi.useHandle<Exception> { h ->
+            h.execute("ALTER TABLE hog_commit_receipt ADD CONSTRAINT fail_receipt CHECK (snapshot_id < 0)")
+        }
+        assertThatThrownBy { service.commit("cat", request) }.isInstanceOf(Exception::class.java)
+        assertThatThrownBy { service.receipt("cat", key) }.isInstanceOf(HoglakeException.NotFound::class.java)
+        jdbi.useHandle<Exception> { h ->
+            assertThat(h.createQuery("SELECT COUNT(*) FROM hog_data_file").mapTo(Long::class.java).one()).isZero()
+            assertThat(h.createQuery("SELECT last_snapshot_id FROM hog_catalog").mapTo(Long::class.java).one()).isZero()
+            h.execute("ALTER TABLE hog_commit_receipt DROP CONSTRAINT fail_receipt")
+        }
+        val result = service.commit("cat", request)
+        assertThat(service.receipt("cat", key)).isEqualTo(result)
+    }
+
+    @Test
+    fun `canonical replay survives new service table removal and snapshot expiry`() {
+        seed()
+        val key = java.util.UUID.randomUUID()
+        val files = listOf(file("s3://b/data/z.parquet", 7), file("s3://b/data/a.parquet", 11))
+        val request =
+            CommitRequest(
+                readSnapshot = 0,
+                idempotencyKey = key,
+                appends = listOf(TableAppend("ns", "events", files)),
+            )
+        val result = service.commit("cat", request)
+        // Simulate an existing pre-capability receipt with its original array ordering.
+        jdbi.useHandle<Exception> { h ->
+            h.createUpdate("UPDATE hog_commit_receipt SET request = CAST(:request AS jsonb)")
+                .bind("request", com.posthog.hoglake.wireObjectMapper().writeValueAsString(request)).execute()
+        }
+        val reordered = request.copy(appends = listOf(request.appends.single().copy(files = files.reversed())))
+        assertThat(CommitService(jdbi).commit("cat", reordered)).isEqualTo(result)
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/later.parquet", 3))))),
+        )
+        jdbi.useHandle<Exception> { h ->
+            assertThat(h.createQuery("SELECT COUNT(*) FROM hog_data_file").mapTo(Long::class.java).one()).isEqualTo(3)
+            assertThat(
+                h.createQuery("SELECT SUM(record_count) FROM hog_data_file").mapTo(Long::class.java).one(),
+            ).isEqualTo(21)
+            h.execute("UPDATE hog_table_version SET name = 'renamed'")
+        }
+        assertThat(service.commit("cat", reordered)).isEqualTo(result)
+        jdbi.useHandle<Exception> { h ->
+            h.execute("DELETE FROM hog_table_version")
+            h.execute("UPDATE hog_catalog SET earliest_snapshot_id = last_snapshot_id")
+            h.execute("DELETE FROM hog_snapshot_change")
+            h.execute("DELETE FROM hog_snapshot")
+        }
+        assertThat(CommitService(jdbi).commit("cat", reordered)).isEqualTo(result)
+        assertThat(CommitService(jdbi).receipt("cat", key)).isEqualTo(result)
+        assertThatThrownBy { service.receipt("other-catalog", key) }.isInstanceOf(HoglakeException.NotFound::class.java)
+        val changed =
+            listOf(
+                request.copy(readSnapshot = 1),
+                request.copy(
+                    appends = listOf(request.appends.single().copy(expectedTableUuid = java.util.UUID.randomUUID())),
+                ),
+                request.copy(
+                    appends = listOf(request.appends.single().copy(files = listOf(files.first().copy(footerSize = 1)))),
+                ),
+            )
+        changed.forEach { mismatch ->
+            assertThatThrownBy { service.commit("cat", mismatch) }.isInstanceOf(HoglakeException.Validation::class.java)
+        }
+    }
+
     /** Mint a snapshot with one change row via direct SQL (DDL simulation). */
     private fun seedChange(
         catalogId: Long,
