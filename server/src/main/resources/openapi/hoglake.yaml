@@ -167,6 +167,10 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
+        - in: query
+          name: expected_namespace_id
+          description: Optional namespace identity guard, checked under the commit lock; mismatch returns 409. Requires guarded-schema-evolution-v1.
+          schema: { type: integer, format: int64 }
       responses:
         "200":
           description: Dropped; returns the snapshot that recorded it
@@ -301,6 +305,10 @@ paths:
           name: expected_table_uuid
           description: Optional incarnation guard, checked under the commit lock; mismatch returns 409.
           schema: { type: string, format: uuid }
+        - in: query
+          name: read_snapshot
+          description: Optional DDL conflict basis. Under the commit lock, rejects table alterations since this snapshot with 409, expired history with 410, and negative or future snapshots with 422. Pair with expected_table_uuid. Requires guarded-schema-evolution-v1.
+          schema: { type: integer, format: int64, minimum: 0 }
       requestBody:
         required: true
         content:
@@ -319,14 +327,16 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
+        "410": { $ref: "#/components/responses/Gone" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
-            Conflict. rename_column additionally fails with error
+            Conflict. add_column and rename_column additionally fail with error
             `idless_files_present` while any LIVE data file of the table
             is flagged missing_field_ids (its parquet schema carries no
-            field ids): such files bind columns by name, so the rename
-            would silently NULL their history in readers. Rewrite
+            field ids): such files bind columns by name, so evolution
+            could misbind their history in readers. Files with pending or failed hydration also block both
+            operations until successfully hydrated. Rewrite
             (compact) or retire the id-less files first. rename_table is
             unaffected.
           content:
@@ -1672,7 +1682,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, guarded-table-lifecycle-v1 and atomic-table-replacement-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 and guarded-schema-evolution-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1727,9 +1737,10 @@ components:
 
     Namespace:
       type: object
-      required: [name]
+      required: [name, namespace_id]
       properties:
         name: { type: string }
+        namespace_id: { type: integer, format: int64, description: Stable identity; not reused after namespace deletion. }
 
     TableCreation:
       type: object

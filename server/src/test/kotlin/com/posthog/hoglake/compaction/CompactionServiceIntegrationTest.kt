@@ -1,6 +1,7 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ChangeKind
@@ -1087,6 +1088,7 @@ class CompactionServiceIntegrationTest {
                     ),
                 )
             }
+            Hydrator(db.jdbi, store).runOnce()
             assertThat(svc.planTable(cat, "ns", "t", cfg).groups)
                 .describedAs("%s: the file set IS groupable before the variant exists", label)
                 .isNotEmpty()
@@ -1762,6 +1764,7 @@ class CompactionServiceIntegrationTest {
             ),
         )
 
+        Hydrator(db.jdbi, store).runOnce()
         // The ALTER: id promotes to long, old drops, score arrives.
         alter.alterTable(
             cat,

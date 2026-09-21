@@ -451,6 +451,9 @@ class AlterServiceIntegrationTest {
             )
         }
         assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG))))
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        assertThatThrownBy {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
         }
             .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
@@ -537,13 +540,34 @@ class AlterServiceIntegrationTest {
             )
         }
         assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG))))
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        assertThatThrownBy {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
         }
             .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
             .hasMessageContaining("1 not-yet-hydrated")
         assertThat(catalogs.getTable(cat, ns, "t").columns.map { it.def.name }).contains("name")
 
-        // Hydration lands an id-bearing verdict: pending -> provided with
+        // Failure before reading the footer (for example, the whole-object cap)
+        // leaves missing_field_ids=false without ever verifying the IDs.
+        db.jdbi.withHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'failed' WHERE catalog_id = ? AND data_file_id = 1",
+                catId(cat),
+            )
+        }
+        val beforeFailureChecks = head(cat)
+        for (op in listOf(
+            AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG)),
+            AlterOp.RenameColumn("name", "label"),
+        )) {
+            assertThatThrownBy { alter.alterTable(cat, ns, "t", listOf(op)) }
+                .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        }
+        assertThat(head(cat)).isEqualTo(beforeFailureChecks)
+
+        // Hydration lands an id-bearing verdict: failed -> provided with
         // missing_field_ids=false. The rename is now allowed.
         db.jdbi.withHandleUnchecked { h ->
             h.execute(

@@ -223,7 +223,7 @@ class ObservabilityIntegrationTest {
             val alter =
                 client.postJson(
                     "/v1/catalogs/$catalog/namespaces/ns/tables/events/alter",
-                    """{"ops": [{"op": "add_column", "column": {"name": "extra", "type": "int"}}]}""",
+                    """{"ops": [{"op": "set_sort_order", "sort_fields": []}]}""",
                 )
             assertThat(alter.status).isEqualTo(HttpStatusCode.OK) // snapshot 4
             val conflicted =

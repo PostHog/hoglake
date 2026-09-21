@@ -211,6 +211,7 @@ class CatalogService(private val jdbi: Jdbi) {
     fun dropNamespace(
         catalog: String,
         namespace: String,
+        expectedNamespaceId: Long? = null,
     ): CommitResult =
         Audit.audited(
             "namespace_drop",
@@ -222,6 +223,9 @@ class CatalogService(private val jdbi: Jdbi) {
                 val cat = requireCatalog(h, catalog)
                 Locks.acquireCatalogCommitLock(h, cat.catalogId)
                 val ns = requireNamespace(h, cat, namespace)
+                if (expectedNamespaceId != null && ns.namespaceId != expectedNamespaceId) {
+                    throw HoglakeException.CommitConflict("namespace '$namespace' no longer has the expected identity")
+                }
                 // Emptiness under the commit lock: a concurrent createTable
                 // or createView into this namespace serializes behind the
                 // same lock, so the live sets read here are the live sets

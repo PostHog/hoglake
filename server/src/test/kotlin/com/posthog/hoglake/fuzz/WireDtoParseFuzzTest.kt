@@ -8,6 +8,7 @@ import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
+import com.posthog.hoglake.api.parseLongQuery
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.TableCreationDefinition
@@ -50,6 +51,16 @@ class WireDtoParseFuzzTest {
             check(parseExpectedTableUuid(uuid.toString()) == uuid)
         } catch (e: Exception) {
             checkAllowed("expected_table_uuid", e)
+        }
+
+        for (name in listOf("read_snapshot", "expected_namespace_id")) {
+            try {
+                val raw = data.toString(Charsets.UTF_8)
+                val value = parseLongQuery(name, raw)
+                check(raw.toLongOrNull() == value)
+            } catch (e: Exception) {
+                checkAllowed(name, e)
+            }
         }
 
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->

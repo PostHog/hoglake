@@ -238,3 +238,30 @@ start from the new UUID/snapshot; the transition is not an append-only change se
 The REST addition is opt-in: Python and DuckDB clients keep their existing creation
 behavior, while Hedgerow must reconcile identity changes. The console's existing
 history and dropped-incarnation views remain applicable.
+
+## Guarded SQL schema evolution
+
+The Trino connector's schema-evolution slice requires `guarded-schema-evolution-v1`;
+roll out the server to every replica first. Namespace responses now include the
+stable `namespace_id`. Optional `expected_namespace_id` on namespace deletion
+rejects name reuse under the catalog lock. Optional `read_snapshot` on `/alter`,
+paired with `expected_table_uuid`, rejects intervening table DDL and expired
+conflict history. Ordinary appends and changes to other tables do not conflict.
+Prepared replacement already checks target changes and namespace identity: an
+alteration committed first rejects replacement, and replacement committed first
+rejects an alteration using the old UUID.
+
+ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files and files
+with pending or failed hydration.
+Without IDs, an old file can contain a name being added (including DROP + ADD),
+and name-based readers could expose those old values under the new field ID.
+Hydrate, rewrite, or retire blocking files first. All clients using `/alter`
+(including Python, DuckDB and the console) receive `idless_files_present` for
+this unsafe case. Existing requests otherwise retain their semantics; the new
+guards are optional for legacy callers. Namespace identity is additive response
+metadata, which existing consumers may ignore. No mutation replay is introduced.
+
+Trino exposes nullable top-level ADD COLUMN, RENAME COLUMN, DROP COLUMN, CREATE
+SCHEMA and empty DROP SCHEMA. SQL type changes remain unsupported; the server's
+existing REST scalar-promotion policy is unchanged. No cascade, nested evolution,
+new writable types, partition/sort writes, defaults or property changes are added.

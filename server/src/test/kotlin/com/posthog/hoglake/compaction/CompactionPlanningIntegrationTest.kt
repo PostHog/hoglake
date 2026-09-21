@@ -309,7 +309,8 @@ class CompactionPlanningIntegrationTest {
     @Test
     fun `schema and candidate reads share a snapshot across concurrent alter and append`() {
         val cat = fixture()
-        append(cat, file("before-alter", 150)) // below the 250 quota alone
+        // Synthetic ID-bearing file with supplied stats; evolution must not race hydration.
+        append(cat, file("before-alter", 150).copy(columnStats = emptyList())) // below the 250 quota alone
         val changed = java.util.concurrent.atomic.AtomicBoolean(false)
         val instrumented = com.posthog.hoglake.Database.jdbi(db.dataSource)
         instrumented.setSqlLogger(
