@@ -59,7 +59,12 @@ data class CatalogDto(
     /** Expiry-floor snapshot's time; NON_NULL omits it until expiry first advances the floor. */
     val earliestSnapshotTime: Instant? = null,
     val capabilities: List<String> =
-        listOf("atomic-table-creation-v1", "idempotent-append-v1", "guarded-table-lifecycle-v1"),
+        listOf(
+            "atomic-table-creation-v1",
+            "idempotent-append-v1",
+            "guarded-table-lifecycle-v1",
+            "atomic-table-replacement-v1",
+        ),
     /**
      * Live totals from the metrics sampler's last pass — display
      * numbers, not a consistency primitive, and the same provenance as

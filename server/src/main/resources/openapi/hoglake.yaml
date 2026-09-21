@@ -1046,6 +1046,16 @@ paths:
                   minItems: 1
                   maxItems: 10000
                   items: { $ref: "#/components/schemas/ColumnDef" }
+                replacement:
+                  type: object
+                  description: >
+                    Requires atomic-table-replacement-v1. Guard the target as observed at
+                    read_snapshot; a null UUID requires absence. Publication rejects target
+                    changes since that snapshot and replaces an existing incarnation atomically.
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
       responses:
         "200":
           description: Durable operation state; inspect state and reason, not HTTP status alone
@@ -1107,7 +1117,11 @@ paths:
       operationId: publishTableCreation
       summary: Atomically publish the table, initial files, and durable receipt in one snapshot
       description: >
-        Requires atomic-table-creation-v1 capability. Target must be absent at publication.
+        Requires atomic-table-creation-v1 capability. Without a replacement guard the target
+        must be absent at publication. With the atomic-table-replacement-v1 guard, target
+        identity and all target changes since read_snapshot are checked under the commit lock.
+        A replacement retires the old incarnation and publishes a new UUID at one snapshot.
+        Stale or expired guards return a durable rejected receipt with reason target_changed.
         The exact ordered file list is compared as JSON on retries; an identical retry
         returns the original terminal result even if the table was subsequently dropped.
         Up to 10000 unique file paths, all under the operation write_path. Empty files
@@ -1658,7 +1672,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1 and guarded-table-lifecycle-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, guarded-table-lifecycle-v1 and atomic-table-replacement-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1735,7 +1749,7 @@ components:
         schema_version: { type: integer, format: int64 }
         reason:
           type: string
-          enum: [target_exists, namespace_changed, client_abort, expired,
+          enum: [target_exists, target_changed, namespace_changed, client_abort, expired,
                  definition_invalid]
           description: >
             Why a `rejected` receipt cannot be published.

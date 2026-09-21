@@ -277,18 +277,25 @@ class CatalogService(private val jdbi: Jdbi) {
         name: String,
         columns: List<ColumnDef>,
         tableUuid: UUID = UUID.randomUUID(),
+        replacementTableId: Long? = null,
     ): TableInfo {
         validateTableDefinition(name, columns)
         val cat = requireCatalog(h, catalog)
         Locks.acquireCatalogCommitLock(h, cat.catalogId)
         val ns = requireNamespace(h, cat, namespace)
-        if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name) != null) {
+        if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, name)?.tableId != replacementTableId) {
             throw HoglakeException.AlreadyExists(
                 "table '$name' already exists in namespace '$namespace'",
             )
         }
         val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
         SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
+        if (replacementTableId != null) {
+            SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DROPPED, replacementTableId)
+            TableRepo.markDropped(h, cat.catalogId, replacementTableId, alloc.snapshotId)
+            FileRepo.endLiveDeleteFiles(h, cat.catalogId, replacementTableId, alloc.snapshotId)
+            FileRepo.endLiveFiles(h, cat.catalogId, replacementTableId, alloc.snapshotId)
+        }
         val tableId = CatalogRepo.allocateTableId(h, cat.catalogId)
         SnapshotRepo.insertChange(
             h,
@@ -297,6 +304,12 @@ class CatalogService(private val jdbi: Jdbi) {
             ChangeKind.TABLE_CREATED,
             tableId,
         )
+        if (replacementTableId != null) {
+            // The new incarnation's feed must also fence consumers whose window starts
+            // before publication, even after expiry removes the old name's version row.
+            SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_ALTERED, tableId)
+            SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DELETED_FROM, tableId)
+        }
         val createdUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid)
         // nodeCount, not columns.size: a nested column needs one id per
         // NODE, not one per top-level column. Allocating by size would
@@ -720,7 +733,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
-            // TRUNCATE has no newly registered DV to carry its deletion through this
+            // TRUNCATE and replacement have no newly registered DV to carry its deletion through this
             // append-oriented feed. The paired change kinds identify its DDL barrier.
             val truncated =
                 h.createQuery(
@@ -743,7 +756,7 @@ class CatalogService(private val jdbi: Jdbi) {
                     .findOne()
             if (truncated.isPresent) {
                 throw HoglakeException.ReconciliationRequired(
-                    "table '$namespace.$table' was truncated at snapshot ${truncated.get()}; " +
+                    "table '$namespace.$table' was truncated or replaced at snapshot ${truncated.get()}; " +
                         "changefeed window ($fromSnapshot, $to] cannot represent this deletion. " +
                         "Reconcile the destination from a full snapshot before advancing its checkpoint.",
                 )

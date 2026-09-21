@@ -23,7 +23,14 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 import java.time.Instant
 import java.util.UUID
 
-data class TableCreationDefinition(val namespace: String, val name: String, val columns: List<ColumnDef>)
+data class ReplacementTarget(val expectedTableUuid: UUID?, val readSnapshot: Long)
+
+data class TableCreationDefinition(
+    val namespace: String,
+    val name: String,
+    val columns: List<ColumnDef>,
+    val replacement: ReplacementTarget? = null,
+)
 
 data class TableCreation(
     val operationId: UUID,
@@ -82,6 +89,15 @@ class TableCreationService(
                 val ns =
                     NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
                         ?: throw HoglakeException.NotFound("namespace '${definition.namespace}'")
+                definition.replacement?.let {
+                    if (it.readSnapshot < cat.earliestSnapshotId || it.readSnapshot > cat.headSnapshotId) {
+                        throw HoglakeException.CommitConflict("replacement read snapshot is not retained")
+                    }
+                    val target = TableRepo.findAt(h, cat.catalogId, ns.namespaceId, definition.name, it.readSnapshot)
+                    if (target?.tableUuid != it.expectedTableUuid) {
+                        throw HoglakeException.CommitConflict("replacement target does not match read snapshot")
+                    }
+                }
                 // Prefix includes a server-generated identity: even a future catalog recreation
                 // and reused client operation id cannot reuse old object paths.
                 val uuid = UUID.randomUUID()
@@ -135,8 +151,9 @@ class TableCreationService(
         var replay = false
         return observed("publish", catalog, operationId, { if (replay) "replayed" else it.state }) {
             operationTransaction { h ->
+                val catalogId = CatalogRepo.require(h, catalog).catalogId
+                Locks.acquireCatalogCommitLock(h, catalogId, lockTimeoutMs)
                 val cat = CatalogRepo.require(h, catalog)
-                Locks.acquireCatalogCommitLock(h, cat.catalogId, lockTimeoutMs)
                 val operation = load(h, cat.catalogId, operationId)
                 replay = operation.state != "prepared"
                 val encoded = mapper.writeValueAsString(files)
@@ -177,9 +194,28 @@ class TableCreationService(
                     """,
                     )
                         .bind("catalog", cat.catalogId).bind("operation", operationId).mapTo(Long::class.java).one()
+                val target = ns?.let { TableRepo.findLive(h, cat.catalogId, it.namespaceId, definition.name) }
+                val replacement = definition.replacement
+                val targetModified =
+                    replacement != null && target != null &&
+                        h.createQuery(
+                            """
+                        SELECT EXISTS (SELECT 1 FROM hog_snapshot_change
+                        WHERE catalog_id = :catalog AND object_id = :table
+                          AND snapshot_id > :snapshot AND kind LIKE 'table_%')
+                        """,
+                        ).bind("catalog", cat.catalogId).bind("table", target.tableId)
+                            .bind("snapshot", replacement.readSnapshot).mapTo(Boolean::class.java).one()
+                val targetChanged =
+                    replacement != null && (
+                        replacement.readSnapshot < cat.earliestSnapshotId ||
+                            target?.tableUuid != replacement.expectedTableUuid || targetModified
+                    )
                 if (ns == null || ns.namespaceId != originalNamespace) {
                     transition(h, cat.catalogId, operationId, "rejected", "namespace_changed")
-                } else if (TableRepo.findLive(h, cat.catalogId, ns.namespaceId, definition.name) != null) {
+                } else if (targetChanged) {
+                    transition(h, cat.catalogId, operationId, "rejected", "target_changed")
+                } else if (replacement == null && target != null) {
                     transition(h, cat.catalogId, operationId, "rejected", "target_exists")
                 } else {
                     // A receipt PREPARED under an older, laxer rule set
@@ -211,6 +247,7 @@ class TableCreationService(
                                 definition.name,
                                 definition.columns,
                                 operation.tableUuid,
+                                replacementTableId = target?.tableId,
                             )
                         } catch (e: HoglakeException.Validation) {
                             log.warn {

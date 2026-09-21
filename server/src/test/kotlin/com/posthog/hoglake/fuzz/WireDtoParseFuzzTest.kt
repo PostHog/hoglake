@@ -6,9 +6,12 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
+import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.service.TableCreationDefinition
+import com.posthog.hoglake.service.TableCreationDefinitionCodec
 import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
 
@@ -70,6 +73,24 @@ class WireDtoParseFuzzTest {
                 check(commitFingerprint(request.copy(readSnapshot = (request.readSnapshot ?: 0) xor 1)) != fingerprint)
             } catch (e: Exception) {
                 checkAllowed("CommitRequestDto", e)
+            }
+        }
+
+        parseOrNull { mapper.readValue<PrepareTableCreationDto>(data) }?.let { dto ->
+            try {
+                val definition =
+                    TableCreationDefinition(
+                        dto.namespace,
+                        dto.name,
+                        dto.columns.map { it.toModel() },
+                        dto.replacement,
+                    )
+                if ((dto.replacement?.readSnapshot ?: 0) >= 0) {
+                    val encoded = TableCreationDefinitionCodec.encode(definition)
+                    check(TableCreationDefinitionCodec.decode(encoded) == definition)
+                }
+            } catch (e: Exception) {
+                checkAllowed("PrepareTableCreationDto", e)
             }
         }
 

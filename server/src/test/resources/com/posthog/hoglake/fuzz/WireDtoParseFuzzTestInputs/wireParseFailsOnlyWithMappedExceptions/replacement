@@ -1,0 +1,1 @@
+{"namespace":"test","name":"t","columns":[{"name":"id","type":"long"}],"replacement":{"expected_table_uuid":"12345678-1234-5678-90ab-1234567890ab","read_snapshot":12}}
