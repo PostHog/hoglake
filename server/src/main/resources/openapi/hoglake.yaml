@@ -335,8 +335,8 @@ paths:
             `idless_files_present` while any LIVE data file of the table
             is flagged missing_field_ids (its parquet schema carries no
             field ids): such files bind columns by name, so evolution
-            could misbind their history in readers. Pending files also block both
-            operations until hydrated. Rewrite
+            could misbind their history in readers. Files with pending or failed hydration also block both
+            operations until successfully hydrated. Rewrite
             (compact) or retire the id-less files first. rename_table is
             unaffected.
           content:

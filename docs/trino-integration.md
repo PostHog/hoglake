@@ -251,7 +251,8 @@ Prepared replacement already checks target changes and namespace identity: an
 alteration committed first rejects replacement, and replacement committed first
 rejects an alteration using the old UUID.
 
-ADD COLUMN now shares RENAME COLUMN's refusal of live id-less or pending files.
+ADD COLUMN now shares RENAME COLUMN's refusal of live id-less files and files
+with pending or failed hydration.
 Without IDs, an old file can contain a name being added (including DROP + ADD),
 and name-based readers could expose those old values under the new field ID.
 Hydrate, rewrite, or retire blocking files first. All clients using `/alter`

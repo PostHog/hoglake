@@ -346,6 +346,8 @@ class AlterService(private val jdbi: Jdbi) {
         // is UNKNOWN and must be treated as id-less until proven otherwise
         // (the TOCTOU: commit deferred-stats id-less file -> rename slips
         // through before the sweep -> the flag arrives too late).
+        // A failed footer read also leaves the ID state unknown. Conservatively
+        // block failed hydration until a successful rehydrate verifies the IDs.
         // RenameTable is unaffected — table binding rides table_uuid.
         requireFieldIds(h, catalogId, tableId, "cannot rename column '${op.from}' to '${op.to}'")
         endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
@@ -371,28 +373,28 @@ class AlterService(private val jdbi: Jdbi) {
         tableId: Long,
         action: String,
     ) {
-        val (idlessLive, pendingLive) =
+        val (idlessLive, unverifiedLive) =
             h.createQuery(
                 """
                 SELECT count(*) FILTER (WHERE missing_field_ids) AS idless,
-                       count(*) FILTER (WHERE stats_state = 'pending' AND NOT missing_field_ids) AS pending
+                       count(*) FILTER (WHERE stats_state IN ('pending', 'failed') AND NOT missing_field_ids) AS pending
                 FROM hog_data_file
                 WHERE catalog_id = :catalogId AND table_id = :tableId
                   AND end_snapshot IS NULL
-                  AND (missing_field_ids OR stats_state = 'pending')
+                  AND (missing_field_ids OR stats_state IN ('pending', 'failed'))
                 """,
             )
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
                 .map { rs, _ -> rs.getLong("idless") to rs.getLong("pending") }
                 .one()
-        if (idlessLive > 0 || pendingLive > 0) {
+        if (idlessLive > 0 || unverifiedLive > 0) {
             val blockers =
                 buildList {
                     if (idlessLive > 0) add("$idlessLive id-less")
-                    if (pendingLive > 0) {
+                    if (unverifiedLive > 0) {
                         add(
-                            "$pendingLive not-yet-hydrated (id state unknown until the footer is read)",
+                            "$unverifiedLive not-yet-hydrated (pending or failed; field IDs not verified)",
                         )
                     }
                 }.joinToString(" and ")
