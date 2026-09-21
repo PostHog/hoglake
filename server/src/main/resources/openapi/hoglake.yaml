@@ -488,6 +488,16 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ChangePlan" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: >
+            reconciliation_required — the window crosses a TRUNCATE that this
+            append-oriented feed cannot represent. Reconcile the destination
+            from a full snapshot before advancing its checkpoint. Do not retry
+            or skip the window automatically. The lower bound is exclusive:
+            windows starting at the reconciled truncate snapshot are allowed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "410":
           description: >
             from_snapshot falls below the catalog's expiry floor

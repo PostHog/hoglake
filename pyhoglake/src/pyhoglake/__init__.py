@@ -22,6 +22,7 @@ from .errors import (
     MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
+    ReconciliationRequiredError,
     UnsupportedTypeError,
     ValidationError,
 )
@@ -83,6 +84,7 @@ __all__ = [
     "OffsetRegressionError",
     "PartitionField",
     "PartitionSpec",
+    "ReconciliationRequiredError",
     "S3Config",
     "ScanFile",
     "Snapshot",

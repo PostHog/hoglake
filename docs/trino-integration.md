@@ -161,7 +161,7 @@ The `guarded-table-lifecycle-v1` catalog capability advertises an
 POST `/truncate` (where the UUID is required). The guard is checked after name
 resolution under the catalog commit lock; a mismatch returns 409. Existing
 clients that omit the optional guard on DELETE/alter retain their old behavior.
-Pyhoglake, DuckDB, hedgerow and the console need no wire changes; they do not
+DuckDB and the console need no lifecycle-request changes; they do not
 acquire the guarded guarantee until they send the UUID. Truncate is available
 through REST and the paired Trino connector change.
 
@@ -187,3 +187,19 @@ receipt recovery does not confer lifecycle idempotency.
 
 Deploy the server capability before enabling the paired Trino connector, which
 refuses lifecycle SQL on servers without it. Cross-schema rename remains unsupported.
+
+
+Changefeed windows `(from_snapshot, to_snapshot]` crossing TRUNCATE return
+HTTP 409 `reconciliation_required`: ending old files creates no new deletion
+vector, so returning an empty append plan would silently lose the deletion.
+The guard uses the paired `table_altered`/`table_deleted_from` snapshot records
+for the resolved table identity. Historical windows ending before truncate and
+windows starting at or after it remain available. A consumer must reconcile its
+destination from a full snapshot before explicitly advancing to that snapshot;
+this is not an instruction to skip the rejected window. Pyhoglake exposes a
+non-retryable `ReconciliationRequiredError`; both Hedgerow modes halt without
+checkpointing the rejected window. Older clients receive an HTTP error rather
+than an apparently successful empty plan. DuckDB and the console do not gain
+new changefeed behavior; any caller of `/changes` must honor this refusal.
+Ship the updated pyhoglake package with the updated Hedgerow package; the server
+refusal also protects older consumers, which receive a permanent HTTP error.

@@ -718,6 +718,34 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $to",
                     )
+            // TRUNCATE has no newly registered DV to carry its deletion through this
+            // append-oriented feed. The paired change kinds identify its DDL barrier.
+            val truncated =
+                h.createQuery(
+                    """
+                    SELECT c.snapshot_id FROM hog_snapshot_change c
+                    WHERE c.catalog_id = :catalogId AND c.object_id = :tableId
+                      AND c.kind = 'table_deleted_from'
+                      AND c.snapshot_id > :fromSnapshot AND c.snapshot_id <= :toSnapshot
+                      AND EXISTS (
+                        SELECT 1 FROM hog_snapshot_change ddl
+                        WHERE ddl.catalog_id = c.catalog_id AND ddl.object_id = c.object_id
+                          AND ddl.snapshot_id = c.snapshot_id AND ddl.kind = 'table_altered')
+                    ORDER BY c.snapshot_id LIMIT 1
+                    """,
+                ).bind("catalogId", cat.catalogId)
+                    .bind("tableId", t.tableId)
+                    .bind("fromSnapshot", fromSnapshot)
+                    .bind("toSnapshot", to)
+                    .mapTo(Long::class.java)
+                    .findOne()
+            if (truncated.isPresent) {
+                throw HoglakeException.ReconciliationRequired(
+                    "table '$namespace.$table' was truncated at snapshot ${truncated.get()}; " +
+                        "changefeed window ($fromSnapshot, $to] cannot represent this deletion. " +
+                        "Reconcile the destination from a full snapshot before advancing its checkpoint.",
+                )
+            }
             ChangesPlan(
                 tableUuid = t.tableUuid,
                 fromSnapshot = fromSnapshot,

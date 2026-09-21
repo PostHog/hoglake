@@ -85,3 +85,10 @@ class MalformedResponseError(HoglakeError):
 
 class UnsupportedTypeError(HoglakeError, TypeError):
     """An Arrow type with no hoglake column-type mapping."""
+
+
+class ReconciliationRequiredError(HoglakeError):
+    """409 — a changefeed window crosses TRUNCATE; reconcile before checkpointing.
+
+    Non-retryable: replaying the same window cannot represent this deletion.
+    """

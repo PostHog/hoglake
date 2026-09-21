@@ -1253,6 +1253,9 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
 
     class AlreadyExists(what: String) : HoglakeException(what)
 
+    /** A changefeed window crosses a deletion it cannot represent; never blindly retry or skip it. */
+    class ReconciliationRequired(detail: String) : HoglakeException(detail)
+
     class CommitConflict(detail: String) : HoglakeException(detail)
 
     class Validation(detail: String) : HoglakeException(detail)

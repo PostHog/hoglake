@@ -47,6 +47,7 @@ fun StatusPagesConfig.installErrorMapping() {
             when (cause) {
                 is HoglakeException.NotFound -> HttpStatusCode.NotFound to "not_found"
                 is HoglakeException.AlreadyExists -> HttpStatusCode.Conflict to "already_exists"
+                is HoglakeException.ReconciliationRequired -> HttpStatusCode.Conflict to "reconciliation_required"
                 is HoglakeException.CommitConflict -> HttpStatusCode.Conflict to "commit_conflict"
                 is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
                 is HoglakeException.IdlessFilesPresent -> HttpStatusCode.Conflict to "idless_files_present"

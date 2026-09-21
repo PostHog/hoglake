@@ -263,3 +263,47 @@ def test_coordinator_accumulates_windows_and_recovers_ambiguous_publication(
         assert len(daemon.store.cleanup_candidates()) == 2
     finally:
         daemon.close()
+
+
+def test_truncate_halts_buffered_discovery_without_checkpointing(tmp_path):
+    from dataclasses import replace
+
+    from pyhoglake import ReconciliationRequiredError
+
+    from hedgerow.halts import DeletesPresentError
+
+    transform = layout()
+    source_info = replace(
+        transform.destination,
+        table_uuid="source",
+        columns=transform.source_columns,
+        partition_spec=None,
+        sort_spec=None,
+    )
+
+    def truncated(*args):
+        raise ReconciliationRequiredError("reconciliation_required", status_code=409)
+
+    source_catalog, destination_catalog = Catalog(), Catalog()
+    daemon = BufferedIngestion(
+        SimpleNamespace(info=lambda: source_info, changes=truncated),
+        SimpleNamespace(info=lambda: transform.destination),
+        source_catalog=source_catalog,
+        destination_catalog=destination_catalog,
+        consumer_id="job",
+        state_path=str(tmp_path / "state.sqlite"),
+        filesystem=None,
+        spill_directory=str(tmp_path),
+        policy=BufferPolicy(workers=1),
+    )
+    try:
+        with pytest.raises(DeletesPresentError, match="reconciliation"):
+            daemon.run_once()
+        assert daemon.store.discovered == 0
+        assert daemon.store.published_through == 0
+        assert (
+            source_catalog.committed == 0
+        )  # initial retention pin, never the rejected window
+        assert destination_catalog.calls == []
+    finally:
+        daemon.close()

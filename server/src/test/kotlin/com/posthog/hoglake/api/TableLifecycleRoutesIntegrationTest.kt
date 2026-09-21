@@ -58,7 +58,11 @@ class TableLifecycleRoutesIntegrationTest {
                         setBody(rename)
                     }.status,
                 ).isEqualTo(HttpStatusCode.Conflict)
+                val before = catalogs.getCatalog("wire-lifecycle").headSnapshotId
                 assertThat(client.post("$path/truncate$expected").status).isEqualTo(HttpStatusCode.OK)
+                val changes = client.get("$path/changes?from_snapshot=$before")
+                assertThat(changes.status).isEqualTo(HttpStatusCode.Conflict)
+                assertThat(changes.bodyAsText()).contains("reconciliation_required", "Reconcile")
                 assertThat(
                     client.post("$path/alter$expected") {
                         contentType(ContentType.Application.Json)

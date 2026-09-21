@@ -209,6 +209,30 @@ class TableLifecycleIntegrationTest {
     }
 
     @Test
+    fun `changefeed refuses windows crossing truncate but allows reconciled and historical windows`() {
+        val cat = fixture()
+        val before = commits.commit(cat, append(cat)).snapshotId
+        val uuid = catalogs.getTable(cat, "ns", "t").tableUuid
+        val truncated = catalogs.truncateTable(cat, "ns", "t", uuid).snapshotId
+        val after = commits.commit(cat, append(cat, "after.parquet")).snapshotId
+        for ((from, to) in listOf(before to truncated, 0L to after, before to after)) {
+            assertThatThrownBy { catalogs.changes(cat, "ns", "t", from, to) }
+                .isInstanceOf(HoglakeException.ReconciliationRequired::class.java)
+                .hasMessageContaining("Reconcile")
+        }
+        assertThat(catalogs.changes(cat, "ns", "t", 0, before).files).hasSize(1)
+        assertThat(catalogs.changes(cat, "ns", "t", truncated, truncated).files).isEmpty()
+        assertThat(catalogs.changes(cat, "ns", "t", truncated, after).files).hasSize(1)
+        // Ordinary DDL is not a truncate barrier, and barriers belong to table identity.
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("renamed")))
+        assertThatThrownBy { catalogs.changes(cat, "ns", "renamed", before) }
+            .isInstanceOf(HoglakeException.ReconciliationRequired::class.java)
+        assertThat(catalogs.changes(cat, "ns", "renamed", after).files).isEmpty()
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        assertThat(catalogs.changes(cat, "ns", "t", before).files).isEmpty()
+    }
+
+    @Test
     fun `failed truncate publication rolls back files DVs and snapshot`() {
         val cat = fixture()
         val appended = commits.commit(cat, append(cat))
