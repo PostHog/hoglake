@@ -31,6 +31,7 @@ fun Application.installAlterRoutes(alter: AlterService) {
                     call.alterPathParam("table"),
                     ops,
                     call.expectedTableUuid(),
+                    call.longQuery("read_snapshot"),
                 ).toAlteredDto(),
             )
         }

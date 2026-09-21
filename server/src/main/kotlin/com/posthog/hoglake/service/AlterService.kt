@@ -55,6 +55,7 @@ class AlterService(private val jdbi: Jdbi) {
         table: String,
         ops: List<AlterOp>,
         expectedTableUuid: UUID? = null,
+        readSnapshot: Long? = null,
     ): TableInfo =
         Audit.audited(
             "table_alter",
@@ -79,6 +80,27 @@ class AlterService(private val jdbi: Jdbi) {
 
                 if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
                     throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                }
+                if (readSnapshot != null) {
+                    val head = CatalogRepo.findByName(h, catalog)!!
+                    if (readSnapshot < 0 || readSnapshot > head.headSnapshotId) {
+                        throw HoglakeException.Validation("read_snapshot must be between zero and catalog head")
+                    }
+                    if (readSnapshot < head.earliestSnapshotId) {
+                        throw HoglakeException.Expired("read_snapshot is below the expiry floor")
+                    }
+                    val changed =
+                        h.createQuery(
+                            """
+                            SELECT EXISTS (SELECT 1 FROM hog_snapshot_change
+                            WHERE catalog_id = :catalog AND object_id = :table
+                              AND snapshot_id > :snapshot AND kind IN ('table_altered', 'table_dropped'))
+                            """,
+                        ).bind("catalog", cat.catalogId).bind("table", t.tableId)
+                            .bind("snapshot", readSnapshot).mapTo(Boolean::class.java).one()
+                    if (changed) {
+                        throw HoglakeException.CommitConflict("concurrent DDL since snapshot $readSnapshot")
+                    }
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
@@ -210,6 +232,10 @@ class AlterService(private val jdbi: Jdbi) {
             depthOffset = parent?.let { depthOf(state, it) } ?: 0,
             existingNodes = state.cols.allNodes().size,
         )
+        // A name-bound file may already contain the added name (for example
+        // after DROP + ADD). Without field IDs its old values would become
+        // values of this new column instead of nulls. Pending files are unknown.
+        requireFieldIds(h, catalogId, tableId, "cannot add column '${op.def.name}'")
         val count = ColumnTrees.nodeCount(listOf(op.def))
         val firstFieldId = TableRepo.allocateFieldIds(h, catalogId, tableId, count)
         val assigned = ColumnTrees.assignFieldIds(listOf(op.def), firstFieldId).single()
@@ -321,6 +347,30 @@ class AlterService(private val jdbi: Jdbi) {
         // (the TOCTOU: commit deferred-stats id-less file -> rename slips
         // through before the sweep -> the flag arrives too late).
         // RenameTable is unaffected — table binding rides table_uuid.
+        requireFieldIds(h, catalogId, tableId, "cannot rename column '${op.from}' to '${op.to}'")
+        endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
+        // Only THIS row is rewritten; the children keep their own live
+        // rows (and their parent_field_id, which is the stable field id,
+        // not the version) — so renaming a struct does not churn its
+        // fields' history.
+        val renamed = col.copy(def = col.def.copy(name = op.to))
+        TableRepo.insertColumns(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            listOf(renamed.copy(children = emptyList())),
+            located.parent?.fieldId,
+        )
+        state.cols = replaceNode(state.cols, col.fieldId) { renamed }
+    }
+
+    private fun requireFieldIds(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        action: String,
+    ) {
         val (idlessLive, pendingLive) =
             h.createQuery(
                 """
@@ -347,26 +397,10 @@ class AlterService(private val jdbi: Jdbi) {
                     }
                 }.joinToString(" and ")
             throw HoglakeException.IdlessFilesPresent(
-                "cannot rename column '${op.from}' to '${op.to}': $blockers live data " +
-                    "file(s) may bind columns by name — renaming would silently NULL " +
-                    "their history in readers; hydrate, rewrite, or retire them first",
+                "$action: $blockers live data " +
+                    "file(s) may bind columns by name; hydrate, rewrite, or retire them first",
             )
         }
-        endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
-        // Only THIS row is rewritten; the children keep their own live
-        // rows (and their parent_field_id, which is the stable field id,
-        // not the version) — so renaming a struct does not churn its
-        // fields' history.
-        val renamed = col.copy(def = col.def.copy(name = op.to))
-        TableRepo.insertColumns(
-            h,
-            catalogId,
-            tableId,
-            snapshot,
-            listOf(renamed.copy(children = emptyList())),
-            located.parent?.fieldId,
-        )
-        state.cols = replaceNode(state.cols, col.fieldId) { renamed }
     }
 
     private fun promoteColumn(

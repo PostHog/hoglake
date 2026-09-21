@@ -116,7 +116,7 @@ class CommitRetentionAndPathGuardIntegrationTest {
             cat,
             "ns",
             "t",
-            listOf(com.posthog.hoglake.model.AlterOp.AddColumn(ColumnDef("extra", ColType.STRING))),
+            listOf(com.posthog.hoglake.model.AlterOp.SetSortOrder(emptyList())),
         )
         val alteredSnap = catalogs.getCatalog(cat).headSnapshotId
         append(cat, "s3://bucket/$cat/f2.parquet")

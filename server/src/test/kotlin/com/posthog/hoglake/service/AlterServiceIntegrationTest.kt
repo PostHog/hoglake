@@ -451,6 +451,9 @@ class AlterServiceIntegrationTest {
             )
         }
         assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG))))
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
+        assertThatThrownBy {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
         }
             .isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
@@ -536,6 +539,9 @@ class AlterServiceIntegrationTest {
                 tableId,
             )
         }
+        assertThatThrownBy {
+            alter.alterTable(cat, ns, "t", listOf(AlterOp.AddColumn(ColumnDef("new_column", ColType.LONG))))
+        }.isInstanceOf(HoglakeException.IdlessFilesPresent::class.java)
         assertThatThrownBy {
             alter.alterTable(cat, ns, "t", listOf(AlterOp.RenameColumn("name", "label")))
         }

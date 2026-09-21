@@ -91,7 +91,11 @@ fun Application.installApiRoutes(
                     }
                     delete("/{namespace}") {
                         call.respond(
-                            catalogs.dropNamespace(call.catalog(), call.namespace()).toDto(),
+                            catalogs.dropNamespace(
+                                call.catalog(),
+                                call.namespace(),
+                                call.longQuery("expected_namespace_id"),
+                            ).toDto(),
                         )
                     }
 
@@ -363,11 +367,13 @@ private fun ApplicationCall.uuidPath(name: String): UUID {
 /** Hard cap on a single file page, matching the snapshots endpoint's cap. */
 private const val FILES_MAX_LIMIT = 10_000
 
-private fun ApplicationCall.longQuery(name: String): Long? =
-    request.queryParameters[name]?.let {
-        it.toLongOrNull()
-            ?: throw BadRequestException("query parameter '$name' must be an integer, got '$it'")
-    }
+internal fun ApplicationCall.longQuery(name: String): Long? =
+    request.queryParameters[name]?.let { parseLongQuery(name, it) }
+
+internal fun parseLongQuery(
+    name: String,
+    raw: String,
+): Long = raw.toLongOrNull() ?: throw BadRequestException("query parameter '$name' must be an integer")
 
 private fun ApplicationCall.intQuery(name: String): Int? =
     request.queryParameters[name]?.let {

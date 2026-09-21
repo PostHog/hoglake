@@ -64,6 +64,7 @@ data class CatalogDto(
             "idempotent-append-v1",
             "guarded-table-lifecycle-v1",
             "atomic-table-replacement-v1",
+            "guarded-schema-evolution-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -109,9 +110,9 @@ data class CreateCatalogRequestDto(val name: String, val dataPath: String)
 
 // ---- namespaces ----------------------------------------------------------
 
-data class NamespaceDto(val name: String)
+data class NamespaceDto(val name: String, val namespaceId: Long)
 
-fun NamespaceInfo.toDto() = NamespaceDto(name)
+fun NamespaceInfo.toDto() = NamespaceDto(name, namespaceId)
 
 data class CreateNamespaceRequestDto(val name: String)
 

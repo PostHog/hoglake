@@ -21,10 +21,70 @@ import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
+import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.junit.jupiter.api.Test
 import java.util.UUID
 
 class TableLifecycleRoutesIntegrationTest {
+    @Test
+    fun `schema guards fence reused names and stale column plans`() =
+        testApplication {
+            PgTestSupport.freshDatabase().use { db ->
+                val catalogs = CatalogService(db.jdbi)
+                val alter = AlterService(db.jdbi)
+                catalogs.createCatalog("schema-guards", "s3://bucket/schema-guards")
+                val namespace = catalogs.createNamespace("schema-guards", "ns")
+                val table = catalogs.createTable("schema-guards", "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+                application {
+                    install(ContentNegotiation) { jackson { configureHoglakeWire() } }
+                    install(StatusPages) { installErrorMapping() }
+                    installApiRoutes(catalogs, CommitService(db.jdbi))
+                    installAlterRoutes(alter)
+                }
+                val base = "/v1/catalogs/schema-guards"
+                val path = "$base/namespaces/ns/tables/t/alter?expected_table_uuid=${table.tableUuid}"
+                val snapshot = catalogs.getCatalog("schema-guards").headSnapshotId
+                val add = """{"ops":[{"op":"add_column","column":{"name":"extra","type":"long"}}]}"""
+
+                suspend fun alteration(
+                    basis: String,
+                    body: String,
+                ) = client.post("$path&read_snapshot=$basis") {
+                    contentType(ContentType.Application.Json)
+                    setBody(body)
+                }
+                assertThat(client.get(base).bodyAsText()).contains("guarded-schema-evolution-v1")
+                assertThat(client.get("$base/namespaces/ns").bodyAsText()).contains("namespace_id")
+                for (invalid in listOf("invalid", "9223372036854775808")) {
+                    assertThat(alteration(invalid, add).status).isEqualTo(HttpStatusCode.BadRequest)
+                }
+                for (invalid in listOf("-1", "${snapshot + 1}")) {
+                    assertThat(alteration(invalid, add).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                }
+                catalogs.createNamespace("schema-guards", "unrelated")
+                assertThat(alteration("$snapshot", add).status).isEqualTo(HttpStatusCode.OK)
+                val drop = """{"ops":[{"op":"drop_column","name":"id"}]}"""
+                assertThat(alteration("$snapshot", drop).status).isEqualTo(HttpStatusCode.Conflict)
+                assertThat(catalogs.getTable("schema-guards", "ns", "t").columns.map { it.def.name })
+                    .containsExactly("id", "extra")
+                val floor = catalogs.getCatalog("schema-guards").headSnapshotId
+                db.jdbi.useHandleUnchecked { h ->
+                    h.execute("UPDATE hog_catalog SET earliest_snapshot_id = ? WHERE name = ?", floor, "schema-guards")
+                }
+                assertThat(alteration("$snapshot", drop).status).isEqualTo(HttpStatusCode.Gone)
+                catalogs.dropTable("schema-guards", "ns", "t")
+                catalogs.dropNamespace("schema-guards", "ns")
+                val replacement = catalogs.createNamespace("schema-guards", "ns")
+                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=bad").status)
+                    .isEqualTo(HttpStatusCode.BadRequest)
+                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=${namespace.namespaceId}").status)
+                    .isEqualTo(HttpStatusCode.Conflict)
+                assertThat(catalogs.getNamespace("schema-guards", "ns")).isEqualTo(replacement)
+                assertThat(client.delete("$base/namespaces/ns?expected_namespace_id=${replacement.namespaceId}").status)
+                    .isEqualTo(HttpStatusCode.OK)
+            }
+        }
+
     @Test
     fun `lifecycle routes enforce guards and advertise support`() =
         testApplication {
