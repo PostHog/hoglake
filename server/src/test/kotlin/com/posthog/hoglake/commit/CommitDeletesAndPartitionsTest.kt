@@ -353,6 +353,89 @@ class CommitDeletesAndPartitionsTest {
     // ------------------------------------------------------------------
 
     @Test
+    fun `delete receipts replay atomically after supersession and reject changed payload`() {
+        val f = seed()
+        val base =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            append(
+                                "events",
+                                FileRegistration("s3://b/a", 10, 100),
+                                FileRegistration("s3://b/b", 10, 100),
+                            ),
+                        ),
+                ),
+            )
+        val key = java.util.UUID.randomUUID()
+        val request =
+            CommitRequest(
+                readSnapshot = base.snapshotId,
+                idempotencyKey = key,
+                deletes =
+                    listOf(
+                        deletes(
+                            "events",
+                            DeleteFileRegistration(1, "s3://b/d1", 2, 50),
+                            DeleteFileRegistration(2, "s3://b/d2", 3, 50),
+                        ),
+                    ),
+            )
+        val committed = service.commit("cat", request)
+        service.commit(
+            "cat",
+            CommitRequest(
+                readSnapshot = committed.snapshotId,
+                deletes = listOf(deletes("events", DeleteFileRegistration(1, "s3://b/d3", 4, 50))),
+            ),
+        )
+        assertThat(CommitService(jdbi).commit("cat", request)).isEqualTo(committed)
+        assertThat(service.receipt("cat", key)).isEqualTo(committed)
+        assertThat(dvRows(f.catalogId)).hasSize(3)
+        assertThatThrownBy { service.commit("cat", request.copy(message = "changed")) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+        // A stale second file rolls the first supersession back too.
+        val before = dvRows(f.catalogId)
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                request.copy(
+                    idempotencyKey = java.util.UUID.randomUUID(),
+                    deletes =
+                        listOf(
+                            deletes(
+                                "events",
+                                DeleteFileRegistration(2, "s3://b/d4", 4, 50),
+                                DeleteFileRegistration(1, "s3://b/d5", 5, 50),
+                            ),
+                        ),
+                ),
+            )
+        }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(dvRows(f.catalogId)).isEqualTo(before)
+    }
+
+    @Test
+    fun `delete cannot target a file appended after the read snapshot`() {
+        seed()
+        service.commit("cat", CommitRequest(appends = listOf(append("events", FileRegistration("s3://b/a", 10, 100)))))
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 0,
+                    deletes = listOf(deletes("events", DeleteFileRegistration(1, "s3://b/d", 1, 50))),
+                ),
+            )
+        }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("created after read snapshot")
+    }
+
+    @Test
     fun `delete registers a DV without touching table stats`() {
         val fx = seed()
         val tableId = fx.tables.getValue("events")

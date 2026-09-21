@@ -19,6 +19,73 @@ import org.junit.jupiter.api.Test
 @Tag("integration")
 class CommitReceiptApiIntegrationTest {
     @Test
+    fun `prepared delete requires guards and replays a lost response`() {
+        PgTestSupport.freshDatabase().use { db ->
+            testApplication {
+                application { App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0), db.jdbi).module(this) }
+
+                suspend fun post(
+                    path: String,
+                    body: String,
+                ) = client.post(path) {
+                    contentType(ContentType.Application.Json)
+                    setBody(body)
+                }
+                val base = "/v1/catalogs/delete-test"
+                val json = ObjectMapper()
+                post("/v1/catalogs", """{"name":"delete-test","data_path":"s3://synthetic/"}""")
+                post("$base/namespaces", """{"name":"ns"}""")
+                val table =
+                    json.readTree(
+                        post(
+                            "$base/namespaces/ns/tables",
+                            """{"name":"target","columns":[{"name":"id","type":"long"}]}""",
+                        ).bodyAsText(),
+                    )
+                val uuid = table["table_uuid"].asText()
+                val appended =
+                    json.readTree(
+                        post(
+                            "$base/commit",
+                            """{"appends":[{"namespace":"ns","table":"target",
+                    "files":[{"path":"s3://synthetic/data","record_count":7,"file_size_bytes":700}]}]}""",
+                        ).bodyAsText(),
+                    )
+                val snapshot = appended["snapshot_id"].asLong()
+                val key = java.util.UUID.randomUUID()
+                val request = """{"idempotency_key":"$key","read_snapshot":$snapshot,"deletes":[{
+                    "namespace":"ns","table":"target","expected_table_uuid":"$uuid",
+                    "files":[{"data_file_id":1,"path":"s3://synthetic/dv","delete_count":2,"file_size_bytes":100}]}]}"""
+                assertThat(json.readTree(client.get(base).bodyAsText())["capabilities"].map { it.asText() })
+                    .contains("idempotent-delete-v1")
+                assertThat(
+                    post("$base/commit/deletes/prepared", "{}").status,
+                ).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                val empty = """{"idempotency_key":"${java.util.UUID.randomUUID()}","read_snapshot":$snapshot,
+                    "deletes":[{"namespace":"ns","table":"target","expected_table_uuid":"$uuid","files":[]}]}"""
+                assertThat(post("$base/commit/deletes/prepared", empty).status).isEqualTo(HttpStatusCode.OK)
+                assertThat(post("$base/commit", empty).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                val result = post("$base/commit/deletes/prepared", request)
+                assertThat(result.status).isEqualTo(HttpStatusCode.OK)
+                val committed = json.readTree(result.bodyAsText())["snapshot_id"].asLong()
+                assertThat(
+                    json.readTree(post("$base/commit/deletes/prepared", request).bodyAsText())["snapshot_id"].asLong(),
+                )
+                    .isEqualTo(committed)
+                assertThat(json.readTree(client.get("$base/commit/receipts/$key").bodyAsText())["snapshot_id"].asLong())
+                    .isEqualTo(committed)
+                assertThat(
+                    post(
+                        "$base/commit/deletes/prepared",
+                        request.replace("\"delete_count\":2", "\"delete_count\":3"),
+                    ).status,
+                )
+                    .isEqualTo(HttpStatusCode.UnprocessableEntity)
+            }
+        }
+    }
+
+    @Test
     fun `receipt lookup survives application restart and is catalog scoped`() {
         PgTestSupport.freshDatabase().use { db ->
             val key = "12345678-1234-5678-90ab-1234567890ab"
