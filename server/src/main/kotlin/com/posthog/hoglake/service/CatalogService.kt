@@ -691,7 +691,9 @@ class CatalogService(private val jdbi: Jdbi) {
         fromSnapshot: Long,
         toSnapshot: Long? = null,
     ): ChangesPlan =
-        jdbi.withHandleUnchecked { h ->
+        jdbi.inTransactionUnchecked { h ->
+            // Keep the retention floor, truncate barriers and file plan on one MVCC snapshot.
+            h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             val cat = requireCatalog(h, catalog)
             val to = resolveSnapshot(cat, toSnapshot)
             if (fromSnapshot < 0) {
