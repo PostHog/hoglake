@@ -153,3 +153,37 @@ stays with the CDC machinery that understands lineage.
 - **Conformance testing**: phase 4 grows a two-way suite — hoglake
   writes / Trino reads (v1 gate), and Trino writes-via-adapter /
   hoglake + Trino read-back (gate for enabling 2b in anger).
+
+### Guarded table lifecycle
+
+The `guarded-table-lifecycle-v1` catalog capability advertises an
+`expected_table_uuid` query parameter on table DELETE and POST `/alter`, and
+POST `/truncate` (where the UUID is required). The guard is checked after name
+resolution under the catalog commit lock; a mismatch returns 409. Existing
+clients that omit the optional guard on DELETE/alter retain their old behavior.
+Pyhoglake, DuckDB, hedgerow and the console need no wire changes; they do not
+acquire the guarded guarantee until they send the UUID. Truncate is available
+through REST and the paired Trino connector change.
+
+Same-namespace rename preserves identity, files, schema and retained history.
+Truncate ends live data-file and deletion-vector visibility in one snapshot,
+without recreating the table or changing its UUID, schema, partition/sort specs,
+properties or row-id allocator. DROP and TRUNCATE perform no object-storage
+removal; normal retention/expiry/cleanup policy still applies later.
+
+Truncate records `table_altered` as the existing DDL conflict barrier and
+`table_deleted_from` for change tracking. An INSERT committed before truncate
+is cleared. A snapshot-based INSERT planned before truncate but committed after
+it conflicts; a fresh INSERT can commit normally. Legacy blind appends follow
+catalog commit order. A committed append's durable receipt can still be replayed
+after rename, truncate or drop without appending again or resurrecting a table.
+
+Lifecycle requests have no durable operation receipt. A lost response, malformed
+success response or server failure can leave the outcome unknown. Do not retry
+these operations automatically or infer their outcome from a reused name.
+In particular, replaying TRUNCATE could erase intervening INSERTs. Inspect table
+identity and snapshot history before deciding on a new SQL operation. Append
+receipt recovery does not confer lifecycle idempotency.
+
+Deploy the server capability before enabling the paired Trino connector, which
+refuses lifecycle SQL on servers without it. Cross-schema rename remains unsupported.

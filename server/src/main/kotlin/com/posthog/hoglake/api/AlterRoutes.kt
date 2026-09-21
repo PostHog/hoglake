@@ -30,6 +30,7 @@ fun Application.installAlterRoutes(alter: AlterService) {
                     call.alterPathParam("namespace"),
                     call.alterPathParam("table"),
                     ops,
+                    call.expectedTableUuid(),
                 ).toAlteredDto(),
             )
         }

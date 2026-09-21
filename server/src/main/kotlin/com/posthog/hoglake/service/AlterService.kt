@@ -27,6 +27,7 @@ import com.posthog.hoglake.stats.IcebergSingleValue
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
+import java.util.UUID
 
 /**
  * Schema evolution: one ALTER request is one DDL commit. The whole op
@@ -53,6 +54,7 @@ class AlterService(private val jdbi: Jdbi) {
         namespace: String,
         table: String,
         ops: List<AlterOp>,
+        expectedTableUuid: UUID? = null,
     ): TableInfo =
         Audit.audited(
             "table_alter",
@@ -75,6 +77,9 @@ class AlterService(private val jdbi: Jdbi) {
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                         ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
 
+                if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
+                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
                 SnapshotRepo.insertChange(
