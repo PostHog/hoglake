@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import java.util.UUID
 
 /**
  * Versioned durable format. Type spellings are API wire names, never JVM
@@ -13,7 +14,8 @@ import com.posthog.hoglake.model.ColumnDef
  *
  * **Versions.** 0 is the pre-versioned shape (JVM enum names,
  * `typeParams`); 1 added the version marker and wire spellings; 2 adds
- * `children`, without which a nested definition cannot be represented
+ * `children`; 3 adds the replacement identity and snapshot guard.
+ * Without children a nested definition cannot be represented
  * at all.
  *
  * A definition is encoded at the LOWEST version that can express it —
@@ -44,10 +46,27 @@ internal object TableCreationDefinitionCodec {
     fun encode(definition: TableCreationDefinition): String =
         mapper.writeValueAsString(
             mapOf(
-                "version" to if (anyChildren(definition.columns)) NESTED_VERSION else FLAT_VERSION,
+                "version" to
+                    if (definition.replacement != null) {
+                        3
+                    } else if (anyChildren(definition.columns)) {
+                        NESTED_VERSION
+                    } else {
+                        FLAT_VERSION
+                    },
                 "namespace" to definition.namespace,
                 "name" to definition.name,
                 "columns" to definition.columns.map { encodeColumn(it) },
+            ) + (
+                definition.replacement?.let {
+                    mapOf(
+                        "replacement" to
+                            mapOf(
+                                "expected_table_uuid" to it.expectedTableUuid?.toString(),
+                                "read_snapshot" to it.readSnapshot,
+                            ),
+                    )
+                } ?: emptyMap()
             ),
         )
 
@@ -132,7 +151,7 @@ internal object TableCreationDefinitionCodec {
             }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
-        if (version !in 0..NESTED_VERSION) {
+        if (version !in 0..3) {
             corrupt("unsupported table creation definition version $version")
         }
         val columns =
@@ -142,6 +161,31 @@ internal object TableCreationDefinitionCodec {
             text(node, "namespace", "the definition", ::corrupt),
             text(node, "name", "the definition", ::corrupt),
             columns.map { decodeColumn(it, version, ::corrupt) },
+            if (version == 3) {
+                val replacement = node["replacement"]
+                if (replacement == null || !replacement.isObject) corrupt("missing replacement guard")
+                val snapshot = replacement["read_snapshot"]
+                if (snapshot == null || !snapshot.isIntegralNumber ||
+                    !snapshot.canConvertToLong() || snapshot.longValue() < 0
+                ) {
+                    corrupt("invalid replacement read_snapshot")
+                }
+                val uuid = replacement["expected_table_uuid"]
+                ReplacementTarget(
+                    if (uuid == null || uuid.isNull) {
+                        null
+                    } else {
+                        try {
+                            UUID.fromString(text(replacement, "expected_table_uuid", "replacement", ::corrupt))
+                        } catch (e: IllegalArgumentException) {
+                            corrupt("invalid replacement UUID", e)
+                        }
+                    },
+                    snapshot.longValue(),
+                )
+            } else {
+                null
+            },
         )
     }
 

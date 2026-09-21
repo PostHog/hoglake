@@ -1,5 +1,6 @@
 package com.posthog.hoglake.api
 
+import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.TableCreation
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationService
@@ -16,7 +17,12 @@ import io.ktor.server.routing.routing
 import java.time.Instant
 import java.util.UUID
 
-data class PrepareTableCreationDto(val namespace: String, val name: String, val columns: List<ColumnDefDto>)
+data class PrepareTableCreationDto(
+    val namespace: String,
+    val name: String,
+    val columns: List<ColumnDefDto>,
+    val replacement: ReplacementTarget? = null,
+)
 
 data class PublishTableCreationDto(val files: List<FileRegistrationDto>)
 
@@ -58,6 +64,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                             request.columns.map {
                                 it.toModel()
                             },
+                            request.replacement,
                         ),
                     ).toDto(),
                 )

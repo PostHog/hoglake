@@ -203,3 +203,38 @@ than an apparently successful empty plan. DuckDB and the console do not gain
 new changefeed behavior; any caller of `/changes` must honor this refusal.
 Ship the updated pyhoglake package with the updated Hedgerow package; the server
 refusal also protects older consumers, which receive a permanent HTTP error.
+
+### Atomic table replacement
+
+`atomic-table-replacement-v1` extends prepared table creation with an optional
+`replacement` guard: `expected_table_uuid` (null for an absent target) and
+`read_snapshot`. Normal prepared creation remains unchanged. Deploy the server
+capability before enabling connector replacement; finish the server rollout
+before using it, since replacement receipts use durable definition version 3
+and older servers refuse that version.
+
+The connector supports empty `CREATE OR REPLACE TABLE` and replacement CTAS
+for its supported definitions, including CTAS reading the old target. It captures
+the target identity and snapshot during planning. Preparation and upload leave
+the original visible; publication checks the guard under the catalog lock and
+retires the old incarnation while publishing the new definition, UUID, and files
+at one snapshot. Retained snapshots can still read the old incarnation.
+
+Any recorded target change after the guarded snapshot (including INSERT, rename,
+drop, truncate, replacement, and compaction) rejects publication. Unrelated table
+changes do not conflict. An absent target uses normal creation semantics and must
+still be absent at publication. A guard overtaken by retention rejects publication.
+Stale identified writers cannot append into the replacement. Replaying a committed
+old INSERT or creation operation returns its original receipt without republishing.
+
+Abort or a failed publication transaction leaves the old table intact. Lost
+publication responses use the existing durable creation receipt; uncertain outcomes
+never authorize upload deletion. Objects from retired incarnations remain subject
+to normal retention and cleanup, with no immediate storage deletion.
+
+Changefeed windows crossing replacement return `reconciliation_required`, including
+at the retention boundary. Consumers must reconcile against a full snapshot and
+start from the new UUID/snapshot; the transition is not an append-only change set.
+The REST addition is opt-in: Python and DuckDB clients keep their existing creation
+behavior, while Hedgerow must reconcile identity changes. The console's existing
+history and dropped-incarnation views remain applicable.
