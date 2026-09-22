@@ -6,7 +6,9 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
@@ -117,6 +119,8 @@ class AlterService(private val jdbi: Jdbi) {
                     TableState(
                         cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         name = t.name,
+                        comment = t.comment,
+                        properties = t.properties,
                         spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                     )
@@ -130,6 +134,8 @@ class AlterService(private val jdbi: Jdbi) {
                     tableUuid = t.tableUuid,
                     namespace = ns.name,
                     name = state.name,
+                    comment = state.comment,
+                    properties = state.properties,
                     columns = state.cols.sortedBy { it.ordinal },
                     recordCount = agg.recordCount,
                     fileCount = agg.fileCount,
@@ -158,6 +164,8 @@ class AlterService(private val jdbi: Jdbi) {
     private class TableState(
         var cols: List<Column>,
         var name: String,
+        var comment: String?,
+        var properties: Map<String, String>,
         var spec: PartitionSpec?,
         var sortSpec: SortSpec?,
     )
@@ -187,6 +195,32 @@ class AlterService(private val jdbi: Jdbi) {
             renameTable(h, catalogId, tableId, namespaceId, namespaceName, snapshot, state, op)
         is AlterOp.SetPartitionSpec -> setPartitionSpec(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
+        is AlterOp.SetColumnComment -> {
+            TableMetadata.validateComment(op.comment)
+            val located = requireColumn(state, op.name)
+            val col = located.column
+            val updated = col.copy(def = col.def.copy(comment = op.comment))
+            endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
+            TableRepo.insertColumns(
+                h,
+                catalogId,
+                tableId,
+                snapshot,
+                listOf(updated.copy(children = emptyList())),
+                located.parent?.fieldId,
+            )
+            state.cols = replaceNode(state.cols, col.fieldId) { updated }
+        }
+        is AlterOp.SetTableComment -> {
+            TableMetadata.validateComment(op.comment)
+            state.comment = op.comment
+            rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
+        }
+        is AlterOp.SetProperties -> {
+            TableMetadata.validateProperties(op.properties)
+            state.properties = op.properties.toMap()
+            rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
+        }
     }
 
     /**
@@ -551,6 +585,27 @@ class AlterService(private val jdbi: Jdbi) {
     private fun widenFloatToDouble(b: ByteArray): ByteArray =
         IcebergSingleValue.encode(ColType.DOUBLE, (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble())
 
+    private fun rewriteMetadata(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        namespaceId: Long,
+        snapshot: Long,
+        state: TableState,
+    ) {
+        endOrDeleteVersionRow(h, catalogId, tableId, snapshot)
+        TableRepo.insertVersion(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            namespaceId,
+            state.name,
+            state.comment,
+            state.properties,
+        )
+    }
+
     private fun renameTable(
         h: Handle,
         catalogId: Long,
@@ -569,7 +624,16 @@ class AlterService(private val jdbi: Jdbi) {
             )
         }
         endOrDeleteVersionRow(h, catalogId, tableId, snapshot)
-        TableRepo.insertVersion(h, catalogId, tableId, snapshot, namespaceId, op.newName)
+        TableRepo.insertVersion(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            namespaceId,
+            op.newName,
+            state.comment,
+            state.properties,
+        )
         state.name = op.newName
     }
 
@@ -581,8 +645,15 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.SetPartitionSpec,
     ) {
-        for (f in op.fields) {
-            val col = requireSourceField(state.cols, f.sourceFieldId, "partition")
+        state.spec = installPartitionSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
+    }
+
+    internal fun validatePartitionFields(
+        columns: List<Column>,
+        fields: List<PartitionFieldDef>,
+    ) {
+        for (f in fields) {
+            val col = requireSourceField(columns, f.sourceFieldId, "partition")
             when (f.transform) {
                 Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -632,10 +703,20 @@ class AlterService(private val jdbi: Jdbi) {
                 )
             }
         }
+    }
+
+    internal fun installPartitionSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        columns: List<Column>,
+        fields: List<PartitionFieldDef>,
+    ): PartitionSpec? {
+        validatePartitionFields(columns, fields)
         endOrDeleteSpec(h, catalogId, tableId, snapshot)
-        if (op.fields.isEmpty()) {
-            state.spec = null
-            return
+        if (fields.isEmpty()) {
+            return null
         }
         val specId =
             h.createQuery(
@@ -667,7 +748,7 @@ class AlterService(private val jdbi: Jdbi) {
             VALUES (:catalogId, :tableId, :specId, :keyIndex, :sourceFieldId, :transform, :transformParam)
             """,
             )
-        op.fields.forEachIndexed { i, f ->
+        fields.forEachIndexed { i, f ->
             batch
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
@@ -679,7 +760,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        state.spec = PartitionSpec(specId, op.fields)
+        return PartitionSpec(specId, fields)
     }
 
     /**
@@ -696,19 +777,36 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.SetSortOrder,
     ) {
+        state.sortSpec = installSortSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
+    }
+
+    internal fun validateSortFields(
+        columns: List<Column>,
+        fields: List<SortFieldDef>,
+    ) {
         val seen = HashSet<Long>()
-        for (f in op.fields) {
-            requireSourceField(state.cols, f.sourceFieldId, "sort")
+        for (f in fields) {
+            requireSourceField(columns, f.sourceFieldId, "sort")
             if (!seen.add(f.sourceFieldId)) {
                 throw HoglakeException.Validation(
                     "duplicate sort source field_id ${f.sourceFieldId}",
                 )
             }
         }
+    }
+
+    internal fun installSortSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        columns: List<Column>,
+        fields: List<SortFieldDef>,
+    ): SortSpec? {
+        validateSortFields(columns, fields)
         endOrDeleteSortSpec(h, catalogId, tableId, snapshot)
-        if (op.fields.isEmpty()) {
-            state.sortSpec = null
-            return
+        if (fields.isEmpty()) {
+            return null
         }
         val sortId =
             h.createQuery(
@@ -740,7 +838,7 @@ class AlterService(private val jdbi: Jdbi) {
             VALUES (:catalogId, :tableId, :sortId, :keyIndex, :sourceFieldId, :direction, :nullOrder)
             """,
             )
-        op.fields.forEachIndexed { i, f ->
+        fields.forEachIndexed { i, f ->
             batch
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
@@ -752,7 +850,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        state.sortSpec = SortSpec(sortId, op.fields)
+        return SortSpec(sortId, fields)
     }
 
     // ---- row lifecycle helpers -------------------------------------------

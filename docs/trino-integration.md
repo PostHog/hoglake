@@ -262,6 +262,128 @@ guards are optional for legacy callers. Namespace identity is additive response
 metadata, which existing consumers may ignore. No mutation replay is introduced.
 
 Trino exposes nullable top-level ADD COLUMN, RENAME COLUMN, DROP COLUMN, CREATE
-SCHEMA and empty DROP SCHEMA. SQL type changes remain unsupported; the server's
-existing REST scalar-promotion policy is unchanged. No cascade, nested evolution,
-new writable types, partition/sort writes, defaults or property changes are added.
+SCHEMA and empty DROP SCHEMA. SQL type changes expose the existing signed integer
+widening and float-to-double promotion policy, preserving field IDs. No cascade or
+SQL nested evolution is added by those operations.
+
+### Recursive Trino writes
+
+`recursive-write-schema-v1` advertises the existing recursive column-definition,
+materialized child-ID, and native scalar contracts to the Trino writer. Deploy
+this capability to every server replica before the new connector. Older clients
+may ignore the additive capability; no existing request or durable receipt changes.
+Python remains the reference for these types and uses the same file encodings.
+Hedgerow and the console retain their existing type support. DuckDB clients keep
+their existing named refusals for scalar/variant types they do not recognize;
+this change does not make those clients capable of reading them.
+
+Trino writes ARRAY/MAP/named ROW with IDs on every catalog node, required map keys,
+and preserved nested nullability. It writes signed narrow integers, nanosecond
+timestamps within int64 range, and unshredded native VARIANT. Existing unsigned
+columns use wider signed SQL types or DECIMAL(20,0) for uint64, while preserving
+native physical encodings. uint64 retains the documented Iceberg-facade file
+limitation; Trino's native connector converts the unsigned bits explicitly.
+Existing JSON columns are exposed as validated, unchanged VARCHAR text, and
+second/millisecond timestamp columns reject finer values. New SQL declarations
+use canonical signed/string types. TIME and zoned timestamp precision above six,
+CHAR, and SQL nested type evolution remain refused. Field-ID-keyed statistics are
+populated by the existing hydrator, with no new metadata-store representation.
+
+### Partitioned Trino creation and writes
+
+`atomic-partitioned-table-creation-v1` adds the guarded preparation endpoint
+`PUT /table-creations/{operation}/partitioned` with nonempty `partition_fields`.
+Sources use the deterministic depth-first initial field IDs. The definition,
+partition spec and initial files publish in one snapshot; mismatched values
+roll back publication. Status/commit/abort keep their ordinary paths. The
+ordinary preparation endpoint refuses nonempty partition fields. Deploy all
+server replicas before the connector: older replicas return 404 for preparation
+or refuse version-4 durable receipts, never silently create an unpartitioned table.
+Unpartitioned receipts retain their existing lowest-capable format.
+
+Existing Python, DuckDB, webui and hedgerow requests are unchanged. Other writers
+continue using the same partition-value strings and transform allowlists. The
+Trino connector supports scalar and struct-leaf partition sources, emits null
+partition values as JSON null, and refuses unsupported transforms (including
+truncate and legacy hour(date)). No background production job is activated.
+
+### Sorted Trino creation and writes
+
+`atomic-sorted-table-creation-v1` adds `PUT /table-creations/{operation}/sorted`.
+It requires nonempty `sort_fields` and also accepts initial `partition_fields`.
+Both specs use the initial depth-first field IDs and publish with initial files
+in one snapshot. Ordinary and partition-only preparation refuse sort fields;
+old replicas return 404 for the sorted endpoint. Durable sorted definitions use
+version 5; other definitions retain their prior lowest-capable format.
+All definition validation precedes publication mutations, including replacement.
+
+The connector uses Trino's PageSorter on logical values before unsigned physical
+conversion. Each bounded sorted run closes its files. Sorting is per file and
+composes with partition routing and row-changing SQL. This adds writer CPU and
+bounded buffering; it does not promise global table ordering or sorting of
+historical files. Existing consumers' wire fields and requests are unchanged.
+
+### Comments and custom properties
+
+`COMMENT ON TABLE`, `COMMENT ON COLUMN`, CREATE column/table comments, and
+`extra_properties = MAP(ARRAY['owner.team'], ARRAY['analytics'])` persist in the
+catalog. `ALTER TABLE ... SET PROPERTIES extra_properties = ...` replaces the
+whole custom map; `DEFAULT` clears it. These are inert annotations, not storage
+configuration. Other table properties cannot be altered through this SQL surface.
+
+Metadata edits use the existing guarded DDL transaction and mint a new snapshot;
+concurrent stale schema-based writers conflict even when only an annotation changed.
+No Parquet rewrite is needed. Comments and properties follow snapshot visibility. Rename and type promotion
+preserve comments and stable field IDs; replacement receives only its new
+metadata. SQL metadata and SHOW CREATE return the persisted values. Comment NULL
+removes the value; an empty string is a distinct comment. Comments allow at most
+16,384 UTF-16 code units. Custom maps allow 100 string pairs, keys matching
+`[a-z][a-z0-9_.-]{0,127}`, and values of at most 4,096 UTF-16 code units. NUL is
+refused. `hoglake.`/`trino.` prefixes and `partitioning`, `sorted_by`, `location`,
+`format`, `comment` keys are reserved to avoid implied configuration behavior.
+
+Deploy the additive V11 migration and upgrade **all server replicas** before
+enabling metadata writes. Old server DDL can rewrite a version without preserving
+new metadata fields; a mixed-version fleet or downgrade after metadata use is not
+supported. The connector
+requires `versioned-table-metadata-v1`; atomic creation uses `/metadata` and
+receipt version 6 only when metadata is present. Old replicas reject that endpoint
+or receipt. Metadata ALTER operation names (including `add_column_with_metadata`)
+are distinct so old replicas cannot acknowledge and silently drop annotations.
+Existing no-metadata receipts retain their earlier encodings. Python, DuckDB,
+hedgerow and console consumers can ignore the additive response fields; this change
+does not add metadata editing to their UIs or synthesize Iceberg properties.
+
+
+### Reclaiming abandoned Trino uploads
+
+With `claimed-uploads-v1`, Trino claims each Parquet or deletion-vector path before
+PUT. The server creates unique paths, records the statement owner, and leases them
+for 24 hours. Writers renew the owner's active leases while writing (at five-minute
+intervals) and before handing off/publishing. Active claims, committed files, and
+all retained historical data/DV references protect objects. Publication settles
+claims in the same catalog transaction as files and the permanent commit receipt.
+A lost response therefore cannot authorize deletion of a successful publication.
+Existing immutable objects with retained references can still be referenced by
+another commit; registered paths without retained references cannot be revived.
+
+An explicit `POST /v1/catalogs/{catalog}/uploads/schedule-expired?limit=1000` fences
+expired leases and queues abandoned paths. It does not run in a new background job
+and does not enable production cleanup. The existing cleanup drain still checks
+retained references under the commit lock before physical deletion. Renewal,
+expiry and publication share that lock: once expiry wins, a late commit fails even
+after removal-ledger pruning. Abandoned tombstones are retained permanently; later
+explicit sweeps revisit them because an in-flight PUT may finish after an earlier
+DELETE. Selection rotates through bounded batches. Unclaimed historical or foreign
+objects are never inferred to be garbage from their age or a bucket listing.
+
+This adds one durable row and claim request per output file, occasional owner-wide
+renewals, and permanent fencing metadata. A paused writer exceeding its lease may
+fail if an operator reclaims it; it must retry with fresh paths. Unfinished worker
+aborts fence only their own paths; workers never directly delete claimed files.
+Uploads handed to the coordinator remain protected until publication or lease
+expiry. Claim support requires V12 and all server replicas upgraded before use.
+Claimed publication uses dedicated endpoints so old replicas refuse it. Older
+servers retain legacy writes without this reclamation guarantee. Python, DuckDB,
+hedgerow and the console can continue their existing paths; they do not claim or
+schedule uploads in this feature. No object-store listing permissions are added.

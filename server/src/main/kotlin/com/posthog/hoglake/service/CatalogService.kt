@@ -13,7 +13,9 @@ import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.initialColumns
@@ -282,8 +284,19 @@ class CatalogService(private val jdbi: Jdbi) {
         columns: List<ColumnDef>,
         tableUuid: UUID = UUID.randomUUID(),
         replacementTableId: Long? = null,
+        partitionFields: List<PartitionFieldDef> = emptyList(),
+        sortFields: List<SortFieldDef> = emptyList(),
+        comment: String? = null,
+        properties: Map<String, String> = emptyMap(),
     ): TableInfo {
+        TableMetadata.validateComment(comment)
+        TableMetadata.validateProperties(properties)
         validateTableDefinition(name, columns)
+        val cols = initialColumns(columns)
+        // Publication catches definition validation and records a rejected receipt.
+        // All such refusals must precede snapshot allocation or table mutation.
+        AlterService(jdbi).validatePartitionFields(cols, partitionFields)
+        AlterService(jdbi).validateSortFields(cols, sortFields)
         val cat = requireCatalog(h, catalog)
         Locks.acquireCatalogCommitLock(h, cat.catalogId)
         val ns = requireNamespace(h, cat, namespace)
@@ -321,17 +334,27 @@ class CatalogService(private val jdbi: Jdbi) {
         // container would collide with the next table's ids.
         val firstFieldId =
             TableRepo.allocateFieldIds(h, cat.catalogId, tableId, nodeCount(columns))
-        val cols = initialColumns(columns)
         check(firstFieldId == cols.first().fieldId) { "new table field allocation must start at one" }
-        TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
+        TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name, comment, properties)
         TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
         TableRepo.insertStatsRow(h, cat.catalogId, tableId)
+        val partitionSpec =
+            AlterService(
+                jdbi,
+            ).installPartitionSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, partitionFields)
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
+            comment = comment,
+            properties = properties,
             namespace = ns.name,
             name = name,
             columns = cols,
+            partitionSpec = partitionSpec,
+            sortSpec =
+                AlterService(
+                    jdbi,
+                ).installSortSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, sortFields),
             recordCount = 0,
             fileCount = 0,
             fileSizeBytes = 0,
@@ -454,6 +477,8 @@ class CatalogService(private val jdbi: Jdbi) {
             TableInfo(
                 tableId = t.tableId,
                 tableUuid = t.tableUuid,
+                comment = t.comment,
+                properties = t.properties,
                 namespace = ns.name,
                 name = t.name,
                 columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
@@ -480,6 +505,8 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableInfo(
                     tableId = t.tableId,
                     tableUuid = t.tableUuid,
+                    comment = t.comment,
+                    properties = t.properties,
                     namespace = ns.name,
                     name = t.name,
                     columns = emptyList(),
@@ -837,7 +864,7 @@ class CatalogService(private val jdbi: Jdbi) {
     fun commitOffset(
         catalog: String,
         consumerId: String,
-        tableUuid: java.util.UUID,
+        tableUuid: UUID,
         snapshotId: Long,
     ): ConsumerOffset =
         Audit.audited(
@@ -916,7 +943,7 @@ class CatalogService(private val jdbi: Jdbi) {
     fun getOffset(
         catalog: String,
         consumerId: String,
-        tableUuid: java.util.UUID,
+        tableUuid: UUID,
     ): ConsumerOffset =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)

@@ -5,6 +5,11 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -39,6 +44,175 @@ class TableCreationIntegrationTest {
     }
 
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
+
+    @Test
+    fun `metadata survives creation replay versioned edits rename and replacement`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                columns = listOf(ColumnDef("id", ColType.INT, comment = "identifier")),
+                comment = "original table",
+                properties = mapOf("owner.team" to "analytics"),
+            )
+        val operation = UUID.randomUUID()
+        val prepared = creations.prepare(catalog, operation, request)
+        assertThat(creations.prepare(catalog, operation, request).definition).isEqualTo(request)
+        assertThatThrownBy { creations.prepare(catalog, operation, request.copy(comment = "changed")) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        val published = creations.publish(catalog, operation, emptyList())
+        val original = catalogs.getTable(catalog, "test", "target")
+        assertThat(original.comment).isEqualTo("original table")
+        assertThat(original.properties).isEqualTo(request.properties)
+        val altered =
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "target",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("new table"),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(mapOf("owner.team" to "data")),
+                    com.posthog.hoglake.model.AlterOp.SetColumnComment("id", "new identifier"),
+                    com.posthog.hoglake.model.AlterOp.PromoteColumn("id", ColType.LONG),
+                    com.posthog.hoglake.model.AlterOp.RenameColumn("id", "renamed_id"),
+                    com.posthog.hoglake.model.AlterOp.RenameTable("renamed"),
+                ),
+                original.tableUuid,
+                published.snapshotId,
+            )
+        assertThat(altered.comment).isEqualTo("new table")
+        assertThat(altered.properties).containsEntry("owner.team", "data")
+        assertThat(altered.columns.single().def.comment).isEqualTo("new identifier")
+        assertThat(altered.columns.single().fieldId).isEqualTo(prepared.columns.single().fieldId)
+        assertThat(catalogs.getTable(catalog, "test", "target", published.snapshotId)).isEqualTo(original)
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        assertThatThrownBy {
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "renamed",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("stale"),
+                ),
+                original.tableUuid,
+                published.snapshotId,
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "renamed",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("must roll back"),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(mapOf("hoglake.location" to "bad")),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+        val replacement =
+            creations.prepare(
+                catalog,
+                UUID.randomUUID(),
+                definition.copy(
+                    name = "renamed",
+                    replacement = ReplacementTarget(original.tableUuid, head),
+                    comment = "replacement",
+                ),
+            )
+        creations.publish(catalog, replacement.operationId, emptyList())
+        val replaced = catalogs.getTable(catalog, "test", "renamed")
+        assertThat(replaced.comment).isEqualTo("replacement")
+        assertThat(replaced.properties).isEmpty()
+        assertThat(replaced.columns.single().def.comment).isNull()
+        assertThat(catalogs.getTable(catalog, "test", "renamed", head)).isEqualTo(altered)
+    }
+
+    @Test
+    fun `metadata removal and nested comments preserve field identities`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                columns =
+                    listOf(
+                        ColumnDef(
+                            "r",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("x", ColType.STRING, comment = "nested")),
+                            comment = "parent",
+                        ),
+                    ),
+                comment = "table",
+                properties = mapOf("key" to "value"),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), request)
+        creations.publish(catalog, prepared.operationId, emptyList())
+        val altered =
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "target",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetColumnComment("r.x", null),
+                    com.posthog.hoglake.model.AlterOp.SetTableComment(null),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(emptyMap()),
+                ),
+            )
+        assertThat(altered.comment).isNull()
+        assertThat(altered.properties).isEmpty()
+        assertThat(altered.columns.single().def.comment).isEqualTo("parent")
+        assertThat(altered.columns.single().children.single().def.comment).isNull()
+        assertThat(altered.columns.single().children.single().fieldId).isEqualTo(2)
+    }
+
+    @Test
+    fun `sorted and partitioned creation installs both specs with initial files`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                partitionFields = listOf(PartitionFieldDef(1, Transform.IDENTITY)),
+                sortFields = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), request)
+        val published =
+            creations.publish(
+                catalog,
+                prepared.operationId,
+                listOf(file(prepared).copy(partitionValues = listOf("7"))),
+            )
+        assertThat(published.state).isEqualTo("committed")
+        val table = catalogs.getTable(catalog, "test", "target")
+        assertThat(table.partitionSpec!!.fields).isEqualTo(request.partitionFields)
+        assertThat(table.sortSpec!!.fields).isEqualTo(request.sortFields)
+        assertThat(creations.status(catalog, prepared.operationId).definition).isEqualTo(request)
+    }
+
+    @Test
+    fun `partitioned creation publishes spec and files in one snapshot and fences changed retries`() {
+        val catalog = catalog()
+        val operation = UUID.randomUUID()
+        val fields = listOf(PartitionFieldDef(1, Transform.BUCKET, 16))
+        val requested = definition.copy(partitionFields = fields)
+        val prepared = creations.prepare(catalog, operation, requested)
+        assertThatThrownBy {
+            creations.prepare(catalog, operation, definition)
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            creations.publish(catalog, operation, listOf(file(prepared)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertThatThrownBy {
+            catalogs.getTable(
+                catalog,
+                "test",
+                "target",
+            )
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        val files = listOf(file(prepared).copy(partitionValues = listOf("3")))
+        val published = creations.publish(catalog, operation, files)
+        assertThat(published.state).isEqualTo("committed")
+        assertThat(catalogs.getTable(catalog, "test", "target").partitionSpec!!.fields).isEqualTo(fields)
+        assertThat(creations.publish(catalog, operation, files).snapshotId).isEqualTo(published.snapshotId)
+        assertThat(creations.status(catalog, operation).definition).isEqualTo(requested)
+    }
 
     /** One of every container shape, plus a three-level combination. */
     private val nestedColumns =
@@ -407,6 +581,26 @@ class TableCreationIntegrationTest {
         // rather than re-running the doomed validation.
         assertThat(creations.publish(catalog, operation.operationId, emptyList()).state)
             .isEqualTo("rejected")
+    }
+
+    @Test
+    fun `a rejected stored partition definition publishes no table or snapshot`() {
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val invalid = definition.copy(partitionFields = listOf(PartitionFieldDef(999, Transform.IDENTITY)))
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_table_creation SET definition = CAST(:definition AS jsonb) WHERE operation_id = :op",
+            )
+                .bind("definition", TableCreationDefinitionCodec.encode(invalid))
+                .bind("op", operation.operationId).execute()
+        }
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        val published = creations.publish(catalog, operation.operationId, emptyList())
+        assertThat(published.state).isEqualTo("rejected")
+        assertThat(published.reason).isEqualTo("definition_invalid")
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
     }
 
     @Test

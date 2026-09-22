@@ -15,6 +15,8 @@ data class TableRow(
     val tableUuid: UUID,
     val namespaceId: Long,
     val name: String,
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 /** Rollup row from hog_table_stats. */
@@ -39,6 +41,8 @@ object TableRepo {
                 tableUuid = rs.getObject("table_uuid") as UUID,
                 namespaceId = rs.getLong("namespace_id"),
                 name = rs.getString("name"),
+                comment = rs.getString("comment"),
+                properties = Pg.fromJson(rs.getString("properties"))!!.mapValues { (_, value) -> value as String },
             )
         }
 
@@ -59,6 +63,7 @@ object TableRepo {
                 def =
                     ColumnDef(
                         name = rs.getString("name"),
+                        comment = rs.getString("comment"),
                         type = ColType.fromWire(rs.getString("col_type")),
                         typeParams = Pg.fromJson(rs.getString("type_params")),
                         nullable = rs.getBoolean("nullable"),
@@ -163,12 +168,14 @@ object TableRepo {
         beginSnapshot: Long,
         namespaceId: Long,
         name: String,
+        comment: String? = null,
+        properties: Map<String, String> = emptyMap(),
     ) {
         try {
             handle.createUpdate(
                 """
-                INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, namespace_id, name)
-                VALUES (:catalogId, :tableId, :beginSnapshot, :namespaceId, :name)
+                INSERT INTO hog_table_version (catalog_id, table_id, begin_snapshot, namespace_id, name, comment, properties)
+                VALUES (:catalogId, :tableId, :beginSnapshot, :namespaceId, :name, :comment, :properties::jsonb)
                 """,
             )
                 .bind("catalogId", catalogId)
@@ -176,6 +183,8 @@ object TableRepo {
                 .bind("beginSnapshot", beginSnapshot)
                 .bind("namespaceId", namespaceId)
                 .bind("name", name)
+                .bind("comment", comment)
+                .bind("properties", Pg.toJson(properties))
                 .execute()
         } catch (e: UnableToExecuteStatementException) {
             if (Pg.isUniqueViolation(e)) {
@@ -207,9 +216,9 @@ object TableRepo {
                 """
             INSERT INTO hog_column
                 (catalog_id, table_id, field_id, begin_snapshot, name, col_type,
-                 type_params, nullable, ordinal, parent_field_id)
+                 type_params, nullable, ordinal, parent_field_id, comment)
             VALUES (:catalogId, :tableId, :fieldId, :beginSnapshot, :name, :colType,
-                    :typeParams::jsonb, :nullable, :ordinal, :parentFieldId)
+                    :typeParams::jsonb, :nullable, :ordinal, :parentFieldId, :comment)
             """,
             )
         for ((c, parent) in rows) {
@@ -222,6 +231,7 @@ object TableRepo {
                 .bind("colType", c.def.type.wire)
                 .bind("typeParams", Pg.toJson(c.def.typeParams))
                 .bind("nullable", c.def.nullable)
+                .bindByType("comment", c.def.comment, String::class.java)
                 .bind("ordinal", c.ordinal)
                 // bindByType, NOT bind + bindNull: a prepared BATCH binds
                 // one argument factory per name, and a null bound with
@@ -263,7 +273,7 @@ object TableRepo {
     ): TableRow? =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -291,7 +301,7 @@ object TableRepo {
     ): TableRow? =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -316,7 +326,7 @@ object TableRepo {
     ): List<TableRow> =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -345,7 +355,7 @@ object TableRepo {
         assemble(
             handle.createQuery(
                 """
-                SELECT field_id, parent_field_id, name, col_type, type_params, nullable, ordinal
+                SELECT field_id, parent_field_id, name, col_type, type_params, nullable, ordinal, comment
                 FROM hog_column
                 WHERE catalog_id = :catalogId AND table_id = :tableId
                   AND begin_snapshot <= :snapshot

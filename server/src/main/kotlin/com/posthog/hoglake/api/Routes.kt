@@ -291,6 +291,44 @@ fun Application.installApiRoutes(
                     )
                 }
 
+                post("/commit/uploads") {
+                    val req = call.receive<CommitRequestDto>()
+                    if (req.idempotencyKey == null || req.readSnapshot == null ||
+                        req.appends.any { it.expectedTableUuid == null } ||
+                        req.deletes.any { it.expectedTableUuid == null }
+                    ) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "claimed uploads require a guarded idempotent commit",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(
+                            call.catalog(),
+                            req.toModel(allowEmptyDeletes = true)
+                                .copy(requireUnchangedTables = req.deletes.isNotEmpty()),
+                        ).toDto(),
+                    )
+                }
+
+                post("/commit/transaction") {
+                    val req = call.receive<CommitRequestDto>()
+                    if (req.idempotencyKey == null || req.readSnapshot == null ||
+                        req.appends.any { it.expectedTableUuid == null } ||
+                        req.deletes.any { it.expectedTableUuid == null }
+                    ) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "transaction requires idempotency_key, read_snapshot and guarded targets",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(
+                            call.catalog(),
+                            req.toModel(allowEmptyDeletes = true)
+                                .copy(requireUnchangedTables = true, allowPendingDeletes = true),
+                        ).toDto(),
+                    )
+                }
+
                 get("/commit/receipts/{operation}") {
                     val operation =
                         try {

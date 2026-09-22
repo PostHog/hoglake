@@ -110,6 +110,8 @@ data class AlterOpDto(
     val newName: String? = null,
     val fields: List<AlterPartitionFieldDto>? = null,
     val sortFields: List<AlterSortFieldDto>? = null,
+    val comment: String? = null,
+    val properties: Map<String, String>? = null,
 ) {
     fun toModel(): AlterOp {
         // `parent` belongs to add_column alone. Silently ignoring it on
@@ -117,18 +119,21 @@ data class AlterOpDto(
         // who writes `{"op":"drop_column","parent":"addr","name":"zip"}`
         // meaning `addr.zip` gets a 200 and the WRONG column dropped.
         // The other ops address by dotted path; say so.
-        if (parent != null && op != "add_column") {
+        if (parent != null && op !in setOf("add_column", "add_column_with_metadata")) {
             throw HoglakeException.Validation(
                 "op '$op' does not take 'parent' (only add_column does); address a nested column " +
                     "by its dotted path instead, e.g. \"addr.zip\"",
             )
         }
         return when (op) {
-            "add_column" -> AlterOp.AddColumn(required(column, "column").toModel(), parent)
+            "add_column", "add_column_with_metadata" -> AlterOp.AddColumn(required(column, "column").toModel(), parent)
             "drop_column" -> AlterOp.DropColumn(required(name, "name"))
             "rename_column" -> AlterOp.RenameColumn(required(from, "from"), required(to, "to"))
             "promote_column" ->
                 AlterOp.PromoteColumn(required(name, "name"), parseColType(required(to, "to")))
+            "set_table_comment" -> AlterOp.SetTableComment(comment)
+            "set_column_comment" -> AlterOp.SetColumnComment(required(name, "name"), comment)
+            "set_properties" -> AlterOp.SetProperties(required(properties, "properties"))
             "rename_table" -> AlterOp.RenameTable(required(newName, "new_name"))
             "set_partition_spec" ->
                 AlterOp.SetPartitionSpec(required(fields, "fields").map { it.toModel() })
@@ -162,6 +167,8 @@ data class AlteredTableDto(
     val fileSizeBytes: Long,
     val partitionSpec: AlterPartitionSpecDto? = null,
     val sortSpec: AlterSortSpecDto? = null,
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 fun TableInfo.toAlteredDto() =
@@ -175,4 +182,6 @@ fun TableInfo.toAlteredDto() =
         fileSizeBytes = fileSizeBytes,
         partitionSpec = partitionSpec?.toAlterDto(),
         sortSpec = sortSpec?.toAlterDto(),
+        comment = comment,
+        properties = properties,
     )

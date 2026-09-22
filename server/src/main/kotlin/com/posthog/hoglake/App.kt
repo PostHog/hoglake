@@ -9,6 +9,7 @@ import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
 import com.posthog.hoglake.api.installTableCreationRoutes
+import com.posthog.hoglake.api.installUploadRoutes
 import com.posthog.hoglake.api.installViewRoutes
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.compaction.CompactionConfig
@@ -224,6 +225,7 @@ class App private constructor(
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
         )
+        app.installUploadRoutes(com.posthog.hoglake.service.UploadService(jdbi))
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)

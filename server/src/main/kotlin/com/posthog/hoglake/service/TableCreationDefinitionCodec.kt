@@ -6,6 +6,11 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.Transform
 import java.util.UUID
 
 /**
@@ -14,7 +19,7 @@ import java.util.UUID
  *
  * **Versions.** 0 is the pre-versioned shape (JVM enum names,
  * `typeParams`); 1 added the version marker and wire spellings; 2 adds
- * `children`; 3 adds the replacement identity and snapshot guard.
+ * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields; 5 adds initial sort fields; 6 adds comments and custom properties.
  * Without children a nested definition cannot be represented
  * at all.
  *
@@ -47,7 +52,15 @@ internal object TableCreationDefinitionCodec {
         mapper.writeValueAsString(
             mapOf(
                 "version" to
-                    if (definition.replacement != null) {
+                    if (definition.comment != null || definition.properties.isNotEmpty() ||
+                        anyComments(definition.columns)
+                    ) {
+                        6
+                    } else if (definition.sortFields.isNotEmpty()) {
+                        5
+                    } else if (definition.partitionFields.isNotEmpty()) {
+                        4
+                    } else if (definition.replacement != null) {
                         3
                     } else if (anyChildren(definition.columns)) {
                         NESTED_VERSION
@@ -57,18 +70,58 @@ internal object TableCreationDefinitionCodec {
                 "namespace" to definition.namespace,
                 "name" to definition.name,
                 "columns" to definition.columns.map { encodeColumn(it) },
-            ) + (
-                definition.replacement?.let {
-                    mapOf(
-                        "replacement" to
-                            mapOf(
-                                "expected_table_uuid" to it.expectedTableUuid?.toString(),
-                                "read_snapshot" to it.readSnapshot,
-                            ),
-                    )
-                } ?: emptyMap()
-            ),
+            ) + (definition.comment?.let { mapOf("comment" to it) } ?: emptyMap()) +
+                (
+                    if (definition.properties.isNotEmpty()) {
+                        mapOf("properties" to definition.properties)
+                    } else {
+                        emptyMap()
+                    }
+                ) + (
+                    definition.replacement?.let {
+                        mapOf(
+                            "replacement" to
+                                mapOf(
+                                    "expected_table_uuid" to it.expectedTableUuid?.toString(),
+                                    "read_snapshot" to it.readSnapshot,
+                                ),
+                        )
+                    } ?: emptyMap()
+                ) + (
+                    if (definition.partitionFields.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        mapOf(
+                            "partition_fields" to
+                                definition.partitionFields.map { field ->
+                                    mapOf(
+                                        "source_field_id" to field.sourceFieldId,
+                                        "transform" to field.transform.wire,
+                                        "transform_param" to field.transformParam,
+                                    )
+                                },
+                        )
+                    }
+                ) + (
+                    if (definition.sortFields.isEmpty()) {
+                        emptyMap()
+                    } else {
+                        mapOf(
+                            "sort_fields" to
+                                definition.sortFields.map { field ->
+                                    mapOf(
+                                        "source_field_id" to field.sourceFieldId,
+                                        "direction" to field.direction.wire,
+                                        "null_order" to field.nullOrder.wire,
+                                    )
+                                },
+                        )
+                    }
+                ),
         )
+
+    private fun anyComments(columns: List<ColumnDef>): Boolean =
+        columns.any { it.comment != null || anyComments(it.children ?: emptyList()) }
 
     private fun anyChildren(columns: List<ColumnDef>): Boolean =
         columns.any { it.children != null || anyChildren(it.children ?: emptyList()) }
@@ -85,6 +138,7 @@ internal object TableCreationDefinitionCodec {
             put("type", column.type.wire)
             put("type_params", column.typeParams)
             put("nullable", column.nullable)
+            column.comment?.let { put("comment", it) }
             column.children?.let { kids -> put("children", kids.map { encodeColumn(it) }) }
         }
 
@@ -151,7 +205,7 @@ internal object TableCreationDefinitionCodec {
             }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
-        if (version !in 0..3) {
+        if (version !in 0..6) {
             corrupt("unsupported table creation definition version $version")
         }
         val columns =
@@ -161,7 +215,7 @@ internal object TableCreationDefinitionCodec {
             text(node, "namespace", "the definition", ::corrupt),
             text(node, "name", "the definition", ::corrupt),
             columns.map { decodeColumn(it, version, ::corrupt) },
-            if (version == 3) {
+            if (version == 3 || (version >= 4 && node.has("replacement"))) {
                 val replacement = node["replacement"]
                 if (replacement == null || !replacement.isObject) corrupt("missing replacement guard")
                 val snapshot = replacement["read_snapshot"]
@@ -185,6 +239,77 @@ internal object TableCreationDefinitionCodec {
                 )
             } else {
                 null
+            },
+            if (version == 4 || (version >= 5 && node.has("partition_fields"))) {
+                val fields = node["partition_fields"]
+                if (fields == null || !fields.isArray || fields.isEmpty) corrupt("missing partition_fields array")
+                fields.map { field ->
+                    val source = field["source_field_id"]
+                    if (source == null || !source.isIntegralNumber ||
+                        !source.canConvertToLong() || source.longValue() <= 0
+                    ) {
+                        corrupt(
+                            "invalid partition source_field_id",
+                        )
+                    }
+                    val param = field["transform_param"]
+                    if (param != null && !param.isNull && (!param.isIntegralNumber || !param.canConvertToInt())) {
+                        corrupt(
+                            "invalid partition transform_param",
+                        )
+                    }
+                    val transform =
+                        try {
+                            Transform.fromWire(
+                                text(field, "transform", "partition field", ::corrupt),
+                            )
+                        } catch (e: IllegalArgumentException) {
+                            corrupt("invalid partition transform", e)
+                        }
+                    PartitionFieldDef(
+                        source.longValue(),
+                        transform,
+                        param?.takeIf { !it.isNull }?.intValue(),
+                    )
+                }
+            } else {
+                emptyList()
+            },
+            if (version == 5 || (version >= 6 && node.has("sort_fields"))) {
+                val fields = node["sort_fields"]
+                if (fields == null || !fields.isArray || fields.isEmpty) corrupt("missing sort_fields array")
+                fields.map { field ->
+                    val source = field["source_field_id"]
+                    if (source == null || !source.isIntegralNumber ||
+                        !source.canConvertToLong() || source.longValue() <= 0
+                    ) {
+                        corrupt(
+                            "invalid sort source_field_id",
+                        )
+                    }
+                    try {
+                        SortFieldDef(
+                            source.longValue(),
+                            SortDirection.fromWire(text(field, "direction", "sort field", ::corrupt)),
+                            NullOrder.fromWire(text(field, "null_order", "sort field", ::corrupt)),
+                        )
+                    } catch (e: IllegalArgumentException) {
+                        corrupt("invalid sort field", e)
+                    }
+                }
+            } else {
+                emptyList()
+            },
+            if (version >= 6 && node.has("comment")) text(node, "comment", "definition", ::corrupt) else null,
+            if (version >= 6 && node.has("properties")) {
+                val properties = node["properties"]
+                if (!properties.isObject) corrupt("invalid properties object")
+                properties.fields().asSequence().associate { (key, value) ->
+                    if (!value.isTextual) corrupt("invalid custom property value")
+                    key to value.textValue()
+                }
+            } else {
+                emptyMap()
             },
         )
     }
@@ -302,6 +427,7 @@ internal object TableCreationDefinitionCodec {
             // reading one back as empty would make old receipts
             // unpublishable.
             if (children == null || children.isNull) null else children.map { decodeColumn(it, version, corrupt) },
+            if (version >= 6 && column.has("comment")) text(column, "comment", "column", corrupt) else null,
         )
     }
 }

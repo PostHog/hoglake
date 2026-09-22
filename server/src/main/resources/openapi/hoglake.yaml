@@ -1122,12 +1122,239 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/partitioned:
+    put:
+      operationId: preparePartitionedTableCreation
+      summary: Prepare an atomic partitioned table creation
+      description: >
+        Requires atomic-partitioned-table-creation-v1. This separate endpoint prevents
+        old replicas from ignoring partition fields. Status, commit and abort use
+        the ordinary table-creations operation paths. Definition receipts use version
+        4 only for partitioned creation; old servers refuse those receipts.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns, partition_fields]
+              properties:
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+                partition_fields:
+                  type: array
+                  minItems: 1
+                  description: >
+                    Requires atomic-partitioned-table-creation-v1. Initial partition fields,
+                    using depth-first pre-order field IDs starting at 1 in columns. Persisted
+                    in the durable definition and installed atomically with initial files.
+                    Must be nonempty. Same validation as set_partition_spec.
+                  items: { $ref: "#/components/schemas/PartitionField" }
+                replacement:
+                  type: object
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: Durable operation state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400": { description: Malformed request }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Conflicting operation definition }
+        "422": { description: Invalid partition fields or table definition }
+        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
+
+  /catalogs/{catalog}/table-creations/{operation}/sorted:
+    put:
+      operationId: prepareSortedTableCreation
+      summary: Prepare an atomic sorted table creation, optionally partitioned
+      description: >
+        Requires atomic-sorted-table-creation-v1. This separate endpoint prevents
+        old replicas from ignoring sort fields. Status, commit and abort use
+        the ordinary table-creations operation paths. Definition receipts use version
+        5 only for sorted creation; old servers refuse those receipts.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns, sort_fields]
+              properties:
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+                sort_fields:
+                  type: array
+                  minItems: 1
+                  description: Initial sort fields using depth-first field IDs; same validation as set_sort_order.
+                  items: { $ref: "#/components/schemas/SortField" }
+                partition_fields:
+                  type: array
+                  description: >
+                    Requires atomic-partitioned-table-creation-v1. Initial partition fields,
+                    using depth-first pre-order field IDs starting at 1 in columns. Persisted
+                    in the durable definition and installed atomically with initial files.
+                    Omitted or empty means unpartitioned. Same validation as set_partition_spec.
+                  items: { $ref: "#/components/schemas/PartitionField" }
+                replacement:
+                  type: object
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: Durable operation state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400": { description: Malformed request }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Conflicting operation definition }
+        "422": { description: Invalid sort or partition fields or table definition }
+        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
+
+  /catalogs/{catalog}/table-creations/{operation}/metadata:
+    put:
+      operationId: prepareMetadataTableCreation
+      summary: Prepare atomic creation with comments and custom properties
+      description: >
+        Requires versioned-table-metadata-v1. Receipts with metadata use durable
+        definition version 6, refused by older replicas. May compose with partitions,
+        sorting and replacement. Ordinary preparation endpoints reject metadata.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns]
+              properties:
+                comment: { type: [string, "null"], maxLength: 16384 }
+                properties: { $ref: "#/components/schemas/CustomProperties" }
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+                sort_fields:
+                  type: array
+                  description: Initial sort fields using depth-first field IDs; same validation as set_sort_order.
+                  items: { $ref: "#/components/schemas/SortField" }
+                partition_fields:
+                  type: array
+                  description: >
+                    Requires atomic-partitioned-table-creation-v1. Initial partition fields,
+                    using depth-first pre-order field IDs starting at 1 in columns. Persisted
+                    in the durable definition and installed atomically with initial files.
+                    Omitted or empty means unpartitioned. Same validation as set_partition_spec.
+                  items: { $ref: "#/components/schemas/PartitionField" }
+                replacement:
+                  type: object
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: Durable operation state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400": { description: Malformed request }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Conflicting operation definition }
+        "422": { description: Invalid sort or partition fields or table definition }
+        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
+
   /catalogs/{catalog}/table-creations/{operation}/commit:
     post:
       operationId: publishTableCreation
       summary: Atomically publish the table, initial files, and durable receipt in one snapshot
       description: >
         Requires atomic-table-creation-v1 capability. Without a replacement guard the target
+        must be absent at publication. With the atomic-table-replacement-v1 guard, target
+        identity and all target changes since read_snapshot are checked under the commit lock.
+        A replacement retires the old incarnation and publishes a new UUID at one snapshot.
+        Stale or expired guards return a durable rejected receipt with reason target_changed.
+        The exact ordered file list is compared as JSON on retries; an identical retry
+        returns the original terminal result even if the table was subsequently dropped.
+        Up to 10000 unique file paths, all under the operation write_path. Empty files
+        creates an empty table. No object-store reads occur during publication.
+        Aborted or expired operations cannot publish. Terminal receipts are retained.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/FileRegistration" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/commit/uploads:
+    post:
+      operationId: publishTableCreationUploads
+      summary: Atomically publish the table, initial files, and durable receipt in one snapshot
+      description: >
+        Requires claimed-uploads-v1 and atomic-table-creation-v1. Upload claims must
+        be active and owned by this operation; claim settlement shares publication.
+        Older replicas return 404, with no fallback. Without a replacement guard the target
         must be absent at publication. With the atomic-table-replacement-v1 guard, target
         identity and all target changes since read_snapshot are checked under the commit lock.
         A replacement retires the old incarnation and publishes a new UUID at one snapshot.
@@ -1259,6 +1486,193 @@ paths:
                 - { $ref: "#/components/schemas/CommitRequest" }
                 - type: object
                   required: [idempotency_key]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
+  /catalogs/{catalog}/uploads/{upload}:
+    put:
+      operationId: claimUpload
+      summary: Claim a fresh object path before uploading
+      description: >
+        Requires claimed-uploads-v1. Generates a unique server path under prefix,
+        which must be inside catalog data_path. Replaying upload ID requires the
+        same owner, prefix and kind and returns the same path and current state.
+        Owner is the durable commit key or table-creation operation ID. Lease is
+        24 hours. Active claims protect objects even if erroneously queued.
+        Registered and abandoned states are permanent fences against path reuse.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: upload, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, prefix, file_kind]
+              properties:
+                owner: { type: string, format: uuid }
+                prefix: { type: string }
+                file_kind: { type: string, enum: [data, delete] }
+      responses:
+        "200":
+          description: Durable claim (replay may return a terminal state)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload_id, owner, prefix, path, file_kind, state, expires_at]
+                properties:
+                  upload_id: { type: string, format: uuid }
+                  owner: { type: string, format: uuid }
+                  prefix: { type: string }
+                  path: { type: string }
+                  file_kind: { type: string, enum: [data, delete] }
+                  state: { type: string, enum: [active, registered, abandoned] }
+                  expires_at: { type: string, format: date-time }
+        "409": { description: Upload identity reused with different intent }
+        "422": { description: Invalid prefix or file kind }
+
+  /catalogs/{catalog}/uploads/renew:
+    post:
+      operationId: renewUploads
+      summary: Extend active claims for an owner by 24 hours
+      description: Never revives an abandoned or registered claim; serializes with expiry and publication.
+      parameters: [{ $ref: "#/components/parameters/catalog" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner]
+              properties:
+                owner: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Number of active leases renewed
+          content:
+            application/json:
+              schema: { type: object, properties: { renewed: { type: integer } } }
+
+  /catalogs/{catalog}/uploads/abandon:
+    post:
+      operationId: abandonUploads
+      summary: Fence selected uncommitted uploads owned by this operation
+      description: Registered claims are immutable; unknown publication outcomes can never be rolled back by this call.
+      parameters: [{ $ref: "#/components/parameters/catalog" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, paths]
+              properties:
+                owner: { type: string, format: uuid }
+                paths: { type: array, maxItems: 10000, items: { type: string } }
+      responses:
+        "200":
+          description: Number fenced (already registered, terminal or differently owned paths are unchanged)
+          content:
+            application/json:
+              schema: { type: object, properties: { abandoned: { type: integer } } }
+
+  /catalogs/{catalog}/uploads/schedule-expired:
+    post:
+      operationId: scheduleExpiredUploads
+      summary: Explicitly fence expired uploads and queue abandoned paths for cleanup
+      description: >
+        No background job invokes this endpoint. Under the catalog commit lock,
+        expired active claims become abandoned and abandoned paths are queued for
+        the existing retained-reference-aware cleanup drain. No bucket scan occurs.
+        Tombstones remain permanent and later invocations revisit abandoned paths
+        so PUTs finishing after an earlier DELETE remain reclaimable. Selection is
+        bounded and rotates by last scheduling time. This never deletes an object
+        itself; existing cleanup triggers and configuration still control draining.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 } }
+      responses:
+        "200":
+          description: Number of claims examined and fenced or rescheduled
+          content:
+            application/json:
+              schema: { type: object, properties: { scheduled: { type: integer } } }
+        "422": { description: Limit outside allowed range }
+
+  /catalogs/{catalog}/commit/uploads:
+    post:
+      operationId: commitUploads
+      summary: Publish files with durable upload ownership
+      description: >
+        Requires claimed-uploads-v1. All target tables require expected_table_uuid.
+        Fresh upload claims referenced by path must be active, match idempotency_key as
+        owner and match the file kind. Registered immutable objects with retained
+        references of that kind may be referenced again without transferring ownership. Registration, claim settlement and receipt
+        commit atomically under the catalog lock. Deletes use the prepared mutation
+        conflict contract. Identical replay returns the original receipt. Older
+        replicas return 404; no fallback is permitted for claimed paths.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
+  /catalogs/{catalog}/commit/transaction:
+    post:
+      operationId: commitTransaction
+      summary: Publish a multi-table DML transaction atomically
+      description: >
+        Requires atomic-dml-transactions-v1. Every target requires expected_table_uuid;
+        all target tables must be unchanged since read_snapshot, including append-only
+        targets. Optional data_file_path deletion references address exactly one
+        same-table append in this commit, with data_file_id zero. Numeric references
+        retain ordinary snapshot visibility and vector-growth checks. Upload claims,
+        all file registrations and the full-payload receipt commit in one catalog-locked
+        transaction. Replay returns the original receipt. A missing receipt is not a
+        fence. Older replicas return 404; no fallback is permitted. This endpoint
+        provides snapshot isolation with write-write conflict detection, not validation
+        of a transaction's read-only tables or cross-catalog atomicity.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot]
       responses:
         "200":
           description: Committed, or the original result of an identical replay
@@ -1758,7 +2172,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 and guarded-schema-evolution-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1848,10 +2262,21 @@ components:
             failing publish rolled itself back and only an explicit
             abort could end it.)
 
+    CustomProperties:
+      type: object
+      maxProperties: 100
+      description: >
+        Inert user metadata. Replaced as a whole by set_properties; an empty object clears it.
+        Keys are lowercase ASCII identifiers; hoglake. and trino. prefixes and
+        partitioning, sorted_by, location, format, comment are reserved. No NUL in values.
+      propertyNames: { pattern: "^[a-z][a-z0-9_.-]{0,127}$" }
+      additionalProperties: { type: string, maxLength: 4096 }
+
     ColumnDef:
       type: object
       required: [name, type]
       properties:
+        comment: { type: [string, "null"], maxLength: 16384, description: "Versioned comment; no NUL. Requires versioned-table-metadata-v1 for writes." }
         name:
           type: string
           # PATTERN STAYS IN ITS SIBLING POSITION. Every other identifier
@@ -1996,6 +2421,8 @@ components:
       required: [name, namespace, table_uuid, columns, record_count,
                  file_count, file_size_bytes]
       properties:
+        comment: { type: [string, "null"], maxLength: 16384 }
+        properties: { $ref: "#/components/schemas/CustomProperties" }
         name: { type: string }
         namespace: { type: string }
         table_uuid: { type: string, format: uuid }
@@ -2102,7 +2529,13 @@ components:
       type: object
       required: [data_file_id, path, delete_count, file_size_bytes]
       properties:
-        data_file_id: { type: integer, format: int64 }
+        data_file_id: { type: integer, format: int64, description: Zero only when data_file_path is supplied. }
+        data_file_path:
+          type: string
+          description: >
+            Only accepted by /commit/transaction. References exactly one append in the
+            same table and same commit. This is a private staged-file reference, not
+            a lookup of an existing file by path. data_file_id must be zero.
         path: { type: string, description: Puffin deletion-vector file URI }
         delete_count:
           type: integer
@@ -2127,7 +2560,7 @@ components:
             TableAppend.expected_table_uuid (mismatch -> 409).
         files:
           type: array
-          description: Empty only for guarded zero-row statements through /commit/deletes/prepared or /commit/mutations/prepared.
+          description: Empty for guarded zero-row statements through prepared, uploads or transaction commit endpoints.
           items: { $ref: "#/components/schemas/DeleteFileRegistration" }
 
     DeleteFile:
@@ -2232,10 +2665,13 @@ components:
         its type. Nested containers are also not promotable — promote a
         struct's LEAF field, which follows the ordinary scalar matrix.
       properties:
+        comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
+        properties: { $ref: "#/components/schemas/CustomProperties" }
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
-                 rename_table, set_partition_spec, set_sort_order]
+                 rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
+                 set_table_comment, set_column_comment, set_properties]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
         parent:                       # add_column, optional
           type: string

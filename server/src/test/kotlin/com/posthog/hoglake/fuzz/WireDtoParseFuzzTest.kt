@@ -67,6 +67,15 @@ class WireDtoParseFuzzTest {
             try {
                 val request = dto.toModel()
                 val fingerprint = commitFingerprint(request)
+                check(commitFingerprint(request.copy(allowPendingDeletes = true)) != fingerprint)
+                val pending = request.deletes.flatMap { it.files }.filter { it.dataFilePath != null }
+                pending.forEach { file ->
+                    check(
+                        mapper.readValue<com.posthog.hoglake.model.DeleteFileRegistration>(
+                            mapper.writeValueAsBytes(file),
+                        ) == file,
+                    )
+                }
                 val reordered =
                     request.copy(
                         appends =
@@ -87,6 +96,12 @@ class WireDtoParseFuzzTest {
             }
         }
 
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(data) }?.let { dto ->
+            check(mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.AbandonUploadsDto>(data) }
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.UploadOwnerDto>(data) }
+
         parseOrNull { mapper.readValue<PrepareTableCreationDto>(data) }?.let { dto ->
             try {
                 val definition =
@@ -95,8 +110,16 @@ class WireDtoParseFuzzTest {
                         dto.name,
                         dto.columns.map { it.toModel() },
                         dto.replacement,
+                        dto.partitionFields.map { it.toModel() },
+                        dto.sortFields.map { it.toModel() },
+                        dto.comment,
+                        dto.properties,
                     )
-                if ((dto.replacement?.readSnapshot ?: 0) >= 0) {
+                if ((dto.replacement?.readSnapshot ?: 0) >= 0 &&
+                    dto.partitionFields.all {
+                        it.sourceFieldId > 0
+                    } && dto.sortFields.all { it.sourceFieldId > 0 }
+                ) {
                     val encoded = TableCreationDefinitionCodec.encode(definition)
                     check(TableCreationDefinitionCodec.decode(encoded) == definition)
                 }

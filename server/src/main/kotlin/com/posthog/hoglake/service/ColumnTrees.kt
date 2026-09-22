@@ -99,6 +99,7 @@ object ColumnTrees {
         path: List<String>,
         syntheticallyNamed: Boolean,
     ) {
+        TableMetadata.validateComment(def.comment)
         val here = path + def.name
         val qualified = here.joinToString(".")
         val children = def.children ?: emptyList()

@@ -143,6 +143,25 @@ class CleanupServiceIntegrationTest {
     // ---- tests -------------------------------------------------------------
 
     @Test
+    fun `upload claims protect active PUTs and abandoned late PUTs remain reclaimable`() {
+        val catalogId = seedCatalog("cl-uploads")
+        val uploads = UploadService(jdbi)
+        val owner = java.util.UUID.randomUUID()
+        val claim = uploads.claim("cl-uploads", java.util.UUID.randomUUID(), owner, "s3://$BUCKET/cl-uploads", "data")
+        putObject(claim.path)
+        queue(catalogId, claim.path)
+        assertThat(svc.runOnce("cl-uploads", 100).stillReferenced).isEqualTo(1)
+        assertThat(uploads.abandon("cl-uploads", owner, listOf(claim.path))).isEqualTo(1)
+        assertThat(svc.runOnce("cl-uploads", 100).removed).isEqualTo(1)
+        // An already-running PUT can finish after the first DELETE. A later explicit
+        // sweep revisits the permanent fence rather than assuming the first DELETE was final.
+        putObject(claim.path)
+        assertThat(uploads.scheduleExpired("cl-uploads")).isEqualTo(1)
+        assertThat(svc.runOnce("cl-uploads", 100).removed).isEqualTo(1)
+        assertThat(uploads.renew("cl-uploads", owner)).isZero()
+    }
+
+    @Test
     fun `happy drain deletes objects and empties the queue`() {
         val catalogId = seedCatalog("cl-happy")
         val paths = (1..3).map { "s3://$BUCKET/cl-happy/f$it.parquet" }

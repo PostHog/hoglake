@@ -64,7 +64,7 @@ object HogSchemaColumns {
             "hog_table_version" to
                 setOf(
                     "catalog_id", "table_id", "begin_snapshot", "end_snapshot",
-                    "namespace_id", "name",
+                    "namespace_id", "name", "comment", "properties",
                 ),
             // TableRepo.columnsAt, AlterService, Hydrator.liveColumns.
             "hog_column" to
@@ -72,7 +72,7 @@ object HogSchemaColumns {
                     "catalog_id", "table_id", "field_id", "begin_snapshot", "end_snapshot",
                     "name", "col_type", "type_params", "nullable", "ordinal",
                     // V9: the tree edge; NULL = top-level column.
-                    "parent_field_id",
+                    "parent_field_id", "comment",
                 ),
             // CommitService.writeAppends (rollup + row-id allocator).
             "hog_table_stats" to
@@ -125,6 +125,11 @@ object HogSchemaColumns {
                 setOf(
                     "catalog_id", "view_id", "view_uuid", "namespace_id", "name", "dialect",
                     "sql", "begin_snapshot", "end_snapshot",
+                ),
+            "hog_upload" to
+                setOf(
+                    "catalog_id", "upload_id", "owner", "prefix", "path", "file_kind", "state",
+                    "expires_at", "last_scheduled_at",
                 ),
             // CleanupService (drain + ledger), ExpiryService queue inserts.
             "hog_file_removal" to

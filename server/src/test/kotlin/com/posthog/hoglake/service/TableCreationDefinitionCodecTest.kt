@@ -3,10 +3,16 @@ package com.posthog.hoglake.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.nodeCount
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
+import java.util.UUID
 
 /**
  * The durable format behind an atomic table creation's receipt.
@@ -65,6 +71,68 @@ class TableCreationDefinitionCodecTest {
                 ),
             ),
         )
+
+    @Test
+    fun `metadata uses version six and preserves empty and nested comments`() {
+        val metadata =
+            flat.copy(
+                comment = "",
+                properties = mapOf("owner" to "data"),
+                columns =
+                    listOf(
+                        ColumnDef(
+                            "r",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("x", ColType.LONG, comment = "nested")),
+                        ),
+                    ),
+            )
+        val encoded = TableCreationDefinitionCodec.encode(metadata)
+        assertThat(encoded).contains("\"version\":6")
+        assertThat(TableCreationDefinitionCodec.decode(encoded)).isEqualTo(metadata)
+        val composed =
+            metadata.copy(
+                partitionFields = listOf(PartitionFieldDef(2, Transform.IDENTITY)),
+                sortFields = listOf(SortFieldDef(2, SortDirection.ASC, NullOrder.NULLS_LAST)),
+                replacement = ReplacementTarget(UUID.randomUUID(), 42),
+            )
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(composed)),
+        ).isEqualTo(composed)
+        assertThatThrownBy { TableCreationDefinitionCodec.decode(encoded.replace("\"data\"", "42")) }
+            .isInstanceOf(CorruptDefinitionException::class.java)
+    }
+
+    @Test
+    fun `sorted definitions compose with partitions and replacement in version five`() {
+        val sorted = flat.copy(sortFields = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)))
+        assertThat(TableCreationDefinitionCodec.encode(sorted)).contains("\"version\":5")
+        assertThat(TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(sorted))).isEqualTo(sorted)
+        val combined =
+            sorted.copy(
+                partitionFields = listOf(PartitionFieldDef(1, Transform.IDENTITY)),
+                replacement = ReplacementTarget(UUID.randomUUID(), 42),
+            )
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(combined)),
+        ).isEqualTo(combined)
+    }
+
+    @Test
+    fun `partition fields require version four and preserve replacement guards`() {
+        val partitioned = flat.copy(partitionFields = listOf(PartitionFieldDef(1, Transform.BUCKET, 16)))
+        val encoded = TableCreationDefinitionCodec.encode(partitioned)
+        assertThat(encoded).contains("\"version\":4")
+        assertThat(TableCreationDefinitionCodec.decode(encoded)).isEqualTo(partitioned)
+        val replaced = partitioned.copy(replacement = ReplacementTarget(UUID.randomUUID(), 42))
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(replaced)),
+        ).isEqualTo(replaced)
+        assertThat(TableCreationDefinitionCodec.encode(flat)).contains("\"version\":1")
+        assertThatThrownBy {
+            TableCreationDefinitionCodec.decode(encoded.replace("\"source_field_id\":1", "\"source_field_id\":0"))
+        }.isInstanceOf(CorruptDefinitionException::class.java)
+    }
 
     @Test
     fun `a nested definition survives the round trip whole`() {

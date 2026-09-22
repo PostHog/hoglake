@@ -72,6 +72,88 @@ class TableCreationApiIntegrationTest {
     }
 
     @Test
+    fun `upload claim routes renew abandon and schedule through durable state`() =
+        api { client, base ->
+            val owner = UUID.randomUUID()
+            val id = UUID.randomUUID()
+            val prefix = "s3://bucket/${base.substringAfterLast('/')}"
+            val body = """{"owner":"$owner","prefix":"$prefix","file_kind":"data"}"""
+            val claimed = client.prepare("$base/uploads/$id", body)
+            assertThat(claimed.status).isEqualTo(HttpStatusCode.OK)
+            val claim = json.readTree(claimed.bodyAsText())
+            assertThat(claim["state"].asText()).isEqualTo("active")
+            val path = claim["path"].asText()
+            assertThat(path).startsWith("$prefix/trino-upload/")
+
+            suspend fun action(
+                suffix: String,
+                request: String = "{}",
+            ) = client.post("$base/uploads/$suffix") {
+                contentType(ContentType.Application.Json)
+                setBody(request)
+            }
+            assertThat(action("renew", """{"owner":"$owner"}""").status).isEqualTo(HttpStatusCode.OK)
+            assertThat(json.readTree(action("schedule-expired").bodyAsText())["scheduled"].asInt()).isZero()
+            assertThat(
+                action("abandon", """{"owner":"$owner","paths":["$path"]}""").status,
+            ).isEqualTo(HttpStatusCode.OK)
+            assertThat(json.readTree(action("schedule-expired").bodyAsText())["scheduled"].asInt()).isEqualTo(1)
+            assertThat(action("schedule-expired?limit=0").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+        }
+
+    @Test
+    fun `metadata creation refuses old preparation paths and returns persisted comments`() =
+        api { client, base ->
+            val path = "$base/table-creations/${UUID.randomUUID()}"
+            val body = """{"namespace":"test","name":"target","comment":"table",
+                "properties":{"owner.team":"data"},"columns":[{"name":"id","type":"long","comment":"id"}]}"""
+            for (suffix in listOf("", "/partitioned", "/sorted")) {
+                assertThat(client.prepare(path + suffix, body).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            }
+            assertThat(client.prepare("$path/metadata", body).status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.publish(path).status).isEqualTo(HttpStatusCode.OK)
+            val table = json.readTree(client.get("$base/namespaces/test/tables/target").bodyAsText())
+            assertThat(table["comment"].asText()).isEqualTo("table")
+            assertThat(table["properties"]["owner.team"].asText()).isEqualTo("data")
+            assertThat(table["columns"][0]["comment"].asText()).isEqualTo("id")
+        }
+
+    @Test
+    fun `sorted preparation rejects ordinary and partition-only endpoints`() =
+        api { client, base ->
+            val path = "$base/table-creations/${UUID.randomUUID()}"
+            val request = json.readTree(definition) as com.fasterxml.jackson.databind.node.ObjectNode
+            request.set<com.fasterxml.jackson.databind.JsonNode>(
+                "sort_fields",
+                json.readTree("""[{"source_field_id":1,"direction":"desc","null_order":"nulls_first"}]"""),
+            )
+            assertThat(client.prepare(path, request.toString()).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(
+                client.prepare("$path/partitioned", request.toString()).status,
+            ).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(client.prepare("$path/sorted", request.toString()).status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.publish(path).status).isEqualTo(HttpStatusCode.OK)
+            val table = json.readTree(client.get("$base/namespaces/test/tables/target").bodyAsText())
+            assertThat(table["sort_spec"]["fields"][0]["direction"].asText()).isEqualTo("desc")
+        }
+
+    @Test
+    fun `partition preparation requires its distinct endpoint`() =
+        api { client, base ->
+            val path = "$base/table-creations/${UUID.randomUUID()}"
+            val request = json.readTree(definition) as com.fasterxml.jackson.databind.node.ObjectNode
+            request.set<com.fasterxml.jackson.databind.JsonNode>(
+                "partition_fields",
+                json.readTree("""[{"source_field_id":1,"transform":"identity"}]"""),
+            )
+            assertThat(client.prepare(path, request.toString()).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(client.prepare("$path/partitioned", request.toString()).status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.publish(path).status).isEqualTo(HttpStatusCode.OK)
+            val table = json.readTree(client.get("$base/namespaces/test/tables/target").bodyAsText())
+            assertThat(table["partition_spec"]["fields"][0]["source_field_id"].asLong()).isEqualTo(1)
+        }
+
+    @Test
     fun `wire lifecycle preserves identities and terminal receipts`() =
         api { client, base ->
             val capabilities = json.readTree(client.get(base).bodyAsText())["capabilities"]

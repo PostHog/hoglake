@@ -49,9 +49,9 @@ import java.util.UUID
  * readSnapshot).
  *
  * A commit may mix appends and deletes, including on the same table;
- * appends are applied first, and a delete may NOT target a data file
- * created in the same commit (Validation — keeps the readSnapshot
- * semantics coherent: you cannot have read a file this commit creates).
+ * appends are applied first. Ordinary commits cannot delete newly created files.
+ * Explicit DML transactions may reference a same-commit append by path, reflecting
+ * a read of their private staged files; ordinary numeric IDs retain snapshot checks.
  *
  * NOTE on stats: deletes do NOT touch hog_table_stats. record_count /
  * file_size_bytes remain the gross append counters (and next_row_id the
@@ -99,6 +99,21 @@ class CommitService(
         val deletes = request.deletes.sumOf { it.files.size }
         val result =
             try {
+                if (request.allowPendingDeletes &&
+                    (
+                        request.idempotencyKey == null || request.readSnapshot == null ||
+                            !request.requireUnchangedTables ||
+                            request.appends.any { it.expectedTableUuid == null } ||
+                            request.deletes.any { it.expectedTableUuid == null }
+                    )
+                ) {
+                    throw HoglakeException.Validation("transaction requires guarded idempotent publication")
+                }
+                if (request.deletes.any { table -> table.files.any { it.dataFilePath != null } } &&
+                    !request.allowPendingDeletes
+                ) {
+                    throw HoglakeException.Validation("pending delete targets require /commit/transaction")
+                }
                 // Canonicalizing large registrations needs neither a connection nor
                 // the catalog lock. Receipt comparison and publication stay locked.
                 val requestJson = request.idempotencyKey?.let { commitFingerprint(request) }
@@ -168,10 +183,17 @@ class CommitService(
         tableId: Long,
         snapshotId: Long,
         files: List<FileRegistration>,
+        uploadOwner: UUID? = null,
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
-        val append = validateFiles(h, catalogId, ResolvedAppend(namespace, table, tableId, files, null))
+        val append =
+            validateFiles(
+                h,
+                catalogId,
+                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
+            )
+        com.posthog.hoglake.service.UploadService.register(h, catalogId, uploadOwner, files.map { it.path to "data" })
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =
@@ -369,6 +391,13 @@ class CommitService(
         // Duplicate paths against live/historical file rows stay legal —
         // this rejects only paths the cleanup queue currently owns; once
         // the entry drains (drained_at set) the path is registrable again.
+        com.posthog.hoglake.service.UploadService.register(
+            h,
+            catalogId,
+            req.idempotencyKey,
+            resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
+                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
+        )
         checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
 
         // 4. Conflict check ('table_dropped'/'table_altered' since
@@ -771,7 +800,29 @@ class CommitService(
             )
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
-            for (reg in deletes.files) {
+            for (registration in deletes.files) {
+                val reg =
+                    if (registration.dataFilePath == null) {
+                        registration
+                    } else {
+                        val ids =
+                            h.createQuery(
+                                """
+                        SELECT data_file_id FROM hog_data_file
+                        WHERE catalog_id = :catalog AND table_id = :table AND begin_snapshot = :snapshot
+                          AND path = :path
+                        LIMIT 2
+                        """,
+                            ).bind("catalog", catalogId).bind("table", deletes.tableId)
+                                .bind("snapshot", snapshotId).bind("path", registration.dataFilePath)
+                                .mapTo(Long::class.java).list()
+                        if (ids.size != 1) {
+                            throw HoglakeException.Validation(
+                                "pending delete must target exactly one same-table append in this commit",
+                            )
+                        }
+                        registration.copy(dataFileId = ids.single())
+                    }
                 val target =
                     h.createQuery(
                         """
@@ -794,13 +845,13 @@ class CommitService(
                         }
                 val (tableIdRecordsBegin, live) = target
                 val (targetTableId, recordCount, targetBegin) = tableIdRecordsBegin
-                if (targetBegin == snapshotId) {
+                if (targetBegin == snapshotId && reg.dataFilePath == null) {
                     throw HoglakeException.Validation(
                         "delete for $qualified targets data_file_id ${reg.dataFileId} " +
                             "created in this same commit",
                     )
                 }
-                if (targetBegin > readSnapshot) {
+                if (targetBegin > readSnapshot && !(targetBegin == snapshotId && reg.dataFilePath != null)) {
                     throw HoglakeException.CommitConflict(
                         "delete for $qualified targets data_file_id ${reg.dataFileId} " +
                             "created after read snapshot $readSnapshot",
@@ -1106,7 +1157,7 @@ class CommitService(
 
     /** DB-independent DV registration checks: shapes, ranges, duplicate targets. */
     private fun validateDeleteRegistrations(resolved: List<ResolvedDeletes>) {
-        val seenTargets = HashSet<Long>()
+        val seenTargets = HashSet<Any>()
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
             for (reg in deletes.files) {
@@ -1125,7 +1176,14 @@ class CommitService(
                             "${reg.dataFileId} in $qualified",
                     )
                 }
-                if (!seenTargets.add(reg.dataFileId)) {
+                if (reg.dataFilePath != null && (reg.dataFileId != 0L || reg.dataFilePath.isBlank())) {
+                    throw HoglakeException.Validation(
+                        "pending delete requires data_file_id zero and a nonblank data_file_path",
+                    )
+                }
+                val targetKey: Any =
+                    reg.dataFilePath?.let { Triple(deletes.namespace, deletes.table, it) } ?: reg.dataFileId
+                if (!seenTargets.add(targetKey)) {
                     throw HoglakeException.Validation(
                         "duplicate delete target data_file_id ${reg.dataFileId} in one commit",
                     )

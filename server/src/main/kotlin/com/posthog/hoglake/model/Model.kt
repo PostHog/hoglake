@@ -541,6 +541,12 @@ sealed class AlterOp {
 
     data class RenameTable(val newName: String) : AlterOp()
 
+    data class SetTableComment(val comment: String?) : AlterOp()
+
+    data class SetColumnComment(val name: String, val comment: String?) : AlterOp()
+
+    data class SetProperties(val properties: Map<String, String>) : AlterOp()
+
     /** Replace the partition spec (empty list = unpartitioned). */
     data class SetPartitionSpec(val fields: List<PartitionFieldDef>) : AlterOp()
 
@@ -597,6 +603,7 @@ data class ColumnDef(
     val typeParams: Map<String, Any?>? = null,
     val nullable: Boolean = true,
     val children: List<ColumnDef>? = null,
+    val comment: String? = null,
 )
 
 /**
@@ -685,6 +692,8 @@ data class TableInfo(
     val partitionSpec: PartitionSpec? = null,
     /** Live sort order; null = unsorted. */
     val sortSpec: SortSpec? = null,
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 data class Snapshot(
@@ -870,6 +879,9 @@ data class DeleteFileRegistration(
     val path: String,
     val deleteCount: Long,
     val fileSizeBytes: Long,
+    /** Transaction-only reference to an append in this same commit; dataFileId must be zero. */
+    @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    val dataFilePath: String? = null,
 )
 
 data class TableDeletes(
@@ -889,6 +901,8 @@ data class CommitRequest(
     val idempotencyKey: UUID? = null,
     /** Prepared mutations require the entire target read set to remain unchanged. */
     val requireUnchangedTables: Boolean = false,
+    @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
+    val allowPendingDeletes: Boolean = false,
 )
 
 data class CommitResult(
