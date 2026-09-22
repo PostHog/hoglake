@@ -72,6 +72,22 @@ class TableCreationApiIntegrationTest {
     }
 
     @Test
+    fun `partition preparation requires its distinct endpoint`() =
+        api { client, base ->
+            val path = "$base/table-creations/${UUID.randomUUID()}"
+            val request = json.readTree(definition) as com.fasterxml.jackson.databind.node.ObjectNode
+            request.set<com.fasterxml.jackson.databind.JsonNode>(
+                "partition_fields",
+                json.readTree("""[{"source_field_id":1,"transform":"identity"}]"""),
+            )
+            assertThat(client.prepare(path, request.toString()).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(client.prepare("$path/partitioned", request.toString()).status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.publish(path).status).isEqualTo(HttpStatusCode.OK)
+            val table = json.readTree(client.get("$base/namespaces/test/tables/target").bodyAsText())
+            assertThat(table["partition_spec"]["fields"][0]["source_field_id"].asLong()).isEqualTo(1)
+        }
+
+    @Test
     fun `wire lifecycle preserves identities and terminal receipts`() =
         api { client, base ->
             val capabilities = json.readTree(client.get(base).bodyAsText())["capabilities"]

@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.Transform
 import java.util.UUID
 
 /**
@@ -14,7 +16,7 @@ import java.util.UUID
  *
  * **Versions.** 0 is the pre-versioned shape (JVM enum names,
  * `typeParams`); 1 added the version marker and wire spellings; 2 adds
- * `children`; 3 adds the replacement identity and snapshot guard.
+ * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields.
  * Without children a nested definition cannot be represented
  * at all.
  *
@@ -47,7 +49,9 @@ internal object TableCreationDefinitionCodec {
         mapper.writeValueAsString(
             mapOf(
                 "version" to
-                    if (definition.replacement != null) {
+                    if (definition.partitionFields.isNotEmpty()) {
+                        4
+                    } else if (definition.replacement != null) {
                         3
                     } else if (anyChildren(definition.columns)) {
                         NESTED_VERSION
@@ -67,6 +71,21 @@ internal object TableCreationDefinitionCodec {
                             ),
                     )
                 } ?: emptyMap()
+            ) + (
+                if (definition.partitionFields.isEmpty()) {
+                    emptyMap()
+                } else {
+                    mapOf(
+                        "partition_fields" to
+                            definition.partitionFields.map { field ->
+                                mapOf(
+                                    "source_field_id" to field.sourceFieldId,
+                                    "transform" to field.transform.wire,
+                                    "transform_param" to field.transformParam,
+                                )
+                            },
+                    )
+                }
             ),
         )
 
@@ -151,7 +170,7 @@ internal object TableCreationDefinitionCodec {
             }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
-        if (version !in 0..3) {
+        if (version !in 0..4) {
             corrupt("unsupported table creation definition version $version")
         }
         val columns =
@@ -161,7 +180,7 @@ internal object TableCreationDefinitionCodec {
             text(node, "namespace", "the definition", ::corrupt),
             text(node, "name", "the definition", ::corrupt),
             columns.map { decodeColumn(it, version, ::corrupt) },
-            if (version == 3) {
+            if (version == 3 || (version == 4 && node.has("replacement"))) {
                 val replacement = node["replacement"]
                 if (replacement == null || !replacement.isObject) corrupt("missing replacement guard")
                 val snapshot = replacement["read_snapshot"]
@@ -185,6 +204,41 @@ internal object TableCreationDefinitionCodec {
                 )
             } else {
                 null
+            },
+            if (version == 4) {
+                val fields = node["partition_fields"]
+                if (fields == null || !fields.isArray || fields.isEmpty) corrupt("missing partition_fields array")
+                fields.map { field ->
+                    val source = field["source_field_id"]
+                    if (source == null || !source.isIntegralNumber ||
+                        !source.canConvertToLong() || source.longValue() <= 0
+                    ) {
+                        corrupt(
+                            "invalid partition source_field_id",
+                        )
+                    }
+                    val param = field["transform_param"]
+                    if (param != null && !param.isNull && (!param.isIntegralNumber || !param.canConvertToInt())) {
+                        corrupt(
+                            "invalid partition transform_param",
+                        )
+                    }
+                    val transform =
+                        try {
+                            Transform.fromWire(
+                                text(field, "transform", "partition field", ::corrupt),
+                            )
+                        } catch (e: IllegalArgumentException) {
+                            corrupt("invalid partition transform", e)
+                        }
+                    PartitionFieldDef(
+                        source.longValue(),
+                        transform,
+                        param?.takeIf { !it.isNull }?.intValue(),
+                    )
+                }
+            } else {
+                emptyList()
             },
         )
     }

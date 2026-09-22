@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
@@ -581,8 +582,15 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.SetPartitionSpec,
     ) {
-        for (f in op.fields) {
-            val col = requireSourceField(state.cols, f.sourceFieldId, "partition")
+        state.spec = installPartitionSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
+    }
+
+    internal fun validatePartitionFields(
+        columns: List<Column>,
+        fields: List<PartitionFieldDef>,
+    ) {
+        for (f in fields) {
+            val col = requireSourceField(columns, f.sourceFieldId, "partition")
             when (f.transform) {
                 Transform.BUCKET -> {
                     if (f.transformParam == null || f.transformParam < 1) {
@@ -632,10 +640,20 @@ class AlterService(private val jdbi: Jdbi) {
                 )
             }
         }
+    }
+
+    internal fun installPartitionSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        columns: List<Column>,
+        fields: List<PartitionFieldDef>,
+    ): PartitionSpec? {
+        validatePartitionFields(columns, fields)
         endOrDeleteSpec(h, catalogId, tableId, snapshot)
-        if (op.fields.isEmpty()) {
-            state.spec = null
-            return
+        if (fields.isEmpty()) {
+            return null
         }
         val specId =
             h.createQuery(
@@ -667,7 +685,7 @@ class AlterService(private val jdbi: Jdbi) {
             VALUES (:catalogId, :tableId, :specId, :keyIndex, :sourceFieldId, :transform, :transformParam)
             """,
             )
-        op.fields.forEachIndexed { i, f ->
+        fields.forEachIndexed { i, f ->
             batch
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
@@ -679,7 +697,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        state.spec = PartitionSpec(specId, op.fields)
+        return PartitionSpec(specId, fields)
     }
 
     /**

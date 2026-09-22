@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
@@ -282,6 +283,7 @@ class CatalogService(private val jdbi: Jdbi) {
         columns: List<ColumnDef>,
         tableUuid: UUID = UUID.randomUUID(),
         replacementTableId: Long? = null,
+        partitionFields: List<PartitionFieldDef> = emptyList(),
     ): TableInfo {
         validateTableDefinition(name, columns)
         val cat = requireCatalog(h, catalog)
@@ -326,12 +328,17 @@ class CatalogService(private val jdbi: Jdbi) {
         TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
         TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
         TableRepo.insertStatsRow(h, cat.catalogId, tableId)
+        val partitionSpec =
+            AlterService(
+                jdbi,
+            ).installPartitionSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, partitionFields)
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
             namespace = ns.name,
             name = name,
             columns = cols,
+            partitionSpec = partitionSpec,
             recordCount = 0,
             fileCount = 0,
             fileSizeBytes = 0,
@@ -837,7 +844,7 @@ class CatalogService(private val jdbi: Jdbi) {
     fun commitOffset(
         catalog: String,
         consumerId: String,
-        tableUuid: java.util.UUID,
+        tableUuid: UUID,
         snapshotId: Long,
     ): ConsumerOffset =
         Audit.audited(
@@ -916,7 +923,7 @@ class CatalogService(private val jdbi: Jdbi) {
     fun getOffset(
         catalog: String,
         consumerId: String,
-        tableUuid: java.util.UUID,
+        tableUuid: UUID,
     ): ConsumerOffset =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)

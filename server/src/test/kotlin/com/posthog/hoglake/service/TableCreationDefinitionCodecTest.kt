@@ -3,10 +3,13 @@ package com.posthog.hoglake.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.nodeCount
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
+import java.util.UUID
 
 /**
  * The durable format behind an atomic table creation's receipt.
@@ -65,6 +68,22 @@ class TableCreationDefinitionCodecTest {
                 ),
             ),
         )
+
+    @Test
+    fun `partition fields require version four and preserve replacement guards`() {
+        val partitioned = flat.copy(partitionFields = listOf(PartitionFieldDef(1, Transform.BUCKET, 16)))
+        val encoded = TableCreationDefinitionCodec.encode(partitioned)
+        assertThat(encoded).contains("\"version\":4")
+        assertThat(TableCreationDefinitionCodec.decode(encoded)).isEqualTo(partitioned)
+        val replaced = partitioned.copy(replacement = ReplacementTarget(UUID.randomUUID(), 42))
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(replaced)),
+        ).isEqualTo(replaced)
+        assertThat(TableCreationDefinitionCodec.encode(flat)).contains("\"version\":1")
+        assertThatThrownBy {
+            TableCreationDefinitionCodec.decode(encoded.replace("\"source_field_id\":1", "\"source_field_id\":0"))
+        }.isInstanceOf(CorruptDefinitionException::class.java)
+    }
 
     @Test
     fun `a nested definition survives the round trip whole`() {

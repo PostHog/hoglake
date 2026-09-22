@@ -95,8 +95,9 @@ class WireDtoParseFuzzTest {
                         dto.name,
                         dto.columns.map { it.toModel() },
                         dto.replacement,
+                        dto.partitionFields.map { it.toModel() },
                     )
-                if ((dto.replacement?.readSnapshot ?: 0) >= 0) {
+                if ((dto.replacement?.readSnapshot ?: 0) >= 0 && dto.partitionFields.all { it.sourceFieldId > 0 }) {
                     val encoded = TableCreationDefinitionCodec.encode(definition)
                     check(TableCreationDefinitionCodec.decode(encoded) == definition)
                 }

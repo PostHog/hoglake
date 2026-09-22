@@ -68,6 +68,7 @@ data class CatalogDto(
             "atomic-table-replacement-v1",
             "guarded-schema-evolution-v1",
             "recursive-write-schema-v1",
+            "atomic-partitioned-table-creation-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display

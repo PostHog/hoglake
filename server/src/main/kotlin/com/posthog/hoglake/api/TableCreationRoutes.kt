@@ -22,6 +22,7 @@ data class PrepareTableCreationDto(
     val name: String,
     val columns: List<ColumnDefDto>,
     val replacement: ReplacementTarget? = null,
+    val partitionFields: List<AlterPartitionFieldDto> = emptyList(),
 )
 
 data class PublishTableCreationDto(val files: List<FileRegistrationDto>)
@@ -52,23 +53,8 @@ private fun TableCreation.toDto() =
 fun Application.installTableCreationRoutes(creations: TableCreationService) {
     routing {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {
-            put {
-                val request = call.receive<PrepareTableCreationDto>()
-                call.respond(
-                    creations.prepare(
-                        call.creationCatalog(),
-                        call.creationOperation(),
-                        TableCreationDefinition(
-                            request.namespace,
-                            request.name,
-                            request.columns.map {
-                                it.toModel()
-                            },
-                            request.replacement,
-                        ),
-                    ).toDto(),
-                )
-            }
+            put { call.prepareCreation(creations, partitioned = false) }
+            put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
             get { call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto()) }
             post("/commit") {
                 val request = call.receive<PublishTableCreationDto>()
@@ -85,6 +71,33 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
             post("/abort") { call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto()) }
         }
     }
+}
+
+private suspend fun ApplicationCall.prepareCreation(
+    creations: TableCreationService,
+    partitioned: Boolean,
+) {
+    val request = receive<PrepareTableCreationDto>()
+    if (request.partitionFields.isNotEmpty() != partitioned) {
+        throw com.posthog.hoglake.model.HoglakeException.Validation(
+            "partition fields require the partitioned preparation endpoint",
+        )
+    }
+    respond(
+        creations.prepare(
+            creationCatalog(),
+            creationOperation(),
+            TableCreationDefinition(
+                request.namespace,
+                request.name,
+                request.columns.map {
+                    it.toModel()
+                },
+                request.replacement,
+                request.partitionFields.map { it.toModel() },
+            ),
+        ).toDto(),
+    )
 }
 
 private fun ApplicationCall.creationCatalog(): String =

@@ -5,6 +5,8 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -39,6 +41,34 @@ class TableCreationIntegrationTest {
     }
 
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
+
+    @Test
+    fun `partitioned creation publishes spec and files in one snapshot and fences changed retries`() {
+        val catalog = catalog()
+        val operation = UUID.randomUUID()
+        val fields = listOf(PartitionFieldDef(1, Transform.BUCKET, 16))
+        val requested = definition.copy(partitionFields = fields)
+        val prepared = creations.prepare(catalog, operation, requested)
+        assertThatThrownBy {
+            creations.prepare(catalog, operation, definition)
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            creations.publish(catalog, operation, listOf(file(prepared)))
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertThatThrownBy {
+            catalogs.getTable(
+                catalog,
+                "test",
+                "target",
+            )
+        }.isInstanceOf(HoglakeException.NotFound::class.java)
+        val files = listOf(file(prepared).copy(partitionValues = listOf("3")))
+        val published = creations.publish(catalog, operation, files)
+        assertThat(published.state).isEqualTo("committed")
+        assertThat(catalogs.getTable(catalog, "test", "target").partitionSpec!!.fields).isEqualTo(fields)
+        assertThat(creations.publish(catalog, operation, files).snapshotId).isEqualTo(published.snapshotId)
+        assertThat(creations.status(catalog, operation).definition).isEqualTo(requested)
+    }
 
     /** One of every container shape, plus a three-level combination. */
     private val nestedColumns =

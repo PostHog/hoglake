@@ -288,3 +288,21 @@ second/millisecond timestamp columns reject finer values. New SQL declarations
 use canonical signed/string types. TIME and zoned timestamp precision above six,
 CHAR, and SQL nested type evolution remain refused. Field-ID-keyed statistics are
 populated by the existing hydrator, with no new metadata-store representation.
+
+### Partitioned Trino creation and writes
+
+`atomic-partitioned-table-creation-v1` adds the guarded preparation endpoint
+`PUT /table-creations/{operation}/partitioned` with nonempty `partition_fields`.
+Sources use the deterministic depth-first initial field IDs. The definition,
+partition spec and initial files publish in one snapshot; mismatched values
+roll back publication. Status/commit/abort keep their ordinary paths. The
+ordinary preparation endpoint refuses nonempty partition fields. Deploy all
+server replicas before the connector: older replicas return 404 for preparation
+or refuse version-4 durable receipts, never silently create an unpartitioned table.
+Unpartitioned receipts retain their existing lowest-capable format.
+
+Existing Python, DuckDB, webui and hedgerow requests are unchanged. Other writers
+continue using the same partition-value strings and transform allowlists. The
+Trino connector supports scalar and struct-leaf partition sources, emits null
+partition values as JSON null, and refuses unsupported transforms (including
+truncate and legacy hour(date)). No background production job is activated.

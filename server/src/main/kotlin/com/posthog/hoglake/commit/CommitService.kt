@@ -171,7 +171,12 @@ class CommitService(
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
-        val append = validateFiles(h, catalogId, ResolvedAppend(namespace, table, tableId, files, null))
+        val append =
+            validateFiles(
+                h,
+                catalogId,
+                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
+            )
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =

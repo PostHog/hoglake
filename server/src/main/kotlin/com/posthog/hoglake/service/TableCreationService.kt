@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
@@ -30,6 +31,7 @@ data class TableCreationDefinition(
     val name: String,
     val columns: List<ColumnDef>,
     val replacement: ReplacementTarget? = null,
+    val partitionFields: List<PartitionFieldDef> = emptyList(),
 )
 
 data class TableCreation(
@@ -85,6 +87,9 @@ class TableCreationService(
                 // the ONE path that had it and left the others building
                 // the forest prepare refused.
                 catalogs.validateTableDefinition(definition.name, definition.columns)
+                AlterService(
+                    jdbi,
+                ).validatePartitionFields(initialColumns(definition.columns), definition.partitionFields)
                 Identifiers.validate("namespace", definition.namespace)
                 val ns =
                     NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
@@ -248,6 +253,7 @@ class TableCreationService(
                                 definition.columns,
                                 operation.tableUuid,
                                 replacementTableId = target?.tableId,
+                                partitionFields = definition.partitionFields,
                             )
                         } catch (e: HoglakeException.Validation) {
                             log.warn {
