@@ -126,6 +126,11 @@ object HogSchemaColumns {
                     "catalog_id", "view_id", "view_uuid", "namespace_id", "name", "dialect",
                     "sql", "begin_snapshot", "end_snapshot",
                 ),
+            "hog_upload" to
+                setOf(
+                    "catalog_id", "upload_id", "owner", "prefix", "path", "file_kind", "state",
+                    "expires_at", "last_scheduled_at",
+                ),
             // CleanupService (drain + ledger), ExpiryService queue inserts.
             "hog_file_removal" to
                 setOf(

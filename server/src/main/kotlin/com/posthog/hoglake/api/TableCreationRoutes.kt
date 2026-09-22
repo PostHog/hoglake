@@ -73,6 +73,16 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
                     ).toDto(),
                 )
             }
+            post("/commit/uploads") {
+                val request = call.receive<PublishTableCreationDto>()
+                call.respond(
+                    creations.publish(
+                        call.creationCatalog(),
+                        call.creationOperation(),
+                        request.files.map { it.toModel() },
+                    ).toDto(),
+                )
+            }
             post("/abort") { call.respond(creations.abort(call.creationCatalog(), call.creationOperation()).toDto()) }
         }
     }

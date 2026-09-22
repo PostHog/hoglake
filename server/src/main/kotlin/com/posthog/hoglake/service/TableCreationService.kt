@@ -285,6 +285,7 @@ class TableCreationService(
                         table.tableId,
                         published.headSnapshotId,
                         files,
+                        operationId,
                     )
                     h.createUpdate(
                         """

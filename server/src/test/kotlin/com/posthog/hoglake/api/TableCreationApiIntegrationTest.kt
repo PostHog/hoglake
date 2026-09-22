@@ -72,6 +72,36 @@ class TableCreationApiIntegrationTest {
     }
 
     @Test
+    fun `upload claim routes renew abandon and schedule through durable state`() =
+        api { client, base ->
+            val owner = UUID.randomUUID()
+            val id = UUID.randomUUID()
+            val prefix = "s3://bucket/${base.substringAfterLast('/')}"
+            val body = """{"owner":"$owner","prefix":"$prefix","file_kind":"data"}"""
+            val claimed = client.prepare("$base/uploads/$id", body)
+            assertThat(claimed.status).isEqualTo(HttpStatusCode.OK)
+            val claim = json.readTree(claimed.bodyAsText())
+            assertThat(claim["state"].asText()).isEqualTo("active")
+            val path = claim["path"].asText()
+            assertThat(path).startsWith("$prefix/trino-upload/")
+
+            suspend fun action(
+                suffix: String,
+                request: String = "{}",
+            ) = client.post("$base/uploads/$suffix") {
+                contentType(ContentType.Application.Json)
+                setBody(request)
+            }
+            assertThat(action("renew", """{"owner":"$owner"}""").status).isEqualTo(HttpStatusCode.OK)
+            assertThat(json.readTree(action("schedule-expired").bodyAsText())["scheduled"].asInt()).isZero()
+            assertThat(
+                action("abandon", """{"owner":"$owner","paths":["$path"]}""").status,
+            ).isEqualTo(HttpStatusCode.OK)
+            assertThat(json.readTree(action("schedule-expired").bodyAsText())["scheduled"].asInt()).isEqualTo(1)
+            assertThat(action("schedule-expired?limit=0").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+        }
+
+    @Test
     fun `metadata creation refuses old preparation paths and returns persisted comments`() =
         api { client, base ->
             val path = "$base/table-creations/${UUID.randomUUID()}"

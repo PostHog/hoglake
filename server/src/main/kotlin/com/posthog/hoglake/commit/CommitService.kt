@@ -168,6 +168,7 @@ class CommitService(
         tableId: Long,
         snapshotId: Long,
         files: List<FileRegistration>,
+        uploadOwner: UUID? = null,
     ) {
         val request = CommitRequest(appends = listOf(TableAppend(namespace, table, files)))
         validatePathsUnderDataPath(dataPath, request)
@@ -177,6 +178,7 @@ class CommitService(
                 catalogId,
                 ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
             )
+        com.posthog.hoglake.service.UploadService.register(h, catalogId, uploadOwner, files.map { it.path to "data" })
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =
@@ -374,6 +376,13 @@ class CommitService(
         // Duplicate paths against live/historical file rows stay legal —
         // this rejects only paths the cleanup queue currently owns; once
         // the entry drains (drained_at set) the path is registrable again.
+        com.posthog.hoglake.service.UploadService.register(
+            h,
+            catalogId,
+            req.idempotencyKey,
+            resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
+                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
+        )
         checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
 
         // 4. Conflict check ('table_dropped'/'table_altered' since

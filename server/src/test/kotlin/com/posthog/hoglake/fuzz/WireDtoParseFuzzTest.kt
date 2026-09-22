@@ -87,6 +87,12 @@ class WireDtoParseFuzzTest {
             }
         }
 
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(data) }?.let { dto ->
+            check(mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.AbandonUploadsDto>(data) }
+        parseOrNull { mapper.readValue<com.posthog.hoglake.api.UploadOwnerDto>(data) }
+
         parseOrNull { mapper.readValue<PrepareTableCreationDto>(data) }?.let { dto ->
             try {
                 val definition =

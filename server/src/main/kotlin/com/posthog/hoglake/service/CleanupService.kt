@@ -423,6 +423,9 @@ class CleanupService(
             UNION
             SELECT path FROM hog_delete_file
             WHERE catalog_id = :catalogId AND path = ANY(:paths)
+            UNION
+            SELECT path FROM hog_upload
+            WHERE catalog_id = :catalogId AND path = ANY(:paths) AND state = 'active'
             """,
         )
             .bind("catalogId", catalogId)

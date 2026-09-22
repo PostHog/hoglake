@@ -353,3 +353,37 @@ are distinct so old replicas cannot acknowledge and silently drop annotations.
 Existing no-metadata receipts retain their earlier encodings. Python, DuckDB,
 hedgerow and console consumers can ignore the additive response fields; this change
 does not add metadata editing to their UIs or synthesize Iceberg properties.
+
+
+### Reclaiming abandoned Trino uploads
+
+With `claimed-uploads-v1`, Trino claims each Parquet or deletion-vector path before
+PUT. The server creates unique paths, records the statement owner, and leases them
+for 24 hours. Writers renew the owner's active leases while writing (at five-minute
+intervals) and before handing off/publishing. Active claims, committed files, and
+all retained historical data/DV references protect objects. Publication settles
+claims in the same catalog transaction as files and the permanent commit receipt.
+A lost response therefore cannot authorize deletion of a successful publication.
+Existing immutable objects with retained references can still be referenced by
+another commit; registered paths without retained references cannot be revived.
+
+An explicit `POST /v1/catalogs/{catalog}/uploads/schedule-expired?limit=1000` fences
+expired leases and queues abandoned paths. It does not run in a new background job
+and does not enable production cleanup. The existing cleanup drain still checks
+retained references under the commit lock before physical deletion. Renewal,
+expiry and publication share that lock: once expiry wins, a late commit fails even
+after removal-ledger pruning. Abandoned tombstones are retained permanently; later
+explicit sweeps revisit them because an in-flight PUT may finish after an earlier
+DELETE. Selection rotates through bounded batches. Unclaimed historical or foreign
+objects are never inferred to be garbage from their age or a bucket listing.
+
+This adds one durable row and claim request per output file, occasional owner-wide
+renewals, and permanent fencing metadata. A paused writer exceeding its lease may
+fail if an operator reclaims it; it must retry with fresh paths. Unfinished worker
+aborts fence only their own paths; workers never directly delete claimed files.
+Uploads handed to the coordinator remain protected until publication or lease
+expiry. Claim support requires V12 and all server replicas upgraded before use.
+Claimed publication uses dedicated endpoints so old replicas refuse it. Older
+servers retain legacy writes without this reclamation guarantee. Python, DuckDB,
+hedgerow and the console can continue their existing paths; they do not claim or
+schedule uploads in this feature. No object-store listing permissions are added.

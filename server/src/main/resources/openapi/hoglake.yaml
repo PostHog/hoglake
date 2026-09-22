@@ -1347,6 +1347,63 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
+  /catalogs/{catalog}/table-creations/{operation}/commit/uploads:
+    post:
+      operationId: publishTableCreationUploads
+      summary: Atomically publish the table, initial files, and durable receipt in one snapshot
+      description: >
+        Requires claimed-uploads-v1 and atomic-table-creation-v1. Upload claims must
+        be active and owned by this operation; claim settlement shares publication.
+        Older replicas return 404, with no fallback. Without a replacement guard the target
+        must be absent at publication. With the atomic-table-replacement-v1 guard, target
+        identity and all target changes since read_snapshot are checked under the commit lock.
+        A replacement retires the old incarnation and publishes a new UUID at one snapshot.
+        Stale or expired guards return a durable rejected receipt with reason target_changed.
+        The exact ordered file list is compared as JSON on retries; an identical retry
+        returns the original terminal result even if the table was subsequently dropped.
+        Up to 10000 unique file paths, all under the operation write_path. Empty files
+        creates an empty table. No object-store reads occur during publication.
+        Aborted or expired operations cannot publish. Terminal receipts are retained.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [files]
+              properties:
+                files:
+                  type: array
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/FileRegistration" }
+      responses:
+        "200":
+          description: Durable operation state; inspect state and reason, not HTTP status alone
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400":
+          description: Malformed JSON or invalid operation UUID
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "503":
+          description: Operation or catalog lock wait exceeded the configured timeout; retry with the same operation ID
+          headers:
+            Retry-After: { schema: { type: integer }, description: Seconds before retrying }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "422":
+          description: Invalid definition or file registrations; no publication occurred
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
   /catalogs/{catalog}/table-creations/{operation}/abort:
     post:
       operationId: abortTableCreation
@@ -1429,6 +1486,154 @@ paths:
                 - { $ref: "#/components/schemas/CommitRequest" }
                 - type: object
                   required: [idempotency_key]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
+  /catalogs/{catalog}/uploads/{upload}:
+    put:
+      operationId: claimUpload
+      summary: Claim a fresh object path before uploading
+      description: >
+        Requires claimed-uploads-v1. Generates a unique server path under prefix,
+        which must be inside catalog data_path. Replaying upload ID requires the
+        same owner, prefix and kind and returns the same path and current state.
+        Owner is the durable commit key or table-creation operation ID. Lease is
+        24 hours. Active claims protect objects even if erroneously queued.
+        Registered and abandoned states are permanent fences against path reuse.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: upload, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, prefix, file_kind]
+              properties:
+                owner: { type: string, format: uuid }
+                prefix: { type: string }
+                file_kind: { type: string, enum: [data, delete] }
+      responses:
+        "200":
+          description: Durable claim (replay may return a terminal state)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [upload_id, owner, prefix, path, file_kind, state, expires_at]
+                properties:
+                  upload_id: { type: string, format: uuid }
+                  owner: { type: string, format: uuid }
+                  prefix: { type: string }
+                  path: { type: string }
+                  file_kind: { type: string, enum: [data, delete] }
+                  state: { type: string, enum: [active, registered, abandoned] }
+                  expires_at: { type: string, format: date-time }
+        "409": { description: Upload identity reused with different intent }
+        "422": { description: Invalid prefix or file kind }
+
+  /catalogs/{catalog}/uploads/renew:
+    post:
+      operationId: renewUploads
+      summary: Extend active claims for an owner by 24 hours
+      description: Never revives an abandoned or registered claim; serializes with expiry and publication.
+      parameters: [{ $ref: "#/components/parameters/catalog" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner]
+              properties:
+                owner: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Number of active leases renewed
+          content:
+            application/json:
+              schema: { type: object, properties: { renewed: { type: integer } } }
+
+  /catalogs/{catalog}/uploads/abandon:
+    post:
+      operationId: abandonUploads
+      summary: Fence selected uncommitted uploads owned by this operation
+      description: Registered claims are immutable; unknown publication outcomes can never be rolled back by this call.
+      parameters: [{ $ref: "#/components/parameters/catalog" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [owner, paths]
+              properties:
+                owner: { type: string, format: uuid }
+                paths: { type: array, maxItems: 10000, items: { type: string } }
+      responses:
+        "200":
+          description: Number fenced (already registered, terminal or differently owned paths are unchanged)
+          content:
+            application/json:
+              schema: { type: object, properties: { abandoned: { type: integer } } }
+
+  /catalogs/{catalog}/uploads/schedule-expired:
+    post:
+      operationId: scheduleExpiredUploads
+      summary: Explicitly fence expired uploads and queue abandoned paths for cleanup
+      description: >
+        No background job invokes this endpoint. Under the catalog commit lock,
+        expired active claims become abandoned and abandoned paths are queued for
+        the existing retained-reference-aware cleanup drain. No bucket scan occurs.
+        Tombstones remain permanent and later invocations revisit abandoned paths
+        so PUTs finishing after an earlier DELETE remain reclaimable. Selection is
+        bounded and rotates by last scheduling time. This never deletes an object
+        itself; existing cleanup triggers and configuration still control draining.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 } }
+      responses:
+        "200":
+          description: Number of claims examined and fenced or rescheduled
+          content:
+            application/json:
+              schema: { type: object, properties: { scheduled: { type: integer } } }
+        "422": { description: Limit outside allowed range }
+
+  /catalogs/{catalog}/commit/uploads:
+    post:
+      operationId: commitUploads
+      summary: Publish files with durable upload ownership
+      description: >
+        Requires claimed-uploads-v1. All target tables require expected_table_uuid.
+        Fresh upload claims referenced by path must be active, match idempotency_key as
+        owner and match the file kind. Registered immutable objects with retained
+        references of that kind may be referenced again without transferring ownership. Registration, claim settlement and receipt
+        commit atomically under the catalog lock. Deletes use the prepared mutation
+        conflict contract. Identical replay returns the original receipt. Older
+        replicas return 404; no fallback is permitted for claimed paths.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot]
       responses:
         "200":
           description: Committed, or the original result of an identical replay
@@ -1928,7 +2133,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:

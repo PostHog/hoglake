@@ -71,6 +71,7 @@ data class CatalogDto(
             "atomic-partitioned-table-creation-v1",
             "atomic-sorted-table-creation-v1",
             "versioned-table-metadata-v1",
+            "claimed-uploads-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
