@@ -1648,6 +1648,45 @@ paths:
         "503":
           description: Commit admission timed out; retry the identical request
 
+  /catalogs/{catalog}/commit/transaction:
+    post:
+      operationId: commitTransaction
+      summary: Publish a multi-table DML transaction atomically
+      description: >
+        Requires atomic-dml-transactions-v1. Every target requires expected_table_uuid;
+        all target tables must be unchanged since read_snapshot, including append-only
+        targets. Optional data_file_path deletion references address exactly one
+        same-table append in this commit, with data_file_id zero. Numeric references
+        retain ordinary snapshot visibility and vector-growth checks. Upload claims,
+        all file registrations and the full-payload receipt commit in one catalog-locked
+        transaction. Replay returns the original receipt. A missing receipt is not a
+        fence. Older replicas return 404; no fallback is permitted. This endpoint
+        provides snapshot isolation with write-write conflict detection, not validation
+        of a transaction's read-only tables or cross-catalog atomicity.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit/deletes/prepared:
     post:
       operationId: commitPreparedDelete
@@ -2133,7 +2172,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 and claimed-uploads-v1 and atomic-dml-transactions-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -2490,7 +2529,13 @@ components:
       type: object
       required: [data_file_id, path, delete_count, file_size_bytes]
       properties:
-        data_file_id: { type: integer, format: int64 }
+        data_file_id: { type: integer, format: int64, description: Zero only when data_file_path is supplied. }
+        data_file_path:
+          type: string
+          description: >
+            Only accepted by /commit/transaction. References exactly one append in the
+            same table and same commit. This is a private staged-file reference, not
+            a lookup of an existing file by path. data_file_id must be zero.
         path: { type: string, description: Puffin deletion-vector file URI }
         delete_count:
           type: integer
@@ -2515,7 +2560,7 @@ components:
             TableAppend.expected_table_uuid (mismatch -> 409).
         files:
           type: array
-          description: Empty only for guarded zero-row statements through /commit/deletes/prepared or /commit/mutations/prepared.
+          description: Empty for guarded zero-row statements through prepared, uploads or transaction commit endpoints.
           items: { $ref: "#/components/schemas/DeleteFileRegistration" }
 
     DeleteFile:

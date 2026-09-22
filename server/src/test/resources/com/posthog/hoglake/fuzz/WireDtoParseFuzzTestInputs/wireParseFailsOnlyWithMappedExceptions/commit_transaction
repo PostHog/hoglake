@@ -1,0 +1,1 @@
+{"read_snapshot":3,"appends":[{"namespace":"test","table":"t","files":[{"path":"s3://bucket/new.parquet","record_count":2,"file_size_bytes":100,"footer_size":20}]}],"deletes":[{"namespace":"test","table":"t","files":[{"data_file_id":0,"data_file_path":"s3://bucket/new.parquet","path":"s3://bucket/new.puffin","delete_count":1,"file_size_bytes":20}]}]}

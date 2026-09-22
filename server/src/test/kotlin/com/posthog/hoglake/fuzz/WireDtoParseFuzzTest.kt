@@ -67,6 +67,15 @@ class WireDtoParseFuzzTest {
             try {
                 val request = dto.toModel()
                 val fingerprint = commitFingerprint(request)
+                check(commitFingerprint(request.copy(allowPendingDeletes = true)) != fingerprint)
+                val pending = request.deletes.flatMap { it.files }.filter { it.dataFilePath != null }
+                pending.forEach { file ->
+                    check(
+                        mapper.readValue<com.posthog.hoglake.model.DeleteFileRegistration>(
+                            mapper.writeValueAsBytes(file),
+                        ) == file,
+                    )
+                }
                 val reordered =
                     request.copy(
                         appends =

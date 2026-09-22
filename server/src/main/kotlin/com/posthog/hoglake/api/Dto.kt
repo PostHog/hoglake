@@ -72,6 +72,7 @@ data class CatalogDto(
             "atomic-sorted-table-creation-v1",
             "versioned-table-metadata-v1",
             "claimed-uploads-v1",
+            "atomic-dml-transactions-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -287,6 +288,7 @@ data class DeleteFileRegistrationDto(
     val path: String,
     val deleteCount: Long,
     val fileSizeBytes: Long,
+    val dataFilePath: String? = null,
 ) {
     fun toModel() =
         DeleteFileRegistration(
@@ -294,6 +296,7 @@ data class DeleteFileRegistrationDto(
             path = path,
             deleteCount = deleteCount,
             fileSizeBytes = fileSizeBytes,
+            dataFilePath = dataFilePath,
         )
 }
 

@@ -879,6 +879,9 @@ data class DeleteFileRegistration(
     val path: String,
     val deleteCount: Long,
     val fileSizeBytes: Long,
+    /** Transaction-only reference to an append in this same commit; dataFileId must be zero. */
+    @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_NULL)
+    val dataFilePath: String? = null,
 )
 
 data class TableDeletes(
@@ -898,6 +901,8 @@ data class CommitRequest(
     val idempotencyKey: UUID? = null,
     /** Prepared mutations require the entire target read set to remain unchanged. */
     val requireUnchangedTables: Boolean = false,
+    @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
+    val allowPendingDeletes: Boolean = false,
 )
 
 data class CommitResult(

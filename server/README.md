@@ -206,8 +206,9 @@ enforced in `CommitService` and by a unique partial index:
   stale vector, and merging bitmaps is the client's job. Lost updates
   are structurally impossible.
 - A DV must target a live file of the right table, can't shrink, can't
-  exceed the file's `record_count`, and can't target a file created in
-  the same commit.
+  exceed the file's `record_count`, and ordinary numeric references cannot
+  target a file created in the same commit. The explicit transaction endpoint
+  additionally permits private same-commit append references by path (below).
 
 Read planning pairs each data file with its DV *as of the requested
 snapshot* (`service/ScanService.kt`, `GET /scan`) — historical scans
@@ -917,3 +918,29 @@ The standalone server has no application authentication. Protect this lookup
 with the same authenticated deployment boundary and catalog authorization as
 `/commit`; catalog scoping alone is not authentication. This change does not
 introduce an authentication framework or authorize any deployment.
+
+### Atomic DML transaction publication
+
+`atomic-dml-transactions-v1` adds `POST /v1/catalogs/{catalog}/commit/transaction`.
+The request uses the existing guarded, idempotent commit envelope, with all written
+tables required to remain unchanged since `read_snapshot`. Every table publishes
+in one snapshot and one durable receipt. This is snapshot isolation with write-write
+conflicts; read-only tables and other catalogs are not part of the commit read set.
+
+A transaction may delete rows from files it has staged privately. A DV registration
+can specify `data_file_id: 0` and `data_file_path` referencing exactly one append in
+the same table and same commit. The server resolves that reference after allocating
+and inserting the new files, inside the same transaction. Ambiguous, missing and
+cross-table references roll everything back. Numeric IDs retain their existing
+snapshot checks. Other commit endpoints reject this new field; old replicas lack
+the transaction endpoint, so clients must never fall back. New fields are omitted
+from ordinary receipt fingerprints, preserving existing receipts.
+
+Trino stages DML on its coordinator and uses this endpoint at explicit COMMIT.
+DDL remains autocommit-only. Failed/coordinator-lost transactions leave only leased
+uploads until publication; an unknown publication outcome must be resolved from
+the receipt, not by deleting objects or blindly resubmitting SQL. Python, DuckDB,
+hedgerow and the web UI retain their ordinary commit behavior. They read the usual
+positive file IDs, row lineage and Puffin vectors after publication; private IDs
+and paths add no new committed storage or scan representation. No migration is
+needed beyond the claimed-upload ledger required by this capability.
