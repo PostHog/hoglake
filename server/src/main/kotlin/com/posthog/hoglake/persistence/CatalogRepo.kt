@@ -75,7 +75,7 @@ object CatalogRepo {
                     throw HoglakeException.AlreadyExists("catalog '$name' already exists")
                 Pg.isCheckViolation(e) ->
                     throw HoglakeException.Validation(
-                        "invalid catalog name '$name' (must match ^[a-z][a-z0-9_-]{0,62}$)",
+                        "invalid catalog name '$name' (must match ^[a-z0-9][a-z0-9_-]{0,62}$)",
                     )
                 else -> throw e
             }

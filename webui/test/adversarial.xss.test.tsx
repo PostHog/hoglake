@@ -82,7 +82,7 @@ describe("hostile strings render as text, never markup", () => {
   it("ApiError detail (server echoes hostile names back) in the error box", async () => {
     const detail =
       "invalid catalog name 'ui-qe-xss-<img src=x onerror=alert(1)>' " +
-      "(must match ^[a-z][a-z0-9_-]{0,62}$)";
+      "(must match ^[a-z0-9][a-z0-9_-]{0,62}$)";
     mockFetch((url) => {
       if (url === "/v1/catalogs")
         return jsonResponse({ error: "validation", detail }, 422);

@@ -2222,7 +2222,7 @@ components:
       type: object
       required: [name, data_path]
       properties:
-        name: { type: string }
+        name: { type: string, pattern: "^[a-z0-9][a-z0-9_-]{0,62}$" }
         data_path: { type: string }
 
     Namespace:
