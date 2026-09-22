@@ -306,3 +306,19 @@ continue using the same partition-value strings and transform allowlists. The
 Trino connector supports scalar and struct-leaf partition sources, emits null
 partition values as JSON null, and refuses unsupported transforms (including
 truncate and legacy hour(date)). No background production job is activated.
+
+### Sorted Trino creation and writes
+
+`atomic-sorted-table-creation-v1` adds `PUT /table-creations/{operation}/sorted`.
+It requires nonempty `sort_fields` and also accepts initial `partition_fields`.
+Both specs use the initial depth-first field IDs and publish with initial files
+in one snapshot. Ordinary and partition-only preparation refuse sort fields;
+old replicas return 404 for the sorted endpoint. Durable sorted definitions use
+version 5; other definitions retain their prior lowest-capable format.
+All definition validation precedes publication mutations, including replacement.
+
+The connector uses Trino's PageSorter on logical values before unsigned physical
+conversion. Each bounded sorted run closes its files. Sorting is per file and
+composes with partition routing and row-changing SQL. This adds writer CPU and
+bounded buffering; it does not promise global table ordering or sorting of
+historical files. Existing consumers' wire fields and requests are unchanged.

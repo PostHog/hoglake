@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
@@ -32,6 +33,7 @@ data class TableCreationDefinition(
     val columns: List<ColumnDef>,
     val replacement: ReplacementTarget? = null,
     val partitionFields: List<PartitionFieldDef> = emptyList(),
+    val sortFields: List<SortFieldDef> = emptyList(),
 )
 
 data class TableCreation(
@@ -90,6 +92,7 @@ class TableCreationService(
                 AlterService(
                     jdbi,
                 ).validatePartitionFields(initialColumns(definition.columns), definition.partitionFields)
+                AlterService(jdbi).validateSortFields(initialColumns(definition.columns), definition.sortFields)
                 Identifiers.validate("namespace", definition.namespace)
                 val ns =
                     NamespaceRepo.findLiveByName(h, cat.catalogId, definition.namespace)
@@ -254,6 +257,7 @@ class TableCreationService(
                                 operation.tableUuid,
                                 replacementTableId = target?.tableId,
                                 partitionFields = definition.partitionFields,
+                                sortFields = definition.sortFields,
                             )
                         } catch (e: HoglakeException.Validation) {
                             log.warn {

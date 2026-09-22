@@ -15,6 +15,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.Snapshot
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.initialColumns
@@ -284,12 +285,14 @@ class CatalogService(private val jdbi: Jdbi) {
         tableUuid: UUID = UUID.randomUUID(),
         replacementTableId: Long? = null,
         partitionFields: List<PartitionFieldDef> = emptyList(),
+        sortFields: List<SortFieldDef> = emptyList(),
     ): TableInfo {
         validateTableDefinition(name, columns)
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
         // All such refusals must precede snapshot allocation or table mutation.
         AlterService(jdbi).validatePartitionFields(cols, partitionFields)
+        AlterService(jdbi).validateSortFields(cols, sortFields)
         val cat = requireCatalog(h, catalog)
         Locks.acquireCatalogCommitLock(h, cat.catalogId)
         val ns = requireNamespace(h, cat, namespace)
@@ -342,6 +345,10 @@ class CatalogService(private val jdbi: Jdbi) {
             name = name,
             columns = cols,
             partitionSpec = partitionSpec,
+            sortSpec =
+                AlterService(
+                    jdbi,
+                ).installSortSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, sortFields),
             recordCount = 0,
             fileCount = 0,
             fileSizeBytes = 0,

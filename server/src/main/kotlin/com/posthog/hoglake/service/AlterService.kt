@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
 import com.posthog.hoglake.model.PartitionSpec
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.SortSpec
 import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
@@ -714,19 +715,36 @@ class AlterService(private val jdbi: Jdbi) {
         state: TableState,
         op: AlterOp.SetSortOrder,
     ) {
+        state.sortSpec = installSortSpec(h, catalogId, tableId, snapshot, state.cols, op.fields)
+    }
+
+    internal fun validateSortFields(
+        columns: List<Column>,
+        fields: List<SortFieldDef>,
+    ) {
         val seen = HashSet<Long>()
-        for (f in op.fields) {
-            requireSourceField(state.cols, f.sourceFieldId, "sort")
+        for (f in fields) {
+            requireSourceField(columns, f.sourceFieldId, "sort")
             if (!seen.add(f.sourceFieldId)) {
                 throw HoglakeException.Validation(
                     "duplicate sort source field_id ${f.sourceFieldId}",
                 )
             }
         }
+    }
+
+    internal fun installSortSpec(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        columns: List<Column>,
+        fields: List<SortFieldDef>,
+    ): SortSpec? {
+        validateSortFields(columns, fields)
         endOrDeleteSortSpec(h, catalogId, tableId, snapshot)
-        if (op.fields.isEmpty()) {
-            state.sortSpec = null
-            return
+        if (fields.isEmpty()) {
+            return null
         }
         val sortId =
             h.createQuery(
@@ -758,7 +776,7 @@ class AlterService(private val jdbi: Jdbi) {
             VALUES (:catalogId, :tableId, :sortId, :keyIndex, :sourceFieldId, :direction, :nullOrder)
             """,
             )
-        op.fields.forEachIndexed { i, f ->
+        fields.forEachIndexed { i, f ->
             batch
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
@@ -770,7 +788,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        state.sortSpec = SortSpec(sortId, op.fields)
+        return SortSpec(sortId, fields)
     }
 
     // ---- row lifecycle helpers -------------------------------------------

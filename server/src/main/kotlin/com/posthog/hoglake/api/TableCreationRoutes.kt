@@ -23,6 +23,7 @@ data class PrepareTableCreationDto(
     val columns: List<ColumnDefDto>,
     val replacement: ReplacementTarget? = null,
     val partitionFields: List<AlterPartitionFieldDto> = emptyList(),
+    val sortFields: List<AlterSortFieldDto> = emptyList(),
 )
 
 data class PublishTableCreationDto(val files: List<FileRegistrationDto>)
@@ -55,6 +56,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
         route("/v1/catalogs/{catalog}/table-creations/{operation}") {
             put { call.prepareCreation(creations, partitioned = false) }
             put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
+            put("/sorted") { call.prepareCreation(creations, partitioned = false, sorted = true) }
             get { call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto()) }
             post("/commit") {
                 val request = call.receive<PublishTableCreationDto>()
@@ -76,11 +78,12 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
 private suspend fun ApplicationCall.prepareCreation(
     creations: TableCreationService,
     partitioned: Boolean,
+    sorted: Boolean = false,
 ) {
     val request = receive<PrepareTableCreationDto>()
-    if (request.partitionFields.isNotEmpty() != partitioned) {
+    if ((!sorted && request.partitionFields.isNotEmpty() != partitioned) || request.sortFields.isNotEmpty() != sorted) {
         throw com.posthog.hoglake.model.HoglakeException.Validation(
-            "partition fields require the partitioned preparation endpoint",
+            "partition or sort fields require their dedicated preparation endpoint",
         )
     }
     respond(
@@ -95,6 +98,7 @@ private suspend fun ApplicationCall.prepareCreation(
                 },
                 request.replacement,
                 request.partitionFields.map { it.toModel() },
+                request.sortFields.map { it.toModel() },
             ),
         ).toDto(),
     )

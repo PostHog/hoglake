@@ -1176,6 +1176,64 @@ paths:
         "422": { description: Invalid partition fields or table definition }
         "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
 
+  /catalogs/{catalog}/table-creations/{operation}/sorted:
+    put:
+      operationId: prepareSortedTableCreation
+      summary: Prepare an atomic sorted table creation, optionally partitioned
+      description: >
+        Requires atomic-sorted-table-creation-v1. This separate endpoint prevents
+        old replicas from ignoring sort fields. Status, commit and abort use
+        the ordinary table-creations operation paths. Definition receipts use version
+        5 only for sorted creation; old servers refuse those receipts.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns, sort_fields]
+              properties:
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+                sort_fields:
+                  type: array
+                  minItems: 1
+                  description: Initial sort fields using depth-first field IDs; same validation as set_sort_order.
+                  items: { $ref: "#/components/schemas/SortField" }
+                partition_fields:
+                  type: array
+                  description: >
+                    Requires atomic-partitioned-table-creation-v1. Initial partition fields,
+                    using depth-first pre-order field IDs starting at 1 in columns. Persisted
+                    in the durable definition and installed atomically with initial files.
+                    Omitted or empty means unpartitioned. Same validation as set_partition_spec.
+                  items: { $ref: "#/components/schemas/PartitionField" }
+                replacement:
+                  type: object
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: Durable operation state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400": { description: Malformed request }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Conflicting operation definition }
+        "422": { description: Invalid sort or partition fields or table definition }
+        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
+
   /catalogs/{catalog}/table-creations/{operation}/commit:
     post:
       operationId: publishTableCreation
@@ -1812,7 +1870,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 and atomic-partitioned-table-creation-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 and atomic-sorted-table-creation-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:

@@ -6,7 +6,10 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.Transform
 import java.util.UUID
 
@@ -16,7 +19,7 @@ import java.util.UUID
  *
  * **Versions.** 0 is the pre-versioned shape (JVM enum names,
  * `typeParams`); 1 added the version marker and wire spellings; 2 adds
- * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields.
+ * `children`; 3 adds the replacement identity and snapshot guard; 4 adds initial partition fields; 5 adds initial sort fields.
  * Without children a nested definition cannot be represented
  * at all.
  *
@@ -49,7 +52,9 @@ internal object TableCreationDefinitionCodec {
         mapper.writeValueAsString(
             mapOf(
                 "version" to
-                    if (definition.partitionFields.isNotEmpty()) {
+                    if (definition.sortFields.isNotEmpty()) {
+                        5
+                    } else if (definition.partitionFields.isNotEmpty()) {
                         4
                     } else if (definition.replacement != null) {
                         3
@@ -82,6 +87,21 @@ internal object TableCreationDefinitionCodec {
                                     "source_field_id" to field.sourceFieldId,
                                     "transform" to field.transform.wire,
                                     "transform_param" to field.transformParam,
+                                )
+                            },
+                    )
+                }
+            ) + (
+                if (definition.sortFields.isEmpty()) {
+                    emptyMap()
+                } else {
+                    mapOf(
+                        "sort_fields" to
+                            definition.sortFields.map { field ->
+                                mapOf(
+                                    "source_field_id" to field.sourceFieldId,
+                                    "direction" to field.direction.wire,
+                                    "null_order" to field.nullOrder.wire,
                                 )
                             },
                     )
@@ -170,7 +190,7 @@ internal object TableCreationDefinitionCodec {
             }
         }
         val version = versionNode?.takeIf { !it.isNull }?.asInt() ?: 0
-        if (version !in 0..4) {
+        if (version !in 0..5) {
             corrupt("unsupported table creation definition version $version")
         }
         val columns =
@@ -180,7 +200,7 @@ internal object TableCreationDefinitionCodec {
             text(node, "namespace", "the definition", ::corrupt),
             text(node, "name", "the definition", ::corrupt),
             columns.map { decodeColumn(it, version, ::corrupt) },
-            if (version == 3 || (version == 4 && node.has("replacement"))) {
+            if (version == 3 || (version >= 4 && node.has("replacement"))) {
                 val replacement = node["replacement"]
                 if (replacement == null || !replacement.isObject) corrupt("missing replacement guard")
                 val snapshot = replacement["read_snapshot"]
@@ -205,7 +225,7 @@ internal object TableCreationDefinitionCodec {
             } else {
                 null
             },
-            if (version == 4) {
+            if (version == 4 || (version == 5 && node.has("partition_fields"))) {
                 val fields = node["partition_fields"]
                 if (fields == null || !fields.isArray || fields.isEmpty) corrupt("missing partition_fields array")
                 fields.map { field ->
@@ -236,6 +256,31 @@ internal object TableCreationDefinitionCodec {
                         transform,
                         param?.takeIf { !it.isNull }?.intValue(),
                     )
+                }
+            } else {
+                emptyList()
+            },
+            if (version == 5) {
+                val fields = node["sort_fields"]
+                if (fields == null || !fields.isArray || fields.isEmpty) corrupt("missing sort_fields array")
+                fields.map { field ->
+                    val source = field["source_field_id"]
+                    if (source == null || !source.isIntegralNumber ||
+                        !source.canConvertToLong() || source.longValue() <= 0
+                    ) {
+                        corrupt(
+                            "invalid sort source_field_id",
+                        )
+                    }
+                    try {
+                        SortFieldDef(
+                            source.longValue(),
+                            SortDirection.fromWire(text(field, "direction", "sort field", ::corrupt)),
+                            NullOrder.fromWire(text(field, "null_order", "sort field", ::corrupt)),
+                        )
+                    } catch (e: IllegalArgumentException) {
+                        corrupt("invalid sort field", e)
+                    }
                 }
             } else {
                 emptyList()

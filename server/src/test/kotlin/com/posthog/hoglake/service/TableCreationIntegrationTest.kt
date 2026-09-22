@@ -5,7 +5,10 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
@@ -41,6 +44,28 @@ class TableCreationIntegrationTest {
     }
 
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
+
+    @Test
+    fun `sorted and partitioned creation installs both specs with initial files`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                partitionFields = listOf(PartitionFieldDef(1, Transform.IDENTITY)),
+                sortFields = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), request)
+        val published =
+            creations.publish(
+                catalog,
+                prepared.operationId,
+                listOf(file(prepared).copy(partitionValues = listOf("7"))),
+            )
+        assertThat(published.state).isEqualTo("committed")
+        val table = catalogs.getTable(catalog, "test", "target")
+        assertThat(table.partitionSpec!!.fields).isEqualTo(request.partitionFields)
+        assertThat(table.sortSpec!!.fields).isEqualTo(request.sortFields)
+        assertThat(creations.status(catalog, prepared.operationId).definition).isEqualTo(request)
+    }
 
     @Test
     fun `partitioned creation publishes spec and files in one snapshot and fences changed retries`() {

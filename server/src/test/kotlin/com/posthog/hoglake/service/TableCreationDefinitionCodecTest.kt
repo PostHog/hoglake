@@ -3,7 +3,10 @@ package com.posthog.hoglake.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.model.nodeCount
 import org.assertj.core.api.Assertions.assertThat
@@ -68,6 +71,21 @@ class TableCreationDefinitionCodecTest {
                 ),
             ),
         )
+
+    @Test
+    fun `sorted definitions compose with partitions and replacement in version five`() {
+        val sorted = flat.copy(sortFields = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)))
+        assertThat(TableCreationDefinitionCodec.encode(sorted)).contains("\"version\":5")
+        assertThat(TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(sorted))).isEqualTo(sorted)
+        val combined =
+            sorted.copy(
+                partitionFields = listOf(PartitionFieldDef(1, Transform.IDENTITY)),
+                replacement = ReplacementTarget(UUID.randomUUID(), 42),
+            )
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(combined)),
+        ).isEqualTo(combined)
+    }
 
     @Test
     fun `partition fields require version four and preserve replacement guards`() {
