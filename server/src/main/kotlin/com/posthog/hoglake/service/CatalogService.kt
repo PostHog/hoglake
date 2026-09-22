@@ -286,6 +286,10 @@ class CatalogService(private val jdbi: Jdbi) {
         partitionFields: List<PartitionFieldDef> = emptyList(),
     ): TableInfo {
         validateTableDefinition(name, columns)
+        val cols = initialColumns(columns)
+        // Publication catches definition validation and records a rejected receipt.
+        // All such refusals must precede snapshot allocation or table mutation.
+        AlterService(jdbi).validatePartitionFields(cols, partitionFields)
         val cat = requireCatalog(h, catalog)
         Locks.acquireCatalogCommitLock(h, cat.catalogId)
         val ns = requireNamespace(h, cat, namespace)
@@ -323,7 +327,6 @@ class CatalogService(private val jdbi: Jdbi) {
         // container would collide with the next table's ids.
         val firstFieldId =
             TableRepo.allocateFieldIds(h, cat.catalogId, tableId, nodeCount(columns))
-        val cols = initialColumns(columns)
         check(firstFieldId == cols.first().fieldId) { "new table field allocation must start at one" }
         TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
         TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)

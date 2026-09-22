@@ -440,6 +440,26 @@ class TableCreationIntegrationTest {
     }
 
     @Test
+    fun `a rejected stored partition definition publishes no table or snapshot`() {
+        val catalog = catalog()
+        val operation = creations.prepare(catalog, UUID.randomUUID(), definition)
+        val invalid = definition.copy(partitionFields = listOf(PartitionFieldDef(999, Transform.IDENTITY)))
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_table_creation SET definition = CAST(:definition AS jsonb) WHERE operation_id = :op",
+            )
+                .bind("definition", TableCreationDefinitionCodec.encode(invalid))
+                .bind("op", operation.operationId).execute()
+        }
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        val published = creations.publish(catalog, operation.operationId, emptyList())
+        assertThat(published.state).isEqualTo("rejected")
+        assertThat(published.reason).isEqualTo("definition_invalid")
+        assertThat(catalogs.listTables(catalog, "test")).isEmpty()
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+    }
+
+    @Test
     fun `an unreadable stored definition is a named error, not a generic 500`() {
         // CorruptDefinitionException promised to say WHICH receipt. It
         // named none and, being an IllegalStateException, landed in the
