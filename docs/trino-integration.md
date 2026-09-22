@@ -262,6 +262,29 @@ guards are optional for legacy callers. Namespace identity is additive response
 metadata, which existing consumers may ignore. No mutation replay is introduced.
 
 Trino exposes nullable top-level ADD COLUMN, RENAME COLUMN, DROP COLUMN, CREATE
-SCHEMA and empty DROP SCHEMA. SQL type changes remain unsupported; the server's
-existing REST scalar-promotion policy is unchanged. No cascade, nested evolution,
-new writable types, partition/sort writes, defaults or property changes are added.
+SCHEMA and empty DROP SCHEMA. SQL type changes expose the existing signed integer
+widening and float-to-double promotion policy, preserving field IDs. No cascade or
+SQL nested evolution is added by those operations.
+
+### Recursive Trino writes
+
+`recursive-write-schema-v1` advertises the existing recursive column-definition,
+materialized child-ID, and native scalar contracts to the Trino writer. Deploy
+this capability to every server replica before the new connector. Older clients
+may ignore the additive capability; no existing request or durable receipt changes.
+Python remains the reference for these types and uses the same file encodings.
+Hedgerow and the console retain their existing type support. DuckDB clients keep
+their existing named refusals for scalar/variant types they do not recognize;
+this change does not make those clients capable of reading them.
+
+Trino writes ARRAY/MAP/named ROW with IDs on every catalog node, required map keys,
+and preserved nested nullability. It writes signed narrow integers, nanosecond
+timestamps within int64 range, and unshredded native VARIANT. Existing unsigned
+columns use wider signed SQL types or DECIMAL(20,0) for uint64, while preserving
+native physical encodings. uint64 retains the documented Iceberg-facade file
+limitation; Trino's native connector converts the unsigned bits explicitly.
+Existing JSON columns are exposed as validated, unchanged VARCHAR text, and
+second/millisecond timestamp columns reject finer values. New SQL declarations
+use canonical signed/string types. TIME and zoned timestamp precision above six,
+CHAR, and SQL nested type evolution remain refused. Field-ID-keyed statistics are
+populated by the existing hydrator, with no new metadata-store representation.
