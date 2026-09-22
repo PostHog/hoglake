@@ -62,6 +62,7 @@ data class CatalogDto(
         listOf(
             "atomic-table-creation-v1",
             "idempotent-append-v1",
+            "idempotent-delete-v1",
             "guarded-table-lifecycle-v1",
             "atomic-table-replacement-v1",
             "guarded-schema-evolution-v1",
@@ -288,8 +289,8 @@ data class TableDeletesDto(
     val files: List<DeleteFileRegistrationDto>,
     val expectedTableUuid: UUID? = null,
 ) {
-    fun toModel(): TableDeletes {
-        if (files.isEmpty()) {
+    fun toModel(allowEmpty: Boolean = false): TableDeletes {
+        if (files.isEmpty() && !allowEmpty) {
             throw HoglakeException.Validation("deletes for $namespace.$table have no files")
         }
         return TableDeletes(namespace, table, files.map { it.toModel() }, expectedTableUuid)
@@ -306,11 +307,11 @@ data class CommitRequestDto(
     val message: String? = null,
     val idempotencyKey: UUID? = null,
 ) {
-    fun toModel() =
+    fun toModel(allowEmptyDeletes: Boolean = false) =
         CommitRequest(
             readSnapshot = readSnapshot,
             appends = appends.map { it.toModel() },
-            deletes = deletes.map { it.toModel() },
+            deletes = deletes.map { it.toModel(allowEmptyDeletes) },
             author = author,
             message = message,
             idempotencyKey = idempotencyKey,

@@ -258,6 +258,19 @@ fun Application.installApiRoutes(
                     call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
                 }
 
+                // Distinct endpoint fences replicas that predate the DELETE contract.
+                post("/commit/deletes/prepared") {
+                    val req = call.receive<CommitRequestDto>()
+                    if (req.idempotencyKey == null || req.readSnapshot == null || req.appends.isNotEmpty() ||
+                        req.deletes.isEmpty() || req.deletes.any { it.expectedTableUuid == null }
+                    ) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "prepared DELETE requires idempotency_key, read_snapshot, guarded deletes and no appends",
+                        )
+                    }
+                    call.respond(commits.commit(call.catalog(), req.toModel(allowEmptyDeletes = true)).toDto())
+                }
+
                 get("/commit/receipts/{operation}") {
                     val operation =
                         try {

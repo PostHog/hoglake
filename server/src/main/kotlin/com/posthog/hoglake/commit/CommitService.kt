@@ -800,6 +800,12 @@ class CommitService(
                             "created in this same commit",
                     )
                 }
+                if (targetBegin > readSnapshot) {
+                    throw HoglakeException.CommitConflict(
+                        "delete for $qualified targets data_file_id ${reg.dataFileId} " +
+                            "created after read snapshot $readSnapshot",
+                    )
+                }
                 if (targetTableId != deletes.tableId) {
                     throw HoglakeException.Validation(
                         "delete for $qualified targets data_file_id ${reg.dataFileId} " +

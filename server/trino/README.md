@@ -122,3 +122,21 @@ a pre-DV image; the javadoc says so in those words, and that is the only guard.
 The connector also supports `CREATE TABLE`, `INSERT`, and CTAS as of
 2026-09-16. The harness does not exercise the write path — the connector's own
 suite does — so nothing here asserts read-only behavior.
+
+### SQL DELETE rollout
+
+Deploy `idempotent-delete-v1` to every Hoglake replica before rolling out the
+Trino connector that writes deletion vectors. `/commit/deletes/prepared` requires
+a snapshot, table UUID per delete group, and catalog-scoped operation UUID; it
+publishes all vectors atomically using the existing commit lock and durable
+receipt. It also accepts empty file lists for zero-row statements, validating
+identity and the DDL conflict window before recording the result. Legacy commit
+endpoints continue to reject empty delete file lists.
+
+Full-payload replay returns the original result even after vector supersession,
+DDL or snapshot expiry. Missing receipts do not fence an in-flight publication.
+The connector retains uploads after submission if the outcome is uncertain.
+Deletes reject newer vectors on the same file and removed/compacted target files;
+concurrent appends are allowed and remain outside the pinned DELETE snapshot.
+No schema migration or new receipt store is needed. The new endpoint prevents
+old replicas from silently accepting a weaker contract.
