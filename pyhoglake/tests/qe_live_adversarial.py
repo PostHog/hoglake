@@ -1,11 +1,11 @@
 """Live adversarial integration tests (skip cleanly with no server).
 
-Everything created here is qe-* prefixed and disposable: catalog
+Everything created here is qe-* or 9qe-* prefixed and disposable: catalog
 ``qe-adv-<runid>`` with data under ``s3://qe-itest/<runid>/``.
 
 Server behaviors OBSERVED on 2026-09-05 and pinned here:
 
-* Catalog names enforce ``^[a-z][a-z0-9_-]{0,62}$`` (422 otherwise).
+* Catalog names enforce ``^[a-z0-9][a-z0-9_-]{0,62}$`` (422 otherwise).
   Namespace/table/view/column names enforce
   ``^[A-Za-z_][A-Za-z0-9_-]{0,127}$`` at every DDL surface (422
   otherwise; policy change 2026-09-06 — verbatim round-trip was the
@@ -118,7 +118,6 @@ def _sanity(client, catalog):
         "qe-café",  # unicode
         "qe-日本語",  # more unicode
         "qe-\U0001f994",  # astral-plane emoji
-        "9qe-leading-digit",
         "QE-UPPER",
         INJECTION,
         "qe-" + "y" * 61,  # 64 chars: one past the cap
@@ -126,7 +125,7 @@ def _sanity(client, catalog):
     ],
 )
 def test_catalog_name_charset_rejected_and_catalog_survives(client, catalog, bad):
-    # observed CHECK: ^[a-z][a-z0-9_-]{0,62}$ -> 422, never a 5xx/corruption
+    # observed CHECK: ^[a-z0-9][a-z0-9_-]{0,62}$ -> 422, never a 5xx/corruption
     with pytest.raises(ValidationError) as ei:
         client.create_catalog(bad, f"s3://{BUCKET}/{RUN_ID}-never/")
     assert ei.value.status_code == 422
@@ -134,7 +133,7 @@ def test_catalog_name_charset_rejected_and_catalog_survives(client, catalog, bad
 
 
 def test_catalog_name_63_chars_is_accepted(client):
-    name = f"qe-{RUN_ID}-" + "x" * (63 - len(f"qe-{RUN_ID}-"))
+    name = f"9qe-{RUN_ID}-" + "x" * (63 - len(f"9qe-{RUN_ID}-"))
     assert len(name) == 63
     cat = client.create_catalog(name, f"s3://{BUCKET}/{RUN_ID}-63/")
     assert client.catalog(name).name == name

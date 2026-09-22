@@ -54,7 +54,7 @@ class QeAdversarialStateTest {
 
     @Test
     fun `catalog name regex boundaries - 63 ok, 64 rejected, shape edges`() {
-        val ok63 = "a" + "b".repeat(62)
+        val ok63 = "0" + "b".repeat(62)
         assertThat(ok63).hasSize(63)
         assertThat(catalogs.createCatalog(ok63, "s3://qe/adv-63").name).isEqualTo(ok63)
 
@@ -62,11 +62,13 @@ class QeAdversarialStateTest {
         assertThatThrownBy { catalogs.createCatalog(bad64, "s3://qe/adv-64") }
             .isInstanceOf(HoglakeException.Validation::class.java)
 
-        for (bad in listOf("1abc", "Abc", "abC", "-abc", "_abc", "", "a b", "a.b", "abé")) {
+        for (bad in listOf("Abc", "abC", "-abc", "_abc", "", "a b", "a.b", "abé")) {
             assertThatThrownBy { catalogs.createCatalog(bad, "s3://qe/adv-$bad") }
                 .describedAs("catalog name '%s' must be rejected", bad)
                 .isInstanceOf(HoglakeException.Validation::class.java)
         }
+        assertThat(catalogs.createCatalog("0", "s3://qe/numeric-min").name).isEqualTo("0")
+        assertThat(catalogs.createCatalog("1abc", "s3://qe/numeric-name").name).isEqualTo("1abc")
         // Hyphens/underscores/digits after the first char are legal.
         assertThat(catalogs.createCatalog("a-b_c9", "s3://qe/adv").name).isEqualTo("a-b_c9")
     }

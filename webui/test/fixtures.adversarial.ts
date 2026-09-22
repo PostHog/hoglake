@@ -1,6 +1,6 @@
 // Adversarial fixtures. Every string here was VERIFIED accepted by a live
 // hoglake server (2026-09-05, catalog ui-qe-adv-1): only catalog names are
-// validated (^[a-z][a-z0-9_-]{0,62}$); namespace names, table names, column
+// validated (^[a-z0-9][a-z0-9_-]{0,62}$); namespace names, table names, column
 // names, commit authors and commit messages all pass through unvalidated, so
 // HTML-shaped payloads really do arrive on the wire.
 

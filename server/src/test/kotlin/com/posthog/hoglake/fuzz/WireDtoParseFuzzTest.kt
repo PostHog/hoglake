@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.CommitRequestDto
+import com.posthog.hoglake.api.CreateCatalogRequestDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
@@ -61,6 +62,10 @@ class WireDtoParseFuzzTest {
             } catch (e: Exception) {
                 checkAllowed(name, e)
             }
+        }
+
+        parseOrNull { mapper.readValue<CreateCatalogRequestDto>(data) }?.let { dto ->
+            check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
 
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->

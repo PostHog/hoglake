@@ -25,7 +25,7 @@
 
 CREATE TABLE hog_catalog (
     catalog_id       bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    name             text NOT NULL UNIQUE CHECK (name ~ '^[a-z][a-z0-9_-]{0,62}$'),
+    name             text NOT NULL UNIQUE CHECK (name ~ '^[a-z0-9][a-z0-9_-]{0,62}$'),
     data_path        text NOT NULL,
     -- Allocators, advanced only inside the commit tail / DDL txn. This
     -- row is UPDATEd on every commit; keep every allocator column
