@@ -72,6 +72,23 @@ class TableCreationApiIntegrationTest {
     }
 
     @Test
+    fun `metadata creation refuses old preparation paths and returns persisted comments`() =
+        api { client, base ->
+            val path = "$base/table-creations/${UUID.randomUUID()}"
+            val body = """{"namespace":"test","name":"target","comment":"table",
+                "properties":{"owner.team":"data"},"columns":[{"name":"id","type":"long","comment":"id"}]}"""
+            for (suffix in listOf("", "/partitioned", "/sorted")) {
+                assertThat(client.prepare(path + suffix, body).status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            }
+            assertThat(client.prepare("$path/metadata", body).status).isEqualTo(HttpStatusCode.OK)
+            assertThat(client.publish(path).status).isEqualTo(HttpStatusCode.OK)
+            val table = json.readTree(client.get("$base/namespaces/test/tables/target").bodyAsText())
+            assertThat(table["comment"].asText()).isEqualTo("table")
+            assertThat(table["properties"]["owner.team"].asText()).isEqualTo("data")
+            assertThat(table["columns"][0]["comment"].asText()).isEqualTo("id")
+        }
+
+    @Test
     fun `sorted preparation rejects ordinary and partition-only endpoints`() =
         api { client, base ->
             val path = "$base/table-creations/${UUID.randomUUID()}"

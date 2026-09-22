@@ -1234,6 +1234,64 @@ paths:
         "422": { description: Invalid sort or partition fields or table definition }
         "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
 
+  /catalogs/{catalog}/table-creations/{operation}/metadata:
+    put:
+      operationId: prepareMetadataTableCreation
+      summary: Prepare atomic creation with comments and custom properties
+      description: >
+        Requires versioned-table-metadata-v1. Receipts with metadata use durable
+        definition version 6, refused by older replicas. May compose with partitions,
+        sorting and replacement. Ordinary preparation endpoints reject metadata.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { name: operation, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [namespace, name, columns]
+              properties:
+                comment: { type: [string, "null"], maxLength: 16384 }
+                properties: { $ref: "#/components/schemas/CustomProperties" }
+                namespace: { type: string }
+                name: { type: string }
+                columns:
+                  type: array
+                  minItems: 1
+                  maxItems: 10000
+                  items: { $ref: "#/components/schemas/ColumnDef" }
+                sort_fields:
+                  type: array
+                  description: Initial sort fields using depth-first field IDs; same validation as set_sort_order.
+                  items: { $ref: "#/components/schemas/SortField" }
+                partition_fields:
+                  type: array
+                  description: >
+                    Requires atomic-partitioned-table-creation-v1. Initial partition fields,
+                    using depth-first pre-order field IDs starting at 1 in columns. Persisted
+                    in the durable definition and installed atomically with initial files.
+                    Omitted or empty means unpartitioned. Same validation as set_partition_spec.
+                  items: { $ref: "#/components/schemas/PartitionField" }
+                replacement:
+                  type: object
+                  required: [read_snapshot]
+                  properties:
+                    expected_table_uuid: { type: [string, "null"], format: uuid }
+                    read_snapshot: { type: integer, format: int64, minimum: 0 }
+      responses:
+        "200":
+          description: Durable operation state
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TableCreation" }
+        "400": { description: Malformed request }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Conflicting operation definition }
+        "422": { description: Invalid sort or partition fields or table definition }
+        "503": { description: Operation or catalog lock wait exceeded; retry with the same operation ID }
+
   /catalogs/{catalog}/table-creations/{operation}/commit:
     post:
       operationId: publishTableCreation
@@ -1870,7 +1928,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 and atomic-sorted-table-creation-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 guarded-schema-evolution-v1 recursive-write-schema-v1 atomic-partitioned-table-creation-v1 atomic-sorted-table-creation-v1 and versioned-table-metadata-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -1960,10 +2018,21 @@ components:
             failing publish rolled itself back and only an explicit
             abort could end it.)
 
+    CustomProperties:
+      type: object
+      maxProperties: 100
+      description: >
+        Inert user metadata. Replaced as a whole by set_properties; an empty object clears it.
+        Keys are lowercase ASCII identifiers; hoglake. and trino. prefixes and
+        partitioning, sorted_by, location, format, comment are reserved. No NUL in values.
+      propertyNames: { pattern: "^[a-z][a-z0-9_.-]{0,127}$" }
+      additionalProperties: { type: string, maxLength: 4096 }
+
     ColumnDef:
       type: object
       required: [name, type]
       properties:
+        comment: { type: [string, "null"], maxLength: 16384, description: "Versioned comment; no NUL. Requires versioned-table-metadata-v1 for writes." }
         name:
           type: string
           # PATTERN STAYS IN ITS SIBLING POSITION. Every other identifier
@@ -2108,6 +2177,8 @@ components:
       required: [name, namespace, table_uuid, columns, record_count,
                  file_count, file_size_bytes]
       properties:
+        comment: { type: [string, "null"], maxLength: 16384 }
+        properties: { $ref: "#/components/schemas/CustomProperties" }
         name: { type: string }
         namespace: { type: string }
         table_uuid: { type: string, format: uuid }
@@ -2344,10 +2415,13 @@ components:
         its type. Nested containers are also not promotable — promote a
         struct's LEAF field, which follows the ordinary scalar matrix.
       properties:
+        comment: { type: [string, "null"], maxLength: 16384, description: "set_table_comment or set_column_comment; null or absent removes the comment." }
+        properties: { $ref: "#/components/schemas/CustomProperties" }
         op:
           type: string
           enum: [add_column, drop_column, rename_column, promote_column,
-                 rename_table, set_partition_spec, set_sort_order]
+                 rename_table, set_partition_spec, set_sort_order, add_column_with_metadata,
+                 set_table_comment, set_column_comment, set_properties]
         column: { $ref: "#/components/schemas/ColumnDef" }   # add_column
         parent:                       # add_column, optional
           type: string

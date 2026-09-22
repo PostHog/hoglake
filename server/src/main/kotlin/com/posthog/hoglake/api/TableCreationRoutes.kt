@@ -24,6 +24,8 @@ data class PrepareTableCreationDto(
     val replacement: ReplacementTarget? = null,
     val partitionFields: List<AlterPartitionFieldDto> = emptyList(),
     val sortFields: List<AlterSortFieldDto> = emptyList(),
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 data class PublishTableCreationDto(val files: List<FileRegistrationDto>)
@@ -57,6 +59,7 @@ fun Application.installTableCreationRoutes(creations: TableCreationService) {
             put { call.prepareCreation(creations, partitioned = false) }
             put("/partitioned") { call.prepareCreation(creations, partitioned = true) }
             put("/sorted") { call.prepareCreation(creations, partitioned = false, sorted = true) }
+            put("/metadata") { call.prepareCreation(creations, partitioned = false, metadata = true) }
             get { call.respond(creations.status(call.creationCatalog(), call.creationOperation()).toDto()) }
             post("/commit") {
                 val request = call.receive<PublishTableCreationDto>()
@@ -79,9 +82,22 @@ private suspend fun ApplicationCall.prepareCreation(
     creations: TableCreationService,
     partitioned: Boolean,
     sorted: Boolean = false,
+    metadata: Boolean = false,
 ) {
     val request = receive<PrepareTableCreationDto>()
-    if ((!sorted && request.partitionFields.isNotEmpty() != partitioned) || request.sortFields.isNotEmpty() != sorted) {
+
+    fun hasComment(columns: List<ColumnDefDto>): Boolean =
+        columns.any {
+            it.comment != null || hasComment(it.children ?: emptyList())
+        }
+    if (!metadata && (request.comment != null || request.properties.isNotEmpty() || hasComment(request.columns))) {
+        throw com.posthog.hoglake.model.HoglakeException.Validation(
+            "metadata requires its dedicated preparation endpoint",
+        )
+    }
+    if (!metadata &&
+        ((!sorted && request.partitionFields.isNotEmpty() != partitioned) || request.sortFields.isNotEmpty() != sorted)
+    ) {
         throw com.posthog.hoglake.model.HoglakeException.Validation(
             "partition or sort fields require their dedicated preparation endpoint",
         )
@@ -99,6 +115,8 @@ private suspend fun ApplicationCall.prepareCreation(
                 request.replacement,
                 request.partitionFields.map { it.toModel() },
                 request.sortFields.map { it.toModel() },
+                request.comment,
+                request.properties,
             ),
         ).toDto(),
     )

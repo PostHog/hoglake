@@ -34,6 +34,8 @@ data class TableCreationDefinition(
     val replacement: ReplacementTarget? = null,
     val partitionFields: List<PartitionFieldDef> = emptyList(),
     val sortFields: List<SortFieldDef> = emptyList(),
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 data class TableCreation(
@@ -88,6 +90,8 @@ class TableCreationService(
                 // the same one. It used to live here alone, which capped
                 // the ONE path that had it and left the others building
                 // the forest prepare refused.
+                TableMetadata.validateComment(definition.comment)
+                TableMetadata.validateProperties(definition.properties)
                 catalogs.validateTableDefinition(definition.name, definition.columns)
                 AlterService(
                     jdbi,
@@ -258,6 +262,8 @@ class TableCreationService(
                                 replacementTableId = target?.tableId,
                                 partitionFields = definition.partitionFields,
                                 sortFields = definition.sortFields,
+                                comment = definition.comment,
+                                properties = definition.properties,
                             )
                         } catch (e: HoglakeException.Validation) {
                             log.warn {

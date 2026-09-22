@@ -322,3 +322,34 @@ conversion. Each bounded sorted run closes its files. Sorting is per file and
 composes with partition routing and row-changing SQL. This adds writer CPU and
 bounded buffering; it does not promise global table ordering or sorting of
 historical files. Existing consumers' wire fields and requests are unchanged.
+
+### Comments and custom properties
+
+`COMMENT ON TABLE`, `COMMENT ON COLUMN`, CREATE column/table comments, and
+`extra_properties = MAP(ARRAY['owner.team'], ARRAY['analytics'])` persist in the
+catalog. `ALTER TABLE ... SET PROPERTIES extra_properties = ...` replaces the
+whole custom map; `DEFAULT` clears it. These are inert annotations, not storage
+configuration. Other table properties cannot be altered through this SQL surface.
+
+Metadata edits use the existing guarded DDL transaction and mint a new snapshot;
+concurrent stale schema-based writers conflict even when only an annotation changed.
+No Parquet rewrite is needed. Comments and properties follow snapshot visibility. Rename and type promotion
+preserve comments and stable field IDs; replacement receives only its new
+metadata. SQL metadata and SHOW CREATE return the persisted values. Comment NULL
+removes the value; an empty string is a distinct comment. Comments allow at most
+16,384 UTF-16 code units. Custom maps allow 100 string pairs, keys matching
+`[a-z][a-z0-9_.-]{0,127}`, and values of at most 4,096 UTF-16 code units. NUL is
+refused. `hoglake.`/`trino.` prefixes and `partitioning`, `sorted_by`, `location`,
+`format`, `comment` keys are reserved to avoid implied configuration behavior.
+
+Deploy the additive V11 migration and upgrade **all server replicas** before
+enabling metadata writes. Old server DDL can rewrite a version without preserving
+new metadata fields; a mixed-version fleet or downgrade after metadata use is not
+supported. The connector
+requires `versioned-table-metadata-v1`; atomic creation uses `/metadata` and
+receipt version 6 only when metadata is present. Old replicas reject that endpoint
+or receipt. Metadata ALTER operation names (including `add_column_with_metadata`)
+are distinct so old replicas cannot acknowledge and silently drop annotations.
+Existing no-metadata receipts retain their earlier encodings. Python, DuckDB,
+hedgerow and console consumers can ignore the additive response fields; this change
+does not add metadata editing to their UIs or synthesize Iceberg properties.

@@ -73,6 +73,37 @@ class TableCreationDefinitionCodecTest {
         )
 
     @Test
+    fun `metadata uses version six and preserves empty and nested comments`() {
+        val metadata =
+            flat.copy(
+                comment = "",
+                properties = mapOf("owner" to "data"),
+                columns =
+                    listOf(
+                        ColumnDef(
+                            "r",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("x", ColType.LONG, comment = "nested")),
+                        ),
+                    ),
+            )
+        val encoded = TableCreationDefinitionCodec.encode(metadata)
+        assertThat(encoded).contains("\"version\":6")
+        assertThat(TableCreationDefinitionCodec.decode(encoded)).isEqualTo(metadata)
+        val composed =
+            metadata.copy(
+                partitionFields = listOf(PartitionFieldDef(2, Transform.IDENTITY)),
+                sortFields = listOf(SortFieldDef(2, SortDirection.ASC, NullOrder.NULLS_LAST)),
+                replacement = ReplacementTarget(UUID.randomUUID(), 42),
+            )
+        assertThat(
+            TableCreationDefinitionCodec.decode(TableCreationDefinitionCodec.encode(composed)),
+        ).isEqualTo(composed)
+        assertThatThrownBy { TableCreationDefinitionCodec.decode(encoded.replace("\"data\"", "42")) }
+            .isInstanceOf(CorruptDefinitionException::class.java)
+    }
+
+    @Test
     fun `sorted definitions compose with partitions and replacement in version five`() {
         val sorted = flat.copy(sortFields = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)))
         assertThat(TableCreationDefinitionCodec.encode(sorted)).contains("\"version\":5")

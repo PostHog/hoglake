@@ -137,6 +137,8 @@ CREATE TABLE hog_table_version (
     end_snapshot   bigint,
     namespace_id   bigint NOT NULL,
     name           text   NOT NULL CHECK (name ~ '^[A-Za-z_][A-Za-z0-9_-]{0,127}$'),
+    comment        text,
+    properties     jsonb NOT NULL DEFAULT '{}'::jsonb,
     PRIMARY KEY (catalog_id, table_id, begin_snapshot),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     -- Deferred no-action (not CASCADE): a namespace delete must never
@@ -193,6 +195,7 @@ CREATE TABLE hog_column (
     -- would break the moment the parent is renamed or promoted. Field
     -- ids are stable across versions; versions are not.
     parent_field_id bigint,
+    comment        text,
     PRIMARY KEY (catalog_id, table_id, field_id, begin_snapshot),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot),

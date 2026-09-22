@@ -70,6 +70,7 @@ data class CatalogDto(
             "recursive-write-schema-v1",
             "atomic-partitioned-table-creation-v1",
             "atomic-sorted-table-creation-v1",
+            "versioned-table-metadata-v1",
         ),
     /**
      * Live totals from the metrics sampler's last pass — display
@@ -137,6 +138,7 @@ data class ColumnDefDto(
      * overflow.
      */
     val children: List<ColumnDefDto>? = null,
+    val comment: String? = null,
 ) {
     fun toModel(): ColumnDef =
         ColumnDef(
@@ -148,6 +150,7 @@ data class ColumnDefDto(
             typeParams = typeParams,
             nullable = nullable,
             children = children?.map { it.toModel() },
+            comment = comment,
         )
 }
 
@@ -166,11 +169,13 @@ data class ColumnDto(
      * client sees the shape it always saw.
      */
     val children: List<ColumnDto>? = null,
+    val comment: String? = null,
 )
 
 fun Column.toDto(): ColumnDto =
     ColumnDto(
         name = def.name,
+        comment = def.comment,
         type = def.type.wire,
         typeParams = def.typeParams,
         nullable = def.nullable,
@@ -198,6 +203,8 @@ data class TableDto(
     val partitionSpec: AlterPartitionSpecDto? = null,
     /** Sort order at the requested snapshot; NON_NULL omits when unsorted. */
     val sortSpec: AlterSortSpecDto? = null,
+    val comment: String? = null,
+    val properties: Map<String, String> = emptyMap(),
 )
 
 fun TableInfo.toDto() =
@@ -211,6 +218,8 @@ fun TableInfo.toDto() =
         fileSizeBytes = fileSizeBytes,
         partitionSpec = partitionSpec?.toAlterDto(),
         sortSpec = sortSpec?.toAlterDto(),
+        comment = comment,
+        properties = properties,
     )
 
 // ---- commits -------------------------------------------------------------

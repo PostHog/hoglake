@@ -97,6 +97,8 @@ class WireDtoParseFuzzTest {
                         dto.replacement,
                         dto.partitionFields.map { it.toModel() },
                         dto.sortFields.map { it.toModel() },
+                        dto.comment,
+                        dto.properties,
                     )
                 if ((dto.replacement?.readSnapshot ?: 0) >= 0 &&
                     dto.partitionFields.all {

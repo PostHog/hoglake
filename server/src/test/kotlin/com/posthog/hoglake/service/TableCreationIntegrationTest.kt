@@ -46,6 +46,125 @@ class TableCreationIntegrationTest {
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
 
     @Test
+    fun `metadata survives creation replay versioned edits rename and replacement`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                columns = listOf(ColumnDef("id", ColType.INT, comment = "identifier")),
+                comment = "original table",
+                properties = mapOf("owner.team" to "analytics"),
+            )
+        val operation = UUID.randomUUID()
+        val prepared = creations.prepare(catalog, operation, request)
+        assertThat(creations.prepare(catalog, operation, request).definition).isEqualTo(request)
+        assertThatThrownBy { creations.prepare(catalog, operation, request.copy(comment = "changed")) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        val published = creations.publish(catalog, operation, emptyList())
+        val original = catalogs.getTable(catalog, "test", "target")
+        assertThat(original.comment).isEqualTo("original table")
+        assertThat(original.properties).isEqualTo(request.properties)
+        val altered =
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "target",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("new table"),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(mapOf("owner.team" to "data")),
+                    com.posthog.hoglake.model.AlterOp.SetColumnComment("id", "new identifier"),
+                    com.posthog.hoglake.model.AlterOp.PromoteColumn("id", ColType.LONG),
+                    com.posthog.hoglake.model.AlterOp.RenameColumn("id", "renamed_id"),
+                    com.posthog.hoglake.model.AlterOp.RenameTable("renamed"),
+                ),
+                original.tableUuid,
+                published.snapshotId,
+            )
+        assertThat(altered.comment).isEqualTo("new table")
+        assertThat(altered.properties).containsEntry("owner.team", "data")
+        assertThat(altered.columns.single().def.comment).isEqualTo("new identifier")
+        assertThat(altered.columns.single().fieldId).isEqualTo(prepared.columns.single().fieldId)
+        assertThat(catalogs.getTable(catalog, "test", "target", published.snapshotId)).isEqualTo(original)
+        val head = catalogs.getCatalog(catalog).headSnapshotId
+        assertThatThrownBy {
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "renamed",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("stale"),
+                ),
+                original.tableUuid,
+                published.snapshotId,
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "renamed",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetTableComment("must roll back"),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(mapOf("hoglake.location" to "bad")),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+        assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
+        val replacement =
+            creations.prepare(
+                catalog,
+                UUID.randomUUID(),
+                definition.copy(
+                    name = "renamed",
+                    replacement = ReplacementTarget(original.tableUuid, head),
+                    comment = "replacement",
+                ),
+            )
+        creations.publish(catalog, replacement.operationId, emptyList())
+        val replaced = catalogs.getTable(catalog, "test", "renamed")
+        assertThat(replaced.comment).isEqualTo("replacement")
+        assertThat(replaced.properties).isEmpty()
+        assertThat(replaced.columns.single().def.comment).isNull()
+        assertThat(catalogs.getTable(catalog, "test", "renamed", head)).isEqualTo(altered)
+    }
+
+    @Test
+    fun `metadata removal and nested comments preserve field identities`() {
+        val catalog = catalog()
+        val request =
+            definition.copy(
+                columns =
+                    listOf(
+                        ColumnDef(
+                            "r",
+                            ColType.STRUCT,
+                            children = listOf(ColumnDef("x", ColType.STRING, comment = "nested")),
+                            comment = "parent",
+                        ),
+                    ),
+                comment = "table",
+                properties = mapOf("key" to "value"),
+            )
+        val prepared = creations.prepare(catalog, UUID.randomUUID(), request)
+        creations.publish(catalog, prepared.operationId, emptyList())
+        val altered =
+            AlterService(db.jdbi).alterTable(
+                catalog,
+                "test",
+                "target",
+                listOf(
+                    com.posthog.hoglake.model.AlterOp.SetColumnComment("r.x", null),
+                    com.posthog.hoglake.model.AlterOp.SetTableComment(null),
+                    com.posthog.hoglake.model.AlterOp.SetProperties(emptyMap()),
+                ),
+            )
+        assertThat(altered.comment).isNull()
+        assertThat(altered.properties).isEmpty()
+        assertThat(altered.columns.single().def.comment).isEqualTo("parent")
+        assertThat(altered.columns.single().children.single().def.comment).isNull()
+        assertThat(altered.columns.single().children.single().fieldId).isEqualTo(2)
+    }
+
+    @Test
     fun `sorted and partitioned creation installs both specs with initial files`() {
         val catalog = catalog()
         val request =

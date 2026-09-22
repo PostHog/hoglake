@@ -286,7 +286,11 @@ class CatalogService(private val jdbi: Jdbi) {
         replacementTableId: Long? = null,
         partitionFields: List<PartitionFieldDef> = emptyList(),
         sortFields: List<SortFieldDef> = emptyList(),
+        comment: String? = null,
+        properties: Map<String, String> = emptyMap(),
     ): TableInfo {
+        TableMetadata.validateComment(comment)
+        TableMetadata.validateProperties(properties)
         validateTableDefinition(name, columns)
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
@@ -331,7 +335,7 @@ class CatalogService(private val jdbi: Jdbi) {
         val firstFieldId =
             TableRepo.allocateFieldIds(h, cat.catalogId, tableId, nodeCount(columns))
         check(firstFieldId == cols.first().fieldId) { "new table field allocation must start at one" }
-        TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name)
+        TableRepo.insertVersion(h, cat.catalogId, tableId, alloc.snapshotId, ns.namespaceId, name, comment, properties)
         TableRepo.insertColumns(h, cat.catalogId, tableId, alloc.snapshotId, cols)
         TableRepo.insertStatsRow(h, cat.catalogId, tableId)
         val partitionSpec =
@@ -341,6 +345,8 @@ class CatalogService(private val jdbi: Jdbi) {
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
+            comment = comment,
+            properties = properties,
             namespace = ns.name,
             name = name,
             columns = cols,
@@ -471,6 +477,8 @@ class CatalogService(private val jdbi: Jdbi) {
             TableInfo(
                 tableId = t.tableId,
                 tableUuid = t.tableUuid,
+                comment = t.comment,
+                properties = t.properties,
                 namespace = ns.name,
                 name = t.name,
                 columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
@@ -497,6 +505,8 @@ class CatalogService(private val jdbi: Jdbi) {
                 TableInfo(
                     tableId = t.tableId,
                     tableUuid = t.tableUuid,
+                    comment = t.comment,
+                    properties = t.properties,
                     namespace = ns.name,
                     name = t.name,
                     columns = emptyList(),

@@ -119,6 +119,8 @@ class AlterService(private val jdbi: Jdbi) {
                     TableState(
                         cols = TableRepo.columnsAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         name = t.name,
+                        comment = t.comment,
+                        properties = t.properties,
                         spec = SpecRepo.specAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                         sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, alloc.snapshotId - 1),
                     )
@@ -132,6 +134,8 @@ class AlterService(private val jdbi: Jdbi) {
                     tableUuid = t.tableUuid,
                     namespace = ns.name,
                     name = state.name,
+                    comment = state.comment,
+                    properties = state.properties,
                     columns = state.cols.sortedBy { it.ordinal },
                     recordCount = agg.recordCount,
                     fileCount = agg.fileCount,
@@ -160,6 +164,8 @@ class AlterService(private val jdbi: Jdbi) {
     private class TableState(
         var cols: List<Column>,
         var name: String,
+        var comment: String?,
+        var properties: Map<String, String>,
         var spec: PartitionSpec?,
         var sortSpec: SortSpec?,
     )
@@ -189,6 +195,32 @@ class AlterService(private val jdbi: Jdbi) {
             renameTable(h, catalogId, tableId, namespaceId, namespaceName, snapshot, state, op)
         is AlterOp.SetPartitionSpec -> setPartitionSpec(h, catalogId, tableId, snapshot, state, op)
         is AlterOp.SetSortOrder -> setSortOrder(h, catalogId, tableId, snapshot, state, op)
+        is AlterOp.SetColumnComment -> {
+            TableMetadata.validateComment(op.comment)
+            val located = requireColumn(state, op.name)
+            val col = located.column
+            val updated = col.copy(def = col.def.copy(comment = op.comment))
+            endOrDeleteColumnRow(h, catalogId, tableId, col.fieldId, snapshot)
+            TableRepo.insertColumns(
+                h,
+                catalogId,
+                tableId,
+                snapshot,
+                listOf(updated.copy(children = emptyList())),
+                located.parent?.fieldId,
+            )
+            state.cols = replaceNode(state.cols, col.fieldId) { updated }
+        }
+        is AlterOp.SetTableComment -> {
+            TableMetadata.validateComment(op.comment)
+            state.comment = op.comment
+            rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
+        }
+        is AlterOp.SetProperties -> {
+            TableMetadata.validateProperties(op.properties)
+            state.properties = op.properties.toMap()
+            rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
+        }
     }
 
     /**
@@ -553,6 +585,27 @@ class AlterService(private val jdbi: Jdbi) {
     private fun widenFloatToDouble(b: ByteArray): ByteArray =
         IcebergSingleValue.encode(ColType.DOUBLE, (IcebergSingleValue.decode(ColType.FLOAT, b) as Float).toDouble())
 
+    private fun rewriteMetadata(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        namespaceId: Long,
+        snapshot: Long,
+        state: TableState,
+    ) {
+        endOrDeleteVersionRow(h, catalogId, tableId, snapshot)
+        TableRepo.insertVersion(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            namespaceId,
+            state.name,
+            state.comment,
+            state.properties,
+        )
+    }
+
     private fun renameTable(
         h: Handle,
         catalogId: Long,
@@ -571,7 +624,16 @@ class AlterService(private val jdbi: Jdbi) {
             )
         }
         endOrDeleteVersionRow(h, catalogId, tableId, snapshot)
-        TableRepo.insertVersion(h, catalogId, tableId, snapshot, namespaceId, op.newName)
+        TableRepo.insertVersion(
+            h,
+            catalogId,
+            tableId,
+            snapshot,
+            namespaceId,
+            op.newName,
+            state.comment,
+            state.properties,
+        )
         state.name = op.newName
     }
 
