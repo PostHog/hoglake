@@ -402,7 +402,7 @@ class CommitService(
             val names = HashMap<Long, String>()
             resolvedAppends.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
             resolvedDeletes.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
-            checkConflicts(h, catalogId, readSnapshot, names)
+            checkConflicts(h, catalogId, readSnapshot, names, req.requireUnchangedTables)
         }
 
         // 5. Allocations, all under the lock via UPDATE..RETURNING. Data
@@ -1135,37 +1135,43 @@ class CommitService(
     }
 
     /**
-     * DDL-vs-write is the only table-level conflict class for a commit, so
-     * one indexed lookup over the typed change table covers appends and
-     * deletes alike. 'table_inserted_into' / 'table_deleted_from' changes
-     * never conflict at table level (DV-level staleness is handled per
-     * target in [applyDeletes]).
+     * One indexed lookup over the typed change table covers appends and
+     * deletes alike. Legacy writes conflict with DDL; prepared mutations
+     * also protect their target-table read set. 'table_inserted_into' / 'table_deleted_from' changes
+     * conflict at table level only for prepared mutations, which require the
+     * complete target read set to remain unchanged. Legacy writes retain
+     * per-file DV staleness checks in [applyDeletes].
      */
     private fun checkConflicts(
         h: Handle,
         catalogId: Long,
         readSnapshot: Long,
         nameByTableId: Map<Long, String>,
+        requireUnchangedTables: Boolean,
     ) {
         val conflicted =
             h.createQuery(
                 """
             SELECT DISTINCT object_id FROM hog_snapshot_change
              WHERE catalog_id = :catalogId
-               AND kind IN ('table_dropped', 'table_altered')
+               AND (kind IN ('table_dropped', 'table_altered') OR
+                    (:requireUnchangedTables AND kind IN
+                        ('table_created', 'table_inserted_into', 'table_deleted_from', 'table_compacted')))
                AND object_id IN (<tableIds>)
                AND snapshot_id > :readSnapshot
             """,
             )
                 .bind("catalogId", catalogId)
                 .bind("readSnapshot", readSnapshot)
+                .bind("requireUnchangedTables", requireUnchangedTables)
                 .bindList("tableIds", nameByTableId.keys.toList())
                 .mapTo(Long::class.java)
                 .list()
         if (conflicted.isNotEmpty()) {
             val names = conflicted.mapNotNull(nameByTableId::get).sorted()
+            val change = if (requireUnchangedTables) "table change" else "DDL"
             throw HoglakeException.CommitConflict(
-                "concurrent DDL since snapshot $readSnapshot on table(s): " +
+                "concurrent $change since snapshot $readSnapshot on table(s): " +
                     names.joinToString(", "),
             )
         }
