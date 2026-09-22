@@ -1310,6 +1310,45 @@ paths:
         "503":
           description: Commit admission timed out; retry the identical request
 
+  /catalogs/{catalog}/commit/mutations/prepared:
+    post:
+      operationId: commitPreparedMutation
+      summary: Atomically publish guarded appends and deletion vectors with durable replay protection
+      description: >
+        Requires idempotent-mutation-v1, idempotency_key, read_snapshot and non-empty
+        deletes with expected_table_uuid on every delete and append group. A delete
+        group with an empty files list anchors insert-only and zero-row mutations.
+        Appends and deletion vectors publish together in one snapshot. Every target
+        table must be unchanged since read_snapshot, including inserts, deletes,
+        compaction and DDL. Unrelated table changes do not conflict. Full-payload
+        replay, including the stronger conflict contract, returns the original result
+        before current-state validation. A changed payload is rejected. Missing
+        receipts do not fence in-flight publication; preserve uploads on unknown
+        outcomes. Deploy to all replicas before enabling SQL UPDATE and MERGE.
+      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - { $ref: "#/components/schemas/CommitRequest" }
+                - type: object
+                  required: [idempotency_key, read_snapshot, deletes]
+      responses:
+        "200":
+          description: Committed, or the original result of an identical replay
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CommitResult" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Commit conflict
+        "422":
+          description: Invalid request, missing key, or key reused with another payload
+        "503":
+          description: Commit admission timed out; retry the identical request
+
   /catalogs/{catalog}/commit:
     post:
       operationId: commit
@@ -1719,7 +1758,7 @@ components:
       properties:
         name: { type: string }
         data_path: { type: string }
-        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 and guarded-schema-evolution-v1 when supported" }
+        capabilities: { type: array, items: { type: string }, description: "Includes atomic-table-creation-v1, idempotent-append-v1, idempotent-delete-v1, idempotent-mutation-v1, guarded-table-lifecycle-v1, atomic-table-replacement-v1 and guarded-schema-evolution-v1 when supported" }
         head_snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }
         earliest_snapshot_time:
@@ -2088,7 +2127,7 @@ components:
             TableAppend.expected_table_uuid (mismatch -> 409).
         files:
           type: array
-          description: Empty only for guarded zero-row statements through /commit/deletes/prepared.
+          description: Empty only for guarded zero-row statements through /commit/deletes/prepared or /commit/mutations/prepared.
           items: { $ref: "#/components/schemas/DeleteFileRegistration" }
 
     DeleteFile:

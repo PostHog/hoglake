@@ -63,6 +63,7 @@ data class CatalogDto(
             "atomic-table-creation-v1",
             "idempotent-append-v1",
             "idempotent-delete-v1",
+            "idempotent-mutation-v1",
             "guarded-table-lifecycle-v1",
             "atomic-table-replacement-v1",
             "guarded-schema-evolution-v1",

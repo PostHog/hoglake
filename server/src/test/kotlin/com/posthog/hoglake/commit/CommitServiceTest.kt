@@ -2,9 +2,11 @@ package com.posthog.hoglake.commit
 
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -12,6 +14,8 @@ import org.jdbi.v3.core.Jdbi
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.ValueSource
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -145,6 +149,65 @@ class CommitServiceTest {
             jdbi.useHandle<Exception> { h ->
                 assertThat(h.createQuery("SELECT COUNT(*) FROM hog_data_file").mapTo(Long::class.java).one())
                     .isEqualTo(1L)
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `concurrent mixed mutations publish one complete winner`() {
+        val fx = seed()
+        val initial =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/initial", 10)))),
+                ),
+            )
+        val pool = Executors.newFixedThreadPool(2)
+        try {
+            val start = CountDownLatch(1)
+            val futures =
+                (1..2).map { worker ->
+                    pool.submit<Boolean> {
+                        start.await()
+                        try {
+                            service.commit(
+                                "cat",
+                                CommitRequest(
+                                    readSnapshot = initial.snapshotId,
+                                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new$worker", 2)))),
+                                    deletes =
+                                        listOf(
+                                            TableDeletes(
+                                                "ns",
+                                                "events",
+                                                listOf(
+                                                    DeleteFileRegistration(1, "s3://b/dv$worker", 2, 100),
+                                                ),
+                                            ),
+                                        ),
+                                    idempotencyKey = java.util.UUID.randomUUID(),
+                                    requireUnchangedTables = true,
+                                ),
+                            )
+                            true
+                        } catch (_: HoglakeException.CommitConflict) {
+                            false
+                        }
+                    }
+                }
+            start.countDown()
+            assertThat(futures.count { it.get(10, TimeUnit.SECONDS) }).isEqualTo(1)
+            assertThat(dataFiles(fx.catalogId)).hasSize(2)
+            jdbi.useHandle<Exception> { h ->
+                assertThat(
+                    h.createQuery("SELECT COUNT(*) FROM hog_delete_file").mapTo(Long::class.java).one(),
+                ).isEqualTo(1)
+                assertThat(
+                    h.createQuery("SELECT COUNT(*) FROM hog_commit_receipt").mapTo(Long::class.java).one(),
+                ).isEqualTo(1)
             }
         } finally {
             pool.shutdownNow()
@@ -611,6 +674,48 @@ class CommitServiceTest {
                 ),
             )
         assertThat(result.snapshotId).isEqualTo(2)
+    }
+
+    @ParameterizedTest
+    @ValueSource(
+        strings = [
+            "table_created", "table_inserted_into", "table_deleted_from",
+            "table_compacted", "table_altered", "table_dropped",
+        ],
+    )
+    fun `prepared mutation rejects any newer target table change`(kind: String) {
+        val fx = seed()
+        seedChange(fx.catalogId, kind, fx.tables.getValue("events").first)
+        val request =
+            CommitRequest(
+                readSnapshot = 0,
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new", 2)))),
+                idempotencyKey = java.util.UUID.randomUUID(),
+                requireUnchangedTables = true,
+            )
+        assertThatThrownBy { service.commit("cat", request) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThat(dataFiles(fx.catalogId)).isEmpty()
+        assertThatThrownBy { service.receipt("cat", request.idempotencyKey!!) }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `prepared mutation ignores other tables and non table object IDs`() {
+        val fx = seed(tableNames = listOf("events", "other"))
+        seedChange(fx.catalogId, "table_inserted_into", fx.tables.getValue("other").first)
+        seedChange(fx.catalogId, "namespace_created", fx.tables.getValue("events").first)
+        val request =
+            CommitRequest(
+                readSnapshot = 0,
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new", 2)))),
+                idempotencyKey = java.util.UUID.randomUUID(),
+                requireUnchangedTables = true,
+            )
+        val committed = service.commit("cat", request)
+        assertThat(service.commit("cat", request)).isEqualTo(committed)
+        assertThatThrownBy { service.commit("cat", request.copy(requireUnchangedTables = false)) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
     }
 
     @Test

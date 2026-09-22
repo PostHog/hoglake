@@ -887,6 +887,8 @@ data class CommitRequest(
     val author: String? = null,
     val message: String? = null,
     val idempotencyKey: UUID? = null,
+    /** Prepared mutations require the entire target read set to remain unchanged. */
+    val requireUnchangedTables: Boolean = false,
 )
 
 data class CommitResult(

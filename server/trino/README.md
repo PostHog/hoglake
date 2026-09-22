@@ -140,3 +140,21 @@ Deletes reject newer vectors on the same file and removed/compacted target files
 concurrent appends are allowed and remain outside the pinned DELETE snapshot.
 No schema migration or new receipt store is needed. The new endpoint prevents
 old replicas from silently accepting a weaker contract.
+
+### SQL UPDATE and MERGE rollout
+
+Deploy `idempotent-mutation-v1` to **every server replica first**, then roll out
+Trino UPDATE/MERGE support. `/commit/mutations/prepared` reuses the commit
+transaction and full-payload receipt store to publish appends and deletion
+vectors in a single snapshot. It requires a read snapshot, operation UUID and
+table UUID guards, including an empty delete group for insert-only or no-op
+statements. No schema migration is needed. The delete-only endpoint remains
+unchanged and rejects appends.
+
+Prepared mutations reject any intervening target-table change, including INSERT,
+DELETE, compaction, schema changes and lifecycle operations. Unrelated tables
+may change. Replays return the original receipt before current-state checks;
+both appended files and vectors are covered by the receipt. Unknown outcomes
+must retain all potentially committed uploads. MERGE provides SQL match semantics,
+not unique-key enforcement. Partitioned/sorted writes and new writable types are
+outside this contract's connector scope.

@@ -271,6 +271,26 @@ fun Application.installApiRoutes(
                     call.respond(commits.commit(call.catalog(), req.toModel(allowEmptyDeletes = true)).toDto())
                 }
 
+                // A separate endpoint fences old replicas and includes the stronger
+                // conflict contract in the durable full-payload receipt.
+                post("/commit/mutations/prepared") {
+                    val req = call.receive<CommitRequestDto>()
+                    if (req.idempotencyKey == null || req.readSnapshot == null || req.deletes.isEmpty() ||
+                        req.deletes.any { it.expectedTableUuid == null } ||
+                        req.appends.any { it.expectedTableUuid == null }
+                    ) {
+                        throw com.posthog.hoglake.model.HoglakeException.Validation(
+                            "prepared mutation requires idempotency_key, read_snapshot and guarded target tables",
+                        )
+                    }
+                    call.respond(
+                        commits.commit(
+                            call.catalog(),
+                            req.toModel(allowEmptyDeletes = true).copy(requireUnchangedTables = true),
+                        ).toDto(),
+                    )
+                }
+
                 get("/commit/receipts/{operation}") {
                     val operation =
                         try {
