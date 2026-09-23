@@ -164,6 +164,99 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     assert info.file_count == 1
 
 
+def test_uuid_column_roundtrip_carries_the_parquet_annotation(
+    catalog, ns, s3config, tmp_path
+):
+    """The uuid wire form, end to end against the live stack.
+
+    hoglake's uuid column is FIXED_LEN_BYTE_ARRAY(16) + the UUID logical
+    annotation (docs/iceberg-federation.md), which is what compaction
+    and the Trino connector write. pyhoglake wrote it WITHOUT the
+    annotation until the writer moved to pa.uuid(), so this reads the
+    objects back out of MinIO and asserts the annotation is on them —
+    both for the Arrow append path and for a prepared file that still
+    carries the bare fixed(16) spelling, which must keep being accepted.
+    """
+    schema = pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("event_id", pa.uuid(), nullable=False),
+        ]
+    )
+    table = ns.create_table("uuids", schema)
+    by_name = {c.name: c for c in table.columns}
+    uuid_column = by_name["event_id"]
+    assert uuid_column.type == "uuid"
+
+    values = [uuid.UUID(int=i) for i in range(4)]
+    # The caller hands over plain 16-byte storage: the client's own
+    # target schema is what adds the annotation.
+    table.append(
+        pa.table(
+            {
+                "id": pa.array([1, 2, 3, 4], pa.int64()),
+                "event_id": pa.array([v.bytes for v in values], pa.binary(16)),
+            }
+        )
+    )
+    fs = s3config.filesystem()
+
+    def uuid_leaf(path):
+        raw = fs.open_input_file(path[len("s3://") :]).read()
+        parquet = pq.ParquetFile(pa.BufferReader(raw))
+        leaf = parquet.schema.column(parquet.schema.names.index("event_id"))
+        return leaf, parquet
+
+    (appended,) = table.files()
+    leaf, parquet = uuid_leaf(appended.path)
+    assert leaf.physical_type == "FIXED_LEN_BYTE_ARRAY"
+    assert leaf.length == 16
+    assert leaf.logical_type.type == "UUID"
+    assert parquet.read().column("event_id").to_pylist() == values
+
+    # A prepared file in the OLD spelling — bare fixed(16), no
+    # annotation, exactly what every file registered before this
+    # contract carries — still passes the prepared-file schema check and
+    # commits.
+    bare = tmp_path / "bare-uuid.parquet"
+    bare_schema = pa.schema(
+        [
+            pa.field(
+                "id",
+                pa.int64(),
+                nullable=False,
+                metadata={b"PARQUET:field_id": str(by_name["id"].field_id).encode()},
+            ),
+            pa.field(
+                "event_id",
+                pa.binary(16),
+                nullable=False,
+                metadata={b"PARQUET:field_id": str(uuid_column.field_id).encode()},
+            ),
+        ]
+    )
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([5], pa.int64()),
+                "event_id": pa.array([uuid.UUID(int=9).bytes], pa.binary(16)),
+            }
+        ).cast(bare_schema),
+        bare,
+    )
+    request = table.prepare_append_files(
+        [(str(bare), None)], idempotency_key=str(uuid.uuid4())
+    )
+    catalog.commit_prepared(request)
+    assert table.info().record_count == 5
+    prepared_path = request["appends"][0]["files"][0]["path"]
+    leaf, parquet = uuid_leaf(prepared_path)
+    # Uploaded byte for byte: prepare never rewrites, so this object
+    # keeps the unannotated form its writer chose.
+    assert leaf.logical_type.type == "NONE"
+    assert parquet.read().column("event_id").to_pylist() == [uuid.UUID(int=9).bytes]
+
+
 def test_deferred_append_hydrates_with_exact_footer_size(catalog, ns, s3config):
     """Live regression for the footer_size wire convention (bugs.md #7):
     deferred-stats append -> the hydrator tail-reads the footer with the

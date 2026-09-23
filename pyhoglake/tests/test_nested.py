@@ -792,6 +792,231 @@ def test_an_ordinary_nested_schema_is_not_flagged_reserved():
     _check_reserved_columns(columns_to_arrow_schema(NESTED_COLUMNS))
 
 
+# -- uuid under a container ---------------------------------------------------
+#
+# The nested arms of uuid_storage_form are tested one at a time, with the
+# bare spelling HAND-BUILT on each side. A test that derives "bare" by
+# calling the function under test asserts only that the function agrees
+# with itself: mutations that deleted the struct, list and map arms
+# outright all survived that shape.
+
+
+def _uuid_field(name: str, field_id: int, *, annotated: bool, nullable: bool = True):
+    kind = pa.uuid() if annotated else pa.binary(16)
+    return pa.field(
+        name,
+        kind,
+        nullable=nullable,
+        metadata={PARQUET_FIELD_ID_KEY: str(field_id).encode()},
+    )
+
+
+def _container(kind: str, *, annotated: bool) -> pa.DataType:
+    """One container holding a uuid, in the given spelling. Hand-built:
+    nothing here goes through uuid_storage_form."""
+    if kind == "struct":
+        return pa.struct([_uuid_field("u", 2, annotated=annotated)])
+    if kind == "list":
+        return pa.list_(_uuid_field("element", 2, annotated=annotated))
+    if kind == "large_list":
+        return pa.large_list(_uuid_field("element", 2, annotated=annotated))
+    if kind == "fixed_size_list":
+        return pa.list_(_uuid_field("element", 2, annotated=annotated), 3)
+    if kind == "map_value":
+        return pa.map_(
+            pa.field(
+                "key",
+                pa.string(),
+                nullable=False,
+                metadata={PARQUET_FIELD_ID_KEY: b"2"},
+            ),
+            _uuid_field("value", 3, annotated=annotated),
+        )
+    if kind == "map_key":
+        return pa.map_(
+            _uuid_field("key", 2, annotated=annotated, nullable=False),
+            pa.field("value", pa.string(), metadata={PARQUET_FIELD_ID_KEY: b"3"}),
+        )
+    raise AssertionError(kind)
+
+
+def _wrap(inner: pa.DataType) -> pa.Schema:
+    return pa.schema(
+        [pa.field("c", inner, metadata={PARQUET_FIELD_ID_KEY: b"1"})],
+    )
+
+
+CONTAINER_KINDS = [
+    "struct",
+    "list",
+    "large_list",
+    "fixed_size_list",
+    "map_value",
+    "map_key",
+]
+
+
+@pytest.mark.parametrize("kind", CONTAINER_KINDS)
+def test_bare_uuid_matches_the_annotated_container_arm_by_arm(kind):
+    """Each container arm of the normalizer, on its own: a file whose
+    uuid leaf is the pre-annotation fixed(16) must match a destination
+    whose leaf is pa.uuid(), through struct, every list spelling, and
+    both halves of a map."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    annotated = _wrap(_container(kind, annotated=True))
+    bare = _wrap(_container(kind, annotated=False))
+    assert not annotated.equals(bare), "the two spellings must really differ"
+    assert prepared_schema_matches(bare, annotated)
+    assert prepared_schema_matches(annotated, annotated)
+    assert prepared_schema_matches(bare, bare)
+
+
+@pytest.mark.parametrize("kind", CONTAINER_KINDS)
+def test_nested_field_ids_are_still_compared_arm_by_arm(kind):
+    """The licence is the uuid SPELLING and nothing else: renumbering the
+    leaf's PARQUET:field_id at depth is still a refusal in every
+    container."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    annotated = _wrap(_container(kind, annotated=True))
+    leaf_id = b"3" if kind == "map_value" else b"2"
+    renumbered = _wrap(
+        _container(kind, annotated=False)
+    )  # bare, then renumber its leaf
+    inner = renumbered.field(0).type
+
+    def renumber(field: pa.Field) -> pa.Field:
+        meta = dict(field.metadata or {})
+        if meta.get(PARQUET_FIELD_ID_KEY) == leaf_id:
+            meta[PARQUET_FIELD_ID_KEY] = b"99"
+        return field.with_metadata(meta)
+
+    if pa.types.is_struct(inner):
+        moved = pa.struct([renumber(inner.field(0))])
+    elif pa.types.is_map(inner):
+        moved = pa.map_(
+            renumber(inner.key_field),
+            renumber(inner.item_field),
+            keys_sorted=inner.keys_sorted,
+        )
+    elif pa.types.is_large_list(inner):
+        moved = pa.large_list(renumber(inner.value_field))
+    elif pa.types.is_fixed_size_list(inner):
+        moved = pa.list_(renumber(inner.value_field), inner.list_size)
+    else:
+        moved = pa.list_(renumber(inner.value_field))
+    assert not prepared_schema_matches(_wrap(moved), annotated)
+
+
+def test_uuid_normalization_keeps_every_other_container_property():
+    """Unwrapping the uuid extension must not quietly unify anything
+    ELSE about a container. A map's keys_sorted, a fixed-size list's
+    width and list-vs-large_list all describe the file's actual shape,
+    and a rebuild that dropped one made a sorted uuid-bearing map equal
+    an unsorted one while the int32 equivalent stayed unequal."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+    from pyhoglake.types import uuid_storage_form
+
+    sorted_map = pa.map_(pa.string(), pa.uuid(), keys_sorted=True)
+    assert uuid_storage_form(sorted_map).keys_sorted
+    assert uuid_storage_form(sorted_map) == pa.map_(
+        pa.string(), pa.binary(16), keys_sorted=True
+    )
+    assert not prepared_schema_matches(
+        _wrap(pa.map_(pa.string(), pa.binary(16))), _wrap(sorted_map)
+    )
+    # ... exactly as it behaves for a type with no uuid in it at all.
+    assert not prepared_schema_matches(
+        _wrap(pa.map_(pa.string(), pa.int32())),
+        _wrap(pa.map_(pa.string(), pa.int32(), keys_sorted=True)),
+    )
+
+    fixed = pa.list_(pa.uuid(), 3)
+    assert uuid_storage_form(fixed) == pa.list_(pa.binary(16), 3)
+    assert not prepared_schema_matches(_wrap(pa.list_(pa.binary(16), 4)), _wrap(fixed))
+    assert not prepared_schema_matches(_wrap(pa.list_(pa.binary(16))), _wrap(fixed))
+
+    big = pa.large_list(pa.uuid())
+    assert uuid_storage_form(big) == pa.large_list(pa.binary(16))
+    assert not prepared_schema_matches(_wrap(pa.list_(pa.binary(16))), _wrap(big))
+
+
+def test_schema_level_metadata_is_still_compared():
+    """uuid_storage_form_schema rebuilds the schema when it normalizes
+    anything, and a rebuild that forgot the schema's own metadata would
+    make every prepared file match a destination carrying some — the
+    ``check_metadata=True`` semantics the caller relies on, one level up
+    from the fields."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+
+    want = _wrap(_container("struct", annotated=True)).with_metadata({b"k": b"v"})
+    bare = _wrap(_container("struct", annotated=False))
+    assert prepared_schema_matches(bare.with_metadata({b"k": b"v"}), want)
+    assert not prepared_schema_matches(bare, want)
+    assert not prepared_schema_matches(bare.with_metadata({b"k": b"other"}), want)
+
+
+def test_deeper_than_the_catalog_cap_is_not_normalized():
+    """The walk is bounded by the same cap the catalog puts on column
+    nesting, because it runs over types read from a caller-written
+    footer. Past the cap the type comes back as-is, so such a file is
+    compared un-normalized — refused, never accepted on a guess."""
+    from pyhoglake.types import MAX_COLUMN_NESTING_DEPTH, uuid_storage_form
+
+    at_cap = pa.uuid()
+    for _ in range(MAX_COLUMN_NESTING_DEPTH - 1):
+        at_cap = pa.list_(at_cap)
+    over_cap = pa.list_(at_cap)
+    assert "extension" not in str(uuid_storage_form(at_cap))
+    assert "extension" in str(uuid_storage_form(over_cap))
+
+
+def test_nested_uuid_is_annotated_in_parquet(tmp_path):
+    """The parquet form, at depth: pyarrow stamps the UUID annotation on
+    a struct field and a list element, not only on a top-level column,
+    so a nested uuid written by this client is as Iceberg-conformant as
+    a flat one — and the file it wrote passes prepare's schema check."""
+    from pyhoglake.parquet_schema import prepared_schema_matches
+    from pyhoglake.types import columns_to_arrow_schema
+
+    columns = [
+        Column(
+            name="s",
+            type="struct",
+            field_id=1,
+            ordinal=0,
+            nullable=False,
+            children=(
+                Column(name="u", type="uuid", field_id=2, ordinal=0, nullable=False),
+            ),
+        ),
+        Column(
+            name="l",
+            type="list",
+            field_id=3,
+            ordinal=1,
+            children=(Column(name="element", type="uuid", field_id=4, ordinal=0),),
+        ),
+    ]
+    schema = columns_to_arrow_schema(columns)
+    path = tmp_path / "nested-uuid.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "s": pa.array([{"u": b"\x01" * 16}]),
+                "l": pa.array([[b"\x02" * 16]]),
+            }
+        ).cast(schema),
+        path,
+    )
+    parquet = pq.ParquetFile(path)
+    assert [
+        parquet.schema.column(i).logical_type.type for i in range(len(parquet.schema))
+    ] == ["UUID", "UUID"]
+    assert prepared_schema_matches(parquet.schema_arrow, schema)
+
+
 # -- the single-caller premise stats.py leans on -----------------------------
 
 

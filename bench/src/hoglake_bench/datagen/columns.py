@@ -75,6 +75,19 @@ def _json_type() -> pa.DataType:
         return pa.string()
 
 
+def _uuid_type() -> pa.DataType:
+    """The arrow type that stamps the parquet UUID annotation (pyarrow
+    >= 21); plain fixed(16) elsewhere — same sixteen bytes, annotation
+    lost. This is what the catalog's own writer type is
+    (``coltype_to_arrow("uuid")``), so generating anything else would
+    make the bench's "full type matrix" exercise a wire form the client
+    no longer writes."""
+    try:
+        return pa.uuid()
+    except AttributeError:  # pragma: no cover - old pyarrow
+        return pa.binary(16)
+
+
 #: Arrow generation type per scalar. These are the WRITER-side types:
 #: uint32 stays pa.uint32() here so DDL derives coltype "uint32", and
 #: pyhoglake's append path casts it to the contract's int64 physical.
@@ -100,7 +113,7 @@ ARROW_BY_SCALAR: dict[str, pa.DataType] = {
     "timestamptz": pa.timestamp("us", tz="UTC"),
     "string": pa.string(),
     "json": _json_type(),
-    "uuid": pa.binary(16),
+    "uuid": _uuid_type(),
     "binary": pa.binary(),
 }
 

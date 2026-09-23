@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pyhoglake",
-    "pyarrow>=17.0",
+    # >=21.0, matching pyhoglake: only pyarrow 21+ stamps the parquet
+    # UUID logical annotation hoglake's uuid wire form requires, and
+    # this package reads and filters those columns.
+    "pyarrow>=21.0",
     "duckdb==1.5.5",
     "pyyaml>=6.0",
 ]

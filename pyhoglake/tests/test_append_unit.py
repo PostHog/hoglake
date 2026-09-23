@@ -592,6 +592,200 @@ def test_prepared_seconds_timestamp_preserves_schema_guards(
         assert uploaded["created_at"].to_pylist() == [datetime(2026, 1, 1)]
 
 
+# --- uuid: the annotated wire form, and the two forms on prepare ---------
+#
+# hoglake's uuid column is FIXED_LEN_BYTE_ARRAY(16) + the UUID logical
+# annotation (docs/iceberg-federation.md), which is what compaction's
+# ParquetRewriter and the Trino connector write. pyarrow stamps that
+# annotation only for pa.uuid(), so the writer emits the extension type —
+# but every file already registered carries the bare fixed(16), and a
+# foreign writer may too, so PREPARE accepts either. The bytes are
+# identical; only the annotation differs.
+
+UUID_TABLE_WIRE = {
+    **TABLE_WIRE,
+    "columns": [
+        *TABLE_WIRE["columns"],
+        {
+            "name": "event_id",
+            "type": "uuid",
+            "field_id": 3,
+            "ordinal": 2,
+            "nullable": False,
+        },
+    ],
+}
+
+
+@pytest.mark.parametrize(
+    "form,accepted",
+    [
+        ("annotated", True),
+        ("bare", True),
+        ("narrow", False),
+        ("string", False),
+        ("wrong_field_id", False),
+    ],
+)
+def test_prepared_uuid_column_accepts_both_wire_forms(
+    table, httpx_mock, fake_s3, tmp_path, form, accepted
+):
+    """Both uuid spellings pass the prepared-file schema check; nothing
+    else does. ``narrow``/``string`` are the neighbouring types the
+    equivalence must not swallow, and ``wrong_field_id`` pins that
+    accepting the second spelling did not stop comparing field ids —
+    the check the old ``equals(..., check_metadata=True)`` carried."""
+    from pyhoglake.models import TableInfo
+    from pyhoglake.types import columns_to_arrow_schema
+
+    schema = columns_to_arrow_schema(TableInfo.from_wire(UUID_TABLE_WIRE).columns)
+    field = schema.field("event_id")
+    storage, value = pa.binary(16), uuid.uuid4().bytes
+    # Both spellings are written EXPLICITLY, so the case does not quietly
+    # become a test of whatever coltype_to_arrow happens to return.
+    if form == "annotated":
+        field = field.with_type(pa.uuid())
+    elif form == "bare":
+        field = field.with_type(pa.binary(16))
+    elif form == "narrow":
+        storage, value = pa.binary(15), uuid.uuid4().bytes[:15]
+        field = field.with_type(storage)
+    elif form == "string":
+        storage, value = pa.string(), str(uuid.uuid4())
+        field = field.with_type(storage)
+    elif form == "wrong_field_id":
+        field = field.with_metadata({b"PARQUET:field_id": b"99"})
+    schema = schema.set(2, field)
+    path = tmp_path / f"{form}.parquet"
+    raw = pa.table(
+        {
+            "id": pa.array([1], pa.int64()),
+            "name": pa.array(["a"], pa.string()),
+            "event_id": pa.array([value], storage),
+        }
+    )
+    pq.write_table(raw.cast(schema), path)
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=UUID_TABLE_WIRE,
+    )
+    if accepted:
+        request = table.prepare_append_files(
+            [(str(path), None)], idempotency_key=str(uuid.uuid4())
+        )
+        assert request["appends"][0]["files"][0]["record_count"] == 1
+        assert next(iter(fake_s3.files.values())) == path.read_bytes()
+        # The uuid bound rides the same 16 big-endian bytes either way.
+        stats = {
+            stat["field_id"]: stat
+            for stat in request["appends"][0]["files"][0]["column_stats"]
+        }
+        assert base64.b64decode(stats[3]["lower_bound"]) == value
+    else:
+        with pytest.raises(ValidationError, match="schema/field IDs"):
+            table.prepare_append_files(
+                [(str(path), None)], idempotency_key=str(uuid.uuid4())
+            )
+        assert not fake_s3.files
+
+
+def test_prepared_json_column_still_requires_the_json_extension(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    """The uuid licence is the uuid column's alone. A bare utf8 file
+    under a `json` catalog column stays a refusal: arrow's plain string
+    makes no JSON validity claim, so accepting it would attach one the
+    data never made (types.py module docstring). Pinned here because
+    the obvious over-generalization of the uuid rule — unwrap ANY
+    extension type before comparing — would silently allow it."""
+    from pyhoglake.models import TableInfo
+    from pyhoglake.types import columns_to_arrow_schema
+
+    wire = {
+        **TABLE_WIRE,
+        "columns": [
+            *TABLE_WIRE["columns"],
+            {
+                "name": "props",
+                "type": "json",
+                "field_id": 3,
+                "ordinal": 2,
+                "nullable": False,
+            },
+        ],
+    }
+    schema = columns_to_arrow_schema(TableInfo.from_wire(wire).columns)
+    assert schema.field("props").type == pa.json_()
+    bare = schema.set(2, schema.field("props").with_type(pa.string()))
+    path = tmp_path / "bare-json.parquet"
+    pq.write_table(
+        pa.table(
+            {
+                "id": pa.array([1], pa.int64()),
+                "name": pa.array(["a"], pa.string()),
+                "props": pa.array(['{"a":1}'], pa.string()),
+            }
+        ).cast(bare),
+        path,
+    )
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=wire,
+    )
+    with pytest.raises(ValidationError, match="schema/field IDs"):
+        table.prepare_append_files(
+            [(str(path), None)], idempotency_key=str(uuid.uuid4())
+        )
+    assert not fake_s3.files
+
+
+def test_appended_uuid_file_carries_the_parquet_uuid_annotation(
+    table, httpx_mock, fake_s3
+):
+    """The defect this change closes, read off the object the client
+    uploaded: a uuid column written through Table.append must reach the
+    store as FIXED_LEN_BYTE_ARRAY(16) annotated UUID, not bare fixed
+    binary an Iceberg reader takes for opaque bytes."""
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=UUID_TABLE_WIRE,
+    )
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"snapshot_id": 6, "schema_version": 2},
+    )
+    value = uuid.uuid4().bytes
+    # The caller hands over plain 16-byte storage — the client's own
+    # target schema is what adds the annotation.
+    table.append(
+        pa.table(
+            {
+                "id": pa.array([1], pa.int64()),
+                "name": pa.array(["a"], pa.string()),
+                "event_id": pa.array([value], pa.binary(16)),
+            }
+        )
+    )
+    (raw,) = fake_s3.files.values()
+    parquet = pq.ParquetFile(io.BytesIO(raw))
+    column = parquet.schema.column(2)
+    assert column.physical_type == "FIXED_LEN_BYTE_ARRAY"
+    assert column.length == 16
+    assert column.logical_type.type == "UUID"
+    assert parquet.schema_arrow.field(2).metadata[b"PARQUET:field_id"] == b"3"
+    assert parquet.read().column("event_id").to_pylist() == [uuid.UUID(bytes=value)]
+
+
 def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_s3):
     from pathlib import Path
 

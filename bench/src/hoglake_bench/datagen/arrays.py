@@ -131,6 +131,14 @@ def _scalar_array(rng: np.random.Generator, dtype: pa.DataType, n: int) -> pa.Ar
         lo, hi = _EPOCH_2000_S * scale, _EPOCH_2100_S * scale
         vals = rng.integers(lo, hi, n, dtype=np.int64)
         return pa.array(_plant(vals, (lo, hi - 1)), pa.int64()).cast(dtype)
+    # uuid extension (storage fixed(16)): fabricate the storage bytes and
+    # cast, so the column keeps the parquet UUID annotation that
+    # coltype_to_arrow("uuid") now asks for. Without this arm a uuid
+    # column reached the fabricator as an extension type — which every
+    # pa.types.is_* predicate answers no to — and raised.
+    storage = getattr(dtype, "storage_type", None)
+    if storage is not None and pa.types.is_fixed_size_binary(storage):
+        return _scalar_array(rng, storage, n).cast(dtype)
     if pa.types.is_fixed_size_binary(dtype):  # uuid: 16 random bytes
         width = dtype.byte_width
         raw = rng.bytes(n * width)

@@ -124,9 +124,37 @@ for s in catalog.snapshots(before=head + 1):
 | `time64("us")` | `time` |
 | `timestamp("us")` / `timestamp("us", tz)` | `timestamp` / `timestamptz` |
 | `decimal128(p, s)` | `decimal` (`type_params: {precision, scale}`) |
-| `binary(16)` (fixed) or `pa.uuid()` | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
+| `pa.uuid()` or `binary(16)` (fixed) | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
 
 Anything else is rejected with an error listing the supported set.
+
+### uuid columns: the wire form, and the two spellings
+
+A hoglake `uuid` column is parquet `FIXED_LEN_BYTE_ARRAY(16)` carrying
+the `UUID` logical annotation (docs/iceberg-federation.md) — what
+server-side compaction writes on every file it rewrites, and the form an
+Iceberg-conformant reader needs to see a UUID rather than opaque bytes.
+pyarrow stamps that annotation only for its canonical uuid extension
+type, so `coltype_to_arrow("uuid")` returns `pa.uuid()` and every file
+this client writes is annotated. It needs **pyarrow >= 21** (the package
+floor): `pa.uuid()` exists from 18, but 18 through 20 write the bytes
+with no annotation.
+
+Both spellings are accepted everywhere on the way in:
+
+- `Table.append` takes `pa.uuid()` or plain `pa.binary(16)` — the batch
+  is cast to the catalog's schema, and the 16 bytes are the same either
+  way.
+- `Table.prepare_append_files` accepts a file whose uuid column is
+  annotated **or** bare. A hoglake table holds both: compaction outputs
+  have always been annotated, while files this client registered before
+  the contract — and any writer below the pyarrow floor, or one that
+  simply does not annotate — carry the bare form. Nothing else about the
+  schema check is loosened, so a file with the right type and the wrong
+  `PARQUET:field_id` is refused exactly as before.
+- Reading, `arrow_type_to_coltype` maps both to `uuid`, and footer
+  bounds are read from either (the bytes are unsigned-lexicographic in
+  both).
 
 Identifiers (namespace/table/view/column names) must match
 `^[A-Za-z_][A-Za-z0-9_-]{0,127}$` — the server 422s anything else, and

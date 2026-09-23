@@ -24,13 +24,21 @@ Supported mappings (both directions):
     pa.timestamp("ns")       <-> timestamp_ns
     pa.timestamp("us", tz)   <-> timestamptz
     pa.decimal128(p, s)      <-> decimal  (type_params: {"precision": p, "scale": s})
-    pa.binary(16) (fixed)    <-> uuid
+    pa.uuid()                <-> uuid   (pa.binary(16) also reads as uuid)
 
-Note on uuid: hoglake's ``uuid`` column type maps from Arrow
-``fixed_size_binary(16)`` (``pa.binary(16)``) holding the UUID's 16
-big-endian bytes (``uuid.UUID(...).bytes``). pyarrow's canonical uuid
-extension type (``pa.uuid()``, pyarrow >= 18) is accepted on input and
-treated identically.
+Note on uuid: hoglake's ``uuid`` column is parquet
+``FIXED_LEN_BYTE_ARRAY(16)`` carrying the ``UUID`` logical annotation
+(docs/iceberg-federation.md, and what compaction's ParquetRewriter
+writes on every file it rewrites). pyarrow stamps the annotation only for
+its canonical uuid extension type, so ``coltype_to_arrow("uuid")``
+returns ``pa.uuid()``. The storage is 16 big-endian bytes
+(``uuid.UUID(...).bytes``) either way, so ``pa.binary(16)`` is still
+accepted on input and still WRITES the same bytes — it just leaves the
+annotation off, which is the state every file written before this
+contract is in. Measured, the annotation needs pyarrow >= 21: 18 through
+20 have ``pa.uuid()`` but write a bare ``FIXED_LEN_BYTE_ARRAY(16)``.
+Below the floor (no ``pa.uuid()`` at all) the mapping falls back to
+``pa.binary(16)``, losing the annotation and not one byte.
 
 Note on uint32 — the one deliberately asymmetric mapping. ``uint32``
 maps to Iceberg ``long``, but pyarrow writes ``pa.uint32()`` as parquet
@@ -109,7 +117,7 @@ SYNTHETIC_CHILD_NAMES = {"list": ("element",), "map": ("key", "value")}
 _SUPPORTED = (
     "bool, int8, int16, int32, int64, uint8, uint16, uint32, uint64, "
     "float32, float64, string, large_string, json, binary, large_binary, "
-    "fixed_size_binary(16) [uuid], date32, time64(us), "
+    "uuid (extension), fixed_size_binary(16) [uuid], date32, time64(us), "
     "timestamp(s|ms|us|ns), timestamp(us, tz), decimal128, "
     "list, struct, map"
 )
@@ -301,7 +309,21 @@ def coltype_to_arrow(
     if type_ == "timestamptz":
         return pa.timestamp("us", tz="UTC")
     if type_ == "uuid":
-        return pa.binary(16)
+        # pa.uuid() is what makes pyarrow stamp the parquet UUID logical
+        # annotation (pyarrow >= 21; see the module docstring). The
+        # fallback loses that annotation, not the bytes — and a reader
+        # accepts both forms either way.
+        #
+        # It is NOT the whole guard: on 18 through 20 pa.uuid() exists
+        # and this branch is never taken, yet the file still comes out
+        # unannotated. Only the resolver floor (pyarrow>=21 in
+        # pyproject.toml) enforces the wire contract; this arm just keeps
+        # an environment built below the floor writing correct bytes
+        # instead of raising.
+        try:
+            return pa.uuid()
+        except AttributeError:
+            return pa.binary(16)
     if type_ == "decimal":
         params = type_params or {}
         try:
@@ -388,6 +410,88 @@ def is_list_family(t: pa.DataType) -> bool:
         or pa.types.is_large_list(t)
         or pa.types.is_fixed_size_list(t)
     )
+
+
+def _uuid_storage_field(f: pa.Field, depth: int) -> pa.Field:
+    return f.with_type(uuid_storage_form(f.type, depth))
+
+
+def uuid_storage_form(t: pa.DataType, _depth: int = 1) -> pa.DataType:
+    """``t`` with every ``pa.uuid()`` replaced by its 16-byte storage.
+
+    THE canonical way to compare a file's Arrow type against the
+    catalog's for a ``uuid`` column, because the catalog type has two
+    legal spellings on the wire: ``pa.uuid()`` (annotated) and
+    ``pa.binary(16)`` (bare). They differ in the parquet annotation only,
+    never in the bytes, so a comparison that discriminates between them
+    refuses files it must accept — which is exactly what
+    ``prepare_append_files`` did to any writer that annotated.
+
+    Only the uuid extension is unwrapped. ``pa.json_()`` stays an
+    extension: a bare utf8 column makes no JSON validity claim (see the
+    module docstring), so equating the two would be a different, wrong
+    licence. Every other property a container carries — a map's
+    ``keys_sorted``, a fixed-size list's width, list-vs-large_list — is
+    carried through unchanged, because loosening one of THOSE would
+    accept a file whose shape genuinely differs.
+
+    A type holding no uuid extension is returned UNCHANGED — the same
+    object, never a rebuilt one — so every comparison that passed before
+    compares identically now.
+
+    Recursion stops at :data:`MAX_COLUMN_NESTING_DEPTH`, the depth the
+    catalog itself caps columns at, because this walks types read out of
+    a caller-written footer. Past the cap the type is returned as-is:
+    both sides of a comparison stop at the same depth, so a legal schema
+    is unaffected, and a file nested deeper than any legal destination
+    column is compared un-normalized — i.e. refused, which is the safe
+    direction.
+    """
+    if _is_uuid_extension(t):
+        return pa.binary(16)
+    if _depth >= MAX_COLUMN_NESTING_DEPTH:
+        return t
+    deeper = _depth + 1
+    if pa.types.is_struct(t):
+        fields = [_uuid_storage_field(t.field(i), deeper) for i in range(t.num_fields)]
+        if all(f.type == t.field(i).type for i, f in enumerate(fields)):
+            return t
+        return pa.struct(fields)
+    # is_map before the list family, for the reason is_list_family states.
+    if pa.types.is_map(t):
+        key = _uuid_storage_field(t.key_field, deeper)
+        item = _uuid_storage_field(t.item_field, deeper)
+        if key.type == t.key_type and item.type == t.item_type:
+            return t
+        # keys_sorted rides along: it is part of the type, nothing to do
+        # with the uuid spelling, and dropping it made a sorted map equal
+        # an unsorted one for uuid-bearing maps only.
+        return pa.map_(key, item, keys_sorted=t.keys_sorted)
+    # list/large_list/fixed_size_list only. The *_view spellings are not
+    # in hoglake's type set (arrow_type_to_coltype refuses them), so a
+    # schema built from catalog columns can never hold one and a file
+    # that does is refused before any of this matters.
+    if is_list_family(t):
+        value = _uuid_storage_field(t.value_field, deeper)
+        if value.type == t.value_type:
+            return t
+        if pa.types.is_large_list(t):
+            return pa.large_list(value)
+        if pa.types.is_fixed_size_list(t):
+            return pa.list_(value, t.list_size)
+        return pa.list_(value)
+    return t
+
+
+def uuid_storage_form_schema(schema: pa.Schema) -> pa.Schema:
+    """:func:`uuid_storage_form` over a whole schema, field metadata
+    (the ``PARQUET:field_id`` chain), nullability and the schema's own
+    metadata preserved, so the normalized schemas can be compared with
+    ``check_metadata=True``."""
+    fields = [_uuid_storage_field(f, 1) for f in schema]
+    if all(f.type == schema.field(i).type for i, f in enumerate(fields)):
+        return schema
+    return pa.schema(fields, metadata=schema.metadata)
 
 
 def schema_to_column_defs(schema: pa.Schema) -> list[dict[str, Any]]:

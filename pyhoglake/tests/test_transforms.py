@@ -842,6 +842,41 @@ def test_transform_strings_identity_bucket_truncate_per_unique():
     ]
 
 
+def test_transform_strings_uuid_annotated_column_stays_per_unique(monkeypatch):
+    """A uuid partition source arrives as pa.uuid() now that the writer
+    annotates, and arrow has no kernel — dictionary_encode included —
+    that takes an extension type. Encoding its STORAGE keeps the
+    per-unique-value path (and its identical output); without that, a
+    million-row file would build a million UUID objects to produce two
+    distinct partition strings."""
+    import pyhoglake.transforms as transforms_module
+
+    calls = []
+    real = transforms_module.transform_value
+    monkeypatch.setattr(
+        transforms_module,
+        "transform_value",
+        lambda *a, **k: (calls.append(a[3]), real(*a, **k))[1],
+    )
+    first, second = uuid.UUID(int=1), uuid.UUID(int=2)
+    raw = [first.bytes] * 40 + [second.bytes] * 40 + [None]
+    bare = pa.array(raw, pa.binary(16))
+    annotated = bare.cast(pa.uuid())
+
+    got = transform_strings("identity", None, annotated, "uuid").to_pylist()
+    # One python call per DISTINCT value, not per row (nulls take() to
+    # null without a call).
+    assert len(calls) == 2
+    assert got == [str(first)] * 40 + [str(second)] * 40 + [None]
+    # Byte-identical to what the bare spelling produces, transform by
+    # transform: the annotation must not change a partition value.
+    for transform, param in (("identity", None), ("bucket", 16)):
+        assert (
+            transform_strings(transform, param, annotated, "uuid").to_pylist()
+            == transform_strings(transform, param, bare, "uuid").to_pylist()
+        )
+
+
 def test_transform_strings_decimal_fallback():
     # decimal128 has no arrow dictionary_encode: the per-value python
     # fallback must produce identical strings

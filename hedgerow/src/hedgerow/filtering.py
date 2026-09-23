@@ -19,13 +19,33 @@ from pyhoglake import Column, coltype_to_arrow
 from .config import ConfigError, FilterConfig
 
 
+def _comparable(t: pa.DataType) -> pa.DataType:
+    """An extension type's storage; anything else unchanged.
+
+    Arrow ships NO compute kernels for extension types — `pc.equal` over
+    two `extension<arrow.uuid>` arrays raises ArrowNotImplementedError,
+    and mixing an extension with its own storage raises the same way. A
+    hoglake `uuid` column reaches this code annotated (what pyhoglake
+    and compaction write) or bare (everything registered before that
+    contract), and a `json` column as `extension<arrow.json>` or plain
+    utf8, depending on the writer. Comparing storage is the one form
+    both spellings share, and it is the same bytes.
+    """
+    return t.storage_type if isinstance(t, pa.BaseExtensionType) else t
+
+
 @dataclass(frozen=True)
 class RowFilter:
     column: str
     value: pa.Scalar
 
     def apply(self, batch: pa.RecordBatch) -> pa.RecordBatch:
-        mask = pc.equal(batch.column(self.column), self.value)
+        column = batch.column(self.column)
+        if isinstance(column.type, pa.BaseExtensionType):
+            # The storage side of _comparable, which is the type
+            # build_filter cast the value to.
+            column = column.storage
+        mask = pc.equal(column, self.value)
         mask = pc.fill_null(mask, False)  # NULL == x is NULL: drop, don't keep
         return batch.filter(mask)
 
@@ -62,7 +82,10 @@ def build_filter(
         # validate_projection reports this too; belt and braces for
         # direct construction paths.
         raise ConfigError(f"filter.column {cfg.column!r} is not a source column")
-    arrow_type = coltype_to_arrow(col.type, col.type_params)
+    # Storage form: the value is compared against a column read from
+    # parquet, whose spelling depends on the writer, and no compute
+    # kernel accepts an extension type at all (see _comparable).
+    arrow_type = _comparable(coltype_to_arrow(col.type, col.type_params))
     try:
         value = pa.scalar(cfg.equals, type=arrow_type)
     except (pa.ArrowInvalid, pa.ArrowTypeError, OverflowError, TypeError) as e:
