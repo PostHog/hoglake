@@ -157,12 +157,22 @@ class ApiIntegrationTest {
             assertThat(tableNode["columns"][1]["type_params"]["scale"].asInt()).isEqualTo(2)
             assertThat(tableNode["columns"][2]["type"].asText()).isEqualTo("uuid")
             assertThat(tableNode["record_count"].asLong()).isEqualTo(0)
+            // A create is a DDL commit: the response names the snapshot it
+            // just made, so a transactional client can pin its post-DDL
+            // reads to it instead of racing a separate head read (#35).
+            assertThat(tableNode["snapshot_id"].asLong()).isEqualTo(2)
 
             // Table listing carries TableSummary (name + table_uuid).
             val listed = body(client.get("/v1/catalogs/lake/namespaces/analytics/tables"))
             assertThat(listed).hasSize(1)
             assertThat(listed[0]["name"].asText()).isEqualTo("events")
             assertThat(listed[0]["table_uuid"].asText()).isEqualTo(tableUuid)
+
+            // ...but a READ of the table carries no snapshot_id: getTable
+            // resolves an arbitrary snapshot, so stamping one would dress a
+            // read up as the commit that made it.
+            val read = body(client.get("/v1/catalogs/lake/namespaces/analytics/tables/events"))
+            assertThat(read.has("snapshot_id")).isFalse()
 
             // Commit with provided stats -> 200 (snapshot 3; appends do not
             // bump schema_version). Bounds travel as base64 (format: byte).

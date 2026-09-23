@@ -207,6 +207,16 @@ data class TableDto(
     val sortSpec: AlterSortSpecDto? = null,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
+    /**
+     * The snapshot the DDL commit created — set by createTable and
+     * alterTable (the only TableInfo producers that allocate a snapshot),
+     * absent under NON_NULL on every read. Nullable because a READ of the
+     * same Table shape carries no snapshot: stamping one there would dress
+     * a read up as the commit that made it. This is what lets a
+     * transactional client pin its post-DDL reads to the snapshot its own
+     * DDL made instead of racing a separate head read.
+     */
+    val snapshotId: Long? = null,
 )
 
 fun TableInfo.toDto() =
@@ -222,6 +232,7 @@ fun TableInfo.toDto() =
         sortSpec = sortSpec?.toAlterDto(),
         comment = comment,
         properties = properties,
+        snapshotId = snapshotId,
     )
 
 // ---- commits -------------------------------------------------------------

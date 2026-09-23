@@ -9,10 +9,8 @@ import com.posthog.hoglake.model.PartitionSpec
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.SortSpec
-import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import io.ktor.server.plugins.BadRequestException
-import java.util.UUID
 
 /*
  * Wire DTOs for the /alter endpoint (openapi/hoglake.yaml: AlterOp,
@@ -154,34 +152,6 @@ data class AlterOpDto(
 
 data class AlterTableRequestDto(val ops: List<AlterOpDto> = emptyList())
 
-// ---- response ------------------------------------------------------------
-
-/** The spec's Table schema including partition_spec / sort_spec (null = unpartitioned/unsorted). */
-data class AlteredTableDto(
-    val name: String,
-    val namespace: String,
-    val tableUuid: UUID,
-    val columns: List<ColumnDto>,
-    val recordCount: Long,
-    val fileCount: Long,
-    val fileSizeBytes: Long,
-    val partitionSpec: AlterPartitionSpecDto? = null,
-    val sortSpec: AlterSortSpecDto? = null,
-    val comment: String? = null,
-    val properties: Map<String, String> = emptyMap(),
-)
-
-fun TableInfo.toAlteredDto() =
-    AlteredTableDto(
-        name = name,
-        namespace = namespace,
-        tableUuid = tableUuid,
-        columns = columns.map { it.toDto() },
-        recordCount = recordCount,
-        fileCount = fileCount,
-        fileSizeBytes = fileSizeBytes,
-        partitionSpec = partitionSpec?.toAlterDto(),
-        sortSpec = sortSpec?.toAlterDto(),
-        comment = comment,
-        properties = properties,
-    )
+// The alter response reuses TableDto (Dto.kt): the spec's alter operation
+// $refs the same Table schema as create/get, so there is one table DTO,
+// not two that must be kept in step by hand.

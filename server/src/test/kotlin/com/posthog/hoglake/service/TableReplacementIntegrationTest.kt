@@ -117,7 +117,9 @@ class TableReplacementIntegrationTest {
         val prepared = prepare(cat, null)
         val winner = catalogs.createTable(cat, "ns", "t", columns)
         assertThat(creations.publish(cat, prepared.operationId, emptyList()).reason).isEqualTo("target_changed")
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(winner)
+        // createTable returns the commit's snapshotId; a getTable read
+        // carries none, so compare the table shape with that field cleared.
+        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(winner.copy(snapshotId = null))
     }
 
     @Test
@@ -144,10 +146,12 @@ class TableReplacementIntegrationTest {
                 listOf(FileRegistration(prepared.writePath + "bad", -1, 100, 20)),
             )
         }.isInstanceOf(HoglakeException.Validation::class.java)
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original)
+        // createTable returns the commit's snapshotId; a getTable read
+        // carries none, so compare the table shape with that field cleared.
+        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
         assertThat(creations.abort(cat, prepared.operationId).state).isEqualTo("aborted")
         assertThat(creations.publish(cat, prepared.operationId, emptyList()).state).isEqualTo("aborted")
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original)
+        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
     }
 
     @Test

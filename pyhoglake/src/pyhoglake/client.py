@@ -621,6 +621,11 @@ class Table:
     def __init__(self, namespace: Namespace, info: TableInfo) -> None:
         self._namespace = namespace
         self._info = info
+        # The freshest snapshot this client's own DDL made (create/alter),
+        # kept SEPARATELY from _info: a later info() refresh replaces _info
+        # from a read response that carries no snapshot_id, and must not
+        # erase a pin that is still valid. See snapshot_id.
+        self._ddl_snapshot_id: int | None = info.snapshot_id
 
     # -- identity ----------------------------------------------------------
 
@@ -637,6 +642,21 @@ class Table:
         return self._info.table_uuid
 
     @property
+    def snapshot_id(self) -> int | None:
+        """The freshest snapshot this table's create/alter commit made, or
+        None when this client has not done DDL on it (or the server is too
+        old to return one).
+
+        Reads pin to it automatically: files()/scan_plan() with no explicit
+        snapshot resolve at this snapshot, so a create/alter followed by a
+        read sees that DDL instead of racing a head read (#35). Pass an
+        explicit snapshot (or at_timestamp) to read elsewhere. Sticky
+        across info() refreshes (a read carries no snapshot_id, and a pin
+        to an earlier snapshot stays valid); a new alter replaces it;
+        drop() clears it."""
+        return self._ddl_snapshot_id
+
+    @property
     def columns(self):
         return self._info.columns
 
@@ -650,6 +670,24 @@ class Table:
         )
 
     # -- reads -------------------------------------------------------------
+
+    def _read_snapshot(
+        self,
+        snapshot: int | None,
+        at_timestamp: datetime | str | None,
+    ) -> int | None:
+        """The snapshot a read resolves to.
+
+        Explicit travel always wins (snapshot or at_timestamp). Otherwise
+        the read pins to this client's own DDL snapshot when one exists:
+        the whole point of #35 is that a create/alter followed by a read
+        must see that DDL, not race a head read that could miss or
+        overshoot it. With no pin (a table this client only ever read),
+        it is None and the read goes to head as before.
+        """
+        if snapshot is not None or at_timestamp is not None:
+            return snapshot
+        return self._ddl_snapshot_id
 
     def info(
         self,
@@ -672,7 +710,9 @@ class Table:
         body = self._namespace._catalog._client._request(
             "GET",
             self._path("/files"),
-            params=_travel_params(snapshot, at_timestamp),
+            params=_travel_params(
+                self._read_snapshot(snapshot, at_timestamp), at_timestamp
+            ),
         )
         return [DataFile.from_wire(f) for f in body]
 
@@ -684,7 +724,9 @@ class Table:
         body = self._namespace._catalog._client._request(
             "GET",
             self._path("/scan"),
-            params=_travel_params(snapshot, at_timestamp),
+            params=_travel_params(
+                self._read_snapshot(snapshot, at_timestamp), at_timestamp
+            ),
         )
         return [ScanFile.from_wire(f) for f in body]
 
@@ -714,11 +756,20 @@ class Table:
             conflict=CommitConflictError,
         )
         self._info = TableInfo.from_wire(body)
+        # A newer DDL snapshot supersedes the old pin.
+        if self._info.snapshot_id is not None:
+            self._ddl_snapshot_id = self._info.snapshot_id
         return self._info
 
     def drop(self) -> CommitResult:
         body = self._namespace._catalog._client._request("DELETE", self._path())
-        return CommitResult.from_wire(body)
+        result = CommitResult.from_wire(body)
+        # The table is gone; a pin to one of its snapshots resolves a dead
+        # incarnation, not this table. Drop it rather than hand back a
+        # snapshot_id that points at nothing (or, after a same-name
+        # recreate, at the wrong table).
+        self._ddl_snapshot_id = None
+        return result
 
     # -- THE writer path ---------------------------------------------------
 

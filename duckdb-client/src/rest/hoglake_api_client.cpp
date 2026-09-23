@@ -223,6 +223,16 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 		info.has_sort_spec = true;
 		info.sort_spec = ParseSortSpec(sort);
 	}
+	// Present only on create/alter (a DDL commit's own snapshot); absent
+	// on a read, so a missing key means has_snapshot_id stays false. A
+	// PRESENT but non-integer key must throw like every sibling field
+	// (GetBoundedInt) — silently treating it as absent would degrade the
+	// post-DDL pin back to the racy head read this field exists to remove.
+	auto snap = yyjson_obj_get(obj, "snapshot_id");
+	if (snap && !yyjson_is_null(snap)) {
+		info.has_snapshot_id = true;
+		info.snapshot_id = GetBoundedInt(obj, "snapshot_id", 0, 9223372036854775807LL);
+	}
 	return info;
 }
 

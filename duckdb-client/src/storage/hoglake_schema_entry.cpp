@@ -331,8 +331,25 @@ void HoglakeSchemaEntry::Scan(CatalogType type, const std::function<void(Catalog
 
 //! read travel for an entry whose table was created/altered by THIS
 //! transaction: the pin predates the DDL, so those entries read at the
-//! post-DDL head instead (DESIGN.md, "Transactions and eager DDL")
-static HoglakeTravel PostDDLTravel(HoglakeTransaction &transaction) {
+//! post-DDL snapshot instead (DESIGN.md, "Transactions and eager DDL").
+//!
+//! The snapshot comes from the DDL response itself, not a separate
+//! GetCatalog() head read: a foreign commit landing inside that one-RTT
+//! window would otherwise become visible through the DDL-touched table.
+//! The head read stays only as a fallback for a server old enough not to
+//! return snapshot_id on DDL.
+//!
+//! One interaction the head read did not have: a pinned DDL snapshot can
+//! fall BELOW the expiry floor if the retention sweep advances it between
+//! the DDL commit and this transaction's first read, and then the read
+//! 410s (Expired). The old head read was always >= the floor by
+//! construction. This is the intended trade for determinism — a table
+//! whose creating snapshot has already expired is not meaningfully
+//! readable anyway — but it is a behavior change worth naming.
+static HoglakeTravel PostDDLTravel(HoglakeTransaction &transaction, const HoglakeTableInfo &ddl) {
+	if (ddl.has_snapshot_id) {
+		return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(ddl.snapshot_id));
+	}
 	auto info = transaction.Api().GetCatalog();
 	return HoglakeTravel::AtSnapshot(NumericCast<idx_t>(info.head_snapshot_id));
 }
@@ -385,8 +402,8 @@ optional_ptr<CatalogEntry> HoglakeSchemaEntry::CreateTable(CatalogTransaction tr
 	// The typed case is preserved on the wire (DuckDB semantics).
 	auto created = hoglake_transaction.Api().CreateTable(ns, table_name, defs);
 	// the transaction pin predates this create; the new entry reads at
-	// the post-create head so same-transaction SELECTs work
-	auto read_travel = PostDDLTravel(hoglake_transaction);
+	// the snapshot this create just made, so same-transaction SELECTs work
+	auto read_travel = PostDDLTravel(hoglake_transaction, created);
 	dropped_tables.erase(created.name);
 	table_names[created.name].push_back(created.name);
 	return &CacheTableInternal(hoglake_transaction, std::move(created), read_travel, false);
@@ -690,9 +707,9 @@ void HoglakeSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info) 
 		hoglake_transaction.RecordAlteredTable(ns, altered.name);
 	}
 
-	// the pin predates the alter; the evolved entry reads at the
-	// post-alter head so the new schema and its files line up
-	auto read_travel = PostDDLTravel(hoglake_transaction);
+	// the pin predates the alter; the evolved entry reads at the snapshot
+	// this alter just made, so the new schema and its files line up
+	auto read_travel = PostDDLTravel(hoglake_transaction, altered);
 
 	// swap the cached entry for the evolved table; the old entry stays
 	// alive (retired) because the statement may still reference it

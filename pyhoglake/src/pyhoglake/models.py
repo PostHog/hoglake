@@ -285,6 +285,10 @@ class TableInfo:
     file_size_bytes: int
     partition_spec: PartitionSpec | None = None
     sort_spec: SortSpec | None = None
+    # The snapshot a create/alter commit just made; None on any read
+    # (a getTable response carries no snapshot_id), so a client can tell
+    # "this TableInfo came with a fresh DDL pin" apart from a read.
+    snapshot_id: int | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -302,6 +306,7 @@ class TableInfo:
                 sort_spec=SortSpec.from_wire(d["sort_spec"])
                 if d.get("sort_spec")
                 else None,
+                snapshot_id=d.get("snapshot_id"),
             )
 
         return _wire("TableInfo", d, build)

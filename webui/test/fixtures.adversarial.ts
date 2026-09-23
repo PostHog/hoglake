@@ -133,6 +133,19 @@ export const bigIntSnapshotsPage1WireBody =
   '],"has_more":true}';
 
 /**
+ * A table response as create/alter returns it (#35): snapshot_id present,
+ * as an UNQUOTED JSON number above 2^53 — 2^53+1, the value whose Number
+ * round-trip flips to 2^53+2, so a lossy parse cannot produce it. The
+ * field must ride the INT64_FIELDS reviver to an exact decimal string.
+ */
+export const bigIntTableWireBody =
+  '{"name":"events","namespace":"ns1",' +
+  '"table_uuid":"0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012",' +
+  '"columns":[{"name":"id","type":"long","field_id":1,"ordinal":0,"nullable":false}],' +
+  '"record_count":0,"file_count":0,"file_size_bytes":0,' +
+  '"snapshot_id":9007199254740993}';
+
+/**
  * Raw catalog-listing wire body whose live_rows exceeds 2^53, as an
  * UNQUOTED JSON number — the form the server actually sends.
  *

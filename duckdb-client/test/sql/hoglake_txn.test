@@ -34,6 +34,9 @@ statement ok
 DROP TABLE IF EXISTS lake.ns1.txn_created
 
 statement ok
+DROP TABLE IF EXISTS lake.ns1.txn_altered
+
+statement ok
 CREATE TABLE lake.ns1.txn_t (a BIGINT)
 
 # one file holds all five rows
@@ -126,6 +129,25 @@ CREATE TABLE lake.ns1.txn_created (x BIGINT)
 # pre-create pin): 0 rows, not a 404
 query I
 SELECT count(*) FROM lake.ns1.txn_created
+----
+0
+
+# a table ALTERED in this transaction reads at the post-alter snapshot:
+# the new column is visible immediately, not a "no such column" against
+# the pre-DDL pin (hoglake#35 — PostDDLTravel pins the alter's snapshot)
+statement ok
+CREATE TABLE lake.ns1.txn_altered (a BIGINT)
+
+statement ok
+ALTER TABLE lake.ns1.txn_altered ADD COLUMN b BIGINT
+
+query I
+SELECT count(*) FROM lake.ns1.txn_altered
+----
+0
+
+query I
+SELECT count(b) FROM lake.ns1.txn_altered
 ----
 0
 

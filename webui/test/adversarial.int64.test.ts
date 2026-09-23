@@ -11,12 +11,13 @@
 // Number. These are the pinned regressions.
 
 import { describe, expect, it, vi } from "vitest";
-import { listFiles, listSnapshots } from "../src/api/client";
+import { createTable, listFiles, listSnapshots } from "../src/api/client";
 import { addInt64, compareInt64, parseInt64Json } from "../src/api/int64";
 import { formatCount } from "../src/lib/format";
 import {
   bigIntFilesWireBody,
   bigIntSnapshotsPage1WireBody,
+  bigIntTableWireBody,
 } from "./fixtures.adversarial";
 
 function stubFetchRaw(body: string) {
@@ -42,6 +43,20 @@ describe("int64 wire values above 2^53", () => {
     stubFetchRaw(bigIntFilesWireBody);
     const files = await listFiles("c", "ns", "t");
     expect(String(files[0].file_size_bytes)).toBe("4611686018427387905");
+  });
+
+  // snapshot_id is the post-DDL read pin (#35): a client reads at exactly
+  // this snapshot, so rounding it points the read at the wrong one. 2^53+1
+  // flips to 2^53+2 under a Number parse, so the exact string is the proof.
+  // Exercised through createTable — the DDL path the server actually sends
+  // snapshot_id on (getTable, a read, never carries it).
+  it("snapshot_id survives JSON parsing losslessly", async () => {
+    stubFetchRaw(bigIntTableWireBody);
+    const table = await createTable("c", "ns", {
+      name: "events",
+      columns: [{ name: "id", type: "long" }],
+    });
+    expect(table.snapshot_id).toBe("9007199254740993");
   });
 
   // row_id_start is the lineage anchor; 2^53+3 must not round to 2^53+4.

@@ -2434,6 +2434,14 @@ components:
         file_size_bytes: { type: integer, format: int64 }
         partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
         sort_spec: { $ref: "#/components/schemas/SortSpec" }
+        snapshot_id:
+          type: integer
+          format: int64
+          description: The snapshot the DDL commit created — present on
+            createTable and alterTable responses so a transactional client
+            can pin its post-DDL reads to the snapshot its own DDL made
+            instead of racing a separate head read. Absent on reads
+            (getTable resolves an arbitrary snapshot).
 
     ColumnStats:
       type: object
@@ -2707,6 +2715,14 @@ components:
     CommitResult:
       type: object
       required: [snapshot_id]
+      description: >
+        The receipt of a DDL/DML commit. Convention for how a mutating
+        endpoint reports the snapshot it made: an endpoint that returns a
+        DOMAIN OBJECT carries the snapshot as an optional `snapshot_id`
+        field on that object (Table on create/alter), while an endpoint
+        with no domain object returns this CommitResult (drop table,
+        drop namespace, truncate, consumer offsets). Choose per endpoint;
+        do not add a third idiom.
       properties:
         snapshot_id: { type: integer, format: int64 }
         schema_version: { type: integer, format: int64 }

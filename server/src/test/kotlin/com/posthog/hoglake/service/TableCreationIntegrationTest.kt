@@ -124,7 +124,10 @@ class TableCreationIntegrationTest {
         assertThat(replaced.comment).isEqualTo("replacement")
         assertThat(replaced.properties).isEmpty()
         assertThat(replaced.columns.single().def.comment).isNull()
-        assertThat(catalogs.getTable(catalog, "test", "renamed", head)).isEqualTo(altered)
+        // alter returns the commit's snapshotId; a getTable read carries
+        // none, so compare the table shape with that field cleared.
+        assertThat(catalogs.getTable(catalog, "test", "renamed", head))
+            .isEqualTo(altered.copy(snapshotId = null))
     }
 
     @Test
