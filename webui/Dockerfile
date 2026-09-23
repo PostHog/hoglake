@@ -32,4 +32,8 @@ ENV NGINX_ENVSUBST_FILTER=^HOGLAKE_
 COPY --chmod=755 10-resolver.envsh /docker-entrypoint.d/10-resolver.envsh
 COPY nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /src/dist/ /usr/share/nginx/html/
+# The unprivileged image already defaults to uid 101; say it so the
+# non-root runtime is an explicit instruction, not an image default a
+# scanner (or a swapped base image) can silently drop.
+USER 101
 EXPOSE 8080

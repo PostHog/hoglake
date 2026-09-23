@@ -28,6 +28,11 @@ metadata:
     app: bench-shell
 spec:
   serviceAccountName: gigahog-server
+  # No automounted API token: the pod reaches S3 through IRSA's projected
+  # web-identity token (injected by the EKS pod-identity webhook, a separate
+  # volume this flag does not disable), and the hoglake API over plain HTTP.
+  # The default token would only widen the blast radius to the K8s API.
+  automountServiceAccountToken: false
   # A bench run is a burst of parquet writes; do not let it be the reason a
   # node evicts the server it is writing to.
   priorityClassName: null
@@ -68,12 +73,16 @@ spec:
         - name: HOGLAKE_S3_REGION
           value: us-east-1
       resources:
+        # A bench pod is exec-driven and short-lived, so request == limit:
+        # it is scheduled for the burst it is about to do, and a lower
+        # request would only let it land on a node that cannot take it.
+        # Generating wide nested rows is memory-hungry; the generator holds
+        # a batch in Arrow before writing it.
         requests:
-          cpu: "1"
-          memory: 2Gi
+          cpu: "2"
+          memory: 8Gi
         limits:
-          # Generating wide nested rows is memory-hungry; the generator holds
-          # a batch in Arrow before writing it.
+          cpu: "2"
           memory: 8Gi
       volumeMounts:
         - name: work
@@ -82,6 +91,7 @@ spec:
           mountPath: /tmp
       securityContext:
         allowPrivilegeEscalation: false
+        privileged: false
         capabilities:
           drop: ["ALL"]
   volumes:
