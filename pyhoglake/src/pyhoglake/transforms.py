@@ -548,6 +548,15 @@ def transform_strings(
         # Python path below sees the codec's own carrier: encode_bound
         # and wire_string both take an int as nanos.
         arr = pc.cast(arr, pa.int64())
+    if isinstance(arr.type, pa.BaseExtensionType):
+        # Arrow has no compute kernel that takes an extension type,
+        # dictionary_encode included, so a uuid (or json) partition
+        # source would fall through to the per-ROW python path below and
+        # build one UUID object per row. The storage array carries the
+        # same values in the form transform_value already accepts (16
+        # bytes for uuid, the document string for json), so the
+        # per-UNIQUE-value path keeps working for them.
+        arr = arr.storage
 
     def one(value: Any) -> str | None:
         return wire_string(

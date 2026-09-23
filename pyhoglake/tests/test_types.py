@@ -68,7 +68,9 @@ REVERSE = [
     ("timestamp_ns", None, pa.timestamp("ns")),
     ("timestamptz", None, pa.timestamp("us", tz="UTC")),
     ("decimal", {"precision": 10, "scale": 2}, pa.decimal128(10, 2)),
-    ("uuid", None, pa.binary(16)),
+    # pa.uuid(), NOT pa.binary(16): only the extension type makes pyarrow
+    # stamp the parquet UUID annotation hoglake's wire form requires.
+    ("uuid", None, pa.uuid()),
 ]
 
 
@@ -81,6 +83,66 @@ def test_uuid_extension_type_maps_if_available():
     if not hasattr(pa, "uuid"):
         pytest.skip("pyarrow without pa.uuid()")
     assert arrow_type_to_coltype(pa.uuid()) == ("uuid", None)
+
+
+def test_uuid_writer_contract_is_the_annotating_extension_type():
+    """hoglake's uuid wire form is FIXED_LEN_BYTE_ARRAY(16) + the UUID
+    logical annotation — documented in docs/iceberg-federation.md and
+    written by compaction (server ParquetRewriter.kt, the `uuidType()`
+    arm) — and pyarrow stamps that annotation ONLY for pa.uuid().
+    pa.binary(16)
+    writes the bytes with no annotation, which an Iceberg-conformant
+    reader sees as fixed binary until compaction rewrites the file."""
+    assert coltype_to_arrow("uuid") == pa.uuid()
+    # The bytes are the same 16 big-endian bytes either way: the
+    # extension only adds the annotation.
+    assert coltype_to_arrow("uuid").storage_type == pa.binary(16)
+    # Both forms stay readable — files written before this contract, and
+    # by writers that cannot produce the extension, still map to uuid.
+    assert arrow_type_to_coltype(pa.binary(16)) == ("uuid", None)
+
+
+def test_uuid_column_writes_the_parquet_uuid_annotation(tmp_path):
+    """The point of the extension type, at the parquet level."""
+    import uuid as _uuid
+
+    import pyarrow.parquet as pq
+
+    schema = columns_to_arrow_schema(
+        [Column(name="u", type="uuid", field_id=7, ordinal=0, nullable=False)]
+    )
+    path = tmp_path / "uuid.parquet"
+    pq.write_table(
+        pa.table(
+            {"u": pa.array([_uuid.uuid4().bytes], pa.binary(16))}, schema=None
+        ).cast(schema),
+        path,
+    )
+    parquet = pq.ParquetFile(path)
+    column = parquet.schema.column(0)
+    assert column.physical_type == "FIXED_LEN_BYTE_ARRAY"
+    assert column.logical_type.type == "UUID"
+    # The field id rides along unchanged.
+    assert parquet.schema_arrow.field(0).metadata == {PARQUET_FIELD_ID_KEY: b"7"}
+
+
+def test_uuid_falls_back_to_fixed_binary_without_the_extension(monkeypatch):
+    """Below the pyarrow floor there is no pa.uuid(): the column still
+    writes its 16 bytes, it just loses the annotation — the state every
+    file written before this contract is already in."""
+    monkeypatch.delattr(pa, "uuid", raising=False)
+    assert coltype_to_arrow("uuid") == pa.binary(16)
+
+
+def test_uuid_column_round_trips_through_column_defs():
+    """columns_to_arrow_schema -> schema_to_column_defs is how a caller
+    copies a table's shape; the extension type must survive it as uuid
+    rather than come back as an unsupported type."""
+    columns = [Column(name="u", type="uuid", field_id=3, ordinal=0, nullable=False)]
+    schema = columns_to_arrow_schema(columns)
+    assert schema_to_column_defs(schema) == [
+        {"name": "u", "type": "uuid", "nullable": False}
+    ]
 
 
 def test_json_extension_type_maps_if_available():

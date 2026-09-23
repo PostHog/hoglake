@@ -24,6 +24,7 @@ from hoglake_bench.datagen import (
     random_columns,
     to_arrow_schema,
 )
+from hoglake_bench.datagen.arrays import make_array
 
 #: The server's closed scalar vocabulary (openapi/hoglake.yaml ColumnDef
 #: `type` enum, containers and variant excluded). Restated here so a
@@ -187,6 +188,24 @@ class TestDataShape:
                 assert col.null_count > 0, f"{spec.name} never null"
             if not spec.nullable:
                 assert col.null_count == 0, f"{spec.name} has nulls"
+
+    def test_uuid_generates_for_the_catalog_writer_type(self):
+        """The lifecycle scenario fabricates values for the type
+        coltype_to_arrow returns, which for uuid is the pa.uuid()
+        extension (the only spelling pyarrow annotates UUID in parquet).
+        Every pa.types.is_* predicate answers no to an extension type, so
+        without its own arm the fabricator raised NotImplementedError on
+        the first uuid column a scenario generated."""
+        from pyhoglake import coltype_to_arrow
+
+        dtype = coltype_to_arrow("uuid")
+        values = make_array(np.random.default_rng(1), dtype, 8)
+        assert values.type == dtype
+        assert len(values) == 8
+        # Same 16 bytes underneath either spelling.
+        assert values.cast(pa.binary(16)).to_pylist() == [
+            v.bytes for v in values.to_pylist()
+        ]
 
     def test_uint64_exercises_the_range_beyond_int64(self):
         specs = full_coverage_columns()

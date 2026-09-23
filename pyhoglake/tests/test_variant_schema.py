@@ -42,6 +42,125 @@ def test_invalid_variant_prepared_file_is_rejected(tmp_path, defect):
         validate_variant_file(str(path), p, columns)
 
 
+# -- uuid columns on the variant/optional-fields path -------------------------
+#
+# validate_variant_file is the OTHER prepared-file check: it runs for a
+# table holding any variant column, and for every caller that passes
+# allow_optional_fields (hedgerow's DuckDB writer does). It compares
+# types itself rather than through prepared_schema_matches, so the uuid
+# equivalence has to be stated here too — in BOTH directions, since the
+# catalog's own uuid type is now the annotated extension.
+
+UUID_FIELD_ID = {b"PARQUET:field_id": b"2"}
+ID_FIELD_ID = {b"PARQUET:field_id": b"1"}
+UUID_COLUMNS = (
+    Column("id", "long", 1, 0, False),
+    Column("event_id", "uuid", 2, 1, True),
+)
+STRUCT_UUID_COLUMNS = (
+    Column("id", "long", 1, 0, False),
+    Column("s", "struct", 2, 1, True, children=(Column("u", "uuid", 3, 0, True),)),
+)
+
+
+def _write(tmp_path, name, schema, row, storage=None):
+    """Write one row. ``storage`` is the same schema with plain
+    fixed(16) leaves — arrow cannot build an extension value from
+    python inside a struct, so the row is built on the storage schema
+    and cast. Both schemas are hand-built by the helpers below; nothing
+    here goes through the normalizer under test."""
+    path = tmp_path / name
+    table = pa.Table.from_pylist([row], schema=storage if storage else schema)
+    pq.write_table(table.cast(schema), path)
+    return path
+
+
+def _uuid_schema(leaf: pa.DataType) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=ID_FIELD_ID),
+            pa.field("event_id", leaf, metadata=UUID_FIELD_ID),
+        ]
+    )
+
+
+def _struct_uuid_schema(leaf: pa.DataType) -> pa.Schema:
+    return pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False, metadata=ID_FIELD_ID),
+            pa.field(
+                "s",
+                pa.struct([pa.field("u", leaf, metadata={b"PARQUET:field_id": b"3"})]),
+                metadata=UUID_FIELD_ID,
+            ),
+        ]
+    )
+
+
+@pytest.mark.parametrize("leaf", [pa.uuid(), pa.binary(16)], ids=["annotated", "bare"])
+def test_uuid_column_validates_in_both_spellings(tmp_path, leaf):
+    """The scalar arm. An annotated file is what this client and
+    compaction now write; a bare one is what every file registered before
+    the contract carries, and what a writer below the pyarrow floor still
+    produces. Both are the same 16 bytes."""
+    path = _write(
+        tmp_path,
+        f"uuid-{leaf}.parquet",
+        _uuid_schema(leaf),
+        {"id": 1, "event_id": b"\x01" * 16},
+        storage=_uuid_schema(pa.binary(16)),
+    )
+    with pq.ParquetFile(path) as p:
+        validate_variant_file(str(path), p, UUID_COLUMNS)
+
+
+@pytest.mark.parametrize("leaf", [pa.binary(15), pa.string()], ids=["narrow", "string"])
+def test_a_uuid_column_of_the_wrong_type_is_still_rejected(tmp_path, leaf):
+    """The equivalence is between two spellings of sixteen bytes, not a
+    licence for the neighbouring types."""
+    value = b"\x01" * 15 if leaf == pa.binary(15) else "not-sixteen-bytes"
+    path = _write(
+        tmp_path,
+        f"bad-uuid-{leaf}.parquet",
+        _uuid_schema(leaf),
+        {"id": 1, "event_id": value},
+    )
+    with (
+        pq.ParquetFile(path) as p,
+        pytest.raises(ValidationError, match="type differs"),
+    ):
+        validate_variant_file(str(path), p, UUID_COLUMNS)
+
+
+@pytest.mark.parametrize("leaf", [pa.uuid(), pa.binary(16)], ids=["annotated", "bare"])
+def test_uuid_under_a_container_validates_in_both_spellings(tmp_path, leaf):
+    """The container arm, which compares against column_to_arrow_field's
+    whole type in one go — so the normalization has to reach into it."""
+    path = _write(
+        tmp_path,
+        f"struct-uuid-{leaf}.parquet",
+        _struct_uuid_schema(leaf),
+        {"id": 1, "s": {"u": b"\x02" * 16}},
+        storage=_struct_uuid_schema(pa.binary(16)),
+    )
+    with pq.ParquetFile(path) as p:
+        validate_variant_file(str(path), p, STRUCT_UUID_COLUMNS)
+
+
+def test_a_uuid_under_a_container_of_the_wrong_type_is_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        "struct-bad-uuid.parquet",
+        _struct_uuid_schema(pa.binary(15)),
+        {"id": 1, "s": {"u": b"\x02" * 15}},
+    )
+    with (
+        pq.ParquetFile(path) as p,
+        pytest.raises(ValidationError, match="type differs"),
+    ):
+        validate_variant_file(str(path), p, STRUCT_UUID_COLUMNS)
+
+
 MIXED = FIXTURE.with_name("native_variant_struct.parquet")
 NESTED = Column("s", "struct", 3, 2, False, children=(Column("x", "int", 4, 0, True),))
 MIXED_COLUMNS = (*COLUMNS, NESTED)

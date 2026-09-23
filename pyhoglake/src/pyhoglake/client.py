@@ -54,7 +54,7 @@ from .models import (
     ViewInfo,
 )
 from .ops import AlterOp
-from .parquet_schema import validate_variant_file
+from .parquet_schema import prepared_schema_matches, validate_variant_file
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
@@ -1022,7 +1022,7 @@ class Table:
                 with pq.ParquetFile(path) as parquet:
                     if has_variant or allow_optional_fields:
                         validate_variant_file(path, parquet, info.columns)
-                    elif not parquet.schema_arrow.equals(schema, check_metadata=True):
+                    elif not prepared_schema_matches(parquet.schema_arrow, schema):
                         raise ValidationError(
                             "prepared Parquet schema/field IDs differ from destination",
                             status_code=None,

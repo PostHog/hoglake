@@ -16,7 +16,12 @@ classifiers = [
 ]
 dependencies = [
     "httpx>=0.27",
-    "pyarrow>=17.0",
+    # 21.0, not 18.0: pa.uuid() exists from 18, but pyarrow only stamps
+    # the parquet UUID logical annotation hoglake's uuid wire form
+    # requires from 21 (measured against 18.0/18.1/19.0/20.0, all of
+    # which write a bare FIXED_LEN_BYTE_ARRAY(16)). Current release at
+    # the time of the bump: 25.0.1.
+    "pyarrow>=21.0",
     "thrift>=0.22.0,<1",
 ]
 

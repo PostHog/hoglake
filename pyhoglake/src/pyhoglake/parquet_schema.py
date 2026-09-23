@@ -22,6 +22,8 @@ from .types import (
     PARQUET_FIELD_ID_KEY,
     coltype_to_arrow,
     column_to_arrow_field,
+    uuid_storage_form,
+    uuid_storage_form_schema,
 )
 
 
@@ -152,9 +154,31 @@ def _container_fault(column: Column, field: pa.Field) -> str | None:
         # not the prepared file's, but the caller still sees a refusal
         # rather than a stack trace about the wrong API.
         return f"cannot describe destination column {column.name}: {error}"
-    if field.type != expected.type:
+    if uuid_storage_form(field.type) != uuid_storage_form(expected.type):
         return f"prepared Parquet type differs for {column.name}"
     return _field_id_fault(expected, field, column.name)
+
+
+def prepared_schema_matches(found: pa.Schema, want: pa.Schema) -> bool:
+    """Whether a prepared file's Arrow schema is the destination's.
+
+    Field for field, names, nullability and the ``PARQUET:field_id``
+    metadata compared exactly — the identity check that binds a file to
+    the catalog. The ONE licence is the uuid column's two legal
+    spellings: hoglake's uuid wire form is
+    ``FIXED_LEN_BYTE_ARRAY(16) + UUID``, which pyarrow produces only for
+    ``pa.uuid()``, while every file registered before that contract (and
+    any writer below the pyarrow floor) carries the bare fixed(16). The
+    bytes are identical, so both are accepted, at any nesting depth
+    (:func:`~pyhoglake.types.uuid_storage_form`).
+
+    Nothing else is loosened: the field ids still have to match, so a
+    file that annotates its uuid column but misnumbers it is refused
+    exactly as before.
+    """
+    return uuid_storage_form_schema(found).equals(
+        uuid_storage_form_schema(want), check_metadata=True
+    )
 
 
 def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) -> None:
@@ -226,9 +250,11 @@ def validate_variant_file(path: str, parquet: Any, columns: tuple[Column, ...]) 
             expected = coltype_to_arrow(column.type, column.type_params)
             if expected == pa.timestamp("s"):
                 expected = pa.timestamp("ms")
-            actual = field.type
-            if column.type == "uuid" and isinstance(actual, pa.BaseExtensionType):
-                actual = actual.storage_type
+            # Both sides normalized, not just the file's: the catalog's
+            # uuid type is itself the annotated extension now, and a file
+            # carrying the bare fixed(16) is the same 16 bytes.
+            expected = uuid_storage_form(expected)
+            actual = uuid_storage_form(field.type)
             if (
                 pa.types.is_timestamp(actual)
                 and actual.tz

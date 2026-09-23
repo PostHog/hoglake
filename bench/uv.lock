@@ -84,7 +84,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
-    { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pyarrow", specifier = ">=21.0" },
     { name = "pyhoglake", editable = "../pyhoglake" },
 ]
 
@@ -450,7 +450,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
-    { name = "pyarrow", specifier = ">=17.0" },
+    { name = "pyarrow", specifier = ">=21.0" },
     { name = "thrift", specifier = ">=0.22.0,<1" },
 ]
 

@@ -1,5 +1,7 @@
 """Row-filter construction and application."""
 
+import uuid
+
 import pyarrow as pa
 import pytest
 from fakes import col
@@ -12,6 +14,8 @@ SRC = (
     col("team_id", "long", 2, 1),
     col("name", "string", 3, 2),
     col("active", "boolean", 4, 3),
+    col("event_id", "uuid", 5, 4),
+    col("props", "json", 6, 5),
 )
 
 
@@ -49,6 +53,42 @@ def test_string_filter():
         name=pa.array(["a", "b", None], pa.string()),
     )
     assert f.apply(batch).column("id").to_pylist() == [1]
+
+
+def test_uuid_filter_matches_either_wire_form():
+    """A hoglake uuid column reaches the reader in either spelling: the
+    annotated pa.uuid() (what pyhoglake, compaction and the Trino
+    connector write) or the bare fixed_size_binary(16) of everything
+    registered before that contract. Arrow has NO compute kernel for the
+    extension type — pc.equal over extension<arrow.uuid> raises
+    ArrowNotImplementedError — so the filter compares the 16 storage
+    bytes both forms share."""
+    value = uuid.UUID(int=7).bytes
+    other = uuid.UUID(int=8).bytes
+    f = build_filter(FilterConfig(column="event_id", equals=value), SRC)
+    for spelling in (pa.binary(16), pa.uuid()):
+        batch = _batch(
+            id=pa.array([1, 2, 3], pa.int64()),
+            event_id=pa.array([value, other, None], pa.binary(16)).cast(spelling),
+        )
+        assert f.apply(batch).column("id").to_pylist() == [1], spelling
+
+
+def test_json_filter_matches_either_wire_form():
+    """json has the same two spellings as uuid — pa.json_() from a
+    writer that annotates, plain utf8 from one that does not — and the
+    same no-kernel problem: every arrow compute function refuses an
+    extension type. Filtering on a json column raised
+    ArrowNotImplementedError in both spellings before the filter started
+    comparing storage."""
+    doc = '{"a": 1}'
+    f = build_filter(FilterConfig(column="props", equals=doc), SRC)
+    for spelling in (pa.string(), pa.json_()):
+        batch = _batch(
+            id=pa.array([1, 2, 3], pa.int64()),
+            props=pa.array([doc, '{"a": 2}', None], pa.string()).cast(spelling),
+        )
+        assert f.apply(batch).column("id").to_pylist() == [1], spelling
 
 
 def test_boolean_filter():

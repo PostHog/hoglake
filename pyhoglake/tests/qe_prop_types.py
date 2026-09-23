@@ -5,10 +5,11 @@ Two totality claims under test:
 1. Round-trip: every supported (coltype, type_params) maps to an arrow
    type and back to itself; every canonical arrow type is a fixed point
    after one round-trip (non-canonical spellings — large_string,
-   tz-of-any-name, uuid extension — converge to a fixed point in one
-   hop and never drift further). "uint32" is the ONE exception, carved
-   out into its own test: its writer contract is pa.int64(), so it
-   settles on "long" — see test_uint32_converges_to_long_in_one_hop.
+   tz-of-any-name, the bare fixed_size_binary(16) spelling of uuid —
+   converge to a fixed point in one hop and never drift further).
+   "uint32" is the ONE exception, carved out into its own test: its
+   writer contract is pa.int64(), so it settles on "long" — see
+   test_uint32_converges_to_long_in_one_hop.
 2. Rejection completeness: every generated exotic arrow type (float16,
    date64, the time32/time64(ns) widths, tz-aware non-micros
    timestamps, durations, decimal256, dictionaries) raises
@@ -38,10 +39,17 @@ from pyhoglake.types import (
 
 # -- generators -------------------------------------------------------------
 
-#: pa.json_() arrived in pyarrow 19; the project floor is 17. Without it
+#: pa.json_() arrived in pyarrow 19, below the project's floor of 21,
+#: so this guard only matters to an environment built under the floor.
+#: Without it
 #: "json" maps to pa.string() and comes back as "string", so it is not a
 #: round-trip type on that pyarrow and must leave the identity property.
 HAS_JSON = hasattr(pa, "json_")
+
+#: pa.uuid() arrived in pyarrow 18, and only it makes pyarrow stamp the
+#: parquet UUID annotation (measured: 21+). Without it "uuid" maps to
+#: pa.binary(16), which is then the canonical spelling instead.
+HAS_UUID = hasattr(pa, "uuid")
 
 #: Round-trip coltypes: coltype -> arrow -> the SAME coltype. "uint32" is
 #: deliberately absent (it maps to pa.int64(), i.e. "long" on the way
@@ -101,7 +109,7 @@ canonical_arrow = st.one_of(
             pa.timestamp("us"),
             pa.timestamp("ns"),
             pa.timestamp("us", tz="UTC"),
-            pa.binary(16),
+            pa.uuid() if HAS_UUID else pa.binary(16),
         ]
         + ([pa.json_()] if HAS_JSON else [])
     ),
@@ -111,7 +119,12 @@ canonical_arrow = st.one_of(
 )
 
 noncanonical_arrow = st.one_of(
-    st.sampled_from([pa.large_string(), pa.large_binary()]),
+    st.sampled_from(
+        [pa.large_string(), pa.large_binary()]
+        # The pre-annotation uuid spelling: the same 16 bytes with no
+        # UUID logical type, converging on pa.uuid() in one hop.
+        + ([pa.binary(16)] if HAS_UUID else [])
+    ),
     st.sampled_from(["America/New_York", "Asia/Tokyo", "+05:30", "Europe/Berlin"]).map(
         lambda tz: pa.timestamp("us", tz=tz)
     ),
@@ -194,9 +207,6 @@ def test_coltype_to_arrow_to_coltype_is_identity(tp):
 def test_canonical_arrow_is_roundtrip_fixed_point(t):
     coltype, params = arrow_type_to_coltype(t)
     back = coltype_to_arrow(coltype, params)
-    # uuid is the one canonical mapping that is not type-identical
-    # (fixed_size_binary(16) -> "uuid" -> fixed_size_binary(16)); all
-    # others must be exactly equal.
     assert back.equals(t)
 
 
