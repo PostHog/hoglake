@@ -47,6 +47,30 @@ export const hostileTableFixture: Table = {
   file_size_bytes: "0",
 };
 
+export const XSS_COMMENT = "<script>alert('comment')</script><img src=y onerror=alert(4)>";
+export const XSS_PROP_VALUE = "<svg/onload=alert(5)>";
+
+/**
+ * hostileTableFixture plus hostile COMMENTS and PROPERTIES — the V11
+ * fields are user-authored free text with the same no-validation path, so
+ * they get the same render-as-text guarantee.
+ */
+export const hostileCommentedTableFixture: Table = {
+  ...hostileTableFixture,
+  comment: XSS_COMMENT,
+  properties: { "evil.key": XSS_PROP_VALUE },
+  columns: [
+    {
+      field_id: "1",
+      ordinal: 0,
+      name: "c1",
+      type: "long",
+      nullable: true,
+      comment: XSS_COMMENT,
+    },
+  ],
+};
+
 /**
  * Raw wire body for GET .../files carrying int64 values above 2^53, exactly
  * as the live server emits them (bare JSON numbers, not strings). This MUST

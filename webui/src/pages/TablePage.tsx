@@ -108,7 +108,31 @@ function StatsHeader({ table }: { table: Table }) {
             : "—"}
         </dd>
       </div>
+      <div>
+        <dt>comment</dt>
+        {/* A comment can run to 16384 chars, so it lives on its own field
+            with a clamp + expand rather than inline with the short stats.
+            TextContent only — it is user data, never HTML. */}
+        <dd>{table.comment ? <LongComment text={table.comment} /> : "—"}</dd>
+      </div>
     </dl>
+  );
+}
+
+/** Clamp a long comment to one line, with the full text a click away. */
+function LongComment({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const SHORT = 120;
+  if (text.length <= SHORT) {
+    return <span className="table-comment">{text}</span>;
+  }
+  return (
+    <span className="table-comment">
+      {open ? text : `${text.slice(0, SHORT)}…`}{" "}
+      <button type="button" className="ghost" onClick={() => setOpen(!open)}>
+        {open ? "less" : "more"}
+      </button>
+    </span>
   );
 }
 
@@ -211,6 +235,7 @@ function SchemaTab({ table }: { table: Table }) {
             <th>type</th>
             <th>nullable</th>
             <th className="num">ordinal</th>
+            <th>comment</th>
           </tr>
         </thead>
         <tbody>
@@ -228,6 +253,9 @@ function SchemaTab({ table }: { table: Table }) {
                 {c.nullable === false ? "✗" : "✓"}
               </td>
               <td className="num mono">{c.ordinal}</td>
+              <td className="col-comment">
+                {c.comment ? c.comment : <span className="subtle">—</span>}
+              </td>
             </tr>
           ))}
         </tbody>
@@ -250,6 +278,45 @@ function SchemaTab({ table }: { table: Table }) {
             </ul>
           )}
         </div>
+      )}
+      <TableProperties properties={table.properties} />
+    </div>
+  );
+}
+
+/**
+ * The table's user properties, sorted by key for a stable render. Empty
+ * (the common case) reads as one line rather than an empty table. Keys
+ * and values are user data — rendered as text, never HTML.
+ */
+function TableProperties({ properties }: { properties?: Record<string, string> }) {
+  const entries = Object.entries(properties ?? {}).sort(([a], [b]) =>
+    a < b ? -1 : a > b ? 1 : 0,
+  );
+  return (
+    <div className="table-properties">
+      <h3>
+        Properties <span className="subtle">{entries.length}</span>
+      </h3>
+      {entries.length === 0 ? (
+        <p className="empty">No properties.</p>
+      ) : (
+        <table className="data-table">
+          <thead>
+            <tr>
+              <th>key</th>
+              <th>value</th>
+            </tr>
+          </thead>
+          <tbody>
+            {entries.map(([key, value]) => (
+              <tr key={key}>
+                <td className="mono">{key}</td>
+                <td className="mono">{value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </div>
   );

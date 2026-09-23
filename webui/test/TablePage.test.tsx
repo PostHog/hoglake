@@ -2,7 +2,9 @@ import { screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import {
+  commentedTableFixture,
   filesFixture,
+  longCommentTableFixture,
   notFoundError,
   scanFixture,
   sortedFilesFixture,
@@ -72,6 +74,67 @@ describe("TablePage", () => {
     expect(
       await screen.findByText("user_id asc nulls last, ts desc nulls first"),
     ).toBeInTheDocument();
+  });
+
+  it("renders the table comment, column comments, and properties", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(commentedTableFixture);
+      return undefined;
+    });
+    renderApp(route);
+
+    // Table comment in the header.
+    expect(
+      await screen.findByText(
+        "Page-view events, one row per view. Owned by the web analytics team.",
+      ),
+    ).toBeInTheDocument();
+
+    // Column comments in the schema table; the uncommented column gets an
+    // em dash, not a blank cell.
+    expect(screen.getByText("Event time, UTC.")).toBeInTheDocument();
+    expect(screen.getByText("Full URL, query string included.")).toBeInTheDocument();
+
+    // Properties, sorted by key: quality.tier before owner.
+    expect(screen.getByText("Properties")).toBeInTheDocument();
+    expect(screen.getByText("owner")).toBeInTheDocument();
+    expect(screen.getByText("web-analytics")).toBeInTheDocument();
+    expect(screen.getByText("quality.tier")).toBeInTheDocument();
+    expect(screen.getByText("gold")).toBeInTheDocument();
+  });
+
+  it("shows an em dash for a table with no comment, and 'No properties' when none", async () => {
+    mockFetch(happyHandler); // tableFixture has neither comment nor properties
+    renderApp(route);
+
+    // comment field falls back to the em dash. Scoped to the header's
+    // <dt> — the schema table has a "comment" column header too.
+    const commentLabel = await screen.findByText("comment", { selector: "dt" });
+    expect(commentLabel.nextElementSibling).toHaveTextContent("—");
+
+    // Properties read as one line, not an empty table.
+    expect(screen.getByText("No properties.")).toBeInTheDocument();
+  });
+
+  it("clamps a long table comment behind an expand control", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(longCommentTableFixture);
+      return undefined;
+    });
+    renderApp(route);
+
+    // Clamped: not the whole comment, and a "more" control is present.
+    const more = await screen.findByRole("button", { name: "more" });
+    expect(screen.queryByText(/Trailing detail\./)).not.toBeInTheDocument();
+
+    await userEvent.click(more);
+    expect(await screen.findByText(/Trailing detail\./)).toBeInTheDocument();
+
+    // And collapses again.
+    await userEvent.click(screen.getByRole("button", { name: "less" }));
+    expect(screen.queryByText(/Trailing detail\./)).not.toBeInTheDocument();
   });
 
   it("shows data files with a stats marker per state on the Files tab", async () => {

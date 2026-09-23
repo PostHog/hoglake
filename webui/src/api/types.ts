@@ -111,6 +111,11 @@ export interface ColumnDef {
   type: ColumnType;
   type_params?: Record<string, unknown>;
   nullable?: boolean;
+  /**
+   * Versioned column comment (≤ 16384 chars); absent when the column has
+   * none. Rendered as text, never HTML — it is user data.
+   */
+  comment?: string;
   /** Present only for list/struct/map. */
   children?: ColumnDef[];
 }
@@ -211,6 +216,10 @@ export interface Table {
   name: string;
   namespace: string;
   table_uuid: string;
+  /** Versioned table comment (≤ 16384 chars); absent when none. */
+  comment?: string;
+  /** Inert user metadata (≤ 100 keys, string values); absent when none set. */
+  properties?: Record<string, string>;
   columns: Column[];
   record_count: Int64;
   file_count: Int64;

@@ -155,6 +155,37 @@ export const sortedTableFixture: Table = {
 };
 
 /**
+ * tableFixture with the versioned metadata V11 added: a table comment,
+ * per-column comments (one column deliberately without one, for the em
+ * dash), and a couple of user properties. One property value is long and
+ * carries markup — it must render as text, never HTML.
+ */
+export const commentedTableFixture: Table = {
+  ...tableFixture,
+  comment: "Page-view events, one row per view. Owned by the web analytics team.",
+  properties: {
+    owner: "web-analytics",
+    "quality.tier": "gold",
+  },
+  columns: [
+    { field_id: "1", ordinal: 0, name: "ts", type: "timestamptz", nullable: false, comment: "Event time, UTC." },
+    { field_id: "2", ordinal: 1, name: "user_id", type: "long", nullable: false },
+    { field_id: "3", ordinal: 2, name: "url", type: "string", nullable: true, comment: "Full URL, query string included." },
+  ],
+};
+
+/** A table whose comment exceeds the inline clamp, to exercise expand. */
+export const longCommentTableFixture: Table = {
+  ...commentedTableFixture,
+  comment:
+    "Page-view events. " +
+    "This comment is deliberately longer than the one-line clamp so the expand control appears. ".repeat(
+      3,
+    ) +
+    "Trailing detail.",
+};
+
+/**
  * Files of the sorted table, covering the three states the bound cells
  * have to tell apart:
  *
