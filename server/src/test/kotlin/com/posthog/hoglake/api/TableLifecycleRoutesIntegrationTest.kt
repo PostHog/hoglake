@@ -22,9 +22,11 @@ import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import java.util.UUID
 
+@Tag("integration")
 class TableLifecycleRoutesIntegrationTest {
     @Test
     fun `schema guards fence reused names and stale column plans`() =

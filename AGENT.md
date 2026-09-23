@@ -66,6 +66,14 @@ mutations in a row; each was a rule the diff claimed to enforce and
 nothing pinned. A chain/depth test must not seed the intermediate state
 that lets depth 1 pass.
 
+`./gradlew :test -PunitOnly` runs without Docker. It excludes the JUnit
+tag `integration` (plus `*IntegrationTest*` by name), so every class that
+opens a container MUST carry `@Tag("integration")`;
+`IntegrationTagGateTest` reads the test sources and reds when one does
+not. The earlier `junit.jupiter.tags.exclude` system property was not a
+JUnit parameter and filtered nothing (#181), so twenty tagged classes
+without the name ran and failed on any machine without Docker.
+
 Prefer fixup commits over amending and force-pushing.
 
 ## What this is
