@@ -176,6 +176,8 @@ class Column:
     ordinal: int
     nullable: bool = True
     type_params: dict[str, Any] | None = None
+    #: Versioned column comment; None when the column has none.
+    comment: str | None = None
     #: Present only for list/struct/map.
     children: tuple[Column, ...] | None = None
 
@@ -289,6 +291,10 @@ class TableInfo:
     # (a getTable response carries no snapshot_id), so a client can tell
     # "this TableInfo came with a fresh DDL pin" apart from a read.
     snapshot_id: int | None = None
+    #: Versioned table comment; None when the table has none.
+    comment: str | None = None
+    #: Inert user metadata; None when no properties are set.
+    properties: dict[str, str] | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -307,6 +313,8 @@ class TableInfo:
                 if d.get("sort_spec")
                 else None,
                 snapshot_id=d.get("snapshot_id"),
+                comment=d.get("comment"),
+                properties=dict(d["properties"]) if d.get("properties") else None,
             )
 
         return _wire("TableInfo", d, build)
