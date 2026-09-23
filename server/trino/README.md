@@ -48,6 +48,27 @@ The tests cover schema/table discovery, Parquet reads, aggregates, column
 binding, type promotion, and deletion-vector application. The planned Iceberg
 REST facade remains a separate server feature.
 
+**The harness issues no DML.** Every fixture is seeded through Hoglake's REST
+API and every case is a `SHOW`/`DESCRIBE`/`SELECT`, so the connector's write
+path — claimed uploads, `/commit/mutations/prepared`, `/commit/transaction` — is
+not exercised here at all. Two guarded-DML contracts consequently have no
+harness case, and neither is expressible without first giving the harness a
+write path of its own:
+
+- **A deletion-vector target retired since `read_snapshot` is a 409, and the
+  connector re-plans.** Needs the connector to issue a `DELETE` that races a
+  compaction. Even with DML, a successful internal retry is indistinguishable in
+  the query result from one that never raced, so the assertion would have to pin
+  fork behaviour (a retry count, a log line) — which the harness rules out.
+- **An append-only transaction still sends an empty delete group for a table it
+  read.** That is a request *shape*; the harness observes SQL results, not the
+  requests the connector sends, and has no interception point.
+
+Adding connector DML (S3 write credentials in the engine container, upload
+claims, a publication path verified against the pinned fork image) is its own
+change, not a rider on a server-side fix. Until then both contracts are covered
+only by the server suite.
+
 ## Deletion vectors
 
 The connector applies deletion vectors; it does not refuse them. A read of a

@@ -327,7 +327,11 @@ class CatalogService(private val jdbi: Jdbi) {
             SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_ALTERED, tableId)
             SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DELETED_FROM, tableId)
         }
-        val createdUuid = TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid)
+        // Record the replacement edge with the row itself: the lineage a
+        // consumer's offset release depends on must be a fact, not a
+        // convention re-derived later (OffsetRepo.releaseSupersededOffsets).
+        val createdUuid =
+            TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid, replacementTableId)
         // nodeCount, not columns.size: a nested column needs one id per
         // NODE, not one per top-level column. Allocating by size would
         // hand back a range too short and every subtree after the first
@@ -916,11 +920,27 @@ class CatalogService(private val jdbi: Jdbi) {
                         "unknown table_uuid $tableUuid in catalog '$catalog'",
                     )
                 }
-                OffsetRepo.upsert(h, cat.catalogId, consumerId, tableUuid, snapshotId)
-                    ?: throw HoglakeException.OffsetRegression(
-                        "consumer '$consumerId' already committed past snapshot $snapshotId " +
-                            "for table $tableUuid",
-                    )
+                val committed =
+                    OffsetRepo.upsert(h, cat.catalogId, consumerId, tableUuid, snapshotId)
+                        ?: throw HoglakeException.OffsetRegression(
+                            "consumer '$consumerId' already committed past snapshot $snapshotId " +
+                                "for table $tableUuid",
+                        )
+                // Reaching an incarnation at or past the snapshot that
+                // created it is the consumer's own statement that it has
+                // reconciled across an atomic replacement. Its rows on the
+                // incarnations that one replaced would otherwise pin the
+                // consumer_floor expiry forever — nothing else will ever
+                // advance them. Same transaction as the upsert, so a
+                // consumer never observes both rows as durable.
+                //
+                // The BACKWARD walk, from the row just committed: a
+                // primary-key hop per replacement and, on the overwhelming
+                // majority of commits, zero hops. The forward all-consumer
+                // form is the expiry sweep's, and would cost O(this
+                // consumer's offset count) here on every single commit.
+                OffsetRepo.releaseAncestorsOf(h, cat.catalogId, consumerId, tableUuid, snapshotId)
+                committed
             }
         }
 

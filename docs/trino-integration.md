@@ -221,8 +221,12 @@ retires the old incarnation while publishing the new definition, UUID, and files
 at one snapshot. Retained snapshots can still read the old incarnation.
 
 Any recorded target change after the guarded snapshot (including INSERT, rename,
-drop, truncate, replacement, and compaction) rejects publication. Unrelated table
-changes do not conflict. An absent target uses normal creation semantics and must
+drop, truncate, and replacement) rejects publication. Compaction is the one
+exception: it rewrites which files back a table and never which rows are visible
+in it, so it cannot invalidate anything a replacement read, and the incarnation
+being retired has all its files end-snapshotted anyway. Counting it made a
+CREATE OR REPLACE of a continuously compacted table impossible to land, because
+the rejection is durable. Unrelated table changes do not conflict. An absent target uses normal creation semantics and must
 still be absent at publication. A guard overtaken by retention rejects publication.
 Stale identified writers cannot append into the replacement. Replaying a committed
 old INSERT or creation operation returns its original receipt without republishing.
@@ -368,14 +372,31 @@ Existing immutable objects with retained references can still be referenced by
 another commit; registered paths without retained references cannot be revived.
 
 An explicit `POST /v1/catalogs/{catalog}/uploads/schedule-expired?limit=1000` fences
-expired leases and queues abandoned paths. It does not run in a new background job
-and does not enable production cleanup. The existing cleanup drain still checks
-retained references under the commit lock before physical deletion. Renewal,
-expiry and publication share that lock: once expiry wins, a late commit fails even
-after removal-ledger pruning. Abandoned tombstones are retained permanently; later
-explicit sweeps revisit them because an in-flight PUT may finish after an earlier
-DELETE. Selection rotates through bounded batches. Unclaimed historical or foreign
-objects are never inferred to be garbage from their age or a bucket listing.
+expired leases and queues abandoned paths, and returns how many it fenced. It does
+not run in a new background job and does not enable production cleanup. The
+existing cleanup drain still checks retained references under the commit lock
+before physical deletion.
+
+Claim transitions do NOT take that lock. A writer claims one upload per output
+file, so taking the catalog's write-throughput bottleneck once per file bought
+nothing: paths are server-generated random UUIDs and the claim insert is
+idempotent. Renewal, abort and the expiry sweep serialize on the claim ROW
+instead — each re-checks the claim's state in its own `WHERE`, which Postgres
+re-evaluates after any row-lock wait, and publication takes the claim rows
+`FOR UPDATE` inside the commit transaction. The ordering guarantees are
+unchanged: a renewal that commits first beats the sweep, a publication that
+commits first cannot be fenced afterwards, and once expiry wins a late commit
+fails even after removal-ledger pruning. Each fence is its own short transaction,
+so a publication never waits on a whole sweep while holding the commit lock.
+
+Abandoned tombstones are retained permanently, and later explicit sweeps revisit
+them because an in-flight PUT may finish after an earlier DELETE — but a
+tombstone rests for the drained-ledger retention between offers rather than being
+re-offered on every call, so sweep cost does not grow with the catalog's whole
+upload history. A path that any data or deletion-vector file row still references
+is never queued at all. Selection rotates through bounded batches. Unclaimed
+historical or foreign objects are never inferred to be garbage from their age or
+a bucket listing.
 
 This adds one durable row and claim request per output file, occasional owner-wide
 renewals, and permanent fencing metadata. A paused writer exceeding its lease may

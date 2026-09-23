@@ -310,6 +310,11 @@ fun Application.installApiRoutes(
                     )
                 }
 
+                // requireUnchangedTables is unconditional here because the
+                // transaction contract demands it, but it binds only the
+                // DELETE targets (CommitService.checkConflicts): an
+                // append-only transaction keeps the ordinary DDL-only
+                // conflict rule and does not 409 on a concurrent INSERT.
                 post("/commit/transaction") {
                     val req = call.receive<CommitRequestDto>()
                     if (req.idempotencyKey == null || req.readSnapshot == null ||

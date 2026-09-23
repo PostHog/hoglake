@@ -676,28 +676,148 @@ class CommitServiceTest {
         assertThat(result.snapshotId).isEqualTo(2)
     }
 
+    /**
+     * #161 parameterized this over the DELETE-target table and included
+     * 'table_compacted'. Both halves moved: the read-set requirement now
+     * binds the tables a request DELETES from, so the request has to
+     * carry a delete to be guarded at all, and 'table_compacted' is no
+     * longer a conflict for anyone (its own case is below).
+     */
     @ParameterizedTest
     @ValueSource(
         strings = [
             "table_created", "table_inserted_into", "table_deleted_from",
-            "table_compacted", "table_altered", "table_dropped",
+            "table_altered", "table_dropped",
         ],
     )
-    fun `prepared mutation rejects any newer target table change`(kind: String) {
+    fun `prepared mutation rejects any newer delete-target table change`(kind: String) {
         val fx = seed()
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/target", 5))))),
+        )
+        val readSnapshot = 1L
         seedChange(fx.catalogId, kind, fx.tables.getValue("events").first)
         val request =
             CommitRequest(
-                readSnapshot = 0,
+                readSnapshot = readSnapshot,
                 appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new", 2)))),
+                deletes =
+                    listOf(
+                        TableDeletes("ns", "events", listOf(DeleteFileRegistration(1, "s3://b/dv", 2, 100))),
+                    ),
                 idempotencyKey = java.util.UUID.randomUUID(),
                 requireUnchangedTables = true,
             )
         assertThatThrownBy { service.commit("cat", request) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
-        assertThat(dataFiles(fx.catalogId)).isEmpty()
+        assertThat(dataFiles(fx.catalogId).map { it.path }).containsExactly("s3://b/target")
         assertThatThrownBy { service.receipt("cat", request.idempotencyKey!!) }
             .isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    /**
+     * Compaction publishes 'table_compacted' per group — every ~2.6
+     * minutes on one production table — and it rewrites which FILES back
+     * a table, never which rows are visible in it. Treating it as a
+     * read-set conflict (as #161 did) livelocked every mutation whose
+     * read-to-publish window outlived one compaction interval.
+     */
+    @Test
+    fun `a compaction of a delete-target table is not a conflict`() {
+        val fx = seed()
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/target", 5))))),
+        )
+        seedChange(fx.catalogId, "table_compacted", fx.tables.getValue("events").first)
+        val committed =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 1,
+                    deletes =
+                        listOf(
+                            TableDeletes("ns", "events", listOf(DeleteFileRegistration(1, "s3://b/dv", 2, 100))),
+                        ),
+                    idempotencyKey = java.util.UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                ),
+            )
+        assertThat(committed.snapshotId).isEqualTo(3)
+        // The vector is actually live on the target, not merely admitted.
+        assertThat(liveDvs(fx.catalogId))
+            .containsExactly(Triple("s3://b/dv", 1L, committed.snapshotId))
+    }
+
+    /** Live deletion vectors as (path, data_file_id, begin_snapshot). */
+    private fun liveDvs(catalogId: Long): List<Triple<String, Long, Long>> =
+        jdbi.withHandle<List<Triple<String, Long, Long>>, Exception> { h ->
+            h.createQuery(
+                """
+                SELECT path, data_file_id, begin_snapshot FROM hog_delete_file
+                WHERE catalog_id = :catalogId AND end_snapshot IS NULL ORDER BY delete_file_id
+                """,
+            ).bind("catalogId", catalogId)
+                .map { rs, _ -> Triple(rs.getString(1), rs.getLong(2), rs.getLong(3)) }
+                .list()
+        }
+
+    /**
+     * The read-set requirement is per table, not per request: a guarded
+     * commit that only APPENDS to a table keeps the DDL-only rule, so a
+     * concurrent insert into it is not a conflict. Otherwise an
+     * append-only /commit/transaction — which always sets
+     * require_unchanged_tables — would 409 on any concurrent INSERT.
+     */
+    @Test
+    fun `a guarded append-only target does not conflict with a concurrent insert`() {
+        val fx = seed(tableNames = listOf("events", "other"))
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "other", listOf(file("s3://b/target", 5))))),
+        )
+        seedChange(fx.catalogId, "table_inserted_into", fx.tables.getValue("events").first)
+        val committed =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 1,
+                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new", 2)))),
+                    deletes =
+                        listOf(
+                            TableDeletes("ns", "other", listOf(DeleteFileRegistration(1, "s3://b/dv", 2, 100))),
+                        ),
+                    idempotencyKey = java.util.UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                ),
+            )
+        assertThat(committed.snapshotId).isEqualTo(3)
+        // Both halves of the commit are durable: the append landed on
+        // `events`, the vector on `other`.
+        assertThat(dataFiles(fx.catalogId).map { it.path })
+            .containsExactlyInAnyOrder("s3://b/target", "s3://b/new")
+        assertThat(
+            dataFiles(fx.catalogId).single { it.path == "s3://b/new" }.tableId,
+        ).isEqualTo(fx.tables.getValue("events").first)
+        assertThat(liveDvs(fx.catalogId)).containsExactly(Triple("s3://b/dv", 1L, 3L))
+        // ... but a DDL change on that same append-only table still conflicts.
+        seedChange(fx.catalogId, "table_altered", fx.tables.getValue("events").first)
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = 3,
+                    appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/new2", 2)))),
+                    deletes =
+                        listOf(
+                            TableDeletes("ns", "other", listOf(DeleteFileRegistration(1, "s3://b/dv2", 3, 100))),
+                        ),
+                    idempotencyKey = java.util.UUID.randomUUID(),
+                    requireUnchangedTables = true,
+                ),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
     }
 
     @Test
@@ -717,6 +837,128 @@ class CommitServiceTest {
         assertThatThrownBy { service.commit("cat", request.copy(requireUnchangedTables = false)) }
             .isInstanceOf(HoglakeException.Validation::class.java)
     }
+
+    /**
+     * Deletes on A + appends on B: only A carries the read-set
+     * requirement, so an insert into B is not a conflict and an insert
+     * into A is.
+     */
+    @Test
+    fun `a transaction guards its delete target and not its append target`() {
+        val fx = seed(tableNames = listOf("a", "b"))
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "a", listOf(file("s3://b/a-target", 5))))),
+        )
+
+        fun transaction(
+            readSnapshot: Long,
+            suffix: String,
+        ) = CommitRequest(
+            readSnapshot = readSnapshot,
+            appends = listOf(TableAppend("ns", "b", listOf(file("s3://b/b-$suffix", 2)))),
+            deletes = listOf(TableDeletes("ns", "a", listOf(DeleteFileRegistration(1, "s3://b/dv-$suffix", 2, 100)))),
+            idempotencyKey = java.util.UUID.randomUUID(),
+            requireUnchangedTables = true,
+        )
+
+        seedChange(fx.catalogId, "table_inserted_into", fx.tables.getValue("b").first)
+        assertThat(service.commit("cat", transaction(1, "one")).snapshotId).isEqualTo(3)
+
+        seedChange(fx.catalogId, "table_inserted_into", fx.tables.getValue("a").first)
+        assertThatThrownBy { service.commit("cat", transaction(3, "two")) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+    }
+
+    /**
+     * A DV target that another writer (compaction, expiry, a concurrent
+     * DML commit) retired AFTER the read snapshot is a race the writer
+     * wins by re-reading: 409, not the 422 that made the connector give
+     * up on a retryable DELETE. A target already dead AT the read
+     * snapshot is still a malformed request.
+     */
+    @Test
+    fun `a delete target retired since the read snapshot is a conflict not a validation failure`() {
+        val fx = seed()
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/target", 5))))),
+        )
+        val retiredAt = seedChange(fx.catalogId, "table_compacted", fx.tables.getValue("events").first)
+        jdbi.useHandle<Exception> { h ->
+            h.createUpdate(
+                "UPDATE hog_data_file SET end_snapshot = :snapshot " +
+                    "WHERE catalog_id = :catalogId AND data_file_id = 1",
+            ).bind("snapshot", retiredAt).bind("catalogId", fx.catalogId).execute()
+        }
+
+        fun deleteAt(readSnapshot: Long) =
+            CommitRequest(
+                readSnapshot = readSnapshot,
+                deletes = listOf(TableDeletes("ns", "events", listOf(DeleteFileRegistration(1, "s3://b/dv", 2, 100)))),
+            )
+
+        // Live at snapshot 1, retired at 2: retryable.
+        assertThatThrownBy { service.commit("cat", deleteAt(1)) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("retired at snapshot $retiredAt")
+        // Already dead at snapshot 2: the request is simply wrong.
+        assertThatThrownBy { service.commit("cat", deleteAt(retiredAt)) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("no longer live")
+    }
+
+    /**
+     * The rolling-deploy hazard, from the read side: two API replicas, and
+     * the one that wrote a receipt is a version ahead of the one replaying
+     * it. Its stored JSON carries a property this version has never heard
+     * of, and a defaulted one the current serializer no longer emits.
+     * Both must replay to the original snapshot, not 500 inside the commit
+     * tail under the catalog lock.
+     */
+    @Test
+    fun `a receipt written by a newer replica still replays`() {
+        seed()
+        val key = java.util.UUID.randomUUID()
+        val request =
+            CommitRequest(
+                readSnapshot = 0,
+                appends = listOf(TableAppend("ns", "events", listOf(file("s3://b/data/fwd.parquet", 4)))),
+                idempotencyKey = key,
+            )
+        val result = service.commit("cat", request)
+        jdbi.useHandle<Exception> { h ->
+            // Top level: an unknown property AND a known one spelled out
+            // at its default (every receipt written before NON_DEFAULT).
+            // NESTED: an unknown property inside appends[].files[], which
+            // is where a newer replica's per-file field would land and
+            // where a strict decode fails just as hard.
+            h.createUpdate(
+                """
+                UPDATE hog_commit_receipt
+                   SET request = jsonb_set(
+                           request || '{"require_unchanged_tables": false, "future_guard": "v2"}'::jsonb,
+                           '{appends,0,files,0,future_file_field}', '"v2"'::jsonb, true)
+                 WHERE catalog_id = :catalogId AND idempotency_key = :key
+                """,
+            ).bind("catalogId", seedCatalogId()).bind("key", key).execute()
+        }
+        val stored =
+            jdbi.withHandle<String, Exception> { h ->
+                h.createQuery("SELECT request::text FROM hog_commit_receipt WHERE idempotency_key = :key")
+                    .bind("key", key).mapTo(String::class.java).one()
+            }
+        assertThat(stored).contains("future_guard").contains("future_file_field")
+
+        assertThat(CommitService(jdbi).commit("cat", request)).isEqualTo(result)
+        assertThat(dataFiles(seedCatalogId()).map { it.path }).containsExactly("s3://b/data/fwd.parquet")
+    }
+
+    /** The one catalog the seed fixture makes. */
+    private fun seedCatalogId(): Long =
+        jdbi.withHandle<Long, Exception> { h ->
+            h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = 'cat'").mapTo(Long::class.java).one()
+        }
 
     @Test
     fun `blind append succeeds despite concurrent DDL history`() {

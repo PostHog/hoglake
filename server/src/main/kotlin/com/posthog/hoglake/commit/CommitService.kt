@@ -13,7 +13,7 @@ import com.posthog.hoglake.model.validateFooterSize
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
-import com.posthog.hoglake.wireObjectMapper
+import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -64,6 +64,14 @@ import java.util.UUID
  * that snapshot — one indexed lookup. A null readSnapshot is a blind
  * append with no conflict window (only legal when the commit has no
  * deletes).
+ *
+ * requireUnchangedTables adds the read-set rule ON TOP of that, and only
+ * for the tables the request DELETES from: those additionally conflict
+ * with 'table_created' / 'table_inserted_into' / 'table_deleted_from'
+ * since readSnapshot, because a delete is planned against a read of the
+ * target's rows. A table a guarded request only APPENDS to keeps the
+ * DDL-only rule — appends never conflict with appends, inside a
+ * transaction as much as outside one. See [checkConflicts].
  */
 class CommitService(
     private val jdbi: Jdbi,
@@ -238,6 +246,15 @@ class CommitService(
         val spec: LiveSpec?,
     )
 
+    /** The targeted data file's row, as [applyDeletes]'s per-target checks need it. */
+    private data class DeleteTarget(
+        val tableId: Long,
+        val recordCount: Long,
+        val beginSnapshot: Long,
+        /** null = live; otherwise the snapshot that retired the file. */
+        val endSnapshot: Long?,
+    )
+
     private data class ResolvedDeletes(
         val namespace: String,
         val table: String,
@@ -273,7 +290,13 @@ class CommitService(
                     """,
                 ).bind("catalog", catalogId).bind("key", key)
                     .map { rs, _ ->
-                        val stored = wireObjectMapper().readValue<CommitRequest>(rs.getString("request"))
+                        // storedPayloadObjectMapper, NOT the strict API mapper: this
+                        // JSON was written by a replica of this service, which during
+                        // a rolling deploy may be a NEWER one carrying a field this
+                        // version does not know. A strict decode would throw here,
+                        // inside the commit tail under the catalog lock, and turn a
+                        // half-finished deploy into 500s on replay.
+                        val stored = storedPayloadObjectMapper().readValue<CommitRequest>(rs.getString("request"))
                         if (commitFingerprint(stored) != requestJson) {
                             throw HoglakeException.Validation("idempotency_key reused with a different request")
                         }
@@ -431,7 +454,17 @@ class CommitService(
             val names = HashMap<Long, String>()
             resolvedAppends.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
             resolvedDeletes.forEach { names[it.tableId] = "${it.namespace}.${it.table}" }
-            checkConflicts(h, catalogId, readSnapshot, names, req.requireUnchangedTables)
+            // requireUnchangedTables binds the DELETE targets, not every
+            // touched table. A delete is published against a read of the
+            // target's file set, so anything that moved that file set is a
+            // conflict; an APPEND carries no such read, so a table this
+            // commit only appends to keeps the DDL-only rule even inside a
+            // guarded transaction — otherwise an append-only explicit
+            // transaction would 409 on a concurrent INSERT into the same
+            // table, which is the one thing appends have never done.
+            val unchangedTableIds =
+                if (req.requireUnchangedTables) resolvedDeletes.mapTo(HashSet()) { it.tableId } else emptySet()
+            checkConflicts(h, catalogId, readSnapshot, names, unchangedTableIds)
         }
 
         // 5. Allocations, all under the lock via UPDATE..RETURNING. Data
@@ -826,8 +859,7 @@ class CommitService(
                 val target =
                     h.createQuery(
                         """
-                    SELECT table_id, record_count, begin_snapshot,
-                           (end_snapshot IS NULL) AS live
+                    SELECT table_id, record_count, begin_snapshot, end_snapshot
                       FROM hog_data_file
                      WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                     """,
@@ -835,7 +867,12 @@ class CommitService(
                         .bind("catalogId", catalogId)
                         .bind("dataFileId", reg.dataFileId)
                         .map { rs, _ ->
-                            Triple(rs.getLong(1), rs.getLong(2), rs.getLong(3)) to rs.getBoolean(4)
+                            DeleteTarget(
+                                tableId = rs.getLong("table_id"),
+                                recordCount = rs.getLong("record_count"),
+                                beginSnapshot = rs.getLong("begin_snapshot"),
+                                endSnapshot = rs.getObject("end_snapshot") as Long?,
+                            )
                         }
                         .findOne()
                         .orElseThrow {
@@ -843,8 +880,9 @@ class CommitService(
                                 "delete for $qualified targets unknown data_file_id ${reg.dataFileId}",
                             )
                         }
-                val (tableIdRecordsBegin, live) = target
-                val (targetTableId, recordCount, targetBegin) = tableIdRecordsBegin
+                val targetTableId = target.tableId
+                val recordCount = target.recordCount
+                val targetBegin = target.beginSnapshot
                 if (targetBegin == snapshotId && reg.dataFilePath == null) {
                     throw HoglakeException.Validation(
                         "delete for $qualified targets data_file_id ${reg.dataFileId} " +
@@ -863,7 +901,27 @@ class CommitService(
                             "which belongs to another table",
                     )
                 }
-                if (!live) {
+                // Liveness, split by WHEN the file died. A file that was live
+                // at the writer's read snapshot and has since been retired
+                // lost a race — compaction rewriting it, or another DML
+                // commit — and the writer wins it by re-reading: 409,
+                // retryable. This is the common case on a compacted table,
+                // and 422 was making the connector give up on a DELETE that
+                // one retry would have published. A file that was ALREADY
+                // dead at the read snapshot is a malformed request, not a
+                // race: 422, as before.
+                //
+                // Expiry cannot reach this branch: it only removes rows
+                // below the floor, and a readSnapshot below the floor was
+                // already answered 410 by the guard above.
+                target.endSnapshot?.let { end ->
+                    if (end > readSnapshot) {
+                        throw HoglakeException.CommitConflict(
+                            "delete for $qualified targets data_file_id ${reg.dataFileId} " +
+                                "which was retired at snapshot $end, since read snapshot " +
+                                "$readSnapshot",
+                        )
+                    }
                     throw HoglakeException.Validation(
                         "delete for $qualified targets data_file_id ${reg.dataFileId} " +
                             "which is no longer live",
@@ -1194,40 +1252,58 @@ class CommitService(
 
     /**
      * One indexed lookup over the typed change table covers appends and
-     * deletes alike. Legacy writes conflict with DDL; prepared mutations
-     * also protect their target-table read set. 'table_inserted_into' / 'table_deleted_from' changes
-     * conflict at table level only for prepared mutations, which require the
-     * complete target read set to remain unchanged. Legacy writes retain
-     * per-file DV staleness checks in [applyDeletes].
+     * deletes alike.
+     *
+     * Every touched table gets the DDL check ('table_dropped' /
+     * 'table_altered' since readSnapshot). The tables in
+     * [unchangedTableIds] — the DELETE targets of a guarded request, see
+     * CommitRequest.requireUnchangedTables — additionally require that
+     * nothing changed their ROW CONTENT, because the delete was planned
+     * against a read of it: 'table_created', 'table_inserted_into' and
+     * 'table_deleted_from'. Legacy writes pass an empty set and retain
+     * the per-file DV staleness checks in [applyDeletes].
+     *
+     * 'table_compacted' is deliberately NOT in that list, and never was
+     * a correct member of it. Compaction changes which FILES back a
+     * table, never which rows are visible in it, so it cannot invalidate
+     * a read set. Treating it as a conflict livelocked every mutation on
+     * a continuously-compacted table: production publishes a compaction
+     * group every ~2.6 minutes on one table, so any UPDATE or MERGE
+     * whose read-to-publish window exceeded that interval retried into
+     * the next compaction forever. What compaction CAN invalidate is a
+     * specific DV target, and that is caught per file by the liveness
+     * check in [applyDeletes], which stays.
      */
     private fun checkConflicts(
         h: Handle,
         catalogId: Long,
         readSnapshot: Long,
         nameByTableId: Map<Long, String>,
-        requireUnchangedTables: Boolean,
+        unchangedTableIds: Set<Long>,
     ) {
         val conflicted =
             h.createQuery(
                 """
-            SELECT DISTINCT object_id FROM hog_snapshot_change
+            SELECT DISTINCT object_id,
+                   kind IN ('table_dropped', 'table_altered') AS ddl
+              FROM hog_snapshot_change
              WHERE catalog_id = :catalogId
-               AND (kind IN ('table_dropped', 'table_altered') OR
-                    (:requireUnchangedTables AND kind IN
-                        ('table_created', 'table_inserted_into', 'table_deleted_from', 'table_compacted')))
-               AND object_id IN (<tableIds>)
                AND snapshot_id > :readSnapshot
+               AND object_id IN (<tableIds>)
+               AND (kind IN ('table_dropped', 'table_altered') OR
+                    (kind IN ('table_created', 'table_inserted_into', 'table_deleted_from')
+                     AND object_id = ANY(:unchangedTableIds)))
             """,
             )
                 .bind("catalogId", catalogId)
                 .bind("readSnapshot", readSnapshot)
-                .bind("requireUnchangedTables", requireUnchangedTables)
+                .bindArray("unchangedTableIds", Long::class.javaObjectType, unchangedTableIds)
                 .bindList("tableIds", nameByTableId.keys.toList())
-                .mapTo(Long::class.java)
+                .map { rs, _ -> rs.getLong("object_id") to rs.getBoolean("ddl") }
                 .list()
         if (conflicted.isNotEmpty()) {
-            val names = conflicted.mapNotNull(nameByTableId::get).sorted()
-            val change = if (requireUnchangedTables) "table change" else "DDL"
+            val names = conflicted.mapNotNull { nameByTableId[it.first] }.distinct().sorted()
+            val change = if (conflicted.all { it.second }) "DDL" else "table change"
             throw HoglakeException.CommitConflict(
                 "concurrent $change since snapshot $readSnapshot on table(s): " +
                     names.joinToString(", "),

@@ -225,7 +225,9 @@ class App private constructor(
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
         )
-        app.installUploadRoutes(com.posthog.hoglake.service.UploadService(jdbi))
+        app.installUploadRoutes(
+            com.posthog.hoglake.service.UploadService(jdbi, cfg.removalLedgerRetentionSeconds),
+        )
         app.installAlterRoutes(alterService)
         app.installScanRoutes(scanService)
         app.installViewRoutes(viewService)

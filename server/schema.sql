@@ -125,8 +125,21 @@ CREATE TABLE hog_table (
     created_snapshot bigint NOT NULL,
     dropped_snapshot bigint,
     next_field_id bigint NOT NULL DEFAULT 1,
+    -- The replacement edge (V14): the incarnation THIS row replaced, set
+    -- by CatalogService.createTable when it publishes an atomic
+    -- replacement. Recorded rather than derived from
+    -- `dropped_snapshot = created_snapshot`, because that convention is
+    -- nothing the schema enforces and the cost of being wrong about it
+    -- is deleting a consumer's position on a table it still reads
+    -- (OffsetRepo.releaseSupersededOffsets). Deliberately not a FK: the
+    -- referenced row is in this same table and is retired, never deleted,
+    -- and a cascade is exactly the behaviour we do not want.
+    replaced_table_id bigint,
     PRIMARY KEY (catalog_id, table_id),
-    UNIQUE (catalog_id, table_uuid)
+    UNIQUE (catalog_id, table_uuid),
+    -- The edge has no FK, so this is its only structural defence: a
+    -- self-edge would be a 1-cycle for the recursive walk that follows it.
+    CONSTRAINT hog_table_no_self_replacement CHECK (replaced_table_id <> table_id)
 );
 
 -- Versioned mutable bits of a table (name, namespace).
@@ -646,3 +659,11 @@ CREATE TABLE hog_upload (
 );
 CREATE INDEX hog_upload_owner ON hog_upload (catalog_id, owner) WHERE state = 'active';
 CREATE INDEX hog_upload_cleanup ON hog_upload (catalog_id, last_scheduled_at, upload_id) WHERE state <> 'registered';
+
+-- Replacement lineage (V14): the access path for the walk
+-- OffsetRepo.releaseSupersededOffsets runs on every offset commit and
+-- inside the expiry sweep, following `replaced_table_id` forward from a
+-- retired incarnation to the one that replaced it. Partial, because only
+-- a replacement row carries the edge.
+CREATE INDEX hog_table_replacement_lineage
+    ON hog_table (catalog_id, replaced_table_id) WHERE replaced_table_id IS NOT NULL;
