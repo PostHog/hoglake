@@ -691,6 +691,33 @@ button.ghost:hover:not(:disabled) {
   padding-left: 20px;
 }
 
+/* -- table comment + properties (issue #170) ------------------------------- */
+
+/* A table comment is prose in a field that otherwise holds short mono
+   values: left-aligned, wrapped, and capped so a 16k one cannot shove the
+   rest of the header off the row. */
+.table-comment {
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-width: 48rem;
+  display: inline-block;
+}
+.col-comment {
+  max-width: 32rem;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.table-properties {
+  margin-top: 20px;
+}
+.table-properties h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
 /* -- metrics page --------------------------------------------------------- */
 
 .metrics-toolbar {

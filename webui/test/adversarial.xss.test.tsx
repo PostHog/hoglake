@@ -11,8 +11,11 @@ import { describe, expect, it } from "vitest";
 import { catalogsFixture, tablesFixture } from "./fixtures";
 import {
   XSS_AUTHOR,
+  XSS_COMMENT,
   XSS_MESSAGE,
   XSS_NS,
+  XSS_PROP_VALUE,
+  hostileCommentedTableFixture,
   hostileNamespacesFixture,
   hostileSnapshotsFixture,
   hostileTableFixture,
@@ -110,6 +113,23 @@ describe("hostile strings render as text, never markup", () => {
     expect(link.getAttribute("href")).toContain(
       encodeURIComponent("T<script>"),
     );
+    noInjectedMarkup(document.body);
+  });
+
+  it("table comment, column comments and property values render as text", async () => {
+    const tBase = "/v1/catalogs/analytics/namespaces/qens/tables/t1";
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === tBase) return jsonResponse(hostileCommentedTableFixture);
+      return undefined;
+    });
+    renderApp("/catalogs/analytics/namespaces/qens/tables/t1");
+
+    // The header comment, the column comment, and the property value all
+    // appear verbatim as text…
+    expect((await screen.findAllByText(XSS_COMMENT)).length).toBeGreaterThan(0);
+    expect(screen.getByText(XSS_PROP_VALUE)).toBeInTheDocument();
+    // …and none of it parsed into an element.
     noInjectedMarkup(document.body);
   });
 });
