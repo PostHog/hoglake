@@ -11,6 +11,7 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     HoglakeClient,
+    MalformedResponseError,
     NotFoundError,
     OffsetRegressionError,
     ReconciliationRequiredError,
@@ -731,6 +732,83 @@ def test_expire_and_cleanup(client, httpx_mock):
     )
     res = cat.cleanup()
     assert res.removed == 1
+
+
+def test_verify(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/maintenance/verify",
+        json={
+            "catalog": "cat",
+            "status": "fail",
+            "checks": [
+                {
+                    "check": "row_id_tiling",
+                    "status": "pass",
+                    "violations": 0,
+                    "samples": [],
+                    "description": "Invariant 2: row-id ranges tile.",
+                },
+                {
+                    "check": "removal_queue",
+                    "status": "fail",
+                    "violations": 25,
+                    "samples": [
+                        "removal_id=1 path='s3://b/f.parquet' queued but still live-referenced"
+                    ],
+                    "description": "Invariant 4: the queue is never authorization.",
+                },
+            ],
+        },
+    )
+    report = cat.verify()
+    assert report.catalog == "cat"
+    assert report.status == "fail"
+    assert report.passed is False
+    assert [c.check for c in report.checks] == ["row_id_tiling", "removal_queue"]
+    # The TRUE count survives the sample cap: 25 violations, one sample.
+    failed = report.failures
+    assert [c.check for c in failed] == ["removal_queue"]
+    assert failed[0].violations == 25
+    assert failed[0].samples == (
+        "removal_id=1 path='s3://b/f.parquet' queued but still live-referenced",
+    )
+    assert failed[0].description.startswith("Invariant 4")
+    assert report.checks[0].passed is True
+
+
+def test_verify_tolerates_a_server_without_check_descriptions(client, httpx_mock):
+    # `description` is additive, so a rolling deploy can answer from a
+    # server that predates it. That is a missing OPTION, not a malformed
+    # response — the strict from_wire guard must not reject it.
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/maintenance/verify",
+        json={
+            "catalog": "cat",
+            "status": "pass",
+            "checks": [
+                {"check": "orphans", "status": "pass", "violations": 0, "samples": []}
+            ],
+        },
+    )
+    report = cat.verify()
+    assert report.passed is True
+    assert report.failures == ()
+    assert report.checks[0].description == ""
+
+
+def test_verify_rejects_a_malformed_report(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/maintenance/verify",
+        json={"catalog": "cat", "status": "pass", "checks": [{"check": "orphans"}]},
+    )
+    with pytest.raises(MalformedResponseError):
+        cat.verify()
 
 
 # -- consumer offsets -------------------------------------------------------

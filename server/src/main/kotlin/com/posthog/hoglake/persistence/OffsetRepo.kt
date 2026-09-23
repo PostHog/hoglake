@@ -192,8 +192,16 @@ object OffsetRepo {
         catalogId: Long,
     ): Int = handle.createUpdate(RELEASE_ALL_CONSUMERS).bind("catalogId", catalogId).execute()
 
-    /** Exposed for the V14 migration test, which EXPLAINs the real walk. */
-    internal val RELEASE_ALL_CONSUMERS: String =
+    /**
+     * The forward lineage walk, as a WITH RECURSIVE prelude. Split out
+     * of [RELEASE_ALL_CONSUMERS] so VerifyService's `offset_release`
+     * check can ASK the same question this DELETE answers instead of
+     * restating it: a test that restates the predicate it claims to
+     * mirror asserts only that the file compiles (AGENT.md). The
+     * released set and the flagged set are the same set, by
+     * construction.
+     */
+    internal const val SUPERSEDED_LINEAGE_CTE: String =
         """
         WITH RECURSIVE lineage AS (
             -- Seed: every offset row that names a DROPPED incarnation. A
@@ -220,9 +228,17 @@ object OffsetRepo {
              -- have to decrease and so cannot survive one hop.
              AND n.created_snapshot > l.created_snapshot
         )
-        DELETE FROM hog_consumer_offset o
-        WHERE o.catalog_id = :catalogId
-          AND EXISTS (
+        """
+
+    /**
+     * "This offset row has a reconciled successor, so it is dead" —
+     * the EXISTS half of [RELEASE_ALL_CONSUMERS], applied to the
+     * correlated alias `o`. Requires [SUPERSEDED_LINEAGE_CTE] in front
+     * of the statement it appears in.
+     */
+    internal const val SUPERSEDED_PREDICATE: String =
+        """
+          EXISTS (
               SELECT 1
               FROM lineage l
               JOIN hog_consumer_offset reconciled
@@ -234,6 +250,15 @@ object OffsetRepo {
                 AND l.table_uuid <> o.table_uuid
                 AND reconciled.committed_snapshot >= l.created_snapshot
           )
+        """
+
+    /** Exposed for the V14 migration test, which EXPLAINs the real walk. */
+    internal val RELEASE_ALL_CONSUMERS: String =
+        """
+        $SUPERSEDED_LINEAGE_CTE
+        DELETE FROM hog_consumer_offset o
+        WHERE o.catalog_id = :catalogId
+          AND $SUPERSEDED_PREDICATE
         """
 
     fun find(

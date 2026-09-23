@@ -21,6 +21,7 @@ import type {
   SnapshotPage,
   Table,
   TableSummary,
+  VerifyReport,
 } from "./types";
 import { parseInt64Json } from "./int64";
 
@@ -254,6 +255,17 @@ export function listPartitionStats(
 }
 
 // -- maintenance --------------------------------------------------------------
+
+/**
+ * Run the catalog's invariant scan and return the report. A POST with no
+ * body: the scan takes no batch (it is bounded by the checks themselves)
+ * and is read-only on the server, so re-running it is always safe.
+ */
+export function runVerify(catalog: string): Promise<VerifyReport> {
+  return request(buildUrl(`/catalogs/${seg(catalog)}/maintenance/verify`), {
+    method: "POST",
+  });
+}
 
 export function getMaintenanceStatus(
   catalog: string,

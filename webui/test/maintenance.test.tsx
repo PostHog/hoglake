@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup as cleanupRender, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
@@ -44,6 +44,69 @@ describe("maintenance outcome and history", () => {
     render(<RunOutcomeBadge run={run} />);
     expect(screen.getByText("issues")).toHaveClass("stats-failed");
     expect(screen.queryByText("ok")).not.toBeInTheDocument();
+  });
+
+  it("never calls an expiry sweep quiet when it released consumer offsets", () => {
+    // A retention-disabled catalog's sweep expires nothing; releasing a
+    // superseded offset is the only work it can do, and the row would
+    // otherwise be hidden by the quiet filter and rendered with no
+    // trace of what it did.
+    const released = {
+      ...expiry,
+      result: {
+        ...expiry.result!,
+        snapshots_expired: "0",
+        data_files_queued: "0",
+        delete_files_queued: "0",
+        floored_by_consumer: undefined,
+        offsets_released: "1",
+      },
+    } as MaintenanceRun;
+    expect(isQuietRun(released)).toBe(false);
+    render(<RunSummary run={released} />);
+    expect(screen.getByText(/released 1 superseded offsets/)).toBeInTheDocument();
+
+    cleanupRender();
+    const idle = {
+      ...released,
+      result: { ...released.result!, offsets_released: "0" },
+    } as MaintenanceRun;
+    expect(isQuietRun(idle)).toBe(true);
+  });
+
+  it("summarises a verify ledger row by its failing checks and their counts", () => {
+    // The runs table's outcome column: a passing report is a badge and
+    // nothing else, a failing one names WHICH checks and how many
+    // violations each — the summary an operator scans a ledger page for.
+    const { container } = render(<RunSummary run={verify} />);
+    expect(screen.getByText("ok")).toHaveClass("stats-provided");
+    expect(container.textContent).not.toMatch(/row_id_tiling/);
+
+    cleanupRender();
+    render(
+      <RunSummary
+        run={
+          {
+            ...verify,
+            result: {
+              ...verify.result!,
+              status: "fail",
+              checks: [
+                { check: "row_id_tiling", status: "pass", violations: "0", samples: [] },
+                {
+                  check: "removal_queue",
+                  status: "fail",
+                  violations: "25",
+                  samples: ["removal_id=7 ..."],
+                },
+              ],
+            },
+          } as MaintenanceRun
+        }
+      />,
+    );
+    expect(screen.getByText("failed")).toHaveClass("stats-failed");
+    expect(screen.getByText("removal_queue(25)")).toBeInTheDocument();
   });
 
   it("renders no skip badge for a pre-upgrade compaction row with no invalid_data", () => {
@@ -126,9 +189,13 @@ describe("maintenance outcome and history", () => {
     });
 
     it("distinguishes a task with no loop from a server that did not answer", () => {
-      // null = verify, which has no loop at all. undefined = an older
-      // server. Rendering the second as the first would put a claim on
-      // screen that the response never made.
+      // null = a task with no loop at all. No task is in that position
+      // any more — verify gained one with HOGLAKE_VERIFY_INTERVAL_MS —
+      // so null now only reaches this page from an older server that
+      // still had one. undefined = an older server still, which does
+      // not report the field. Rendering the second as the first would
+      // put a claim on screen that the response never made, which is
+      // why both branches stay.
       expect(loopCadence(null)).toBe("manual only");
       expect(loopCadence(undefined)).toBeNull();
     });

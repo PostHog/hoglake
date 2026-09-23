@@ -442,6 +442,16 @@ export interface ExpiryResult {
   delete_files_queued: Int64;
   new_earliest_snapshot_id: Int64;
   floored_by_consumer?: string;
+  /**
+   * Superseded consumer offsets the sweep deleted — the only work a
+   * retention-disabled sweep can do.
+   *
+   * OPTIONAL although the server fills it in on read, for the same
+   * reason invalid_data is: a rolling deploy can serve this page from
+   * a build that predates the normalization. Guard with `positive()`,
+   * which is undefined-safe.
+   */
+  offsets_released?: Int64;
 }
 
 export interface CleanupResult {
@@ -503,6 +513,16 @@ export interface VerifyCheck {
   status: "pass" | "fail";
   violations: Int64;
   samples: string[];
+  /**
+   * The invariant this check enforces, one paragraph, from the server.
+   *
+   * OPTIONAL, and the spec says so too: the maintenance run ledger
+   * stores verify results WITHOUT descriptions (they are constants —
+   * paying for them per row forever), and a report served by an older
+   * build carries none either. Prose, never an identifier: switch on
+   * `check`.
+   */
+  description?: string;
 }
 
 export interface VerifyReport {
@@ -586,8 +606,11 @@ interface MaintenanceTaskStatusBase {
   last_run: MaintenanceRun | null;
   /**
    * Always present on a server that reports it; null = the task has no
-   * loop (verify). Absent means an OLDER server, which is a different
-   * claim from "no loop runs" and must not render as one.
+   * loop at all. No task is in that position any more — verify gained
+   * one with HOGLAKE_VERIFY_INTERVAL_MS — so null now means an older
+   * server that had a loop-less task. Absent means an OLDER server
+   * still, which is a different claim from "no loop runs" and must not
+   * render as one.
    */
   loop?: LoopObservation | null;
 }

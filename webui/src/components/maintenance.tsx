@@ -155,9 +155,15 @@ export function isQuietRun(run: MaintenanceRun): boolean {
       const r = run.result;
       if (!r) return false;
       return (
-        ![r.snapshots_expired, r.data_files_queued, r.delete_files_queued].some(
-          positive,
-        ) && !r.floored_by_consumer
+        ![
+          r.snapshots_expired,
+          r.data_files_queued,
+          r.delete_files_queued,
+          // A sweep that deleted consumer positions is never quiet,
+          // even when it expired nothing: on a retention-disabled
+          // catalog that is the only work it can report.
+          r.offsets_released,
+        ].some(positive) && !r.floored_by_consumer
       );
     }
     case "cleanup": {
@@ -242,6 +248,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           expired {formatCount(r.snapshots_expired)} snapshots, queued{" "}
           {formatCount(r.data_files_queued)} files, floor{" "}
           <span className="mono">{r.new_earliest_snapshot_id}</span>
+          {positive(r.offsets_released) && (
+            <span className="badge">
+              released {formatCount(r.offsets_released)} superseded offsets
+            </span>
+          )}
           {r.floored_by_consumer && (
             <span className="badge badge-warn">
               floored by {r.floored_by_consumer}

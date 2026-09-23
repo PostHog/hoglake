@@ -67,7 +67,34 @@ class ExpiryService(private val jdbi: Jdbi) {
     /** The run ledger; records after the sweep resolves, never inside it. */
     private val runStore = MaintenanceRunStore(jdbi)
 
-    private companion object {
+    internal companion object {
+        /**
+         * WHICH OFFSETS CAN FLOOR EXPIRY — the source clause of the
+         * consumer-floor query, shared verbatim with
+         * `VerifyService`'s `expiry_floor` check.
+         *
+         * The join to `hog_table` is the load-bearing part: an offset
+         * counts only while its table identity still exists (any
+         * incarnation, dropped included — offsets survive drops by
+         * design), because an offset naming a uuid the catalog no longer
+         * has cannot be advanced by anyone and must not pin retention
+         * forever. The check asserts the invariant this query enforces,
+         * so it asks THIS clause rather than a restatement of it: a copy
+         * that lost the join would let the check pass on exactly the
+         * rows the sweep ignores (AGENT.md — a parity test that
+         * restates its subject asserts only that the file compiles).
+         *
+         * Binds `:catalogId`. No interpolated values (invariant 9
+         * intact).
+         */
+        internal const val FLOOR_CANDIDATE_OFFSETS: String =
+            """
+            FROM hog_consumer_offset o
+            JOIN hog_table t
+              ON t.catalog_id = o.catalog_id AND t.table_uuid = o.table_uuid
+            WHERE o.catalog_id = :catalogId
+            """
+
         /**
          * The end-snapshotted-but-never-deleted versioned tables (DDL
          * churn grows them without bound); sweep step 5 deletes their
@@ -134,9 +161,14 @@ class ExpiryService(private val jdbi: Jdbi) {
             }
         }
         Metrics.snapshotsExpired(catalog, result.snapshotsExpired)
+        // A sweep that DELETED consumer positions did work, even when it
+        // expired nothing — on a retention-null catalog that is the only
+        // work it can do, and logging it as "nothing to do" is how the
+        // stranded-offset release stayed invisible for as long as it did.
         val zeroWork =
             result.snapshotsExpired == 0L && result.dataFilesQueued == 0L &&
-                result.deleteFilesQueued == 0L && result.flooredByConsumer == null
+                result.deleteFilesQueued == 0L && result.flooredByConsumer == null &&
+                result.offsetsReleased == 0L
         if (zeroWork) {
             log.debug { "expiry sweep for catalog '$catalog': nothing to do" }
         } else {
@@ -149,7 +181,8 @@ class ExpiryService(private val jdbi: Jdbi) {
                     "snapshots_expired=${result.snapshotsExpired} " +
                         "data_files_queued=${result.dataFilesQueued} " +
                         "delete_files_queued=${result.deleteFilesQueued} " +
-                        "new_earliest=${result.newEarliestSnapshotId}" +
+                        "new_earliest=${result.newEarliestSnapshotId} " +
+                        "offsets_released=${result.offsetsReleased}" +
                         (result.flooredByConsumer?.let { " floored_by_consumer=$it" } ?: ""),
             )
         }
@@ -161,9 +194,39 @@ class ExpiryService(private val jdbi: Jdbi) {
         cat: CatalogInfo,
         batchSize: Int,
     ): ExpiryResult {
+        // FIRST, and deliberately ABOVE the retention check below.
+        //
+        // An offset left on an incarnation that atomic replacement
+        // retired can never be advanced by anyone (see
+        // OffsetRepo.releaseSupersededOffsets), so it is dead state
+        // whatever the catalog's retention setting is: GET /consumers
+        // shows a position the consumer will never read again, and
+        // /maintenance/verify's offset_release check flags it. It used
+        // to sit after the retention early-return, which meant a
+        // retention-NULL catalog — expiry configured off, which several
+        // production catalogs are — could never release anything: the
+        // rows were stranded with no code path left that would ever
+        // clear them, and the check would have fired forever with no
+        // remedy an operator could apply. The commit path's cheap
+        // backward walk still handles the common case; this forward form
+        // is the catch-all for rows stranded before that rule existed.
+        //
+        // The per-catalog commit lock is already held (runSweep takes it
+        // before calling here), so this runs under the same
+        // serialization as every other write in the sweep.
+        //
+        // Idempotent, but not free: it joins every offset in the catalog
+        // to hog_table. That is affordable because a sweep is once per
+        // interval and a commit is not, which is exactly why the commit
+        // path uses the cheap backward form instead.
+        // It is NOT gated on consumerFloor either: these rows are dead
+        // whether or not they would floor anything, and GET /consumers
+        // must not keep showing a position the consumer will never read.
+        val offsetsReleased = OffsetRepo.releaseSupersededOffsets(h, cat.catalogId).toLong()
+
         val retention =
             cat.snapshotRetentionSeconds
-                ?: return ExpiryResult(0, 0, 0, cat.earliestSnapshotId, null)
+                ?: return ExpiryResult(0, 0, 0, cat.earliestSnapshotId, null, offsetsReleased)
 
         // Oldest snapshot still inside the retention window; everything
         // below it is expirable time-wise.
@@ -182,38 +245,18 @@ class ExpiryService(private val jdbi: Jdbi) {
                 .mapTo(Long::class.javaObjectType)
                 .one()
 
-        // Release before measuring. An offset left on an incarnation that
-        // atomic replacement retired can never be advanced by anyone (see
-        // OffsetRepo.releaseSupersededOffsets), so on a consumer_floor
-        // catalog it is an expiry floor nothing can lift. commitOffset
-        // releases these as they are superseded, by the cheap backward
-        // walk; running the FORWARD form here clears the ones stranded by
-        // replicas that predate that, and makes this sweep's floor honest
-        // instead of merely filtered — the row is GONE, so a later sweep
-        // cannot rediscover it. Idempotent, but not free: this is the one
-        // remaining caller of the forward seed, which joins every offset
-        // in the catalog to hog_table, and it runs under the commit lock.
-        // It is here rather than on the commit path precisely because a
-        // sweep is once per interval and a commit is not. It is NOT gated
-        // on consumerFloor — those rows are dead whether or not they
-        // would floor anything, and GET /consumers should not show them —
-        // but it IS gated on retention being configured, since sweep()
-        // returns above when snapshotRetentionSeconds is null.
-        OffsetRepo.releaseSupersededOffsets(h, cat.catalogId)
-
-        // The join to hog_table scopes the floor to offsets whose table
-        // identity still exists (any incarnation, dropped included —
-        // offsets survive drops by design). An offset whose table row is
-        // gone entirely (expired away) must not pin retention forever.
+        // [FLOOR_CANDIDATE_OFFSETS] scopes the floor to offsets whose
+        // table identity still exists (any incarnation, dropped included
+        // — offsets survive drops by design). An offset whose table row
+        // is gone entirely (expired away) must not pin retention
+        // forever. VerifyService's expiry_floor check asks the SAME
+        // fragment rather than a copy of it.
         val minOffset: Pair<String, Long>? =
             if (cat.consumerFloor) {
                 h.createQuery(
                     """
                 SELECT o.consumer_id, o.committed_snapshot
-                FROM hog_consumer_offset o
-                JOIN hog_table t
-                  ON t.catalog_id = o.catalog_id AND t.table_uuid = o.table_uuid
-                WHERE o.catalog_id = :catalogId
+                $FLOOR_CANDIDATE_OFFSETS
                 ORDER BY o.committed_snapshot, o.consumer_id
                 LIMIT 1
                 """,
@@ -240,7 +283,7 @@ class ExpiryService(private val jdbi: Jdbi) {
         // NOTE: no logging in here — this runs inside the sweep transaction
         // under the catalog commit lock; runOnce warns AFTER commit.
         if (newEarliest <= cat.earliestSnapshotId) {
-            return ExpiryResult(0, 0, 0, cat.earliestSnapshotId, flooredBy)
+            return ExpiryResult(0, 0, 0, cat.earliestSnapshotId, flooredBy, offsetsReleased)
         }
 
         // 1) Delete-vector rows first: superseded DVs (end_snapshot in
@@ -351,6 +394,7 @@ class ExpiryService(private val jdbi: Jdbi) {
             deleteFilesQueued = deleteFilesQueued.toLong(),
             newEarliestSnapshotId = newEarliest,
             flooredByConsumer = flooredBy,
+            offsetsReleased = offsetsReleased,
         )
     }
 

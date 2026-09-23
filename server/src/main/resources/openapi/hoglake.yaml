@@ -620,15 +620,113 @@ paths:
     post:
       operationId: runVerify
       summary: >
-        Metadata-only invariant scan, on demand: the QE suite's global
+        Metadata-only invariant scan, on demand: the catalog's global
         invariants promoted to a production endpoint. Read-only (one
         REPEATABLE READ MVCC snapshot, no catalog lock — never blocks
-        writers). Checks row-id tiling (no positional overlap;
-        compaction outputs with explicit_row_ids are exempt by design),
-        deletion-vector uniqueness/monotonicity/bounds, orphaned live
-        child rows on dropped tables, still-referenced removal-queue
-        entries, true snapshot density (count(*) equals
-        head - earliest + 1), and next_row_id allocator consistency.
+        writers). The same eleven checks the background verify sweep
+        runs — that sweep is OFF by default
+        (HOGLAKE_VERIFY_INTERVAL_MS=0, turned on per workload, like
+        compaction), so on a default deployment this endpoint is the
+        only thing that runs them. Recorded in the maintenance run
+        ledger either way.
+      description: |
+        Eleven checks run in one read-only snapshot. Each also carries
+        its own `description` in the response, so a report is readable
+        without this document. The summaries below are ABRIDGED: the
+        response is the authority on what a check enforces, and nothing
+        keeps these two texts byte-identical — only the check NAMES are
+        contract, and those are pinned against the server by
+        `VerifySpecParityTest`.
+
+        **row_id_tiling** — Invariant 2: row-id ranges are assigned
+        server-side at commit, contiguous per file, tile [0, total) per
+        table, and are never reused (the lineage guarantee). Every
+        positional file row of a table, live and historical alike, must
+        be a non-overlapping interval with a non-negative start; gaps
+        are legal (expiry deletes rows no retained snapshot can reach),
+        overlap never is. Compaction outputs are exempt: they carry
+        their inputs' row ids as data in `_hog_row_id` under reserved
+        field id 2147483646, so their `row_id_start` is only
+        min(input ids).
+
+        **delete_vectors** — Invariant 3: one live deletion vector per
+        data file, supersessions only grow (`delete_count` monotone
+        along `begin_snapshot`), and no vector claims more deletes than
+        its data file has rows.
+
+        **orphans** — Dropping a table end-snapshots its data files,
+        columns and versioned name rows, so a live `hog_data_file`,
+        `hog_column` or `hog_table_version` row on a table carrying a
+        `dropped_snapshot` is a write that outlived its parent.
+
+        **removal_queue** — Invariant 4: physical deletion is never
+        authorized by the queue. An undrained `hog_file_removal` row
+        whose path a file row still claims is cleanup's
+        `still_referenced` alert condition, observed at rest.
+
+        **snapshot_density** — Invariant 1: snapshot ids are dense per
+        catalog, so the retained set is exactly
+        [earliest_snapshot_id, head] — `count(*)` equals
+        head - earliest + 1, min and max on the two ends.
+
+        **next_row_id** — Invariant 2's allocator half:
+        `hog_table_stats.next_row_id` is at or past every positional
+        file's range end, because the allocator can never have handed
+        out a range it does not remember.
+
+        **expiry_floor** — Invariant 5: expiry never passes head or
+        (when `consumer_floor` is set) the min consumer offset, and the
+        sweep's fifth step deletes versioned DDL rows below the floor.
+        At rest: `earliest_snapshot_id <= head`; with `consumer_floor`
+        on, `earliest_snapshot_id` is at or below every
+        `committed_snapshot` whose table row still exists (the same
+        query the sweep floors on, superseded offsets excluded because
+        the sweep releases them first); and no versioned row with
+        `end_snapshot <= earliest_snapshot_id` survives in
+        `hog_data_file`, `hog_delete_file`, `hog_table_version`,
+        `hog_column`, `hog_partition_spec`, `hog_sort_spec` or
+        `hog_view` — there is no lag window, since the sweep deletes
+        them in the transaction that advances the floor.
+
+        **visibility_bounds** — Invariant 6: a row is visible at S iff
+        `begin_snapshot <= S AND (end_snapshot IS NULL OR S <
+        end_snapshot)`. Every versioned row must satisfy
+        `begin_snapshot <= head`, `end_snapshot IS NULL OR end_snapshot
+        > begin_snapshot`, and `end_snapshot <= head`; `hog_table`,
+        the identity row, must satisfy `created_snapshot <= head` and
+        `created_snapshot <= dropped_snapshot` when dropped.
+
+        **offset_release** — Whatever mints a new identity releases the
+        old one's consumers. Replacement lineage is recorded in
+        `hog_table.replaced_table_id` and walked forward; a consumer's
+        row on a retired incarnation is released once that same
+        consumer holds an offset at or past a descendant's
+        `created_snapshot`. A row meeting that condition and still
+        present was never released, can never be advanced, and pins the
+        expiry floor forever.
+
+        **staging_tickets** — Compaction pre-registers its output path
+        as an undrained `hog_file_removal` row with reason
+        `compaction_staging`, settled `registered` by the group commit
+        that makes the path live. Flagged: a row settled `registered`
+        whose path the catalog has never heard of; an undrained
+        `compaction_staging` ticket with no file row older than the
+        service's staleness bound (6h by default — an OPERATIONAL
+        judgement rather than a derivation: nothing bounds a rewrite in
+        time, so the bound is set to clear the window in which the
+        ticket is still somebody's job, comfortably above the cleanup
+        drain's cadence); and a ticket drained `absent` whose path IS a
+        file row.
+
+        **upload_claims** — An upload claim is durable ownership of a
+        path before the PUT, settled `registered` inside the commit
+        that registers the path. Flagged: a `registered` claim with an
+        undrained `trino_upload` removal row for its path (a fence
+        raced a registration; `snapshot_expiry` rows are excluded as
+        the normal lifecycle); an `active` claim whose path is a file
+        row (registered without settling); an `abandoned` claim whose
+        path is a file row (fenced a live path).
+
         NOT covered: the field-id contract for inline-stats files
         (needs S3 footer reads; out of scope for a metadata-only scan).
       parameters:
@@ -3077,6 +3175,20 @@ components:
         floored_by_consumer:
           type: string
           description: Consumer id pinning the floor, when the sweep was capped.
+        offsets_released:
+          type: integer
+          format: int64
+          description: >
+            Consumer offsets the sweep DELETED because atomic
+            replacement had superseded them: rows nothing could ever
+            advance, which on a `consumer_floor` catalog would pin the
+            retention floor forever. Released before the floor is
+            measured, and released even when retention is off, so this
+            is the only work a retention-disabled sweep can report.
+            Not required: a run recorded before the counter existed has
+            no such field, and the ledger replays rows verbatim (the
+            read path fills it with 0, which is what a run that
+            predates the counter did).
 
     CleanupResult:
       type: object
@@ -3101,9 +3213,14 @@ components:
       properties:
         check:
           type: string
+          enum: [row_id_tiling, delete_vectors, orphans, removal_queue,
+                 snapshot_density, next_row_id, expiry_floor, visibility_bounds,
+                 offset_release, staging_tickets, upload_claims]
           description: >
-            One of row_id_tiling, delete_vectors, orphans,
-            removal_queue, snapshot_density, next_row_id.
+            The check's stable id, and the order a report lists them
+            in. An enum rather than prose so a generated client gets
+            the vocabulary and so the server can be pinned against it
+            (VerifySpecParityTest runs a real report and compares).
         status:
           type: string
           enum: [pass, fail]
@@ -3115,6 +3232,19 @@ components:
           type: array
           description: Human-readable violation details, capped at 20.
           items: { type: string }
+        description:
+          type: string
+          description: >
+            The invariant this check enforces, one paragraph, so a
+            report is readable without the spec. Prose, not an
+            identifier — never parse it; switch on `check`.
+            OPTIONAL, and absent in exactly two places, both in the
+            maintenance run ledger rather than here: this schema also
+            describes a `verify` run's stored `result`, which is
+            recorded WITHOUT descriptions (they are constants, and a
+            ledger row would pay for them per row forever) and which for
+            older rows predates the field entirely. A live response to
+            this endpoint always carries it.
 
     VerifyReport:
       type: object
@@ -3350,11 +3480,11 @@ components:
           description: >
             Whether every sweep of this task records a run, which is how
             a reader must interpret SILENCE here. True (expiry, cleanup,
-            compaction): no runs means no loop is running the task.
-            False (hydrator): its sweep is instance-wide and records only
-            for the catalogs it claimed files for, so no runs means no
-            work arrived for this catalog and says nothing about whether
-            the loop is alive.
+            compaction, verify): no runs means no loop is running the
+            task. False (hydrator): its sweep is instance-wide and
+            records only for the catalogs it claimed files for, so no
+            runs means no work arrived for this catalog and says nothing
+            about whether the loop is alive.
 
     MaintenanceTaskStatus:
       type: object
@@ -3366,18 +3496,22 @@ components:
           format: int64
           description: >
             The RESPONDING PROCESS's configured cadence (0 = the loop is
-            off in this process; manual triggers still work). Absent for
-            verify, which has no loop. A deployment may run a task's
-            loop in a pod other than the one serving the API, so this
-            must not be read as "the task is not running" — use `loop`.
+            off in this process; manual triggers still work — which is
+            how the API workload runs verify). Absent only for a task
+            with no loop at all, of which there are none today. A
+            deployment may run a task's loop in a pod other than the one
+            serving the API, so this must not be read as "the task is
+            not running" — use `loop`.
         loop:
           oneOf:
             - { $ref: "#/components/schemas/LoopObservation" }
             - { type: object, nullable: true, enum: [null] }
           description: >
-            Always included; null when the task has no loop at all
-            (verify). A MISSING key means an older server that does not
-            report it, which is not the same claim.
+            Always included; null when the task has no loop at all — no
+            task is in that position today, so null now means an older
+            server that had one. A MISSING key means an older server
+            that does not report the field at all, which is not the same
+            claim.
         last_run:
           oneOf:
             - { $ref: "#/components/schemas/MaintenanceRun" }

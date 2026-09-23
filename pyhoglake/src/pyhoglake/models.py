@@ -78,6 +78,10 @@ class ExpiryResult:
     delete_files_queued: int
     new_earliest_snapshot_id: int
     floored_by_consumer: str | None = None
+    #: Superseded consumer offsets the sweep deleted — the only work a
+    #: retention-disabled sweep can do. Defaulted: a run recorded before
+    #: the counter existed replays without it.
+    offsets_released: int = 0
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> ExpiryResult:
@@ -93,6 +97,76 @@ class CleanupResult:
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> CleanupResult:
         return _wire("CleanupResult", d, lambda d: cls(**_pick(cls, d)))
+
+
+@dataclass(frozen=True)
+class VerifyCheck:
+    """One invariant check inside a verify report.
+
+    ``violations`` is the TRUE count; ``samples`` is capped detail (20
+    per check on the server), so a badly broken catalog never produces
+    an unbounded response. ``description`` is the invariant this check
+    enforces, in prose — display it, never parse it; switch on
+    ``check``, which is a stable id.
+    """
+
+    check: str
+    status: str
+    violations: int
+    samples: tuple[str, ...] = ()
+    description: str = ""
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "pass"
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> VerifyCheck:
+        return _wire(
+            "VerifyCheck",
+            d,
+            lambda d: cls(
+                check=d["check"],
+                status=d["status"],
+                violations=d["violations"],
+                samples=tuple(d.get("samples") or ()),
+                # Additive field (server >= 1.2.1): an older server
+                # sends no description, and that is not a malformed
+                # response.
+                description=d.get("description", ""),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class VerifyReport:
+    """One verify run's report: ``status`` is "pass" iff every check
+    passed."""
+
+    catalog: str
+    status: str
+    checks: tuple[VerifyCheck, ...] = ()
+
+    @property
+    def passed(self) -> bool:
+        return self.status == "pass"
+
+    @property
+    def failures(self) -> tuple[VerifyCheck, ...]:
+        """The checks that did not pass, in report order."""
+        return tuple(c for c in self.checks if not c.passed)
+
+    @classmethod
+    def from_wire(cls, d: dict[str, Any]) -> VerifyReport:
+        return _wire(
+            "VerifyReport",
+            d,
+            lambda d: cls(
+                catalog=d["catalog"],
+                status=d["status"],
+                checks=tuple(VerifyCheck.from_wire(c) for c in (d.get("checks") or ())),
+            ),
+        )
 
 
 @dataclass(frozen=True)

@@ -1,16 +1,19 @@
 import { Link, useParams } from "react-router-dom";
-import { useQuery } from "@tanstack/react-query";
-import { getMaintenanceStatus } from "../api/client";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { getMaintenanceStatus, runVerify } from "../api/client";
 import type {
   Int64,
   MaintenanceRun,
   MaintenanceTaskStatus,
+  VerifyCheck,
+  VerifyReport,
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock } from "../components/Skeleton";
 import {
   LedgerUnavailableNotice,
   RunOutcomeBadge,
+  RunStateBadge,
   RunSummary,
   RunsTable,
   formatRunDuration,
@@ -136,8 +139,103 @@ function Backlog({
         </dl>
       );
     case "verify":
-      return <p className="subtle">Nothing queued — verify runs on demand.</p>;
+      return <VerifyPanel catalog={catalog} />;
   }
+}
+
+/** One check of a report: outcome, count, samples, and the invariant. */
+function VerifyCheckRow({ check }: { check: VerifyCheck }) {
+  const failed = check.status !== "pass";
+  return (
+    <li className="verify-check" data-check={check.check} data-status={check.status}>
+      <p className="verify-check-head">
+        <RunStateBadge status={failed ? "failed" : "ok"} />
+        <span className="mono">{check.check}</span>
+        <span className={failed ? "mono backlog-bad" : "mono subtle"}>
+          {formatCount(check.violations)} violations
+        </span>
+      </p>
+      {/* Absent on a report from a build that predates the field; an
+          empty paragraph would read as "this check has no invariant". */}
+      {check.description && (
+        <p className="verify-check-why subtle">{check.description}</p>
+      )}
+      {check.samples.length > 0 && (
+        <ul className="verify-samples">
+          {check.samples.map((sample, i) => (
+            <li key={i} className="mono">
+              {sample}
+            </li>
+          ))}
+        </ul>
+      )}
+    </li>
+  );
+}
+
+/**
+ * The rendered report: overall status, then every check — failures
+ * first, because a passing check is the uninteresting case and eleven of
+ * them would bury the one that matters.
+ */
+function VerifyReportView({ report }: { report: VerifyReport }) {
+  const ordered = [
+    ...report.checks.filter((c) => c.status !== "pass"),
+    ...report.checks.filter((c) => c.status === "pass"),
+  ];
+  return (
+    <div className="verify-report">
+      <p className="verify-status">
+        <RunStateBadge status={report.status === "pass" ? "ok" : "failed"} />
+        <span className="subtle">
+          {report.status === "pass"
+            ? "every check passed"
+            : `${report.checks.filter((c) => c.status !== "pass").length} of ${report.checks.length} checks failed`}
+        </span>
+      </p>
+      <ul className="verify-checks">
+        {ordered.map((c) => (
+          <VerifyCheckRow key={c.check} check={c} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * Verify has no backlog to show — it scans on demand — so its panel is
+ * the trigger and the last report this page ran. The run is also
+ * recorded in the ledger, so the runs table below picks it up; the
+ * invalidation is what makes that appear without a manual reload.
+ */
+function VerifyPanel({ catalog }: { catalog: string }) {
+  const queryClient = useQueryClient();
+  const mutation = useMutation({
+    mutationFn: () => runVerify(catalog),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["maintenance-runs"] });
+      void queryClient.invalidateQueries({
+        queryKey: ["maintenance-status", catalog],
+      });
+    },
+  });
+  return (
+    <div className="verify-panel">
+      <p className="subtle">
+        Nothing queued — verify scans metadata only, on demand or on its
+        loop.
+      </p>
+      <button
+        type="button"
+        onClick={() => mutation.mutate()}
+        disabled={mutation.isPending}
+      >
+        {mutation.isPending ? "Verifying…" : "Verify"}
+      </button>
+      {mutation.isError && <ErrorBox error={mutation.error} />}
+      {mutation.data && <VerifyReportView report={mutation.data} />}
+    </div>
+  );
 }
 
 function TaskPanel({

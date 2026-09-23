@@ -30,6 +30,7 @@ class MaintenanceStatusService(
     private val expiryIntervalMs: Long,
     private val cleanupIntervalMs: Long,
     private val compactionIntervalMs: Long,
+    private val verifyIntervalMs: Long,
     private val smallFileThresholdBytes: Long,
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
@@ -187,7 +188,7 @@ class MaintenanceStatusService(
                     ),
                     MaintenanceTaskStatus(
                         MaintenanceTask.VERIFY,
-                        null,
+                        verifyIntervalMs,
                         runs[MaintenanceTask.VERIFY],
                         MaintenanceBacklog.VerifyBacklog,
                         loop(MaintenanceTask.VERIFY),

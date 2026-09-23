@@ -501,6 +501,26 @@ def test_expire_and_cleanup(client):
     assert cleanup.still_referenced == 0
     assert cleanup.removed >= 0 and cleanup.missing >= 0
 
+    # A catalog that has just been appended to, expired and cleaned is
+    # exactly the state the invariant scan must call healthy.
+    report = cat.verify()
+    assert report.catalog == cat.name
+    assert report.passed, [(c.check, c.violations, c.samples) for c in report.failures]
+    assert [c.check for c in report.checks] == [
+        "row_id_tiling",
+        "delete_vectors",
+        "orphans",
+        "removal_queue",
+        "snapshot_density",
+        "next_row_id",
+        "expiry_floor",
+        "visibility_bounds",
+        "offset_release",
+        "staging_tickets",
+        "upload_claims",
+    ]
+    assert all(c.violations == 0 and c.description for c in report.checks)
+
 
 def _part_schema() -> pa.Schema:
     return pa.schema(

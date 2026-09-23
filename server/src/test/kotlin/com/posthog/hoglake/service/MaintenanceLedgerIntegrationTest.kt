@@ -411,7 +411,11 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(compactionBacklog.targetBytes).isEqualTo(512L * 1024 * 1024)
 
         val verify = status.tasks[4]
-        assertThat(verify.loopIntervalMs).isNull()
+        // Verify has a loop of its own now (HOGLAKE_VERIFY_INTERVAL_MS),
+        // so the status endpoint reports the interval THIS process was
+        // built with instead of the old manual-only null. The fixture
+        // wires the production default.
+        assertThat(verify.loopIntervalMs).isEqualTo(3_600_000)
         assertThat(verify.lastRun).isNull()
     }
 
@@ -461,6 +465,7 @@ class MaintenanceLedgerIntegrationTest {
             expiryIntervalMs = 60_000,
             cleanupIntervalMs = 60_000,
             compactionIntervalMs = 0,
+            verifyIntervalMs = 3_600_000,
             smallFileThresholdBytes = 512L * 1024 * 1024,
         )
 
@@ -573,6 +578,71 @@ class MaintenanceLedgerIntegrationTest {
     }
 
     @Test
+    fun `verify reports its configured interval AND the cadence the ledger observed`() {
+        // Verify has a loop now (HOGLAKE_VERIFY_INTERVAL_MS). Two things
+        // had to move together for the console to stop saying "manual
+        // only" about a task that sweeps hourly: the status service must
+        // report the interval THIS process was built with, and
+        // MaintenanceTask.VERIFY must declare hasLoop — which is what
+        // makes MaintenanceRunStore ask for its `run_trigger = 'loop'`
+        // rows at all. Leaving the flag false left the second half
+        // silently dead: the interval would show, the observation never
+        // would.
+        val id = seedCatalog("led-verify-loop")
+        seedRunsAgo(id, MaintenanceTask.VERIFY, MaintenanceTrigger.LOOP, 5, 65, 125, 185)
+
+        val task = taskOf("led-verify-loop", MaintenanceTask.VERIFY)
+        assertThat(task.loopIntervalMs)
+            .describedAs("the responder's own config, not null")
+            .isEqualTo(3_600_000)
+        assertThat(task.loop?.intervalMs)
+            .describedAs("the gaps the ledger recorded")
+            .isBetween(59_000L, 61_000L)
+        assertThat(task.loop?.lastRunAt).isNotNull()
+        assertThat(task.loop?.recordsEverySweep)
+            .describedAs("every verify sweep records a row, so silence means no loop")
+            .isTrue()
+    }
+
+    @Test
+    fun `a verify ledger row stores no check descriptions and is served back without them`() {
+        // The descriptions are constants: identical prose in every row,
+        // for every catalog, on every sweep — about 8 KB against a
+        // payload of a few hundred bytes, in a ledger that keeps a week
+        // of hourly runs per catalog. The live response carries them;
+        // the ledger records what the run FOUND.
+        seedCatalog("led-verify-desc")
+        val live = VerifyService(jdbi).runOnce("led-verify-desc")
+        assertThat(live.checks).allSatisfy { assertThat(it.description).isNotBlank() }
+
+        val stored =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT CAST(r.result AS text) FROM hog_maintenance_run r
+                    JOIN hog_catalog c ON c.catalog_id = r.catalog_id
+                    WHERE c.name = :n AND r.task = 'verify'
+                    ORDER BY r.run_id DESC LIMIT 1
+                    """,
+                ).bind("n", "led-verify-desc").mapTo(String::class.java).one()
+            }
+        assertThat(stored)
+            .describedAs("the key is absent, not empty: an empty string would read as 'no invariant'")
+            .doesNotContain("description")
+        // ...and still carries what the run found.
+        assertThat(stored).contains("row_id_tiling").contains("violations")
+
+        // The runs endpoint replays the stored row verbatim, so it is
+        // served without descriptions too — which is why the spec marks
+        // the field optional rather than required.
+        val run =
+            statusSvc().runs("led-verify-desc", MaintenanceTask.VERIFY, null, 10).runs.first()
+        val payload = run.toDto().result!!
+        assertThat(payload["checks"].map { it["check"].asText() }).contains("row_id_tiling")
+        assertThat(payload["checks"]).allSatisfy { assertThat(it.has("description")).isFalse() }
+    }
+
+    @Test
     fun `one slow sweep does not move the cadence`() {
         val id = seedCatalog("led-cad-slow")
         // Gaps of 60, 60, 600 (a stalled sweep), 60, 60. A mean would
@@ -640,14 +710,20 @@ class MaintenanceLedgerIntegrationTest {
     }
 
     @Test
-    fun `verify has no loop at all, which is not the same as a silent one`() {
+    fun `every task reports an observation, so a null loop can only mean an older server`() {
+        // Verify used to be the exception here — the one task with no
+        // loop, and therefore the one legitimate null. It has one now
+        // (HOGLAKE_VERIFY_INTERVAL_MS), so EVERY task reports an
+        // observation even against an empty ledger, and a reader that
+        // sees null is talking to a build that predates the field.
         seedCatalog("led-cad-verify")
         val tasks = statusSvc().status("led-cad-verify").tasks
-        assertThat(tasks.single { it.task == MaintenanceTask.VERIFY }.loop).isNull()
-        // Every looping task reports an observation even with an empty
-        // ledger, so "null" can only ever mean "no loop exists".
-        assertThat(tasks.filter { it.task != MaintenanceTask.VERIFY })
-            .allSatisfy { assertThat(it.loop).isNotNull() }
+        assertThat(tasks).allSatisfy { assertThat(it.loop).isNotNull() }
+        val verify = tasks.single { it.task == MaintenanceTask.VERIFY }
+        assertThat(verify.loop?.intervalMs)
+            .describedAs("an empty ledger states no cadence, which is not the same as no loop")
+            .isNull()
+        assertThat(verify.loop?.recordsEverySweep).isTrue()
     }
 
     @Test
@@ -677,12 +753,15 @@ class MaintenanceLedgerIntegrationTest {
                 statusSvc().status("led-cad-wire").toDto(),
             )
         val byTask = wire["tasks"].associateBy { it["task"].asText() }
-        // Present-and-null for the task with no loop, present-and-object
-        // for the rest. A client that sees NEITHER is talking to a build
-        // from before this existed, which is a different claim from "no
-        // loop runs" and must not render as one.
+        // Present-and-object for every task now that verify loops too;
+        // the key is ALWAYS there. A client that sees NEITHER the key
+        // nor a value is talking to a build from before this existed,
+        // which is a different claim from "no loop runs" and must not
+        // render as one.
         assertThat(byTask.getValue("verify").has("loop")).isTrue()
-        assertThat(byTask.getValue("verify")["loop"].isNull).isTrue()
+        assertThat(byTask.getValue("verify")["loop"].isObject).isTrue()
+        assertThat(byTask.getValue("verify")["loop"]["records_every_sweep"].asBoolean()).isTrue()
+        assertThat(byTask.getValue("verify")["loop_interval_ms"].asLong()).isEqualTo(3_600_000)
         assertThat(byTask.getValue("compaction")["loop"].isObject).isTrue()
         assertThat(byTask.getValue("compaction")["loop"]["records_every_sweep"].asBoolean()).isTrue()
         assertThat(byTask.getValue("hydrator")["loop"]["records_every_sweep"].asBoolean()).isFalse()

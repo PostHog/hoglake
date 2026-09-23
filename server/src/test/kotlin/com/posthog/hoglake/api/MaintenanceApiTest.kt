@@ -50,7 +50,12 @@ import java.util.Comparator
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class MaintenanceApiTest {
     private val db = PgTestSupport.freshDatabase()
-    private val cfg = Config(hydratorIntervalMs = 0)
+
+    // A NON-DEFAULT verify interval on purpose: the default is 0 (the
+    // loop is an ops decision per workload), and asserting the endpoint
+    // reports 0 would not distinguish "reports this process's config"
+    // from "still reports nothing for verify".
+    private val cfg = Config(hydratorIntervalMs = 0, verifyIntervalMs = 3_600_000)
     private val app = App.build(cfg, db.jdbi)
     private val json = ObjectMapper()
 
@@ -108,6 +113,7 @@ class MaintenanceApiTest {
                         expiryIntervalMs = 60_000,
                         cleanupIntervalMs = 60_000,
                         compactionIntervalMs = 0,
+                        verifyIntervalMs = 3_600_000,
                         smallFileThresholdBytes = 512L * 1024 * 1024,
                     ),
                     DatabaseHealthService(db.jdbi),
@@ -371,11 +377,21 @@ class MaintenanceApiTest {
                 "removal_queue",
                 "snapshot_density",
                 "next_row_id",
+                "expiry_floor",
+                "visibility_bounds",
+                "offset_release",
+                "staging_tickets",
+                "upload_claims",
             )
             for (check in report["checks"]) {
                 assertThat(check["status"].asText()).isEqualTo("pass")
                 assertThat(check["violations"].asLong()).isEqualTo(0)
                 assertThat(check["samples"].isArray).isTrue()
+                // Additive wire field: the invariant, in words, on every
+                // check — the spec marks it required.
+                assertThat(check["description"].asText())
+                    .describedAs("check %s carries its invariant", check["check"].asText())
+                    .isNotBlank()
             }
 
             assertApiError(
@@ -526,11 +542,15 @@ class MaintenanceApiTest {
             assertThat(lastRun["result"]["snapshots_expired"].asLong()).isEqualTo(0)
             assertThat(expiry["backlog"]["consumer_floor"].asBoolean()).isTrue()
 
-            // Compaction's loop is disabled (interval 0) in this wiring;
-            // verify is manual-only (no loop_interval_ms key at all).
+            // Compaction's loop is disabled (interval 0) in this wiring.
             assertThat(tasks.getValue("compaction")["loop_interval_ms"].asLong()).isEqualTo(0)
+            // Verify is no longer manual-only: it has a loop of its own
+            // (HOGLAKE_VERIFY_INTERVAL_MS), and the status endpoint must
+            // report the interval THIS process was built with rather than
+            // keep claiming the task has no loop.
             val verify = tasks.getValue("verify")
-            assertThat(verify.has("loop_interval_ms")).isFalse()
+            assertThat(verify["loop_interval_ms"].asLong()).isEqualTo(cfg.verifyIntervalMs)
+            assertThat(cfg.verifyIntervalMs).describedAs("a value 0 could not tell the two apart").isNotZero()
             assertThat(verify["last_run"].isNull).isTrue()
             // No sampler has run: unknown backlogs must not masquerade as zero.
             assertThat(tasks.getValue("cleanup")["backlog"].has("queued_removals")).isFalse()

@@ -91,6 +91,9 @@ table.append(big_table, deferred_stats=True)  # register as pending
 catalog.set_retention(7 * 86400, consumer_floor=True)  # retention policy
 catalog.expire()
 catalog.cleanup()  # maintenance sweeps
+report = catalog.verify()  # metadata-only invariant scan (read-only)
+for c in report.failures:  # () when report.passed
+    print(c.check, c.violations, c.description, c.samples)
 ns.create_view("v", "SELECT 1", dialect="trino")
 for s in catalog.snapshots(limit=1000):
     ...  # auto-paginated

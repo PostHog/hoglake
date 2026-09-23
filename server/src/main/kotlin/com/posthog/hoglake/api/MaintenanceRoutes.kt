@@ -5,6 +5,7 @@ import com.posthog.hoglake.compaction.CompactionService
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
+import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.DatabaseHealthService
 import com.posthog.hoglake.service.ExpiryService
@@ -89,8 +90,10 @@ fun Application.installMaintenanceRoutes(
             }
             // Metadata-only invariant scan (gaps.md B3, absorbing B4's
             // density assertion). Read-only, MVCC snapshot, no locks.
+            // The route is always the MANUAL trigger; the periodic sweep
+            // (HOGLAKE_VERIFY_INTERVAL_MS) records LOOP.
             post("/maintenance/verify") {
-                call.respond(verify.runOnce(call.maintenanceCatalog()).toDto())
+                call.respond(verify.runOnce(call.maintenanceCatalog(), MaintenanceTrigger.MANUAL).toDto())
             }
             // Operator requeue for structurally-failed hydrations: flips
             // 'failed' files back to 'pending' (whole catalog, or one
