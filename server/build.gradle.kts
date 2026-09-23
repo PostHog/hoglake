@@ -193,15 +193,22 @@ application {
 }
 
 tasks.test {
-    useJUnitPlatform()
+    // Integration tests need Docker (Testcontainers). `gradle :test
+    // -PunitOnly` excludes them by TAG, through the JUnit Platform's own
+    // tag filter: every Docker-backed class carries @Tag("integration"),
+    // and IntegrationTagGateTest reds when one does not. The filename
+    // exclude below is belt and braces for the same set. (An earlier
+    // form set a `junit.jupiter.tags.exclude` system property, which is
+    // not a JUnit configuration parameter; it filtered nothing, and
+    // -PunitOnly ran every tagged class that lacked the name, #181.)
+    useJUnitPlatform {
+        if (project.hasProperty("unitOnly")) excludeTags("integration")
+    }
     // Rehearse a Postgres major-version move against the whole suite:
     // `./gradlew :test -PpgImage=postgres:19`. Unset, the harness pins
     // the version production runs.
     (project.findProperty("pgImage") as String?)?.let { systemProperty("pgImage", it) }
-    // Integration tests need Docker (Testcontainers); tag-gated so `gradle
-    // test -PunitOnly` stays runnable without it.
     if (project.hasProperty("unitOnly")) {
-        systemProperty("junit.jupiter.tags.exclude", "integration")
         exclude("**/*IntegrationTest*")
     }
     // jazzer-junit self-attaches its instrumentation agent (ByteBuddy)
