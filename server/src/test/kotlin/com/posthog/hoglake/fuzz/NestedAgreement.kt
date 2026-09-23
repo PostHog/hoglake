@@ -1,13 +1,13 @@
 package com.posthog.hoglake.fuzz
 
+import com.posthog.hoglake.MemoryOutputFile
 import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
-import com.posthog.hoglake.compaction.localInput
-import com.posthog.hoglake.compaction.rewriteToLocal
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
+import com.posthog.hoglake.memoryInput
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.NullOrder
@@ -16,16 +16,12 @@ import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.assignFieldIds
 import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.stats.IcebergSingleValue
+import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
-import org.apache.parquet.io.InputFile
-import org.apache.parquet.io.LocalInputFile
-import org.apache.parquet.io.SeekableInputStream
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.Type
-import java.nio.file.Files
-import java.nio.file.Path
 
 /** One oracle violation. [kind] is the dedupe key. */
 class Finding(
@@ -67,9 +63,21 @@ class Finding(
  * values for must have produced stats on the read side.
  */
 object NestedAgreement {
+    /**
+     * The rewrite output codec this campaign asks for.
+     *
+     * UNCOMPRESSED, and deliberately not the production default: what
+     * the oracles below judge is SCHEMA pairing and value conservation,
+     * and a page codec changes neither. Compaction's real codec choice
+     * (zstd) is a storage decision covered by its own tests; here it
+     * bought nothing and cost 5 ms of zstd-jni setup per accepted
+     * rewrite, measured, which is more than every other phase of an
+     * iteration put together.
+     */
+    private val FUZZ_CODEC = ParquetRewriter.OutputCodec(CompressionCodecName.UNCOMPRESSED)
+
     fun runOne(
         e: Entropy,
-        tmp: Path,
         sink: (Finding) -> Unit,
     ) {
         val depth = e.int(1, NestedFuzz.maxDepth())
@@ -90,20 +98,26 @@ object NestedAgreement {
         val derived = NestedFuzz.deriveSchema(e, live, if (canonical) 0 else e.int(5, 40))
         val schema = derived.schema
 
-        val src = tmp.resolve("in.parquet")
+        // The generated file lives in MEMORY, never in a temp directory.
+        // Production never stages a parquet object to local disk — the
+        // hydrator reads a byte range and compaction reads S3 in place —
+        // so a temp file added a filesystem the subject does not have
+        // and charged every iteration for open/create/stat/unlink.
         val rows = e.int(1, 6)
         val maxRep = if (e.int(0, 99) < 3) e.int(20, 120) else e.int(0, 4)
+        val srcSink = MemoryOutputFile()
         try {
-            NestedFuzz.writeFile(e, schema, src, rows, maxRep)
+            NestedFuzz.writeFile(e, schema, srcSink, rows, maxRep)
         } catch (t: Throwable) {
             // Generator could not express data for this shape (e.g. INT96
             // in an odd slot). Not a finding: the subject never saw it.
             return
         }
+        val src = memoryInput(srcSink.bytes())
 
         val footer: ParquetMetadata =
             try {
-                FooterParse.parse(fileOf(src))
+                FooterParse.parse(src)
             } catch (t: Throwable) {
                 sink(Finding("own-output-unreadable", "schema=$schema", t))
                 return
@@ -114,7 +128,7 @@ object NestedAgreement {
             try {
                 FooterStats.missingFieldIds(schema)
                 FooterStats.usesFieldIds(schema)
-                FooterStats.aggregate(footer, catalog, src.toString())
+                FooterStats.aggregate(footer, catalog, SRC_LABEL)
             } catch (t: Throwable) {
                 sink(Finding("reader-raw-throw", "schema=$schema catalog=$catalog", t))
                 return
@@ -139,11 +153,19 @@ object NestedAgreement {
         }
 
         // ---- per top-level column: rewrite + agreement --------------------
+        // Read back ONCE, not once per column: the input never changes
+        // inside the loop, and re-opening it per column was the single
+        // most expensive line in the campaign.
+        val inById by lazy {
+            NestedFuzz.leafStats(src).second
+                .filter { it.fieldId != null }
+                .groupBy { it.fieldId!! }
+        }
         val duplicates = NestedFuzz.duplicateIds(schema)
         val duplicateNames = duplicateSiblingNames(schema)
         val partlyIdless = FooterStats.missingFieldIds(schema)
-        for ((i, col) in live.withIndex()) {
-            val out = tmp.resolve("out$i.parquet")
+        for (col in live) {
+            val out = MemoryOutputFile()
             val sortFields = maybeSort(e, col)
             // Which of the two typed refusals fired, if either. The
             // agreement oracles below are about SCHEMA agreement — do
@@ -154,11 +176,13 @@ object NestedAgreement {
             var dataRefused = false
             val result =
                 try {
-                    rewriteToLocal(
-                        listOf(localInput(src, 0L, null)),
+                    ParquetRewriter.rewrite(
+                        listOf(ParquetRewriter.Input(src, SRC_LABEL, 0L, null, false)),
                         listOf(col),
                         sortFields,
                         out,
+                        ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
+                        FUZZ_CODEC,
                     )
                 } catch (t: UnconvertibleSchemaException) {
                     null
@@ -189,7 +213,7 @@ object NestedAgreement {
                 // physical-mismatch case in the documented matrix).
                 val perColRefused =
                     try {
-                        FooterStats.aggregate(footer, listOf(catalogOf(catalog, col.fieldId)!!), src.toString())
+                        FooterStats.aggregate(footer, listOf(catalogOf(catalog, col.fieldId)!!), SRC_LABEL)
                     } catch (t: Throwable) {
                         emptyList()
                     }
@@ -238,9 +262,10 @@ object NestedAgreement {
                 )
             }
 
+            val outFile = memoryInput(out.bytes())
             val (outSchema, outLeaves) =
                 try {
-                    NestedFuzz.leafStats(out)
+                    NestedFuzz.leafStats(outFile)
                 } catch (t: Throwable) {
                     sink(Finding("rewrite-output-unreadable", "outSchema-from=$col schema=$schema", t))
                     continue
@@ -248,23 +273,20 @@ object NestedAgreement {
 
             // Round trip: the output must read back through the reader too.
             try {
-                val outFooter = FooterParse.parse(fileOf(out))
-                FooterStats.aggregate(outFooter, listOf(catalogOf(catalog, col.fieldId)!!), out.toString())
+                val outFooter = FooterParse.parse(outFile)
+                FooterStats.aggregate(outFooter, listOf(catalogOf(catalog, col.fieldId)!!), OUT_LABEL)
             } catch (t: Throwable) {
                 sink(Finding("roundtrip-reader-throw", "outSchema=$outSchema", t))
             }
 
             val perCol =
                 try {
-                    FooterStats.aggregate(footer, listOf(catalogOf(catalog, col.fieldId)!!), src.toString())
+                    FooterStats.aggregate(footer, listOf(catalogOf(catalog, col.fieldId)!!), SRC_LABEL)
                 } catch (t: Throwable) {
                     sink(Finding("reader-raw-throw-percol", "col=$col schema=$schema", t))
                     continue
                 }
             val readLeaves = perCol.associateBy { it.fieldId }
-
-            val inLeaves = NestedFuzz.leafStats(src).second
-            val inById = inLeaves.filter { it.fieldId != null }.groupBy { it.fieldId!! }
 
             for (leaf in outLeaves) {
                 val fid = leaf.fieldId ?: continue
@@ -745,9 +767,11 @@ object NestedAgreement {
             cols.forEach { walk(it) }
         }
 
-    fun fileOf(p: Path): InputFile = LocalInputFile(p)
-
-    fun freshTmp(): Path = Files.createTempDirectory("hoglake-nested-fuzz")
-
-    private fun unused(s: SeekableInputStream) = s
+    /**
+     * Labels for the two in-memory files, for the messages the oracles
+     * build. They used to be filesystem paths, which told a reader
+     * nothing a finding's schema dump does not already say.
+     */
+    private const val SRC_LABEL = "memory://in.parquet"
+    private const val OUT_LABEL = "memory://out.parquet"
 }

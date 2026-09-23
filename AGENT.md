@@ -458,6 +458,15 @@ there would break that gate on every build.
   `./gradlew generateFuzzSeeds` and recommitting the seeds — otherwise
   the seeds silently start exercising different types than their names
   claim.
+  - A target whose coverage is flat from `INITED` to `DONE` is
+    saturated: its budget is a regression sweep, and it belongs in the
+    sweep class (`fuzzSweepTargets`). A target under ~1,000 exec/s is
+    starved and finds nothing at any budget: profile it with JFR before
+    giving it minutes — the nightly ran NestedAgreement at 11 exec/s
+    (7k executions a night) for a week and ParquetFooter at 580/s, both
+    dominated by Hadoop `Configuration` construction (#165), while five
+    saturated targets burned 600 s each. Read the nightly's
+    `INITED`/`DONE` lines when a run is suspiciously green.
 - **QE culture**: substantive changes get an adversarial review or QE
   agent pass before merge; bugs found by tests/fuzzing become pinned
   regression tests + (design-class ones) defect-ledger entries.

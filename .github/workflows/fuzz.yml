@@ -1,9 +1,14 @@
 name: Fuzz nightly
 
-# Deep coverage-guided Jazzer soak of the hermetic fuzz targets
+# Deep coverage-guided Jazzer run of the hermetic fuzz targets
 # (fuzzing.md layer 4). The normal server suite only REPLAYS the
 # committed seed corpus; this run actually fuzzes, and accumulates its
 # generated corpus across nights through the cache so coverage compounds.
+#
+# Two budget classes, set by the two inputs below: the SOAK targets get
+# the night (fuzz_seconds), the SATURATED ones get a short regression
+# sweep over the accumulated corpus (sweep_seconds). build.gradle.kts
+# carries the measurements that put each target in its class.
 #
 # A crash fails the run and uploads the crashing inputs jazzer-junit
 # wrote back into the seed-corpus resource directories. Promotion rule
@@ -17,9 +22,13 @@ on:
   workflow_dispatch:
     inputs:
       fuzz_seconds:
-        description: "Per-target libFuzzer budget in seconds"
+        description: "Per-target libFuzzer budget for the SOAK targets, in seconds"
         required: false
-        default: "600"
+        default: "900"
+      sweep_seconds:
+        description: "Per-target libFuzzer budget for the SWEEP targets, in seconds"
+        required: false
+        default: "60"
 
 permissions:
   contents: read
@@ -32,9 +41,14 @@ jobs:
   fuzz:
     if: github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
-    # Eight sequential targets x the default 600s budget, plus build:
-    # ~90 min. Dispatch with a bigger budget needs this raised too.
-    timeout-minutes: 120
+    # Sequential, and the two budget classes are not the same size
+    # (build.gradle.kts says why): 5 soak targets x 900s = 75 min, plus
+    # 5 sweep targets x 60s = 5 min, plus checkout, JDK, corpus restore
+    # and the gradle build, ~15 min => ~95 min. The cap is deliberately
+    # well above that: a run killed on the timeout never saves its
+    # accumulated corpus, so the night's coverage is lost as well as the
+    # night. Dispatch with a bigger budget needs this raised too.
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,18 +73,23 @@ jobs:
 
       - name: Fuzz all targets
         working-directory: server
-        # The dispatch input reaches the shell through env, never by
+        # The dispatch inputs reach the shell through env, never by
         # template interpolation into run: (semgrep run-shell-injection),
-        # and must be a plain integer.
+        # and must both be plain integers.
         env:
-          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '600' }}
+          FUZZ_SECONDS: ${{ github.event.inputs.fuzz_seconds || '900' }}
+          SWEEP_SECONDS: ${{ github.event.inputs.sweep_seconds || '60' }}
         run: |
           case "$FUZZ_SECONDS" in
             ''|*[!0-9]*) echo "fuzz_seconds must be an integer, got '$FUZZ_SECONDS'" >&2; exit 1 ;;
           esac
+          case "$SWEEP_SECONDS" in
+            ''|*[!0-9]*) echo "sweep_seconds must be an integer, got '$SWEEP_SECONDS'" >&2; exit 1 ;;
+          esac
           # tee for the triage job below; bash runs with pipefail, so
           # the gradle exit code survives the pipe.
-          ./gradlew --no-daemon fuzz -PfuzzSeconds="$FUZZ_SECONDS" 2>&1 | tee ../fuzz-run.log
+          ./gradlew --no-daemon fuzz \
+            -PfuzzSeconds="$FUZZ_SECONDS" -PfuzzSweepSeconds="$SWEEP_SECONDS" 2>&1 | tee ../fuzz-run.log
 
       # jazzer-junit writes crashing inputs into the committed seed
       # corpus directories — on a red run, ship exactly those new files

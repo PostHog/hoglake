@@ -8,14 +8,18 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.MAX_COLUMN_NESTING_DEPTH
+import org.apache.hadoop.conf.Configuration
+import org.apache.parquet.ParquetReadOptions
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.ParquetFileWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.OutputFile
 import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
@@ -563,16 +567,33 @@ object NestedFuzz {
      */
     private const val MAX_GENERATED_NODES_PER_ROW = 200_000
 
-    /** Write [rows] generated records under [schema]; returns the record count. */
+    /** Write [rows] generated records under [schema] to [path]; returns the record count. */
     fun writeFile(
         e: Entropy,
         schema: MessageType,
         path: Path,
         rows: Int,
         maxRep: Int,
+    ): Int = writeFile(e, schema, LocalOutputFile(path), rows, maxRep)
+
+    /**
+     * The same write onto any parquet [OutputFile].
+     *
+     * The campaigns use a memory sink (`MemoryOutputFile`): the subject
+     * of the nested fuzzers is the reader/rewriter pair, never the
+     * filesystem, and a temp file per iteration was costing more than
+     * every oracle in the target put together.
+     */
+    fun writeFile(
+        e: Entropy,
+        schema: MessageType,
+        out: OutputFile,
+        rows: Int,
+        maxRep: Int,
     ): Int {
         val factory = SimpleGroupFactory(schema)
-        ExampleParquetWriter.builder(LocalOutputFile(path))
+        ExampleParquetWriter.builder(out)
+            .withConf(SHARED_CONF)
             .withType(schema)
             .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
             .withWriteMode(ParquetFileWriter.Mode.OVERWRITE)
@@ -767,8 +788,10 @@ object NestedFuzz {
         val nullCount: Long?,
     )
 
-    fun leafStats(path: Path): Pair<MessageType, List<LeafStat>> =
-        ParquetFileReader.open(LocalInputFile(path)).use { r ->
+    fun leafStats(path: Path): Pair<MessageType, List<LeafStat>> = leafStats(LocalInputFile(path))
+
+    fun leafStats(input: InputFile): Pair<MessageType, List<LeafStat>> =
+        ParquetFileReader.open(input, SHARED_READ_OPTIONS).use { r ->
             val footer = r.footer
             val schema = footer.fileMetaData.schema
             val ids = HashMap<List<String>, Int?>()
@@ -822,4 +845,32 @@ object NestedFuzz {
     }
 
     fun maxDepth(): Int = MAX_COLUMN_NESTING_DEPTH
+
+    /**
+     * One Hadoop [Configuration] and one [ParquetReadOptions] for the
+     * whole JVM, handed to every writer and reader this generator
+     * builds.
+     *
+     * Not a micro-optimisation. parquet-java's no-argument
+     * `ParquetWriter.Builder` and `ParquetFileReader.open(InputFile)`
+     * each construct a fresh `Configuration`, and a fresh
+     * `Configuration` re-parses `core-default.xml` out of the
+     * hadoop-common jar on first use: 0.74 ms, measured, every time.
+     * A single nested iteration opened enough of them to spend most of
+     * its budget parsing the same XML over and over — reading one
+     * generated footer went from 0.83 ms to 0.012 ms once the options
+     * were prebuilt. A Hadoop `Configuration` is mutable, so "shared" is
+     * a claim that has to hold: nothing in this harness and nothing in
+     * parquet-hadoop's writer path sets a value on it, so it is never
+     * mutated after construction and sharing it changes nothing the
+     * campaigns can observe. `ParquetReadOptions` is immutable.
+     *
+     * The same charge is still paid inside `FooterParse.parse` and
+     * `ParquetRewriter.rewrite`, which build their own; that is
+     * production's to decide, not the harness's, and it is what remains
+     * between this target and a faster one.
+     */
+    private val SHARED_CONF = Configuration()
+
+    private val SHARED_READ_OPTIONS: ParquetReadOptions = ParquetReadOptions.builder().build()
 }

@@ -1,0 +1,1 @@
+{"columns":[{"name":"id","nullable":false,"type":"long","type_params":null}],"name":"t","namespace":"ns","partition_fields":[{"source_field_id":1,"transform":"bucket","transform_param":16}],"version":4}

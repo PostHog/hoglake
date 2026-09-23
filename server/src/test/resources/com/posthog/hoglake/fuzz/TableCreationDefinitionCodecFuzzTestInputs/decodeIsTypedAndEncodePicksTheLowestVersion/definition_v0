@@ -1,0 +1,1 @@
+{"namespace":"ns","name":"t","columns":[{"name":"id","typeParams":null,"type":"LONG","nullable":false},{"name":"u","typeParams":null,"type":"UUID_T","nullable":true}]}
