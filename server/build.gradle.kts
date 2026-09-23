@@ -210,69 +210,110 @@ tasks.test {
 
 // ---- fuzzing (docs/fuzzing.md layer 4) -----------------------------------------
 //
-// `./gradlew fuzz -PfuzzSeconds=300` runs every @FuzzTest target under
-// libFuzzer for the given per-target budget (default 60s). jazzer-junit
-// permits one fuzz test per JVM run, so each target gets its own Test task,
-// chained sequentially. Committed seed corpus lives under
+// `./gradlew fuzz -PfuzzSeconds=900 -PfuzzSweepSeconds=60` runs every
+// @FuzzTest target under libFuzzer. jazzer-junit permits one fuzz test per
+// JVM run, so each target gets its own Test task, chained sequentially.
+// Committed seed corpus lives under
 // src/test/resources/com/posthog/hoglake/fuzz/<Target>Inputs/<method>/
 // (jazzer-junit's inputs convention — the same files the normal :test run
 // replays deterministically); crashing inputs found while fuzzing are
 // written back into those directories, and the growing generated corpus
 // lands in .cifuzz-corpus/ (transient, not committed).
+//
+// TWO BUDGET CLASSES, because one flat budget was spending the night on
+// the targets that had nothing left to find. The 2026-09-19 nightly, 600
+// seconds each:
+//
+//   target                              execs  coverage     exec/s
+//   IcebergSingleValueCompareFuzzTest    356M  145 -> 145     592k
+//   IcebergSingleValueDecodeFuzzTest      80M  146 -> 146     134k
+//   BoundWireFuzzTest                     76M  128 -> 128     126k
+//   PuffinDeletionVectorFuzzTest          57M  142 -> 142      94k
+//   IdentifiersFuzzTest                   30M  102 -> 102      50k
+//   WireDtoParseFuzzTest                 7.5M  620 -> 645       12k
+//   ParquetFooterFuzzTest                349k  544 -> 550        580
+//   NestedAgreementFuzzTest                7k  2564 -> 2564       11
+//
+// The first five are SATURATED: tens of millions of executions moved the
+// coverage counter by nothing at all, so a longer budget there buys
+// nothing. Their run is a REGRESSION SWEEP over the accumulated corpus —
+// it re-proves a settled contract after a change — and that is what
+// -PfuzzSweepSeconds pays for. The rest is the SOAK class: the two
+// targets whose coverage was still climbing when the clock ran out (and
+// which found September's real defects), plus the targets for surfaces
+// nothing has fuzzed yet. They get the night.
+//
+// Which class a target is in is a judgement about the TARGET, not a
+// tuning knob: it earns its way into sweep by flat coverage across a
+// full soak, and it goes straight back to soak the day its surface
+// changes.
+val fuzzSoakTargets =
+    listOf(
+        "ParquetFooterFuzzTest",
+        "NestedAgreementFuzzTest",
+        "WireDtoParseFuzzTest",
+        "TableCreationDefinitionCodecFuzzTest",
+        "CommitReceiptFuzzTest",
+    )
 
-val fuzzTargets =
+val fuzzSweepTargets =
     listOf(
         "IcebergSingleValueDecodeFuzzTest",
-        "BoundWireFuzzTest",
         "IcebergSingleValueCompareFuzzTest",
-        "ParquetFooterFuzzTest",
+        "BoundWireFuzzTest",
         "PuffinDeletionVectorFuzzTest",
         "IdentifiersFuzzTest",
-        "WireDtoParseFuzzTest",
-        "NestedAgreementFuzzTest",
     )
 
 val fuzzSeconds = (project.findProperty("fuzzSeconds") as String?)?.toLongOrNull() ?: 60L
+val fuzzSweepSeconds = (project.findProperty("fuzzSweepSeconds") as String?)?.toLongOrNull() ?: 60L
+
+fun registerFuzzTarget(
+    target: String,
+    budgetClass: String,
+    seconds: Long,
+) = tasks.register<Test>("fuzz$target") {
+    description = "Coverage-guided Jazzer run of $target ($budgetClass, budget ${seconds}s)"
+    group = "verification"
+    testClassesDirs = sourceSets.test.get().output.classesDirs
+    classpath = sourceSets.test.get().runtimeClasspath
+    useJUnitPlatform()
+    filter { includeTestsMatching("com.posthog.hoglake.fuzz.$target") }
+    // Truthy JAZZER_FUZZ (env var or system property) flips
+    // jazzer-junit from corpus replay to real fuzzing.
+    systemProperty("JAZZER_FUZZ", "1")
+    // Budget override: extra libFuzzer args are appended after the
+    // annotation's -max_total_time, and the last occurrence wins.
+    // (arg 0 is argv0 and skipped by jazzer-junit.)
+    systemProperty("jazzer.internal.arg.0", "jazzer")
+    systemProperty("jazzer.internal.arg.1", "-max_total_time=$seconds")
+    // -XX:-OmitStackTraceInFastThrow is load-bearing here. Fuzzing
+    // makes an exception site hot, and HotSpot then throws a
+    // preallocated instance with NO stack trace and NO message.
+    // A finding reported that way cannot be diagnosed at all (#15
+    // was misfiled against the wrong class for exactly this
+    // reason) and any stack-frame check silently stops matching.
+    jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
+    outputs.upToDateWhen { false }
+    testLogging {
+        events("passed", "failed")
+        showStackTraces = true
+        showStandardStreams = true
+    }
+}
 
 val fuzzTasks =
-    fuzzTargets.map { target ->
-        tasks.register<Test>("fuzz$target") {
-            description = "Coverage-guided Jazzer run of $target (budget ${fuzzSeconds}s)"
-            group = "verification"
-            testClassesDirs = sourceSets.test.get().output.classesDirs
-            classpath = sourceSets.test.get().runtimeClasspath
-            useJUnitPlatform()
-            filter { includeTestsMatching("com.posthog.hoglake.fuzz.$target") }
-            // Truthy JAZZER_FUZZ (env var or system property) flips
-            // jazzer-junit from corpus replay to real fuzzing.
-            systemProperty("JAZZER_FUZZ", "1")
-            // Budget override: extra libFuzzer args are appended after the
-            // annotation's -max_total_time, and the last occurrence wins.
-            // (arg 0 is argv0 and skipped by jazzer-junit.)
-            systemProperty("jazzer.internal.arg.0", "jazzer")
-            systemProperty("jazzer.internal.arg.1", "-max_total_time=$fuzzSeconds")
-            // -XX:-OmitStackTraceInFastThrow is load-bearing here. Fuzzing
-            // makes an exception site hot, and HotSpot then throws a
-            // preallocated instance with NO stack trace and NO message.
-            // A finding reported that way cannot be diagnosed at all (#15
-            // was misfiled against the wrong class for exactly this
-            // reason) and any stack-frame check silently stops matching.
-            jvmArgs("-XX:+EnableDynamicAgentLoading", "-XX:-OmitStackTraceInFastThrow")
-            outputs.upToDateWhen { false }
-            testLogging {
-                events("passed", "failed")
-                showStackTraces = true
-                showStandardStreams = true
-            }
-        }
-    }
+    fuzzSoakTargets.map { registerFuzzTarget(it, "soak", fuzzSeconds) } +
+        fuzzSweepTargets.map { registerFuzzTarget(it, "sweep", fuzzSweepSeconds) }
 
 // Serialize the per-target runs: concurrent libFuzzer instances would fight
 // over CPU and the shared build directory.
 fuzzTasks.zipWithNext().forEach { (a, b) -> b.configure { mustRunAfter(a) } }
 
 tasks.register("fuzz") {
-    description = "Run every Jazzer fuzz target for -PfuzzSeconds seconds each (default 60)"
+    description =
+        "Run every Jazzer fuzz target: soak for -PfuzzSeconds, sweep for " +
+        "-PfuzzSweepSeconds seconds each (both default 60)"
     group = "verification"
     dependsOn(fuzzTasks)
 }

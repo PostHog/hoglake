@@ -1,0 +1,8 @@
+{"read_snapshot":9,"idempotency_key":"123e4567-e89b-12d3-a456-426614174008",
+                       "appends":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174009",
+                       "files":[{"path":"s3://b/g.parquet","record_count":1,"file_size_bytes":10}]}],
+                       "deletes":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174009",
+                       "files":[{"data_file_id":0,"data_file_path":"s3://b/g.parquet",
+                       "path":"s3://b/g.dv","delete_count":1,"file_size_bytes":20}]}]}

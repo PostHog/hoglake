@@ -140,7 +140,7 @@ object NestedFuzzSoak {
         val found = ArrayList<Finding>()
         val e = RandomEntropy(seed)
         when (campaign) {
-            "agreement" -> NestedAgreement.runOne(e, tmp) { found.add(it) }
+            "agreement" -> NestedAgreement.runOne(e) { found.add(it) }
             "footer" -> footerCampaign(e, tmp) { found.add(it) }
             "data" -> dataCampaign(e, tmp) { found.add(it) }
             "trees" -> treeCampaign(e) { found.add(it) }

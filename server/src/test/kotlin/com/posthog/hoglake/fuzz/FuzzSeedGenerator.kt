@@ -1,8 +1,22 @@
 package com.posthog.hoglake.fuzz
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.api.CommitRequestDto
 import com.posthog.hoglake.compaction.PuffinTestFiles
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
+import com.posthog.hoglake.model.TableAppend
+import com.posthog.hoglake.model.Transform
+import com.posthog.hoglake.service.ReplacementTarget
+import com.posthog.hoglake.service.TableCreationDefinition
+import com.posthog.hoglake.service.TableCreationDefinitionCodec
+import com.posthog.hoglake.wireObjectMapper
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -13,6 +27,8 @@ import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Random
+import java.util.UUID
 
 /**
  * One-shot generator for the committed fuzz seed corpus
@@ -52,6 +68,8 @@ object FuzzSeedGenerator {
         seedIdentifiersTarget(root)
         seedNestedAgreementTarget(root)
         seedDtoTarget(root)
+        seedTableCreationCodecTarget(root)
+        seedCommitReceiptTarget(root)
 
         println("fuzz seed corpus written under $root")
     }
@@ -290,13 +308,275 @@ object FuzzSeedGenerator {
                 // refused one exercises the named-refusal branch too.
                 "alter_bad_enum" to """{"ops":[{"op":"add_column","column":{"name":"c","type":"int128"}}]}""",
                 "not_json" to "PAR1 ",
+                // The two-phase table creation and the upload claims
+                // (#156-#162): shapes the DTO target now parses AND
+                // reserializes.
+                "publish_table_creation" to
+                    """{"files":[{"path":"s3://b/created.parquet","record_count":3,"file_size_bytes":300,
+                       "footer_size":64,"column_stats":[{"field_id":1,"value_count":3,"null_count":0,
+                       "lower_bound":"AAAAAA==","upper_bound":"/////w=="}]}]}""",
+                "claim_upload" to
+                    """{"owner":"123e4567-e89b-12d3-a456-426614174000","prefix":"data/",
+                       "file_kind":"data"}""",
+                "upload_owner" to """{"owner":"123e4567-e89b-12d3-a456-426614174000"}""",
+                "abandon_uploads" to
+                    """{"owner":"123e4567-e89b-12d3-a456-426614174000",
+                       "paths":["s3://b/x.parquet","s3://b/y.parquet"]}""",
+                // The guarded-DML fields on a commit body, in one seed.
+                "commit_guarded_dml" to
+                    """{"read_snapshot":9,"idempotency_key":"123e4567-e89b-12d3-a456-426614174008",
+                       "appends":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174009",
+                       "files":[{"path":"s3://b/g.parquet","record_count":1,"file_size_bytes":10}]}],
+                       "deletes":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174009",
+                       "files":[{"data_file_id":0,"data_file_path":"s3://b/g.parquet",
+                       "path":"s3://b/g.dv","delete_count":1,"file_size_bytes":20}]}]}""",
             )
         for ((name, value) in samples) {
             write(out, name, value.trimIndent().toByteArray(Charsets.UTF_8))
         }
     }
 
+    // ---- table creation definition codec ---------------------------------------
+
+    /**
+     * One seed per stored format version, 0 through 6.
+     *
+     * Versions 1-6 are produced BY the codec, so a seed can never claim
+     * a shape the encoder does not actually write; version 0 is the
+     * pre-versioned receipt (JVM enum names, `typeParams`), which no
+     * encoder emits any more and which only a hand-written fixture can
+     * cover. Each seed is the receipt and nothing else: the target reads
+     * the whole input as the stored row AND as its generator tape, so
+     * one readable file exercises both arms.
+     */
+    private fun seedTableCreationCodecTarget(root: Path) {
+        val out = dir(root, "TableCreationDefinitionCodecFuzzTest", "decodeIsTypedAndEncodePicksTheLowestVersion")
+        val scalar = ColumnDef("id", ColType.LONG, null, false)
+        val nested =
+            ColumnDef(
+                "payload",
+                ColType.STRUCT,
+                null,
+                true,
+                listOf(
+                    ColumnDef("inner", ColType.STRING),
+                    ColumnDef("n", ColType.DECIMAL, mapOf("precision" to 9, "scale" to 2)),
+                ),
+            )
+        val base = TableCreationDefinition("ns", "t", listOf(scalar))
+        val byVersion =
+            mapOf(
+                1 to base,
+                2 to base.copy(columns = listOf(scalar, nested)),
+                3 to
+                    base.copy(
+                        replacement =
+                            ReplacementTarget(UUID.fromString("123e4567-e89b-12d3-a456-426614174000"), 12L),
+                    ),
+                4 to base.copy(partitionFields = listOf(PartitionFieldDef(1L, Transform.BUCKET, 16))),
+                5 to
+                    base.copy(
+                        partitionFields = listOf(PartitionFieldDef(1L, Transform.DAY)),
+                        sortFields = listOf(SortFieldDef(1L, SortDirection.DESC, NullOrder.NULLS_FIRST)),
+                    ),
+                6 to
+                    base.copy(
+                        columns = listOf(scalar.copy(comment = "the id"), nested),
+                        comment = "a table",
+                        properties = mapOf("owner.team" to "data"),
+                    ),
+            )
+        for ((version, definition) in byVersion) {
+            val encoded = TableCreationDefinitionCodec.encode(definition)
+            val written = ObjectMapper().readTree(encoded)["version"].asInt()
+            require(written == version) {
+                "seed for version $version encoded as $written; the seed names a version the codec does not write"
+            }
+            write(out, "definition_v$version", encoded.toByteArray(Charsets.UTF_8))
+        }
+        // Version 0: the pre-versioned shape, JVM enum spellings and
+        // `typeParams`, including the UUID_T special case decode still
+        // carries for it.
+        write(out, "definition_v0", V0_RECEIPT.toByteArray(Charsets.UTF_8))
+        // Receipts the decode arm must refuse by NAME rather than crash:
+        // truncated JSON, a version this codec does not know, and a
+        // field whose KIND is wrong where a coercing reader would have
+        // invented a value.
+        write(out, "corrupt_truncated", """{"version":2,"namespace":"ns","name":""".toByteArray(Charsets.UTF_8))
+        write(
+            out,
+            "corrupt_future_version",
+            """{"version":97,"namespace":"ns","name":"t","columns":[]}""".toByteArray(Charsets.UTF_8),
+        )
+        write(
+            out,
+            "corrupt_type_params",
+            """{"version":2,"namespace":"ns","name":"t","columns":[{"name":"c","type":"long","type_params":5}]}"""
+                .toByteArray(Charsets.UTF_8),
+        )
+    }
+
+    /**
+     * The pre-versioned receipt, on ONE line on purpose: a multi-line
+     * raw string is reformatted by ktlint, which would silently change
+     * the bytes of a committed seed without anyone touching the seed.
+     */
+    private const val V0_RECEIPT =
+        """{"namespace":"ns","name":"t","columns":[{"name":"id","typeParams":null,"type":"LONG",""" +
+            """"nullable":false},{"name":"u","typeParams":null,"type":"UUID_T","nullable":true}]}"""
+
+    // ---- stored commit receipts ---------------------------------------------------
+
+    /**
+     * The guarded-DML request shapes, in the receipt target's layout:
+     * eight bytes of permutation entropy, then the body.
+     *
+     * These are the bodies the endpoints added for guarded DML actually
+     * receive — every one of them takes a `CommitRequestDto` and differs
+     * only in which fields it insists on — so the seeds are named for
+     * the guard they carry rather than for the route.
+     */
+    private fun seedCommitReceiptTarget(root: Path) {
+        val out = dir(root, "CommitReceiptFuzzTest", "commitReceiptsAreStableUnderPermutation")
+        val samples =
+            mapOf(
+                "guarded_idempotent" to
+                    """{"read_snapshot":41,"idempotency_key":"123e4567-e89b-12d3-a456-426614174000",
+                       "appends":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174001",
+                       "files":[{"path":"s3://b/a.parquet","record_count":10,"file_size_bytes":1024,
+                       "footer_size":256,"column_stats":[{"field_id":2,"value_count":10,"null_count":1},
+                       {"field_id":1,"value_count":10,"null_count":0}]}]}]}""",
+                "require_unchanged_tables" to
+                    """{"read_snapshot":7,"idempotency_key":"123e4567-e89b-12d3-a456-426614174002",
+                       "appends":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174003",
+                       "files":[{"path":"s3://b/b.parquet","record_count":1,"file_size_bytes":10}]}],
+                       "deletes":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174003",
+                       "files":[{"data_file_id":9,"path":"s3://b/9.dv","delete_count":2,"file_size_bytes":40}]}]}""",
+                "allow_pending_deletes" to
+                    """{"read_snapshot":3,"idempotency_key":"123e4567-e89b-12d3-a456-426614174004",
+                       "appends":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174005",
+                       "files":[{"path":"s3://b/new.parquet","record_count":2,"file_size_bytes":100}]}],
+                       "deletes":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174005",
+                       "files":[{"data_file_id":0,"data_file_path":"s3://b/new.parquet",
+                       "path":"s3://b/new.dv","delete_count":1,"file_size_bytes":30}]}]}""",
+                "empty_delete_group" to
+                    """{"read_snapshot":5,"idempotency_key":"123e4567-e89b-12d3-a456-426614174006",
+                       "deletes":[{"namespace":"ns","table":"t",
+                       "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174007","files":[]}]}""",
+                // Two appends, two files each, stats out of field-id
+                // order: the permutation oracle has something to permute.
+                "permutable_appends" to
+                    """{"read_snapshot":11,"appends":[
+                       {"namespace":"ns","table":"a","files":[
+                        {"path":"s3://b/1.parquet","record_count":3,"file_size_bytes":30,
+                         "column_stats":[{"field_id":3,"value_count":3,"null_count":0},
+                                         {"field_id":1,"value_count":3,"null_count":2}]},
+                        {"path":"s3://b/2.parquet","record_count":4,"file_size_bytes":40}]},
+                       {"namespace":"ns","table":"b","files":[
+                        {"path":"s3://b/3.parquet","record_count":5,"file_size_bytes":50,
+                         "partition_values":["2026-01-01",null]}]}]}""",
+                // FOUR column stats, distinct ids, out of order. Two is
+                // not enough to trust: a 2-element shuffle is the
+                // identity half the time, and QE proved every seed here
+                // still passed with the canonicalising sort deleted
+                // because the identity is what the nonces happened to
+                // produce. Replay-only PR CI cannot tell those apart, so
+                // the seeds have to be chosen, not taken.
+                "wide_column_stats" to
+                    """{"read_snapshot":13,"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/w.parquet","record_count":8,"file_size_bytes":800,
+                        "column_stats":[{"field_id":4,"value_count":8,"null_count":0},
+                                        {"field_id":1,"value_count":8,"null_count":3},
+                                        {"field_id":9,"value_count":8,"null_count":1},
+                                        {"field_id":2,"value_count":8,"null_count":0}]}]}]}""",
+                "empty" to "{}",
+            )
+        var nonce = 1L
+        for ((name, body) in samples) {
+            val json = body.trimIndent()
+            nonce = permutingNonce(name, json, nonce)
+            write(out, name, noncePrefix(nonce) + json.toByteArray(Charsets.UTF_8))
+            nonce += 0x0101_0101L
+        }
+    }
+
+    private fun noncePrefix(nonce: Long): ByteArray =
+        ByteArray(COMMIT_PERMUTATION_PREFIX_BYTES) { i -> ((nonce shr (8 * (7 - i))) and 0xFF).toByte() }
+
+    /**
+     * The first nonce at or after [start] whose permutation is
+     * NON-IDENTITY at every level this body can exercise.
+     *
+     * The permutation itself comes from [permuteCommitRequest], the
+     * function the target calls, so this cannot drift from what the
+     * seed will actually do at replay time. A body with nothing to
+     * permute (no two appends, no two files, no two column stats)
+     * accepts the first nonce, which is correct: there is no level to
+     * be identity at.
+     */
+    private fun permutingNonce(
+        name: String,
+        body: String,
+        start: Long,
+    ): Long {
+        val mapper = wireObjectMapper()
+        val request = mapper.readValue<CommitRequestDto>(body).toModel(allowEmptyDeletes = true)
+        var nonce = start
+        repeat(MAX_NONCE_SEARCH) {
+            val permuted = permuteCommitRequest(request, Random(commitPermutationSeed(noncePrefix(nonce))))
+            val identity = identityLevel(request, permuted)
+            if (identity == null) return nonce
+            nonce++
+        }
+        error("no nonce within $MAX_NONCE_SEARCH of $start permutes seed '$name' at every level")
+    }
+
+    /**
+     * The first ordering that came back unchanged, or null if every
+     * level with something to reorder was actually reordered.
+     *
+     * Appends are matched by namespace/table and files by path, which
+     * is why the seeds give each one a distinct name: without that, a
+     * reordered list and its original could not be paired up to compare.
+     */
+    private fun identityLevel(
+        before: CommitRequest,
+        after: CommitRequest,
+    ): String? {
+        fun key(append: TableAppend) = "${append.namespace}.${append.table}"
+        if (before.appends.size >= 2 && after.appends.map(::key) == before.appends.map(::key)) return "appends"
+        val originalAppends = before.appends.associateBy(::key)
+        for (append in after.appends) {
+            val original = originalAppends.getValue(key(append))
+            if (original.files.size >= 2 && append.files.map { it.path } == original.files.map { it.path }) {
+                return "files of ${key(append)}"
+            }
+            val originalFiles = original.files.associateBy { it.path }
+            for (file in append.files) {
+                val stats = file.columnStats ?: continue
+                val originalStats = originalFiles.getValue(file.path).columnStats ?: continue
+                if (originalStats.size >= 2 &&
+                    originalStats.map { it.fieldId }.toSet().size == originalStats.size &&
+                    stats.map { it.fieldId } == originalStats.map { it.fieldId }
+                ) {
+                    return "column_stats of ${file.path}"
+                }
+            }
+        }
+        return null
+    }
+
     // ---- vector file -----------------------------------------------------------
+
+    /** A runaway search is a bug in the seed, not a reason to keep trying. */
+    private const val MAX_NONCE_SEARCH = 10_000
 
     private data class Vector(val type: String, val bytes: ByteArray, val scale: Int)
 

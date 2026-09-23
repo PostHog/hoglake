@@ -4,11 +4,9 @@ import com.code_intelligence.jazzer.junit.FuzzTest
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
+import com.posthog.hoglake.memoryInput
 import com.posthog.hoglake.model.ColType
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
-import org.apache.parquet.io.InputFile
-import org.apache.parquet.io.SeekableInputStream
-import java.io.EOFException
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -19,11 +17,16 @@ import java.nio.ByteOrder
  * whatever parses.
  *
  * The harness mirrors Hydrator.parseFooter exactly: [FooterParse.parse]
- * over an in-memory [InputFile] — the same wrapper production uses, so
- * the contract below is tested where it is enforced. Input shape: bytes starting with "PAR1" are treated as a
- * whole parquet file; anything else is wrapped as the thrift footer of a
- * synthetic file (PAR1 + data + LE len + PAR1) so the fuzzer spends its
- * time inside the thrift decode, not hunting for magic bytes.
+ * over an in-memory `InputFile` — the same SHAPE production uses (a byte
+ * range, never a file), so the contract below is tested where it is
+ * enforced. That wrapper is the shared `memoryInput` helper rather than
+ * a private copy, so the nested campaigns and this target share one
+ * implementation of the bounds checks.
+ *
+ * Input shape: bytes starting with "PAR1" are treated as a whole parquet
+ * file; anything else is wrapped as the thrift footer of a synthetic
+ * file (PAR1 + data + LE len + PAR1) so the fuzzer spends its time
+ * inside the thrift decode, not hunting for magic bytes.
  *
  * Contract under test:
  *  - the footer parse fails as an IOException and nothing else.
@@ -50,7 +53,7 @@ class ParquetFooterFuzzTest {
 
         val footer: ParquetMetadata =
             try {
-                FooterParse.parse(BytesInputFile(file))
+                FooterParse.parse(memoryInput(file))
             } catch (e: Exception) {
                 checkAllowedParseFailure(e)
                 return
@@ -84,78 +87,6 @@ class ParquetFooterFuzzTest {
         out.putInt(data.size)
         out.put(MAGIC)
         return out.array()
-    }
-
-    /** Minimal in-memory [InputFile], the fuzz twin of Hydrator's RegionInputFile. */
-    private class BytesInputFile(private val bytes: ByteArray) : InputFile {
-        override fun getLength(): Long = bytes.size.toLong()
-
-        override fun newStream(): SeekableInputStream =
-            object : SeekableInputStream() {
-                private var pos = 0L
-
-                override fun getPos(): Long = pos
-
-                override fun seek(newPos: Long) {
-                    pos = newPos
-                }
-
-                override fun read(): Int {
-                    if (pos >= bytes.size) return -1
-                    val v = bytes[posInt(1)].toInt() and 0xFF
-                    pos += 1
-                    return v
-                }
-
-                override fun read(
-                    b: ByteArray,
-                    off: Int,
-                    len: Int,
-                ): Int {
-                    if (len == 0) return 0
-                    if (pos >= bytes.size) return -1
-                    val n = minOf(len.toLong(), bytes.size - pos).toInt()
-                    System.arraycopy(bytes, posInt(n), b, off, n)
-                    pos += n
-                    return n
-                }
-
-                override fun readFully(b: ByteArray) = readFully(b, 0, b.size)
-
-                override fun readFully(
-                    b: ByteArray,
-                    start: Int,
-                    len: Int,
-                ) {
-                    if (pos + len > bytes.size) throw EOFException("read past end of fuzz input")
-                    System.arraycopy(bytes, posInt(len), b, start, len)
-                    pos += len
-                }
-
-                override fun read(buf: ByteBuffer): Int {
-                    val len = buf.remaining()
-                    if (len == 0) return 0
-                    if (pos >= bytes.size) return -1
-                    val n = minOf(len.toLong(), bytes.size - pos).toInt()
-                    buf.put(bytes, posInt(n), n)
-                    pos += n
-                    return n
-                }
-
-                override fun readFully(buf: ByteBuffer) {
-                    val len = buf.remaining()
-                    if (pos + len > bytes.size) throw EOFException("read past end of fuzz input")
-                    buf.put(bytes, posInt(len), len)
-                    pos += len
-                }
-
-                private fun posInt(len: Int): Int {
-                    if (pos < 0 || pos + len > bytes.size) {
-                        throw EOFException("range [$pos, +$len) outside fuzz input of ${bytes.size} bytes")
-                    }
-                    return Math.toIntExact(pos)
-                }
-            }
     }
 
     private companion object {

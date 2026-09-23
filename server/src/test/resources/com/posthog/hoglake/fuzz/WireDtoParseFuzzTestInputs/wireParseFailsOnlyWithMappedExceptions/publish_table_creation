@@ -1,0 +1,3 @@
+{"files":[{"path":"s3://b/created.parquet","record_count":3,"file_size_bytes":300,
+                       "footer_size":64,"column_stats":[{"field_id":1,"value_count":3,"null_count":0,
+                       "lower_bound":"AAAAAA==","upper_bound":"/////w=="}]}]}

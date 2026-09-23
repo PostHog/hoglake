@@ -1,0 +1,1 @@
+{"columns":[{"name":"id","nullable":false,"type":"long","type_params":null},{"children":[{"name":"inner","nullable":true,"type":"string","type_params":null},{"name":"n","nullable":true,"type":"decimal","type_params":{"precision":9,"scale":2}}],"name":"payload","nullable":true,"type":"struct","type_params":null}],"name":"t","namespace":"ns","version":2}

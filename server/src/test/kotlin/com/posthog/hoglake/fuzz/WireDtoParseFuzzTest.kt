@@ -4,10 +4,14 @@ import com.code_intelligence.jazzer.junit.FuzzTest
 import com.fasterxml.jackson.core.JacksonException
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.api.AbandonUploadsDto
 import com.posthog.hoglake.api.AlterTableRequestDto
+import com.posthog.hoglake.api.ClaimUploadDto
 import com.posthog.hoglake.api.CommitRequestDto
 import com.posthog.hoglake.api.CreateCatalogRequestDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
+import com.posthog.hoglake.api.PublishTableCreationDto
+import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
 import com.posthog.hoglake.commit.commitFingerprint
@@ -18,11 +22,13 @@ import com.posthog.hoglake.wireObjectMapper
 import io.ktor.server.plugins.BadRequestException
 
 /**
- * Fuzz target (docs/fuzzing.md layer 4, target f): the wire parse path for the
- * two most structured request bodies — CommitRequestDto and the
- * polymorphic AlterTableRequestDto (`op`-discriminated) — over arbitrary
- * bytes, through the production wire mapper itself (api/WireJson.kt),
- * shared with App.module rather than reconstructed here.
+ * Fuzz target (docs/fuzzing.md layer 4, target f): the wire parse path for
+ * every structured request body the server accepts — CommitRequestDto,
+ * the polymorphic AlterTableRequestDto (`op`-discriminated), the
+ * two-phase table-creation pair and the upload-claim bodies — over
+ * arbitrary bytes, through the production wire mapper itself
+ * (api/WireJson.kt), shared with App.module rather than reconstructed
+ * here.
  *
  * The two phases have different contracts, and conflating them produces
  * false findings:
@@ -68,6 +74,14 @@ class WireDtoParseFuzzTest {
             check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
 
+        // Every commit-shaped endpoint added for guarded DML receives
+        // this same DTO — /commit/prepared, /commit/deletes/prepared,
+        // /commit/mutations/prepared, /commit/uploads and
+        // /commit/transaction all `call.receive<CommitRequestDto>()`
+        // (api/Routes.kt) and differ only in the required-field checks
+        // they run afterwards. /truncate has no body at all: its guard
+        // is the mandatory `expected_table_uuid` query parameter, which
+        // parseExpectedTableUuid above already fuzzes.
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->
             try {
                 val request = dto.toModel()
@@ -101,11 +115,37 @@ class WireDtoParseFuzzTest {
             }
         }
 
-        parseOrNull { mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(data) }?.let { dto ->
-            check(mapper.readValue<com.posthog.hoglake.api.ClaimUploadDto>(mapper.writeValueAsBytes(dto)) == dto)
+        // The upload-claim bodies (api/UploadRoutes.kt). Each one is
+        // parsed AND reserialized: a DTO that binds but cannot be
+        // written back is a response the server cannot produce either,
+        // and the round trip is what catches a field whose wire name
+        // and property name have drifted apart.
+        parseOrNull { mapper.readValue<ClaimUploadDto>(data) }?.let { dto ->
+            check(mapper.readValue<ClaimUploadDto>(mapper.writeValueAsBytes(dto)) == dto)
         }
-        parseOrNull { mapper.readValue<com.posthog.hoglake.api.AbandonUploadsDto>(data) }
-        parseOrNull { mapper.readValue<com.posthog.hoglake.api.UploadOwnerDto>(data) }
+        parseOrNull { mapper.readValue<AbandonUploadsDto>(data) }?.let { dto ->
+            check(mapper.readValue<AbandonUploadsDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+        parseOrNull { mapper.readValue<UploadOwnerDto>(data) }?.let { dto ->
+            check(mapper.readValue<UploadOwnerDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+
+        // The publish half of the two-phase table creation
+        // (api/TableCreationRoutes.kt): a list of file registrations,
+        // each of which also has to survive toModel().
+        parseOrNull { mapper.readValue<PublishTableCreationDto>(data) }?.let { dto ->
+            // Reserialized and re-parsed, but NOT compared: a file
+            // registration carries ColumnStatsDto, whose ByteArray
+            // bounds keep identity equals on purpose (api/Dto.kt), so
+            // `==` here would fail on every body with bounds in it and
+            // assert nothing about the wire.
+            check(mapper.readValue<PublishTableCreationDto>(mapper.writeValueAsBytes(dto)).files.size == dto.files.size)
+            try {
+                dto.files.forEach { it.toModel() }
+            } catch (e: Exception) {
+                checkAllowed("PublishTableCreationDto", e)
+            }
+        }
 
         parseOrNull { mapper.readValue<PrepareTableCreationDto>(data) }?.let { dto ->
             try {
@@ -154,6 +194,15 @@ class WireDtoParseFuzzTest {
         dto: String,
         e: Exception,
     ) {
+        // KNOWN GAP, same one CommitReceiptFuzzTest documents and does
+        // not share: `JacksonException` is NOT a family ErrorMapping
+        // handles. StatusPages installs handlers for HoglakeException,
+        // CorruptDefinitionException, BadRequestException,
+        // JsonConvertException and ContentTransformationException, and
+        // everything else reaches the Throwable arm as a 500 — so a
+        // JacksonException escaping a handler-phase toModel() is waved
+        // through here as "mapped" when the wire answer would be 500.
+        // Tightening it belongs with this target, not with the new one.
         check(e is JacksonException || e is BadRequestException || e is HoglakeException) {
             "$dto parse escaped with unmapped ${e.javaClass.name}: ${e.message?.take(200)}"
         }
