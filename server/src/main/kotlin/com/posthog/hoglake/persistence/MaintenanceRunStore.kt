@@ -192,10 +192,12 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
      * task), newest first — the evidence behind the status page's
      * observed cadence. Unordered pairs are absent, never empty.
      *
-     * Only tasks that have a loop are asked for: verify has none, so a
-     * `run_trigger = 'loop'` row cannot exist for it, and the LATERAL
-     * would read every verify row the catalog has to prove it. For the
-     * tasks that do loop, loop rows vastly outnumber manual ones, so the
+     * Only tasks that have a loop are asked for ([MaintenanceTask.hasLoop]):
+     * for a loop-less task no `run_trigger = 'loop'` row can exist, and the
+     * LATERAL would read every row the catalog has to prove it. Every task
+     * loops today, so the filter is currently a no-op that stays because the
+     * cost of getting it wrong falls on the status endpoint's hot path. For
+     * the tasks that do loop, loop rows vastly outnumber manual ones, so the
      * index scan stops within a few rows of the newest.
      */
     fun recentLoopRunsAll(

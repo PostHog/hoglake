@@ -1,5 +1,9 @@
 package com.posthog.hoglake.service
 
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.LoggerContext
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.AppenderBase
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
@@ -16,7 +20,9 @@ import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.slf4j.LoggerFactory
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
 
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -196,6 +202,81 @@ class TableReplacementIntegrationTest {
             assertThat(catalogs.getCatalog(cat).earliestSnapshotId).isEqualTo(beforeReplacement)
         }
         assertThat(offsetUuids(cat)).containsExactly(old.tableUuid)
+    }
+
+    /**
+     * A catalog with expiry OFF still releases stranded offsets.
+     *
+     * The release used to sit BELOW `sweep()`'s retention early-return,
+     * so a retention-null catalog — expiry deliberately configured off,
+     * which several production catalogs are — could never release
+     * anything. The rows were unreachable: the commit path's backward
+     * walk only fires when the consumer commits on the successor, and it
+     * never will (the whole point is that it reconciled long ago), so
+     * nothing left in the system would ever clear them. `/maintenance/
+     * verify`'s offset_release check would have reported the violation
+     * forever with no action an operator could take. The release is now
+     * the FIRST thing the sweep does, above the retention check.
+     */
+    @Test
+    fun `a retention-null catalog still releases offsets stranded by a replacement`() {
+        val cat = fixture()
+        val old = catalogs.createTable(cat, "ns", "t", columns)
+        commits.commit(cat, append(cat))
+        val beforeReplacement = catalogs.getCatalog(cat).headSnapshotId
+        val prepared = prepare(cat, old.tableUuid)
+        val replacement = creations.publish(cat, prepared.operationId, emptyList()).snapshotId!!
+        rawOffset(cat, old.tableUuid, beforeReplacement)
+        rawOffset(cat, prepared.tableUuid, replacement)
+        // NO retention: sweep() returns before it expires anything.
+        assertThat(catalogs.getCatalog(cat).snapshotRetentionSeconds).isNull()
+
+        val audit = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    audit += event
+                }
+            }
+        appender.context = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.start()
+        val auditLogger = LoggerFactory.getLogger("hoglake.audit") as Logger
+        auditLogger.addAppender(appender)
+        val result =
+            try {
+                ExpiryService(db.jdbi).runOnce(cat, batchSize = 1000)
+            } finally {
+                auditLogger.detachAppender(appender)
+                appender.stop()
+            }
+        assertThat(result.snapshotsExpired).describedAs("expiry is off").isZero()
+        // A sweep that deleted a consumer position is NOT zero work, so
+        // it emits an audit event rather than an app-log debug line —
+        // and the event says how many positions it deleted.
+        assertThat(audit.map { it.formattedMessage })
+            .describedAs("a sweep that released offsets must not be logged as nothing-to-do")
+            .isNotEmpty()
+        // The detail rides as a logstash StructuredArgument, so the
+        // assertion reads the argument array rather than the rendered
+        // message (which is just "expiry ok").
+        assertThat(audit.flatMap { e -> e.argumentArray.orEmpty().map { it.toString() } })
+            .anySatisfy { assertThat(it).contains("offsets_released=1") }
+        assertThat(offsetUuids(cat))
+            .describedAs("the stranded row is gone even though nothing expired")
+            .containsExactly(prepared.tableUuid)
+        // COUNTED, not silent. Deleting a consumer's position is the
+        // only work this sweep can do, and an uncounted one is reported
+        // as "nothing to do" — which is how the stranded rows stayed
+        // invisible in the first place.
+        assertThat(result.offsetsReleased).isEqualTo(1)
+
+        // A second sweep is idempotent AND says so: nothing left to
+        // release, so the counter is back to zero.
+        assertThat(ExpiryService(db.jdbi).runOnce(cat, batchSize = 1000).offsetsReleased).isZero()
+        // And the invariant scan agrees, which is the surface that would
+        // otherwise have alerted on it forever.
+        val report = VerifyService(db.jdbi).runOnce(cat)
+        assertThat(report.checks.single { it.check == "offset_release" }.violations).isZero()
     }
 
     /**

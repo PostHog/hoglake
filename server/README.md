@@ -745,17 +745,49 @@ travel like everything else.
 
 The catalog reports on itself instead of waiting for ops SQL:
 
-- **`POST /maintenance/verify`** (`service/VerifyService.kt`) — the QE
-  suite's global-invariant SQL as a read-only, metadata-only endpoint
-  (one REPEATABLE READ MVCC snapshot, no catalog lock). Six checks:
-  row-id tiling (positional overlap; `explicit_row_ids` compaction
-  outputs exempt by design), deletion vectors (one live per file,
-  monotone supersession chains, `delete_count <= record_count`),
-  orphaned live rows on dropped tables, still-referenced removal-queue
-  entries, true snapshot density (`count(*)` equals the dense
-  `[earliest, head]` range), and `next_row_id` allocator consistency.
-  The JSON report carries per-check status, true violation counts, and
-  samples capped at 20.
+- **`POST /maintenance/verify`** (`service/VerifyService.kt`) — the
+  catalog's global-invariant SQL as a read-only, metadata-only
+  endpoint (one REPEATABLE READ MVCC snapshot, no catalog lock), and
+  the same code the **verify loop** runs on a cadence
+  (`HOGLAKE_VERIFY_INTERVAL_MS`, below). Eleven checks:
+  - `row_id_tiling` — positional overlap; `explicit_row_ids`
+    compaction outputs exempt by design (invariant 2).
+  - `delete_vectors` — one live DV per file, monotone supersession
+    chains, `delete_count <= record_count` (invariant 3).
+  - `orphans` — live `hog_data_file` / `hog_column` /
+    `hog_table_version` rows on a dropped table.
+  - `removal_queue` — undrained queue entries whose path a file row
+    still claims: cleanup's `still_referenced` alert at rest
+    (invariant 4).
+  - `snapshot_density` — `count(*)` equals the dense
+    `[earliest, head]` range (invariant 1).
+  - `next_row_id` — the allocator is never behind a range it handed
+    out (invariant 2).
+  - `expiry_floor` — the floor is at or below head and (under
+    `consumer_floor`) at or below every live consumer offset, using
+    ExpiryService's own floor query with the superseded-offset release
+    applied; and no versioned row with
+    `end_snapshot <= earliest_snapshot_id` survives the sweep that
+    advanced the floor (invariant 5).
+  - `visibility_bounds` — every versioned row's `begin`/`end` pair is
+    inside the catalog's snapshot range and correctly ordered, and
+    `hog_table.created_snapshot <= dropped_snapshot` when dropped
+    (invariant 6).
+  - `offset_release` — no consumer offset survives on an incarnation
+    whose lineage successor that same consumer has already reconciled
+    past; such a row can never be advanced and pins the floor forever.
+  - `staging_tickets` — compaction's `compaction_staging` claim-ticket
+    lifecycle: settled `registered` with nothing registered, an
+    undrained ticket older than the staleness bound with no file row,
+    or a ticket drained `absent` whose path IS a file row.
+  - `upload_claims` — the upload-claim state machine: a `registered`
+    claim queued for `trino_upload` reclamation, or an
+    `active`/`abandoned` claim whose path the catalog has registered.
+
+  The JSON report carries per-check status, true violation counts
+  (`count(*)`, never the sample length), samples capped at 20, and
+  each check's own one-paragraph `description` of the invariant it
+  enforces.
 - **`POST /maintenance/rehydrate`** — the operator requeue for the
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
@@ -787,8 +819,23 @@ transaction (`observability/`):
   pending-stats AND failed-stats counts
   (`hoglake_stats_failed_files`), live id-less-file count
   (`hoglake_missing_field_id_files`), live table
-  count, per-consumer lag (cardinality-capped) — plus source-side
-  counters: commits by outcome, snapshots expired, files removed,
+  count, per-consumer lag (cardinality-capped) — plus
+  `hoglake_verify_violations{catalog, check}`, which is NOT sampled:
+  the verify SWEEP pushes each check's true violation count at the end
+  of every pass (0 meaning the check passed) and it stands until the
+  next sweep. A `MultiGauge`, so one sweep replaces the whole row set
+  and a deleted catalog's series retire; and the LOOP alone publishes —
+  a manual trigger on a replica whose loop is off would mint an
+  alerting series nothing ever refreshes. Its companion is
+  `hoglake_verify_errors_total{catalog}`: a catalog whose scan THREW is
+  absent from the gauge (the sweep has no answer for it) and invisible
+  to `hoglake_background_loop_failures_total` (the per-catalog catch
+  means the iteration succeeded), so this counter is the only thing
+  that says a catalog is not being checked at all — alert on
+  `increase(...) > 0` alongside `hoglake_verify_violations > 0`. Plus
+  source-side counters: commits by outcome, snapshots expired (and superseded
+  consumer offsets released, in the sweep's result and audit event),
+  files removed,
   hydrations by result (transient errors counted separately), and the
   `hoglake_commit_lock_wait_seconds` histogram on every commit/DDL/
   maintenance tail (the convoy early-warning). HTTP server metrics
@@ -808,13 +855,41 @@ transaction (`observability/`):
 `App.kt` wires services into Ktor and `startBackground()` runs the
 loops — hydrator, expiry, cleanup, compaction (default off:
 `HOGLAKE_COMPACTION_INTERVAL_MS=0` — flipping it on is an ops
-decision), metrics sampler — as **coroutines under one supervisor
-scope** (`BackgroundLoops`), each with its own interval knob
+decision), **verify** (`HOGLAKE_VERIFY_INTERVAL_MS`, also default
+off: `0`; `<= 0` disables), metrics sampler — as
+**coroutines under one supervisor scope** (`BackgroundLoops`), each
+with its own interval knob
 (`Config.kt`, all env-sourced, `<= 0` disables), per-catalog failure
 isolation (a failed iteration is logged + counted and the loop keeps
 running), and structured, bounded shutdown (cancel + join, 5s cap).
 `Main.kt` = migrate (under an advisory lock, so replicas don't race
 DDL) → assemble → start loops → serve.
+
+The **verify loop** runs `VerifyService.runOnceAllCatalogs()`: one
+report per catalog, recorded in the run ledger with trigger `loop`,
+with per-catalog isolation (a catalog that throws is logged and the
+rest proceed — the loop never throws out of an iteration). A catalog
+whose report FAILS is logged at WARN **once per distinct failing-check
+set**, not once an interval: a violation is a standing state, and the
+unchanged-condition log flood is the lesson compaction's heap-refusal
+warning already learned. Every LOOP sweep publishes
+`hoglake_verify_violations{catalog, check}`, set to the true violation
+count and to 0 on a pass, so an alert keys on `> 0` and a healthy
+catalog is a published zero rather than an absent series. A MANUAL run
+deliberately publishes nothing: the trigger works on every replica,
+including the ones with the loop off, and a one-off run there would
+mint an alerting series that nothing ever refreshes. Series for
+catalogs that vanish retire with the next sweep (`MultiGauge`, whole
+row set replaced), like every other per-catalog gauge.
+
+Like compaction, the interval defaults to **0 — off** and turning it
+on is a per-workload ops decision: in Gigahog the server workload is
+expected to leave it at `0` while the maintenance workload sets
+`3600000`, so the aggregate pass never runs on the pods serving the
+commit tail. That split lives in PostHog/charts and has not landed
+yet; until it does, every workload inherits the default and the sweep
+runs nowhere — the manual trigger still works everywhere. A default of
+an hour here would have run it on every replica instead.
 
 ### Specified, not yet implemented
 

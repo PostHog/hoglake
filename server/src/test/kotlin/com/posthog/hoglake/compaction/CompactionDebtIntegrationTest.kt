@@ -107,7 +107,18 @@ class CompactionDebtIntegrationTest {
         val (name, id) = seed(List(17) { 1024L })
         val first = MaintenanceSummarySampler(db.jdbi, 65536, minFiles, maxFiles, 3600)
         assertThat(first.runOnce(3)).isTrue()
-        val service = MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 65536, minFiles, maxFiles)
+        val service =
+            MaintenanceStatusService(
+                db.jdbi,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                verifyIntervalMs = 0,
+                smallFileThresholdBytes = 65536,
+                minInputFiles = minFiles,
+                maxInputFiles = maxFiles,
+            )
         assertThat(service.status(name).sampledAt).isNull()
         assertThat(db.jdbi.withHandleUnchecked { h -> MaintenanceSummarySampler.read(h, listOf(id)) }).isEmpty()
         // New object, no in-memory carry: state is in Postgres.
@@ -153,7 +164,18 @@ class CompactionDebtIntegrationTest {
                 ).bind("cat", id).mapTo(String::class.java).list().joinToString("\n")
             assertThat(plan).contains("hog_delete_file_data_lookup")
         }
-        val service = MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 65536, minFiles, maxFiles)
+        val service =
+            MaintenanceStatusService(
+                db.jdbi,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                verifyIntervalMs = 0,
+                smallFileThresholdBytes = 65536,
+                minInputFiles = minFiles,
+                maxInputFiles = maxFiles,
+            )
         val start = System.nanoTime()
         assertThat(service.status(name).sampledAt).isNull()
         assertThat(Duration.ofNanos(System.nanoTime() - start)).isLessThan(Duration.ofSeconds(2))
@@ -228,7 +250,18 @@ class CompactionDebtIntegrationTest {
         // the stale sample sits there.
         assertThat(db.jdbi.withHandleUnchecked { MaintenanceSummarySampler.read(it, listOf(id)) })
             .isEmpty()
-        val service = MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 65536, minFiles, maxFiles)
+        val service =
+            MaintenanceStatusService(
+                db.jdbi,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                verifyIntervalMs = 0,
+                smallFileThresholdBytes = 65536,
+                minInputFiles = minFiles,
+                maxInputFiles = maxFiles,
+            )
         assertThat(service.status(name).sampledAt).isNull()
         assertThat(
             PartitionStatsService(db.jdbi, 65536, minFiles, maxFiles).partitionStats(name, null, null, 50).partitions,

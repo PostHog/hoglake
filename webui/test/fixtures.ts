@@ -516,10 +516,15 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       loop: { observed_interval_ms: "68800", last_run_at: "2026-09-11T09:59:30Z", records_every_sweep: true },
     },
     {
+      // Verify has a loop of its own now; this fixture is the gigahog
+      // API pod, which runs it OFF (loop_interval_ms 0) while the
+      // maintenance workload sweeps hourly — so the ledger still shows
+      // no loop runs for this catalog.
       task: "verify",
+      loop_interval_ms: "0",
       last_run: maintenanceRunsFixture[4],
       backlog: {},
-      loop: null,
+      loop: { records_every_sweep: true },
     },
   ],
 };

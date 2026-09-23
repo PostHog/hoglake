@@ -350,7 +350,7 @@ there would break that gate on every build.
   failures 400). New failure modes get a typed exception, not a status
   code sprinkled in a route.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, metrics sampler) registers with
+  expiry, cleanup, compaction, verify, metrics sampler) registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
   `intervalMs <= 0` = disabled; a failed iteration is logged + counted
@@ -571,10 +571,33 @@ there would break that gate on every build.
 - **Maintenance verify — LANDED**: `POST
   /v1/catalogs/{c}/maintenance/verify` (schema-gaps review item B3, absorbing B4) — the
   QE suite's global-invariant SQL as a metadata-only, read-only
-  endpoint (REPEATABLE READ MVCC snapshot, no catalog lock): row-id
-  tiling (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
+  endpoint (REPEATABLE READ MVCC snapshot, no catalog lock), and the
+  same code a background sweep runs. **Eleven** checks: row-id tiling
+  (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
   orphaned live rows on dropped tables, still-referenced removal-queue
-  entries, true snapshot density, next_row_id consistency.
+  entries, true snapshot density, next_row_id consistency,
+  expiry-floor (invariant 5, sharing ExpiryService's own floor clause),
+  versioned-row visibility bounds (invariant 6, over every versioned
+  table), superseded-offset release (#167, asking OffsetRepo's own
+  predicate), compaction staging tickets (#174) and upload claims
+  (#162/#167). Each check carries a one-paragraph `description` of the
+  invariant it enforces; counts are `count(*)` and samples are capped
+  at 20, trimmed round-robin so a composite check's noisiest class
+  cannot crowd out its siblings.
+  The LOOP is `HOGLAKE_VERIFY_INTERVAL_MS`, **default 0 = off** — like
+  compaction, turning it on is a per-workload ops decision, because an
+  aggregate pass over every catalog must not run on the replicas
+  serving the commit tail. A sweep publishes
+  `hoglake_verify_violations{catalog, check}` (MultiGauge, whole row
+  set, so a vanished catalog's series retire) and counts a catalog it
+  could not read in `hoglake_verify_errors_total{catalog}`; a manual
+  trigger publishes neither. A standing violation warns once per
+  distinct failing-check set, not once per sweep.
+  Every path-equality sub-query is registered in
+  `VerifyService.PATH_EQUALITY_QUERIES` and EXPLAINed against a
+  50k-file manifest (`VerifyQueryPlanIntegrationTest`): none of those
+  tables is indexed on `path`, so a query the planner cannot flatten is
+  quadratic and invisible on any fixture-sized catalog.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
   NOT yet in CI and not yet released — no path-scoped workflow, and its

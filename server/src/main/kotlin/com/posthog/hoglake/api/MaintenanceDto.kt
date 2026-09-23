@@ -49,6 +49,15 @@ data class ExpiryResultDto(
     val deleteFilesQueued: Long,
     val newEarliestSnapshotId: Long,
     val flooredByConsumer: String? = null,
+    /**
+     * Superseded consumer offsets the sweep deleted. Optional in the
+     * spec: a ledger row written before the counter existed replays
+     * without it, the same position invalid_data took on
+     * CompactionResult — and it is filled in on read by
+     * [normalizeLedgerResult] so a client generated from the spec does
+     * not meet an absent required field.
+     */
+    val offsetsReleased: Long,
 )
 
 fun ExpiryResult.toDto() =
@@ -58,6 +67,7 @@ fun ExpiryResult.toDto() =
         deleteFilesQueued = deleteFilesQueued,
         newEarliestSnapshotId = newEarliestSnapshotId,
         flooredByConsumer = flooredByConsumer,
+        offsetsReleased = offsetsReleased,
     )
 
 data class CleanupResultDto(
@@ -113,6 +123,23 @@ data class VerifyCheckDto(
     val status: String,
     val violations: Long,
     val samples: List<String>,
+    /**
+     * The invariant this check enforces, one paragraph, in AGENT.md's
+     * own words. Additive: existing consumers ignore it, and a report
+     * read by somebody who has never seen the code still says what was
+     * violated rather than only that something was.
+     *
+     * NULLABLE, and optional in the spec, for one reason: the same
+     * `VerifyCheck` schema describes this response AND the `result`
+     * payload of a `verify` row in the maintenance run ledger, which is
+     * stored raw and replayed verbatim. Ledger rows deliberately carry
+     * no descriptions ([VerifyReport.forLedger] — identical constant
+     * prose in every row), and rows written before the field existed
+     * carry none either. Marking it required would make the spec
+     * contradict every historical row. A LIVE response always fills it.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val description: String?,
 )
 
 data class VerifyReportDto(
@@ -127,6 +154,7 @@ fun VerifyCheck.toDto() =
         status = status,
         violations = violations,
         samples = samples,
+        description = description,
     )
 
 fun VerifyReport.toDto() =
@@ -193,9 +221,15 @@ private fun normalizeLedgerResult(
     task: MaintenanceTask,
     node: JsonNode,
 ): JsonNode {
-    if (task != MaintenanceTask.COMPACTION || !node.isObject) return node
+    if (!node.isObject) return node
+    val added =
+        when (task) {
+            MaintenanceTask.COMPACTION -> COMPACTION_COUNTERS_ADDED_LATER
+            MaintenanceTask.EXPIRY -> EXPIRY_COUNTERS_ADDED_LATER
+            else -> return node
+        }
     val obj = node as ObjectNode
-    for (field in COMPACTION_COUNTERS_ADDED_LATER) {
+    for (field in added) {
         if (!obj.has(field)) obj.put(field, 0L)
     }
     return obj
@@ -207,6 +241,9 @@ private fun normalizeLedgerResult(
  * it to CompactionResult, and never leaves.
  */
 private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data", "heap_budget_exceeded")
+
+/** The same, for ExpiryResult. Append-only for the same reason. */
+private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")
 
 /**
  * What the run ledger observed about a task's loop — fleet-wide, unlike
@@ -225,7 +262,9 @@ data class MaintenanceTaskStatusDto(
     val task: String,
     /**
      * The RESPONDING PROCESS's configured cadence (absent under NON_NULL
-     * for manual-only tasks; 0 = the loop is off IN THIS PROCESS). A
+     * for a task with no loop, of which there are none today; 0 = the
+     * loop is off IN THIS PROCESS, which is how the API workload runs
+     * verify). A
      * deployment may run a task's loop in a different pod from the one
      * serving the API, so a reader must never turn this into "the task
      * is not running" — that is [loop]'s job.

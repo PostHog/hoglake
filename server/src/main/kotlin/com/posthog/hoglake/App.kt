@@ -70,7 +70,15 @@ class App private constructor(
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi)
-    private val verifyService = VerifyService(jdbi)
+    private val verifyService =
+        VerifyService(
+            jdbi,
+            // The two knobs the staging_tickets description quotes: a
+            // report must explain itself against THIS process's config,
+            // never against the defaults.
+            compactionTargetBytes = cfg.compactionTargetBytes,
+            cleanupIntervalMs = cfg.cleanupIntervalMs,
+        )
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
     private val partitionStatsService =
@@ -118,6 +126,7 @@ class App private constructor(
             expiryIntervalMs = cfg.expiryIntervalMs,
             cleanupIntervalMs = cfg.cleanupIntervalMs,
             compactionIntervalMs = cfg.compactionIntervalMs,
+            verifyIntervalMs = cfg.verifyIntervalMs,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
@@ -267,6 +276,13 @@ class App private constructor(
         // Default interval 0 = off for now; the manual trigger stays live.
         loops.register("compaction", cfg.compactionIntervalMs) {
             compactionService.runOnceAllCatalogs()
+        }
+        // Default 0 = off, like compaction: the chart turns it on for the
+        // maintenance workload alone (an hour), because an aggregate pass
+        // over every catalog must not run on the replicas serving the
+        // commit tail. The manual trigger stays live everywhere.
+        loops.register("verify", cfg.verifyIntervalMs) {
+            verifyService.runOnceAllCatalogs()
         }
         loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
         return AutoCloseable {

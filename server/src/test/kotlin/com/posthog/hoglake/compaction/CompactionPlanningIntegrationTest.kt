@@ -398,7 +398,17 @@ class CompactionPlanningIntegrationTest {
         assertThat(stats.partitions.sumOf { it.debtScore }).isEqualTo(planned)
         assertThat(stats.partitions.sumOf { it.smallFileCount }).isEqualTo(41)
         val maintenance =
-            MaintenanceStatusService(db.jdbi, 0, 0, 0, 0, 1024, policy.minInputFiles, policy.maxInputFiles)
+            MaintenanceStatusService(
+                db.jdbi,
+                hydratorIntervalMs = 0,
+                expiryIntervalMs = 0,
+                cleanupIntervalMs = 0,
+                compactionIntervalMs = 0,
+                verifyIntervalMs = 0,
+                smallFileThresholdBytes = 1024,
+                minInputFiles = policy.minInputFiles,
+                maxInputFiles = policy.maxInputFiles,
+            )
 
         fun count(status: com.posthog.hoglake.model.MaintenanceStatus): Long? =
             (

@@ -376,6 +376,48 @@ tr.has-deletes {
   display: inline-block;
   vertical-align: bottom;
 }
+/* -- verify panel --------------------------------------------------------- */
+
+.verify-panel button {
+  margin-top: 4px;
+}
+.verify-report {
+  margin-top: 10px;
+}
+.verify-status {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0 0 6px;
+  font-size: 12px;
+}
+.verify-checks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 8px;
+}
+.verify-check-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  margin: 0;
+  font-size: 12px;
+}
+.verify-check-why {
+  margin: 2px 0 0;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.verify-samples {
+  margin: 4px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  overflow-x: auto;
+}
+
 .backlog-bad {
   color: var(--bad);
 }

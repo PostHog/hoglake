@@ -1,5 +1,6 @@
 package com.posthog.hoglake.observability
 
+import com.posthog.hoglake.model.VerifyReport
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
@@ -12,6 +13,81 @@ import java.util.concurrent.atomic.AtomicLong
 
 /** Instance-wide live-data totals, refreshed by the metrics sampler. */
 data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
+
+/**
+ * `hoglake_verify_violations{catalog, check}` — the violation count of
+ * each check of the last verify SWEEP of each catalog, 0 on a pass, so
+ * an alert keys on `> 0` and a healthy catalog is a published zero
+ * rather than an absent series.
+ *
+ * It lives beside the other per-catalog gauges and is a [MultiGauge]
+ * like them, refreshed with `overwrite = true`: one sweep replaces the
+ * whole row set, so a catalog that has been deleted (or that the sweep
+ * could no longer read) stops emitting instead of freezing its last
+ * value forever. That is the only way a per-catalog series retires, and
+ * it is why this is not a map of individually registered gauges.
+ *
+ * It is NOT part of [CatalogMetrics]'s sample: verify is not samplable.
+ * Its answer costs eleven aggregate queries in a REPEATABLE READ
+ * transaction, which is an hourly sweep's worth of work rather than a
+ * 15-second sampler's, so the value is PUSHED by
+ * `VerifyService.runOnceAllCatalogs` and stands until the next sweep.
+ *
+ * LOOP RUNS ONLY. A manual `POST /maintenance/verify` publishes
+ * nothing. The trigger works on every replica, including the ones whose
+ * loop is off (the API workload runs `HOGLAKE_VERIFY_INTERVAL_MS=0`),
+ * and one manual run there would mint an alerting series that nothing
+ * ever refreshes — a stale nonzero that pages forever, or a stale zero
+ * that says "healthy" about a catalog nobody is checking. Both are
+ * worse than no series.
+ *
+ * A catalog whose sweep THREW is absent from the row set rather than
+ * carrying a stale value: the sweep has no answer for it, and
+ * `hoglake_background_loop_failures_total` plus the ledger's absence of
+ * a run row are what say so.
+ */
+object VerifyGauges {
+    /**
+     * The MultiGauge, and the registry it belongs to. Held as a pair
+     * because `Metrics.bind` can be called again (tests bind a fresh
+     * registry per case) and a MultiGauge registered against the old one
+     * would silently publish into a registry nothing scrapes.
+     */
+    @Volatile
+    private var bound: Pair<MeterRegistry, MultiGauge>? = null
+
+    private fun gauge(): MultiGauge? {
+        val registry = Metrics.boundRegistry ?: return null
+        bound?.let { (bound, gauge) -> if (bound === registry) return gauge }
+        val gauge =
+            MultiGauge.builder("hoglake_verify_violations")
+                .description("Violations found by the last verify sweep, per catalog and check (0 = pass)")
+                .register(registry)
+        bound = registry to gauge
+        return gauge
+    }
+
+    /**
+     * Publish one sweep's whole picture: every (catalog, check) it could
+     * report on, and nothing else.
+     */
+    fun publish(reports: List<Pair<String, VerifyReport>>) {
+        val gauge = gauge() ?: return
+        gauge.register(
+            reports.flatMap { (catalog, report) ->
+                report.checks.map { check ->
+                    MultiGauge.Row.of(Tags.of("catalog", catalog, "check", check.check), check.violations)
+                }
+            },
+            true,
+        )
+    }
+
+    /** Forget the registry binding (tests); never called in production. */
+    fun clear() {
+        bound = null
+    }
+}
 
 /**
  * One catalog's live totals, as of the last metrics sample.

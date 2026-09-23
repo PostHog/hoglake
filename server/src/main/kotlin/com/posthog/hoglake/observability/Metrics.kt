@@ -16,6 +16,15 @@ object Metrics {
     @Volatile
     private var registry: MeterRegistry? = null
 
+    /**
+     * The bound registry, for the one observability surface in this
+     * package that is a GAUGE rather than a counter and is therefore not
+     * served by [increment]: [VerifyGauges]. Internal — nothing outside
+     * observability/ reaches the registry directly.
+     */
+    internal val boundRegistry: MeterRegistry?
+        get() = registry
+
     /** Bind the process registry (App.build). Last bind wins. */
     fun bind(r: MeterRegistry) {
         registry = r
@@ -162,6 +171,22 @@ object Metrics {
      * nonzero value here is storage growing silently.
      */
     fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
+
+    /**
+     * hoglake_verify_errors_total{catalog} — verify sweeps that THREW
+     * for one catalog.
+     *
+     * The verify sweep catches per catalog so one bad catalog cannot
+     * stop the others, which means `hoglake_background_loop_failures_
+     * total` never fires for it — the iteration succeeded. And because
+     * the violation gauge is a MultiGauge refreshed with the sweep's
+     * whole row set, a catalog that throws is simply absent from it:
+     * its series RETIRE, which is correct (the sweep has no answer for
+     * it) and silent (nothing left says so). This counter is the thing
+     * that says so. A standing `increase(...) > 0` is a catalog nobody
+     * is checking, which is worse than a catalog that fails a check.
+     */
+    fun verifyError(catalog: String) = increment("hoglake_verify_errors_total", 1.0, "catalog", catalog)
 
     /** hoglake_background_loop_failures_total{loop} — iterations that threw (loop continued). */
     fun backgroundLoopFailure(loop: String) = increment("hoglake_background_loop_failures_total", 1.0, "loop", loop)

@@ -1,5 +1,6 @@
 package com.posthog.hoglake.model
 
+import com.fasterxml.jackson.annotation.JsonInclude
 import java.time.Instant
 import java.util.UUID
 
@@ -968,6 +969,23 @@ data class ExpiryResult(
     val newEarliestSnapshotId: Long,
     /** Non-null when the consumer floor capped the sweep (page-worthy). */
     val flooredByConsumer: String?,
+    /**
+     * Consumer offsets the sweep DELETED because atomic replacement had
+     * superseded them (OffsetRepo.releaseSupersededOffsets).
+     *
+     * Counted because it is the only work a retention-null catalog's
+     * sweep can do, and an uncounted deletion of consumer positions is
+     * exactly the kind of thing that should never be silent: without it
+     * the run is logged as "nothing to do" and the ledger row says the
+     * sweep changed nothing.
+     *
+     * Defaulted, and `@JsonInclude(NON_DEFAULT)` for the stored-payload
+     * rule: a ledger row written before this counter existed replays
+     * without it, and a rolling deploy has both versions reading each
+     * other's rows.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val offsetsReleased: Long = 0,
 )
 
 /** One compaction run's outcome (POST /maintenance/compact + the loop). */
@@ -1056,13 +1074,26 @@ data class CompactionResult(
  * One invariant check inside a verify run (POST /maintenance/verify).
  * [violations] is the TRUE count; [samples] is capped detail
  * (VerifyService.MAX_SAMPLES) so a badly broken catalog cannot produce
- * an unbounded response.
+ * an unbounded response. [description] states the invariant the check
+ * enforces, in the words of AGENT.md's Invariants section, so a report
+ * read by somebody who has never seen the code still says what was
+ * violated.
+ *
+ * [description] is NULLABLE, and null in exactly one place: the
+ * maintenance run ledger (see [VerifyReport.forLedger]). It is dropped
+ * from the JSON entirely under NON_NULL rather than stored empty,
+ * because a ledger row is replayed verbatim and an empty string would
+ * read as "this check has no invariant" instead of "this row predates
+ * the field" — which is also what a row written before the field
+ * existed looks like, and the two must be indistinguishable.
  */
 data class VerifyCheck(
     val check: String,
     val status: String,
     val violations: Long,
     val samples: List<String>,
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val description: String?,
 )
 
 /** One verify run's report: per-check status + overall rollup. */
@@ -1071,7 +1102,21 @@ data class VerifyReport(
     /** "pass" iff every check passed. */
     val status: String,
     val checks: List<VerifyCheck>,
-)
+) {
+    /**
+     * The same report with every [VerifyCheck.description] dropped, for
+     * `hog_maintenance_run.result`.
+     *
+     * The descriptions are constants: identical prose in every row, for
+     * every catalog, on every sweep — about 8 KB per row against a
+     * payload of a few hundred bytes without them, in a ledger that
+     * keeps a week of hourly runs per catalog. The ledger records what
+     * a run FOUND; what the checks MEAN belongs to the code and to the
+     * live response, and a reader who wants it can ask the spec or run
+     * the endpoint. Storing it would be paying per row for a constant.
+     */
+    fun forLedger(): VerifyReport = copy(checks = checks.map { it.copy(description = null) })
+}
 
 /**
  * One rehydrate request's outcome (POST /maintenance/rehydrate):
@@ -1108,7 +1153,13 @@ data class CleanupResult(
 
 /** The maintenance-task vocabulary (hog_maintenance_run.task's CHECK). */
 enum class MaintenanceTask(
-    /** False for the manual-only task: no background loop ever drives it. */
+    /**
+     * False for a task no background loop ever drives. Every task has
+     * one today — verify gained hers with HOGLAKE_VERIFY_INTERVAL_MS —
+     * but the flag stays, because it is what keeps
+     * MaintenanceRunStore.recentLoopRunsAll from asking for
+     * `run_trigger = 'loop'` rows that cannot exist.
+     */
     val hasLoop: Boolean,
     /**
      * True when EVERY loop sweep records a run row, which is what makes
@@ -1123,7 +1174,11 @@ enum class MaintenanceTask(
     EXPIRY(hasLoop = true, loopRecordsEverySweep = true),
     CLEANUP(hasLoop = true, loopRecordsEverySweep = true),
     COMPACTION(hasLoop = true, loopRecordsEverySweep = true),
-    VERIFY(hasLoop = false, loopRecordsEverySweep = false),
+
+    // Every verify sweep records a row (the runOnceAllCatalogs fan-out
+    // records one per catalog, pass or fail), so the gaps between loop
+    // rows really are the loop's cadence.
+    VERIFY(hasLoop = true, loopRecordsEverySweep = true),
     ;
 
     val wire: String get() = name.lowercase()
@@ -1250,15 +1305,16 @@ data class MaintenanceTaskStatus(
     val task: MaintenanceTask,
     /**
      * The RESPONDING PROCESS's configured cadence; 0 = disabled here,
-     * null = the task has no loop at all (verify). Says nothing about
-     * any other process, so it must not be read as "the task is
-     * disabled" — [loop] is the fleet-wide answer.
+     * null = the task has no loop at all. Every task has one today, so
+     * null now only means an older server. Says nothing about any other
+     * process, so it must not be read as "the task is disabled" —
+     * [loop] is the fleet-wide answer.
      */
     val loopIntervalMs: Long?,
     /** The task's most recent recorded run; null = never recorded. */
     val lastRun: MaintenanceRun?,
     val backlog: MaintenanceBacklog,
-    /** Ledger evidence about the loop; null for a task with no loop. */
+    /** Ledger evidence about the loop; null for a task with no loop (none today). */
     val loop: LoopObservation? = null,
 )
 

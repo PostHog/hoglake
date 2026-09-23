@@ -50,6 +50,7 @@ from .models import (
     Snapshot,
     TableInfo,
     TableSummary,
+    VerifyReport,
     ViewInfo,
 )
 from .ops import AlterOp
@@ -457,6 +458,20 @@ class Catalog:
             "POST", self._path("/maintenance/cleanup"), params={"batch": batch}
         )
         return CleanupResult.from_wire(body)
+
+    def verify(self) -> VerifyReport:
+        """Run the catalog's metadata-only invariant scan and return the
+        report.
+
+        Read-only on the server (one REPEATABLE READ snapshot, no
+        catalog lock), so it never blocks writers, and it takes no
+        batch: the scan is bounded by the checks themselves, which count
+        violations with ``count(*)`` and cap their samples. The server
+        also runs this on a loop, so a report here is the same shape the
+        maintenance run ledger records.
+        """
+        body = self._client._request("POST", self._path("/maintenance/verify"))
+        return VerifyReport.from_wire(body)
 
     # -- consumer offsets --------------------------------------------------
 

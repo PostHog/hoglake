@@ -74,6 +74,25 @@ data class Config(
      */
     val maintenanceLedgerRetentionSeconds: Long =
         env("HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS", "${7L * 24 * 60 * 60}").toLong(),
+    /**
+     * Verify sweep interval; <= 0 disables. Default **0 — OFF**, the
+     * same position compaction takes: the loop belongs to ONE workload,
+     * and which one is an ops decision the chart makes, not a default
+     * every replica inherits.
+     *
+     * The reasoning behind the value the chart sets (one hour on the
+     * maintenance workload): a run is eleven metadata-only aggregate
+     * queries in ONE read-only REPEATABLE READ transaction that takes no
+     * catalog lock, measured at 0.3-1.4 s on dev catalogs including a
+     * 95k-file table. The cadence is therefore chosen against what it
+     * can DETECT rather than what it costs — an invariant violation is a
+     * standing state, a broken row does not heal, so an hour's detection
+     * latency changes nothing an operator can act on. A default of one
+     * hour HERE would have meant every API replica running that
+     * aggregate pass over every catalog against the database that serves
+     * its own commit tail, which is the one place it must not run.
+     */
+    val verifyIntervalMs: Long = env("HOGLAKE_VERIFY_INTERVAL_MS", "0").toLong(),
     /** Catalog-health gauge sample interval; <= 0 disables the sampler loop. */
     val metricsIntervalMs: Long = env("HOGLAKE_METRICS_INTERVAL_MS", "15000").toLong(),
     /**

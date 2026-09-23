@@ -643,6 +643,41 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
+    fun `verify reads a real staging ticket - registered is clean, absent over a live path is not`() {
+        // The ticket here is the one CompactionService minted and settled
+        // itself, over an object it really uploaded and registered: the
+        // #174 lifecycle end to end, not a row this test invented.
+        val fx = fixture(dvOnMiddle = false)
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+        val ticket = removalRows(fx.cat).single()
+        assertThat(ticket.reason).isEqualTo("compaction_staging")
+        assertThat(ticket.drainedOutcome).isEqualTo("registered")
+        assertVerifyPasses(fx.cat)
+
+        // Now the race resolved the wrong way: cleanup settled the ticket
+        // 'absent' — "this object never existed" — while the catalog is
+        // serving reads from the very path it names. The removal ledger is
+        // the only thing that knows that path, so nothing else can see it.
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_file_removal SET drained_outcome = 'absent'
+                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                """,
+            ).bind("cat", fx.cat).execute()
+        }
+        val report = verify.runOnce(fx.cat)
+        assertThat(report.status).isEqualTo("fail")
+        val staging = report.checks.single { it.check == "staging_tickets" }
+        assertThat(staging.violations).isEqualTo(1)
+        assertThat(staging.samples.single())
+            .contains(ticket.path)
+            .contains("was drained 'absent' but the catalog holds a file row")
+        assertThat(report.checks.filter { it.status != "pass" }.map { it.check })
+            .containsExactly("staging_tickets")
+    }
+
+    @Test
     fun `the committed object carries the configured codec, in every column chunk`() {
         // CompactionCodecTest pins the rewriter; CompactionConfigTest pins
         // the env wiring into CompactionConfig. Between them sits the
