@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/pypi/pyversions/pyhoglake)](https://pypi.org/project/pyhoglake/)
 [![Downloads](https://static.pepy.tech/badge/pyhoglake)](https://pepy.tech/project/pyhoglake)
 [![Kotlin](https://img.shields.io/badge/kotlin-2.4-7F52FF?logo=kotlin&logoColor=white)](server/build.gradle.kts)
-[![JDK](https://img.shields.io/badge/JDK-21-orange?logo=openjdk&logoColor=white)](server/build.gradle.kts)
+[![JDK](https://img.shields.io/badge/JDK-25-orange?logo=openjdk&logoColor=white)](server/build.gradle.kts)
 [![Postgres](https://img.shields.io/badge/Postgres-18-4169E1?logo=postgresql&logoColor=white)](server/schema.sql)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/PostHog/hoglake/pulls)
@@ -233,7 +233,7 @@ just dev           # the dev stack plus the server in the foreground
 just --list        # everything, including the per-component recipes
 ```
 
-Requires JDK 21, Docker (the server suite runs Postgres and MinIO through
+Requires JDK 25, Docker (the server suite runs Postgres and MinIO through
 Testcontainers), [uv](https://docs.astral.sh/uv/) for the Python trees, Node
 for the console, and [just](https://github.com/casey/just). Each component
 carries its own recipes — `just server test`, `just pyhoglake unit`,

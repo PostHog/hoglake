@@ -79,7 +79,7 @@ React console, Python replication daemon:
 
 | Component | What | Stack | Tests |
 |---|---|---|---|
-| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.2 / JDK 21 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit5 + Testcontainers (PG18, MinIO) + kotest-property |
+| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.4 / JDK 25 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit 6 + Testcontainers (PG18, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |

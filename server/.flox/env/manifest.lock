@@ -3,8 +3,8 @@
   "manifest": {
     "schema-version": "1.15.0",
     "install": {
-      "jdk21": {
-        "pkg-path": "jdk21"
+      "jdk25": {
+        "pkg-path": "jdk25"
       }
     },
     "hook": {},
@@ -13,91 +13,89 @@
   },
   "packages": [
     {
-      "attr_path": "jdk21",
+      "attr_path": "jdk25",
       "broken": false,
-      "derivation": "/nix/store/d6dc3l6w1w8igb2xz44wp692xd2kvhb6-zulu-ca-jdk-21.0.11.drv",
+      "derivation": "/nix/store/dyh1msql1igysmxa0gr8blj71dwcfv6k-zulu-ca-jdk-25.0.3.drv",
       "description": "Certified builds of OpenJDK",
-      "install_id": "jdk21",
+      "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "name": "zulu-ca-jdk-21.0.11",
-      "pname": "jdk21",
-      "rev": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "rev_count": 1066106,
-      "rev_date": "2026-09-02T02:38:36Z",
-      "scrape_date": "2026-09-04T04:57:47.656048Z",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "name": "zulu-ca-jdk-25.0.3",
+      "pname": "jdk25",
+      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "rev_count": 1077996,
+      "rev_date": "2026-09-22T03:11:10Z",
+      "scrape_date": "2026-09-23T04:58:22.146658Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
-      "version": "21.0.11",
+      "version": "25.0.3",
       "outputs_to_install": [
         "out"
       ],
       "outputs": {
-        "out": "/nix/store/36hja12smabqn4b8vyqh7kp94fszf5qj-zulu-ca-jdk-21.0.11"
+        "out": "/nix/store/cv14k7dgglyhjqlqpcj0rgrqdbsrvg02-zulu-ca-jdk-25.0.3"
       },
       "system": "aarch64-darwin",
       "group": "toplevel",
       "priority": 5
     },
     {
-      "attr_path": "jdk21",
+      "attr_path": "jdk25",
       "broken": false,
-      "derivation": "/nix/store/n3dw9k0cp3h6k4zmg5gsav4xv0r1g0cz-openjdk-21.0.12+8.drv",
+      "derivation": "/nix/store/nlq8cwvbhi0j5fqispdysabshgdd427n-openjdk-25.0.4.1+1.drv",
       "description": "Open-source Java Development Kit",
-      "install_id": "jdk21",
+      "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "name": "openjdk-21.0.12+8",
-      "pname": "jdk21",
-      "rev": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "rev_count": 1066106,
-      "rev_date": "2026-09-02T02:38:36Z",
-      "scrape_date": "2026-09-04T05:29:33.023485Z",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "name": "openjdk-25.0.4.1+1",
+      "pname": "jdk25",
+      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "rev_count": 1077996,
+      "rev_date": "2026-09-22T03:11:10Z",
+      "scrape_date": "2026-09-23T05:30:01.217119Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
-      "version": "21.0.12+8",
+      "version": "25.0.4.1+1",
       "outputs_to_install": [
-        "out",
         "out"
       ],
       "outputs": {
-        "debug": "/nix/store/cdil72w7rp5a5w49xh0vcqdihfzdj4d5-openjdk-21.0.12+8-debug",
-        "out": "/nix/store/sixk04gz0bk9rmbd77fiy60jnsp0zrdf-openjdk-21.0.12+8"
+        "debug": "/nix/store/rnazkz0sv75c1vl81m05kwd5g94my964-openjdk-25.0.4.1+1-debug",
+        "out": "/nix/store/dl7vqkb450hdgn6h5bqa9fx335jzm9d3-openjdk-25.0.4.1+1"
       },
       "system": "aarch64-linux",
       "group": "toplevel",
       "priority": 5
     },
     {
-      "attr_path": "jdk21",
+      "attr_path": "jdk25",
       "broken": false,
-      "derivation": "/nix/store/kqbgfsahwpp6gbp2ba8lkvlkh0a9bj4j-openjdk-21.0.12+8.drv",
+      "derivation": "/nix/store/hz3alqbwnkd7g21l2cs6p9msg3rxa7l1-openjdk-25.0.4.1+1.drv",
       "description": "Open-source Java Development Kit",
-      "install_id": "jdk21",
+      "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "name": "openjdk-21.0.12+8",
-      "pname": "jdk21",
-      "rev": "3ed67ec0a4d3c7ab4ae1f04f8ee8df07bfa506a2",
-      "rev_count": 1066106,
-      "rev_date": "2026-09-02T02:38:36Z",
-      "scrape_date": "2026-09-04T06:06:04.924206Z",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "name": "openjdk-25.0.4.1+1",
+      "pname": "jdk25",
+      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "rev_count": 1077996,
+      "rev_date": "2026-09-22T03:11:10Z",
+      "scrape_date": "2026-09-23T06:06:40.825566Z",
       "stabilities": [
         "unstable"
       ],
       "unfree": false,
-      "version": "21.0.12+8",
+      "version": "25.0.4.1+1",
       "outputs_to_install": [
-        "out",
         "out"
       ],
       "outputs": {
-        "debug": "/nix/store/vk2p43sfpk8fci47v28n1ykf81z111dx-openjdk-21.0.12+8-debug",
-        "out": "/nix/store/ij5q131fzyqw8wh76y9nrj5jl45zviqw-openjdk-21.0.12+8"
+        "debug": "/nix/store/xxr2nx40lqd45winf7k716w4py09krnb-openjdk-25.0.4.1+1-debug",
+        "out": "/nix/store/55y3dbgp7xc1x1c6s0vh8mzf9fprywl2-openjdk-25.0.4.1+1"
       },
       "system": "x86_64-linux",
       "group": "toplevel",
