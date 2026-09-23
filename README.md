@@ -10,7 +10,7 @@
 [![Downloads](https://static.pepy.tech/badge/pyhoglake)](https://pepy.tech/project/pyhoglake)
 [![Kotlin](https://img.shields.io/badge/kotlin-2.4-7F52FF?logo=kotlin&logoColor=white)](server/build.gradle.kts)
 [![JDK](https://img.shields.io/badge/JDK-21-orange?logo=openjdk&logoColor=white)](server/build.gradle.kts)
-[![Postgres](https://img.shields.io/badge/Postgres-16-4169E1?logo=postgresql&logoColor=white)](server/schema.sql)
+[![Postgres](https://img.shields.io/badge/Postgres-18-4169E1?logo=postgresql&logoColor=white)](server/schema.sql)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![PRs welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](https://github.com/PostHog/hoglake/pulls)
 [![Last commit](https://img.shields.io/github/last-commit/PostHog/hoglake)](https://github.com/PostHog/hoglake/commits/main)
