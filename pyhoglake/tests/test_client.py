@@ -935,3 +935,98 @@ def test_changes_truncate_requires_reconciliation(client, httpx_mock):
     with pytest.raises(ReconciliationRequiredError, match="Reconcile") as failure:
         table.changes(3)
     assert failure.value.retryable is False
+
+
+# -- table/column comments and properties (#169) ----------------------------
+
+
+def test_comment_and_properties_ops_wire_shape(client, httpx_mock):
+    t = _table(client, httpx_mock)
+    url = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events/alter"
+    httpx_mock.add_response(
+        method="POST", url=url, json=dict(TABLE_WIRE, snapshot_id=12)
+    )
+    t.alter(
+        [
+            ops.set_table_comment("page views"),
+            ops.set_column_comment("id", "surrogate key"),
+            ops.set_column_comment("name", None),  # None removes
+            ops.set_properties({"owner": "web-analytics", "quality.tier": "gold"}),
+        ]
+    )
+    body = json.loads(httpx_mock.get_requests()[-1].content)
+    assert body == {
+        "ops": [
+            {"op": "set_table_comment", "comment": "page views"},
+            {"op": "set_column_comment", "name": "id", "comment": "surrogate key"},
+            {"op": "set_column_comment", "name": "name", "comment": None},
+            {
+                "op": "set_properties",
+                "properties": {"owner": "web-analytics", "quality.tier": "gold"},
+            },
+        ]
+    }
+
+
+def test_table_comment_and_properties_parse_from_wire(client, httpx_mock):
+    commented = dict(
+        TABLE_WIRE,
+        comment="page views",
+        properties={"owner": "web-analytics"},
+        columns=[
+            dict(TABLE_WIRE["columns"][0], comment="surrogate key"),
+            TABLE_WIRE["columns"][1],  # no comment
+        ],
+    )
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        json=commented,
+    )
+    from pyhoglake.client import Namespace
+
+    t = Namespace(cat, "ns1").table("events")
+    assert t.comment == "page views"
+    assert t.properties == {"owner": "web-analytics"}
+    assert t.columns[0].comment == "surrogate key"
+    assert t.columns[1].comment is None  # absent, not ""
+
+
+def test_table_without_metadata_parses_to_none(client, httpx_mock):
+    t = _table(client, httpx_mock)  # TABLE_WIRE has no comment/properties
+    assert t.comment is None
+    assert t.properties is None
+    assert all(c.comment is None for c in t.columns)
+
+
+def test_comment_ops_client_side_validation():
+    # Over the length cap or containing NUL fails before the round trip.
+    with pytest.raises(ValueError, match="16384"):
+        ops.set_table_comment("x" * 16385)
+    with pytest.raises(ValueError, match="no NUL"):
+        ops.set_table_comment("a\x00b")
+    with pytest.raises(ValueError, match="16384"):
+        ops.set_column_comment("c", "x" * 16385)
+    # Exactly at the cap is fine, and None (remove) skips validation.
+    ops.set_table_comment("x" * 16384)
+    ops.set_table_comment(None)
+    ops.set_column_comment("c", None)
+
+
+def test_set_properties_client_side_validation():
+    with pytest.raises(ValueError, match="at most 100"):
+        ops.set_properties({f"k{i}": "v" for i in range(101)})
+    with pytest.raises(ValueError, match="reserved"):
+        ops.set_properties({"hoglake.internal": "v"})
+    with pytest.raises(ValueError, match="reserved"):
+        ops.set_properties({"comment": "v"})
+    with pytest.raises(ValueError, match="invalid or reserved"):
+        ops.set_properties({"Bad Key": "v"})
+    with pytest.raises(ValueError, match="4096"):
+        ops.set_properties({"k": "v" * 4097})
+    with pytest.raises(ValueError, match="no NUL"):
+        ops.set_properties({"k": "a\x00b"})
+    # A valid set passes, and an empty dict (clear) is valid.
+    ops.set_properties({"owner": "web-analytics", "quality.tier": "gold"})
+    ops.set_properties({})

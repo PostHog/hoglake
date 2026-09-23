@@ -660,6 +660,16 @@ class Table:
     def columns(self):
         return self._info.columns
 
+    @property
+    def comment(self) -> str | None:
+        """The table's versioned comment; None when it has none."""
+        return self._info.comment
+
+    @property
+    def properties(self) -> dict[str, str] | None:
+        """The table's user properties; None when none are set."""
+        return self._info.properties
+
     def _path(self, suffix: str = "") -> str:
         return self._namespace._path(f"/tables/{_seg(self._info.name)}{suffix}")
 

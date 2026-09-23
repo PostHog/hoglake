@@ -11,6 +11,7 @@ Usage::
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -80,3 +81,61 @@ def set_partition_spec(
     """Set the partition spec. An empty list makes the table unpartitioned."""
     wire = [f.to_wire() if isinstance(f, PartitionField) else dict(f) for f in fields]
     return AlterOp("set_partition_spec", {"fields": wire})
+
+
+# Server-side bounds (server/.../service/TableMetadata.kt). Mirrored here
+# so a bad comment or property set fails BEFORE the round trip, with the
+# same message the server would raise. test_metadata_parity.py parses these
+# out of TableMetadata.kt rather than restating them, so a drifted constant
+# fails the suite instead of silently disagreeing with the server.
+_COMMENT_MAX_CHARS = 16384
+_PROPERTIES_MAX = 100
+_PROPERTY_VALUE_MAX_CHARS = 4096
+_PROPERTY_KEY_PATTERN = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+_PROPERTY_KEY_RESERVED_PREFIXES = ("hoglake.", "trino.")
+_PROPERTY_KEY_RESERVED = frozenset(
+    {"partitioning", "sorted_by", "location", "format", "comment"}
+)
+
+
+def _validate_comment(comment: str) -> None:
+    if len(comment) > _COMMENT_MAX_CHARS or "\x00" in comment:
+        raise ValueError("comment must contain at most 16384 characters and no NUL")
+
+
+def _validate_properties(properties: dict[str, str]) -> None:
+    if len(properties) > _PROPERTIES_MAX:
+        raise ValueError("at most 100 custom properties are allowed")
+    for key, value in properties.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            raise TypeError("custom properties require string keys and values")
+        if (
+            not _PROPERTY_KEY_PATTERN.fullmatch(key)
+            or key.startswith(_PROPERTY_KEY_RESERVED_PREFIXES)
+            or key in _PROPERTY_KEY_RESERVED
+        ):
+            raise ValueError(f"invalid or reserved custom property key '{key}'")
+        if len(value) > _PROPERTY_VALUE_MAX_CHARS or "\x00" in value:
+            raise ValueError(
+                "custom property values must contain at most 4096 characters and no NUL"
+            )
+
+
+def set_table_comment(comment: str | None) -> AlterOp:
+    """Set the table comment; ``None`` removes it."""
+    if comment is not None:
+        _validate_comment(comment)
+    return AlterOp("set_table_comment", {"comment": comment})
+
+
+def set_column_comment(name: str, comment: str | None) -> AlterOp:
+    """Set a column's comment; ``None`` removes it. ``name`` is a dotted path."""
+    if comment is not None:
+        _validate_comment(comment)
+    return AlterOp("set_column_comment", {"name": name, "comment": comment})
+
+
+def set_properties(properties: dict[str, str]) -> AlterOp:
+    """Replace the table's properties as a whole; an empty dict clears them."""
+    _validate_properties(properties)
+    return AlterOp("set_properties", {"properties": dict(properties)})
