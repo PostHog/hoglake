@@ -81,6 +81,62 @@ class CommitReceiptApiIntegrationTest {
                     ).status,
                 )
                     .isEqualTo(HttpStatusCode.UnprocessableEntity)
+
+                // A DV whose target was retired since read_snapshot — what
+                // compaction does to a connector's plan — is 409 at the
+                // wire, not the 422 that told it to give up. A target that
+                // was ALREADY dead at read_snapshot stays 422.
+                val second =
+                    json.readTree(
+                        post(
+                            "$base/commit",
+                            """{"appends":[{"namespace":"ns","table":"target",
+                    "files":[{"path":"s3://synthetic/data2","record_count":5,"file_size_bytes":500}]}]}""",
+                        ).bodyAsText(),
+                    )["snapshot_id"].asLong()
+                val retiredAt = second + 1
+                val catalogId =
+                    db.jdbi.withHandle<Long, Exception> { h ->
+                        h.createQuery("SELECT catalog_id FROM hog_catalog WHERE name = 'delete-test'")
+                            .mapTo(Long::class.java).one()
+                    }
+                db.jdbi.useHandle<Exception> { h ->
+                    h.createUpdate(
+                        "INSERT INTO hog_snapshot (catalog_id, snapshot_id, schema_version) " +
+                            "VALUES (:cat, :snapshot, 0)",
+                    ).bind("cat", catalogId).bind("snapshot", retiredAt).execute()
+                    h.createUpdate("UPDATE hog_catalog SET last_snapshot_id = :snapshot WHERE catalog_id = :cat")
+                        .bind("cat", catalogId).bind("snapshot", retiredAt).execute()
+                    h.createUpdate(
+                        "UPDATE hog_data_file SET end_snapshot = :snapshot " +
+                            "WHERE catalog_id = :cat AND path = :path",
+                    ).bind("cat", catalogId).bind("snapshot", retiredAt)
+                        .bind("path", "s3://synthetic/data2").execute()
+                }
+                val fileId =
+                    db.jdbi.withHandle<Long, Exception> { h ->
+                        h.createQuery(
+                            "SELECT data_file_id FROM hog_data_file WHERE catalog_id = :cat AND path = :path",
+                        ).bind("cat", catalogId).bind("path", "s3://synthetic/data2")
+                            .mapTo(Long::class.java).one()
+                    }
+
+                fun deleteAt(
+                    readSnapshot: Long,
+                    dv: String,
+                ) = """{"idempotency_key":"${java.util.UUID.randomUUID()}","read_snapshot":$readSnapshot,
+                    "deletes":[{"namespace":"ns","table":"target","expected_table_uuid":"$uuid","files":[
+                    {"data_file_id":$fileId,"path":"s3://synthetic/$dv","delete_count":1,
+                     "file_size_bytes":100}]}]}"""
+                assertThat(post("$base/commit/deletes/prepared", deleteAt(second, "dv-retired")).status)
+                    .describedAs("live at read_snapshot, retired since")
+                    .isEqualTo(HttpStatusCode.Conflict)
+                assertThat(post("$base/commit/mutations/prepared", deleteAt(second, "dv-retired-m")).status)
+                    .describedAs("same rule on the mutation endpoint")
+                    .isEqualTo(HttpStatusCode.Conflict)
+                assertThat(post("$base/commit/deletes/prepared", deleteAt(retiredAt, "dv-dead")).status)
+                    .describedAs("already dead at read_snapshot")
+                    .isEqualTo(HttpStatusCode.UnprocessableEntity)
             }
         }
     }
@@ -197,6 +253,155 @@ class CommitReceiptApiIntegrationTest {
                             .bind("snapshot", committed).mapTo(Long::class.java).one(),
                     ).isEqualTo(2)
                 }
+            }
+        }
+    }
+
+    /**
+     * /commit/transaction at the WIRE, which nothing covered: the guarded
+     * -targets validation the route enforces, an append+delete transaction
+     * over two tables with a same-commit private delete reference, and the
+     * conflict rule the route depends on — "unchanged" binds the tables
+     * the transaction DELETES from, so an append-only target does not 409
+     * on a concurrent insert.
+     */
+    @Test
+    fun `transaction publishes multi-table DML and guards only its delete targets`() {
+        PgTestSupport.freshDatabase().use { db ->
+            testApplication {
+                application { App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0), db.jdbi).module(this) }
+
+                suspend fun post(
+                    path: String,
+                    body: String,
+                ) = client.post(path) {
+                    contentType(ContentType.Application.Json)
+                    setBody(body)
+                }
+                val base = "/v1/catalogs/txn-test"
+                val json = ObjectMapper()
+                post("/v1/catalogs", """{"name":"txn-test","data_path":"s3://synthetic/"}""")
+                post("$base/namespaces", """{"name":"ns"}""")
+
+                fun uuidOf(body: String) = json.readTree(body)["table_uuid"].asText()
+                val aUuid =
+                    uuidOf(
+                        post(
+                            "$base/namespaces/ns/tables",
+                            """{"name":"a","columns":[{"name":"id","type":"long"}]}""",
+                        ).bodyAsText(),
+                    )
+                val bUuid =
+                    uuidOf(
+                        post(
+                            "$base/namespaces/ns/tables",
+                            """{"name":"b","columns":[{"name":"id","type":"long"}]}""",
+                        ).bodyAsText(),
+                    )
+                val seeded =
+                    json.readTree(
+                        post(
+                            "$base/commit",
+                            """{"appends":[{"namespace":"ns","table":"a","files":[
+                    {"path":"s3://synthetic/a-old","record_count":7,"file_size_bytes":700}]}]}""",
+                        ).bodyAsText(),
+                    )["snapshot_id"].asLong()
+
+                assertThat(json.readTree(client.get(base).bodyAsText())["capabilities"].map { it.asText() })
+                    .contains("atomic-dml-transactions-v1")
+
+                // Guarded-targets validation: every one of these is a 422
+                // before any work happens.
+                val guardFailures =
+                    listOf(
+                        """{"read_snapshot":$seeded,"appends":[{"namespace":"ns","table":"b",
+                    "expected_table_uuid":"$bUuid","files":[]}]}""",
+                        """{"idempotency_key":"${java.util.UUID.randomUUID()}","appends":[{"namespace":"ns",
+                    "table":"b","expected_table_uuid":"$bUuid","files":[]}]}""",
+                        """{"idempotency_key":"${java.util.UUID.randomUUID()}","read_snapshot":$seeded,
+                    "appends":[{"namespace":"ns","table":"b","files":[
+                    {"path":"s3://synthetic/unguarded","record_count":1,"file_size_bytes":100}]}]}""",
+                        """{"idempotency_key":"${java.util.UUID.randomUUID()}","read_snapshot":$seeded,
+                    "deletes":[{"namespace":"ns","table":"a","files":[
+                    {"data_file_id":1,"path":"s3://synthetic/dv-unguarded","delete_count":1,
+                     "file_size_bytes":100}]}]}""",
+                    )
+                for (body in guardFailures) {
+                    assertThat(post("$base/commit/transaction", body).status)
+                        .describedAs(body)
+                        .isEqualTo(HttpStatusCode.UnprocessableEntity)
+                }
+                assertThat(json.readTree(client.get(base).bodyAsText())["head_snapshot_id"].asLong())
+                    .isEqualTo(seeded)
+
+                // A concurrent INSERT into b, which the transaction below
+                // only APPENDS to. Under the old rule this alone made every
+                // append-only transaction on b a 409.
+                post(
+                    "$base/commit",
+                    """{"appends":[{"namespace":"ns","table":"b","files":[
+                    {"path":"s3://synthetic/b-concurrent","record_count":3,"file_size_bytes":300}]}]}""",
+                )
+
+                val key = java.util.UUID.randomUUID()
+                val transaction = """{"idempotency_key":"$key","read_snapshot":$seeded,
+                    "appends":[
+                      {"namespace":"ns","table":"a","expected_table_uuid":"$aUuid","files":[
+                        {"path":"s3://synthetic/a-new","record_count":4,"file_size_bytes":400}]},
+                      {"namespace":"ns","table":"b","expected_table_uuid":"$bUuid","files":[
+                        {"path":"s3://synthetic/b-new","record_count":5,"file_size_bytes":500}]}],
+                    "deletes":[{"namespace":"ns","table":"a","expected_table_uuid":"$aUuid","files":[
+                      {"data_file_id":1,"path":"s3://synthetic/dv-a","delete_count":2,"file_size_bytes":100},
+                      {"data_file_id":0,"data_file_path":"s3://synthetic/a-new",
+                       "path":"s3://synthetic/dv-staged","delete_count":1,"file_size_bytes":100}]}]}"""
+                val result = post("$base/commit/transaction", transaction)
+                assertThat(result.status).isEqualTo(HttpStatusCode.OK)
+                val committed = json.readTree(result.bodyAsText())["snapshot_id"].asLong()
+                assertThat(json.readTree(post("$base/commit/transaction", transaction).bodyAsText())["snapshot_id"])
+                    .isEqualTo(json.readTree(result.bodyAsText())["snapshot_id"])
+                assertThat(json.readTree(client.get("$base/commit/receipts/$key").bodyAsText())["snapshot_id"].asLong())
+                    .isEqualTo(committed)
+
+                // Both tables moved, in one snapshot, including the delete
+                // against a file this very commit staged.
+                assertThat(
+                    json.readTree(client.get("$base/namespaces/ns/tables/a").bodyAsText())["record_count"].asLong(),
+                ).isEqualTo(11)
+                assertThat(
+                    json.readTree(client.get("$base/namespaces/ns/tables/b").bodyAsText())["record_count"].asLong(),
+                ).isEqualTo(8)
+                db.jdbi.useHandle<Exception> { h ->
+                    assertThat(
+                        h.createQuery(
+                            """
+                            SELECT COUNT(*) FROM hog_delete_file d
+                            JOIN hog_catalog c ON c.catalog_id = d.catalog_id
+                            WHERE c.name = 'txn-test' AND d.begin_snapshot = :s AND d.end_snapshot IS NULL
+                            """,
+                        ).bind("s", committed).mapTo(Long::class.java).one(),
+                    ).isEqualTo(2)
+                }
+
+                // The other half of the rule: an INSERT into the DELETE
+                // target a since the read snapshot IS a conflict.
+                post(
+                    "$base/commit",
+                    """{"appends":[{"namespace":"ns","table":"a","files":[
+                    {"path":"s3://synthetic/a-concurrent","record_count":1,"file_size_bytes":100}]}]}""",
+                )
+                val stale = """{"idempotency_key":"${java.util.UUID.randomUUID()}","read_snapshot":$committed,
+                    "appends":[{"namespace":"ns","table":"b","expected_table_uuid":"$bUuid","files":[
+                      {"path":"s3://synthetic/b-later","record_count":1,"file_size_bytes":100}]}],
+                    "deletes":[{"namespace":"ns","table":"a","expected_table_uuid":"$aUuid","files":[]}]}"""
+                assertThat(post("$base/commit/transaction", stale).status).isEqualTo(HttpStatusCode.Conflict)
+
+                // Append-only on the same read snapshot, with a concurrent
+                // insert into its own target, still publishes.
+                val appendOnly = """{"idempotency_key":"${java.util.UUID.randomUUID()}",
+                    "read_snapshot":$committed,
+                    "appends":[{"namespace":"ns","table":"a","expected_table_uuid":"$aUuid","files":[
+                      {"path":"s3://synthetic/a-append-only","record_count":2,"file_size_bytes":200}]}]}"""
+                assertThat(post("$base/commit/transaction", appendOnly).status).isEqualTo(HttpStatusCode.OK)
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.posthog.hoglake
 
 import com.fasterxml.jackson.databind.exc.InvalidNullException
+import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException
 import com.fasterxml.jackson.module.kotlin.readValue
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
@@ -40,6 +41,27 @@ class WireJsonTest {
         val json = wireObjectMapper().writeValueAsString(Probe(Instant.EPOCH, "x"))
         assertThat(json).contains(""""some_name":"x"""")
         assertThat(json).doesNotContain("absent")
+    }
+
+    @Test
+    fun `request parsing is strict and stored payloads are lenient about unknown properties`() {
+        // The rolling-deploy hazard: a receipt written by a NEWER replica
+        // carries a field this version has never heard of. Decoding it with
+        // the request mapper throws inside the commit tail, under the
+        // catalog lock, and the replay contract becomes a 500.
+        val withUnknown = """{"started_at":"1970-01-01T00:00:00Z","some_name":"x","future_field":7}"""
+        assertThatThrownBy { wireObjectMapper().readValue<Probe>(withUnknown) }
+            .isInstanceOf(UnrecognizedPropertyException::class.java)
+        assertThat(storedPayloadObjectMapper().readValue<Probe>(withUnknown).someName).isEqualTo("x")
+    }
+
+    @Test
+    fun `mappers are shared instances, not rebuilt per call`() {
+        // commitFingerprint built a fresh mapper — and paid its Kotlin
+        // module scan — on every idempotent commit.
+        assertThat(wireObjectMapper()).isSameAs(wireObjectMapper())
+        assertThat(storedPayloadObjectMapper()).isSameAs(storedPayloadObjectMapper())
+        assertThat(storedPayloadObjectMapper()).isNotSameAs(wireObjectMapper())
     }
 
     @Test

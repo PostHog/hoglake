@@ -59,6 +59,10 @@ object HogSchemaColumns {
                 setOf(
                     "catalog_id", "table_id", "table_uuid", "created_snapshot",
                     "dropped_snapshot", "next_field_id",
+                    // V14: the recorded replacement edge, written by
+                    // TableRepo.insertTable and read by
+                    // OffsetRepo.releaseSupersededOffsets.
+                    "replaced_table_id",
                 ),
             // TableRepo versioned-name mappers, CommitService.resolveLiveTable.
             "hog_table_version" to

@@ -610,7 +610,10 @@ class CommitDeletesAndPartitionsTest {
         }.isInstanceOf(HoglakeException.Validation::class.java)
             .hasMessageContaining("duplicate delete target")
 
-        // Dead (end-snapshotted) data file.
+        // Dead data file, split by WHEN it died. A snapshot 2 to retire it
+        // into (an innocuous non-table change, so the rollup below is
+        // untouched), then the same dead file read from either side of it.
+        seedChange(fx.catalogId, "namespace_created", 0)
         jdbi.useHandle<Exception> { h ->
             h.createUpdate(
                 """
@@ -619,10 +622,22 @@ class CommitDeletesAndPartitionsTest {
                 """,
             ).bind(0, fx.catalogId).execute()
         }
+        // Live at read snapshot 1, retired at 2: a lost race (compaction is
+        // the common cause), retryable. 422 here told the connector to give
+        // up on a DELETE that one retry would have published.
         assertThatThrownBy {
             service.commit(
                 "cat",
                 CommitRequest(readSnapshot = 1, deletes = listOf(deletes("events", del(1, 1)))),
+            )
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("retired at snapshot 2")
+
+        // Already dead AT read snapshot 2: the request is simply wrong.
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(readSnapshot = 2, deletes = listOf(deletes("events", del(1, 1)))),
             )
         }.isInstanceOf(HoglakeException.Validation::class.java)
             .hasMessageContaining("no longer live")

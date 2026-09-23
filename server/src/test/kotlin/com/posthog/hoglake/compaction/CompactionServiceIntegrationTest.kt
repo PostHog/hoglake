@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NullOrder
 import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
@@ -21,7 +22,10 @@ import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.RemovalStore
+import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.ScanService
+import com.posthog.hoglake.service.TableCreationDefinition
+import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
@@ -40,6 +44,7 @@ import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -48,6 +53,7 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 import org.testcontainers.containers.MinIOContainer
 import java.nio.file.Files
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -71,6 +77,7 @@ class CompactionServiceIntegrationTest {
     private val alter = AlterService(db.jdbi)
     private val scans = ScanService(db.jdbi)
     private val verify = VerifyService(db.jdbi)
+    private val creations = TableCreationService(db.jdbi, catalogs, commits)
     private val counter = AtomicInteger(0)
 
     // KB-scale target for the test fixtures' parquet files (~0.7-1 KiB
@@ -1209,6 +1216,269 @@ class CompactionServiceIntegrationTest {
         assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
             .isEqualTo(CompactionService.GroupOutcome.SkippedConflict)
         assertThat(catalogs.getCatalog(fx.cat).headSnapshotId).isEqualTo(headBefore)
+    }
+
+    // ---- compaction vs. guarded DML ----------------------------------------
+    //
+    // Compaction publishes a 'table_compacted' change per group, and on a
+    // busy production table it publishes one every couple of minutes. #161
+    // counted that as a read-set conflict for guarded mutations, so any
+    // UPDATE or MERGE whose read-to-publish window outlived one compaction
+    // interval retried into the next compaction forever. These drive a REAL
+    // compaction between a writer's read and its publish.
+
+    /** A guarded append registering one real parquet file. */
+    private fun guardedAppend(
+        cat: String,
+        name: String,
+    ): Pair<TableAppend, Long> {
+        val rows = (100L until 105L).map { TestRow(it, "late-$it", it.toDouble()) }
+        val bytes = parquetBytes(rows)
+        val path = "s3://$BUCKET/$cat/data/ns/t/$name.parquet"
+        store.put(path, bytes)
+        val append =
+            TableAppend(
+                "ns",
+                "t",
+                listOf(FileRegistration(path, rows.size.toLong(), bytes.size.toLong())),
+                catalogs.getTable(cat, "ns", "t").tableUuid,
+            )
+        val snapshot = commits.commit(cat, CommitRequest(appends = listOf(append))).snapshotId
+        val fileId =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT f.data_file_id FROM hog_data_file f
+                    JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                    WHERE c.name = :cat AND f.path = :path
+                    """,
+                ).bind("cat", cat).bind("path", path).mapTo(Long::class.java).one()
+            }
+        return append to fileId
+    }
+
+    /** The /commit/mutations/prepared shape: guarded, idempotent, read-set protected. */
+    private fun preparedMutation(
+        cat: String,
+        readSnapshot: Long,
+        dataFileId: Long,
+        dvName: String,
+        positions: List<Long>,
+    ): CommitRequest {
+        val dvBytes = PuffinTestFiles.deletionVector(positions)
+        val dvPath = "s3://$BUCKET/$cat/dv/$dvName.puffin"
+        store.put(dvPath, dvBytes)
+        return CommitRequest(
+            readSnapshot = readSnapshot,
+            deletes =
+                listOf(
+                    TableDeletes(
+                        "ns",
+                        "t",
+                        listOf(
+                            DeleteFileRegistration(
+                                dataFileId,
+                                dvPath,
+                                positions.size.toLong(),
+                                dvBytes.size.toLong(),
+                            ),
+                        ),
+                        catalogs.getTable(cat, "ns", "t").tableUuid,
+                    ),
+                ),
+            idempotencyKey = UUID.randomUUID(),
+            requireUnchangedTables = true,
+        )
+    }
+
+    @Test
+    fun `a prepared mutation on a file compaction did not touch survives the compaction`() {
+        val fx = fixture(dvOnMiddle = false)
+        val group = svc.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        // f4 lands after planning, so compaction rewrites f1..f3 and leaves it alone.
+        val (_, lateFileId) = guardedAppend(fx.cat, "f4")
+        val readSnapshot = catalogs.getCatalog(fx.cat).headSnapshotId
+
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isInstanceOf(CompactionService.GroupOutcome.Committed::class.java)
+        val compactionSnap = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(compactionSnap).isGreaterThan(readSnapshot)
+
+        val request = preparedMutation(fx.cat, readSnapshot, lateFileId, "f4", listOf(0L, 2L))
+        val published = commits.commit(fx.cat, request)
+        assertThat(published.snapshotId).isGreaterThan(compactionSnap)
+        // Replay is unaffected, and the vector is live on the untouched file.
+        assertThat(commits.commit(fx.cat, request)).isEqualTo(published)
+        val scan = scans.planScan(fx.cat, "ns", "t").single { it.dataFile.dataFileId == lateFileId }
+        assertThat(scan.deleteFile?.deleteCount).isEqualTo(2)
+        assertVerifyPasses(fx.cat)
+    }
+
+    @Test
+    fun `a prepared mutation on a file compaction retired is a conflict not a validation failure`() {
+        val fx = fixture(dvOnMiddle = false)
+        val group = svc.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        val readSnapshot = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isInstanceOf(CompactionService.GroupOutcome.Committed::class.java)
+        val compactionSnap = catalogs.getCatalog(fx.cat).headSnapshotId
+
+        // 409, not 422: the file WAS live at read_snapshot, so re-reading and
+        // re-publishing against the compaction output is the writer's fix.
+        // 422 told the connector its DELETE was malformed and to give up.
+        assertThatThrownBy {
+            commits.commit(fx.cat, preparedMutation(fx.cat, readSnapshot, fx.fileIds[0], "retired", listOf(0L)))
+        }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("retired at snapshot $compactionSnap")
+        assertThat(catalogs.getCatalog(fx.cat).headSnapshotId).isEqualTo(compactionSnap)
+        assertVerifyPasses(fx.cat)
+    }
+
+    @Test
+    fun `an append-only transaction survives a concurrent insert and a compaction group`() {
+        val fx = fixture(dvOnMiddle = false)
+        val group = svc.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        val readSnapshot = catalogs.getCatalog(fx.cat).headSnapshotId
+
+        // Both things an append-only transaction must tolerate: another
+        // writer's INSERT into its own target table, and a compaction of it.
+        guardedAppend(fx.cat, "concurrent")
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isInstanceOf(CompactionService.GroupOutcome.Committed::class.java)
+        val head = catalogs.getCatalog(fx.cat).headSnapshotId
+
+        val rows = (200L until 203L).map { TestRow(it, "txn-$it", it.toDouble()) }
+        val bytes = parquetBytes(rows)
+        val path = "s3://$BUCKET/${fx.cat}/data/ns/t/txn.parquet"
+        store.put(path, bytes)
+        // The /commit/transaction shape: requireUnchangedTables is set
+        // unconditionally by the route, but with no deletes it binds nothing.
+        val request =
+            CommitRequest(
+                readSnapshot = readSnapshot,
+                appends =
+                    listOf(
+                        TableAppend(
+                            "ns",
+                            "t",
+                            listOf(FileRegistration(path, rows.size.toLong(), bytes.size.toLong())),
+                            catalogs.getTable(fx.cat, "ns", "t").tableUuid,
+                        ),
+                    ),
+                idempotencyKey = UUID.randomUUID(),
+                requireUnchangedTables = true,
+                allowPendingDeletes = true,
+            )
+        val published = commits.commit(fx.cat, request)
+        assertThat(published.snapshotId).isGreaterThan(head)
+        assertThat(commits.commit(fx.cat, request)).isEqualTo(published)
+        // The transaction's file is LIVE and scannable beside the
+        // compaction output and the concurrent insert — not merely admitted.
+        val scanned = scans.planScan(fx.cat, "ns", "t")
+        assertThat(scanned.map { it.dataFile.path }).contains(path)
+        val txnFile = scanned.single { it.dataFile.path == path }
+        assertThat(txnFile.dataFile.recordCount).isEqualTo(rows.size.toLong())
+        assertThat(txnFile.deleteFile).isNull()
+        assertThat(catalogs.getTable(fx.cat, "ns", "t").recordCount).isEqualTo(23)
+        assertVerifyPasses(fx.cat)
+    }
+
+    @Test
+    fun `a guarded table replacement survives a compaction of the incarnation it retires`() {
+        val fx = fixture(dvOnMiddle = false)
+        val group = svc.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        val target = catalogs.getTable(fx.cat, "ns", "t")
+        val prepared =
+            creations.prepare(
+                fx.cat,
+                UUID.randomUUID(),
+                TableCreationDefinition(
+                    "ns",
+                    "t",
+                    listOf(ColumnDef("id", ColType.LONG, nullable = false)),
+                    ReplacementTarget(target.tableUuid, catalogs.getCatalog(fx.cat).headSnapshotId),
+                ),
+            )
+
+        // The window a real upload spends writing parquet is longer than
+        // one compaction interval on a busy table. The guard used to count
+        // 'table_compacted' as a target change and burn the receipt
+        // DURABLY — rejected/target_changed, which a retry cannot undo.
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isInstanceOf(CompactionService.GroupOutcome.Committed::class.java)
+
+        val receipt = creations.publish(fx.cat, prepared.operationId, emptyList())
+        assertThat(receipt.state).isEqualTo("committed")
+        assertThat(receipt.reason).isNull()
+        val replaced = catalogs.getTable(fx.cat, "ns", "t")
+        assertThat(replaced.tableUuid).isEqualTo(prepared.tableUuid).isNotEqualTo(target.tableUuid)
+        assertThat(replaced.recordCount).isZero()
+        assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()
+        assertVerifyPasses(fx.cat)
+    }
+
+    /**
+     * The whole retry loop the 409 exists to make possible: a DELETE
+     * targeting a file compaction retires must be re-readable against the
+     * compaction OUTPUT and land there, with the rows actually gone. A 422
+     * ended this story at step two.
+     */
+    @Test
+    fun `a delete refused for a retired target re-reads against the output and still deletes the rows`() {
+        val fx = fixture(dvOnMiddle = false)
+        val group = svc.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        val readSnapshot = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isInstanceOf(CompactionService.GroupOutcome.Committed::class.java)
+
+        assertThatThrownBy {
+            commits.commit(fx.cat, preparedMutation(fx.cat, readSnapshot, fx.fileIds[1], "stale", listOf(0L)))
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+
+        // Re-read at the compaction snapshot: one output file carrying the
+        // same rows, with row ids preserved (invariant 2). Row id 5 — f2's
+        // first row, the one the refused vector aimed at — is at whatever
+        // position the sorted output put it.
+        val output = scans.planScan(fx.cat, "ns", "t").single()
+        val outputRowIds = readRowIds(store.get(output.dataFile.path))
+        val position = outputRowIds.indexOf(5L).toLong()
+        assertThat(position).isNotNegative()
+
+        val retry =
+            preparedMutation(
+                fx.cat,
+                catalogs.getCatalog(fx.cat).headSnapshotId,
+                output.dataFile.dataFileId,
+                "retry",
+                listOf(position),
+            )
+        commits.commit(fx.cat, retry)
+
+        val rescan = scans.planScan(fx.cat, "ns", "t").single()
+        assertThat(rescan.deleteFile?.deleteCount).isEqualTo(1)
+        // And a later compaction MATERIALIZES that deletion: pair the
+        // output with one more file (a group needs two) and rewrite. Row
+        // id 5 is gone from the bytes for good; every other id survives.
+        val (_, lateFileId) = guardedAppend(fx.cat, "after-retry")
+        val lateRowIds =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT f.row_id_start, f.record_count FROM hog_data_file f
+                    JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                    WHERE c.name = :cat AND f.data_file_id = :id
+                    """,
+                ).bind("cat", fx.cat).bind("id", lateFileId)
+                    .map { rs, _ -> rs.getLong(1) until (rs.getLong(1) + rs.getLong(2)) }
+                    .one()
+            }
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+        val compacted = catalogs.listFiles(fx.cat, "ns", "t").single()
+        assertThat(readRowIds(store.get(compacted.path)))
+            .containsExactlyInAnyOrderElementsOf(outputRowIds.filter { it != 5L } + lateRowIds)
+        assertThat(scans.planScan(fx.cat, "ns", "t").single().deleteFile).isNull()
+        assertVerifyPasses(fx.cat)
     }
 
     // ---- staging-ticket lifecycle ------------------------------------------

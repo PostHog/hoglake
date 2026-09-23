@@ -1548,7 +1548,10 @@ paths:
     post:
       operationId: renewUploads
       summary: Extend active claims for an owner by 24 hours
-      description: Never revives an abandoned or registered claim; serializes with expiry and publication.
+      description: >
+        Never revives an abandoned or registered claim: the state predicate is
+        re-evaluated after any row-lock wait, so it serializes with expiry and
+        publication without taking the per-catalog commit lock.
       parameters: [{ $ref: "#/components/parameters/catalog" }]
       requestBody:
         required: true
@@ -1594,19 +1597,29 @@ paths:
       operationId: scheduleExpiredUploads
       summary: Explicitly fence expired uploads and queue abandoned paths for cleanup
       description: >
-        No background job invokes this endpoint. Under the catalog commit lock,
-        expired active claims become abandoned and abandoned paths are queued for
-        the existing retained-reference-aware cleanup drain. No bucket scan occurs.
-        Tombstones remain permanent and later invocations revisit abandoned paths
-        so PUTs finishing after an earlier DELETE remain reclaimable. Selection is
-        bounded and rotates by last scheduling time. This never deletes an object
-        itself; existing cleanup triggers and configuration still control draining.
+        No background job invokes this endpoint. Expired active claims become
+        abandoned and abandoned paths are queued for the existing
+        retained-reference-aware cleanup drain. No bucket scan occurs, and no
+        catalog commit lock is taken: each fence is one state-checking UPDATE, so
+        a claim a concurrent publication settled is left alone. A path a data or
+        deletion-vector file row already claims is never queued. Tombstones remain
+        permanent and later invocations revisit abandoned paths so PUTs finishing
+        after an earlier DELETE remain reclaimable, but a tombstone rests for the
+        drained-ledger retention between offers rather than being revisited on
+        every call. Selection is bounded and rotates by last scheduling time. This
+        never deletes an object itself; existing cleanup triggers and configuration
+        still control draining. The `scheduled` count is how many claims this call
+        actually FENCED, not how many it considered: a candidate that a concurrent
+        publication settled, or that a renewal extended, is left alone and is not
+        counted. A rested tombstone whose path a data or deletion-vector file row
+        still references IS re-fenced and counted, but queues nothing - the count
+        is claims fenced, never paths queued.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 10000, default: 1000 } }
       responses:
         "200":
-          description: Number of claims examined and fenced or rescheduled
+          description: Number of claims actually fenced (see the description)
           content:
             application/json:
               schema: { type: object, properties: { scheduled: { type: integer } } }
@@ -1653,9 +1666,20 @@ paths:
       operationId: commitTransaction
       summary: Publish a multi-table DML transaction atomically
       description: >
-        Requires atomic-dml-transactions-v1. Every target requires expected_table_uuid;
-        all target tables must be unchanged since read_snapshot, including append-only
-        targets. Optional data_file_path deletion references address exactly one
+        Requires atomic-dml-transactions-v1. Every target requires expected_table_uuid.
+        Tables this transaction DELETES from must be unchanged since read_snapshot
+        (inserts, deletes and DDL all conflict); a table it only appends to conflicts
+        with DDL alone, so an append-only transaction does not conflict with a
+        concurrent insert into its targets. A statement that READ a table but
+        produced no deletion vector for it (a MERGE or UPDATE whose predicate
+        matched nothing) MUST therefore still send a delete group for that table
+        with an empty files list, exactly as commitPreparedMutation documents, or
+        it keeps no read-set protection. Compaction never conflicts: it changes
+        which files back a table, never which rows are visible in it - but a
+        deletion vector whose target data file was retired since read_snapshot
+        by compaction or another commit is a 409 (it was a 422 before this
+        contract), so re-read and re-publish against the compaction output. Optional
+        data_file_path deletion references address exactly one
         same-table append in this commit, with data_file_id zero. Numeric references
         retain ordinary snapshot visibility and vector-growth checks. Upload claims,
         all file registrations and the full-payload receipt commit in one catalog-locked
@@ -1681,7 +1705,15 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Commit conflict
+          description: >
+            Commit conflict: a delete-target table changed since
+            read_snapshot, a DDL change on any touched table, a table
+            incarnation mismatch, or a targeted data file that was live at
+            read_snapshot and has since been retired (by compaction or
+            another commit). All are retryable after re-reading. Expiry is
+            NOT among them: for expiry to have removed a file live at
+            read_snapshot, read_snapshot must be below the floor, and the
+            floor guard returns 410 before any per-file check runs.
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -1732,9 +1764,13 @@ paths:
         Requires idempotent-mutation-v1, idempotency_key, read_snapshot and non-empty
         deletes with expected_table_uuid on every delete and append group. A delete
         group with an empty files list anchors insert-only and zero-row mutations.
-        Appends and deletion vectors publish together in one snapshot. Every target
-        table must be unchanged since read_snapshot, including inserts, deletes,
-        compaction and DDL. Unrelated table changes do not conflict. Full-payload
+        Appends and deletion vectors publish together in one snapshot. Every DELETE
+        target table must be unchanged since read_snapshot, including inserts,
+        deletes and DDL; a table this request only appends to conflicts with DDL
+        alone. Compaction never conflicts — it changes which files back a table, not
+        which rows are visible in it — but a deletion vector whose target file
+        compaction retired since read_snapshot is a 409, not a 422. Unrelated table
+        changes do not conflict. Full-payload
         replay, including the stronger conflict contract, returns the original result
         before current-state validation. A changed payload is rejected. Missing
         receipts do not fence in-flight publication; preserve uploads on unknown
@@ -1757,7 +1793,15 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Commit conflict
+          description: >
+            Commit conflict: a guarded delete target changed since
+            read_snapshot, a DDL change on a touched table, a table
+            incarnation mismatch, or a targeted data file that was live at
+            read_snapshot and has since been retired (by compaction or
+            another commit). All are retryable after re-reading. Expiry is
+            NOT among them: for expiry to have removed a file live at
+            read_snapshot, read_snapshot must be below the floor, and the
+            floor guard returns 410 before any per-file check runs.
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2005,8 +2049,12 @@ paths:
       summary: >
         Every consumer in the catalog with its per-table offsets, table
         names resolved (a dropped table keeps its last name and is
-        flagged — offsets outlive drops so consumers see incarnation
-        changes). Ordered by consumer id, then namespace.table.
+        flagged — offsets outlive a plain drop so consumers see
+        incarnation changes). A row on an incarnation that atomic
+        REPLACEMENT retired is the exception: it is deleted once that
+        consumer commits on the replacing incarnation at or past the
+        replacement snapshot, so such rows disappear from this listing.
+        Ordered by consumer id, then namespace.table.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
       responses:
@@ -2056,6 +2104,17 @@ paths:
       summary: >
         Commit a consumer offset. Monotonic: a snapshot below the stored
         offset is rejected with 409.
+
+        Committing at or past an incarnation's creation snapshot also
+        DELETES this caller's offset rows on the incarnations that one
+        replaced, transitively along the replacement chain, in the same
+        transaction. Reaching the successor is the caller's own statement
+        that it reconciled across the replacement, and a row on a retired
+        incarnation can never be advanced again by anyone — on a
+        consumer_floor catalog it would pin snapshot expiry forever. Only
+        this consumer's rows are touched; another consumer that has not
+        reconciled keeps its position. The deleted rows stop appearing in
+        listConsumers.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/consumer" }
@@ -3665,8 +3724,10 @@ components:
             namespace_created/dropped, table_created/dropped/altered,
             table_inserted_into, table_deleted_from, table_compacted
             (a maintenance rewrite — object_id is the table; never a
-            conflict for appenders and its files never enter the
-            changefeed), view_created/dropped.
+            conflict for any writer, guarded or not, since it changes
+            which files back a table and not which rows are visible in
+            it, and its files never enter the changefeed),
+            view_created/dropped.
           items:
             type: object
             required: [kind, object_id]

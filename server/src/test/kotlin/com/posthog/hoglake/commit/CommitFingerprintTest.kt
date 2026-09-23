@@ -98,4 +98,27 @@ class CommitFingerprintTest {
             ) + changedFiles.map { request.copy(appends = listOf(append.copy(files = listOf(it)))) }
         changedRequests.forEach { assertThat(commitFingerprint(it)).isNotEqualTo(original) }
     }
+
+    /**
+     * Defaulted booleans are omitted from the stored payload. A receipt
+     * that spells out every default is a receipt an OLDER replica cannot
+     * decode during a rolling deploy, and the field it spelled out —
+     * require_unchanged_tables — is on every guarded receipt in dev.
+     */
+    @Test
+    fun `a default commit request omits its boolean flags`() {
+        val request =
+            CommitRequest(
+                readSnapshot = 1,
+                appends = listOf(TableAppend("ns", "a", listOf(FileRegistration("s3://b/a.parquet", 1, 100, 20)))),
+                idempotencyKey = UUID.randomUUID(),
+            )
+        val canonical = commitFingerprint(request)
+        assertThat(canonical).doesNotContain("require_unchanged_tables")
+        assertThat(canonical).doesNotContain("allow_pending_deletes")
+        // Both still participate when they are actually asked for.
+        assertThat(commitFingerprint(request.copy(requireUnchangedTables = true)))
+            .contains(""""require_unchanged_tables":true""")
+            .isNotEqualTo(canonical)
+    }
 }

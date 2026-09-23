@@ -3,6 +3,7 @@ package com.posthog.hoglake.testing
 import com.posthog.hoglake.Database
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import org.flywaydb.core.api.MigrationVersion
 import org.jdbi.v3.core.Jdbi
 import org.testcontainers.containers.PostgreSQLContainer
 
@@ -68,6 +69,24 @@ object PgTestSupport {
     /** Create a new empty database, run migrations, return a pooled Jdbi. */
     @Synchronized
     fun freshDatabase(): TestDb = freshEmpty().also { Database.migrate(it.dataSource) }
+
+    /**
+     * A database migrated only as far as [version], so a migration test
+     * can populate the state its migration will actually run against.
+     * Driving [Database.flywayConfig] rather than a local Flyway builder
+     * is deliberate (see that function): a copy asserts only that it
+     * compiles. The production advisory lock is skipped — nothing else is
+     * migrating this database — so `Database.migrate` is what the test
+     * then calls to apply the rest.
+     */
+    @Synchronized
+    fun freshDatabaseAt(version: String): TestDb =
+        freshEmpty().also {
+            Database.flywayConfig(it.dataSource)
+                .target(MigrationVersion.fromVersion(version))
+                .load()
+                .migrate()
+        }
 
     @Synchronized
     private fun freshEmpty(): TestDb {

@@ -57,6 +57,15 @@ must equal the set declared in `persistence/HogSchemaColumns.kt` — a
 new column means updating the row mapper(s) named there AND the
 declaration, or the gate fails naming the table and column.
 
+Before the PR opens, **mutation-test every load-bearing predicate**
+you added or changed: flip it (a conflict kind in or out, `>` to `>=`,
+a `NOT EXISTS` guard removed, `FOR UPDATE` dropped, a lock put back),
+run the narrowest class, and the test you wrote for it must red. Three
+review rounds on one change found three, four and three uncaught
+mutations in a row; each was a rule the diff claimed to enforce and
+nothing pinned. A chain/depth test must not seed the intermediate state
+that lets depth 1 pass.
+
 Prefer fixup commits over amending and force-pushing.
 
 ## What this is
@@ -247,9 +256,95 @@ there would break that gate on every build.
   partial indexes for hot predicates, CHECK-constrained vocabularies
   (deliberate choice over PG enums while the vocabulary churns). No
   migration ledger hacks — Flyway owns it.
+  - **Every heavy-lock statement runs inside the `lock_timeout` window.**
+    `ALTER TABLE` (ADD COLUMN included — it is ACCESS EXCLUSIVE even
+    when metadata-only), `ADD/DROP CONSTRAINT`, `DROP INDEX` and any
+    backfill `UPDATE` sit after the V9 save+`SET lock_timeout = '5s'`
+    and before the restore; only `CREATE INDEX CONCURRENTLY` sits
+    outside it, because that build waits out older transactions by
+    design. A migration session has no `lock_timeout` of its own, so an
+    unguarded ALTER queues behind one in-flight commit for up to the
+    statement timeout and every reader queues behind IT, while every
+    other booting pod waits on the Flyway advisory lock. V10 put its
+    ADD COLUMN after the restore, V11 and V12 had no guard at all, and
+    V14's first draft repeated it. A CHECK over a table that is not
+    known-tiny is `NOT VALID` then `VALIDATE CONSTRAINT`.
+  - **An index proves itself against the query it serves.** The
+    migration test runs the migration FILE (`Database.migrate()` after
+    `PgTestSupport.freshDatabaseAt(<previous version>)`, or after
+    deleting the history row) against rows inserted BEFORE it, then
+    `ANALYZE`s and `EXPLAIN`s the production statement — the repo
+    function's own SQL, exposed `internal` — asserting the index name
+    appears and `Seq Scan` on the table does not. V14's first index was
+    on the wrong column of a recursive join, and its test was green
+    because it EXPLAINed a predicate no code path issues. A partial
+    predicate is asserted through `pg_index.indpred`, not by counting
+    table rows.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`.
+- **Compaction is never a conflict, and only a race gets a retryable
+  status.** Any guard that compares a writer's read set against
+  `hog_snapshot_change` excludes `table_compacted` (both the commit
+  path and the guarded replacement publish): compaction changes no
+  visible row, and a deletion vector whose target compaction retired is
+  caught per file by the liveness check. On a table under continuous
+  compaction (one group every ~2.6 min in production) anything that
+  treats it as a conflict livelocks every statement longer than one
+  interval — and did, for UPDATE/MERGE, from #161 until the post-merge
+  review of #156–#162 caught it. A plan-to-commit
+  race answers 409; 422 is for a request that was already wrong at its
+  own `read_snapshot`, and `end_snapshot == read_snapshot` is the 422
+  side of that line. A conflict test drives the real service between
+  read and publish (`CompactionService.compactPlannedGroup`,
+  `ExpiryService.runOnce`); seeding change rows by SQL asserts the rule
+  you wrote, not the system, and passed a livelock.
+- **Whatever mints a new identity releases the old one's consumers.**
+  Consumer offsets pin expiry on purpose and survive drops on purpose;
+  atomic replacement mints a new `table_uuid`, so a consumer's row on
+  the retired uuid pinned the whole catalog forever with no delete API.
+  Lineage between incarnations is RECORDED (`hog_table.replaced_table_id`,
+  written by the replacement path) and walked from that column; it is
+  never derived at run time from a convention such as "dropped in the
+  snapshot the successor was created in", because a convention nothing
+  enforces has a failure mode of deleting a consumer's position on a
+  table it is still draining. The commit path walks backward from the
+  table just committed (primary-key hops, zero in the normal case); the
+  expiry sweep walks forward for every consumer as the catch-all for
+  rows committed before the rule existed.
+- **Stored payloads outlive the code that wrote them.** JSON the server
+  writes and later reads back — commit receipts, table-creation
+  definitions, the maintenance ledger — is decoded with the lenient
+  stored-payload mapper (`WireJson.storedPayloadObjectMapper`), never
+  the strict API mapper, and every new defaulted field on a stored
+  model is `@JsonInclude(NON_DEFAULT)`. A rolling deploy has both
+  versions replaying each other's rows; a receipt carrying
+  `"require_unchanged_tables": false` made the older replica throw
+  under the catalog lock and 500. The mixed-fleet case is a test with an
+  unknown property at the top level AND nested inside a file entry.
+  The API mapper stays strict: an unknown request field is a 400.
+- **The per-catalog commit lock is for commits.** Nothing acquires it
+  unless it allocates a snapshot or settles state inside a commit
+  transaction, and every acquirer passes `commitLockTimeoutMs` — the
+  default argument is an unbounded wait. Upload claims took it once per
+  output file with no bound. Row-level state re-checks replace it:
+  under READ COMMITTED an `UPDATE ... WHERE state = 'active'` re-evaluates
+  its predicate after waiting on the row lock, so a settle that landed
+  first wins without any global lock; the predicate that selects
+  candidates is the predicate that fences them, verbatim, or a renewal
+  in the window is clobbered. Sweeps settle one row per transaction so a
+  commit never queues behind a sweep while holding the commit lock.
+- **A new guard never edits an existing test out of its way.** When a
+  new refusal reds a test, that test either asserts the refusal or has
+  its fixture changed to satisfy the guard legitimately, with the reason
+  in the test. Swapping `add_column` for `set_sort_order` in two tests to
+  keep them green (#159) hid that the guard fires on any table with
+  hydration in flight.
+- **PR-body claims are not evidence.** Test counts, "adversarial review
+  found no blocking issues" and "verified against Trino" are read as
+  claims to verify from the code and the tests; a review that trusts
+  them reviews nothing. Eight PRs each carried the clean-review line;
+  three of them held the livelock, the 500 and the expiry pin above.
 - **Errors**: services throw `HoglakeException.*`; the API maps them
   (404/409/410/422; commit admission timeout 503 + Retry-After; parse
   failures 400). New failure modes get a typed exception, not a status

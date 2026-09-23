@@ -3,9 +3,11 @@ package com.posthog.hoglake.commit
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.wireObjectMapper
 
+/** The process-wide wire mapper; a fresh one per fingerprint was a Kotlin-module scan per commit. */
+private val mapper = wireObjectMapper()
+
 /** Canonical full payload, not a lossy subset or hash. Partition value order is significant. */
 internal fun commitFingerprint(request: CommitRequest): String {
-    val mapper = wireObjectMapper()
     val appends =
         request.appends.map { append ->
             append.copy(

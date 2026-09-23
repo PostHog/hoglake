@@ -110,18 +110,28 @@ object TableRepo {
         }
     }
 
-    /** Insert the identity row; returns the generated table_uuid. */
+    /**
+     * Insert the identity row; returns the generated table_uuid.
+     *
+     * [replacedTableId] is the RECORDED replacement edge (V14): the
+     * incarnation this row retires, non-null only on an atomic
+     * replacement. It exists so nothing has to infer lineage from
+     * `dropped_snapshot = created_snapshot` at runtime — see
+     * OffsetRepo.releaseSupersededOffsets for what being wrong about it
+     * would cost.
+     */
     fun insertTable(
         handle: Handle,
         catalogId: Long,
         tableId: Long,
         createdSnapshot: Long,
         tableUuid: UUID = UUID.randomUUID(),
+        replacedTableId: Long? = null,
     ): UUID =
         handle.createQuery(
             """
-            INSERT INTO hog_table (catalog_id, table_id, created_snapshot, table_uuid)
-            VALUES (:catalogId, :tableId, :createdSnapshot, :tableUuid)
+            INSERT INTO hog_table (catalog_id, table_id, created_snapshot, table_uuid, replaced_table_id)
+            VALUES (:catalogId, :tableId, :createdSnapshot, :tableUuid, :replacedTableId)
             RETURNING table_uuid
             """,
         )
@@ -129,6 +139,7 @@ object TableRepo {
             .bind("tableId", tableId)
             .bind("createdSnapshot", createdSnapshot)
             .bind("tableUuid", tableUuid)
+            .bind("replacedTableId", replacedTableId)
             .map { rs, _ -> rs.getObject("table_uuid") as UUID }
             .one()
 

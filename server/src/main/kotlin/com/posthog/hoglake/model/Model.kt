@@ -913,7 +913,18 @@ data class CommitRequest(
     val author: String? = null,
     val message: String? = null,
     val idempotencyKey: UUID? = null,
-    /** Prepared mutations require the entire target read set to remain unchanged. */
+    /**
+     * Prepared mutations require the entire target read set to remain
+     * unchanged; the requirement binds the tables this request DELETES
+     * from (see CommitService.checkConflicts).
+     *
+     * NON_DEFAULT, like [allowPendingDeletes]: a commit receipt stores
+     * this canonical payload, and a receipt that spells out every
+     * defaulted field is a receipt an OLDER replica cannot decode during
+     * a rolling deploy. Serializing only what was actually asked for
+     * keeps the stored payload as small as the contract the writer used.
+     */
+    @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
     val requireUnchangedTables: Boolean = false,
     @get:com.fasterxml.jackson.annotation.JsonInclude(com.fasterxml.jackson.annotation.JsonInclude.Include.NON_DEFAULT)
     val allowPendingDeletes: Boolean = false,

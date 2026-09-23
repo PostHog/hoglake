@@ -10,6 +10,7 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
+import com.posthog.hoglake.persistence.OffsetRepo
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -180,6 +181,25 @@ class ExpiryService(private val jdbi: Jdbi) {
                 .bind("retention", retention)
                 .mapTo(Long::class.javaObjectType)
                 .one()
+
+        // Release before measuring. An offset left on an incarnation that
+        // atomic replacement retired can never be advanced by anyone (see
+        // OffsetRepo.releaseSupersededOffsets), so on a consumer_floor
+        // catalog it is an expiry floor nothing can lift. commitOffset
+        // releases these as they are superseded, by the cheap backward
+        // walk; running the FORWARD form here clears the ones stranded by
+        // replicas that predate that, and makes this sweep's floor honest
+        // instead of merely filtered — the row is GONE, so a later sweep
+        // cannot rediscover it. Idempotent, but not free: this is the one
+        // remaining caller of the forward seed, which joins every offset
+        // in the catalog to hog_table, and it runs under the commit lock.
+        // It is here rather than on the commit path precisely because a
+        // sweep is once per interval and a commit is not. It is NOT gated
+        // on consumerFloor — those rows are dead whether or not they
+        // would floor anything, and GET /consumers should not show them —
+        // but it IS gated on retention being configured, since sweep()
+        // returns above when snapshotRetentionSeconds is null.
+        OffsetRepo.releaseSupersededOffsets(h, cat.catalogId)
 
         // The join to hog_table scopes the floor to offsets whose table
         // identity still exists (any incarnation, dropped included —

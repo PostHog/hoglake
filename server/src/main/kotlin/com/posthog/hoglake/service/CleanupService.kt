@@ -452,7 +452,8 @@ class CleanupService(
         return results
     }
 
-    private companion object {
+    /** internal, not private: UploadService's sweep shares the drained-ledger retention. */
+    internal companion object {
         /**
          * Production sub-batch size for physical deletes. Deliberately
          * small: each sub-batch holds the per-catalog commit lock across

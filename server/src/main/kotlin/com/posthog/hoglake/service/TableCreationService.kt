@@ -208,13 +208,28 @@ class TableCreationService(
                         .bind("catalog", cat.catalogId).bind("operation", operationId).mapTo(Long::class.java).one()
                 val target = ns?.let { TableRepo.findLive(h, cat.catalogId, it.namespaceId, definition.name) }
                 val replacement = definition.replacement
+                // Any recorded change to the target since the guarded
+                // snapshot rejects the replacement — EXCEPT
+                // 'table_compacted'. Compaction rewrites which files back
+                // a table and never which rows are visible in it, so it
+                // cannot invalidate anything a replacement read; and the
+                // incarnation being retired here is about to have all its
+                // files end-snapshotted anyway. Counting it meant a
+                // CREATE OR REPLACE of a continuously compacted table
+                // could never land: production publishes a compaction
+                // group every couple of minutes on one table, and this
+                // rejection is DURABLE (`rejected`/`target_changed`), so
+                // an upload that outlived one interval burned its receipt
+                // and the retry raced the next group. Same rule, and the
+                // same reason, as CommitService.checkConflicts.
                 val targetModified =
                     replacement != null && target != null &&
                         h.createQuery(
                             """
                         SELECT EXISTS (SELECT 1 FROM hog_snapshot_change
                         WHERE catalog_id = :catalog AND object_id = :table
-                          AND snapshot_id > :snapshot AND kind LIKE 'table_%')
+                          AND snapshot_id > :snapshot
+                          AND kind LIKE 'table_%' AND kind <> 'table_compacted')
                         """,
                         ).bind("catalog", cat.catalogId).bind("table", target.tableId)
                             .bind("snapshot", replacement.readSnapshot).mapTo(Boolean::class.java).one()

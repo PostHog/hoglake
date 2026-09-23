@@ -2,6 +2,7 @@ package com.posthog.hoglake
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.core.StreamWriteFeature
+import com.fasterxml.jackson.databind.DeserializationFeature
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.PropertyNamingStrategies
 import com.fasterxml.jackson.databind.SerializationFeature
@@ -65,5 +66,42 @@ fun ObjectMapper.configureHoglakeWire(): ObjectMapper =
         factory.enable(StreamWriteFeature.WRITE_BIGDECIMAL_AS_PLAIN.mappedFeature())
     }
 
-/** A standalone mapper carrying [configureHoglakeWire], for tests and tools. */
-fun wireObjectMapper(): ObjectMapper = ObjectMapper().configureHoglakeWire()
+/**
+ * Built once, not per call. An ObjectMapper is thread-safe after
+ * configuration, and building one costs a Kotlin-module reflection scan —
+ * which the commit path paid on EVERY idempotent commit, because
+ * commitFingerprint asked for a fresh mapper each time. Treat the
+ * returned instance as immutable; a caller that needs different settings
+ * adds its own instance here, next to this one.
+ */
+private val WIRE_MAPPER: ObjectMapper = ObjectMapper().configureHoglakeWire()
+
+/** The wire mapper carrying [configureHoglakeWire], for services, tests and tools. */
+fun wireObjectMapper(): ObjectMapper = WIRE_MAPPER
+
+/**
+ * The same wire shape, but tolerant of properties it does not know.
+ *
+ * Request parsing must stay STRICT: an unknown property in a request body
+ * is a client error and has to surface as a 400, so [wireObjectMapper] —
+ * which the API uses — keeps Jackson's default
+ * FAIL_ON_UNKNOWN_PROPERTIES.
+ *
+ * A payload this service STORED is a different thing. A commit receipt's
+ * `request` column was written by some replica of this service, and
+ * during a rolling deploy that replica may be running a NEWER version
+ * than the one reading it back: two API replicas, one already carrying a
+ * field the other has never heard of. Decoding such a receipt strictly
+ * throws UnrecognizedPropertyException inside the commit tail, under the
+ * per-catalog lock, which the error mapping turns into a 500 — the
+ * replay contract broken by nothing worse than a deploy being half done.
+ * Stored payloads therefore decode leniently: an unknown property is a
+ * newer replica's field, and skipping it leaves the known fields — which
+ * is exactly what the fingerprint compares.
+ */
+private val STORED_PAYLOAD_MAPPER: ObjectMapper =
+    ObjectMapper().configureHoglakeWire()
+        .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+
+/** Decoder for payloads this service wrote (see [STORED_PAYLOAD_MAPPER]), never for request bodies. */
+fun storedPayloadObjectMapper(): ObjectMapper = STORED_PAYLOAD_MAPPER

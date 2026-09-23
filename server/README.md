@@ -284,6 +284,69 @@ by `table_uuid` so incarnation changes are visible, and — critically —
 log primitives: a replicator's entire state machine is
 "changes → apply → commit offset."
 
+Offsets survive a drop by design, so a consumer can finish reading a
+dropped table — but an incarnation that **atomic replacement** retired
+is a different case: the consumer reconciles onto the new `table_uuid`
+and never looks at the old one again, so its row there would pin the
+consumer-floor sweep at a pre-replacement snapshot forever, with nothing
+left that could ever advance it. Such rows are **released** — deleted, not
+advanced — in two places, both in `persistence/OffsetRepo.kt`. On the
+commit path, `releaseAncestorsOf` walks **backward** from the row just
+committed, following `replaced_table_id`: a primary-key lookup per hop
+and, on the overwhelming majority of commits, zero hops. (Walking
+forward there would cost O(that consumer's offset count) on every
+offset commit, including on the catalogs — most of them — that have
+never had a replacement.) The expiry sweep has no row in hand, so it
+uses the **forward** `releaseSupersededOffsets` across every consumer,
+clearing rows stranded by replicas predating this so its floor is honest
+rather than merely filtered. A row releases when a replacement
+descendant of its incarnation carries an offset for the same consumer at
+or past that descendant's `created_snapshot`; both walks are recursive,
+because a consumer down across two replacements reconciles straight to
+the newest and both ancestors must go. Same-consumer is load-bearing:
+another consumer that has not reconciled keeps its position and keeps
+pinning.
+
+Two scope notes. The sweep's release is **not** gated on
+`consumer_floor` — the rows are dead either way, and `GET /consumers`
+should not show them — but it *is* gated on
+`snapshot_retention_seconds` being set, because it runs inside the
+sweep; a catalog with retention disabled releases only through
+`commitOffset`. And a released row **disappears from `GET /consumers`**,
+which is a visible contract change from "offsets outlive drops".
+
+The lineage is **recorded, not derived**: V14 adds
+`hog_table.replaced_table_id`, written by `CatalogService.createTable`
+when it publishes a replacement, so the hop is one indexed equality
+(`hog_table_replacement_lineage`, partial on `replaced_table_id IS NOT
+NULL`). The derivation `old.dropped_snapshot = new.created_snapshot` is used
+**exactly once**, in V14's one-time backfill, where it is exact rather
+than probable: `dropped_snapshot` has exactly two writers (the
+replacement branch and `dropTable`, both via `TableRepo.markDropped`),
+`hog_table` rows are inserted from exactly one place
+(`TableRepo.insertTable`, called only by `createTable`), every DDL
+transaction mints its own snapshot under the commit lock, and views,
+compaction and data commits never write `hog_table` at all — so a
+snapshot that both retires a table and creates one is a replacement and
+can be nothing else, in any environment. What the backfill repairs is
+the **rolling-deploy window**: a 1.2.0 replica still publishes
+replacements without writing `replaced_table_id`, and each one strands
+a retired incarnation whose consumer offset pins expiry until the edge
+exists. Re-running the `UPDATE` is the repair; no automated job is wired
+up because production carries no replacements yet, and an operator can
+run it by hand if that stops being true. The derivation is **not** used
+at runtime, for two reasons. Nothing enforces it, and the cost of it
+being wrong is deleting a consumer's position on a table it is still
+draining.
+And it is unindexable in the direction the walk needs: the hop seeks the
+*successor*, whose own `dropped_snapshot` is NULL at the end of every
+chain, so a partial index on `dropped_snapshot` cannot serve it and the
+walk degrades to a sequential scan of `hog_table` per hop — in the
+commit tail, on catalogs holding tens of thousands of dropped tables.
+The walk terminates on `created_snapshot` strictly increasing rather
+than a hop cap, because a cap made an origin more than N replacements
+behind permanently unreleasable, which is the bug being fixed.
+
 ### Retention, expiry, and safe file removal
 
 Retention is a **catalog property** (`PATCH /options`:
@@ -922,10 +985,42 @@ introduce an authentication framework or authorize any deployment.
 ### Atomic DML transaction publication
 
 `atomic-dml-transactions-v1` adds `POST /v1/catalogs/{catalog}/commit/transaction`.
-The request uses the existing guarded, idempotent commit envelope, with all written
-tables required to remain unchanged since `read_snapshot`. Every table publishes
-in one snapshot and one durable receipt. This is snapshot isolation with write-write
-conflicts; read-only tables and other catalogs are not part of the commit read set.
+The request uses the existing guarded, idempotent commit envelope. The
+unchanged-since-`read_snapshot` requirement binds the tables the transaction
+DELETES from — those conflict with inserts, deletes and DDL — because a delete is
+published against a read of the target's rows. A table the transaction only
+appends to keeps the ordinary DDL-only rule: appends never conflict with appends,
+inside a transaction as much as outside one, so an append-only transaction does
+not 409 on a concurrent INSERT. Every table publishes in one snapshot and one
+durable receipt. This is snapshot isolation with write-write conflicts; read-only
+tables and other catalogs are not part of the commit read set.
+
+Because "unchanged" binds only the delete targets, a statement that **read** a
+table but produced no deletion vector for it — a MERGE or UPDATE whose predicate
+matched nothing — must still send a delete group for that table with an empty
+`files` list, or it keeps no read-set protection. That is the same anchor
+`/commit/mutations/prepared` already documents, and it is now load-bearing for
+`/commit/transaction` too.
+
+**Compaction is never a conflict**, on any guarded path. A `table_compacted`
+change rewrites which files back a table, never which rows are visible in it, so
+it cannot invalidate a read set — and treating it as one livelocked every
+mutation on a continuously compacted table, where a group publishes every couple
+of minutes and any read-to-publish window longer than that retried into the next
+one forever. The same exclusion applies to the atomic-replacement guard in
+`service/TableCreationService.kt`, where the rejection is *durable*
+(`rejected`/`target_changed`), so a `CREATE OR REPLACE` whose upload outlived one
+compaction interval burned its receipt and the retry raced the next group.
+
+What compaction *can* invalidate is a specific deletion-vector target, and that
+is caught per file: a DV against a data file that was live at `read_snapshot` and
+has since been retired — by compaction or another commit — is a **409**
+(retryable: re-read at the compaction snapshot and re-publish against the
+output), while one against a file that was already dead at `read_snapshot` stays
+a 422. Expiry is deliberately not on that list: for expiry to have removed a file
+that was live at `read_snapshot`, `read_snapshot` must be below the floor, and
+the floor guard returns **410** before any per-file check runs — so a connector
+never needs a retry path for it.
 
 A transaction may delete rows from files it has staged privately. A DV registration
 can specify `data_file_id: 0` and `data_file_path` referencing exactly one append in
@@ -935,6 +1030,25 @@ cross-table references roll everything back. Numeric IDs retain their existing
 snapshot checks. Other commit endpoints reject this new field; old replicas lack
 the transaction endpoint, so clients must never fall back. New fields are omitted
 from ordinary receipt fingerprints, preserving existing receipts.
+
+**Upload claims do not take the commit lock.** A writer claims one upload per
+output file, so `claim`/`renew`/`abandon`/`schedule-expired` taking the per-catalog
+commit lock — unbounded, with no admission timeout — meant paying the catalog's
+whole write-throughput bottleneck once per file, for nothing: claim paths are
+server-generated random UUIDs and the claim INSERT is `ON CONFLICT DO NOTHING`.
+Row-level semantics replace it. Every UPDATE re-checks the claim's state in its
+WHERE clause, so under READ COMMITTED an update that waited on a publication's
+row lock re-evaluates against the committed row and cannot clobber a settled
+claim, and `UploadService.register` — which runs inside the commit transaction —
+takes the claim rows `FOR UPDATE`. The expired-upload sweep's fence re-checks the
+*whole* candidate predicate, not just "not registered", so a renewal that landed
+between candidate selection and the fence wins, as `renewUploads` promises; it
+fences each candidate in **its own short transaction**, because a publication
+registering one of those paths waits on that row lock while holding the catalog
+commit lock, and one transaction over a 10,000-row batch would convoy the
+catalog behind the sweep. It also refuses to queue a path any data or
+deletion-vector file row still claims, and rests an abandoned tombstone for the
+drained-ledger retention between offers.
 
 Trino stages DML on its coordinator and uses this endpoint at explicit COMMIT.
 DDL remains autocommit-only. Failed/coordinator-lost transactions leave only leased
