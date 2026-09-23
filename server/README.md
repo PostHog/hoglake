@@ -845,7 +845,7 @@ green whether or not the server exists yet; proxied paths return
 
 ## Dev environment
 
-Toolchain via [flox](https://flox.dev) (JDK 21); Gradle via the
+Toolchain via [flox](https://flox.dev) (JDK 25); Gradle via the
 **checked-in wrapper** (`./gradlew`, version pinned in
 `gradle/wrapper/gradle-wrapper.properties` — never a system gradle);
 recipes via `just` (see `justfile`, composed into `../justfile`):

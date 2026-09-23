@@ -8,7 +8,7 @@
 # build host — gradle output is arch-neutral bytecode, so only the JRE
 # runtime stage below is per-target-arch. Without this, a multi-arch
 # buildx run executes gradle under qemu for the foreign arch.
-FROM --platform=$BUILDPLATFORM eclipse-temurin:21-jdk-noble AS build
+FROM --platform=$BUILDPLATFORM eclipse-temurin:25-jdk-noble AS build
 WORKDIR /src
 
 # Wrapper + build scripts first so the dependency layer caches across
@@ -32,7 +32,7 @@ COPY src/ src/
 ARG HOGLAKE_BUILD_STAMP=""
 RUN ./gradlew --no-daemon :installDist -x test -x ktlintCheck -PbuildStamp="$HOGLAKE_BUILD_STAMP"
 
-FROM eclipse-temurin:21-jre-noble
+FROM eclipse-temurin:25-jre-noble
 # Non-root: the server needs no filesystem at all for its data path.
 # Parquet footer reads stream from S3, and compaction streams both its
 # inputs and its output (S3InputFile / S3OutputFile) rather than staging

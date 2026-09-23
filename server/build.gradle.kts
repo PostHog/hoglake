@@ -131,7 +131,7 @@ dependencies {
 }
 
 kotlin {
-    jvmToolchain(21)
+    jvmToolchain(25)
 }
 
 application {
@@ -177,10 +177,18 @@ application {
     // banner lands in the middle of a stream a downstream consumer
     // parses, once per process start, as neither a pattern line nor a
     // JSON object. No test can see it; only the collector can.
+    // --enable-native-access: zstd-jni (every compaction rewrite) and
+    // snappy-java load native code through System.loadLibrary from the
+    // unnamed module. JDK 25 warns once per process (JEP 472) and a later
+    // release blocks the call; under --illegal-native-access=deny the
+    // zstd initializer throws and the compactor cannot write. Granting
+    // it here, where the image ENTRYPOINT and `just server run` already
+    // pick their flags up, keeps that flip from landing in production.
     applicationDefaultJvmArgs =
         listOf(
             "-XX:MaxRAMPercentage=70.0",
             "-Dkotlin-logging.logStartupMessage=false",
+            "--enable-native-access=ALL-UNNAMED",
         )
 }
 
@@ -196,8 +204,14 @@ tasks.test {
         systemProperty("junit.jupiter.tags.exclude", "integration")
         exclude("**/*IntegrationTest*")
     }
-    // jazzer-junit self-attaches its instrumentation agent for the corpus
-    // replay of the fuzz targets; JDK 21 warns on dynamic attach otherwise.
+    // jazzer-junit self-attaches its instrumentation agent (ByteBuddy)
+    // for the corpus replay of the fuzz targets. The flag arrived to
+    // silence the four-line JEP 451 warning a dynamic attach prints
+    // without it; JDK 25 still prints it, and the flag is now also
+    // load-bearing: JEP 451's endgame is refusal by default, and
+    // -XX:-EnableDynamicAgentLoading already fails every @FuzzTest at
+    // initialization (the ByteBuddy self-attach throws), which is
+    // exactly what that default flip will look like.
     // -XX:-OmitStackTraceInFastThrow: see the fuzz tasks below — a hot
     // NPE otherwise arrives with no stack and no message, which makes a
     // failure report useless and any frame-based assertion unreliable.

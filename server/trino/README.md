@@ -39,7 +39,7 @@ There is deliberately no default Trino image and no local plugin mount: the test
 exercise the connector shipped in the selected engine image. The old Gradle
 `:trino:trinoPlugin` assembly task and Trino 446 SPI pin have been removed. The JDBC
 client is pinned in `build.gradle.kts` (currently 483) and moves independently of
-the server version, so this harness can continue using the server project's Java 21
+the server version, so this harness can continue using the server project's Java 25
 toolchain. Its failure-message format is load-bearing: the assertions strip the
 driver's `Query failed (#...)` preamble before matching, and assert that the
 strip matched rather than trusting it.
