@@ -1,10 +1,15 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import {
+  COMPACTION_MESSAGE,
+  MILLPOND_SUMMARY,
+  catalogOptionsFixture,
+  catalogOptionsNoExpiryFixture,
   catalogsFixture,
   conflictError,
   namespacesFixture,
+  snapshotsMessagesPage,
   snapshotsPage1,
   snapshotsPage2,
 } from "./fixtures";
@@ -16,6 +21,7 @@ const base = "/v1/catalogs/analytics";
 // everything below head+1 = 4212, newest first.
 function happyHandler(url: string): Response | undefined {
   if (url === base) return jsonResponse(catalogsFixture[0]);
+  if (url === `${base}/options`) return jsonResponse(catalogOptionsFixture);
   if (url === `${base}/namespaces`) return jsonResponse(namespacesFixture);
   if (url === `${base}/snapshots?before=4212&limit=50`)
     return jsonResponse(snapshotsPage1);
@@ -47,6 +53,40 @@ describe("CatalogPage", () => {
 
     // has_more=true → Load more is offered.
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("shows the catalog's per-catalog expiry and floor settings in the header", async () => {
+    mockFetch(happyHandler);
+    renderApp("/catalogs/analytics");
+
+    // expiry renders the retention window as a duration (604800s = 7d).
+    const expiry = await screen.findByText("expiry", { selector: "dt" });
+    expect(expiry.nextElementSibling).toHaveTextContent("7d");
+
+    // consumer_floor on; earliest_snapshot_id shown.
+    const floor = screen.getByText("consumer_floor", { selector: "dt" });
+    expect(floor.nextElementSibling).toHaveTextContent("on");
+    const earliest = screen.getByText("earliest_snapshot_id", { selector: "dt" });
+    expect(earliest.nextElementSibling).toHaveTextContent("4099");
+  });
+
+  it("reads expiry as off when the catalog has no retention window", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(catalogsFixture[0]);
+      if (path === `${base}/options`)
+        return jsonResponse(catalogOptionsNoExpiryFixture);
+      if (path === `${base}/namespaces`) return jsonResponse(namespacesFixture);
+      return undefined;
+    });
+    renderApp("/catalogs/analytics");
+
+    // No retention window → "disabled" (matching the maintenance page's
+    // word for the identical field), not a duration; consumer_floor off.
+    const expiry = await screen.findByText("expiry", { selector: "dt" });
+    expect(expiry.nextElementSibling).toHaveTextContent("disabled");
+    const floor = screen.getByText("consumer_floor", { selector: "dt" });
+    expect(floor.nextElementSibling).toHaveTextContent("off");
   });
 
   it("pages the timeline older via before/limit when Load more is clicked", async () => {
@@ -131,5 +171,99 @@ describe("CatalogPage", () => {
     expect(alert).toHaveTextContent(
       "name must match ^[A-Za-z_][A-Za-z0-9_-]{0,127}$",
     );
+  });
+});
+
+// A millpond snapshot message is a summary line plus an offsets block of
+// up to 16 KiB. The timeline shows line 1 and folds the rest away.
+describe("CatalogPage snapshot messages", () => {
+  function messagesHandler(url: string): Response | undefined {
+    if (url === base) return jsonResponse(catalogsFixture[0]);
+    if (url === `${base}/namespaces`) return jsonResponse(namespacesFixture);
+    if (url === `${base}/snapshots?before=4212&limit=50`)
+      return jsonResponse(snapshotsMessagesPage);
+    return undefined;
+  }
+
+  /**
+   * The timeline row for one snapshot id, once the table has painted.
+   * The gate is the compaction message rather than an id: the catalog
+   * header prints head_snapshot_id too, so "4211" is not unique text.
+   */
+  async function snapshotRow(id: string) {
+    await screen.findByText(COMPACTION_MESSAGE);
+    const row = screen
+      .getAllByRole("row")
+      .find((r) => r.firstElementChild?.textContent === id);
+    if (!row) throw new Error(`no timeline row for snapshot ${id}`);
+    return within(row);
+  }
+
+  it("leaves a one-line compaction message bare, with no expand control", async () => {
+    mockFetch(messagesHandler);
+    renderApp("/catalogs/analytics");
+
+    const row = await snapshotRow("4209");
+    expect(row.getByText(COMPACTION_MESSAGE)).toBeInTheDocument();
+    // No control of any kind in that row: the message is all there is.
+    expect(row.queryByRole("button")).toBeNull();
+  });
+
+  it("collapses a two-line message to line 1 and counts the hidden ranges", async () => {
+    mockFetch(messagesHandler);
+    renderApp("/catalogs/analytics");
+
+    const row = await snapshotRow("4211");
+    expect(row.getByText(MILLPOND_SUMMARY)).toBeInTheDocument();
+    // The offsets block is nowhere in the DOM while collapsed.
+    expect(screen.queryByText(/p0:41200-83999/)).toBeNull();
+
+    const toggle = row.getByRole("button", { name: "+32 ranges" });
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("expands to the full message with a copy control, then collapses again", async () => {
+    mockFetch(messagesHandler);
+    renderApp("/catalogs/analytics");
+    const user = userEvent.setup();
+
+    const row = await snapshotRow("4211");
+    await user.click(row.getByRole("button", { name: "+32 ranges" }));
+
+    // Whole message, offsets block included, plus a one-click copy of it.
+    const full = row.getByText(/p0:41200-83999/);
+    expect(full).toHaveTextContent(MILLPOND_SUMMARY);
+    expect(full).toHaveTextContent("(32)");
+    expect(row.getByRole("button", { name: "Copy message" })).toBeInTheDocument();
+
+    const less = row.getByRole("button", { name: "less" });
+    expect(less).toHaveAttribute("aria-expanded", "true");
+    await user.click(less);
+    expect(screen.queryByText(/p0:41200-83999/)).toBeNull();
+    // The row keeps its place: the summary line is back, not an empty cell.
+    expect(row.getByText(MILLPOND_SUMMARY)).toBeInTheDocument();
+  });
+
+  it("carries millpond's own (+k more) truncation into the label", async () => {
+    mockFetch(messagesHandler);
+    renderApp("/catalogs/analytics");
+
+    const row = await snapshotRow("4210");
+    expect(row.getByRole("button", { name: "+8 more" })).toBeInTheDocument();
+  });
+
+  it("toggles from the keyboard", async () => {
+    mockFetch(messagesHandler);
+    renderApp("/catalogs/analytics");
+    const user = userEvent.setup();
+
+    const row = await snapshotRow("4211");
+    row.getByRole("button", { name: "+32 ranges" }).focus();
+    await user.keyboard("{Enter}");
+    expect(row.getByText(/p0:41200-83999/)).toBeInTheDocument();
+
+    row.getByRole("button", { name: "less" }).focus();
+    await user.keyboard(" ");
+    expect(screen.queryByText(/p0:41200-83999/)).toBeNull();
   });
 });

@@ -19,6 +19,9 @@ const INT64_FIELDS = new Set([
   "head_snapshot_id",
   "earliest_snapshot_id",
   "new_earliest_snapshot_id",
+  // Catalog retention options (GET /catalogs/{c}/options): the window can
+  // exceed 2^53 seconds at fleet-retention scale.
+  "snapshot_retention_seconds",
   "committed_snapshot",
   "begin_snapshot",
   "end_snapshot",

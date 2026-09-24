@@ -120,9 +120,10 @@ class HoglakeTrinoIntegrationTest
         postgres = new PostgreSQLContainer<>("postgres:18")
                 .withUsername("hoglake")
                 .withPassword("hoglake");
-        // quay.io: Docker Hub stopped serving minio/minio anonymously.
+        // PGSTY Silo, the maintained MinIO build (MinIO's own images are no
+        // longer pullable). Same pin as the server suite's TestImages.SILO.
         minio = new MinIOContainer(
-                DockerImageName.parse("quay.io/minio/minio:RELEASE.2023-09-04T19-57-37Z")
+                DockerImageName.parse("docker.io/pgsty/silo:RELEASE.2026-09-16T00-00-00Z@sha256:635197cb9f36d01bee221d34d1c7d7960f6a95c48b0b6c01d99cd13bdae51a46")
                         .asCompatibleSubstituteFor("minio/minio"));
         postgres.start();
         minio.start();

@@ -38,6 +38,19 @@ export interface CreateCatalogRequest {
   data_path: string;
 }
 
+/**
+ * A catalog's retention configuration (GET /catalogs/{c}/options). These
+ * are the per-catalog knobs — expiry is per catalog, not instance-wide.
+ */
+export interface CatalogOptions {
+  /** Retention window; absent when expiry is disabled for this catalog. */
+  snapshot_retention_seconds?: Int64;
+  /** Whether expiry stops at the min consumer offset. */
+  consumer_floor: boolean;
+  /** The expiry floor: the oldest snapshot a read can resolve. */
+  earliest_snapshot_id: Int64;
+}
+
 export interface Namespace {
   name: string;
 }

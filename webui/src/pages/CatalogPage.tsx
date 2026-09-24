@@ -9,11 +9,14 @@ import {
 import {
   createNamespace,
   getCatalog,
+  getCatalogOptions,
   listNamespaces,
   listSnapshots,
 } from "../api/client";
 import { addInt64, compareInt64 } from "../api/int64";
+import { ClampedText } from "../components/ClampedText";
 import { ErrorBox } from "../components/ErrorBox";
+import { formatSeconds } from "../components/maintenance";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { ChangeBadge } from "../components/badges";
 import { formatTime } from "../lib/format";
@@ -21,13 +24,45 @@ import { identifierError } from "../lib/names";
 
 const SNAPSHOT_PAGE_SIZE = 50;
 
+// Chars of a one-line message shown before it earns an expand control.
+// A millpond summary line runs ~110 chars, so this keeps the common case
+// whole and only clamps the outliers.
+const MESSAGE_CLAMP = 140;
+
+/**
+ * Label for the expand control on a clamped snapshot message.
+ *
+ * A millpond message hides an `offsets <topic> p<n>:<first>-<last> …`
+ * block behind its summary line, and that block ends in its own count —
+ * `(32)` for 32 partition ranges, or `(+8 more)` when the writer already
+ * truncated the list. Surfacing that count as the control's label says
+ * how much is folded away before anyone opens it; anything else (a
+ * hand-written multi-line message) gets the plain fallback.
+ */
+function expandLabelFor(message: string): string {
+  const tail = message.trimEnd();
+  const more = /\(\+(\d+) more\)$/.exec(tail);
+  if (more) return `+${more[1]} more`;
+  const count = /\((\d+)\)$/.exec(tail);
+  if (count) return `+${count[1]} ranges`;
+  return "…more";
+}
+
 function CatalogHeader({ catalog }: { catalog: string }) {
   const { data, isPending, isError, error } = useQuery({
     queryKey: ["catalog", catalog],
     queryFn: () => getCatalog(catalog),
   });
+  // The per-catalog knobs live on a separate endpoint (GET .../options).
+  // They change rarely and the page reads better with them beside the
+  // identity fields than on a second trip through the maintenance page.
+  const options = useQuery({
+    queryKey: ["catalog-options", catalog],
+    queryFn: () => getCatalogOptions(catalog),
+  });
   if (isError) return <ErrorBox error={error} />;
   if (isPending) return <SkeletonBlock />;
+  const opts = options.data;
   return (
     <dl className="stats-header">
       <div>
@@ -41,6 +76,27 @@ function CatalogHeader({ catalog }: { catalog: string }) {
       <div>
         <dt>schema_version</dt>
         <dd className="mono">{data.schema_version}</dd>
+      </div>
+      <div>
+        <dt>expiry</dt>
+        {/* snapshot_retention_seconds absent = expiry disabled for this
+            catalog, not "not loaded yet" — so it reads "disabled", the
+            same word the maintenance page uses for the identical field. */}
+        <dd className="mono">
+          {opts?.snapshot_retention_seconds !== undefined
+            ? formatSeconds(Number(opts.snapshot_retention_seconds))
+            : "disabled"}
+        </dd>
+      </div>
+      <div>
+        <dt>consumer_floor</dt>
+        <dd className="mono">
+          {opts === undefined ? "…" : opts.consumer_floor ? "on" : "off"}
+        </dd>
+      </div>
+      <div>
+        <dt>earliest_snapshot_id</dt>
+        <dd className="mono">{opts?.earliest_snapshot_id ?? "…"}</dd>
       </div>
     </dl>
   );
@@ -199,7 +255,23 @@ function SnapshotsPanel({ catalog }: { catalog: string }) {
                 <td className="num mono">{s.snapshot_id}</td>
                 <td className="mono">{formatTime(s.snapshot_time)}</td>
                 <td>{s.author ?? "—"}</td>
-                <td>{s.message ?? "—"}</td>
+                <td>
+                  {/* A millpond message is a summary line plus a 16 KiB
+                      offsets block; only the summary belongs in the row.
+                      Compaction messages are one line and stay bare. */}
+                  {s.message ? (
+                    <ClampedText
+                      text={s.message}
+                      className="snapshot-message"
+                      maxChars={MESSAGE_CLAMP}
+                      expandLabel={expandLabelFor(s.message)}
+                      copyLabel="message"
+                      block
+                    />
+                  ) : (
+                    "—"
+                  )}
+                </td>
                 <td>
                   {(s.changes ?? []).map((c, i) => (
                     <ChangeBadge key={i} change={c} />
