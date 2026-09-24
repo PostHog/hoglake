@@ -309,11 +309,13 @@ describe("TablePage", () => {
     await user.click(await screen.findByRole("tab", { name: "files" }));
     await screen.findByText("101");
 
-    // One dropdown per partition field, labelled with the transform:
-    // ts_day and url_bucket (matching the spec and the files column).
-    const daySelect = await screen.findByRole("combobox", { name: "filter by ts_day" });
+    // One dropdown per partition field, labelled like the partition-spec
+    // block: day(ts) and bucket(16, url).
+    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
     expect(daySelect).toBeInTheDocument();
-    expect(screen.getByRole("combobox", { name: "filter by url_bucket" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "filter by bucket(16, url)" }),
+    ).toBeInTheDocument();
 
     // Options are decoded for display: the stored day ordinal is a date,
     // the bucket index reads as a bucket. "all" is the empty (unfiltered) value.
@@ -329,7 +331,7 @@ describe("TablePage", () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("tab", { name: "files" }));
-    const daySelect = await screen.findByRole("combobox", { name: "filter by ts_day" });
+    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
 
     // Pick day 20697: the request carries partition=0:20697 verbatim
     // (the stored string, not a decoded date).

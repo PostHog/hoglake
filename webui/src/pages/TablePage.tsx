@@ -713,10 +713,13 @@ function PartitionFilterBar({
     <div className="partition-filter">
       {spec.fields.map((field, keyIndex) => {
         const fieldValues = byFieldId.get(String(field.source_field_id));
+        // The partition-spec block's label (formatPartitionField) for a real
+        // transform — hour(ts) / month(ts) / bucket(16, url) — but identity
+        // is just the column name, not identity(team_id).
         const label =
           field.transform === "identity"
             ? (columnPath(columns, field.source_field_id) ?? `field_${field.source_field_id}`)
-            : `${columnPath(columns, field.source_field_id) ?? `field_${field.source_field_id}`}_${field.transform}`;
+            : formatPartitionField(field, columns);
         const current = filter[keyIndex] ?? "";
         if (fieldValues?.truncated) {
           // Over the distinct-value cap: a partial dropdown would mislead.
