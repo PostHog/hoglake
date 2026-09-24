@@ -9,12 +9,14 @@ import {
 import {
   createNamespace,
   getCatalog,
+  getCatalogOptions,
   listNamespaces,
   listSnapshots,
 } from "../api/client";
 import { addInt64, compareInt64 } from "../api/int64";
 import { ClampedText } from "../components/ClampedText";
 import { ErrorBox } from "../components/ErrorBox";
+import { formatSeconds } from "../components/maintenance";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { ChangeBadge } from "../components/badges";
 import { formatTime } from "../lib/format";
@@ -51,8 +53,16 @@ function CatalogHeader({ catalog }: { catalog: string }) {
     queryKey: ["catalog", catalog],
     queryFn: () => getCatalog(catalog),
   });
+  // The per-catalog knobs live on a separate endpoint (GET .../options).
+  // They change rarely and the page reads better with them beside the
+  // identity fields than on a second trip through the maintenance page.
+  const options = useQuery({
+    queryKey: ["catalog-options", catalog],
+    queryFn: () => getCatalogOptions(catalog),
+  });
   if (isError) return <ErrorBox error={error} />;
   if (isPending) return <SkeletonBlock />;
+  const opts = options.data;
   return (
     <dl className="stats-header">
       <div>
@@ -66,6 +76,26 @@ function CatalogHeader({ catalog }: { catalog: string }) {
       <div>
         <dt>schema_version</dt>
         <dd className="mono">{data.schema_version}</dd>
+      </div>
+      <div>
+        <dt>expiry</dt>
+        {/* snapshot_retention_seconds absent = expiry disabled for this
+            catalog, not "not loaded yet" — so it reads "off", not "…". */}
+        <dd className="mono">
+          {opts?.snapshot_retention_seconds !== undefined
+            ? formatSeconds(Number(opts.snapshot_retention_seconds))
+            : "off"}
+        </dd>
+      </div>
+      <div>
+        <dt>consumer_floor</dt>
+        <dd className="mono">
+          {opts === undefined ? "…" : opts.consumer_floor ? "on" : "off"}
+        </dd>
+      </div>
+      <div>
+        <dt>earliest_snapshot_id</dt>
+        <dd className="mono">{opts?.earliest_snapshot_id ?? "…"}</dd>
       </div>
     </dl>
   );
