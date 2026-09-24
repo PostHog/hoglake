@@ -14,6 +14,7 @@ import com.posthog.hoglake.api.PublishTableCreationDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
+import com.posthog.hoglake.api.parseScanStatsRequest
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.service.TableCreationDefinition
@@ -68,6 +69,25 @@ class WireDtoParseFuzzTest {
             } catch (e: Exception) {
                 checkAllowed(name, e)
             }
+        }
+
+        // GET .../scan's stats request: the fuzz input split at its first
+        // NUL into `include` and `stats_fields`, so both halves (and the
+        // cross-parameter rule) see arbitrary text. Oracle: any request it
+        // accepts names column_stats, and its field ids re-parse to
+        // themselves.
+        try {
+            val raw = data.toString(Charsets.UTF_8)
+            val include = raw.substringBefore('\u0000')
+            val fields = raw.substringAfter('\u0000', missingDelimiterValue = "").ifEmpty { null }
+            parseScanStatsRequest(include, fields)?.let { request ->
+                check(include.split(',').any { it.trim() == "column_stats" })
+                request.fieldIds?.let { ids ->
+                    check(parseScanStatsRequest("column_stats", ids.joinToString(","))?.fieldIds == ids)
+                }
+            }
+        } catch (e: Exception) {
+            checkAllowed("scan include/stats_fields", e)
         }
 
         parseOrNull { mapper.readValue<CreateCatalogRequestDto>(data) }?.let { dto ->

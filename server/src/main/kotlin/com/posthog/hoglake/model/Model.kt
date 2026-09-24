@@ -751,10 +751,22 @@ data class DataFile(
      * The file's ORDERING-KEY range, populated by the files LISTING
      * alone (GET .../files). The changefeed and the scan plan leave it
      * null: they answer "what changed" and "what to read", neither of
-     * which is a question about one column's span, and filling it there
-     * would cost a stats join on every consumer poll.
+     * which is a question about one column's span. The changefeed would
+     * pay a stats join on every consumer poll; the scan plan already
+     * carries every column's bounds in [columnStats], the leading sort
+     * key's included.
      */
     val orderingBounds: FileOrderingBounds? = null,
+    /**
+     * The file's stored stats rows, resolved against the columns visible
+     * at the read snapshot — populated by the SCAN PLAN alone (GET
+     * .../scan with include=column_stats, optionally narrowed to the
+     * requested field ids), so a query engine can prune files at planning
+     * time, and only for a `provided` file: pending and failed files have
+     * no rows, and null here is "no stats", which is different from an
+     * empty list. The listing and the changefeed leave it null.
+     */
+    val columnStats: List<FileColumnStats>? = null,
 )
 
 /**
@@ -834,7 +846,8 @@ data class ColumnStats(
 
 /**
  * One data file's per-column statistics, resolved against the columns
- * visible at the requested snapshot (GET .../files/{fileId}/stats).
+ * visible at the requested snapshot (GET .../files/{fileId}/stats; the
+ * scan plan carries the same entries as [DataFile.columnStats]).
  * [columns] carries one entry per stored `hog_file_column_stats` row
  * whose field id resolves to a visible LEAF — nothing is fabricated:
  * variant columns and containers never have rows, and a row whose field

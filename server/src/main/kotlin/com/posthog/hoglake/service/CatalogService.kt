@@ -3,7 +3,6 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.model.CatalogInfo
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ChangesPlan
-import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
@@ -685,39 +684,12 @@ class CatalogService(private val jdbi: Jdbi) {
                 return@withHandleUnchecked FileStats(fileId, file.statsState, emptyList())
             }
             val byFieldId = columnsByFieldId(TableRepo.columnsAt(h, cat.catalogId, t.tableId, at))
-            val columns =
-                FileRepo.columnStats(h, cat.catalogId, fileId).mapNotNull { row ->
-                    byFieldId[row.fieldId]?.let { (path, column) ->
-                        FileColumnStats(
-                            fieldId = row.fieldId,
-                            name = column.def.name,
-                            path = path,
-                            type = column.def.type,
-                            typeParams = column.def.typeParams,
-                            stats = row,
-                        )
-                    }
-                }
-            FileStats(fileId, file.statsState, columns)
+            FileStats(
+                fileId,
+                file.statsState,
+                resolveColumnStats(FileRepo.columnStats(h, cat.catalogId, fileId), byFieldId),
+            )
         }
-
-    /** Every node of the column forest keyed by field id, with its dotted path. */
-    private fun columnsByFieldId(forest: List<Column>): Map<Long, Pair<String, Column>> {
-        val out = mutableMapOf<Long, Pair<String, Column>>()
-
-        fun walk(
-            columns: List<Column>,
-            prefix: String,
-        ) {
-            for (column in columns) {
-                val path = if (prefix.isEmpty()) column.def.name else "$prefix.${column.def.name}"
-                out[column.fieldId] = path to column
-                walk(column.children, path)
-            }
-        }
-        walk(forest, "")
-        return out
-    }
 
     /**
      * Changefeed plan for (fromSnapshot, toSnapshot]: the table's

@@ -375,7 +375,40 @@ data class DataFileDto(
      * changefeed and the scan plan leave it absent (NON_NULL omits it).
      */
     val orderingBounds: FileOrderingBoundsDto? = null,
+    /**
+     * A `provided` file's stats rows, filled by the scan plan only when
+     * asked (`include=column_stats`); the listing and the changefeed never
+     * carry it, and NON_NULL omits it for a pending or failed file.
+     */
+    val columnStats: List<ScanColumnStatsDto>? = null,
 )
+
+/**
+ * One column's statistics in a scan plan: [FileColumnStatsDto] minus the
+ * column identity (name, path, type, type_params) — per-TABLE facts the
+ * engine already holds by field id, which repeated per file x column were
+ * the bulk of a wide table's plan. The bounds are rendered by the same
+ * [renderBoundOrNull] as the stats endpoint's, so the tokens are
+ * identical; JsonNode for the same explicit-null reason.
+ */
+data class ScanColumnStatsDto(
+    val fieldId: Long,
+    val valueCount: Long,
+    val nullCount: Long,
+    val nanCount: Long? = null,
+    val lowerBound: JsonNode,
+    val upperBound: JsonNode,
+)
+
+fun FileColumnStats.toScanDto(): ScanColumnStatsDto =
+    ScanColumnStatsDto(
+        fieldId = fieldId,
+        valueCount = stats.valueCount,
+        nullCount = stats.nullCount,
+        nanCount = stats.nanCount,
+        lowerBound = renderBoundOrNull(this, stats.lowerBound),
+        upperBound = renderBoundOrNull(this, stats.upperBound),
+    )
 
 /**
  * A file's range along the key its table is ordered by (GET
@@ -428,6 +461,7 @@ fun DataFile.toDto() =
         partitionValues = partitionValues,
         explicitRowIds = explicitRowIds,
         orderingBounds = orderingBounds?.toDto(),
+        columnStats = columnStats?.map { it.toScanDto() },
     )
 
 // ---- per-file column statistics (decoded bounds) ---------------------------

@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
+import com.posthog.hoglake.Database
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.HttpClient
@@ -21,6 +23,8 @@ import io.ktor.server.testing.ApplicationTestBuilder
 import io.ktor.server.testing.testApplication
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
+import org.jdbi.v3.core.statement.SqlLogger
+import org.jdbi.v3.core.statement.StatementContext
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
@@ -29,6 +33,7 @@ import org.junit.jupiter.api.TestInstance
 import java.math.BigDecimal
 import java.math.BigInteger
 import java.util.Base64
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * GET .../tables/{table}/files/{fileId}/stats over the wire: per-column
@@ -50,6 +55,10 @@ import java.util.Base64
  *    no rows;
  *  - a stored bound the live type cannot decode renders as JSON null
  *    (the "NULL, never guessed" read-side dual), never a 500.
+ *
+ * The scan plan's `column_stats` (GET .../scan) is the same entries in
+ * the same shape, so its tests live here too: they compare the scan's
+ * bytes against this endpoint's rather than restating expectations.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -669,5 +678,397 @@ class FileStatsApiTest {
             val atHead = body(client.get("$tablesUrl/tstravel/files/$id/stats"))
             assertThat(atHead["columns"].map { it["field_id"].asLong() })
                 .containsExactly(ids.getValue("keep"))
+        }
+
+    // ---- the scan plan carries the same stats (opt-in, slim) ---------------
+
+    private val statsScan = "scan?include=column_stats"
+
+    /**
+     * The `columns` of GET .../stats for one file, projected to the scan
+     * plan's slim entry AS RAW TEXT: the per-table identity (name, path,
+     * type, type_params) and size_bytes cut out of each entry, every other
+     * token left byte for byte. The scan's column_stats must equal this
+     * string, so a second decode path — or any re-rendering of a bound —
+     * cannot pass.
+     */
+    private suspend fun slimStatsRaw(
+        client: HttpClient,
+        table: String,
+        fileId: Long,
+        query: String = "",
+    ): String {
+        val raw = client.get("$tablesUrl/$table/files/$fileId/stats$query").bodyAsText()
+        // FileStatsDto serializes data_file_id, stats_state, columns — and
+        // no_stats_reason only when not provided — so for a provided file
+        // the array runs to the closing brace.
+        val marker = "\"columns\":"
+        assertThat(raw).contains(marker).endsWith("]}")
+        return raw.substring(raw.indexOf(marker) + marker.length, raw.length - 1)
+            .replace(Regex(""""name":"[^"]*","path":"[^"]*","type":"[^"]*",("type_params":\{[^}]*\},)?"""), "")
+            .replace(Regex(""","size_bytes":\d+"""), "")
+    }
+
+    private fun JsonNode.scanFile(path: String): JsonNode =
+        first { it["data_file"]["path"].asText() == path }["data_file"]
+
+    /** The six-column fixture, one provided + one pending + one failed file. */
+    private suspend fun seedScanned(
+        client: HttpClient,
+        table: String,
+    ): Map<String, Long> {
+        val ids =
+            createTable(
+                client,
+                table,
+                """{"name": "c_long", "type": "long"},
+                   {"name": "c_double", "type": "double"},
+                   {"name": "c_string", "type": "string"},
+                   {"name": "c_decimal", "type": "decimal",
+                    "type_params": {"precision": 10, "scale": 2}},
+                   {"name": "c_ts", "type": "timestamp"},
+                   {"name": "c_allnull", "type": "long"},
+                   {"name": "v", "type": "variant"}""",
+            )
+        commitFile(
+            client,
+            table,
+            "s3://b/$catalog/$table/provided.parquet",
+            10,
+            listOf(
+                // 2^53 + 1, -0.0 and a scale-2 decimal: the tokens a second
+                // decode path would most plausibly render differently.
+                statsRow(
+                    ids.getValue("c_long"),
+                    10,
+                    0,
+                    enc(ColType.LONG, 9007199254740993L),
+                    enc(ColType.LONG, Long.MAX_VALUE),
+                ),
+                statsRow(
+                    ids.getValue("c_double"),
+                    10,
+                    0,
+                    enc(ColType.DOUBLE, -0.0),
+                    enc(ColType.DOUBLE, 0.1),
+                    extra = """"nan_count": 2, "size_bytes": 80""",
+                ),
+                statsRow(ids.getValue("c_string"), 10, 1, enc(ColType.STRING, "aardvark"), enc(ColType.STRING, "🦔")),
+                statsRow(
+                    ids.getValue("c_decimal"),
+                    10,
+                    0,
+                    enc(ColType.DECIMAL, BigInteger("150")),
+                    enc(ColType.DECIMAL, BigInteger("99999")),
+                ),
+                statsRow(
+                    ids.getValue("c_ts"),
+                    10,
+                    0,
+                    enc(ColType.TIMESTAMP, 1_788_566_400_000_000L),
+                    enc(ColType.TIMESTAMP, 1_788_652_799_999_999L),
+                ),
+                statsRow(ids.getValue("c_allnull"), 10, 10, lower = null, upper = null),
+            ).joinToString(","),
+        )
+        commitFile(client, table, "s3://b/$catalog/$table/pending.parquet", 5, statsJson = null)
+        commitFile(client, table, "s3://b/$catalog/$table/failed.parquet", 5, statsJson = null)
+        val failedId = fileId(client, table, "s3://b/$catalog/$table/failed.parquet")
+        db.jdbi.withHandleUnchecked { h ->
+            h.createUpdate("UPDATE hog_data_file SET stats_state = 'failed' WHERE data_file_id = :f")
+                .bind("f", failedId)
+                .execute()
+        }
+        return ids
+    }
+
+    @Test
+    fun `a plain scan carries no column_stats and reads no statistics`() =
+        api { client ->
+            seedScanned(client, "plainscan")
+            val scan = body(client.get("$tablesUrl/plainscan/scan"))
+            assertThat(scan).hasSize(3)
+            // Opt-in: not even the provided file carries it, so a consumer
+            // that cannot prune pays neither the join nor the payload.
+            assertThat(scan.map { it["data_file"].has("column_stats") }).containsOnly(false)
+            assertThat(scanStatements("plainscan", request = null).none { it.contains("hog_file_column_stats") })
+                .isTrue()
+        }
+
+    @Test
+    fun `include=column_stats carries slim stats for a provided file only, tokens identical to the stats endpoint`() =
+        api { client ->
+            val ids = seedScanned(client, "scanned")
+            val provided = "s3://b/$catalog/scanned/provided.parquet"
+            val providedId = fileId(client, "scanned", provided)
+
+            val response = client.get("$tablesUrl/scanned/$statsScan")
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            val raw = response.bodyAsText()
+            val scan = json.readTree(raw)
+
+            val providedFile = scan.scanFile(provided)
+            assertThat(providedFile["stats_state"].asText()).isEqualTo("provided")
+            // Six rows committed, six entries; the variant has none and
+            // gets none. Field-id order, as on the stats endpoint.
+            val columnIds = providedFile["column_stats"].map { it["field_id"].asLong() }
+            assertThat(columnIds).containsExactlyElementsOf(
+                listOf(
+                    "c_long",
+                    "c_double",
+                    "c_string",
+                    "c_decimal",
+                    "c_ts",
+                    "c_allnull",
+                ).map { ids.getValue(it) }.sorted(),
+            )
+            // SLIM: the per-table column identity is not repeated per file.
+            providedFile["column_stats"].forEach { entry ->
+                assertThat(entry.fieldNames().asSequence().toSet())
+                    .isSubsetOf("field_id", "value_count", "null_count", "nan_count", "lower_bound", "upper_bound")
+                    .contains("field_id", "value_count", "null_count", "lower_bound", "upper_bound")
+            }
+            // The round trip, byte for byte on every retained token: the
+            // scan's array IS the stats endpoint's `columns` minus the
+            // identity fields.
+            assertThat(raw).contains("\"column_stats\":" + slimStatsRaw(client, "scanned", providedId))
+            // And the tokens are the decoded ones, not base64 bytes.
+            assertThat(raw).contains("9007199254740993").contains("\"lower_bound\":-0.0")
+            assertThat(raw).contains("\"lower_bound\":1.50").contains("\"lower_bound\":\"2026-09-05T00:00\"")
+            val allNull = providedFile["column_stats"].first { it["field_id"].asLong() == ids.getValue("c_allnull") }
+            // value_count INCLUDES nulls: all-null is null_count == value_count.
+            assertThat(allNull["value_count"].asLong()).isEqualTo(allNull["null_count"].asLong())
+            assertThat(allNull["lower_bound"].isNull).isTrue()
+
+            // No statistics means NO property — not an empty array, which
+            // would read as "provided, but nothing to say".
+            val pending = scan.scanFile("s3://b/$catalog/scanned/pending.parquet")
+            assertThat(pending["stats_state"].asText()).isEqualTo("pending")
+            assertThat(pending.has("column_stats")).isFalse()
+            val failed = scan.scanFile("s3://b/$catalog/scanned/failed.parquet")
+            assertThat(failed["stats_state"].asText()).isEqualTo("failed")
+            assertThat(failed.has("column_stats")).isFalse()
+
+            // The listing and the changefeed embed the same DataFile
+            // schema and do not carry it (spec: "Populated by GET
+            // .../scan ONLY").
+            val listed = body(client.get("$tablesUrl/scanned/files")).first { it["path"].asText() == provided }
+            assertThat(listed.has("column_stats")).isFalse()
+            val changes = body(client.get("$tablesUrl/scanned/changes?from_snapshot=0"))
+            assertThat(changes["files"].first { it["path"].asText() == provided }.has("column_stats")).isFalse()
+        }
+
+    @Test
+    fun `stats_fields narrows column_stats to the named columns`() =
+        api { client ->
+            val ids = seedScanned(client, "narrowed")
+            val provided = "s3://b/$catalog/narrowed/provided.parquet"
+            val ts = ids.getValue("c_ts")
+            val long = ids.getValue("c_long")
+
+            val narrowed =
+                body(client.get("$tablesUrl/narrowed/$statsScan&stats_fields=$ts,$long,$ts")).scanFile(provided)
+            // Only the requested columns, still field-id order, duplicates
+            // collapsed.
+            assertThat(narrowed["column_stats"].map { it["field_id"].asLong() })
+                .containsExactlyElementsOf(listOf(ts, long).sorted())
+            val tsEntry = narrowed["column_stats"].first { it["field_id"].asLong() == ts }
+            assertThat(tsEntry["upper_bound"].asText()).isEqualTo("2026-09-05T23:59:59.999999")
+
+            // Columns with no stats row (the variant) or no column at all:
+            // the file is provided and has nothing for them — an EMPTY
+            // array, which is a different answer from an absent property.
+            val nothing =
+                body(client.get("$tablesUrl/narrowed/$statsScan&stats_fields=${ids.getValue("v")},999999"))
+                    .scanFile(provided)
+            assertThat(nothing.has("column_stats")).isTrue()
+            assertThat(nothing["column_stats"]).isEmpty()
+        }
+
+    @Test
+    fun `a provided file with zero stats rows answers an empty array, not an absent one`() =
+        api { client ->
+            createTable(client, "zerorows", """{"name": "a", "type": "long"}""")
+            val path = "s3://b/$catalog/zerorows/f1.parquet"
+            // Stats were SHIPPED — as an empty list — so the file is
+            // provided with nothing recorded for any column.
+            commitFile(client, "zerorows", path, 3, statsJson = "")
+            val file = body(client.get("$tablesUrl/zerorows/$statsScan")).scanFile(path)
+            assertThat(file["stats_state"].asText()).isEqualTo("provided")
+            assertThat(file.has("column_stats")).isTrue()
+            assertThat(file["column_stats"]).isEmpty()
+        }
+
+    @Test
+    fun `scan column_stats resolve columns at the scan's snapshot, not at head`() =
+        api { client ->
+            val ids =
+                createTable(
+                    client,
+                    "scandrop",
+                    """{"name": "keep", "type": "long"}, {"name": "gone", "type": "long"}""",
+                )
+            val path = "s3://b/$catalog/scandrop/f1.parquet"
+            commitFile(
+                client,
+                "scandrop",
+                path,
+                2,
+                listOf(
+                    statsRow(ids.getValue("keep"), 2, 0, enc(ColType.LONG, 1L), enc(ColType.LONG, 2L)),
+                    statsRow(ids.getValue("gone"), 2, 0, enc(ColType.LONG, 5L), enc(ColType.LONG, 6L)),
+                ).joinToString(","),
+            )
+            val id = fileId(client, "scandrop", path)
+            val preDrop = body(client.get("/v1/catalogs/$catalog"))["head_snapshot_id"].asLong()
+            val altered =
+                client.postJson("$tablesUrl/scandrop/alter", """{"ops": [{"op": "drop_column", "name": "gone"}]}""")
+            assertThat(altered.status).isEqualTo(HttpStatusCode.OK)
+
+            fun ids(scan: JsonNode) = scan.scanFile(path)["column_stats"].map { it["field_id"].asLong() }
+
+            // At head the dropped column has no type to decode under and is
+            // omitted, exactly as the stats endpoint omits it.
+            val atHeadRaw = client.get("$tablesUrl/scandrop/$statsScan").bodyAsText()
+            assertThat(ids(json.readTree(atHeadRaw))).containsExactly(ids.getValue("keep"))
+            assertThat(atHeadRaw).contains("\"column_stats\":" + slimStatsRaw(client, "scandrop", id))
+
+            // Before the drop it is visible, and present.
+            val beforeRaw = client.get("$tablesUrl/scandrop/$statsScan&snapshot=$preDrop").bodyAsText()
+            assertThat(ids(json.readTree(beforeRaw)))
+                .containsExactly(ids.getValue("keep"), ids.getValue("gone"))
+            assertThat(beforeRaw)
+                .contains("\"column_stats\":" + slimStatsRaw(client, "scandrop", id, "?snapshot=$preDrop"))
+        }
+
+    @Test
+    fun `malformed or unusable stats parameters are refused, never ignored`() =
+        api { client ->
+            createTable(client, "badparams", """{"name": "a", "type": "long"}""")
+            val base = "$tablesUrl/badparams/scan"
+            // A misspelt include must not read as "no statistics, so
+            // nothing can be pruned".
+            val unknown = client.get("$base?include=column_stat")
+            assertThat(unknown.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(unknown.bodyAsText()).contains("column_stat").contains("column_stats")
+            assertThat(client.get("$base?include=").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            // stats_fields alone would silently return no statistics.
+            val orphan = client.get("$base?stats_fields=1")
+            assertThat(orphan.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(orphan.bodyAsText()).contains("include=column_stats")
+            // Malformed ids are 400s.
+            assertThat(client.get("$base?include=column_stats&stats_fields=abc").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(client.get("$base?include=column_stats&stats_fields=").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(client.get("$base?include=column_stats&stats_fields=1,,2").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            val tooMany = (1..10_001).joinToString(",")
+            assertThat(client.get("$base?include=column_stats&stats_fields=$tooMany").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            // The well-formed spellings are accepted.
+            assertThat(client.get("$base?include=column_stats,column_stats&stats_fields=1").status)
+                .isEqualTo(HttpStatusCode.OK)
+        }
+
+    /**
+     * The statements one planScan issues, captured on an instrumented
+     * Jdbi over the same database (the pattern VerifySpecParityTest and
+     * CompactionPlanningIntegrationTest use).
+     */
+    private fun scanStatements(
+        table: String,
+        request: ScanService.ColumnStatsRequest? = ScanService.ColumnStatsRequest(),
+    ): List<String> {
+        val issued = CopyOnWriteArrayList<String>()
+        val instrumented = Database.jdbi(db.dataSource)
+        instrumented.setSqlLogger(
+            object : SqlLogger {
+                override fun logAfterExecution(context: StatementContext) {
+                    issued += context.renderedSql
+                }
+            },
+        )
+        ScanService(instrumented).planScan(catalog, "ns", table, columnStats = request)
+        return issued.toList()
+    }
+
+    private suspend fun commitFiles(
+        client: HttpClient,
+        table: String,
+        paths: List<String>,
+        statsJson: String?,
+    ) {
+        val stats = statsJson?.let { ""","column_stats": [$it]""" } ?: ""
+        val files = paths.joinToString(",") { """{"path": "$it", "record_count": 3, "file_size_bytes": 1024$stats}""" }
+        val response =
+            client.postJson(
+                "/v1/catalogs/$catalog/commit",
+                """{"appends": [{"namespace": "ns", "table": "$table", "files": [$files]}]}""",
+            )
+        assertThat(response.status).describedAs(bodyText(response)).isEqualTo(HttpStatusCode.OK)
+    }
+
+    @Test
+    fun `the scan plan's statement count does not grow with the file count`() =
+        api { client ->
+            val ids =
+                createTable(client, "manyfiles", """{"name": "a", "type": "long"}, {"name": "b", "type": "string"}""")
+            val rows =
+                listOf(
+                    statsRow(ids.getValue("a"), 3, 0, enc(ColType.LONG, 1L), enc(ColType.LONG, 3L)),
+                    statsRow(ids.getValue("b"), 3, 0, enc(ColType.STRING, "x"), enc(ColType.STRING, "z")),
+                ).joinToString(",")
+            val narrow = ScanService.ColumnStatsRequest(setOf(ids.getValue("a")))
+            commitFiles(client, "manyfiles", (1..3).map { "s3://b/$catalog/manyfiles/p$it.parquet" }, rows)
+            commitFiles(client, "manyfiles", listOf("s3://b/$catalog/manyfiles/pending.parquet"), null)
+            val small = scanStatements("manyfiles")
+            val smallNarrow = scanStatements("manyfiles", narrow)
+
+            commitFiles(client, "manyfiles", (4..60).map { "s3://b/$catalog/manyfiles/p$it.parquet" }, rows)
+            val large = scanStatements("manyfiles")
+            val largeNarrow = scanStatements("manyfiles", narrow)
+
+            // Every file of the larger plan did get its stats — the count
+            // below is not vacuous because nothing was attached.
+            val plan =
+                ScanService(
+                    db.jdbi,
+                ).planScan(catalog, "ns", "manyfiles", columnStats = ScanService.ColumnStatsRequest())
+            assertThat(plan).hasSize(61)
+            assertThat(plan.filter { it.dataFile.columnStats != null }).hasSize(60)
+            assertThat(plan.mapNotNull { it.dataFile.columnStats }).allSatisfy { assertThat(it).hasSize(2) }
+            val narrowPlan = ScanService(db.jdbi).planScan(catalog, "ns", "manyfiles", columnStats = narrow)
+            assertThat(narrowPlan.mapNotNull { it.dataFile.columnStats }.flatten().map { it.fieldId })
+                .hasSize(60)
+                .containsOnly(ids.getValue("a"))
+
+            // 4 files -> 61 files, same statements: resolution, one
+            // file+DV query, one column query, ONE stats query.
+            assertThat(large).hasSameSizeAs(small)
+            assertThat(largeNarrow).hasSameSizeAs(smallNarrow).hasSameSizeAs(large)
+            for (issued in listOf(large, largeNarrow)) {
+                assertThat(issued.count { it.contains("hog_file_column_stats") })
+                    .describedAs(issued.joinToString("\n---\n"))
+                    .isEqualTo(1)
+                // No per-file shape anywhere: no statement binds a file id.
+                assertThat(issued.filter { it.contains(":dataFileId") || it.contains("IN (") }).isEmpty()
+            }
+            // The field filter is ONE array parameter, not one per id.
+            assertThat(largeNarrow.single { it.contains("hog_file_column_stats") }).contains("ANY(:fieldIds)")
+        }
+
+    @Test
+    fun `a scan with no provided file issues no stats query`() =
+        api { client ->
+            createTable(client, "allpending", """{"name": "a", "type": "long"}""")
+            commitFiles(client, "allpending", (1..3).map { "s3://b/$catalog/allpending/f$it.parquet" }, null)
+            val issued = scanStatements("allpending")
+            assertThat(issued.none { it.contains("hog_file_column_stats") }).isTrue()
+            assertThat(
+                ScanService(db.jdbi)
+                    .planScan(catalog, "ns", "allpending", columnStats = ScanService.ColumnStatsRequest())
+                    .map { it.dataFile.columnStats },
+            ).containsOnlyNulls()
         }
 }
