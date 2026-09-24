@@ -744,6 +744,44 @@ button.ghost:hover:not(:disabled) {
   max-width: 48rem;
   display: inline-block;
 }
+
+/* -- clamped text (long comments, snapshot messages) ---------------------- */
+
+/* The expand control sits inline with the text it reveals, so it reads as
+   part of the sentence rather than as a row action. */
+.clamp-toggle {
+  padding: 0 6px;
+  font-size: 11px;
+  vertical-align: baseline;
+}
+/* The expanded body: monospace, wrapped, and free to be tall. Offsets
+   blocks have no spaces to break on at the column's width, so break-word
+   is what keeps one from widening the whole table. */
+.clamped-block {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 4px 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* A snapshot message shares its row with four other columns, so the
+   collapsed head is held to ONE line: the character clamp decides when
+   the control appears, the ellipsis handles whatever width is left. */
+.snapshot-message {
+  display: inline-block;
+  max-width: 34rem;
+}
+.snapshot-message .clamped-head {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 .col-comment {
   max-width: 32rem;
   white-space: pre-wrap;
