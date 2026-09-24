@@ -385,31 +385,61 @@ paths:
         - name: include
           in: query
           required: false
+          style: form
+          explode: true
           description: >
-            Comma-separated optional parts of the plan. The one value is
-            `column_stats`: attach DataFile.column_stats to every
-            `provided` file. Omitted, the plan carries no statistics and
-            costs no statistics read — the right default for a consumer
-            that cannot prune (an unfiltered scan). An unknown value is a
-            422, never ignored: a misspelling must not read as "no
-            statistics, so nothing can be pruned".
-          schema: { type: string }
-          example: column_stats
+            Optional parts of the plan. The one value is `column_stats`:
+            attach DataFile.column_stats to every `provided` file.
+            Omitted, the plan carries no statistics and costs no
+            statistics read — the right default for a consumer that
+            cannot prune (an unfiltered scan).
+
+            Values may be comma-separated in one occurrence, or spread
+            over repeated occurrences, or both: every occurrence is read
+            and the values UNION. A repeated parameter is never reduced
+            to its first occurrence, because that would silently ignore
+            the half of the request a caller could not see being
+            dropped.
+
+            An unknown value is a 422, never ignored: a misspelling must
+            not read as "no statistics, so nothing can be pruned". An
+            EMPTY value, or more than 16 DISTINCT values, is a 400 — the
+            malformed side of the same line `stats_fields` sits on. The
+            cap counts distinct values, after duplicates collapse, so
+            repetition is never itself an error; a separate guard refuses
+            more than 100000 raw values on either parameter.
+          schema:
+            type: array
+            items: { type: string, enum: [column_stats] }
+          example: [column_stats]
         - name: stats_fields
           in: query
           required: false
+          style: form
+          explode: true
           description: >
-            Comma-separated field ids narrowing column_stats to those
-            columns — the ones an engine's pushed-down predicate names,
-            so a one-column filter over a wide table fetches files x 1
-            entries rather than files x columns. Requires
-            include=column_stats (a 422 without it, which would otherwise
-            silently return no statistics). A field id that names no
-            visible leaf matches nothing. Omitted, every stored row is
-            returned. A non-integer entry, or more than 10000 entries, is
-            a 400.
-          schema: { type: string }
-          example: "3,7"
+            Field ids narrowing column_stats to those columns — the ones
+            an engine's pushed-down predicate names, so a one-column
+            filter over a wide table fetches files x 1 entries rather
+            than files x columns. It is also the lever out of the 422
+            below.
+
+            Comma-separated in one occurrence, repeated, or both: as with
+            `include`, every occurrence is read and the ids UNION, and
+            duplicates collapse.
+
+            Requires include=column_stats (a 422 without it, which would
+            otherwise silently return no statistics). A field id that
+            names no visible leaf matches nothing, and costs nothing
+            against the entry cap below. Omitted, every stored row is
+            returned. An empty or non-integer entry, or more than 10000
+            DISTINCT ids (the per-table column-node maximum, so no legal
+            table has more ids to name), is a 400 — again counted after
+            duplicates collapse, with the same 100000 raw-value guard.
+          schema:
+            type: array
+            items: { type: integer, format: int64 }
+          example: [3, 7]
       responses:
         "200":
           description: Scan plan
@@ -419,7 +449,11 @@ paths:
                 type: array
                 items: { $ref: "#/components/schemas/ScanFile" }
         "400":
-          description: Malformed snapshot, at_timestamp or stats_fields.
+          description: >
+            Malformed snapshot or at_timestamp, or a malformed VALUE on
+            either stats parameter: an empty or non-integer stats_fields
+            entry, an empty include value, more than 10000 field ids, or
+            more than 16 include values.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -427,8 +461,25 @@ paths:
         "410": { $ref: "#/components/responses/Gone" }
         "422":
           description: >
-            Both snapshot and at_timestamp, an unknown include value, or
-            stats_fields without include=column_stats.
+            Both snapshot and at_timestamp; an unknown include value;
+            stats_fields without include=column_stats; or a column_stats
+            request whose answer would exceed 1000000 entries.
+
+            The entry count is `provided files x requested visible leaf
+            columns`. `stats_fields` divides the second factor and is
+            the only lever: /scan plans a table at one snapshot and has
+            no range, page or limit parameter, so a table with more than
+            1000000 files carrying statistics is past the cap at EVERY
+            narrowing — one column still costs one entry per file — and
+            `include=column_stats` is simply unreachable for it. An
+            engine planning such a table gets no bounds and must plan
+            without pruning. Container (list/struct/map) field ids never
+            count, because they never have a statistics row.
+
+            The ceiling is on what the plan COULD carry, counted from
+            the file and column metadata before any statistics row is
+            read, so it is an upper bound: a request is refused on the
+            entries it could produce, not on the ones it would.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3076,6 +3127,27 @@ components:
             An EMPTY array is a different answer: the file is `provided`
             but has no statistics row for any requested column.
 
+            BOUNDED: one plan carries at most 1000000 entries across all
+            its files. Past that the whole request is a 422 rather than a
+            truncated plan — a plan missing files is a wrong answer, and
+            a plan whose statistics stop half way through is worse than
+            one that never had them. `stats_fields` is the lever: it
+            divides the per-file entry count by naming only the columns a
+            predicate prunes on.
+
+            WHAT THE CAP BOUNDS IS THE PAYLOAD, NOT THE READ. A narrowed
+            request returns fewer entries; the server still reads the
+            catalog's whole statistics relation to find them, because
+            those rows carry no table id and one column's rows sit one
+            per file across every page. Measured at 45M stored rows:
+            about 1.6 s warm and 17 s cold, narrowed or not. Treat
+            `include=column_stats` as a planning-time cost per scan, not
+            as something `stats_fields` makes cheap.
+
+            The plan's FILE list is not capped and is not paged. A scan
+            returns every file visible at the snapshot however many
+            there are; only the statistics are bounded.
+
             The entries are the rows GET .../files/{fileId}/stats answers
             for the same file at the same snapshot — same omissions,
             field-id order, identical bound tokens — narrowed to
@@ -3103,6 +3175,22 @@ components:
             A JSON null bound means "do not prune on this column", per
             FileColumnStats.
 
+            PRE-DELETION-VECTOR, every entry. These statistics describe
+            the file as it was WRITTEN. The scan plan hands you the live
+            deletion vector for the same file alongside (ScanFile.
+            delete_file), and nothing subtracts it from these numbers:
+            `value_count`, `null_count` and `nan_count` count rows the
+            vector may have deleted, and `lower_bound`/`upper_bound` may
+            be the extremes of rows that are all deleted.
+
+            PRUNING stays sound, because deletions only shrink the set of
+            live values: a file whose bounds miss a predicate's range
+            still has no live row that matches it, so skipping it is
+            correct whatever the vector says. ANSWERING from these
+            numbers is not sound — count(*), min() and max() pushed down
+            to metadata are wrong by exactly the vector for any file that
+            carries one. Apply the deletion vector, or read the file.
+
     ScanColumnStats:
       type: object
       required: [field_id, value_count, null_count, lower_bound, upper_bound]
@@ -3111,7 +3199,21 @@ components:
         FileColumnStats entry without the column identity (name, path,
         type, type_params), which is per-TABLE and which the engine
         already holds by field_id — repeating it per file x column was
-        the bulk of a wide table's plan. `lower_bound`/`upper_bound`
+        the bulk of a wide table's plan.
+
+        `size_bytes` is dropped too, and is the one dropped property
+        that is NOT per-table: it is this column's compressed bytes in
+        this file. It goes because it says nothing about whether the
+        file can be pruned, which is this array's one job, and because
+        it is one more integer per file x column on a response already
+        capped for size. The server does not even read the column for a
+        scan plan. Callers that want it ask GET
+        .../files/{fileId}/stats, which is per-file and carries every
+        FileColumnStats property.
+
+        Counts and bounds here are PRE-DELETION-VECTOR; see
+        DataFile.column_stats for what that does and does not license.
+        `lower_bound`/`upper_bound`
         follow the FileColumnStats wire conventions and are the SAME
         tokens GET .../files/{fileId}/stats renders (one decoder); read
         that schema before consuming them. Two consequences engines get
@@ -3153,8 +3255,11 @@ components:
         Populated by GET .../files ONLY. The changefeed and the scan
         plan embed the same DataFile schema and omit this property:
         they answer "what changed" and "what to read", neither of which
-        is a question about one column's span. (The scan plan carries
-        every column's bounds instead, in DataFile.column_stats.)
+        is a question about one column's span. (A scan plan can be ASKED
+        for bounds instead, in DataFile.column_stats — opt-in via
+        `include=column_stats`, and narrowed to the columns
+        `stats_fields` names when it is given, so the leading sort key's
+        bounds are in a plan only if the caller asked for that column.)
 
         Which key it describes follows the TABLE, not the file. When
         the table has a sort spec at the requested snapshot the bounds

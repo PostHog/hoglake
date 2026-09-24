@@ -218,6 +218,52 @@ with the data files (so expiry reclaims both row and object — nothing
 `end_snapshot IS NULL` survives a drop), and compaction end-snapshots
 a group's DVs together with the inputs they mask.
 
+A plan can also carry each `provided` file's stored **column
+statistics**, so an engine prunes files before it plans splits for
+them: `GET /scan?include=column_stats`, narrowed by `stats_fields` to
+the field ids a pushed-down predicate names. Opt-in, because most scan
+consumers cannot prune and should pay neither the join nor the
+payload. Five things about it are worth knowing before you ask for
+it:
+
+- **it is the one response whose size is a PRODUCT** — provided files
+  x requested visible leaf columns, at a measured 106 bytes an entry,
+  which is 66 MB for a 20,000-file 30-column table. It is capped at
+  `ScanService.SCAN_COLUMN_STATS_MAX_ENTRIES` (1,000,000 entries,
+  ~100 MB) and a request past that is a 422 naming `stats_fields` as
+  the way back under it, decided from file and column metadata before
+  a statistics row is read. **`stats_fields` divides only the second
+  factor**, so a table with more than a million files carrying
+  statistics is past the cap at every narrowing — one column still
+  costs one entry per file — and `include=column_stats` is unreachable
+  for it: the engine plans without bounds. That is reachable at the top
+  of the fleet, where 3M files x 15 columns is 45x the cap and one
+  column of it is still 3x. The fix when a table needs it is a paged or
+  filtered statistics surface, not a bigger number here, because the
+  number bounds a response the server builds in memory;
+- **the cap bounds the PAYLOAD, not the read.** A narrowed request
+  returns fewer entries; the statement still reads the catalog's whole
+  statistics relation to find them, because `hog_file_column_stats`
+  carries no table id and one column's rows sit one per file across
+  every page. Measured at 45M stored rows: ~1.6 s warm, ~17 s cold,
+  narrowed or not. It is a planning-time cost per scan, and
+  `stats_fields` does not make it cheap;
+- **the plan's file list is uncapped**, deliberately and unchanged: a
+  scan returning some of a table's files would be a wrong answer, where
+  one returning all of them without bounds is a slow one. Only the
+  statistics are bounded;
+- **the counts and bounds are pre-deletion-vector.** The plan hands
+  you the file's live DV alongside and nothing subtracts it. Pruning
+  stays sound (deletions only shrink the live set); answering
+  `count(*)`/`min()`/`max()` from these numbers does not;
+- **the narrowing is in the SQL, not applied afterwards** — the field
+  ids reach the statement as one array parameter, so a one-column
+  request ships one row per file out of Postgres rather than thirty.
+  See `ScanColumnStatsQueryPlanIntegrationTest` for the plans in all
+  three shapes, for the four index candidates that were measured and
+  rejected, and for the one alternative (CLUSTER) that does change the
+  answer and why it is not taken.
+
 ### Partitioning
 
 A table carries a versioned **partition spec** (`hog_partition_spec` /
