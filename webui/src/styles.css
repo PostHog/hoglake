@@ -817,6 +817,32 @@ button.ghost:hover:not(:disabled) {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* -- partition filter bar (files tab) -------------------------------------- */
+
+.partition-filter {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0 0 10px;
+  padding: 8px 12px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.partition-filter-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.partition-filter-field select {
+  min-width: 0;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
 .table-properties {
   margin-top: 20px;
 }

@@ -18,6 +18,7 @@ import type {
   MaintenanceTask,
   Namespace,
   PartitionStatsResponse,
+  PartitionValues,
   ScanFile,
   SnapshotPage,
   Table,
@@ -171,20 +172,47 @@ export function listFiles(
     order?: "asc" | "desc";
     limit?: number;
     offset?: number;
+    /** key_index → stored value, echoed verbatim from /partitions/values. */
+    partition?: Record<number, string>;
   },
 ): Promise<DataFile[]> {
   // The endpoint returns a bare array; a page is just one such array, and
   // the caller reads has-more from its length (received === limit).
+  const base = buildUrl(
+    `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/files`,
+    {
+      snapshot,
+      sort: opts?.sort,
+      order: opts?.order,
+      limit: opts?.limit,
+      offset: opts?.offset,
+    },
+  );
+  // partition is repeatable (key_index:value), so it is appended by hand
+  // rather than through buildUrl, whose params are single-valued.
+  const extra = new URLSearchParams();
+  for (const [keyIndex, value] of Object.entries(opts?.partition ?? {})) {
+    extra.append("partition", `${keyIndex}:${value}`);
+  }
+  const extraQs = extra.toString();
+  return request(extraQs ? `${base}${base.includes("?") ? "&" : "?"}${extraQs}` : base);
+}
+
+/**
+ * The distinct stored values of a table's partition fields — what feeds a
+ * filter-by-partition dropdown. Returned verbatim; the page decodes each
+ * for display (as it does the files table's partition column).
+ */
+export function getPartitionValues(
+  catalog: string,
+  namespace: string,
+  table: string,
+  snapshot?: Int64,
+): Promise<PartitionValues> {
   return request(
     buildUrl(
-      `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/files`,
-      {
-        snapshot,
-        sort: opts?.sort,
-        order: opts?.order,
-        limit: opts?.limit,
-        offset: opts?.offset,
-      },
+      `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/partitions/values`,
+      { snapshot },
     ),
   );
 }

@@ -13,6 +13,8 @@ import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
 import com.posthog.hoglake.model.PartitionFieldDef
+import com.posthog.hoglake.model.PartitionFieldValues
+import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
@@ -541,6 +543,7 @@ class CatalogService(private val jdbi: Jdbi) {
         desc: Boolean = false,
         limit: Int? = null,
         offset: Int = 0,
+        partitionFilter: Map<Int, String> = emptyMap(),
     ): List<DataFile> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
@@ -551,6 +554,20 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
                     )
+            // A filter on a key the table does not partition by at [at] can
+            // only be a client bug (or a stale spec), so refuse it rather
+            // than return an empty page the caller reads as "no such files".
+            if (partitionFilter.isNotEmpty()) {
+                val arity =
+                    SpecRepo.specAt(h, cat.catalogId, t.tableId, at)?.fields?.size ?: 0
+                val bad = partitionFilter.keys.firstOrNull { it < 0 || it >= arity }
+                if (bad != null) {
+                    throw HoglakeException.Validation(
+                        "partition key_index $bad is out of range for table " +
+                            "'$namespace.$table' ($arity partition keys)",
+                    )
+                }
+            }
             // Ordering bounds are attached to the RETURNED page only, so a
             // paged request pays the bound decode for its page, not the
             // whole manifest.
@@ -559,8 +576,60 @@ class CatalogService(private val jdbi: Jdbi) {
                 cat.catalogId,
                 t.tableId,
                 at,
-                FileRepo.listAt(h, cat.catalogId, t.tableId, at, sort, desc, limit, offset),
+                FileRepo.listAt(h, cat.catalogId, t.tableId, at, sort, desc, limit, offset, partitionFilter),
             )
+        }
+
+    /**
+     * The partition fields of the table at the read snapshot, each with
+     * the distinct stored values it takes across the live files — what a
+     * "filter by partition" UI offers. The server returns the stored
+     * strings verbatim and never decodes them; decoding (a day ordinal to
+     * a date, an identity value to itself) is the caller's job, matching
+     * the files table's partition column.
+     */
+    fun partitionValues(
+        catalog: String,
+        namespace: String,
+        table: String,
+        snapshot: Long? = null,
+        atTimestamp: Instant? = null,
+    ): PartitionValues =
+        jdbi.withHandleUnchecked { h ->
+            val cat = requireCatalog(h, catalog)
+            val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
+            val ns = requireNamespace(h, cat, namespace)
+            val t =
+                TableRepo.findAt(h, cat.catalogId, ns.namespaceId, table, at)
+                    ?: throw HoglakeException.NotFound(
+                        "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
+                    )
+            val spec =
+                SpecRepo.specAt(h, cat.catalogId, t.tableId, at)
+                    ?: return@withHandleUnchecked PartitionValues(-1, emptyList())
+            val fields =
+                spec.fields.mapIndexed { keyIndex, field ->
+                    val cap = PartitionValues.PARTITION_VALUES_CAP
+                    val values =
+                        FileRepo.distinctPartitionValues(
+                            h,
+                            cat.catalogId,
+                            t.tableId,
+                            at,
+                            keyIndex,
+                            // One past the cap, so "there are more" is
+                            // distinguishable from "exactly cap values".
+                            cap + 1,
+                        )
+                    PartitionFieldValues(
+                        sourceFieldId = field.sourceFieldId,
+                        transform = field.transform,
+                        transformParam = field.transformParam,
+                        values = values.take(cap),
+                        truncated = values.size > cap,
+                    )
+                }
+            PartitionValues(spec.specId, fields)
         }
 
     /**

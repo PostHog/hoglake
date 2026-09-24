@@ -196,6 +196,35 @@ fun Application.installApiRoutes(
                                             )
                                         }
                                     } ?: 0
+                                // partition=key_index:value, repeatable. The
+                                // value is the stored, transformed string the
+                                // caller got from /partitions/values, so the
+                                // match is plain string equality — the server
+                                // never encodes. Multiple params AND together.
+                                val partitionFilter =
+                                    call.request.queryParameters.getAll("partition")
+                                        ?.associate { param ->
+                                            val (k, v) =
+                                                param.split(":", limit = 2).also {
+                                                    if (it.size != 2) {
+                                                        throw BadRequestException(
+                                                            "query parameter 'partition' must be " +
+                                                                "key_index:value, got '$param'",
+                                                        )
+                                                    }
+                                                }
+                                            val keyIndex =
+                                                k.toIntOrNull()
+                                                    ?: throw BadRequestException(
+                                                        "partition key_index must be a non-negative integer, got '$k'",
+                                                    )
+                                            if (keyIndex < 0) {
+                                                throw BadRequestException(
+                                                    "partition key_index must be a non-negative integer, got '$k'",
+                                                )
+                                            }
+                                            keyIndex to v
+                                        } ?: emptyMap()
                                 call.respond(
                                     catalogs.listFiles(
                                         call.catalog(),
@@ -207,7 +236,19 @@ fun Application.installApiRoutes(
                                         desc = desc,
                                         limit = limit,
                                         offset = offset,
+                                        partitionFilter = partitionFilter,
                                     ).map { it.toDto() },
+                                )
+                            }
+                            get("/partitions/values") {
+                                call.respond(
+                                    catalogs.partitionValues(
+                                        call.catalog(),
+                                        call.namespace(),
+                                        call.table(),
+                                        call.longQuery("snapshot"),
+                                        call.instantQuery("at_timestamp"),
+                                    ).toDto(),
                                 )
                             }
                             get("/files/{fileId}/stats") {
