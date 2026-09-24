@@ -27,6 +27,7 @@ import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.ViewInfo
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.stats.BoundWire
@@ -186,9 +187,38 @@ fun Column.toDto(): ColumnDto =
         children = if (def.type.isNested) children.map { it.toDto() } else null,
     )
 
-data class TableSummaryDto(val name: String, val tableUuid: UUID)
+/**
+ * One row of a namespace listing.
+ *
+ * `comment` and `earliestSnapshotId` are nullable and therefore OMITTED
+ * by the wire mapper's NON_NULL inclusion when unset — an older client
+ * that never saw them reads the shape it always read, and the spec
+ * lists neither as required. Everything else is always present, which
+ * is what `TableSummarySpecParityTest` pins against the spec's own
+ * `required` list rather than against a second copy of it here.
+ */
+data class TableSummaryDto(
+    val name: String,
+    val tableUuid: UUID,
+    val recordCount: Long,
+    val fileCount: Long,
+    val fileSizeBytes: Long,
+    val snapshotCount: Long,
+    val comment: String? = null,
+    val earliestSnapshotId: Long? = null,
+)
 
-fun TableInfo.toSummaryDto() = TableSummaryDto(name, tableUuid)
+fun TableSummaryInfo.toDto() =
+    TableSummaryDto(
+        name = name,
+        tableUuid = tableUuid,
+        recordCount = recordCount,
+        fileCount = fileCount,
+        fileSizeBytes = fileSizeBytes,
+        snapshotCount = snapshotCount,
+        comment = comment,
+        earliestSnapshotId = earliestSnapshotId,
+    )
 
 data class TableDto(
     val name: String,

@@ -206,7 +206,16 @@ class QeContractPedantryTest {
 
             val tables = body(client.get("/v1/catalogs/pedantry/namespaces/ns/tables"))
             assertSnakeCase(tables)
-            assertRequired(tables[0], "TableSummary", "name", "table_uuid")
+            assertRequired(
+                tables[0],
+                "TableSummary",
+                "name",
+                "table_uuid",
+                "record_count",
+                "file_count",
+                "file_size_bytes",
+                "snapshot_count",
+            )
 
             val table = body(client.get("/v1/catalogs/pedantry/namespaces/ns/tables/t"))
             assertSnakeCase(table)

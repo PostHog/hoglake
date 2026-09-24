@@ -7,15 +7,26 @@ import { jsonResponse, mockFetch, renderApp } from "./helpers";
 const tablesUrl = "/v1/catalogs/analytics/namespaces/events/tables";
 
 describe("NamespacePage", () => {
-  it("lists tables with uuids and offers the create-table form", async () => {
+  it("lists tables with their head rollup and offers the create-table form", async () => {
     mockFetch((url) => (url === tablesUrl ? jsonResponse(tablesFixture) : undefined));
     renderApp("/catalogs/analytics/namespaces/events");
 
     expect(await screen.findByText("pageviews")).toBeInTheDocument();
-    expect(
-      screen.getByText("3f2c9c04-8a1b-4c7e-9f10-6d2a5b3e8c71"),
-    ).toBeInTheDocument();
     expect(screen.getByText("clicks")).toBeInTheDocument();
+
+    // table_uuid stays on the wire — consumers key on it — but it is no
+    // longer a COLUMN: the table page shows it with its copy button.
+    expect(
+      screen.queryByText("3f2c9c04-8a1b-4c7e-9f10-6d2a5b3e8c71"),
+    ).not.toBeInTheDocument();
+
+    // Rollup: counts digit-grouped, bytes through the size formatter.
+    expect(screen.getByText("1,234,567")).toBeInTheDocument();
+    expect(screen.getByText("12")).toBeInTheDocument();
+    expect(screen.getByText("942 MiB")).toBeInTheDocument();
+    // Snapshot count and earliest id stay plain digits.
+    expect(screen.getByText("41")).toBeInTheDocument();
+    expect(screen.getByText("7")).toBeInTheDocument();
 
     // Dynamic column row: name input, 23-type dropdown, nullable toggle.
     expect(screen.getByLabelText("column 1 name")).toBeInTheDocument();
@@ -76,7 +87,18 @@ describe("NamespacePage", () => {
       if (url === tablesUrl) {
         // After the create lands, the invalidated list refetch sees the table.
         return jsonResponse(
-          posted ? [{ name: "pageviews", table_uuid: tableFixture.table_uuid }] : [],
+          posted
+            ? [
+                {
+                  name: "pageviews",
+                  table_uuid: tableFixture.table_uuid,
+                  record_count: "0",
+                  file_count: "0",
+                  file_size_bytes: "0",
+                  snapshot_count: "1",
+                },
+              ]
+            : [],
         );
       }
       return undefined;
@@ -185,6 +207,90 @@ describe("NamespacePage", () => {
     await user.type(screen.getByLabelText("column 1 name"), "_leading");
     expect(screen.queryByText(/column 1:/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Create table" })).toBeEnabled();
+  });
+
+  it("clamps a comment to its first line and expands it on demand", async () => {
+    mockFetch((url) => (url === tablesUrl ? jsonResponse(tablesFixture) : undefined));
+    renderApp("/catalogs/analytics/namespaces/events");
+    const user = userEvent.setup();
+
+    // Collapsed: the first line only. The second must not be on screen,
+    // or the clamp is doing nothing and the row grows with the comment.
+    expect(await screen.findByText("raw pageview events")).toBeInTheDocument();
+    expect(screen.queryByText(/kept for 90 days/)).not.toBeInTheDocument();
+
+    const more = screen.getByRole("button", { name: "more" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await user.click(more);
+    expect(screen.getByText(/kept for 90 days/)).toBeInTheDocument();
+
+    // ...and back again, so the row returns to one line.
+    await user.click(screen.getByRole("button", { name: "less" }));
+    expect(screen.queryByText(/kept for 90 days/)).not.toBeInTheDocument();
+  });
+
+  it("renders an em dash for a table with no comment", async () => {
+    mockFetch((url) => (url === tablesUrl ? jsonResponse(tablesFixture) : undefined));
+    renderApp("/catalogs/analytics/namespaces/events");
+
+    const clicks = (await screen.findByText("clicks")).closest("tr")!;
+    const cells = Array.from(clicks.querySelectorAll("td"));
+    // NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS,
+    // EARLIEST_SNAPSHOT, COMMENT — the comment column is last.
+    expect(cells).toHaveLength(7);
+    expect(cells[6]).toHaveTextContent("—");
+    // `clicks` also has no retained earliest snapshot: absent, not zero.
+    expect(cells[5]).toHaveTextContent("—");
+    // ...and no expand control, because there is nothing to expand.
+    expect(cells[6].querySelector("button")).toBeNull();
+  });
+
+  it("keeps a comment as text, never as markup", async () => {
+    mockFetch((url) =>
+      url === tablesUrl
+        ? jsonResponse([
+            {
+              name: "xss",
+              table_uuid: "b7e6d9a2-15f3-4b08-a4c9-0e8f7d6c5b4a",
+              comment: "<img src=x onerror=alert(1)>",
+              record_count: "1",
+              file_count: "1",
+              file_size_bytes: "1",
+              snapshot_count: "1",
+            },
+          ])
+        : undefined,
+    );
+    renderApp("/catalogs/analytics/namespaces/events");
+
+    expect(
+      await screen.findByText("<img src=x onerror=alert(1)>"),
+    ).toBeInTheDocument();
+    expect(document.querySelector("img")).toBeNull();
+  });
+
+  // S3: snapshot_count must ride the INT64_FIELDS reviver, like every
+  // other int64 wire field. Raw body text with an UNQUOTED 2^53+1, the
+  // way CatalogsPage.test.tsx pins live_rows: a number literal that
+  // JSON.parse would round to 9007199254740992, so a field missing from
+  // the set renders the even neighbour and this fails.
+  it("carries snapshot_count losslessly above 2^53", async () => {
+    mockFetch((url) =>
+      url === tablesUrl
+        ? new Response(
+            '[{"name":"ancient","table_uuid":"b7e6d9a2-15f3-4b08-a4c9-0e8f7d6c5b4a",' +
+              '"record_count":0,"file_count":0,"file_size_bytes":0,' +
+              '"snapshot_count":9007199254740993,"earliest_snapshot_id":9007199254740993}]',
+            { status: 200, headers: { "content-type": "application/json" } },
+          )
+        : undefined,
+    );
+    renderApp("/catalogs/analytics/namespaces/events");
+
+    await screen.findByText("ancient");
+    // 9007199254740993 is odd, so a double round-trip cannot produce it.
+    expect(screen.getAllByText("9007199254740993")).toHaveLength(2);
+    expect(screen.queryByText("9007199254740992")).not.toBeInTheDocument();
   });
 
   it("surfaces a 404 when the namespace does not exist", async () => {

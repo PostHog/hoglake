@@ -357,6 +357,57 @@ enum class ChangeKind {
 
     companion object {
         fun fromWire(s: String) = valueOf(s.uppercase())
+
+        /**
+         * The kinds whose `hog_snapshot_change.object_id` is a TABLE id.
+         *
+         * `object_id` is one column over three disjoint id spaces
+         * (table, namespace, view — the schema comment says so), so any
+         * query that reads a change row BY object id must say which
+         * space it means or it silently counts a namespace's history
+         * against a table that happens to share its id.
+         *
+         * WRITTEN OUT, not derived. The first version of this was
+         * `entries.filter { it.name.startsWith("TABLE_") }` with a test
+         * that compared it against the schema's kinds filtered by the
+         * SAME prefix rule — so both sides agreed by construction and a
+         * hypothetical `TABLE_NAMESPACE_MOVED` (a namespace-scoped kind
+         * that happens to start with the word) would have joined this
+         * set and passed the test. A membership decision that cannot be
+         * wrong cannot be checked either.
+         *
+         * So: adding a change kind means deciding, HERE, whether its
+         * `object_id` is a table id, and `TableSummaryVocabularyTest`
+         * reds on any kind in schema.sql that this set has not
+         * classified either way — it cannot tell you the right answer,
+         * but it can refuse to let the question go unasked.
+         */
+        val TABLE_SCOPED: Set<ChangeKind> =
+            setOf(
+                TABLE_CREATED,
+                TABLE_DROPPED,
+                TABLE_ALTERED,
+                TABLE_INSERTED_INTO,
+                TABLE_DELETED_FROM,
+                TABLE_COMPACTED,
+            )
+
+        /**
+         * The kinds whose `object_id` is NOT a table id.
+         *
+         * Its only purpose is to make [TABLE_SCOPED] a decision about
+         * every kind rather than about six of them: the two sets must
+         * partition the vocabulary exactly, which is what the
+         * vocabulary test asserts. A new kind that lands in neither
+         * reds, and the author has to say which it is.
+         */
+        val NON_TABLE_SCOPED: Set<ChangeKind> =
+            setOf(
+                NAMESPACE_CREATED,
+                NAMESPACE_DROPPED,
+                VIEW_CREATED,
+                VIEW_DROPPED,
+            )
     }
 }
 
@@ -679,6 +730,47 @@ fun columnDefDepth(
  * 422, refused BEFORE any field id is allocated.
  */
 const val MAX_COLUMN_NESTING_DEPTH: Int = 8
+
+/**
+ * One row of a namespace's table listing.
+ *
+ * Deliberately NOT a [TableInfo] with empty columns, which is what the
+ * listing used to return: the two answer different questions. A
+ * TableInfo is one table read AT a snapshot, columns and specs
+ * included; this is the per-table rollup a browser shows in a row, and
+ * it carries two numbers a TableInfo has no business holding —
+ * [snapshotCount] and [earliestSnapshotId], which are properties of a
+ * table's HISTORY rather than of its state at any one snapshot.
+ *
+ * Every field here is resolved at the catalog's head, in ONE query (see
+ * `TableRepo.listLiveSummaries`): the listing is head-only, so the
+ * comment, the file aggregates and the history counts all answer for
+ * the same snapshot without a per-table round trip.
+ */
+data class TableSummaryInfo(
+    val tableId: Long,
+    val tableUuid: UUID,
+    val name: String,
+    val comment: String?,
+    /** Rows in the data files live at head — invariant 7, never hog_table_stats. */
+    val recordCount: Long,
+    val fileCount: Long,
+    val fileSizeBytes: Long,
+    /**
+     * RETAINED snapshots that carry a change row for this table.
+     *
+     * Snapshots are catalog-wide, so "this table's snapshots" only
+     * means anything through `hog_snapshot_change`: the count is of
+     * distinct snapshot ids at or above the catalog's
+     * `earliest_snapshot_id` whose change row names this table. Expiry
+     * deletes snapshots below the floor, so this number SHRINKS as the
+     * catalog ages — it is what a reader can still time-travel to, not
+     * how many commits the table has ever taken.
+     */
+    val snapshotCount: Long,
+    /** The smallest such snapshot id; null when the table has no retained change row. */
+    val earliestSnapshotId: Long?,
+)
 
 data class TableInfo(
     val tableId: Long,

@@ -782,6 +782,24 @@ button.ghost:hover:not(:disabled) {
   vertical-align: bottom;
 }
 
+/* A comment in the namespace LISTING shares its row with five numeric
+   columns, so the cell is bounded and its collapsed head held to one
+   line — the same shape as a snapshot message, for the same reason. The
+   width is a `max-width` on the cell rather than a fixed one, so the
+   column gives its space back to the numbers on a narrow screen instead
+   of forcing the table to scroll. */
+.data-table td.table-comment-cell {
+  max-width: 24rem;
+}
+.data-table td.table-comment-cell .clamped-head {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
 .col-comment {
   max-width: 32rem;
   white-space: pre-wrap;

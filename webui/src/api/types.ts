@@ -168,9 +168,41 @@ export interface CreateTableRequest {
   columns: ColumnDef[];
 }
 
+/**
+ * One row of a namespace's table listing.
+ *
+ * Every field is resolved at the catalog HEAD — the listing takes no
+ * snapshot parameter — so the comment, the aggregates and the history
+ * counts all answer for the same snapshot.
+ *
+ * The rollup fields are optional here only because a server older than
+ * they are omits them; a current server always sends them, and the
+ * spec lists them as required.
+ */
 export interface TableSummary {
   name: string;
+  /** Still on the wire, and still what consumers key on; no longer a column. */
   table_uuid: string;
+  /** Versioned table comment at head (≤ 16384 chars); absent when none. */
+  comment?: string;
+  /**
+   * Rows in the data files live at head, GROSS of deletion vectors — a
+   * row a live DV masks is still counted. Same answer as the Table
+   * object's, on purpose.
+   */
+  record_count?: Int64;
+  /** Data files live at head. */
+  file_count?: Int64;
+  /** Total size of the data files live at head. */
+  file_size_bytes?: Int64;
+  /**
+   * Retained snapshots carrying a change row for this table. Snapshots
+   * are catalog-wide, so a table's are defined through the change log;
+   * the number SHRINKS as expiry advances the catalog's floor.
+   */
+  snapshot_count?: Int64;
+  /** Smallest such snapshot id; absent when no retained snapshot names it. */
+  earliest_snapshot_id?: Int64;
 }
 
 export type PartitionTransform =

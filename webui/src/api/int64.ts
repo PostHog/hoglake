@@ -27,6 +27,14 @@ const INT64_FIELDS = new Set([
   "record_count",
   "file_count",
   "file_size_bytes",
+  // Namespace table listing: retained snapshots naming the table. Not
+  // here because 2^53 snapshots is reachable — it is not — but because
+  // the spec types it `integer, format: int64` and this set is the
+  // client's statement of which wire fields that is true of. A field
+  // left out is parsed by JSON.parse as a double, silently, and the
+  // reviver keys on the NAME, so the omission is invisible until a
+  // value is big enough to round.
+  "snapshot_count",
   // Catalog listing totals: live_rows can exceed 2^53 at fleet scale, so
   // it must arrive as its exact decimal string like every other count.
   "live_rows",

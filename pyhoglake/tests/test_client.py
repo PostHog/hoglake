@@ -360,10 +360,68 @@ def test_list_tables(client, httpx_mock):
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
+        json=[
+            {
+                "name": "events",
+                "table_uuid": TABLE_WIRE["table_uuid"],
+                "comment": "raw pageview events",
+                "record_count": 15,
+                "file_count": 2,
+                "file_size_bytes": 1500,
+                "snapshot_count": 4,
+                "earliest_snapshot_id": 2,
+            },
+            # The same row with every optional property ABSENT, which is
+            # what the server sends for a table with no comment and no
+            # retained history — absent, not null.
+            {
+                "name": "bare",
+                "table_uuid": TABLE_WIRE["table_uuid"],
+                "record_count": 0,
+                "file_count": 0,
+                "file_size_bytes": 0,
+                "snapshot_count": 1,
+            },
+        ],
+    )
+    events, bare = Namespace(cat, "ns1").list_tables()
+    assert events.name == "events"
+    assert events.comment == "raw pageview events"
+    assert events.record_count == 15
+    assert events.file_count == 2
+    assert events.file_size_bytes == 1500
+    assert events.snapshot_count == 4
+    assert events.earliest_snapshot_id == 2
+
+    assert bare.comment is None
+    assert bare.earliest_snapshot_id is None
+    assert bare.record_count == 0
+
+
+def test_list_tables_tolerates_a_server_without_the_rollup(client, httpx_mock):
+    """A pre-rollup server sends identity only; the client must not raise.
+
+    None rather than 0 for every count: against such a server "no files"
+    and "not told" are different facts, and only None can say the second.
+    """
+    cat = _catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables",
         json=[{"name": "events", "table_uuid": TABLE_WIRE["table_uuid"]}],
     )
-    tables = Namespace(cat, "ns1").list_tables()
-    assert tables[0].name == "events"
+    (t,) = Namespace(cat, "ns1").list_tables()
+    assert t.name == "events"
+    assert (
+        t.comment,
+        t.record_count,
+        t.file_count,
+        t.file_size_bytes,
+        t.snapshot_count,
+        t.earliest_snapshot_id,
+    ) == (None, None, None, None, None, None)
 
 
 def test_files_and_scan_plan(client, httpx_mock):

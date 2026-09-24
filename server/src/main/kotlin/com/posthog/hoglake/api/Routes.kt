@@ -103,7 +103,7 @@ fun Application.installApiRoutes(
                         get {
                             call.respond(
                                 catalogs.listTables(call.catalog(), call.namespace())
-                                    .map { it.toSummaryDto() },
+                                    .map { it.toDto() },
                             )
                         }
                         post {
