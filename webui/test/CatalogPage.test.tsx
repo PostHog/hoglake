@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import {
   COMPACTION_MESSAGE,
   MILLPOND_SUMMARY,
+  catalogOptionsFixture,
+  catalogOptionsNoExpiryFixture,
   catalogsFixture,
   conflictError,
   namespacesFixture,
@@ -19,6 +21,7 @@ const base = "/v1/catalogs/analytics";
 // everything below head+1 = 4212, newest first.
 function happyHandler(url: string): Response | undefined {
   if (url === base) return jsonResponse(catalogsFixture[0]);
+  if (url === `${base}/options`) return jsonResponse(catalogOptionsFixture);
   if (url === `${base}/namespaces`) return jsonResponse(namespacesFixture);
   if (url === `${base}/snapshots?before=4212&limit=50`)
     return jsonResponse(snapshotsPage1);
@@ -50,6 +53,40 @@ describe("CatalogPage", () => {
 
     // has_more=true → Load more is offered.
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("shows the catalog's per-catalog expiry and floor settings in the header", async () => {
+    mockFetch(happyHandler);
+    renderApp("/catalogs/analytics");
+
+    // expiry renders the retention window as a duration (604800s = 7d).
+    const expiry = await screen.findByText("expiry", { selector: "dt" });
+    expect(expiry.nextElementSibling).toHaveTextContent("7d");
+
+    // consumer_floor on; earliest_snapshot_id shown.
+    const floor = screen.getByText("consumer_floor", { selector: "dt" });
+    expect(floor.nextElementSibling).toHaveTextContent("on");
+    const earliest = screen.getByText("earliest_snapshot_id", { selector: "dt" });
+    expect(earliest.nextElementSibling).toHaveTextContent("4099");
+  });
+
+  it("reads expiry as off when the catalog has no retention window", async () => {
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(catalogsFixture[0]);
+      if (path === `${base}/options`)
+        return jsonResponse(catalogOptionsNoExpiryFixture);
+      if (path === `${base}/namespaces`) return jsonResponse(namespacesFixture);
+      return undefined;
+    });
+    renderApp("/catalogs/analytics");
+
+    // No retention window → "disabled" (matching the maintenance page's
+    // word for the identical field), not a duration; consumer_floor off.
+    const expiry = await screen.findByText("expiry", { selector: "dt" });
+    expect(expiry.nextElementSibling).toHaveTextContent("disabled");
+    const floor = screen.getByText("consumer_floor", { selector: "dt" });
+    expect(floor.nextElementSibling).toHaveTextContent("off");
   });
 
   it("pages the timeline older via before/limit when Load more is clicked", async () => {
