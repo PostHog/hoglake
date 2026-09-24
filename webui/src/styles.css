@@ -172,7 +172,10 @@ h3 {
 
 .two-col {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) 2fr;
+  /* Namespaces at ~1/6, the snapshot timeline at ~5/6: the namespaces
+     list is short identifiers while the timeline carries long commit
+     messages, so the timeline earns the width. */
+  grid-template-columns: minmax(200px, 1fr) 5fr;
   gap: 24px;
   align-items: start;
 }
