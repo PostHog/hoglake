@@ -133,6 +133,10 @@ h3 {
   align-items: center;
   gap: 14px;
   font-size: 12px;
+  /* The breadcrumb used to be the flex spacer pushing this group to the
+     right edge (it had flex: 1); it moved to a sub-header row in #196, so
+     the spacer went with it. margin-left: auto restores the right edge. */
+  margin-left: auto;
 }
 
 .health {
