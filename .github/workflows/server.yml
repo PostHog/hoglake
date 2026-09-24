@@ -95,9 +95,9 @@ jobs:
           java-version: "25"
           cache: gradle
 
-      # Docker required (Testcontainers: postgres:18 + minio — both
-      # unauthenticated Docker Hub pulls, the usual rate-limit flake
-      # source). :test includes the schema-equivalence gate
+      # Docker required (Testcontainers: postgres:18 + pgsty/silo, the
+      # MinIO build — both unauthenticated Docker Hub pulls, the usual
+      # rate-limit flake source). :test includes the schema-equivalence gate
       # (fold(migrations) == schema.sql).
       - name: Server tests + ktlint
         working-directory: server
