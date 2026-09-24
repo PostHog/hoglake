@@ -19,6 +19,7 @@ import type {
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
+import { ClampedText } from "../components/ClampedText";
 import { CopyButton } from "../components/CopyButton";
 import { decodePartition, type PartitionDecode } from "../lib/partitions";
 import {
@@ -64,6 +65,9 @@ function formatSortField(f: SortField, columns?: Column[]): string {
   const nulls = f.null_order === "nulls_first" ? "nulls first" : "nulls last";
   return `${source} ${f.direction} ${nulls}`;
 }
+
+/** Chars of a table comment shown before the expand control takes over. */
+const COMMENT_CLAMP = 120;
 
 function StatsHeader({ table }: { table: Table }) {
   return (
@@ -113,26 +117,19 @@ function StatsHeader({ table }: { table: Table }) {
         {/* A comment can run to 16384 chars, so it lives on its own field
             with a clamp + expand rather than inline with the short stats.
             TextContent only — it is user data, never HTML. */}
-        <dd>{table.comment ? <LongComment text={table.comment} /> : "—"}</dd>
+        <dd>
+          {table.comment ? (
+            <ClampedText
+              text={table.comment}
+              className="table-comment"
+              maxChars={COMMENT_CLAMP}
+            />
+          ) : (
+            "—"
+          )}
+        </dd>
       </div>
     </dl>
-  );
-}
-
-/** Clamp a long comment to one line, with the full text a click away. */
-function LongComment({ text }: { text: string }) {
-  const [open, setOpen] = useState(false);
-  const SHORT = 120;
-  if (text.length <= SHORT) {
-    return <span className="table-comment">{text}</span>;
-  }
-  return (
-    <span className="table-comment">
-      {open ? text : `${text.slice(0, SHORT)}…`}{" "}
-      <button type="button" className="ghost" onClick={() => setOpen(!open)}>
-        {open ? "less" : "more"}
-      </button>
-    </span>
   );
 }
 

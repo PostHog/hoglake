@@ -307,6 +307,50 @@ export const snapshotsPage2: SnapshotPage = {
   has_more: false,
 };
 
+// Snapshot messages as millpond writes them since the offsets block
+// landed: line 1 is a key=value summary, line 2+ an `offsets` block that
+// reaches ~700 bytes at 32 ranges on prod and 16 KiB at worst. The block
+// ends in its own count — a bare `(N)`, or `(+k more)` when millpond
+// itself truncated the list. Compaction stays one line.
+export const MILLPOND_SUMMARY =
+  "records=1048576 files=4 partitions=2 arrow_bytes=134217728 " +
+  "trigger=size millpond=1.9.3 table=events.pageviews";
+export const MILLPOND_OFFSETS =
+  "offsets events_json p0:41200-83999 p1:41200-84010 p2:41198-83944 (32)";
+export const MILLPOND_OFFSETS_TRUNCATED =
+  "offsets events_json p0:11-22 p1:23-44 (+8 more)";
+export const COMPACTION_MESSAGE = "compact 12 files into 1 (events.pageviews)";
+
+export const snapshotsMessagesPage: SnapshotPage = {
+  snapshots: [
+    {
+      snapshot_id: "4211",
+      snapshot_time: "2026-09-04T10:17:00Z",
+      schema_version: "7",
+      author: "millpond",
+      message: `${MILLPOND_SUMMARY}\n${MILLPOND_OFFSETS}`,
+      changes: [{ kind: "files_added", object_id: "55" }],
+    },
+    {
+      snapshot_id: "4210",
+      snapshot_time: "2026-09-04T10:16:00Z",
+      schema_version: "7",
+      author: "millpond",
+      message: `${MILLPOND_SUMMARY}\n${MILLPOND_OFFSETS_TRUNCATED}`,
+      changes: [{ kind: "files_added", object_id: "54" }],
+    },
+    {
+      snapshot_id: "4209",
+      snapshot_time: "2026-09-04T10:15:00Z",
+      schema_version: "7",
+      author: "compactor",
+      message: COMPACTION_MESSAGE,
+      changes: [{ kind: "files_added", object_id: "53" }],
+    },
+  ],
+  has_more: false,
+};
+
 export const consumerOffsetsFixture: ConsumerOffset[] = [
   {
     consumer_id: "viaduck-sink-7",
