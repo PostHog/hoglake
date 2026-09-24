@@ -1043,13 +1043,36 @@ class VerifyService(
          * Every check sub-query whose predicate is a PATH EQUALITY
          * across tables that carry no index on `path`.
          *
-         * `hog_data_file`, `hog_delete_file` and `hog_file_removal` are
-         * indexed on (catalog, file id) and (catalog, removal id) —
-         * their hot predicates — so a path lookup has no access path at
-         * all. That is affordable exactly once per query: ONE scan of
-         * the manifest, hashed, joined against the candidate set. It is
-         * a catastrophe per candidate, and the difference is invisible
-         * on any catalog small enough to be a fixture.
+         * `hog_data_file` and `hog_delete_file` are indexed on (catalog,
+         * file id) — their hot predicate — so a path lookup on either
+         * has no access path at all. `hog_file_removal` is the partial
+         * exception since V16: `hog_file_removal_undrained_path`
+         * (catalog_id, path) WHERE drained_at IS NULL serves a path
+         * lookup, but only over the UNDRAINED rows, and several of these
+         * checks read the settled ledger as well.
+         *
+         * A missing access path is affordable exactly once per query:
+         * ONE scan of the manifest, hashed, joined against the candidate
+         * set. It is a catastrophe per candidate, and the difference is
+         * invisible on any catalog small enough to be a fixture.
+         *
+         * V16 also hands the planner a NEW OPTION on
+         * `upload_claims.registered_but_queued` below, whose join to
+         * `hog_file_removal` is on `(catalog_id, path)` with
+         * `drained_at IS NULL` — exactly the index's key and predicate.
+         * A nested loop over `hog_upload` probing that index is now
+         * available, and it would NOT be a defect: the loop count is
+         * the registered claims, not the manifest, and each probe is a
+         * descent rather than a scan. Measured on the 50k fixture it is
+         * not what the planner takes — the check still plans as a MERGE
+         * JOIN on `path`, driving `hog_upload` from
+         * `hog_upload_catalog_id_path_key` and `hog_file_removal` from
+         * a Bitmap Index Scan on `hog_file_removal_drain`, 77 buffers,
+         * every node at `loops=1`. Which plan it takes is the planner's
+         * business; what must not happen is a per-candidate SCAN, and
+         * that is what the plan test asserts (it measures `loops=`, so
+         * a nested loop that DID appear would still have to justify
+         * itself there rather than being waved through).
          *
          * So every one of these is written in a shape the planner can
          * FLATTEN — a join, or a LEFT JOIN ... IS NULL anti-join — and

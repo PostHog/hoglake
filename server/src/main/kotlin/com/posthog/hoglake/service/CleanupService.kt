@@ -234,14 +234,7 @@ class CleanupService(
             }
         val batch =
             jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                SELECT removal_id, path FROM hog_file_removal
-                WHERE catalog_id = :catalogId AND drained_at IS NULL
-                ORDER BY removal_id
-                LIMIT :limit
-                """,
-                )
+                h.createQuery(DRAIN_BATCH_SQL)
                     .bind("catalogId", catalogId)
                     .bind("limit", batchSize)
                     .map { rs, _ -> Entry(rs.getLong("removal_id"), rs.getString("path")) }
@@ -464,6 +457,42 @@ class CleanupService(
          * would have produced.
          */
         const val SUB_BATCH = 25
+
+        /**
+         * The drain's batch select: the oldest undrained rows of one
+         * catalog, in queue order. This is the statement
+         * `hog_file_removal_drain (catalog_id, removal_id) WHERE
+         * drained_at IS NULL` exists for — when it is chosen, the index
+         * supplies both the predicate and the `ORDER BY`, so the LIMIT
+         * stops the scan rather than trimming a sort.
+         *
+         * WHEN IT IS CHOSEN is a real qualifier, and it is the SPARSE
+         * shape: a catalog whose undrained rows are a small fraction of
+         * the table, which is what a 30-day ledger gives one that
+         * drains. Where they are DENSE — a catalog that is behind, which
+         * is the state #199 describes — the primary key on `removal_id`
+         * already arrives in the right order and discards only a row or
+         * two per row it emits, and the planner takes THAT instead.
+         * Both plans are correct and both stop at the LIMIT; the drain
+         * index is the one that keeps the cost bounded as the settled
+         * ledger grows around the queue.
+         *
+         * `internal` so `V16FileRemovalPathIndexMigrationIntegrationTest`
+         * can prove the drain index survives V16 — on both shapes. A new
+         * index the planner prefers HERE would be a regression, not a
+         * win: `(catalog_id, path)` supplies no `removal_id` ordering, so
+         * the LIMIT would sit on top of a sort of every undrained row.
+         *
+         * Binds `:catalogId` and `:limit`. No interpolated values
+         * (invariant 9 intact).
+         */
+        internal const val DRAIN_BATCH_SQL: String =
+            """
+            SELECT removal_id, path FROM hog_file_removal
+            WHERE catalog_id = :catalogId AND drained_at IS NULL
+            ORDER BY removal_id
+            LIMIT :limit
+            """
 
         /** Default drained-ledger retention: 30 days (HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS). */
         const val LEDGER_RETENTION_SECONDS = 30L * 24 * 60 * 60

@@ -172,8 +172,18 @@ class V15CompactionClaimsMigrationIntegrationTest {
     fun `re-entry is a clean no-op - the file runs outside a transaction and must be retryable`() {
         PgTestSupport.freshDatabase().use { db ->
             val before = indexNodes(db)
+            // Every row from 15 ONWARD goes, not just 15's — V14's
+            // helper learned this on the day V15 landed, and V16 taught
+            // it to this one. An interrupted V15 is the last thing that
+            // ran, so nothing after it can be applied, and Flyway agrees:
+            // with a later migration recorded and 15 missing, `validate`
+            // refuses the whole run as an out-of-order resolved migration
+            // instead of re-applying 15. Deleting the tail keeps the
+            // fixture describing the state it claims to, and costs a
+            // re-run of the later migrations — which are idempotent, as a
+            // migration that can be retried has to be.
             db.jdbi.useHandleUnchecked { h ->
-                h.execute("DELETE FROM flyway_schema_history WHERE version = '15'")
+                h.execute("DELETE FROM flyway_schema_history WHERE version::numeric >= 15")
             }
             Database.migrate(db.dataSource)
             assertThat(tableExists(db)).isTrue()
