@@ -1,9 +1,11 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.TableSummaryInfo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.mapper.RowMapper
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
@@ -351,6 +353,182 @@ object TableRepo {
             .bind("namespaceId", namespaceId)
             .map(tableRowMapper)
             .list()
+
+    /**
+     * A namespace's tables at [snapshot], with their rollups, in ONE
+     * statement.
+     *
+     * The listing used to be `listLive` plus one `FileRepo.aggregateAt`
+     * per table — an N+1 that a browser page paid on every render and
+     * that grows with the namespace. The two LATERAL sub-selects replace
+     * it with a single round trip, one index-driven inner scan per
+     * table.
+     *
+     * The catalog's head and expiry floor are read by THIS STATEMENT,
+     * in the `bounds` CTE, and every predicate — the version row's
+     * included — is evaluated against them. Two things follow, and both
+     * were bugs first:
+     *
+     *  - `end_snapshot IS NULL` would have been "live NOW", a different
+     *    question from "live at the snapshot the aggregates were
+     *    computed at". A table created between a caller's head read and
+     *    the listing would have been LISTED (live now) with
+     *    `snapshot_count = 0` and a null `earliest_snapshot_id` — the
+     *    shape the spec defines as "every one of its commits has
+     *    expired", i.e. the opposite fact, indistinguishable from it on
+     *    the wire. So the `tv` predicate is invariant 6's, verbatim and
+     *    identically to [findAt].
+     *  - and the bounds are read HERE rather than passed in, because one
+     *    statement is one MVCC snapshot by definition. The first fix for
+     *    the race above wrapped the head read and this query in a
+     *    REPEATABLE READ transaction, which broke: JDBI reuses a
+     *    thread's open handle, so a caller already inside a transaction
+     *    got "nested transaction with isolation level REPEATABLE_READ,
+     *    but already running in READ_COMMITTED" — a read path a UI calls
+     *    must not care what its caller is doing. A single statement
+     *    composes with any caller and needs no isolation level at all.
+     *
+     * MEASURED plan (200 tables here plus 600 in a sibling namespace,
+     * 52k data-file rows, 4.2k change rows —
+     * `TableListingQueryPlanIntegrationTest` EXPLAINs this exact string
+     * and asserts every number below):
+     *
+     *  - driving scan: an index scan of `hog_table_version` with
+     *    `namespace_id` as a FILTER, not an index condition — the
+     *    planner prefers the pkey's (catalog_id, table_id,
+     *    begin_snapshot) to `hog_table_version_namespace`. So the
+     *    driving scan is catalog-sized. It is also CHEAP (13 buffers
+     *    against the laterals' 2,199), and the laterals run only for the
+     *    rows it emits, which the filter has already narrowed to this
+     *    namespace. That asymmetry is the LATERAL-versus-GROUP-BY
+     *    argument, and the test asserts it rather than this comment
+     *    claiming it;
+     *  - file rollup: `Index Scan using hog_data_file_changefeed on
+     *    hog_data_file`, 250 rows/loop, 10 removed by the visibility
+     *    filter. NOT `hog_data_file_live`: both lead on
+     *    (catalog_id, table_id, begin_snapshot) and the planner prefers
+     *    the non-partial one. Either is fine and the test asserts
+     *    index-driven rather than an index NAME;
+     *  - history counts: `Index Only Scan using
+     *    hog_snapshot_change_conflict`, 20 rows/loop, with a per-loop
+     *    Sort above it for the `count(DISTINCT)` (see the cost note on
+     *    [LIVE_SUMMARIES_SQL]).
+     *
+     * LATERAL rather than a GROUP BY over the catalog joined back: a
+     * grouped scan sizes with the CATALOG's manifest and change log,
+     * while these laterals size with this namespace's.
+     *
+     * `bounds.earliest` is the catalog's expiry floor — snapshots below
+     * it are gone (invariant 5), so counting them would report history
+     * no reader can reach.
+     *
+     * `kind = ANY(:kinds)` is not decoration: `object_id` spans three id
+     * spaces and only the kind says which (see [ChangeKind.TABLE_SCOPED]).
+     */
+    fun listLiveSummaries(
+        handle: Handle,
+        catalogId: Long,
+        namespaceId: Long,
+    ): List<TableSummaryInfo> =
+        handle.createQuery(LIVE_SUMMARIES_SQL)
+            .bind("catalogId", catalogId)
+            .bind("namespaceId", namespaceId)
+            .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
+            .map(tableSummaryMapper)
+            .list()
+
+    /**
+     * [listLiveSummaries]'s statement, `internal` so the plan test
+     * EXPLAINs the SQL PRODUCTION runs. A plan test that retypes the
+     * query asserts the plan of a string only it has ever executed.
+     *
+     * KNOWN COST, measured here rather than repeated from anywhere.
+     * Fixture: ONE namespace holding 54,000 tables, 270,000 data files
+     * (5 per table) and 270,000 change rows (5 per table) over 50
+     * snapshots — a Portola-shaped catalog. Postgres 18, warm cache,
+     * serial plan:
+     *
+     *  - 389/398/402 ms over three runs;
+     *  - 595,488 shared buffers. The FILE rollup is 432,000 of them
+     *    (73%) and the change-log lateral 162,001 (27%) — the file half
+     *    dominates, and it is the half that has to read the files;
+     *  - the final `ORDER BY tv.name` spills: 595 temp blocks read and
+     *    written, at 54,000 rows;
+     *  - 9.16 MiB of JSON in one unpaged response.
+     *
+     * The change-log lateral pays a per-loop Sort, because
+     * `count(DISTINCT sc.snapshot_id)` cannot use
+     * `hog_snapshot_change_conflict`'s snapshot_id ordering while
+     * `kind = ANY(...)` sits between `object_id` and `snapshot_id` in
+     * it. A covering index `(catalog_id, object_id, snapshot_id) WHERE
+     * kind IN (...)` would remove that Sort — and would add a second
+     * index to the table every commit's OCC check writes, to save 27%
+     * of a read path's buffers. Not worth it, and measurably not the
+     * problem: the file rollup is the bigger term and it is already
+     * minimal.
+     *
+     * The 9 MiB is the real limit, and it is a SHAPE problem rather
+     * than a plan problem. PAGING the endpoint is the answer and is a
+     * follow-up; the OpenAPI description carries these numbers so the
+     * next person starts from measurement.
+     */
+    internal val LIVE_SUMMARIES_SQL =
+        """
+            WITH bounds AS (
+                SELECT last_snapshot_id AS snapshot, earliest_snapshot_id AS earliest
+                FROM hog_catalog WHERE catalog_id = :catalogId
+            )
+            SELECT t.table_id, t.table_uuid, tv.name, tv.comment,
+                   f.file_count, f.record_count, f.file_size_bytes,
+                   c.snapshot_count, c.earliest_snapshot_id
+            FROM bounds b
+            JOIN hog_table_version tv
+              ON tv.catalog_id = :catalogId
+             AND tv.namespace_id = :namespaceId
+             AND tv.begin_snapshot <= b.snapshot
+             AND (tv.end_snapshot IS NULL OR b.snapshot < tv.end_snapshot)
+            JOIN hog_table t
+              ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
+            CROSS JOIN LATERAL (
+                SELECT count(*) AS file_count,
+                       coalesce(sum(d.record_count), 0) AS record_count,
+                       coalesce(sum(d.file_size_bytes), 0) AS file_size_bytes
+                FROM hog_data_file d
+                WHERE d.catalog_id = tv.catalog_id
+                  AND d.table_id = tv.table_id
+                  AND d.begin_snapshot <= b.snapshot
+                  AND (d.end_snapshot IS NULL OR b.snapshot < d.end_snapshot)
+            ) f
+            CROSS JOIN LATERAL (
+                SELECT count(DISTINCT sc.snapshot_id) AS snapshot_count,
+                       min(sc.snapshot_id) AS earliest_snapshot_id
+                FROM hog_snapshot_change sc
+                WHERE sc.catalog_id = tv.catalog_id
+                  AND sc.object_id = tv.table_id
+                  AND sc.kind = ANY(:kinds)
+                  AND sc.snapshot_id >= b.earliest
+                  AND sc.snapshot_id <= b.snapshot
+            ) c
+            ORDER BY tv.name
+        """
+
+    private val tableSummaryMapper =
+        RowMapper { rs, _ ->
+            TableSummaryInfo(
+                tableId = rs.getLong("table_id"),
+                tableUuid = rs.getObject("table_uuid") as UUID,
+                name = rs.getString("name"),
+                comment = rs.getString("comment"),
+                recordCount = rs.getLong("record_count"),
+                fileCount = rs.getLong("file_count"),
+                fileSizeBytes = rs.getLong("file_size_bytes"),
+                snapshotCount = rs.getLong("snapshot_count"),
+                // min() over no rows is SQL NULL, not 0: a table with no
+                // retained change row has no earliest snapshot, and
+                // getLong would report that as snapshot 0 — a real id.
+                earliestSnapshotId = rs.getObject("earliest_snapshot_id", java.lang.Long::class.java)?.toLong(),
+            )
+        }
 
     /**
      * The column FOREST visible at [snapshot]: top-level columns in

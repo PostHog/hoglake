@@ -183,6 +183,24 @@ paths:
   /catalogs/{catalog}/namespaces/{namespace}/tables:
     get:
       operationId: listTables
+      summary: List a namespace's live tables with their rollups
+      description: >
+        HEAD-ONLY: there are no snapshot / at-timestamp parameters here,
+        so every field of every row — the comment, the file aggregates
+        and the history counts — answers for the catalog head, read in
+        one REPEATABLE READ transaction so they cannot disagree.
+
+
+        NOT PAGED, and that is the known limit of this endpoint. One row
+        per live table, computed in a single statement whose per-table
+        work is index-driven, so the plan is linear in the namespace —
+        but the RESPONSE is not bounded. Measured on one namespace of
+        54,000 tables over 270,000 data files and 270,000 change rows
+        (Postgres 18, warm cache, serial plan): 389-402 ms, 595,000
+        shared buffers, and 9.2 MiB of JSON. A caller facing a namespace
+        of that size should expect a several-hundred-millisecond
+        response and should not hold the body in memory casually.
+        Paging is the fix and is not yet implemented.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -2611,10 +2629,61 @@ components:
 
     TableSummary:
       type: object
-      required: [name, table_uuid]
+      required: [name, table_uuid, record_count, file_count, file_size_bytes,
+                 snapshot_count]
       properties:
         name: { type: string }
         table_uuid: { type: string, format: uuid }
+        comment:
+          type: [string, "null"]
+          maxLength: 16384
+          description: >
+            The table's comment as of the listed snapshot (head), from
+            the same versioned row the name comes from. Absent when the
+            table has no comment; a server older than this field omits
+            it too, so a client must treat absent and null alike.
+        record_count:
+          type: integer
+          format: int64
+          description: >
+            Rows in the data files LIVE at head, the same aggregate the
+            Table object reports — never the gross append counter. It is
+            GROSS of deletion vectors: a row masked by a live DV is still
+            counted, because the count comes from each file's registered
+            record_count and nothing subtracts the DVs. Deliberate, for
+            parity with the Table object, which answers the same way; a
+            net count needs the per-file DV join and belongs to a
+            surface that says so.
+        file_count:
+          type: integer
+          format: int64
+          description: Data files live at head.
+        file_size_bytes:
+          type: integer
+          format: int64
+          description: Total size of the data files live at head.
+        snapshot_count:
+          type: integer
+          format: int64
+          description: >
+            How many RETAINED snapshots carry a change row for this
+            table. Snapshots are catalog-wide, so a table's snapshots
+            are defined through the change log: distinct snapshot ids at
+            or above the catalog's earliest_snapshot_id whose change row
+            names this table (the table-scoped change kinds —
+            table_created / table_dropped / table_altered /
+            table_inserted_into / table_deleted_from / table_compacted).
+            It SHRINKS as expiry advances the floor: it is what a reader
+            can still time-travel to, not the table's lifetime commit
+            count.
+        earliest_snapshot_id:
+          type: [integer, "null"]
+          format: int64
+          description: >
+            The smallest snapshot id counted by snapshot_count — the
+            oldest point this table can still be read at. Absent when no
+            retained snapshot carries a change row for the table (every
+            one of its commits has expired below the catalog floor).
 
     Table:
       type: object

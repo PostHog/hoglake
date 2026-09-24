@@ -225,8 +225,37 @@ class ConsumerOffset:
 
 @dataclass(frozen=True)
 class TableSummary:
+    """One row of a namespace's table listing.
+
+    Everything past ``table_uuid`` is resolved at the catalog HEAD (the
+    listing takes no snapshot parameter), and every one of those fields
+    defaults to ``None`` so a client on this version keeps working
+    against a server that predates them — ``_pick`` drops what the wire
+    does not carry, and the constructor supplies the default.
+
+    ``None`` rather than ``0`` for the counts, deliberately: against an
+    older server "this table has no files" and "this server never told
+    me" are different facts, and zero asserts the wrong one. Against a
+    current server they are always present.
+    """
+
     name: str
     table_uuid: str
+    #: Table comment at head; ``None`` when unset (or unsupported).
+    comment: str | None = None
+    #: Rows in the data files live at head.
+    record_count: int | None = None
+    #: Data files live at head.
+    file_count: int | None = None
+    #: Total size of the data files live at head.
+    file_size_bytes: int | None = None
+    #: Retained snapshots carrying a change row for this table. Snapshots
+    #: are catalog-wide, so a table's are defined through the change log;
+    #: the number SHRINKS as expiry advances the catalog floor.
+    snapshot_count: int | None = None
+    #: Smallest such snapshot id — the oldest point this table can still
+    #: be read at. ``None`` when no retained snapshot names the table.
+    earliest_snapshot_id: int | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableSummary:

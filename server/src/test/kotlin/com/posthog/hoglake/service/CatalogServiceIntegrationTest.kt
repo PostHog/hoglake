@@ -190,14 +190,31 @@ class CatalogServiceIntegrationTest {
     }
 
     @Test
-    fun `listTables returns live tables with empty column lists`() {
+    fun `listTables returns live tables name-ordered, with rollups and no columns`() {
         svc.createCatalog("tbl-list-cat", "s3://bucket/tl")
         svc.createNamespace("tbl-list-cat", "ns")
-        svc.createTable("tbl-list-cat", "ns", "bbb", listOf(idCol))
-        svc.createTable("tbl-list-cat", "ns", "aaa", listOf(idCol))
+        val bbb = svc.createTable("tbl-list-cat", "ns", "bbb", listOf(idCol))
+        val aaa = svc.createTable("tbl-list-cat", "ns", "aaa", listOf(idCol))
         val tables = svc.listTables("tbl-list-cat", "ns")
         assertThat(tables.map { it.name }).containsExactly("aaa", "bbb")
-        assertThat(tables).allSatisfy { assertThat(it.columns).isEmpty() }
+        // The "empty column lists" this used to assert is now a property
+        // of the TYPE: a listing row is a TableSummaryInfo, which has no
+        // columns field at all, so the assertion could not be written and
+        // does not need to be. What replaces it is the rollup the row
+        // gained, on a namespace where every number is knowable: two
+        // freshly created tables, no appends.
+        assertThat(tables).allSatisfy {
+            assertThat(it.recordCount).isZero()
+            assertThat(it.fileCount).isZero()
+            assertThat(it.fileSizeBytes).isZero()
+            assertThat(it.comment).isNull()
+            // One retained snapshot each: its own table_created.
+            assertThat(it.snapshotCount).isEqualTo(1)
+        }
+        // ...and that snapshot is the create's own, read off the create
+        // receipt rather than counted out by hand.
+        assertThat(tables.map { it.earliestSnapshotId })
+            .containsExactly(aaa.snapshotId, bbb.snapshotId)
     }
 
     // ---- drop + time travel ----------------------------------------------

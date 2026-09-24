@@ -71,10 +71,24 @@ export const tablesFixture: TableSummary[] = [
   {
     name: "pageviews",
     table_uuid: "3f2c9c04-8a1b-4c7e-9f10-6d2a5b3e8c71",
+    // Two lines: the listing shows the first and offers the rest, which
+    // is the whole point of the clamp.
+    comment: "raw pageview events\nkept for 90 days, then expired",
+    record_count: "1234567",
+    file_count: "12",
+    file_size_bytes: "987654321",
+    snapshot_count: "41",
+    earliest_snapshot_id: "7",
   },
   {
+    // No comment and no retained history: the server omits both
+    // properties rather than nulling them.
     name: "clicks",
     table_uuid: "b7e6d9a2-15f3-4b08-a4c9-0e8f7d6c5b4a",
+    record_count: "0",
+    file_count: "0",
+    file_size_bytes: "0",
+    snapshot_count: "1",
   },
 ];
 

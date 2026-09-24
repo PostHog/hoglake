@@ -89,7 +89,7 @@ React console, Python replication daemon:
 |---|---|---|---|
 | `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.4 / JDK 25 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit 6 + Testcontainers (PG18, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
-| `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
+| `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel; the namespace listing is NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — `table_uuid` stays on the wire but is shown on the table page, not as a column), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
 | `duckdb-client/` | DuckDB extension: ATTACH over REST, scan (partition pruning + deletion vectors), INSERT/UPDATE/DELETE via footer-shipping commits, DDL, time travel, metadata/maintenance functions | C++ / DuckDB (pinned) / cpp-httplib + yyjson (both duckdb-vendored) / roaring via vcpkg | sqllogictests against the live dev stack + cross-client wire vectors |
 
@@ -290,7 +290,55 @@ there would break that gate on every build.
     table rows.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
-  conflict-rule review in `CommitService`.
+  conflict-rule review in `CommitService`. `object_id` is ONE column
+  over three disjoint id spaces — table, namespace, view — and only the
+  kind says which, so any read that goes BY object id filters on kind or
+  silently counts a namespace's history against a table that shares its
+  id. `ChangeKind.TABLE_SCOPED` is that filter, and it is an EXPLICIT
+  list, not `startsWith("TABLE_")`: a derived set cannot be checked,
+  because any test would have to apply the same rule and agree with
+  itself (the first version did, and a hypothetical
+  `TABLE_NAMESPACE_MOVED` would have joined the set and passed). Adding
+  a kind therefore means classifying it in `TABLE_SCOPED` or
+  `NON_TABLE_SCOPED`; `TableSummaryVocabularyTest` asserts the two
+  PARTITION schema.sql's vocabulary, so an unclassified kind reds and
+  the author has to answer the question rather than inherit an answer.
+- **A table's snapshots are defined through the change log**, because
+  snapshots are CATALOG-wide. `TableSummary.snapshot_count` is the
+  number of distinct `hog_snapshot_change.snapshot_id` values at or
+  above the catalog's `earliest_snapshot_id` whose row is
+  `TABLE_SCOPED` and names the table; `earliest_snapshot_id` is the
+  smallest of them, null when none. Both are RETAINED-only by
+  construction, so they shrink as expiry advances the floor — they
+  answer "how far back can this table still be read", never "how many
+  commits has it taken". One commit can write several change rows for
+  one table in one snapshot (truncate writes two, an atomic replacement
+  three), so the count is `DISTINCT` on the snapshot id and nothing
+  else. The floor bound is DEFENCE rather than arithmetic: today's
+  `ExpiryService` advances the floor and deletes the snapshots below it
+  in one transaction, and `hog_snapshot_change` cascades, so after a
+  sweep there is nothing below the floor left to exclude and the bound
+  is provably redundant. It stays because the alternative is a query
+  whose correctness depends on that cascade with nothing saying so, and
+  it is tested against the state it defends against (a floor moved
+  ahead of its reclamation), not against a state the server produces.
+- **`GET .../tables` is the one unpaged listing that scales with data.**
+  One row per live table, one statement, per-table work index-driven —
+  linear in the namespace. Measured on a Portola-shaped namespace (54k
+  tables / 270k files / 270k change rows, PG18, warm, serial):
+  **389-402 ms, 595,488 shared buffers, 9.16 MiB of JSON**, with the
+  final `ORDER BY` spilling 595 temp blocks. The FILE rollup is 73% of
+  the buffer traffic and the change-log lateral 27% — so the tempting
+  optimisation is the wrong one: the change-log lateral's per-loop Sort
+  (`count(DISTINCT)` cannot use `hog_snapshot_change_conflict`'s
+  snapshot_id ordering with the kind filter between `object_id` and
+  `snapshot_id`) would cost a second index on the table every commit's
+  OCC check writes, to save a quarter of a read path's buffers. The
+  9 MiB unpaged body is the real limit, and it is a shape problem, not
+  a plan problem: PAGING is the follow-up. Numbers re-measured for this
+  entry rather than carried over from the review that raised it — the
+  review's differed (444 ms / 813k / 5.4 MiB), which is what happens to
+  a number nobody re-runs.
 - **Compaction is never a conflict, and only a race gets a retryable
   status.** Any guard that compares a writer's read set against
   `hog_snapshot_change` excludes `table_compacted` (both the commit
@@ -434,6 +482,16 @@ there would break that gate on every build.
   - **hedgerow** and the **webui** consume the same wire and restate the
     same vocabularies, and neither is exercised by the server suite
     either — `webui/src/api/types.ts` still has no `variant`.
+  - Worked example, `TableSummary` growing five fields + `comment`
+    (#189): pyhoglake and the webui implemented them; the **DuckDB
+    extension**'s `HoglakeApiClient::ListTables`
+    (duckdb-client/src/rest/hoglake_api_client.cpp:552) reads only
+    `name` and `table_uuid` off each array member and ignores the rest,
+    so an additive change is safe there and it was left alone;
+    **hedgerow** never calls the endpoint at all. Saying
+    which of the four it is — implemented, safe-by-construction, or not
+    a consumer — is the point; "additive, so fine" without naming them
+    is the shape that lets one drift.
 - **Look the invariant up before you write it down.** Before
   implementing a rule about row ids, field ids, or column binding, READ
   the ones already stated: this file, the

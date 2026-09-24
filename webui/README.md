@@ -9,6 +9,21 @@ metrics page.
 Read-heavy by design — v1 exposes create forms for catalogs,
 namespaces, and tables, and deliberately no drop/delete actions.
 
+A namespace's table listing is NAME, RECORD_COUNT, FILE_COUNT,
+FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — one `TableSummary`
+row per table, every field resolved at the catalog head (the listing
+takes no snapshot parameter). SNAPSHOTS and EARLIEST_SNAPSHOT are
+RETAINED-only and shrink as expiry advances the catalog floor.
+RECORD_COUNT is gross of deletion vectors — a row a live DV masks is
+still counted, as the table page's own count is — and its header
+tooltip says so. The comment is clamped to its first line with an
+expand control, like a snapshot message. `table_uuid` is still on the
+wire — consumers key on it — but it is shown on the table page with
+its copy button rather than as a column, because seven columns of
+which one is a UUID reads as a UUID table. The listing is not paged;
+see the endpoint's OpenAPI description for the measured cost on a
+54k-table namespace.
+
 Notable surfaces beyond the catalog browser:
 
 - **Metrics** (`/metrics` route): one snapshot of the server's

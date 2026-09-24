@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.model.TableInfo
+import com.posthog.hoglake.model.TableSummaryInfo
 import com.posthog.hoglake.model.initialColumns
 import com.posthog.hoglake.model.nodeCount
 import com.posthog.hoglake.observability.Audit
@@ -496,29 +497,36 @@ class CatalogService(private val jdbi: Jdbi) {
             )
         }
 
-    /** Live tables at head. Columns are NOT loaded here (empty lists). */
+    /**
+     * Live tables at head, each with its comment, its file rollup and
+     * its retained-history counts.
+     *
+     * HEAD-ONLY, deliberately and completely: there are no snapshot /
+     * at-timestamp parameters on this endpoint (a known gap — see
+     * duckdb-client/DESIGN.md's head-only-listings finding), so every
+     * field of every row answers for the SAME snapshot, the catalog
+     * head. That is the property worth keeping if time travel is ever
+     * added here: a listing whose comment came from head and whose
+     * aggregates came from somewhere else would be a lie no caller
+     * could detect.
+     *
+     * ONE query for the whole listing — the per-table
+     * `FileRepo.aggregateAt` this used to run was an N+1 that grew with
+     * the namespace. Columns and specs are not loaded at all: the row
+     * type no longer has them (see [TableSummaryInfo]).
+     */
     fun listTables(
         catalog: String,
         namespace: String,
-    ): List<TableInfo> =
+    ): List<TableSummaryInfo> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
             val ns = requireNamespace(h, cat, namespace)
-            TableRepo.listLive(h, cat.catalogId, ns.namespaceId).map { t ->
-                val agg = FileRepo.aggregateAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
-                TableInfo(
-                    tableId = t.tableId,
-                    tableUuid = t.tableUuid,
-                    comment = t.comment,
-                    properties = t.properties,
-                    namespace = ns.name,
-                    name = t.name,
-                    columns = emptyList(),
-                    recordCount = agg.recordCount,
-                    fileCount = agg.fileCount,
-                    fileSizeBytes = agg.fileSizeBytes,
-                )
-            }
+            // No head argument: the statement reads the catalog's head and
+            // expiry floor itself, so every number in every row comes off
+            // ONE MVCC snapshot without a transaction, an isolation level,
+            // or any assumption about what the caller is already inside.
+            TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
         }
 
     // ---- files + changefeed ----------------------------------------------

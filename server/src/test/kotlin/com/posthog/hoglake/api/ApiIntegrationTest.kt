@@ -162,11 +162,20 @@ class ApiIntegrationTest {
             // reads to it instead of racing a separate head read (#35).
             assertThat(tableNode["snapshot_id"].asLong()).isEqualTo(2)
 
-            // Table listing carries TableSummary (name + table_uuid).
+            // Table listing carries TableSummary: identity plus the
+            // head rollup. A freshly created table has no files and
+            // exactly one retained snapshot — its own table_created —
+            // and no comment, so the property is absent rather than null.
             val listed = body(client.get("/v1/catalogs/lake/namespaces/analytics/tables"))
             assertThat(listed).hasSize(1)
             assertThat(listed[0]["name"].asText()).isEqualTo("events")
             assertThat(listed[0]["table_uuid"].asText()).isEqualTo(tableUuid)
+            assertThat(listed[0]["record_count"].asLong()).isZero()
+            assertThat(listed[0]["file_count"].asLong()).isZero()
+            assertThat(listed[0]["file_size_bytes"].asLong()).isZero()
+            assertThat(listed[0]["snapshot_count"].asLong()).isEqualTo(1)
+            assertThat(listed[0]["earliest_snapshot_id"].asLong()).isEqualTo(2)
+            assertThat(listed[0].has("comment")).isFalse()
 
             // ...but a READ of the table carries no snapshot_id: getTable
             // resolves an arbitrary snapshot, so stamping one would dress a
