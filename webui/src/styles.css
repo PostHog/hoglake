@@ -109,10 +109,15 @@ h3 {
 }
 
 .breadcrumbs {
-  flex: 1;
+  /* A sub-header row below the top bar, only present on catalog-scoped
+     pages (it returns null elsewhere). Slimmer than the top bar so it
+     reads as navigation, not as a second header. */
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 6px 16px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
   overflow: hidden;
   white-space: nowrap;
 }
