@@ -260,11 +260,15 @@ conflict checks, and the fixture-created ambiguous pairs.
    transform-aware comparison (Iceberg semantics, mirroring
    pyhoglake `transforms.py`). Files with `stats_state != provided`
    are never pruned (correctness by construction).
-   **Gap (server finding)**: `/scan` carries no per-file column bounds,
-   so DuckLake-style zone-map file skipping on arbitrary predicates is
-   not possible; parquet row-group pruning still applies after open.
-   Finding: add optional `column_stats` (or min/max bounds) to
-   `ScanFile`, or an optional filter parameter server-side.
+   **Gap (client side; server finding 1 addressed)**: the extension
+   plans without per-file column bounds, so DuckLake-style zone-map file
+   skipping on arbitrary predicates is not implemented; parquet
+   row-group pruning still applies after open. The server now serves
+   them on request — `/scan?include=column_stats&stats_fields=<ids>`
+   attaches `data_file.column_stats` (decoded bounds, the
+   `ScanColumnStats` schema) to every `provided` file — so this is a
+   client TODO: request the predicate's field ids and skip files whose
+   bounds exclude it.
 4. **Deletes**: a `delete_file` (puffin `deletion-vector-v1`, exactly
    the encoding in `PuffinDeletionVector.kt`) is fetched, decoded
    (roaring via vcpkg — DuckLake's dependency), and applied as a
@@ -454,9 +458,11 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
 
 ## Findings for the server (no server changes made)
 
-1. `/scan` (`ScanFile`) carries no per-file column bounds → no
-   file-level zone-map pruning for external engines. Suggest optional
-   bounds in `ScanFile` or a server-side filter param.
+1. ~~`/scan` (`ScanFile`) carries no per-file column bounds → no
+   file-level zone-map pruning for external engines.~~ **Addressed**
+   server-side: opt-in `include=column_stats` (narrowed by
+   `stats_fields`) adds per-file bounds to the scan plan. The extension
+   does not request them yet (see step 3 above).
 2. No `DELETE /namespaces/{ns}` → `DROP SCHEMA` unimplementable.
 3. No staged/transactional DDL commit → DuckDB DDL cannot participate
    in transaction rollback (documented divergence).

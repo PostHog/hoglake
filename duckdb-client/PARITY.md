@@ -67,7 +67,7 @@ client work not yet done.
 | `rowid` virtual column | DONE | source chosen by the catalog's `explicit_row_ids` flag (both mismatch directions refused typed; `hoglake_wire_hardening.test`); positional path tested (stable across DVs) AND the explicit `_hog_row_id` (2147483646) branch tested DISCRIMINATINGLY: `points_sorted` is compacted under a sort order that permutes row order, so positional-fallback arithmetic yields different rowids than the physical column — `hoglake_compacted_read.test` asserts the explicit values (the plain `points` assertion alone could not catch a fallback regression: its merge is order-preserving and zero-based) |
 | `filename` / `file_row_number` / `snapshot_id` virtual columns | DONE | snapshot_id = file begin_snapshot |
 | Partition pruning | DONE | identity transforms, filter constant-folded per partition value; binary partition wire values base64-decoded (pyhoglake encoding; tested on a fixture-written binary partition); non-live-spec files never pruned |
-| File-level min/max (zone-map) pruning | WIRE GAP | `/scan` carries no column bounds |
+| File-level min/max (zone-map) pruning | TODO | server serves bounds via `/scan?include=column_stats&stats_fields=`; the extension does not request them yet |
 | Global column stats for the optimizer | WIRE GAP | no global stats endpoint |
 | Encryption keys | N/A | |
 

@@ -268,6 +268,25 @@ export interface DataFile {
    */
   explicit_row_ids?: boolean;
   ordering_bounds?: FileOrderingBounds;
+  /**
+   * Per-column statistics, filled by the scan plan ONLY (with
+   * `include=column_stats`) and only for a `provided` file; the listing
+   * and the changefeed never carry it.
+   */
+  column_stats?: ScanColumnStats[];
+}
+
+/**
+ * One column's stats in a scan plan: FileColumnStats without the
+ * per-table column identity (name/path/type), same bound tokens.
+ */
+export interface ScanColumnStats {
+  field_id: Int64;
+  value_count: Int64;
+  null_count: Int64;
+  nan_count?: Int64;
+  lower_bound: DecodedBound;
+  upper_bound: DecodedBound;
 }
 
 /**

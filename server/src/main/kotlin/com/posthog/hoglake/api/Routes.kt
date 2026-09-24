@@ -2,10 +2,12 @@ package com.posthog.hoglake.api
 
 import com.posthog.hoglake.BuildInfo
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.Application
@@ -392,12 +394,19 @@ fun Application.installApiRoutes(
 
 /**
  * GET .../tables/{table}/scan?snapshot= — read planning (openapi
- * planScan): data files paired with their visible deletion vectors.
- * Installed separately so App.kt wires it with its own ScanService.
+ * planScan): data files paired with their visible deletion vectors, and
+ * with `include=column_stats` each provided file's column statistics
+ * (narrowed by `stats_fields`). Installed separately so App.kt wires it
+ * with its own ScanService.
  */
 fun Application.installScanRoutes(scan: ScanService) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
+            // getAll, joined: Parameters[...] is only the FIRST occurrence,
+            // so a repeated `stats_fields=3&stats_fields=7` would silently
+            // drop field 7's bounds and a second, misspelt `include` would
+            // be ignored rather than refused.
+            fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             call.respond(
                 scan.planScan(
                     call.catalog(),
@@ -405,10 +414,67 @@ fun Application.installScanRoutes(scan: ScanService) {
                     call.table(),
                     call.longQuery("snapshot"),
                     call.instantQuery("at_timestamp"),
+                    parseScanStatsRequest(joined("include"), joined("stats_fields")),
                 ).map { it.toDto() },
             )
         }
     }
+}
+
+/** The `include` values GET .../scan understands. */
+internal val SCAN_INCLUDES = setOf("column_stats")
+
+/**
+ * Most field ids `stats_fields` may name: the per-table column-node cap,
+ * so every legal table's leaves fit and nothing larger is buffered.
+ */
+internal const val MAX_STATS_FIELDS = 10_000
+
+/**
+ * `include` and `stats_fields` as a scan's stats request, or null when
+ * none was asked for. Malformed values are 400s (BadRequestException);
+ * well-formed but unusable ones are 422s (Validation): an `include` value
+ * the server does not know — refused rather than ignored, so a caller
+ * misspelling it cannot mistake "no stats" for "nothing to prune" — and
+ * `stats_fields` without `include=column_stats`, which would otherwise
+ * silently return no statistics at all.
+ */
+internal fun parseScanStatsRequest(
+    include: String?,
+    statsFields: String?,
+): ScanService.ColumnStatsRequest? {
+    val includes =
+        include?.split(',')?.map { it.trim() }?.toSet()?.also { values ->
+            val unknown = values - SCAN_INCLUDES
+            if (unknown.isNotEmpty()) {
+                throw HoglakeException.Validation(
+                    "include: unknown value(s) ${unknown.sorted().joinToString { "'${Identifiers.cap(it)}'" }}; " +
+                        "supported: ${SCAN_INCLUDES.sorted().joinToString()}",
+                )
+            }
+        } ?: emptySet()
+    val fieldIds = statsFields?.let { parseStatsFields(it) }
+    if ("column_stats" !in includes) {
+        if (fieldIds != null) {
+            throw HoglakeException.Validation("stats_fields requires include=column_stats")
+        }
+        return null
+    }
+    return ScanService.ColumnStatsRequest(fieldIds)
+}
+
+/** `stats_fields`: a non-empty comma-separated list of int64 field ids. */
+internal fun parseStatsFields(raw: String): Set<Long> {
+    val parts = raw.split(',')
+    if (parts.size > MAX_STATS_FIELDS) {
+        throw BadRequestException("query parameter 'stats_fields' names more than $MAX_STATS_FIELDS field ids")
+    }
+    return parts.map { part ->
+        part.trim().toLongOrNull()
+            ?: throw BadRequestException(
+                "query parameter 'stats_fields' must be a comma-separated list of integer field ids",
+            )
+    }.toSet()
 }
 
 // ---- parameter helpers ---------------------------------------------------

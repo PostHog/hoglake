@@ -6,9 +6,11 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
+import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Instant
@@ -25,15 +27,36 @@ import java.time.Instant
  *
  * Each DataFile carries its partitioning binding (spec_id + the
  * transformed partition values in key_index order) when the file was
- * written under a partition spec.
+ * written under a partition spec. On request ([ColumnStatsRequest]) a
+ * `provided` file also carries its stored column-stats rows, so an
+ * engine can prune files at planning time instead of opening each
+ * footer. Opt-in because most scan consumers (the DuckDB client,
+ * pyhoglake, an unfiltered engine scan) cannot use bounds and should not
+ * pay the join or the payload.
+ *
+ * Statement shape, independent of the file count: the catalog /
+ * namespace / table resolution, ONE file+DV query, then (only when stats
+ * were requested and some file is `provided`) ONE column query and ONE
+ * stats query. Never a statement per file.
  */
 class ScanService(private val jdbi: Jdbi) {
+    /**
+     * Which column statistics a scan plan should carry. [fieldIds] null
+     * means every stored row; a set narrows the rows to those field ids
+     * (the columns an engine's pushed-down predicate names), so a
+     * one-column filter over a wide table fetches files x 1 rows, not
+     * files x columns. Field ids that name no visible leaf simply match
+     * nothing — the answer is reflective, as on the stats endpoint.
+     */
+    data class ColumnStatsRequest(val fieldIds: Set<Long>? = null)
+
     fun planScan(
         catalog: String,
         namespace: String,
         table: String,
         snapshot: Long? = null,
         atTimestamp: Instant? = null,
+        columnStats: ColumnStatsRequest? = null,
     ): List<ScanFile> =
         jdbi.withHandleUnchecked { h ->
             val cat =
@@ -95,8 +118,7 @@ class ScanService(private val jdbi: Jdbi) {
               LEFT JOIN hog_delete_file dv
                 ON dv.catalog_id = df.catalog_id
                AND dv.data_file_id = df.data_file_id
-               AND dv.begin_snapshot <= :snapshot
-               AND (dv.end_snapshot IS NULL OR :snapshot < dv.end_snapshot)
+               AND ${FileRepo.visibleAt("dv")}
               LEFT JOIN LATERAL (
                     SELECT array_agg(v.value ORDER BY v.key_index) AS partition_values
                       FROM hog_file_partition_value v
@@ -104,8 +126,7 @@ class ScanService(private val jdbi: Jdbi) {
                        AND v.data_file_id = df.data_file_id
                    ) pv ON true
              WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
-               AND df.begin_snapshot <= :snapshot
-               AND (df.end_snapshot IS NULL OR :snapshot < df.end_snapshot)
+               AND ${FileRepo.visibleAt("df")}
              ORDER BY df.row_id_start, df.data_file_id
             """,
             )
@@ -152,5 +173,50 @@ class ScanService(private val jdbi: Jdbi) {
                     ScanFile(dataFile, deleteFile)
                 }
                 .list()
+                .let { files ->
+                    if (columnStats == null) {
+                        files
+                    } else {
+                        withColumnStats(
+                            h,
+                            cat.catalogId,
+                            t.tableId,
+                            at,
+                            files,
+                            columnStats,
+                        )
+                    }
+                }
         }
+
+    /**
+     * Attach each `provided` file's stats rows, resolved against the
+     * columns visible at [at] exactly as GET .../files/{fileId}/stats
+     * resolves them (same join, same omissions), so the two surfaces
+     * answer identically for the same file and snapshot.
+     *
+     * One stats query for the whole plan, not one per file
+     * ([FileRepo.providedColumnStatsAt]). The attachment is keyed off the
+     * plan, not the query: a file the hydrator flips to `provided` between
+     * the two statements was `pending` in the plan, and stays stat-less in
+     * it rather than contradicting its own stats_state.
+     */
+    private fun withColumnStats(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        at: Long,
+        files: List<ScanFile>,
+        request: ColumnStatsRequest,
+    ): List<ScanFile> {
+        if (files.none { it.dataFile.statsState == StatsState.PROVIDED }) return files
+        val byFieldId = columnsByFieldId(TableRepo.columnsAt(h, catalogId, tableId, at))
+        val rowsByFile =
+            FileRepo.providedColumnStatsAt(h, catalogId, tableId, at, request.fieldIds)
+        return files.map { file ->
+            if (file.dataFile.statsState != StatsState.PROVIDED) return@map file
+            val rows = rowsByFile[file.dataFile.dataFileId].orEmpty()
+            file.copy(dataFile = file.dataFile.copy(columnStats = resolveColumnStats(rows, byFieldId)))
+        }
+    }
 }

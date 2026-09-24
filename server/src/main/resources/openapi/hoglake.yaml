@@ -354,13 +354,44 @@ paths:
       operationId: planScan
       summary: >
         Read planning: data files paired with their live deletion
-        vectors at a snapshot.
+        vectors at a snapshot. With `include=column_stats`, each
+        `provided` data file also carries its per-column statistics
+        (DataFile.column_stats) so an engine can prune files before
+        planning splits for them.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
         - { $ref: "#/components/parameters/atTimestamp" }
+        - name: include
+          in: query
+          required: false
+          description: >
+            Comma-separated optional parts of the plan. The one value is
+            `column_stats`: attach DataFile.column_stats to every
+            `provided` file. Omitted, the plan carries no statistics and
+            costs no statistics read — the right default for a consumer
+            that cannot prune (an unfiltered scan). An unknown value is a
+            422, never ignored: a misspelling must not read as "no
+            statistics, so nothing can be pruned".
+          schema: { type: string }
+          example: column_stats
+        - name: stats_fields
+          in: query
+          required: false
+          description: >
+            Comma-separated field ids narrowing column_stats to those
+            columns — the ones an engine's pushed-down predicate names,
+            so a one-column filter over a wide table fetches files x 1
+            entries rather than files x columns. Requires
+            include=column_stats (a 422 without it, which would otherwise
+            silently return no statistics). A field id that names no
+            visible leaf matches nothing. Omitted, every stored row is
+            returned. A non-integer entry, or more than 10000 entries, is
+            a 400.
+          schema: { type: string }
+          example: "3,7"
       responses:
         "200":
           description: Scan plan
@@ -369,8 +400,20 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/ScanFile" }
+        "400":
+          description: Malformed snapshot, at_timestamp or stats_fields.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
+        "422":
+          description: >
+            Both snapshot and at_timestamp, an unknown include value, or
+            stats_fields without include=column_stats.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/files:
     get:
@@ -2914,6 +2957,87 @@ components:
             needing row identity must read the column.
         ordering_bounds:
           $ref: '#/components/schemas/FileOrderingBounds'
+        column_stats:
+          type: array
+          items: { $ref: "#/components/schemas/ScanColumnStats" }
+          description: >
+            The file's per-column statistics, for pruning files at
+            planning time without opening their footers.
+
+            Populated by GET .../scan ONLY, only with
+            `include=column_stats`, and there only when stats_state is
+            `provided`. GET .../files and the changefeed embed the same
+            DataFile schema and omit this property; so does the scan plan
+            for a `pending` or `failed` file, which has no statistics — an
+            ABSENT property means "no statistics, do not prune this file".
+            An EMPTY array is a different answer: the file is `provided`
+            but has no statistics row for any requested column.
+
+            The entries are the rows GET .../files/{fileId}/stats answers
+            for the same file at the same snapshot — same omissions,
+            field-id order, identical bound tokens — narrowed to
+            `stats_fields` when given, and without the per-table column
+            identity (see ScanColumnStats). The array may omit columns: a
+            variant or container never has a statistics row, a writer need
+            not ship one for every column, a column added after the file
+            landed has none, and a row whose column is not visible at the
+            requested snapshot (a dropped column) is left out. A column
+            absent from the array has no bounds and must not be pruned on.
+
+            Bounds follow Iceberg single-value semantics: `lower_bound`
+            is <= every non-null, non-NaN value of the column in the file
+            and `upper_bound` is >= every one; they are bounds, not
+            necessarily values that occur. hoglake never truncates or
+            rounds a string or binary bound itself — the commit path stores
+            what the writer shipped and the hydrator copies the parquet
+            footer's min/max bytes verbatim — but a parquet writer may
+            have truncated long string/binary statistics before hoglake
+            saw them. A writer following the parquet specification keeps a
+            truncated value a valid bound (a prefix for the minimum, an
+            incremented prefix for the maximum), so it remains safe to
+            prune on; it is NOT safe to report as the column's exact
+            minimum or maximum (e.g. to answer min()/max() from metadata).
+            A JSON null bound means "do not prune on this column", per
+            FileColumnStats.
+
+    ScanColumnStats:
+      type: object
+      required: [field_id, value_count, null_count, lower_bound, upper_bound]
+      description: >
+        One column's statistics for one file in a scan plan: a
+        FileColumnStats entry without the column identity (name, path,
+        type, type_params), which is per-TABLE and which the engine
+        already holds by field_id — repeating it per file x column was
+        the bulk of a wide table's plan. `lower_bound`/`upper_bound`
+        follow the FileColumnStats wire conventions and are the SAME
+        tokens GET .../files/{fileId}/stats renders (one decoder); read
+        that schema before consuming them. Two consequences engines get
+        wrong: integer and decimal bounds must be parsed EXACTLY (raw
+        token / BigInteger / BigDecimal, never through a double), and
+        temporal bounds elide trailing zero units ("2026-09-05T00:00",
+        "2026-09-05T00:00Z"), so they must be parsed as ISO-8601
+        (ISO_LOCAL_DATE_TIME / ISO_OFFSET_DATE_TIME), never with a
+        fixed-precision pattern.
+      properties:
+        field_id: { type: integer, format: int64 }
+        value_count:
+          type: integer
+          format: int64
+          description: >
+            Values in the file for this column, nulls INCLUDED (Iceberg
+            value_counts): a column is all-null in the file exactly when
+            null_count == value_count.
+        null_count: { type: integer, format: int64 }
+        nan_count:
+          type: integer
+          format: int64
+          description: NaN values (float/double only); absent when unknown.
+        lower_bound:
+          nullable: true
+          description: Decoded lower bound, or null (do not prune on this column).
+        upper_bound:
+          nullable: true
+          description: Decoded upper bound, or null (do not prune on this column).
 
     FileOrderingBounds:
       type: object
@@ -2926,7 +3050,8 @@ components:
         Populated by GET .../files ONLY. The changefeed and the scan
         plan embed the same DataFile schema and omit this property:
         they answer "what changed" and "what to read", neither of which
-        is a question about one column's span.
+        is a question about one column's span. (The scan plan carries
+        every column's bounds instead, in DataFile.column_stats.)
 
         Which key it describes follows the TABLE, not the file. When
         the table has a sort spec at the requested snapshot the bounds
@@ -3050,7 +3175,13 @@ components:
           type: object
           additionalProperties: true
           description: The column's type_params (decimal scale/precision), when present.
-        value_count: { type: integer, format: int64 }
+        value_count:
+          type: integer
+          format: int64
+          description: >
+            Values in the file for this column, nulls INCLUDED (Iceberg
+            value_counts): the column is all-null in the file exactly
+            when null_count == value_count.
         null_count: { type: integer, format: int64 }
         nan_count: { type: integer, format: int64 }
         size_bytes: { type: integer, format: int64 }
