@@ -148,6 +148,96 @@ data class Config(
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
     /**
+     * How many of a sweep's planned groups are rewritten and committed
+     * AT ONCE. **1 (the default) is the sequential sweep this server has
+     * always run** — an existing deployment that sets nothing changes in
+     * no way.
+     *
+     * A group's cost is object-store LATENCY, not bytes (measured ~8.5 s
+     * per group on gigahog-prod-us whatever the group held), and groups
+     * share no input file, so they overlap cleanly: the only
+     * serialization point is the per-catalog commit lock, which each
+     * group takes for its small metadata transaction alone and never
+     * across the rewrite or the upload.
+     *
+     * Raise it together with three things: the JDBI pool (each in-flight
+     * group wants a connection at its staging ticket and its commit),
+     * the maintenance pod's CPU (the rewrite is CPU-bound on zstd), and
+     * an eye on HOGLAKE_COMPACTION_SORTED_HEAP_BYTES — the sorted path's
+     * heap budget is DIVIDED by this value so N concurrent sorted groups
+     * cannot exceed what one was allowed, which makes every sorted
+     * table's groups proportionally smaller. See
+     * CompactionConfig.parallelGroups.
+     */
+    val compactionParallelGroups: Int =
+        env(
+            "HOGLAKE_COMPACTION_PARALLEL_GROUPS",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_PARALLEL_GROUPS}",
+        ).toInt(),
+    /**
+     * How many of ONE group's input files the rewrite may have open at
+     * once — the other half of that fixed per-group cost, and the half
+     * that is safe to turn on by default (8).
+     *
+     * Opening a parquet input costs at least one object-store round trip
+     * before any row can be read, and a 64-file group used to pay 64 of
+     * them end to end. Merge order is preserved (only the `open`
+     * overlaps; the rewrite still consumes inputs in order on one
+     * thread) and so is the streaming memory bound — an open-but-unread
+     * input holds its parsed footer, not a readahead buffer. See
+     * ParquetRewriter.forEachOpenedInput.
+     */
+    val compactionParallelInputOpens: Int = env("HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS", "8").toInt(),
+    /**
+     * Whether a maintainer CLAIMS a compaction group before rewriting
+     * it, so a second maintainer's planner skips it
+     * (`hog_compaction_claim`, V15). Default on.
+     *
+     * An OPTIMIZATION, never authorization: correctness against a
+     * concurrent rewrite is the plan-to-commit re-verification under the
+     * catalog commit lock, with or without this. What it removes is
+     * WASTE — two replicas planning the same candidate set rewrote the
+     * same groups and threw one of the two away at commit (30 of 34
+     * committed groups' worth, in one measured 547 s sweep). Turn it off
+     * and that behaviour comes back; nothing else changes.
+     */
+    val compactionClaimsEnabled: Boolean = boolEnv("HOGLAKE_COMPACTION_CLAIMS_ENABLED", true),
+    /**
+     * How long a group claim is held before ANY maintainer may reclaim
+     * it. A lease, not a lock: there is no heartbeat, so this is also
+     * how long a killed maintainer's files stay untouched.
+     *
+     * 900 s covers a worst-case 64-file group by two orders of magnitude.
+     * Wrong in either direction costs only work: too short duplicates a
+     * rewrite, too long delays one group by one lease.
+     */
+    val compactionClaimTtlSeconds: Long =
+        env(
+            "HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_CLAIM_TTL_SECONDS}",
+        ).toLong(),
+    /**
+     * How long a claim survives once its group has COMMITTED — a short
+     * lease, not the rewrite lease above.
+     *
+     * A committed group's claim is kept rather than deleted, because a
+     * sibling maintainer's plan formed before the commit still names its
+     * (now dead) inputs and the row turns that maintainer's arrival into
+     * a counted skip instead of a wasted rewrite.
+     *
+     * The quantity it has to cover is how OLD that sibling's plan can
+     * be, which is one whole SWEEP: a group costs a measured ~8.5 s, so
+     * 64 groups is ~544 s. 600 s covers it with margin and stays inside
+     * the 900 s rewrite lease. The cost is rows the planner reads the
+     * input-id arrays of — `committed groups per sweep x lease / sweep
+     * duration`, about 70 per table at those settings.
+     */
+    val compactionCommittedClaimTtlSeconds: Long =
+        env(
+            "HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_COMMITTED_CLAIM_TTL_SECONDS}",
+        ).toLong(),
+    /**
      * Sorted-path heap derate for NESTED tables: the sorted ROW CEILING
      * of a table with both nested columns and a live sort order is
      * divided by this. The sorted path materializes a whole group to
@@ -242,9 +332,46 @@ data class Config(
                 "$key was removed: $replacement"
             }
         }
+        // Concurrent compaction takes connections out of the pool the
+        // FOREGROUND shares, and it holds each one across a commit-lock
+        // wait. Refuse a configuration where it could take enough of
+        // them to starve writers: a writer that cannot get a CONNECTION
+        // fails with a Hikari timeout (a 500) rather than the typed,
+        // retryable CommitQueueTimeout (503 + Retry-After) the admission
+        // contract promises, and nothing in the 500 says which knob
+        // caused it.
+        //
+        // [FOREGROUND_CONNECTION_RESERVE] is a FLOOR, not a model of
+        // demand, and the arithmetic below is only the part that can be
+        // checked. What it guarantees is that raising
+        // HOGLAKE_COMPACTION_PARALLEL_GROUPS cannot by itself leave the
+        // pool with nothing: four connections stay outside compaction's
+        // reach. It does NOT promise four are enough — the other
+        // background loops (hydrator, expiry, cleanup, verify, the
+        // metrics sampler) draw on the same pool, and on a busy instance
+        // the foreground wants more than four of its own. An operator
+        // raising this knob raises HOGLAKE_DB_POOL_SIZE with it; the
+        // check exists so that forgetting to is a boot failure naming
+        // both knobs rather than a Hikari timeout during the first busy
+        // sweep.
+        require(compactionParallelGroups <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
+            "HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups needs a database pool " +
+                "of at least ${compactionParallelGroups + FOREGROUND_CONNECTION_RESERVE} " +
+                "(HOGLAKE_DB_POOL_SIZE is $dbPoolSize): each concurrent compaction group holds a " +
+                "pooled connection across its commit-lock wait, and leaving fewer than " +
+                "$FOREGROUND_CONNECTION_RESERVE for the foreground turns commit backpressure " +
+                "from a typed 503 into a connection-pool timeout"
+        }
     }
 
     companion object {
+        /**
+         * Pooled connections HOGLAKE_COMPACTION_PARALLEL_GROUPS must
+         * leave for everything else. See the `require` above: a floor,
+         * not a model of demand.
+         */
+        const val FOREGROUND_CONNECTION_RESERVE = 4
+
         /** Env vars that no longer exist, and what replaced them. */
         private val REMOVED_ENV =
             mapOf(
@@ -259,6 +386,29 @@ data class Config(
             name: String,
             default: String,
         ): String = System.getenv(name)?.takeIf { it.isNotBlank() } ?: default
+
+        /**
+         * A boolean knob that REFUSES anything but `true`/`false`,
+         * naming itself when it does.
+         *
+         * `String.toBoolean()` maps every other spelling — `1`, `yes`,
+         * `on`, a typo — to FALSE, silently, which for a knob whose
+         * default is true means a values file can turn a feature off by
+         * being wrong about how to turn it on. `toBooleanStrict()` alone
+         * throws a message that names neither the variable nor the
+         * value, which in a boot crash is the only thing an operator
+         * needs.
+         */
+        private fun boolEnv(
+            name: String,
+            default: Boolean,
+        ): Boolean {
+            val raw = System.getenv(name)?.takeIf { it.isNotBlank() } ?: return default
+            return raw.lowercase().toBooleanStrictOrNull()
+                ?: throw IllegalArgumentException(
+                    "$name must be 'true' or 'false', got '$raw'",
+                )
+        }
 
         fun fromEnv(): Config = Config()
     }

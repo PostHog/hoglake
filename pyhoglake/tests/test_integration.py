@@ -611,6 +611,7 @@ def test_expire_and_cleanup(client):
         "offset_release",
         "staging_tickets",
         "upload_claims",
+        "compaction_claims",
     ]
     assert all(c.violations == 0 and c.description for c in report.checks)
 

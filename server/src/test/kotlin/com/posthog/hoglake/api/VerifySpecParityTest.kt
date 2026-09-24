@@ -70,7 +70,7 @@ class VerifySpecParityTest {
 
     @Test
     fun `the spec's VerifyCheck enum is exactly the checks a report returns, in order`() {
-        assertThat(serverChecks).hasSize(11)
+        assertThat(serverChecks).hasSize(12)
         assertThat(enumValues(block("    VerifyCheck:")))
             .describedAs("the spec's check vocabulary must be the server's, with no extras either way")
             .isEqualTo(serverChecks)

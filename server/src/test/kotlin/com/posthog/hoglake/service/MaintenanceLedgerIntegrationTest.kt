@@ -173,6 +173,9 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(result["heap_budget_exceeded"].asLong())
             .describedAs("and every counter added after it, by the same rule")
             .isZero()
+        assertThat(result["claimed_elsewhere"].asLong())
+            .describedAs("claimed_elsewhere joined COMPACTION_COUNTERS_ADDED_LATER with the claims")
+            .isZero()
         // Every other field survives untouched, and the row is complete
         // against the schema's required list.
         assertThat(result["groups_compacted"].asLong()).isEqualTo(2)
@@ -181,6 +184,7 @@ class MaintenanceLedgerIntegrationTest {
                 "groups_compacted", "files_in", "files_out", "bytes_in", "bytes_out",
                 "skipped_conflicts", "dv_superseded", "unconvertible_schema",
                 "invalid_data", "heap_budget_exceeded", "failed_groups",
+                "claimed_elsewhere",
             )
     }
 

@@ -506,6 +506,21 @@ export interface CompactionResult {
   heap_budget_exceeded?: Int64;
   /** Groups that failed outright (logged, retried next run) — red-flag counter. */
   failed_groups: Int64;
+  /**
+   * Groups this sweep planned and then dropped because another
+   * maintenance replica holds a live claim over one or more of their
+   * input files.
+   *
+   * Not a conflict and not work lost: the sibling replica is rewriting
+   * those files, and anything this sweep spent on them would have been
+   * discarded at its own commit. A steady nonzero count is the feature
+   * working.
+   *
+   * OPTIONAL for the same reason heap_budget_exceeded is: the counter
+   * postdates ledger rows a rolling deploy can still serve from an
+   * older server, and the server omits it when it is zero.
+   */
+  claimed_elsewhere?: Int64;
 }
 
 export interface VerifyCheck {

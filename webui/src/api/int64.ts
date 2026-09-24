@@ -86,6 +86,7 @@ const INT64_FIELDS = new Set([
   "invalid_data",
   "heap_budget_exceeded",
   "failed_groups",
+  "claimed_elsewhere",
   "violations",
 ]);
 

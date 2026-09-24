@@ -537,7 +537,120 @@ there would break that gate on every build.
   to reclaim, and the commit re-claims the ticket first so a drain that
   won the race just aborts the group. Still deliberate: the background
   loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
-  on is an ops decision, not a code gap. **Nested schemas rewrite** —
+  on is an ops decision, not a code gap.
+  **A GROUP COSTS A FIXED AMOUNT OF WALL TIME, and that is the shape
+  every throughput knob here answers.** Measured on gigahog-prod-us
+  (2026-09-24, catalog millpond-prod-us, `main.events_raw`): ~8.5 s per
+  group whatever the group holds, because the cost is object-store
+  LATENCY — the serialized opens, the plan, the commit — and not bytes.
+  Three knobs overlap it, and only the middle one is on by default.
+  `HOGLAKE_COMPACTION_PARALLEL_GROUPS` (**default 1**, which is the
+  sequential sweep exactly: no executor, groups on the calling thread,
+  tables planned and executed one at a time as before) runs that many of
+  a sweep's planned groups at once. The sweep plans and executes PER
+  TABLE, deliberately — planning every table up front would make the
+  last table's plan as old as every rewrite before it, which at 64
+  groups and ~8.5 s each is minutes of staleness arriving at a commit.
+  A wave is joined whole (the slowest group bounds it) and drawn from
+  ONE table's queue, so a table with fewer groups than the knob runs at
+  its own group count: the knob is a ceiling, not a promise. Groups
+  share no input file by construction, so the only serialization between
+  them is the per-catalog commit lock, which the commit transaction
+  takes ALONE — never across the rewrite or the upload, and there is a
+  test that blocks a rewrite mid-read and takes the real lock to prove
+  it. Compaction's commit now passes `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`
+  like every other acquirer (a timeout anywhere in the commit
+  transaction — the advisory lock or a row lock in the tail, since the
+  setting is transaction-local — is a counted race, not a failure),
+  because N workers queued on an untimed lock hold N pooled connections
+  and turn foreground commit backpressure from a typed 503 into a
+  connection-pool 500. That is also why boot REFUSES
+  `parallelGroups > HOGLAKE_DB_POOL_SIZE - 4` (default pool 10, so the
+  ceiling is 6); the four are a floor, not a model — the other
+  background loops draw on the same pool. Raising the knob wants the
+  pool and the pod's CPU raised with it, and it DIVIDES
+  `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (see below).
+  **Cancellation stops the sweep on BOTH paths.** The table loop and the
+  wave loop check this thread's interrupt flag, `executeGroup` restores
+  it when a caught `Throwable`'s cause chain holds an interrupt (the
+  object-store client translates it and sometimes clears the flag), and
+  `runOnceAllCatalogs` rethrows rather than treating cancellation as a
+  per-catalog failure and sweeping the rest of the fleet. The sweep
+  throws `SweepInterrupted` — an `InterruptedException` carrying the
+  PARTIAL tally — so the ledger row for a cancelled sweep still counts
+  the groups that committed; those commits are durable, and a row saying
+  otherwise is the same lie an uncounted swallow tells.
+  `HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` (**default 8**) opens that
+  many of one group's inputs at a time; merge order and the streaming
+  memory bound are both preserved — only the `open` round trips overlap,
+  an open-but-unread input holds its parsed footer rather than a
+  readahead buffer, and the rewrite still consumes inputs in order on
+  one thread. Measured on a synthetic 64-file group against a MinIO
+  container: 435 ms sequential, 74 ms at 8 (and the double open per
+  input — once for the schema, once for the rows — is gone). It is the
+  one of the three that is ON by default, so its footprint is worth
+  stating: the worst case is `parallelGroups x inputOpenParallelism`
+  readers holding a parsed footer each, capped at
+  `S3InputFile.DEFAULT_MAX_PREFETCH_BYTES` (64 MiB) — 6 x 8 x 64 MiB at
+  the highest `parallelGroups` a default pool allows, against kilobytes
+  per footer for every real file. The window is per GROUP and is not
+  divided by `parallelGroups`.
+  **The sorted-path heap budget is DIVIDED by the group concurrency,
+  not gated.** `sortedHeapBytes / parallelGroups` is what
+  `CompactionConfig.sortedRowCeiling` converts to a row ceiling, so N
+  concurrent sorted groups cannot exceed what one group was allowed, and
+  the bound is arithmetic evaluated at planning time rather than a
+  runtime invariant holding a permit across object-store IO. The price
+  is proportionally smaller sorted groups whether or not a sweep ever
+  runs two at once; at the default of 1 the arithmetic is bit-identical
+  to what it was. BOTH arms are divided — the density arm (a statement
+  about rows) and the nested arm (a statement about bytes) — because
+  they estimate the same heap by different routes and the tightest wins,
+  so leaving either undivided lets N groups take N heaps. At a high N
+  the divided ceiling plus the SCALING file minimum can stop a sorted
+  table forming groups at all; that is the cost, and it is why the
+  default is 1. A gate would preserve sorted group SIZE and is the
+  alternative if that ever bites — but the real fix is the external
+  merge sort `CompactionConfig.sortedHeapBytes` already describes,
+  which removes the ceiling and the division together.
+  **Two maintainers do not rewrite the same group: they CLAIM it**
+  (`hog_compaction_claim`, V15, `HOGLAKE_COMPACTION_CLAIMS_ENABLED`
+  default on). **A claim is an optimization, never authorization** —
+  correctness against a concurrent rewrite is, and stays, the
+  plan-to-commit re-verification under the commit lock, and a change
+  that makes the commit path trust a claim turns an advisory lease into
+  a correctness dependency on two clocks. What it removes is waste: two
+  replicas planning the same candidate set both rewrote and uploaded
+  every group and one of the two was discarded at commit (a 547 s
+  production sweep committed 34 groups and lost 30 that way, counted
+  `skipped_conflicts`). The key is a hash of the group's spec, partition
+  values and sorted input file ids — the identity of the WORK, so two
+  replicas compute it with no coordination — while the planner's skip is
+  by input-file OVERLAP, because a replica planning a moment later packs
+  the same files under a different key. A claim is released when its
+  group does NOT commit and deliberately KEPT when it does: the inputs
+  are dead, and the other maintainer's stale plan still names them, so
+  the row is what turns its arrival into a counted `claimed_elsewhere`
+  instead of a wasted rewrite. A kept claim gets its own lease
+  (`HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS`, 600 s), sized for
+  what it has to cover: the age of a sibling's PLAN, which is one whole
+  sweep — ~544 s for 64 groups at the measured 8.5 s each, not one sweep
+  INTERVAL. The cost is `committed groups per sweep x lease / sweep
+  duration` rows per table, about 70 at production settings, whose
+  `input_file_ids` the planner reads on every pass.
+  `expires_at` is the only liveness
+  protocol (`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS`, 900 s) — there is no
+  heartbeat, so a killed maintainer costs one lease and nothing else —
+  and the bulk purge at the head of each sweep clears the rest. That
+  purge is not gated on `HOGLAKE_COMPACTION_CLAIMS_ENABLED`, so turning
+  the CLAIMS off still clears what they left; it does live at the head
+  of a SWEEP, so turning compaction off stops it like everything else.
+  `/verify`'s `compaction_claims` check is what reds when that purge
+  stops running or an expired claim outlives its table; both arms
+  require the claim to be well PAST its expiry, because a live claim on
+  a dropped table is the normal state of a group that just committed,
+  and the gap between expiry and the next sweep's purge is a correct
+  system. **Nested schemas rewrite** —
   list/struct/map are copied through recursively (the plan is a tree of
   steps; parquet-java's Group API already is one), so a nested table is
   compactable like any other; an input whose nested SHAPE disagrees with
@@ -580,16 +693,18 @@ there would break that gate on every build.
   /v1/catalogs/{c}/maintenance/verify` (schema-gaps review item B3, absorbing B4) — the
   QE suite's global-invariant SQL as a metadata-only, read-only
   endpoint (REPEATABLE READ MVCC snapshot, no catalog lock), and the
-  same code a background sweep runs. **Eleven** checks: row-id tiling
+  same code a background sweep runs. **Twelve** checks: row-id tiling
   (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
   orphaned live rows on dropped tables, still-referenced removal-queue
   entries, true snapshot density, next_row_id consistency,
   expiry-floor (invariant 5, sharing ExpiryService's own floor clause),
   versioned-row visibility bounds (invariant 6, over every versioned
   table), superseded-offset release (#167, asking OffsetRepo's own
-  predicate), compaction staging tickets (#174) and upload claims
-  (#162/#167). Each check carries a one-paragraph `description` of the
-  invariant it enforces; counts are `count(*)` and samples are capped
+  predicate), compaction staging tickets (#174), upload claims
+  (#162/#167) and compaction group claims (V15: a claim is an
+  optimization, never authorization, so a violation is redundant work
+  or a leaked row and never a wrong commit). Each check carries a
+  one-paragraph `description` of the invariant it enforces; counts are `count(*)` and samples are capped
   at 20, trimmed round-robin so a composite check's noisiest class
   cannot crowd out its siblings.
   The LOOP is `HOGLAKE_VERIFY_INTERVAL_MS`, **default 0 = off** — like

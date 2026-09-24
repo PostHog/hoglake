@@ -623,14 +623,14 @@ paths:
         Metadata-only invariant scan, on demand: the catalog's global
         invariants promoted to a production endpoint. Read-only (one
         REPEATABLE READ MVCC snapshot, no catalog lock — never blocks
-        writers). The same eleven checks the background verify sweep
+        writers). The same twelve checks the background verify sweep
         runs — that sweep is OFF by default
         (HOGLAKE_VERIFY_INTERVAL_MS=0, turned on per workload, like
         compaction), so on a default deployment this endpoint is the
         only thing that runs them. Recorded in the maintenance run
         ledger either way.
       description: |
-        Eleven checks run in one read-only snapshot. Each also carries
+        Twelve checks run in one read-only snapshot. Each also carries
         its own `description` in the response, so a report is readable
         without this document. The summaries below are ABRIDGED: the
         response is the authority on what a check enforces, and nothing
@@ -726,6 +726,40 @@ paths:
         the normal lifecycle); an `active` claim whose path is a file
         row (registered without settling); an `abandoned` claim whose
         path is a file row (fenced a live path).
+
+        **compaction_claims** — `hog_compaction_claim` holds only
+        groups a maintainer is working on right now. The claim is an
+        OPTIMIZATION and never authorization: it lets a second
+        maintenance replica's planner skip a group the first is
+        already rewriting, so the two do not both spend a rewrite and
+        an upload for one to be discarded at commit; correctness
+        against a concurrent rewrite is, and stays, the plan-to-commit
+        re-verification under the catalog commit lock. A violation is
+        therefore redundant work or a leaked row, never a wrong
+        commit.
+
+        The lifecycle is asymmetric on purpose: a group that does NOT
+        commit releases its claim at once, so its files stay
+        immediately retryable; a group that DOES commit keeps the row
+        on a short lease, because a sibling maintainer's plan formed
+        before that commit still names the now-dead inputs and the row
+        is what turns its arrival into a counted skip instead of a
+        wasted rewrite. Either way the row is gone within a lease, and
+        a bulk purge at the head of the next sweep removes it.
+
+        Flagged, and BOTH arms require the claim to be well past its
+        expiry — a claim expires between sweeps and is removed by the
+        NEXT sweep's purge, so the window in between is a correct
+        system rather than a leak. Past that grace: a claim nothing
+        purged (the sweep is no longer reaching its head for this
+        catalog, or compaction itself was turned off after having run,
+        since the purge lives at the head of a sweep); and such a claim
+        on a table that is dropped or gone, which outlived the thing it
+        claimed (the foreign key cascades on the CATALOG only). A LIVE
+        claim is never flagged, whatever its files or its table are
+        doing — on the kept-claim path a live claim over
+        end-snapshotted files IS the normal state of every committed
+        group.
 
         NOT covered: the field-id contract for inline-stats files
         (needs S3 footer reads; out of scope for a metadata-only scan).
@@ -3215,7 +3249,8 @@ components:
           type: string
           enum: [row_id_tiling, delete_vectors, orphans, removal_queue,
                  snapshot_density, next_row_id, expiry_floor, visibility_bounds,
-                 offset_release, staging_tickets, upload_claims]
+                 offset_release, staging_tickets, upload_claims,
+                 compaction_claims]
           description: >
             The check's stable id, and the order a report lists them
             in. An enum rather than prose so a generated client gets
@@ -3323,9 +3358,15 @@ components:
           format: int64
           description: >
             Groups aborted at commit time because an input file was no
-            longer live, or because the compactor's staged output claim
-            was reclaimed by a concurrent cleanup drain; re-planned on
-            the next run.
+            longer live, because the compactor's staged output claim was
+            reclaimed by a concurrent cleanup drain, or because the
+            commit could not get the per-catalog commit lock inside
+            HOGLAKE_COMMIT_LOCK_TIMEOUT_MS (the same admission bound
+            foreground commits queue under, applied to compaction's
+            commit transaction and to the row locks inside its tail).
+            All three are contention rather than fault: the group is
+            re-planned on the next run and its staged output stays
+            queued for the cleanup drain.
         dv_superseded:
           type: integer
           format: int64
@@ -3395,6 +3436,37 @@ components:
             still reports groups_compacted=0 with failed_groups naming
             the problem, so a chronically broken compactor can never
             present as a green no-op.
+        claimed_elsewhere:
+          type: integer
+          format: int64
+          description: >
+            Groups this sweep planned and then dropped because ANOTHER
+            maintenance replica holds a live claim over one or more of
+            their input files (hog_compaction_claim).
+
+            Not a conflict, not a failure, and not work lost: the
+            sibling replica is rewriting those files right now, and
+            everything this sweep would have spent on them would have
+            been discarded at its own commit. Read a steady nonzero
+            count as the feature working — a standing ZERO on a fleet
+            with two or more maintenance replicas means either
+            HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the replicas
+            are not in fact planning the same groups.
+
+            It spends no object-store IO, so it does NOT consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment
+            heap_budget_exceeded gets, and for the same reason: a skip
+            that costs nothing must not be able to starve the sweep.
+
+            OPTIONAL, and not in `required`, for the same reason
+            `offsets_released` is: the maintenance run ledger holds
+            rows written before this counter existed, and a rolling
+            deploy has both versions replaying each other's. On a
+            CURRENT server absent means zero — the stored model omits
+            the field under `@JsonInclude(NON_DEFAULT)` and the
+            ledger's read path fills 0 for older rows, so every
+            response this server serves carries it explicitly and only
+            a replayed historical row can lack it.
 
     MaintenanceTask:
       type: string
