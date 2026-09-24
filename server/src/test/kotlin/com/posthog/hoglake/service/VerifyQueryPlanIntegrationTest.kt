@@ -318,12 +318,12 @@ class VerifyQueryPlanIntegrationTest {
     @Test
     fun `the scan resolves on a 50k-file catalog and reports exactly the seeded violations`() {
         // Not a wall-clock budget — that is a property of the machine.
-        // What is worth pinning is that eleven aggregate queries over a
+        // What is worth pinning is that twelve aggregate queries over a
         // manifest this size RESOLVE, and that the checks see exactly
         // the violations the fixture planted: the same rows that give
         // every plan above its candidates.
         val report = VerifyService(db.jdbi).runOnce("plan")
-        assertThat(report.checks).hasSize(11)
+        assertThat(report.checks).hasSize(12)
         val failing = report.checks.filter { it.status != "pass" }.associate { it.check to it.violations }
         assertThat(failing)
             .containsExactlyInAnyOrderEntriesOf(

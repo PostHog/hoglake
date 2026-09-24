@@ -147,6 +147,14 @@ object HogSchemaColumns {
                     "catalog_id", "operation_id", "namespace_id", "definition", "table_uuid",
                     "write_path", "state", "expires_at", "files", "snapshot_id", "schema_version", "reason",
                 ),
+            // CompactionClaimRepo (V15): claim / release / purge and the
+            // planner's live-claim read. A claim is an OPTIMIZATION, never
+            // authorization — nothing on the correctness path maps this row.
+            "hog_compaction_claim" to
+                setOf(
+                    "catalog_id", "table_id", "group_key", "input_file_ids",
+                    "claimant", "claimed_at", "expires_at",
+                ),
             // MaintenanceRunStore (insert + last-run/history mappers),
             // CleanupService (retention purge).
             "hog_maintenance_run" to

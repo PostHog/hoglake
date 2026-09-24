@@ -210,6 +210,7 @@ class VerifyServiceIntegrationTest {
             "offset_release",
             "staging_tickets",
             "upload_claims",
+            "compaction_claims",
         )
         // Every check states its own invariant: a report is readable
         // without the spec, and an empty description is a check that
@@ -973,6 +974,131 @@ class VerifyServiceIntegrationTest {
 
     // ---- upload claims, through the real service ---------------------------
 
+    // ---- 12: compaction_claims (V15) ---------------------------------------
+
+    private fun compactionClaim(
+        cid: Long,
+        tableId: Long,
+        key: String,
+        fileIds: List<Long>,
+        expiresIn: String,
+    ) = db.jdbi.useHandleUnchecked { h ->
+        h.createUpdate(
+            """
+            INSERT INTO hog_compaction_claim
+                   (catalog_id, table_id, group_key, input_file_ids, claimant, expires_at)
+            VALUES (:c, :t, :k, :ids, gen_random_uuid(), now() + :expires::interval)
+            """,
+        )
+            .bind("c", cid)
+            .bind("t", tableId)
+            .bind("k", key)
+            .bindArray("ids", Long::class.javaObjectType, fileIds)
+            .bind("expires", expiresIn)
+            .execute()
+    }
+
+    private fun liveTableId(catalog: String): Long =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT tv.table_id FROM hog_table_version tv
+                JOIN hog_catalog c ON c.catalog_id = tv.catalog_id
+                WHERE c.name = :n AND tv.end_snapshot IS NULL
+                """,
+            ).bind("n", catalog).mapTo(Long::class.javaObjectType).one()
+        }
+
+    @Test
+    fun `a LIVE claim over live files is not a violation - that is the ordinary state`() {
+        // The check must not fire on compaction working. A claim exists
+        // for exactly as long as a maintainer is rewriting the group, so
+        // a verify run that catches one mid-flight has caught nothing
+        // wrong — and a check that flagged it would fail on every
+        // healthy catalog with compaction turned on.
+        val catalog = "vfy-claim-live"
+        val cid = seed(catalog, files = listOf(4L, 4L))
+        compactionClaim(cid, liveTableId(catalog), "live-group", listOf(1L, 2L), "15 minutes")
+        assertOnlyFails(verify.runOnce(catalog))
+    }
+
+    @Test
+    fun `a claim left well past its expiry trips compaction_claims only`() {
+        // Nothing purged it: the sweep is no longer reaching its head for
+        // this catalog, or compaction was disabled after having run. The
+        // row is inert — a claim authorizes nothing — but it is evidence
+        // the purge stopped, and the next thing to stop is the reason
+        // anyone trusts the counter.
+        val catalog = "vfy-claim-stale"
+        val cid = seed(catalog, files = listOf(4L, 4L))
+        val tableId = liveTableId(catalog)
+        // Just expired is NOT a violation: the purge runs at the head of
+        // the next sweep, and a sweep interval is seconds.
+        compactionClaim(cid, tableId, "just-expired", listOf(1L), "-1 second")
+        assertOnlyFails(verify.runOnce(catalog))
+
+        compactionClaim(cid, tableId, "abandoned", listOf(2L), "-2 hours")
+        val report = verify.runOnce(catalog)
+        assertOnlyFails(report, "compaction_claims")
+        assertThat(report.check("compaction_claims").violations).isEqualTo(1)
+        assertThat(report.check("compaction_claims").samples.single())
+            .contains("was never purged")
+    }
+
+    @Test
+    fun `a LIVE claim on a dropped table is not a violation`() {
+        // The false positive this arm shipped with, and the reason it
+        // needed the expiry predicate. A COMMITTED group keeps its claim
+        // for a short lease on purpose, so dropping a table compaction
+        // has just touched leaves live claims on a dropped table as the
+        // ORDINARY state — and the first version of this check turned
+        // /verify red for the whole lease on a catalog where nothing was
+        // wrong. Reproduced here so it cannot come back.
+        val catalog = "vfy-claim-dropped-live"
+        val cid = seed(catalog, files = listOf(4L))
+        val tableId = liveTableId(catalog)
+        compactionClaim(cid, tableId, "kept-by-a-committed-group", listOf(1L), "15 minutes")
+        catalogs.dropTable(catalog, "ns", "t")
+        assertOnlyFails(verify.runOnce(catalog))
+    }
+
+    @Test
+    fun `an EXPIRED claim on a dropped table trips compaction_claims only`() {
+        // Leak detection survives both the expiry predicate and its
+        // grace: a claim nothing releases or purges stays expired
+        // forever, so it crosses any grace. The foreign key cascades on
+        // the CATALOG, not on the table, so a dropped table's claims are
+        // removed by the release or the purge and by nothing else.
+        val catalog = "vfy-claim-dropped"
+        val cid = seed(catalog, files = listOf(4L))
+        val tableId = liveTableId(catalog)
+        compactionClaim(cid, tableId, "just-expired-on-a-dropped-table", listOf(1L), "-1 second")
+        // Not yet, twice over. A claim on a LIVE table that has only
+        // just expired is the next sweep's purge job...
+        assertOnlyFails(verify.runOnce(catalog))
+        catalogs.dropTable(catalog, "ns", "t")
+        // ...and so is one on a DROPPED table: this arm carries the same
+        // grace as the staleness arm, because the gap between a lease
+        // running out and the next sweep's purge is a correct system,
+        // not a leak, whatever the table is doing.
+        assertOnlyFails(verify.runOnce(catalog))
+
+        compactionClaim(cid, tableId, "on-a-dropped-table", listOf(2L), "-2 hours")
+        val report = verify.runOnce(catalog)
+        assertOnlyFails(report, "compaction_claims")
+        // TWO violations for one row, and that is the composite check
+        // working: a claim two hours past its lease on a dropped table
+        // is both un-purged (arm a) and outliving its table (arm b).
+        // Since both arms now carry the same grace, every arm-(b) row is
+        // an arm-(a) row too — which is why the count is 2 and the
+        // samples name both.
+        val claims = report.check("compaction_claims")
+        assertThat(claims.violations).isEqualTo(2)
+        assertThat(claims.samples)
+            .anySatisfy { assertThat(it).contains("claims a group of a table that is dropped") }
+            .anySatisfy { assertThat(it).contains("was never purged") }
+    }
+
     @Test
     fun `a claim taken, registered and committed through the real services passes upload_claims`() {
         // The healthy end state, produced by UploadService + a real
@@ -1055,7 +1181,7 @@ class VerifyServiceIntegrationTest {
 
     @Test
     fun `each check's description is about that check and no other`() {
-        // isNotBlank() would pass on eleven copies of the same
+        // isNotBlank() would pass on twelve copies of the same
         // paragraph, which is exactly the failure mode of a map built by
         // copy-paste. Each entry is a phrase that appears in ONE
         // description and in none of the others.
@@ -1072,6 +1198,7 @@ class VerifyServiceIntegrationTest {
                 "offset_release" to "mints a new identity releases the old one's consumers",
                 "staging_tickets" to "compaction_staging",
                 "upload_claims" to "upload-claim ledger",
+                "compaction_claims" to "OPTIMIZATION and never authorization",
             )
         seed("vfy-descriptions")
         val report = verify.runOnce("vfy-descriptions")

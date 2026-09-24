@@ -25,7 +25,7 @@ import java.util.concurrent.ConcurrentHashMap
  * consistent MVCC snapshot across the cross-table checks), no catalog
  * lock — verify never blocks writers.
  *
- * Eleven checks, each one query shape per violation class, each one
+ * Twelve checks, each one query shape per violation class, each one
  * paragraph of [VerifyCheck.description] naming the invariant it
  * enforces in AGENT.md's own words:
  *
@@ -44,6 +44,10 @@ import java.util.concurrent.ConcurrentHashMap
  *                         the old one's consumers)
  * 10. staging_tickets   — #174 (compaction's claim-ticket lifecycle)
  * 11. upload_claims     — #162/#167 (the upload-claim state machine)
+ * 12. compaction_claims — V15 (the group-claim lease's lifecycle; a
+ *                         claim is an OPTIMIZATION, never authorization,
+ *                         so a violation is redundant work or a leaked
+ *                         row, never a wrong commit)
  *
  * The first six names are unchanged: they are the ids on the wire.
  *
@@ -72,6 +76,16 @@ class VerifyService(
      */
     private val compactionTargetBytes: Long = DEFAULT_COMPACTION_TARGET_BYTES,
     private val cleanupIntervalMs: Long = DEFAULT_CLEANUP_INTERVAL_MS,
+    /**
+     * How far past its expiry a `hog_compaction_claim` row may sit
+     * before `compaction_claims` calls it un-purged. Not the lease
+     * length: the lease says when the claim stops protecting a group,
+     * this says when nobody having REMOVED it is a defect. Generous by
+     * design — the purge runs at the head of a sweep, so the honest
+     * bound is a few sweep intervals, and an hour clears any plausible
+     * one. Constructor-tunable for tests.
+     */
+    private val compactionClaimMaxAgeSeconds: Long = DEFAULT_COMPACTION_CLAIM_MAX_AGE_SECONDS,
 ) {
     private val log = KotlinLogging.logger {}
 
@@ -211,6 +225,7 @@ class VerifyService(
                         offsetRelease(h, cat.catalogId),
                         stagingTickets(h, cat.catalogId),
                         uploadClaims(h, cat.catalogId),
+                        compactionClaims(h, cat.catalogId),
                     )
                 VerifyReport(
                     catalog = catalog,
@@ -773,6 +788,120 @@ class VerifyService(
         return check("upload_claims", UPLOAD_CLAIMS_DESCRIPTION, registeredButQueued + unsettled)
     }
 
+    // ---- 12: compaction group claims (V15) ---------------------------------
+
+    /**
+     * `hog_compaction_claim` holds only claims some maintainer is
+     * WORKING ON.
+     *
+     * The state a claim may legitimately be in is narrow, and that is
+     * what makes it checkable. A claim is taken immediately before a
+     * rewrite. What happens next depends on the outcome, and the
+     * asymmetry is deliberate: a group that did NOT commit releases its
+     * claim at once, so the files stay immediately retryable; a group
+     * that DID commit KEEPS the row on a short lease
+     * (`HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS`), because a
+     * sibling maintainer's plan formed before the commit still names
+     * those now-dead inputs and the row is what turns its arrival into
+     * a counted skip rather than a wasted rewrite. Either way the row is
+     * gone within a lease, and the bulk purge at the head of the next
+     * sweep is what removes it. So a row that is both EXPIRED and OLD
+     * means the purge is not running — which it is not if the sweep
+     * stops reaching its head for this catalog, and which it also is not
+     * if COMPACTION ITSELF was turned off after having run: the purge
+     * lives at the head of a sweep, and a loop set back to
+     * `HOGLAKE_COMPACTION_INTERVAL_MS=0` runs no sweeps at all. (The
+     * purge is deliberately not gated on
+     * `HOGLAKE_COMPACTION_CLAIMS_ENABLED`, so turning only the CLAIMS
+     * off still clears what they left behind.)
+     *
+     * Every arm therefore requires the claim to be EXPIRED, and that is
+     * load-bearing rather than incidental. A LIVE claim says a
+     * maintainer is working, or has just finished working, and the check
+     * has nothing to say about it: not about its files being
+     * end-snapshotted (that is the ordinary race, and on the kept-claim
+     * path it is the NORMAL state of every committed group), and not
+     * about its table being dropped inside the lease. Flagging either
+     * would fire on correct behaviour — which the first draft of this
+     * check did, turning `/verify` red for a full lease after any drop
+     * of a table compaction had just touched.
+     *
+     * And the check asserts nothing about correctness, because a claim
+     * carries none: it is an optimization, so a violation here means
+     * compaction is doing redundant work or leaking rows, never that
+     * anything committed wrongly.
+     */
+    private fun compactionClaims(
+        h: Handle,
+        catalogId: Long,
+    ): VerifyCheck {
+        // (a) expired long ago and still present: nothing purged it.
+        val stale =
+            violations(
+                h,
+                catalogId,
+                """
+                SELECT table_id, group_key, claimant,
+                       EXTRACT(EPOCH FROM (now() - expires_at))::bigint AS expired_seconds
+                FROM hog_compaction_claim
+                WHERE catalog_id = :c
+                  AND expires_at <= now() - make_interval(secs => :claimMaxAge)
+                """,
+                orderBy = "expired_seconds DESC, table_id, group_key",
+                binds = mapOf("claimMaxAge" to compactionClaimMaxAgeSeconds.toDouble()),
+            ) { rs ->
+                "table_id=${rs.getLong("table_id")} group_key='${rs.getString("group_key")}' " +
+                    "claimed by ${rs.getString("claimant")} expired " +
+                    "${rs.getLong("expired_seconds")}s ago and was never purged (bound " +
+                    "${compactionClaimMaxAgeSeconds}s)"
+            }
+        // (b) an EXPIRED claim on a table that no longer exists, or was
+        // dropped. The FK cascades on catalog, not on table, so a
+        // dropped table's claims are only removed by the release or the
+        // purge.
+        //
+        // The expiry predicate is not decoration, and it carries arm
+        // (a)'s GRACE for the same reason arm (a) does.
+        //
+        // A COMMITTED group keeps its claim for a lease on purpose, so
+        // dropping a table compaction has just touched leaves live
+        // claims on a dropped table as the ORDINARY state — without the
+        // predicate this check turned red for a whole lease on a catalog
+        // where nothing was wrong. And expiry alone is not enough
+        // either: a claim expires between sweeps and is removed by the
+        // NEXT sweep's purge, so the window in between is a correct
+        // system, not a leak. Both arms therefore ask the same question
+        // — has this row outlived every mechanism that should have
+        // removed it — and $compactionClaimMaxAgeSeconds seconds past
+        // expiry is far beyond any sweep interval.
+        //
+        // Leak detection survives intact: a claim nothing releases or
+        // purges stays expired forever, so it crosses the grace and is
+        // flagged.
+        val orphaned =
+            violations(
+                h,
+                catalogId,
+                """
+                SELECT c.table_id, c.group_key,
+                       (t.table_id IS NULL) AS missing
+                FROM hog_compaction_claim c
+                LEFT JOIN hog_table t
+                  ON t.catalog_id = c.catalog_id AND t.table_id = c.table_id
+                WHERE c.catalog_id = :c
+                  AND c.expires_at <= now() - make_interval(secs => :claimMaxAge)
+                  AND (t.table_id IS NULL OR t.dropped_snapshot IS NOT NULL)
+                """,
+                orderBy = "table_id, group_key",
+                binds = mapOf("claimMaxAge" to compactionClaimMaxAgeSeconds.toDouble()),
+            ) { rs ->
+                val why = if (rs.getBoolean("missing")) "no longer exists" else "is dropped"
+                "table_id=${rs.getLong("table_id")} group_key='${rs.getString("group_key")}' " +
+                    "claims a group of a table that $why"
+            }
+        return check("compaction_claims", compactionClaimsDescription, stale + orphaned)
+    }
+
     // ---- descriptions ------------------------------------------------------
 
     /**
@@ -801,6 +930,40 @@ class VerifyService(
             "'absent' whose path IS a file row is the staged-output race resolved the wrong way: " +
             "the removal ledger, the only thing that knows the path, records that the object " +
             "never existed while the catalog serves reads from it."
+
+    /**
+     * The other description that names its own bound: the claim-age
+     * grace, which is a constructor field and therefore not a constant.
+     */
+    private val compactionClaimsDescription: String =
+        "hog_compaction_claim holds only groups a maintainer is working on RIGHT NOW. A claim is " +
+            "an OPTIMIZATION and never authorization: it lets a second maintenance replica's " +
+            "planner skip a group the first one is already rewriting, so the two do not both " +
+            "spend a rewrite and an upload for one of them to be discarded at commit. " +
+            "Correctness against a concurrent rewrite is, and stays, the plan-to-commit " +
+            "re-verification under the per-catalog commit lock, which is why nothing here can " +
+            "mean a wrong commit — only redundant work or leaked rows. The lifecycle is narrow, " +
+            "and asymmetric on purpose: a claim is taken immediately before the rewrite; a group " +
+            "that does NOT commit releases it at once, so its files stay immediately retryable; " +
+            "a group that DOES commit KEEPS the row on a short lease " +
+            "(HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS), because a sibling maintainer's " +
+            "plan formed before that commit still names the now-dead inputs and the row is what " +
+            "turns its arrival into a counted skip instead of a wasted rewrite. Either way the " +
+            "row is gone within a lease, and the bulk purge at the head of the next sweep is what " +
+            "removes it. Two states contradict that, and BOTH require the claim to be more than " +
+            "$compactionClaimMaxAgeSeconds seconds past its expiry — a claim expires between " +
+            "sweeps and is removed by the NEXT sweep's purge, so the window in between is a " +
+            "correct system rather than a leak. A claim that outlives that grace means nothing " +
+            "purged it: the sweep is no longer reaching its head for this catalog, or compaction " +
+            "itself was turned off after having run (the purge lives at the head of a sweep, so " +
+            "HOGLAKE_COMPACTION_INTERVAL_MS=0 runs none; it is deliberately NOT gated on " +
+            "HOGLAKE_COMPACTION_CLAIMS_ENABLED, so turning only the claims off still clears " +
+            "them). Such a claim on a table that is dropped or gone outlived the thing " +
+            "it was claiming — the foreign key cascades on the CATALOG only, so a table's claims " +
+            "are removed by the release or the purge and by nothing else. A LIVE claim is never a " +
+            "violation, whatever its files or its table are doing: it says a maintainer is " +
+            "working or has just finished, which on the kept-claim path is the normal state of " +
+            "every committed group."
 
     /** MiB where it divides, bytes otherwise — description text only. */
     private fun bytes(value: Long): String =
@@ -843,6 +1006,15 @@ class VerifyService(
          * healthy sweep, which is how an alert stops being read.
          */
         const val DEFAULT_STAGING_TICKET_MAX_AGE_SECONDS = 6L * 60 * 60
+
+        /**
+         * See [compactionClaimMaxAgeSeconds]: an hour past expiry. The
+         * purge runs once per catalog per sweep, and a sweep interval is
+         * measured in seconds, so an hour is many orders of the honest
+         * bound — deliberately, because the consequence of a false
+         * positive here is an operator chasing a leak that is not one.
+         */
+        const val DEFAULT_COMPACTION_CLAIM_MAX_AGE_SECONDS = 60L * 60
 
         /**
          * One path-equality sub-query, with the ordering its samples are

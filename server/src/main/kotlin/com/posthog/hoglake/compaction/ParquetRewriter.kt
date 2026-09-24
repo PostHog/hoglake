@@ -32,6 +32,11 @@ import org.apache.parquet.schema.PrimitiveType
 import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import java.math.BigInteger
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 
 /**
  * A compaction group whose inputs cannot be rewritten under the live
@@ -238,6 +243,36 @@ object ParquetRewriter {
      * default is comfortably inside any heap this server runs with.
      */
     const val DEFAULT_MAX_NODES_PER_ROW = 1_000_000
+
+    /**
+     * How many of a group's inputs [forEachOpenedInput] may have OPEN at
+     * once (`HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS`).
+     *
+     * 1 here — off — because this is the LIBRARY default, and every unit
+     * test and every caller that did not ask for concurrency gets
+     * exactly the old single-threaded shape. `Config` supplies the
+     * production default (8), and `CompactionService` is the only caller
+     * that passes one.
+     *
+     * The quantity being overlapped is LATENCY, not bytes: opening a
+     * parquet input costs at least one object-store round trip before a
+     * row can be read, and a 64-file group paid 64 of them end to end —
+     * which is why compaction's per-group cost was measured FLAT in
+     * group size (~8.5 s) on gigahog-prod-us. See [forEachOpenedInput]
+     * for what the window does and does not bound.
+     */
+    const val DEFAULT_INPUT_OPEN_PARALLELISM = 1
+
+    /**
+     * How long [forEachOpenedInput] waits for one prefetched `open` to
+     * finish so it can close its reader, when the group is unwinding.
+     *
+     * Bounded because the alternative is a hung object-store call
+     * turning a failed group into a hung sweep; two seconds is longer
+     * than any healthy open and shorter than the background loop's own
+     * shutdown cap.
+     */
+    const val OPEN_DRAIN_MILLIS = 2_000L
 
     /**
      * The synthetic repeated-group names the parquet LIST and MAP
@@ -566,6 +601,7 @@ object ParquetRewriter {
         output: OutputFile,
         maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
         codec: OutputCodec = OutputCodec(),
+        inputOpenParallelism: Int = DEFAULT_INPUT_OPEN_PARALLELISM,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
         // VARIANT anywhere in the forest, not just at the top. #77
@@ -601,7 +637,15 @@ object ParquetRewriter {
         // destination (unlink vs abort the upload), which is why it is
         // the OutputFile's job and not a `delete` here.
         try {
-            return rewriteInto(inputs, liveColumns, sortFields, output, maxNodesPerRow, codec)
+            return rewriteInto(
+                inputs,
+                liveColumns,
+                sortFields,
+                output,
+                maxNodesPerRow,
+                codec,
+                inputOpenParallelism,
+            )
         } catch (e: Throwable) {
             runCatching { (output as? DiscardableOutputFile)?.discard() }
             throw e
@@ -615,6 +659,7 @@ object ParquetRewriter {
         output: OutputFile,
         maxNodesPerRow: Int,
         codec: OutputCodec,
+        inputOpenParallelism: Int,
     ): RewriteResult {
         val outputSchema = outputSchema(liveColumns)
         val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
@@ -636,9 +681,10 @@ object ParquetRewriter {
             var written = 0L
             var minRowId: Long? = null
             writingTo(output, outputSchema, codec) { writer ->
-                for (input in inputs) {
+                forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
                     forEachSurvivor(
                         input,
+                        reader,
                         liveColumns,
                         dataFields,
                         rowIdIndex,
@@ -676,8 +722,16 @@ object ParquetRewriter {
         // is [maxNodesPerRow], as on the streaming path above.
         val rows = ArrayList<Row>()
         var minRowId: Long? = null
-        for (input in inputs) {
-            forEachSurvivor(input, liveColumns, dataFields, rowIdIndex, factory, maxNodesPerRow) { group, rowId ->
+        forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
+            forEachSurvivor(
+                input,
+                reader,
+                liveColumns,
+                dataFields,
+                rowIdIndex,
+                factory,
+                maxNodesPerRow,
+            ) { group, rowId ->
                 rows.add(Row(group, rowId))
                 minRowId = minOf(minRowId ?: rowId, rowId)
             }
@@ -687,9 +741,168 @@ object ParquetRewriter {
         return RewriteResult(ordered.size.toLong(), minRowId)
     }
 
+    /**
+     * Walk [inputs] IN ORDER, handing each to [body] with its parquet
+     * reader already open, and open up to [parallelism] of them at once.
+     *
+     * # Why this exists
+     *
+     * Opening a parquet input is round trips, not bytes. Even with
+     * `S3InputFile`'s footer prefetch it is at least one GET before a
+     * single row can be read, and the rewrite used to pay that cost
+     * strictly one input at a time, twice per input (once for the
+     * schema, once for the rows — see the single [ParquetFileReader]
+     * threaded through [forEachSurvivor] now, which removed the second).
+     * That is the shape behind compaction's FIXED per-group cost:
+     * measured on gigahog-prod-us, ~8.5 s per group regardless of the
+     * group's size, because a 64-file group is 64 serialized opens. The
+     * bytes are not the problem; the latency is, and latency is what
+     * overlaps.
+     *
+     * # Order and the memory bound are both preserved
+     *
+     * ORDER: [body] is called for `inputs[0]`, then `inputs[1]`, and so
+     * on, on the CALLER's thread. Only the `open` is concurrent. That
+     * matters beyond tidiness — the unsorted path writes survivors
+     * straight through in input order, and an input's row ids are
+     * positional from its own `rowIdStart`, so reordering the inputs
+     * would reorder the output for no gain.
+     *
+     * MEMORY: at most [parallelism] readers exist at any moment
+     * (`window` submitted, one of which is the one being consumed), and
+     * a reader that is open but not yet being read holds its parsed
+     * footer plus whatever tail `S3InputFile` prefetched — NOT a
+     * readahead buffer, which is only allocated when the data pages are
+     * read, and only for the input [body] currently holds. The
+     * streaming bound is therefore untouched: it was one 8 MiB readahead
+     * buffer before and it is one now.
+     *
+     * The knob nevertheless has to stay small for a reason the group
+     * size cannot see: a footer is unbounded in principle (capped by
+     * `S3InputFile.DEFAULT_MAX_PREFETCH_BYTES`), so the window
+     * multiplies the worst-case footer footprint. 8 against a 64-file
+     * group is 8x the concurrency for 8x a quantity that is kilobytes
+     * for every real file.
+     *
+     * # Failures
+     *
+     * An open that throws surfaces on the consuming thread, with the
+     * original exception unwrapped, at the position that input occupies
+     * — so a corrupt file is still reported as itself rather than as a
+     * pool failure, and the rewriter's typed refusals keep their
+     * meaning. Whatever was opened ahead is closed on the way out,
+     * whether the walk finished or threw, because those readers hold
+     * object-store streams nothing else will ever reach.
+     */
+    private fun forEachOpenedInput(
+        inputs: List<Input>,
+        parallelism: Int,
+        body: (Input, ParquetFileReader) -> Unit,
+    ) {
+        val window = parallelism.coerceAtMost(inputs.size)
+        if (window <= 1) {
+            // EXACTLY the old shape, with no executor and no thread hop:
+            // the default is 1 for the unit tests and for any caller that
+            // did not ask, and "off" must mean off.
+            for (input in inputs) ParquetFileReader.open(input.source).use { body(input, it) }
+            return
+        }
+        val pool =
+            Executors.newFixedThreadPool(window) { r ->
+                Thread(r, "compaction-input-open").apply { isDaemon = true }
+            }
+        val pending = ArrayDeque<Future<ParquetFileReader?>>()
+        var submitted = 0
+        // Flipped once the window stops being read. A task that opens
+        // its reader AFTER that closes it itself and hands back null —
+        // which is the only thing that can close a reader nobody is
+        // waiting for any more, since the future it would arrive on is
+        // never read again.
+        val abandoned = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            for (input in inputs) {
+                while (submitted < inputs.size && pending.size < window) {
+                    val next = inputs[submitted++]
+                    pending.addLast(
+                        pool.submit(
+                            Callable {
+                                val opened = ParquetFileReader.open(next.source)
+                                if (abandoned.get()) {
+                                    runCatching { opened.close() }
+                                    null
+                                } else {
+                                    opened
+                                }
+                            },
+                        ),
+                    )
+                }
+                val reader =
+                    try {
+                        checkNotNull(pending.removeFirst().get()) {
+                            "a prefetched reader for ${input.label} was abandoned while the " +
+                                "group was still being read"
+                        }
+                    } catch (e: ExecutionException) {
+                        // The pool's wrapper is noise: every caller of
+                        // this rewriter discriminates on the exception
+                        // TYPE (UnconvertibleSchemaException,
+                        // InvalidDataException, the retryable object-store
+                        // ones), and an ExecutionException is none of
+                        // them.
+                        throw e.cause ?: e
+                    }
+                reader.use { body(input, it) }
+            }
+        } finally {
+            // Three steps, in this order, and each one covers a case
+            // the others cannot.
+            //
+            // 1. `shutdownNow()` FIRST: drop what is queued and
+            //    interrupt what is running, so a hung object-store open
+            //    is told to stop before anything waits on it. The
+            //    previous version called `shutdown()` first and then
+            //    waited per-future, which at the defaults is a window of
+            //    8 opens times a 2 s budget each — sixteen seconds of a
+            //    failed group hanging on to a sweep.
+            //
+            // 2. `abandoned`, so a task whose `open` COMPLETES after we
+            //    stop reading closes its own reader. This is the case
+            //    cancelling could never handle: `cancel(true)` marks the
+            //    future and interrupts the thread, but an interrupt that
+            //    lands after the last object-store call — or that the
+            //    client swallows — leaves `open` to finish normally and
+            //    hand a live reader to a future nobody will ever read.
+            //
+            // 3. ONE overall deadline for the drain, not one per future.
+            //    Whatever has already completed is closed here; whatever
+            //    completes later closes itself via (2); and the group
+            //    never waits longer than [OPEN_DRAIN_MILLIS] in total.
+            pool.shutdownNow()
+            abandoned.set(true)
+            val deadline = System.nanoTime() + OPEN_DRAIN_MILLIS * 1_000_000
+            for (future in pending) {
+                val remaining = deadline - System.nanoTime()
+                val reader =
+                    if (remaining > 0) {
+                        runCatching { future.get(remaining, TimeUnit.NANOSECONDS) }.getOrNull()
+                    } else if (future.isDone) {
+                        // Past the deadline, but this one is already
+                        // finished: taking its reader costs nothing and
+                        // leaving it costs an unclosed stream.
+                        runCatching { future.get() }.getOrNull()
+                    } else {
+                        null
+                    }
+                runCatching { reader?.close() }
+            }
+        }
+    }
+
     /** The per-input pipeline: apply the DV, map to the live schema, stamp the row id, emit. */
     private fun forEachSurvivor(
         input: Input,
+        reader: ParquetFileReader,
         liveColumns: List<Column>,
         dataFields: List<Type>,
         rowIdIndex: Int,
@@ -697,7 +910,11 @@ object ParquetRewriter {
         maxNodesPerRow: Int,
         emit: (Group, Long) -> Unit,
     ) {
-        val schema = readSchema(input.source)
+        // From the reader the caller already opened, not a second open of
+        // its own. This used to be `readSchema(input.source)` followed by
+        // `readRows(input.source, ...)`, which opened — and so re-read and
+        // re-parsed the footer of — every input TWICE.
+        val schema = reader.footer.fileMetaData.schema
         refuseDuplicateNames(schema, emptyList())
         // A previously-compacted input carries its ids in its own
         // row-id column; positional ids would be wrong for it.
@@ -720,7 +937,7 @@ object ParquetRewriter {
         // decode produced. Charging the copy is belt-and-braces; charging
         // it from the same allowance turns the braces into a tighter belt.
         val budget = NodeBudget(maxNodesPerRow, input.label)
-        readRows(input.source, schema, budget) { src, ordinal ->
+        readRows(reader, schema, budget) { src, ordinal ->
             if (input.deletes?.contains(ordinal) == true) {
                 applied++
                 return@readRows
@@ -941,9 +1158,6 @@ object ParquetRewriter {
             .build()
 
     // ---- schema ----------------------------------------------------------
-
-    private fun readSchema(file: InputFile): MessageType =
-        ParquetFileReader.open(file).use { it.footer.fileMetaData.schema }
 
     /**
      * The output schema is the LIVE schema: every live column in
@@ -1651,23 +1865,27 @@ object ParquetRewriter {
 
     // ---- row IO ----------------------------------------------------------
 
+    /**
+     * Read every row of an ALREADY-OPEN reader. The reader belongs to
+     * [forEachOpenedInput], which opened it (possibly ahead of time, on
+     * another thread) and closes it when this returns — so this must not
+     * close it, and must not assume any row group has been consumed yet.
+     */
     private fun readRows(
-        file: InputFile,
+        reader: ParquetFileReader,
         schema: MessageType,
         budget: NodeBudget,
         consume: (Group, Long) -> Unit,
     ) {
-        ParquetFileReader.open(file).use { reader ->
-            val columnIO = ColumnIOFactory().getColumnIO(schema)
-            var ordinal = 0L
-            var pages = reader.readNextRowGroup()
-            while (pages != null) {
-                val recordReader = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
-                repeat(Math.toIntExact(pages.rowCount)) {
-                    consume(recordReader.read(), ordinal++)
-                }
-                pages = reader.readNextRowGroup()
+        val columnIO = ColumnIOFactory().getColumnIO(schema)
+        var ordinal = 0L
+        var pages = reader.readNextRowGroup()
+        while (pages != null) {
+            val recordReader = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
+            repeat(Math.toIntExact(pages.rowCount)) {
+                consume(recordReader.read(), ordinal++)
             }
+            pages = reader.readNextRowGroup()
         }
     }
 

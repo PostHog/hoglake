@@ -667,3 +667,30 @@ CREATE INDEX hog_upload_cleanup ON hog_upload (catalog_id, last_scheduled_at, up
 -- a replacement row carries the edge.
 CREATE INDEX hog_table_replacement_lineage
     ON hog_table (catalog_id, replaced_table_id) WHERE replaced_table_id IS NOT NULL;
+
+-- Compaction group claims (V15): the optimization that stops two
+-- maintenance replicas from rewriting the SAME group and throwing one of
+-- the two rewrites away at commit. A CLAIM IS NEVER AUTHORIZATION —
+-- correctness against a concurrent rewrite is the plan-to-commit
+-- re-verification under the per-catalog commit lock, and stays there.
+-- `group_key` is a hex SHA-256 over the group's spec id, partition
+-- values and sorted input data_file_ids, so two replicas that plan the
+-- same group compute the same key with no coordination;
+-- `input_file_ids` rides along because the planner skips by OVERLAP
+-- rather than key equality. `expires_at` is what makes a dead
+-- maintainer's claim reclaimable (HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS).
+CREATE TABLE hog_compaction_claim (
+    catalog_id bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
+    table_id bigint NOT NULL,
+    group_key text NOT NULL,
+    input_file_ids bigint[] NOT NULL,
+    claimant uuid NOT NULL,
+    claimed_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (catalog_id, table_id, group_key)
+);
+-- One index only: the planner's per-table read rides the PRIMARY KEY's
+-- (catalog_id, table_id) prefix, and the per-sweep purge names a
+-- catalog with no table, which the key cannot serve.
+CREATE INDEX hog_compaction_claim_expiry
+    ON hog_compaction_claim (catalog_id, expires_at);

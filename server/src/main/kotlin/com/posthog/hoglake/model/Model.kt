@@ -1173,6 +1173,33 @@ data class CompactionResult(
      * failure mode; count it so the run ledger shows it.
      */
     val failedGroups: Long = 0,
+    /**
+     * Groups this sweep planned and then dropped because ANOTHER
+     * maintenance replica holds a live claim over one or more of their
+     * input files (`hog_compaction_claim`, V15).
+     *
+     * Not a conflict, not a failure, and not work lost: the sibling
+     * replica is rewriting those files right now, and everything this
+     * sweep would have spent on them would have been discarded at its
+     * own commit — which is exactly the production shape the claims were
+     * built for (a 547 s sweep on gigahog-prod-us committed 34 groups
+     * and lost 30 to the other replica's commits, each one a full
+     * rewrite and upload thrown away).
+     *
+     * Read it as the feature working. It spends no object-store IO, so
+     * it does NOT consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. A
+     * standing ZERO on a fleet with two or more maintenance replicas
+     * means either HOGLAKE_COMPACTION_CLAIMS_ENABLED is off or the
+     * replicas are not in fact planning the same groups.
+     *
+     * Defaulted, and `@JsonInclude(NON_DEFAULT)` for the stored-payload
+     * rule: the maintenance ledger holds rows an older replica wrote and
+     * a rolling deploy has both versions replaying each other's, so a
+     * counter that postdates a row must be absent from it rather than
+     * asserted as zero.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val claimedElsewhere: Long = 0,
 )
 
 /**

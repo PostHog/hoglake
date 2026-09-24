@@ -18,6 +18,8 @@ import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
+import com.posthog.hoglake.persistence.PartialResult
+import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.TableRepo
@@ -27,7 +29,9 @@ import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
+import org.jdbi.v3.core.statement.UnableToExecuteStatementException
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 
 /** Per-run compaction knobs (Config's HOGLAKE_COMPACTION_* env surface). */
 data class CompactionConfig(
@@ -42,6 +46,141 @@ data class CompactionConfig(
     val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
+    /**
+     * How many of a sweep's planned groups are REWRITTEN AND COMMITTED
+     * at once (`HOGLAKE_COMPACTION_PARALLEL_GROUPS`).
+     *
+     * **1 — off — is the default, and it is today's behaviour exactly**:
+     * one worker, groups in plan order, no thread hop anywhere. An
+     * existing deployment that sets nothing sees no change at all.
+     *
+     * # What it buys, and why the number is what it is
+     *
+     * A group costs a FIXED amount of wall time almost regardless of its
+     * size, because the cost is object-store LATENCY, not bytes:
+     * measured ~8.5 s per group on gigahog-prod-us for a 64-file group,
+     * dominated by the serialized opens ([inputOpenParallelism] attacks
+     * that half) plus the plan and the commit. Groups are independent —
+     * they share no input file by construction (one pass of bin packing
+     * over a disjoint partition of the candidates) — so the only
+     * serialization point between them is the per-catalog commit lock,
+     * which [CompactionService.commitGroup] takes for the metadata
+     * transaction ALONE and never across the rewrite or the upload. N
+     * groups therefore overlap N rewrites against one short critical
+     * section.
+     *
+     * # Three costs an operator is buying with it
+     *
+     *  - **Database connections.** Each in-flight group needs a
+     *    connection for its staging ticket and, briefly, one for its
+     *    commit. Raising this above the JDBI pool's free capacity turns
+     *    compaction into a connection-starvation source for the
+     *    foreground.
+     *  - **Sorted-path heap** — see [sortedHeapBytes] and
+     *    [sortedRowCeiling]. The heap budget is DIVIDED by this value,
+     *    so N concurrent sorted groups cannot exceed what one was
+     *    allowed; the price is proportionally smaller sorted groups, on
+     *    every table, whether or not a sweep ever runs two at once.
+     *  - **Commit-lock pressure.** N groups queue their commits behind
+     *    the same per-catalog lock that foreground writers use. Each
+     *    wait is milliseconds of metadata, but N of them are N.
+     */
+    val parallelGroups: Int = DEFAULT_PARALLEL_GROUPS,
+    /**
+     * How many of ONE group's input files may be open at once
+     * (`HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS`) — the other half of
+     * the fixed per-group cost. See
+     * `ParquetRewriter.forEachOpenedInput`: merge order and the
+     * streaming memory bound are both preserved; only the `open` round
+     * trips overlap.
+     */
+    val inputOpenParallelism: Int = ParquetRewriter.DEFAULT_INPUT_OPEN_PARALLELISM,
+    /**
+     * Whether a maintainer CLAIMS a group before rewriting it, so a
+     * second maintainer's planner skips it (`hog_compaction_claim`, V15;
+     * `HOGLAKE_COMPACTION_CLAIMS_ENABLED`).
+     *
+     * A claim is an OPTIMIZATION, never authorization — see
+     * [CompactionClaimRepo]. Turning it off costs duplicated rewrites
+     * between replicas and costs nothing else; the plan-to-commit
+     * re-verification is the correctness backstop either way.
+     */
+    val claimsEnabled: Boolean = true,
+    /**
+     * How long a group claim is held before any maintainer may reclaim
+     * it (`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS`).
+     *
+     * This is a LEASE LENGTH, so it is bounded below by the longest
+     * rewrite that should still be protected and above by how long a
+     * dead maintainer's files stay untouchable. 900 s covers a
+     * worst-case 64-file group by two orders of magnitude while keeping
+     * the cost of a killed pod to fifteen minutes on the files it held.
+     * Nothing breaks if it is wrong in either direction: too short means
+     * two replicas may duplicate a rewrite (today's behaviour), too long
+     * means a dead claim delays one group.
+     */
+    val claimTtlSeconds: Long = DEFAULT_CLAIM_TTL_SECONDS,
+    /**
+     * How long a claim survives once its group has COMMITTED
+     * (`HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS`).
+     *
+     * A claim outlives its own group on purpose (see
+     * `CompactionService.executeGroup`'s release), but not necessarily
+     * for the full [claimTtlSeconds].
+     *
+     * # What it has to cover, in the units that matter
+     *
+     * The only reader a committed group's claim has left is a SIBLING
+     * MAINTAINER'S PLAN formed before the commit — so the quantity to
+     * cover is how old that plan can be, which is one sweep, not one
+     * sweep INTERVAL. Those are wildly different numbers and the first
+     * version of this knob confused them. A group costs a measured
+     * ~8.5 s, so a [maxGroupsPerRun] of 64 at [parallelGroups] = 1 is a
+     * sweep of roughly **544 s** — and a 120 s lease covered about a
+     * fifth of it, leaving four fifths of the sibling's plans to arrive
+     * at an expired claim and spend the rewrite anyway.
+     *
+     * 600 s covers that sweep with margin and stays inside the default
+     * [claimTtlSeconds] of 900.
+     *
+     * # What it costs
+     *
+     * Rows, and the planner reads their `input_file_ids` on every pass.
+     * The amplification is `committed groups per sweep x lease / sweep
+     * duration`, which at the same settings is 64 x 600/544, or about
+     * **70 rows per table** — not the ~2,000 an earlier version of this
+     * comment arrived at by dividing the lease by the sweep INTERVAL
+     * instead of by the sweep's duration. Seventy rows is not a number
+     * worth trading correctness of the window for.
+     *
+     * Nothing breaks if it is too short: the sibling's stale plan then
+     * arrives, takes the claim, rewrites, and loses its commit
+     * re-verification — which is exactly today's behaviour without
+     * claims. Too long costs rows and nothing else.
+     */
+    val committedClaimTtlSeconds: Long = DEFAULT_COMMITTED_CLAIM_TTL_SECONDS,
+    /**
+     * The admission bound each group's COMMIT queues under
+     * (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, shared with the commit path).
+     *
+     * Compaction commits used to queue on the per-catalog lock with NO
+     * bound, which AGENT.md already called out as the exception to
+     * "every acquirer passes `commitLockTimeoutMs`". Under
+     * [parallelGroups] > 1 the exception stops being survivable: each
+     * waiting worker holds a pooled connection for the whole wait, so N
+     * workers queued behind a slow commit take N connections out of a
+     * pool the foreground shares — and a foreground writer that cannot
+     * get a CONNECTION fails with a Hikari timeout (a 500) instead of
+     * the typed, retryable [HoglakeException.CommitQueueTimeout] (a 503
+     * with Retry-After) that the admission contract promises.
+     *
+     * Bounding it puts the failure back on compaction's side of the
+     * line, where it is a counted skip: the timeout is caught per group,
+     * counted with the plan-to-commit races, and the staged output is
+     * left undrained for the cleanup drain, which is what every other
+     * race already does. 0 restores the unbounded wait.
+     */
+    val commitLockTimeoutMs: Long = 0,
     /**
      * How far the SORTED path's group budget is derated for a table with
      * nested columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
@@ -207,7 +346,80 @@ data class CompactionConfig(
         require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
         require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
         require(sortedHeapBytes >= 1) { "sorted heap bytes must be at least 1" }
+        // Validated at CONSTRUCTION, which is boot, for the same reason
+        // the file minimums are: a bad value caught inside the sweep
+        // throws out of planSnapshot, outside the per-group catch, and
+        // kills every catalog's sweep on every interval while the
+        // process still looks healthy.
+        require(parallelGroups >= 1) {
+            "HOGLAKE_COMPACTION_PARALLEL_GROUPS must be at least 1, got $parallelGroups: " +
+                "1 is the sequential default, and 0 would mean a sweep that executes nothing " +
+                "while still reporting a clean run"
+        }
+        require(inputOpenParallelism >= 1) {
+            "HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS must be at least 1, got $inputOpenParallelism"
+        }
+        require(claimTtlSeconds >= 1) {
+            "HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS must be at least 1, got $claimTtlSeconds: " +
+                "a claim that expires the instant it is taken is worse than no claim, because " +
+                "every planner still pays to read it"
+        }
+        require(committedClaimTtlSeconds >= 1) {
+            "HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS must be at least 1, got " +
+                "$committedClaimTtlSeconds"
+        }
     }
+
+    /**
+     * The sorted path's heap budget for ONE group, after the division
+     * [parallelGroups] forces.
+     *
+     * # Divided, not gated — and why
+     *
+     * [sortedHeapBytes] is a statement about this PROCESS's heap: the
+     * sorted rewrite materializes a whole group as parquet-java `Group`
+     * objects, and that graph has to fit. It was a per-GROUP budget when
+     * only one group could be in flight, and those were the same
+     * sentence. Under [parallelGroups] > 1 they are not, and N groups
+     * each sized to the whole heap is N times the heap.
+     *
+     * Two ways to close that, and this takes the first:
+     *
+     *  - **DIVIDE** (what this does). The planner's row ceiling and the
+     *    group byte budget both derive from this value, so dividing it
+     *    makes every sorted group 1/N the size and N of them exactly the
+     *    old bound. It is enforced in METADATA at planning time — the
+     *    same place, and by the same arithmetic, as the existing exact
+     *    `record_count` ceiling — so a group that could not fit is never
+     *    formed, never claimed and never spends a byte of IO finding
+     *    out. No lock, no runtime coordination, nothing to deadlock, and
+     *    the bound holds no matter how the sweep interleaves.
+     *  - **GATE** (not done): let a sorted group keep the whole budget
+     *    and admit one at a time through a semaphore. That preserves
+     *    sorted group SIZE, which matters — a sorted table's effective
+     *    target is already derated hard, and the scaling file minimum
+     *    means a small enough target silently stops forming groups at
+     *    all. But it serializes exactly the tables that are slowest to
+     *    rewrite, makes the heap bound depend on a runtime invariant
+     *    rather than on arithmetic a test can evaluate, and the permit
+     *    has to be held across object-store IO — the thing this codebase
+     *    keeps out of the one lock it already has.
+     *
+     * The division is conservative: it applies whether or not a sweep
+     * ever runs two SORTED groups at once, because the planner cannot
+     * know what the other workers will pick up. That is the price, it is
+     * paid only by tables with a live sort order, and it is paid only
+     * when an operator raises [parallelGroups] above the default of 1 —
+     * at which point this returns [sortedHeapBytes] unchanged and every
+     * existing deployment's arithmetic is bit-identical.
+     *
+     * The real fix is the one [sortedHeapBytes] already names: an
+     * external merge sort, after which a group's size stops being a heap
+     * question and this division disappears with the rest of the
+     * ceiling.
+     */
+    val sortedHeapBytesPerGroup: Long
+        get() = maxOf(1L, sortedHeapBytes / parallelGroups)
 
     /**
      * How many ROWS of [columns] the sorted path may materialize inside
@@ -233,7 +445,12 @@ data class CompactionConfig(
     fun sortedRowCeiling(columns: List<Column>): Long {
         val nodes = columns.allNodes().size + 1L // + the _hog_row_id carrier
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
-        val ceiling = sortedHeapBytes / perRow
+        // The PER-GROUP budget, which is the whole heap budget divided by
+        // the number of groups that may be in flight — see
+        // [sortedHeapBytesPerGroup] for why divided rather than gated. At
+        // the default parallelGroups = 1 this is sortedHeapBytes and the
+        // arithmetic is unchanged.
+        val ceiling = sortedHeapBytesPerGroup / perRow
         val nested = columns.allNodes().any { it.def.type.isNested }
         return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
     }
@@ -290,7 +507,15 @@ data class CompactionConfig(
             if (nestedSortExpansion == 1 || columns.allNodes().none { it.def.type.isNested }) {
                 targetBytes
             } else {
-                targetBytes / nestedSortExpansion
+                // Divided by [parallelGroups] as well, for the reason
+                // [sortedHeapBytesPerGroup] gives: this arm is a
+                // statement about how much HEAP a group's nested object
+                // graph takes, so N concurrent groups multiply it just
+                // as they multiply the density arm. Leaving it undivided
+                // made the tightest-bound-wins rule choose an undivided
+                // bound for exactly the tables whose graphs are the
+                // least predictable — the nested ones.
+                maxOf(1L, targetBytes / nestedSortExpansion / parallelGroups)
             }
         val densityBound =
             density.bytesPerRow?.let { bytesPerRow ->
@@ -336,6 +561,24 @@ data class CompactionConfig(
          * the group bytes it buys and server/README.md has the ladder.
          */
         const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
+
+        /**
+         * See [parallelGroups]. 1 = today's sequential sweep, so an
+         * existing deployment that sets nothing changes in no way.
+         */
+        const val DEFAULT_PARALLEL_GROUPS = 1
+
+        /** See [claimTtlSeconds]: fifteen minutes of lease. */
+        const val DEFAULT_CLAIM_TTL_SECONDS = 900L
+
+        /**
+         * See [committedClaimTtlSeconds]: ten minutes, which covers a
+         * full 64-group sweep (~544 s at the measured 8.5 s a group)
+         * with margin and stays inside the 900 s rewrite lease. The
+         * quantity it has to cover is the AGE OF A SIBLING'S PLAN, which
+         * is one sweep — not one sweep interval.
+         */
+        const val DEFAULT_COMMITTED_CLAIM_TTL_SECONDS = 600L
     }
 }
 
@@ -438,6 +681,23 @@ data class CompactionPlan(
      * reaches the run outcome as CompactionResult.heapBudgetExceeded.
      */
     val heapRefusedGroups: Long = 0,
+    /**
+     * Groups this plan formed and then dropped because another
+     * maintainer holds a LIVE claim over one or more of their input
+     * files (`hog_compaction_claim`, V15).
+     *
+     * Not a conflict and not a failure — the other replica is rewriting
+     * those files right now, and everything this one would spend on them
+     * would be thrown away at its own commit. Counted so the value is
+     * visible: on a two-replica fleet a steady nonzero here is the
+     * feature working, and a steady ZERO with two replicas running means
+     * claims are off or the planners are seeing different candidate
+     * sets.
+     *
+     * Like [heapRefusedGroups] and unlike every other skip flavor, it
+     * spends no IO, so it does NOT consume the run's group budget.
+     */
+    val claimedGroups: Long = 0,
 )
 
 /**
@@ -533,6 +793,19 @@ class CompactionService(
     private val runStore = MaintenanceRunStore(jdbi)
 
     /**
+     * This process's identity on the group claims it takes
+     * (`hog_compaction_claim.claimant`).
+     *
+     * Per SERVICE INSTANCE, minted once, not per sweep and not per
+     * group: it exists so a release can only delete a claim this process
+     * still holds, and so a reclaimed-then-released claim cannot be
+     * deleted out from under the maintainer that reclaimed it. Nothing
+     * reads it as an address — there is no protocol between maintainers
+     * beyond the row and its expiry.
+     */
+    private val instanceId: UUID = UUID.randomUUID()
+
+    /**
      * Last heap-refusal picture per table, so a permanent condition is
      * logged when it CHANGES rather than on every sweep. One short string
      * per table that has ever been refused; the planner is the only
@@ -563,6 +836,18 @@ class CompactionService(
         val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
         /** Output compression for the rewrite (CompactionConfig.codec). */
         val codec: ParquetRewriter.OutputCodec = ParquetRewriter.OutputCodec(),
+        /**
+         * How many of a group's inputs the rewrite may OPEN at once
+         * (CompactionConfig.inputOpenParallelism). Merge order and the
+         * streaming memory bound are unaffected; only the object-store
+         * round trips overlap.
+         */
+        val inputOpenParallelism: Int = ParquetRewriter.DEFAULT_INPUT_OPEN_PARALLELISM,
+        /**
+         * The commit's admission bound (CompactionConfig.commitLockTimeoutMs).
+         * 0 = the unbounded wait this path used to take unconditionally.
+         */
+        val commitLockTimeoutMs: Long = 0,
     ) {
         /**
          * Live column types by field id (stats aggregation), over EVERY
@@ -643,18 +928,31 @@ class CompactionService(
                         ?.fields ?: emptyList(),
                 maxNodesPerRow = cfg.maxNodesPerRow,
                 codec = cfg.codec,
+                inputOpenParallelism = cfg.inputOpenParallelism,
+                commitLockTimeoutMs = cfg.commitLockTimeoutMs,
             )
         val planned = groups(h, ctx, cfg)
         return PlanWithContext(
             ctx,
-            CompactionPlan(t.tableId, ns.name, t.name, planned.groups, planned.heapRefused),
+            CompactionPlan(
+                t.tableId,
+                ns.name,
+                t.name,
+                planned.groups,
+                planned.heapRefused,
+                planned.claimed,
+            ),
         )
     }
 
-    /** What [groups] produced: what will be attempted, and what the heap ceiling refused. */
+    /**
+     * What [groups] produced: what will be attempted, what the heap
+     * ceiling refused, and what another maintainer's claim covered.
+     */
     private data class PlannedGroups(
         val groups: List<CompactionGroup>,
         val heapRefused: Long,
+        val claimed: Long = 0,
     )
 
     private fun groups(
@@ -778,9 +1076,13 @@ class CompactionService(
                 "compaction refused ${refused.size} planned group(s) of " +
                     "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +
                     "${refused.maxOf { it.survivingRecords }} rows against a ceiling of " +
-                    "$ceiling (heap budget ${cfg.sortedHeapBytes} B). The table keeps its debt. " +
+                    "$ceiling (heap budget ${cfg.sortedHeapBytesPerGroup} B per group = " +
+                    "${cfg.sortedHeapBytes} B / ${cfg.parallelGroups} concurrent group(s)). " +
+                    "The table keeps its debt. " +
                     "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
-                    "pod's memory (the default is sized for a 4 GiB pod), or drop the table's " +
+                    "pod's memory (the default is sized for a 4 GiB pod), lower " +
+                    "HOGLAKE_COMPACTION_PARALLEL_GROUPS (which divides that budget), or drop " +
+                    "the table's " +
                     "sort order to move it to the streaming path, whose heap is flat in group " +
                     "size. This ceiling is TEMPORARY: the sorted rewrite sorts the whole group " +
                     "in memory, and replacing that with an external merge sort removes it — " +
@@ -789,14 +1091,72 @@ class CompactionService(
                     "CompactionConfig.sortedHeapBytes"
             }
         }
+        // THE PLANNER SKIPS CLAIMED GROUPS — the other half of the
+        // two-replica fix, and the half that costs nothing when it is
+        // wrong.
+        //
+        // By OVERLAP, not by claim-key equality. Two replicas planning
+        // the same catalog metadata form identical groups and would
+        // match exactly; a replica planning a moment later, after one
+        // more ingest file landed, packs the same files into groups with
+        // different keys, and an exact match would wave every one of
+        // them through. Overlap covers both, and a group sharing even one
+        // input with an in-flight rewrite is a group whose commit would
+        // lose the re-verification anyway.
+        //
+        // Read from THIS transaction's REPEATABLE READ snapshot, so a
+        // claim taken after it began is invisible and the group is
+        // planned regardless — which is the pre-existing race, resolved
+        // where it always was, at the commit. A claim is an optimization,
+        // never authorization.
+        //
+        // A FAILING claim read plans the table as if nothing were
+        // claimed, rather than throwing. `groups` runs inside
+        // planSnapshot, which is outside the per-group catch, so an
+        // error here would kill the sweep for every catalog on every
+        // interval — and it would do so on behalf of an optimization.
+        // Losing the read costs duplicated work between replicas and
+        // costs nothing else; `acquireClaim` takes the same position on
+        // the write.
+        // Under a SAVEPOINT, because this transaction has work left to
+        // do. A failed statement poisons a Postgres transaction — every
+        // later statement answers `current transaction is aborted` and
+        // the commit rolls back — so catching the exception without
+        // rewinding would turn a broken optimization into a broken
+        // plan, which is the failure this arm exists to prevent.
+        val claimed =
+            if (!cfg.claimsEnabled) {
+                emptySet()
+            } else {
+                h.savepoint(CLAIM_READ_SAVEPOINT)
+                try {
+                    CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
+                        .also { h.releaseSavepoint(CLAIM_READ_SAVEPOINT) }
+                } catch (e: Exception) {
+                    h.rollbackToSavepoint(CLAIM_READ_SAVEPOINT)
+                    log.warn(e) {
+                        "compaction claim read failed for ${ctx.namespace}.${ctx.table}; " +
+                            "planning as if unclaimed (a claim is an optimization, and the " +
+                            "plan-to-commit re-verification is the correctness backstop)"
+                    }
+                    emptySet()
+                }
+            }
+        val (free, claimedOut) =
+            if (claimed.isEmpty()) {
+                fits to emptyList()
+            } else {
+                fits.partition { g -> g.files.none { it.dataFileId in claimed } }
+            }
         // Most files first: every group now targets the same size, so the
         // one holding the most files buys the largest drop in file count
         // for the same bytes rewritten. Row-id order breaks ties, which
         // keeps a group's inputs adjacent in arrival order.
         return PlannedGroups(
-            fits
+            free
                 .sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
             refused.size.toLong(),
+            claimedOut.size.toLong(),
         )
     }
 
@@ -874,7 +1234,7 @@ class CompactionService(
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
                     "invalid_data=${r.invalidData} heap_budget_exceeded=${r.heapBudgetExceeded} " +
-                    "failed_groups=${r.failedGroups}"
+                    "failed_groups=${r.failedGroups} claimed_elsewhere=${r.claimedElsewhere}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -890,133 +1250,693 @@ class CompactionService(
             Metrics.compactionSkipped(catalog, "heap_budget", result.heapBudgetExceeded)
             // The red-flag outcome, and it had no series either.
             Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
+            // Its own reason label, because it is the one "skip" that is
+            // GOOD news: it is duplicated work that did not happen.
+            Metrics.compactionSkipped(catalog, "claimed_elsewhere", result.claimedElsewhere)
             result
         }
+
+    /**
+     * One group's contribution to the run's counters.
+     *
+     * Every outcome a group can have is ONE of these, produced by the
+     * worker that ran it and summed once, after every worker has joined.
+     * That is what makes the counters exact under
+     * [CompactionConfig.parallelGroups] > 1 without a single shared
+     * mutable variable, a lock or an atomic: there is nothing to
+     * interleave. The previous shape incremented eleven `var`s from the
+     * loop body, which is correct for one thread and silently lossy for
+     * two (`x++` on a JVM `long` is neither atomic nor visible).
+     */
+    private data class GroupTally(
+        val groupsCompacted: Long = 0,
+        val filesIn: Long = 0,
+        val bytesIn: Long = 0,
+        val bytesOut: Long = 0,
+        val skippedConflicts: Long = 0,
+        val dvSuperseded: Long = 0,
+        val unconvertibleSchema: Long = 0,
+        val invalidData: Long = 0,
+        val heapBudgetExceeded: Long = 0,
+        val failedGroups: Long = 0,
+        val claimedElsewhere: Long = 0,
+    ) {
+        /**
+         * What this tally has spent of `maxGroupsPerRun`.
+         *
+         * The budget is a bound on OBJECT-STORE WORK, so it counts every
+         * outcome that spent a group's IO and no outcome that did not.
+         * Two do not:
+         *
+         *  - [heapBudgetExceeded] from the planner's exact row ceiling,
+         *    which is decided in metadata before a byte is fetched;
+         *  - [claimedElsewhere], which is a group another maintainer is
+         *    already rewriting — refused by the planner's claim read or
+         *    by the claim insert, both of which run before the fetch.
+         *
+         * Charging either would let one un-compactable table, or one
+         * busy sibling replica, consume the whole sweep's budget and
+         * starve every other table forever. The counters' own KDoc and
+         * the OpenAPI both state this; `attempts` is where it is
+         * actually true.
+         *
+         * An OOM caught mid-rewrite DID spend its IO and is NOT
+         * charged, because it arrives through [heapBudgetExceeded] and
+         * that counter is excluded wholesale. The budget is therefore
+         * one slot generous in that one case — which costs nothing,
+         * since an OOM also ends the sweep and no further group is
+         * attempted.
+         */
+        val attempts: Int
+            get() =
+                (
+                    groupsCompacted + skippedConflicts + dvSuperseded +
+                        unconvertibleSchema + invalidData + failedGroups
+                ).toInt()
+
+        operator fun plus(other: GroupTally) =
+            GroupTally(
+                groupsCompacted + other.groupsCompacted,
+                filesIn + other.filesIn,
+                bytesIn + other.bytesIn,
+                bytesOut + other.bytesOut,
+                skippedConflicts + other.skippedConflicts,
+                dvSuperseded + other.dvSuperseded,
+                unconvertibleSchema + other.unconvertibleSchema,
+                invalidData + other.invalidData,
+                heapBudgetExceeded + other.heapBudgetExceeded,
+                failedGroups + other.failedGroups,
+                claimedElsewhere + other.claimedElsewhere,
+            )
+
+        companion object {
+            /** A group that was never attempted: no counter moves. */
+            val NOT_ATTEMPTED = GroupTally()
+        }
+    }
+
+    /** One planned group with the table context its execution needs. */
+    private data class WorkItem(val ctx: TableContext, val group: CompactionGroup)
 
     private fun doRunOnce(
         catalog: String,
         cfg: CompactionConfig,
     ): CompactionResult {
+        // Expired claims first, once per catalog per sweep. The reclaim
+        // arm of CompactionClaimRepo.acquire covers a row a re-planned
+        // group lands on again; this covers the rest — a group whose
+        // files the OTHER replica compacted is never re-planned, so
+        // nothing would ever look at its abandoned claim. `/verify`'s
+        // compaction_claims check is what reds if this stops running.
+        //
+        // Run UNCONDITIONALLY, not under `claimsEnabled`. Turning claims
+        // off does not delete the rows a previous configuration wrote,
+        // and a flag flip that strands them turns `compaction_claims`
+        // red an hour later for a deployment that did nothing wrong. The
+        // purge is a DELETE of expired rows: harmless when there are
+        // none, and the only thing that cleans up after the flip.
+        runCatching {
+            jdbi.withHandleUnchecked { h -> CompactionClaimRepo.purgeExpired(h, catalogIdOf(h, catalog)) }
+        }
+            .onFailure { e -> log.warn(e) { "compaction claim purge failed for '$catalog'; continuing" } }
         val tables = jdbi.withHandleUnchecked { h -> liveTables(h, catalog) }
-        var groupsCompacted = 0L
-        var filesIn = 0L
-        var bytesIn = 0L
-        var bytesOut = 0L
-        var skipped = 0L
-        var dvSuperseded = 0L
-        var unconvertible = 0L
-        var invalidData = 0L
-        var heapBudgetExceeded = 0L
-        var failed = 0L
 
-        fun budgetSpent() =
-            groupsCompacted + skipped + dvSuperseded + unconvertible + invalidData + failed >=
-                cfg.maxGroupsPerRun
-        outer@ for ((namespace, table) in tables) {
-            if (budgetSpent()) break
-            val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
-            // Groups the heap ceiling refused in METADATA. Counted but
-            // deliberately NOT charged to maxGroupsPerRun: every other
-            // skip flavor spends the group's IO before it resolves, and
-            // this one spends none, so letting it consume the run's one
-            // slot would let a single un-compactable table starve every
-            // other table of the sweep forever.
-            heapBudgetExceeded += plan.heapRefusedGroups
-            for (group in plan.groups) {
-                if (budgetSpent()) break@outer
-                try {
-                    when (val outcome = compactGroup(ctx, group)) {
-                        is GroupOutcome.Committed -> {
-                            groupsCompacted++
-                            filesIn += group.files.size
-                            bytesIn += group.totalBytes
-                            bytesOut += outcome.bytesOut
-                        }
-                        GroupOutcome.SkippedConflict -> skipped++
-                        GroupOutcome.SkippedDvSuperseded -> dvSuperseded++
-                    }
-                } catch (e: UnconvertibleSchemaException) {
-                    // Skip-with-reason, not a failure: the group stays
-                    // uncompacted until the schema or the file set moves.
-                    log.warn {
-                        "compaction group of ${group.files.size} files for " +
-                            "$catalog/$namespace.$table is not convertible to the live " +
-                            "schema (${e.message}); skipping"
-                    }
-                    unconvertible++
-                } catch (e: InvalidDataException) {
-                    // Skip-with-reason as well, but a DIFFERENT reason:
-                    // DURABLE and the writer's fault. Unlike a schema
-                    // skip this will not clear on its own, so re-planning
-                    // it every sweep is a permanent loop. Counted apart
-                    // so a nonzero value reads as "a writer produced
-                    // something its own registration or schema forbids",
-                    // and logged at warn with the offending detail for
-                    // exactly that hunt.
-                    log.warn {
-                        "compaction group of ${group.files.size} files for " +
-                            "$catalog/$namespace.$table cannot be rewritten as registered " +
-                            "(${e.message}); skipping"
-                    }
-                    invalidData++
-                } catch (e: OutOfMemoryError) {
-                    // The ceiling in `groups` is supposed to make this
-                    // unreachable; reaching it means the per-node heap
-                    // estimate is wrong for this table's shape, which is
-                    // an operator signal, not a retry.
-                    //
-                    // Caught at the GROUP boundary because nothing else
-                    // caught it at all: `catch (e: Exception)` below does
-                    // not match an Error, so the OOM used to unwind the
-                    // whole sweep — losing every other table's accounting
-                    // and leaving the run ledger a bare "Java heap space"
-                    // with no counters (hoglake#118). Catching an OOM is
-                    // only defensible because the allocation it aborts is
-                    // one ArrayList of Groups that is unreachable the
-                    // instant this frame unwinds.
-                    //
-                    // And then the sweep STOPS. Continuing would allocate
-                    // the next group's inputs into a heap that just
-                    // proved it has none to spare.
-                    heapBudgetExceeded++
-                    log.error(e) {
-                        "compaction group of ${group.files.size} files " +
-                            "(${group.survivingRecords} survivors) exhausted the heap for " +
-                            "$catalog/$namespace.$table despite a row ceiling of " +
-                            "${cfg.sortedRowCeiling(ctx.columns)}; ending the sweep. The " +
-                            "per-node heap estimate is too small for this table's shape — " +
-                            "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or raise the heap. " +
-                            "Both are workarounds for an in-memory group sort that should be " +
-                            "an external merge sort; see CompactionConfig.sortedHeapBytes"
-                    }
-                    break@outer
-                } catch (e: Exception) {
-                    // One bad group (unreadable input, corrupt DV, S3
-                    // hiccup) never wedges the sweep — but it IS counted:
-                    // an uncounted swallow is a silently-dead compactor
-                    // with a green run ledger (the NoSuchBucket incident).
-                    failed++
-                    log.error(e) {
-                        "compaction group of ${group.files.size} files failed for " +
-                            "$catalog/$namespace.$table; continuing"
-                    }
+        // PLAN AND EXECUTE PER TABLE, in name order — the loop order
+        // this sweep has always had, and the reason is FRESHNESS.
+        //
+        // Planning every table up front and executing the whole batch
+        // afterwards would make the last table's plan as old as every
+        // rewrite before it: at the production settings
+        // (maxGroupsPerRun=64, ~8.5 s a group) that is minutes of ingest
+        // and compaction by a sibling replica between the read and the
+        // attempt, and every one of those groups arrives at its commit
+        // with a stale input set. A plan is cheap — metadata only — and
+        // its value decays fast, so it is taken as late as it can be.
+        //
+        // At parallelGroups = 1 this is the pre-existing loop exactly:
+        // one table planned, its groups executed one at a time on the
+        // calling thread, the next table planned only if budget remains.
+        val pool = groupPool(cfg)
+        var tally = GroupTally()
+        val heapExhausted = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            for ((namespace, table) in tables) {
+                if (tally.attempts >= cfg.maxGroupsPerRun || heapExhausted.get()) break
+                // CANCELLATION IS CHECKED HERE, on the sweep's own
+                // thread, and it has to be.
+                //
+                // At parallelGroups = 1 there is no pool: `shutdown` is a
+                // no-op, nothing joins a future, and the only signal that
+                // the loop was asked to stop is this thread's interrupt
+                // flag. Without this check a cancelled default-configured
+                // sweep kept going — [executeGroup] catches the
+                // interrupted rewrite as an ordinary failure, counts it,
+                // and the loop pulls the next group; six groups were
+                // asked to stop and five of them committed afterwards.
+                stopIfInterrupted(tally)
+                val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
+                // Groups the heap ceiling refused in METADATA, and groups
+                // another maintainer holds. Counted but deliberately NOT
+                // charged to maxGroupsPerRun: every other skip flavor spends
+                // the group's IO before it resolves and these spend none, so
+                // letting either consume the run's slots would let one
+                // un-compactable table — or one busy sibling replica — starve
+                // every other table of the sweep forever.
+                tally +=
+                    GroupTally(
+                        heapBudgetExceeded = plan.heapRefusedGroups,
+                        claimedElsewhere = plan.claimedGroups,
+                    )
+                val queue = ArrayDeque(plan.groups)
+                while (queue.isNotEmpty() && !heapExhausted.get()) {
+                    val room = cfg.maxGroupsPerRun - tally.attempts
+                    if (room <= 0) break
+                    // A wave of at most `parallelGroups` groups, never
+                    // more than the budget's remaining room. The budget
+                    // is spent by ATTEMPTS — see GroupTally.attempts,
+                    // which counts every outcome that spends IO and no
+                    // outcome that does not — so a group the claim
+                    // arbitration turns away at execute time refunds its
+                    // slot here and the sweep pulls the next candidate
+                    // instead of ending a group short.
+                    // `room` is at least 1 and the queue is non-empty,
+                    // so this always takes at least one group.
+                    val wave =
+                        (0 until minOf(room.toLong(), cfg.parallelGroups.toLong()).toInt())
+                            .mapNotNull { queue.removeFirstOrNull() }
+                            .map { WorkItem(ctx, it) }
+                    tally += executeWave(catalog, wave, cfg, pool, heapExhausted)
+                    // Between waves as well as between tables: one wave
+                    // is up to `parallelGroups` rewrites, which is
+                    // minutes of work to do after being told to stop.
+                    stopIfInterrupted(tally)
                 }
             }
+        } catch (e: InterruptedException) {
+            // The POOL path's cancellation arrives here rather than
+            // through [stopIfInterrupted]: a worker's future throws it
+            // out of `executeWave`. Same treatment either way — restore
+            // the flag (`Future.get` clears it on the way out, and the
+            // flag is how `runInterruptible` learns this was a
+            // cancellation rather than a failure) and carry the partial
+            // tally, because the groups it counts are committed.
+            if (e is SweepInterrupted) throw e
+            Thread.currentThread().interrupt()
+            throw SweepInterrupted(tally.toResult()).also { it.initCause(e) }
+        } finally {
+            shutdown(pool, interrupted = Thread.currentThread().isInterrupted)
         }
-        return CompactionResult(
+        return tally.toResult()
+    }
+
+    /**
+     * Stop the sweep if this thread has been asked to, carrying the
+     * counters it has earned so far.
+     *
+     * THE PARTIAL TALLY IS THE POINT. A cancelled sweep has usually
+     * committed groups already — those commits are durable, their
+     * inputs are retired, their outputs are live — and throwing a bare
+     * `InterruptedException` recorded a failed ledger row with NO
+     * counters for them. An operator reading that row sees a compactor
+     * that did nothing, on a sweep that did most of its work, which is
+     * the same class of lie as the uncounted swallow that
+     * `failed_groups` exists to prevent.
+     *
+     * Still an `InterruptedException`, so `BackgroundLoops`'
+     * `runInterruptible` and every other caller treat it as the
+     * cancellation it is; the counters ride along for the ledger.
+     */
+    private fun stopIfInterrupted(tally: GroupTally) {
+        if (!Thread.currentThread().isInterrupted) return
+        throw SweepInterrupted(tally.toResult())
+    }
+
+    private fun GroupTally.toResult(): CompactionResult =
+        CompactionResult(
             groupsCompacted = groupsCompacted,
             filesIn = filesIn,
             filesOut = groupsCompacted,
             bytesIn = bytesIn,
             bytesOut = bytesOut,
-            skippedConflicts = skipped,
+            skippedConflicts = skippedConflicts,
             dvSuperseded = dvSuperseded,
-            unconvertibleSchema = unconvertible,
+            unconvertibleSchema = unconvertibleSchema,
             invalidData = invalidData,
             heapBudgetExceeded = heapBudgetExceeded,
-            failedGroups = failed,
+            failedGroups = failedGroups,
+            claimedElsewhere = claimedElsewhere,
         )
+
+    /**
+     * The sweep's worker pool, or null at
+     * [CompactionConfig.parallelGroups] = 1.
+     *
+     * Null is not an optimization, it is the CONTRACT: the default
+     * configuration must execute groups on the calling thread, with no
+     * executor in the picture at all, so a deployment that sets nothing
+     * runs the sweep it has always run — same thread, same ordering,
+     * same interruption behaviour.
+     */
+    private fun groupPool(cfg: CompactionConfig): java.util.concurrent.ExecutorService? =
+        if (cfg.parallelGroups <= 1) {
+            null
+        } else {
+            java.util.concurrent.Executors.newFixedThreadPool(cfg.parallelGroups) { r ->
+                Thread(r, "compaction-group").apply { isDaemon = true }
+            }
+        }
+
+    /**
+     * Stop the pool and do not return until its workers have.
+     *
+     * # Why `shutdown()` alone was wrong
+     *
+     * A compaction worker rewrites and COMMITS. Leaving one running past
+     * the sweep is not a tidy-up detail: `BackgroundLoops` runs the loop
+     * body under `runInterruptible` and gives shutdown a 5 s hard cap,
+     * so a worker that outlives the sweep thread is a thread that
+     * rewrites and commits after the supervisor believes compaction has
+     * stopped — and a JVM kill in that window lands mid-upload, leaving
+     * multipart parts that are billed and that no ledger row points at.
+     * `shutdown()` on its own makes that the NORMAL path on interrupt:
+     * it lets every queued group run to completion.
+     *
+     * So the exceptional path is [java.util.concurrent.ExecutorService.shutdownNow]
+     * — drop what is queued, interrupt what is running — followed by a
+     * bounded wait, so this returns only once the workers are gone or
+     * the wait expired (logged, because a worker that ignores an
+     * interrupt is an operator's problem). The interrupt flag is
+     * restored on the way out: swallowing it would leave the loop's
+     * supervisor unable to see that it was asked to stop.
+     *
+     * The ORDINARY path still drains: a sweep that finished normally has
+     * no in-flight work, so `shutdown()` returns at once.
+     */
+    private fun shutdown(
+        pool: java.util.concurrent.ExecutorService?,
+        interrupted: Boolean,
+    ) {
+        if (pool == null) return
+        if (interrupted) pool.shutdownNow() else pool.shutdown()
+        // CLEAR the flag for the wait, and restore it after.
+        //
+        // `awaitTermination` on a thread whose interrupt flag is already
+        // set throws immediately without waiting at all — which is
+        // exactly the state this method is called in on the interrupt
+        // path, and it made the bounded wait a no-op: the sweep returned
+        // while its workers were still mid-rewrite, aborting uploads
+        // behind it. The wait is the whole point of the method, so the
+        // flag is taken down for its duration and put back before
+        // returning, which is what any caller-facing "I was cancelled"
+        // contract requires.
+        val hadFlag = Thread.interrupted() || interrupted
+        var interruptedDuringWait = false
+        val stopped =
+            try {
+                pool.awaitTermination(SHUTDOWN_WAIT_SECONDS, TimeUnit.SECONDS)
+            } catch (e: InterruptedException) {
+                // A SECOND interrupt, arriving DURING the wait. Two
+                // things follow, and the first version of this got both
+                // wrong. The flag has to be restored — `hadFlag` was
+                // computed before the wait, so it is false here and the
+                // cancellation would be swallowed on exactly the path
+                // where somebody is insisting on it. And this is not the
+                // "workers ignored us" condition: nobody waited three
+                // seconds, so the error below would be describing a wait
+                // that never happened.
+                interruptedDuringWait = true
+                log.debug(e) { "interrupted while waiting for compaction workers to stop" }
+                false
+            }
+        if (!stopped) pool.shutdownNow()
+        if (!stopped && !interruptedDuringWait) {
+            log.error {
+                "compaction workers did not stop within ${SHUTDOWN_WAIT_SECONDS}s of the sweep " +
+                    "ending; a rewrite or commit may still be in flight after the sweep returned"
+            }
+        }
+        if (hadFlag || interruptedDuringWait) Thread.currentThread().interrupt()
     }
+
+    /**
+     * Run one wave of groups — at most [CompactionConfig.parallelGroups]
+     * of them — and return their summed tally.
+     *
+     * # Concurrency
+     *
+     * [pool] null (the default configuration) means the loop below runs
+     * on the calling thread with no executor: today's sweep, thread for
+     * thread.
+     *
+     * Otherwise every item is submitted and every future is joined
+     * before this returns — no orphan continues past the wave, and the
+     * next wave's plan is never read while a previous group is still
+     * committing under it. The workers share nothing: the groups
+     * partition the candidate files (one pass of bin packing over
+     * disjoint buckets), the per-group staging ticket is its own row,
+     * and the only contended resource is the per-catalog commit lock,
+     * which each group holds for its metadata transaction alone — never
+     * across the rewrite or the upload (see [commitGroup], which opens
+     * the transaction, takes the lock, and is reached only after
+     * [ParquetRewriter.rewrite] has returned and the output is
+     * uploaded).
+     *
+     * # Why `Callable` never throws
+     *
+     * [executeGroup] converts every outcome, `Throwable` included, into
+     * a [GroupTally]. So `Future.get()` cannot throw an
+     * `ExecutionException` and the reduction cannot lose a group's
+     * accounting to an exception raised on a thread nobody is watching —
+     * the failure mode that made the pre-#118 sweep report a clean run
+     * for a dead compactor. `get()` can still throw
+     * `InterruptedException`, which is the sweep being cancelled and is
+     * handled by [shutdown]'s exceptional path.
+     *
+     * # The heap stop
+     *
+     * An `OutOfMemoryError` ends the sweep, as it always has: continuing
+     * would allocate the next group's inputs into a heap that just
+     * proved it has none to spare. Concurrently, "ends" means items not
+     * yet STARTED do nothing and report [GroupTally.NOT_ATTEMPTED];
+     * groups already in flight run to completion, because cancelling
+     * them would strand staged objects that their own commit would
+     * otherwise settle, and because the allocation that OOM'd is
+     * unreachable the moment its frame unwinds.
+     */
+    private fun executeWave(
+        catalog: String,
+        items: List<WorkItem>,
+        cfg: CompactionConfig,
+        pool: java.util.concurrent.ExecutorService?,
+        heapExhausted: java.util.concurrent.atomic.AtomicBoolean,
+    ): GroupTally {
+        if (items.isEmpty()) return GroupTally()
+        if (pool == null) {
+            var tally = GroupTally()
+            for (item in items) tally += executeGroup(catalog, item, cfg, heapExhausted)
+            return tally
+        }
+        val futures =
+            items.map { item ->
+                pool.submit(
+                    java.util.concurrent.Callable { executeGroup(catalog, item, cfg, heapExhausted) },
+                )
+            }
+        return try {
+            futures.fold(GroupTally()) { acc, f -> acc + f.get() }
+        } catch (e: InterruptedException) {
+            // The sweep was cancelled. Stop the workers rather than
+            // letting the queue drain behind us, and let it up: the
+            // caller ([doRunOnce]) restores the flag and attaches the
+            // partial tally, in ONE place. Setting the flag here as well
+            // was redundant — removing it changed nothing any test could
+            // see, which is how it was found — and two places that must
+            // agree about a thread's interrupt state is one too many.
+            futures.forEach { it.cancel(true) }
+            throw e
+        }
+    }
+
+    /**
+     * Claim, rewrite, commit and release ONE group, converting every
+     * outcome into a [GroupTally].
+     *
+     * NOTHING escapes, `Throwable` included. The sweep's per-group
+     * failure isolation is what keeps one unreadable input from wedging
+     * a catalog; under concurrency it additionally keeps a worker
+     * thread's exception from vanishing. `Exception` alone was not
+     * enough: the nested copier recurses, so a `StackOverflowError` is
+     * live in this code path, and an `Error` escaping a pool worker
+     * loses that group's accounting, leaves its claim held for a full
+     * lease, and — before [shutdown] — let the rest of the queue keep
+     * running behind a sweep that had already returned.
+     */
+    private fun executeGroup(
+        catalog: String,
+        item: WorkItem,
+        cfg: CompactionConfig,
+        heapExhausted: java.util.concurrent.atomic.AtomicBoolean,
+    ): GroupTally {
+        val (ctx, group) = item
+        if (heapExhausted.get()) return GroupTally.NOT_ATTEMPTED
+        // The claim, taken BEFORE any IO and after the planner already
+        // filtered the groups it could see claimed. The two are not
+        // redundant: the planner reads a snapshot that may predate
+        // another replica's claim, and this is the write that arbitrates.
+        // It is still only an optimization — losing it costs a re-plan
+        // next sweep, and winning it authorizes nothing.
+        val claimKey = if (cfg.claimsEnabled) CompactionClaimRepo.groupKey(group) else null
+        if (claimKey != null && !acquireClaim(ctx, group, claimKey, cfg)) {
+            log.debug {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} is claimed by another maintainer; " +
+                    "skipping without spending its IO"
+            }
+            // No IO spent, so no budget spent: GroupTally.attempts does
+            // not count this and doRunOnce pulls the next candidate.
+            return GroupTally(claimedElsewhere = 1)
+        }
+        var committed = false
+        try {
+            return when (val outcome = compactGroup(ctx, group)) {
+                is GroupOutcome.Committed -> {
+                    committed = true
+                    GroupTally(
+                        groupsCompacted = 1,
+                        filesIn = group.files.size.toLong(),
+                        bytesIn = group.totalBytes,
+                        bytesOut = outcome.bytesOut,
+                    )
+                }
+                GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
+                GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
+            }
+        } catch (e: HoglakeException.CommitQueueTimeout) {
+            // The commit could not get the catalog lock inside the
+            // admission bound. Race-class, not failure-class: nothing is
+            // wrong with the group, the catalog was busy, and the staged
+            // output is left with an undrained ticket for the cleanup
+            // drain exactly as a lost plan-to-commit race leaves it.
+            // Counted with the other races so a busy catalog reads as
+            // contention rather than as a broken compactor.
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} timed out waiting for the catalog " +
+                    "commit lock (${e.message}); skipping — the staged output stays queued for " +
+                    "the cleanup drain"
+            }
+            return GroupTally(skippedConflicts = 1)
+        } catch (e: UnableToExecuteStatementException) {
+            // A lock timeout ANYWHERE in the commit transaction, not
+            // just on the advisory lock itself.
+            //
+            // `acquireCatalogCommitLock(..., commitLockTimeoutMs)` sets
+            // a TRANSACTION-LOCAL `lock_timeout`, and it stays in force
+            // for the rest of the tail — deliberately, per Locks.kt: the
+            // admission contract is meant to bound the whole commit, not
+            // only its first statement. The consequence is that a row
+            // lock later in the tail (the inputs' `end_snapshot` update
+            // queueing behind a concurrent writer, say) can now expire
+            // too, and it arrives as a raw driver exception rather than
+            // the typed CommitQueueTimeout. Counting that as
+            // `failed_groups` would read as a broken compactor when it
+            // is a busy catalog.
+            if (!Pg.isLockTimeout(e)) throw e
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} hit the commit transaction's " +
+                    "lock_timeout inside the commit tail; skipping — the staged output stays " +
+                    "queued for the cleanup drain"
+            }
+            return GroupTally(skippedConflicts = 1)
+        } catch (e: UnconvertibleSchemaException) {
+            // Skip-with-reason, not a failure: the group stays
+            // uncompacted until the schema or the file set moves.
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} is not convertible to the live " +
+                    "schema (${e.message}); skipping"
+            }
+            return GroupTally(unconvertibleSchema = 1)
+        } catch (e: InvalidDataException) {
+            // Skip-with-reason as well, but a DIFFERENT reason:
+            // DURABLE and the writer's fault. Unlike a schema
+            // skip this will not clear on its own, so re-planning
+            // it every sweep is a permanent loop. Counted apart
+            // so a nonzero value reads as "a writer produced
+            // something its own registration or schema forbids",
+            // and logged at warn with the offending detail for
+            // exactly that hunt.
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} cannot be rewritten as registered " +
+                    "(${e.message}); skipping"
+            }
+            return GroupTally(invalidData = 1)
+        } catch (e: OutOfMemoryError) {
+            // The ceiling in `groups` is supposed to make this
+            // unreachable; reaching it means the per-node heap
+            // estimate is wrong for this table's shape, which is
+            // an operator signal, not a retry.
+            //
+            // Caught at the GROUP boundary because nothing else
+            // caught it at all: `catch (e: Exception)` below does
+            // not match an Error, so the OOM used to unwind the
+            // whole sweep — losing every other table's accounting
+            // and leaving the run ledger a bare "Java heap space"
+            // with no counters (hoglake#118). Catching an OOM is
+            // only defensible because the allocation it aborts is
+            // one ArrayList of Groups that is unreachable the
+            // instant this frame unwinds.
+            //
+            // And then the sweep STOPS. Continuing would allocate
+            // the next group's inputs into a heap that just
+            // proved it has none to spare.
+            heapExhausted.set(true)
+            log.error(e) {
+                "compaction group of ${group.files.size} files " +
+                    "(${group.survivingRecords} survivors) exhausted the heap for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} despite a row ceiling of " +
+                    "${cfg.sortedRowCeiling(ctx.columns)}; ending the sweep. The " +
+                    "per-node heap estimate is too small for this table's shape — " +
+                    "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES, lower " +
+                    "HOGLAKE_COMPACTION_PARALLEL_GROUPS (which divides it), or raise the " +
+                    "heap. All three are workarounds for an in-memory group sort that should " +
+                    "be an external merge sort; see CompactionConfig.sortedHeapBytes"
+            }
+            return GroupTally(heapBudgetExceeded = 1)
+        } catch (e: Throwable) {
+            // One bad group (unreadable input, corrupt DV, S3
+            // hiccup, a stack overflow in the nested copier) never
+            // wedges the sweep — but it IS counted: an uncounted
+            // swallow is a silently-dead compactor with a green run
+            // ledger (the NoSuchBucket incident).
+            //
+            // AN INTERRUPT IN DISGUISE STILL HAS TO SET THE FLAG.
+            //
+            // `e is InterruptedException` was not enough. The object
+            // store's client, the HTTP stack under it and NIO all
+            // translate an interrupt into something else — a
+            // `ClosedByInterruptException`, an SDK exception wrapping
+            // one, an `IOException` with it somewhere down the cause
+            // chain — and several of them CLEAR the flag on the way
+            // past. On the sequential path this frame runs on the
+            // sweep's own thread, so a cancellation that arrives as a
+            // wrapped exception and leaves the flag down is a sweep
+            // that was asked to stop, counted the group as an ordinary
+            // failure, and carried on to the next one.
+            if (wasInterrupt(e)) Thread.currentThread().interrupt()
+            log.error(e) {
+                "compaction group of ${group.files.size} files failed for " +
+                    "$catalog/${ctx.namespace}.${ctx.table}; continuing"
+            }
+            return GroupTally(failedGroups = 1)
+        } finally {
+            // RELEASED ONLY IF THE GROUP DID NOT COMMIT, and that
+            // asymmetry is the point.
+            //
+            // A group that did NOT commit — skipped, failed, refused —
+            // leaves files that are still live candidates, and the next
+            // maintainer to plan them should be free to try immediately;
+            // holding the claim for the rest of its lease would just
+            // delay the retry.
+            //
+            // A group that DID commit leaves the opposite situation. Its
+            // inputs are end-snapshotted, so no future plan can include
+            // them — but a plan another maintainer formed BEFORE the
+            // commit still names them, and that maintainer is about to
+            // arrive, acquire the freshly-released claim, and spend a
+            // full rewrite and upload on files that are already dead
+            // before its own commit re-verification refuses it. That is
+            // exactly the lost race the claims exist to remove, arriving
+            // one step later. Keeping the claim in place turns it into a
+            // counted claimed_elsewhere.
+            //
+            // It is kept on a SHORT lease, not the full one
+            // (CompactionConfig.committedClaimTtlSeconds): the only
+            // reader it has left is a sibling's plan that predates this
+            // commit, and a plan is at most one sweep old. Holding the
+            // row for the full 900 s instead would leave roughly
+            // committed-groups-per-sweep x lease/interval rows per
+            // table, every one of whose input-id arrays the planner then
+            // reads on every pass.
+            //
+            // Best-effort either way — the lease is the backstop for a
+            // release that never runs at all (a killed pod), so a failed
+            // DELETE is a delay and never a leak.
+            if (claimKey != null) {
+                runCatching {
+                    jdbi.withHandleUnchecked { h ->
+                        if (committed) {
+                            CompactionClaimRepo.shortenToCommitted(
+                                h,
+                                ctx.catalogId,
+                                ctx.tableId,
+                                claimKey,
+                                instanceId,
+                                cfg.committedClaimTtlSeconds,
+                            )
+                        } else {
+                            CompactionClaimRepo.release(h, ctx.catalogId, ctx.tableId, claimKey, instanceId)
+                        }
+                    }
+                }.onFailure { e ->
+                    log.warn(e) {
+                        "could not settle the compaction claim for " +
+                            "$catalog/${ctx.namespace}.${ctx.table}; it expires in " +
+                            "${cfg.claimTtlSeconds}s"
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Take the group's claim; false means another maintainer holds a
+     * live one.
+     *
+     * A claim failure is never fatal to the group in the other
+     * direction: if the claim TABLE itself errors, the group proceeds
+     * UNCLAIMED rather than being skipped, because a claim is an
+     * optimization and a broken optimization must not stop compaction.
+     * The planner's own claim read takes the same position (see
+     * [groups]), so a claim table that is missing, locked or broken
+     * costs duplicated work between replicas and costs nothing else.
+     */
+    private fun acquireClaim(
+        ctx: TableContext,
+        group: CompactionGroup,
+        claimKey: String,
+        cfg: CompactionConfig,
+    ): Boolean =
+        runCatching {
+            jdbi.withHandleUnchecked { h ->
+                CompactionClaimRepo.acquire(
+                    h,
+                    ctx.catalogId,
+                    ctx.tableId,
+                    claimKey,
+                    group.files.map { it.dataFileId },
+                    instanceId,
+                    cfg.claimTtlSeconds,
+                )
+            }
+        }.getOrElse { e ->
+            log.warn(e) {
+                "compaction claim insert failed for ${ctx.namespace}.${ctx.table}; " +
+                    "rewriting the group unclaimed (the plan-to-commit re-verification is " +
+                    "the correctness backstop, not the claim)"
+            }
+            true
+        }
+
+    /** The catalog id, for the sweep's own bookkeeping statements. */
+    private fun catalogIdOf(
+        h: Handle,
+        catalog: String,
+    ): Long =
+        CatalogRepo.findByName(h, catalog)?.catalogId
+            ?: throw HoglakeException.NotFound("catalog '$catalog'")
 
     private fun liveTables(
         h: Handle,
@@ -1170,6 +2090,7 @@ class CompactionService(
                 sink,
                 ctx.maxNodesPerRow,
                 ctx.codec,
+                ctx.inputOpenParallelism,
             )
         check(rewritten.rowsWritten == group.survivingRecords) {
             // Name the FILES, not just the counts. This check is durable
@@ -1271,7 +2192,7 @@ class CompactionService(
         stagingId: Long,
     ): GroupOutcome =
         jdbi.inTransactionUnchecked { h ->
-            Locks.acquireCatalogCommitLock(h, ctx.catalogId)
+            Locks.acquireCatalogCommitLock(h, ctx.catalogId, ctx.commitLockTimeoutMs)
 
             // Re-claim the staging ticket under the lock: cleanup drains
             // under the SAME lock, so "still undrained" here means the
@@ -1699,10 +2620,107 @@ class CompactionService(
         for (name in names) {
             try {
                 results += name to runOnce(name, cfg, MaintenanceTrigger.LOOP)
+            } catch (e: InterruptedException) {
+                // CANCELLATION IS NOT A PER-CATALOG FAILURE.
+                //
+                // `catch (Exception)` matched this, and per-catalog
+                // isolation then did exactly what it is for and exactly
+                // the wrong thing: it logged the cancelled catalog and
+                // swept every remaining one. On a fleet with a dozen
+                // catalogs that is a dozen purges, plans, waves and
+                // bounded shutdowns after the supervisor asked the loop
+                // to stop — and the supervisor's own cap is 5 s.
+                //
+                // Rethrown rather than broken out of, because the flag
+                // is how `BackgroundLoops`' `runInterruptible` learns
+                // the body was cancelled rather than merely finished.
+                Thread.currentThread().interrupt()
+                log.warn {
+                    "compaction sweep was cancelled during catalog '$name'; " +
+                        "stopping the instance-wide sweep after ${results.size} catalog(s)"
+                }
+                throw e
             } catch (e: Exception) {
                 log.error(e) { "compaction sweep failed for catalog '$name'; continuing" }
             }
+            // A catalog whose sweep swallowed the interrupt itself — a
+            // wrapped one that never surfaced as InterruptedException —
+            // still stops the fan-out here.
+            if (Thread.currentThread().isInterrupted) {
+                log.warn {
+                    "compaction sweep was cancelled after catalog '$name'; " +
+                        "stopping the instance-wide sweep after ${results.size} catalog(s)"
+                }
+                throw InterruptedException("compaction sweep cancelled after catalog '$name'")
+            }
         }
         return results
+    }
+
+    /**
+     * A cancelled sweep, carrying the counters it had already earned.
+     *
+     * An `InterruptedException` first and foremost, so every caller —
+     * `BackgroundLoops`' `runInterruptible` above all — treats it as
+     * cancellation rather than as an error. [MaintenanceRunStore.recorded]
+     * reads [partial] off it and stores those counters on the failed
+     * ledger row, because the groups they count are committed and
+     * durable and a row that says a cancelled sweep did nothing is
+     * simply wrong.
+     */
+    internal class SweepInterrupted(
+        private val result: CompactionResult,
+    ) : InterruptedException("compaction sweep was cancelled"), PartialResult {
+        override val partial: Any get() = result
+    }
+
+    private companion object {
+        /**
+         * Does this throwable's cause chain hold an interrupt?
+         *
+         * The object store's client, the HTTP stack and NIO all
+         * translate an interrupt into something else on the way up — a
+         * `ClosedByInterruptException`, an SDK exception wrapping one,
+         * an `IOException` with it several frames down — and several of
+         * them clear the flag while they are at it. So the type of the
+         * exception a worker catches is not the question; whether an
+         * interrupt is anywhere underneath it is.
+         *
+         * Bounded walk: a self-referential cause chain is rare but it is
+         * not this method's job to hang on one.
+         */
+        fun wasInterrupt(top: Throwable): Boolean {
+            if (Thread.currentThread().isInterrupted) return true
+            var e: Throwable? = top
+            var depth = 0
+            while (e != null && depth++ < CAUSE_CHAIN_LIMIT) {
+                if (e is InterruptedException || e is java.nio.channels.ClosedByInterruptException) return true
+                e = e.cause.takeIf { it !== e }
+            }
+            return false
+        }
+
+        /** How far [wasInterrupt] walks a cause chain. */
+        const val CAUSE_CHAIN_LIMIT = 16
+
+        /**
+         * Savepoint the planner's claim read runs under, so a claim
+         * table that is missing or broken cannot poison the planning
+         * transaction — see [groups].
+         */
+        const val CLAIM_READ_SAVEPOINT = "hog_compaction_claim_read"
+
+        /**
+         * How long [shutdown] waits for a worker to notice that the
+         * sweep is over.
+         *
+         * Under BackgroundLoops the supervisor's own hard cap is 5 s, so
+         * this is deliberately inside it: a compaction worker that
+         * outlives the supervisor's shutdown is a thread that commits
+         * after the process believes compaction has stopped. 3 s is long
+         * enough for an S3 call to notice an interrupt and short enough
+         * to leave the supervisor margin to do its own bookkeeping.
+         */
+        const val SHUTDOWN_WAIT_SECONDS = 3L
     }
 }

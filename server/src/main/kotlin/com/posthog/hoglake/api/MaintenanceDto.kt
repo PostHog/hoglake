@@ -95,6 +95,17 @@ data class CompactionResultDto(
     val invalidData: Long,
     val heapBudgetExceeded: Long,
     val failedGroups: Long,
+    /**
+     * Groups another maintenance replica's live claim covered, so this
+     * sweep never spent their IO. See CompactionResult.claimedElsewhere.
+     *
+     * Serialized unconditionally here, unlike on the stored model: this
+     * DTO is the RESPONSE, and a response that omits a counter it
+     * declares makes every client's zero a guess. The ledger's read path
+     * is what fills 0 for rows an older server wrote — see
+     * COMPACTION_COUNTERS_ADDED_LATER.
+     */
+    val claimedElsewhere: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -110,6 +121,7 @@ fun CompactionResult.toDto() =
         invalidData = invalidData,
         heapBudgetExceeded = heapBudgetExceeded,
         failedGroups = failedGroups,
+        claimedElsewhere = claimedElsewhere,
     )
 
 data class RehydrateResultDto(
@@ -240,7 +252,8 @@ private fun normalizeLedgerResult(
  * Append-only: a counter joins this list in the same change that adds
  * it to CompactionResult, and never leaves.
  */
-private val COMPACTION_COUNTERS_ADDED_LATER = listOf("invalid_data", "heap_budget_exceeded")
+private val COMPACTION_COUNTERS_ADDED_LATER =
+    listOf("invalid_data", "heap_budget_exceeded", "claimed_elsewhere")
 
 /** The same, for ExpiryResult. Append-only for the same reason. */
 private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")

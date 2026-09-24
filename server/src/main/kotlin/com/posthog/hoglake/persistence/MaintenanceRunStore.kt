@@ -14,6 +14,27 @@ import java.sql.Types
 import java.time.Instant
 
 /**
+ * A failure that still has an outcome worth recording.
+ *
+ * [MaintenanceRunStore.recorded] stores a `failed` row with NO result
+ * payload, which is right for a task that threw before it did anything
+ * and wrong for one that was CANCELLED part way through: a compaction
+ * sweep interrupted after committing forty groups has forty durable
+ * commits behind it, and a ledger row saying it did nothing is a lie an
+ * operator acts on. A task that can be stopped mid-flight throws
+ * something implementing this, and the funnel records [partial]
+ * alongside the error.
+ *
+ * Deliberately NOT a way to record a result for an ordinary failure: the
+ * status stays `failed`, the error text is still stored, and the only
+ * thing this adds is the counters the task had already earned.
+ */
+interface PartialResult {
+    /** The wire-shaped result to store on the failed row. */
+    val partial: Any?
+}
+
+/**
  * The hog_maintenance_run ledger: one row per maintenance-task run,
  * loop sweep and manual trigger alike (V2__maintenance.sql).
  *
@@ -34,6 +55,7 @@ import java.time.Instant
  *    status endpoint's REPEATABLE READ snapshot composes them with its
  *    backlog queries.
  */
+
 class MaintenanceRunStore(private val jdbi: Jdbi) {
     private val log = KotlinLogging.logger {}
 
@@ -72,7 +94,11 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
                 Instant.now(),
                 MaintenanceRunStatus.FAILED,
                 errorText(e),
-                null,
+                // Whatever the task had already earned, for a task that
+                // can be stopped mid-flight — see [PartialResult]. Null
+                // for every other failure, which is the shape this
+                // ledger has always had.
+                (e as? PartialResult)?.partial,
             )
             throw e
         }

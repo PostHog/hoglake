@@ -186,6 +186,15 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         r.invalid_data,
         r.heap_budget_exceeded,
         r.failed_groups,
+        // claimed_elsewhere COUNTS AS WORK, on the offsets_released
+        // precedent above: it is the only thing a sweep can report on a
+        // catalog whose groups another maintenance replica is already
+        // rewriting, and a run that says "I planned 64 groups and found
+        // every one of them taken" is a run an operator wants to see
+        // rather than one the page folds away as idle. It is also the
+        // signal that says the claims are working, so hiding it would
+        // hide the feature from the only screen that shows a sweep.
+        r.claimed_elsewhere,
       ].some(positive);
     }
     case "verify": {

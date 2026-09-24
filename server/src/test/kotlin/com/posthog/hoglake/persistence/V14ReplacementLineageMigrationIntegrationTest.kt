@@ -49,9 +49,25 @@ class V14ReplacementLineageMigrationIntegrationTest {
             (row != null) to (row == true)
         }
 
-    /** Re-run the migration the way a Flyway repair-and-retry does. */
+    /**
+     * Re-run the migration the way a Flyway repair-and-retry does: put
+     * the history back to the point where V14 has yet to succeed, then
+     * migrate.
+     *
+     * Every row from 14 ONWARD goes, not just 14's. An interrupted V14
+     * is the last thing that ran, so nothing after it can be applied —
+     * and Flyway agrees: with a later migration recorded and 14 missing,
+     * `validate` refuses the whole run as an out-of-order resolved
+     * migration rather than re-applying 14, which is what V15 turned
+     * this helper into on the day it landed. Deleting the tail keeps the
+     * fixture describing the state it claims to describe, and costs a
+     * re-run of the later migrations — which are idempotent, as a
+     * migration that can be retried has to be.
+     */
     private fun reapplyV14(db: PgTestSupport.TestDb) {
-        db.jdbi.useHandleUnchecked { h -> h.execute("DELETE FROM flyway_schema_history WHERE version = '14'") }
+        db.jdbi.useHandleUnchecked { h ->
+            h.execute("DELETE FROM flyway_schema_history WHERE version::numeric >= 14")
+        }
         Database.migrate(db.dataSource)
     }
 

@@ -382,6 +382,7 @@ class MaintenanceApiTest {
                 "offset_release",
                 "staging_tickets",
                 "upload_claims",
+                "compaction_claims",
             )
             for (check in report["checks"]) {
                 assertThat(check["status"].asText()).isEqualTo("pass")
