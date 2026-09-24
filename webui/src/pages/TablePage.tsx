@@ -730,6 +730,31 @@ function PartitionFilterBar({
             </label>
           );
         }
+        // Sort the options by their DECODED display value, so a temporal
+        // field reads chronologically (2026-04, 2026-05…) and a long list
+        // is browsable. The server returns most-frequent-first, which is
+        // right for capping at the cap but the wrong order to browse. The
+        // stored value stays the option's value; only the order changes.
+        // An identity column of integers sorts NUMERICALLY (17, 42, 1042),
+        // not lexically (1042, 17, 42) — the raw string is the value there.
+        const raw = fieldValues?.values ?? [];
+        const numeric =
+          field.transform === "identity" &&
+          raw.length > 0 &&
+          raw.every((v) => v !== null && /^-?\d+$/.test(v));
+        const options = raw
+          .map((v) => ({
+            stored: v,
+            display: decodeValue(field.transform, v, field.transform_param),
+          }))
+          .sort((a, b) => {
+            if (numeric) {
+              const an = a.stored === null ? 0 : parseInt(a.stored, 10);
+              const bn = b.stored === null ? 0 : parseInt(b.stored, 10);
+              return an - bn;
+            }
+            return a.display < b.display ? -1 : a.display > b.display ? 1 : 0;
+          });
         return (
           <label key={keyIndex} className="partition-filter-field">
             {label}
@@ -739,9 +764,9 @@ function PartitionFilterBar({
               aria-label={`filter by ${label}`}
             >
               <option value="">all</option>
-              {(fieldValues?.values ?? []).map((v, i) => (
-                <option key={i} value={v ?? ""}>
-                  {decodeValue(field.transform, v, field.transform_param)}
+              {options.map((o, i) => (
+                <option key={i} value={o.stored ?? ""}>
+                  {o.display}
                 </option>
               ))}
             </select>

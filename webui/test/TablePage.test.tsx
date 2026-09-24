@@ -325,6 +325,103 @@ describe("TablePage", () => {
     expect(screen.getByRole("option", { name: "bucket 12/16" })).toBeInTheDocument();
   });
 
+  it("sorts the dropdown options by their decoded display value, not frequency", async () => {
+    // The server returns most-frequent-first; the dropdown re-sorts by the
+    // decoded value. Give it an UNSORTED set (most-frequent first) and
+    // assert the rendered options are in date order.
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(tableFixture);
+      if (path === `${base}/files`) return jsonResponse(filesFixture);
+      if (path === `${base}/scan`) return jsonResponse(scanFixture);
+      if (path === `${base}/partitions/values`)
+        return jsonResponse({
+          spec_id: "1",
+          fields: [
+            {
+              source_field_id: "1",
+              transform: "day",
+              // Frequency order (server): 20698 most common, then 20697.
+              values: ["20698", "20697"],
+              truncated: false,
+            },
+            {
+              source_field_id: "3",
+              transform: "bucket",
+              transform_param: 16,
+              values: ["12", "7"],
+              truncated: false,
+            },
+          ],
+        });
+      return undefined;
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    const daySelect = await screen.findByRole("combobox", { name: "filter by day(ts)" });
+
+    // The rendered option order is the decoded (chronological) order:
+    // 2026-09-01 (20697) before 2026-09-02 (20698), despite the server
+    // returning 20698 first.
+    const optionTexts = [...daySelect.querySelectorAll("option")].map(
+      (o) => o.textContent,
+    );
+    expect(optionTexts).toEqual(["all", "2026-09-01", "2026-09-02"]);
+
+    // But the option VALUES stay the stored strings, so the filter echoes
+    // the stored value, not the decoded one.
+    const optionValues = [...daySelect.querySelectorAll("option")].map((o) =>
+      o.getAttribute("value"),
+    );
+    expect(optionValues).toEqual(["", "20697", "20698"]);
+  });
+
+  it("sorts an identity column of integers numerically, not lexically", async () => {
+    // team_id ids are numeric but stored as strings: lexical order puts
+    // "1042" before "42", which is not how a user scans for team 42. The
+    // table fixture's spec is day(ts)+bucket; swap it for an identity spec.
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base)
+        return jsonResponse({
+          ...tableFixture,
+          partition_spec: {
+            spec_id: "1",
+            fields: [{ source_field_id: "2", transform: "identity" }],
+          },
+        });
+      if (path === `${base}/files`) return jsonResponse(filesFixture);
+      if (path === `${base}/scan`) return jsonResponse(scanFixture);
+      if (path === `${base}/partitions/values`)
+        return jsonResponse({
+          spec_id: "1",
+          fields: [
+            {
+              source_field_id: "2",
+              transform: "identity",
+              // Frequency order (server), coincidentally lexical here.
+              values: ["1042", "137", "17", "42"],
+              truncated: false,
+            },
+          ],
+        });
+      return undefined;
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    // identity stays a bare column label.
+    const idSelect = await screen.findByRole("combobox", { name: "filter by user_id" });
+    const optionValues = [...idSelect.querySelectorAll("option")].map((o) =>
+      o.getAttribute("value"),
+    );
+    // Numeric order, not lexical: 17, 42, 137, 1042.
+    expect(optionValues).toEqual(["", "17", "42", "137", "1042"]);
+  });
+
   it("filtering by a partition echoes the stored value and refetches", async () => {
     const fetchMock = mockFetch(happyHandler);
     renderApp(route);
