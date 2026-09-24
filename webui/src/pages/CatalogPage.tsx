@@ -80,11 +80,12 @@ function CatalogHeader({ catalog }: { catalog: string }) {
       <div>
         <dt>expiry</dt>
         {/* snapshot_retention_seconds absent = expiry disabled for this
-            catalog, not "not loaded yet" — so it reads "off", not "…". */}
+            catalog, not "not loaded yet" — so it reads "disabled", the
+            same word the maintenance page uses for the identical field. */}
         <dd className="mono">
           {opts?.snapshot_retention_seconds !== undefined
             ? formatSeconds(Number(opts.snapshot_retention_seconds))
-            : "off"}
+            : "disabled"}
         </dd>
       </div>
       <div>

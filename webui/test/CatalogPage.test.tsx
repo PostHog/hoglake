@@ -81,9 +81,10 @@ describe("CatalogPage", () => {
     });
     renderApp("/catalogs/analytics");
 
-    // No retention window → "off", not a duration; consumer_floor off.
+    // No retention window → "disabled" (matching the maintenance page's
+    // word for the identical field), not a duration; consumer_floor off.
     const expiry = await screen.findByText("expiry", { selector: "dt" });
-    expect(expiry.nextElementSibling).toHaveTextContent("off");
+    expect(expiry.nextElementSibling).toHaveTextContent("disabled");
     const floor = screen.getByText("consumer_floor", { selector: "dt" });
     expect(floor.nextElementSibling).toHaveTextContent("off");
   });
