@@ -277,6 +277,33 @@ there would break that gate on every build.
     ADD COLUMN after the restore, V11 and V12 had no guard at all, and
     V14's first draft repeated it. A CHECK over a table that is not
     known-tiny is `NOT VALID` then `VALIDATE CONSTRAINT`.
+    `MigrationLockWindowTest` now READS the files (V14 and up; V9-V13
+    are grandfathered, V10-V12 being the recorded violations) and reds
+    on a heavy statement outside the window, on a missing window, and on
+    `SET LOCAL` in a file Flyway runs outside a transaction — where it
+    applies to nothing. Deleting the save/restore pair from a migration
+    used to leave the whole suite green, which is why the rule was
+    broken four times and caught by review four times.
+  - **`CREATE INDEX CONCURRENTLY` is not the safe default; it is a
+    trade, and it is measured.** The exemption above says CIC MAY sit
+    outside the window, not that it should be preferred. On PG 18.6 at
+    `hog_file_removal`'s production size (164k undrained rows) a plain
+    build blocks INSERTs for 1.37 s while CIC takes 1.48 s uncontended
+    — no faster, two passes instead of one — and CIC's first phase
+    waits out older transactions, which on a rolling deploy includes a
+    SECOND replica blocked inside `pg_advisory_lock` in
+    `Database.migrate`. A blocked lock wait is an open transaction with
+    a live xmin, so CIC parks in WaitForOlderSnapshots behind a
+    transaction waiting on the very migration CIC is part of: a CHAIN,
+    not a cycle, so the deadlock detector never fires and it unwinds
+    only when that replica's 60 s `statement_timeout` kills it —
+    crash-looping pods, and an INVALID index left behind by every
+    cancelled build. So: seconds of blocked writes inside the 5 s
+    window (V13's/V16's transactional shape, where a failure rolls back
+    and writes no history row) unless the build is long enough that a
+    blocking one is untenable (V14). Either way the file states which
+    and why, from a measurement rather than from the neighbouring
+    migration.
   - **An index proves itself against the query it serves.** The
     migration test runs the migration FILE (`Database.migrate()` after
     `PgTestSupport.freshDatabaseAt(<previous version>)`, or after
@@ -287,7 +314,35 @@ there would break that gate on every build.
     on the wrong column of a recursive join, and its test was green
     because it EXPLAINed a predicate no code path issues. A partial
     predicate is asserted through `pg_index.indpred`, not by counting
-    table rows.
+    table rows, and the KEY through `pg_index.indkey` resolved to
+    attribute names — a `contains("catalog_id", "path")` over
+    `pg_get_indexdef` is satisfied by the index's own NAME.
+    **The index name and the absence of `Seq Scan` are the weakest
+    assertions available**, and V16 has the proof: rewriting its guard
+    to `path LIKE ANY(...)` — which no btree under a non-C collation can
+    drive — still produced `Index Only Scan using
+    hog_file_removal_undrained_path`, because the leading `catalog_id`
+    was enough, with `path` demoted to a Filter. What separates the two
+    is what the scan DID: `Index Searches` (one descent per probe key,
+    not one for the whole statement) and the ABSENCE of `Rows Removed by
+    Filter`. Take buffers from the SCAN NODE, not the plan's maximum —
+    EXPLAIN's `Planning:` section carries a `Buffers:` line that dwarfed
+    a well-indexed scan's — and derive the budget from the probe rather
+    than writing a constant: the constant V16 started with sat 1.27x
+    below the degraded plan it had to exclude. The probe set itself must
+    be SCATTERED, as a commit's output paths are; sixty-four keys
+    sharing a prefix let the btree descend twice and walk, which made
+    the measurement four times kinder than the real statement.
+  - **`hog_file_removal` is indexed BOTH ways** — `..._drain
+    (catalog_id, removal_id)` for the cleanup drain's ordered LIMIT and
+    `..._undrained_path (catalog_id, path)` for the commit path's
+    path-reuse guard and `UploadService`'s reclaim probe (V16, #199:
+    without it every commit read the catalog's whole queue). Both are
+    partial on `drained_at IS NULL`, and the path one is deliberately
+    NOT unique: nothing makes a file path unique, so expiry can queue
+    one path twice from one `DELETE ... RETURNING`, and with no writer
+    carrying `ON CONFLICT` a unique violation would abort the sweep that
+    advances the retention floor.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
@@ -776,9 +831,11 @@ there would break that gate on every build.
   distinct failing-check set, not once per sweep.
   Every path-equality sub-query is registered in
   `VerifyService.PATH_EQUALITY_QUERIES` and EXPLAINed against a
-  50k-file manifest (`VerifyQueryPlanIntegrationTest`): none of those
-  tables is indexed on `path`, so a query the planner cannot flatten is
-  quadratic and invisible on any fixture-sized catalog.
+  50k-file manifest (`VerifyQueryPlanIntegrationTest`): `hog_data_file`
+  and `hog_delete_file` carry no index on `path` at all, and
+  `hog_file_removal`'s (V16) covers only its UNDRAINED rows — so a
+  query the planner cannot flatten is quadratic and invisible on any
+  fixture-sized catalog.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
   NOT yet in CI and not yet released — no path-scoped workflow, and its

@@ -18,6 +18,19 @@ import javax.sql.DataSource
 object Database {
     const val MIGRATION_LOCK_KEY: Long = 0x486F674C616B6531 // "HogLake1"
 
+    /**
+     * What every production session is configured with, as ONE
+     * definition. `PgTestSupport` applies THIS constant rather than a
+     * copy of it, so a migration test can reach the session behaviour a
+     * real pod has — a build that blocks past `statement_timeout` is
+     * killed, an open transaction that idles past
+     * `idle_in_transaction_session_timeout` is killed — instead of
+     * hanging in a test and passing in production, or the reverse. A
+     * helper that restates these values asserts that it compiles.
+     */
+    const val SESSION_INIT_SQL: String =
+        "SET idle_in_transaction_session_timeout = '30s'; SET statement_timeout = '60s'"
+
     fun dataSource(cfg: Config): HikariDataSource {
         val hc =
             HikariConfig().apply {
@@ -31,8 +44,7 @@ object Database {
                 connectionTimeout = 5_000
                 validationTimeout = 2_500
                 // No idle-in-transaction squatters, ever (README.md §7).
-                connectionInitSql =
-                    "SET idle_in_transaction_session_timeout = '30s'; SET statement_timeout = '60s'"
+                connectionInitSql = SESSION_INIT_SQL
             }
         return HikariDataSource(hc)
     }

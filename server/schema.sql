@@ -517,6 +517,20 @@ CREATE TABLE hog_file_removal (
 CREATE INDEX hog_file_removal_drain
     ON hog_file_removal (catalog_id, removal_id)
     WHERE drained_at IS NULL;
+-- The commit path's access path (V16). The path-reuse guard
+-- (CommitService.REMOVAL_QUEUE_COLLISION_SQL) and UploadService's
+-- reclaim `NOT EXISTS` both ask (catalog_id, path) over undrained rows,
+-- which hog_file_removal_drain cannot serve: `removal_id` is a gap in
+-- that predicate. Without this index every commit reads the catalog's
+-- whole queue, so a commit costs what cleanup is behind on (#199).
+-- NOT UNIQUE on purpose: no file path is unique in this schema, so
+-- expiry can legitimately queue one path twice, and with no writer
+-- carrying `ON CONFLICT` a unique violation would abort the sweep that
+-- advances the retention floor. See the V16 migration for the full
+-- argument.
+CREATE INDEX hog_file_removal_undrained_path
+    ON hog_file_removal (catalog_id, path)
+    WHERE drained_at IS NULL;
 -- The maintenance run ledger: one row per maintenance-task run, whether
 -- the BackgroundLoops sweep or the manual /maintenance/* trigger drove
 -- it. The queryable answer to "is the loop alive, when did it last run,

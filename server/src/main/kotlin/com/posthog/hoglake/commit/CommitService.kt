@@ -92,6 +92,32 @@ class CommitService(
          * registration from racing the row-id allocator toward overflow.
          */
         private const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
+
+        /**
+         * THE PATH-REUSE GUARD, issued once per commit under the
+         * per-catalog commit lock (invariant 4). `internal` so
+         * `V16FileRemovalPathIndexMigrationIntegrationTest` can EXPLAIN
+         * the statement production runs instead of a hand-written
+         * lookalike — V14's first index was proven by a predicate no
+         * code path sends, and was on the wrong column.
+         *
+         * Its access path is `hog_file_removal_undrained_path`
+         * (catalog_id, path) WHERE drained_at IS NULL, added in V16;
+         * before it, this statement read every undrained row in the
+         * catalog on every commit (#199). The `drained_at IS NULL`
+         * clause is not decorative: it is both the correctness
+         * predicate (a settled row no longer owns its path) and the
+         * index's own partial predicate, so dropping it costs the index
+         * as well as the meaning.
+         *
+         * Binds `:catalogId` and the `:paths` array. No interpolated
+         * values (invariant 9 intact).
+         */
+        internal const val REMOVAL_QUEUE_COLLISION_SQL: String =
+            """
+            SELECT DISTINCT path FROM hog_file_removal
+            WHERE catalog_id = :catalogId AND drained_at IS NULL AND path = ANY(:paths)
+            """
     }
 
     /**
@@ -626,12 +652,7 @@ class CommitService(
                 .distinct()
         if (paths.isEmpty()) return
         val queued =
-            h.createQuery(
-                """
-                SELECT DISTINCT path FROM hog_file_removal
-                WHERE catalog_id = :catalogId AND drained_at IS NULL AND path = ANY(:paths)
-                """,
-            )
+            h.createQuery(REMOVAL_QUEUE_COLLISION_SQL)
                 .bind("catalogId", catalogId)
                 .bindArray("paths", String::class.java, paths)
                 .mapTo(String::class.java)

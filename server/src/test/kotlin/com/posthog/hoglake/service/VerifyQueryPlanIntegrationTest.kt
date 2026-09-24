@@ -17,13 +17,15 @@ import org.junit.jupiter.api.TestInstance
  * The plans behind the checks' PATH-EQUALITY sub-queries, against a
  * manifest the size of a real one.
  *
- * `hog_data_file`, `hog_delete_file` and `hog_file_removal` carry NO
- * index on `path` — their hot predicates are (catalog, file id) and
- * (catalog, removal id) — so every one of these sub-queries asks a
- * question the schema has no access path for. That is fine exactly once
- * per query: a single scan of the manifest, hashed, joined against the
- * candidate set. It is a catastrophe if any node runs per candidate,
- * which is what a small dev catalog will always look fast doing.
+ * `hog_data_file` and `hog_delete_file` carry NO index on `path` — their
+ * hot predicates are (catalog, file id) — and `hog_file_removal`'s
+ * `hog_file_removal_undrained_path` (V16) covers only its UNDRAINED
+ * rows, which is a fraction of what these checks read. So every one of
+ * these sub-queries asks a question the schema has no full access path
+ * for. That is fine exactly once per query: a single scan of the
+ * manifest, hashed, joined against the candidate set. It is a
+ * catastrophe if any node runs per candidate, which is what a small dev
+ * catalog will always look fast doing.
  *
  * Two things this test has to get right to mean anything, both learned
  * the hard way:

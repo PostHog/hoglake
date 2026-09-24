@@ -66,9 +66,23 @@ object PgTestSupport {
         return db
     }
 
-    /** Create a new empty database, run migrations, return a pooled Jdbi. */
+    /**
+     * Create a new empty database, run migrations, return a pooled Jdbi.
+     *
+     * [productionSession] wires the pool with [Database.SESSION_INIT_SQL]
+     * — the `statement_timeout` / `idle_in_transaction_session_timeout`
+     * a real pod's sessions carry. OPT-IN, and default OFF on purpose:
+     * turning it on for the whole suite would put a 60 s statement bound
+     * and a 30 s idle-in-transaction bound under every fixture in the
+     * tree, including the six-figure bulk seeds and the drain tests that
+     * hold a transaction open across MinIO round trips, and a suite that
+     * starts failing on a slow machine teaches nothing about the code.
+     * A test that needs session behaviour to be REACHABLE (a migration
+     * whose build can block, say) asks for it.
+     */
     @Synchronized
-    fun freshDatabase(): TestDb = freshEmpty().also { Database.migrate(it.dataSource) }
+    fun freshDatabase(productionSession: Boolean = false): TestDb =
+        freshEmpty(productionSession).also { Database.migrate(it.dataSource) }
 
     /**
      * A database migrated only as far as [version], so a migration test
@@ -80,8 +94,11 @@ object PgTestSupport {
      * then calls to apply the rest.
      */
     @Synchronized
-    fun freshDatabaseAt(version: String): TestDb =
-        freshEmpty().also {
+    fun freshDatabaseAt(
+        version: String,
+        productionSession: Boolean = false,
+    ): TestDb =
+        freshEmpty(productionSession).also {
             Database.flywayConfig(it.dataSource)
                 .target(MigrationVersion.fromVersion(version))
                 .load()
@@ -89,7 +106,7 @@ object PgTestSupport {
         }
 
     @Synchronized
-    private fun freshEmpty(): TestDb {
+    private fun freshEmpty(productionSession: Boolean = false): TestDb {
         val name = "hoglake_test_${dbCounter++}"
         container.createConnection("").use { conn ->
             conn.createStatement().use { it.execute("CREATE DATABASE $name") }
@@ -103,6 +120,8 @@ object PgTestSupport {
                     password = container.password
                     maximumPoolSize = 8
                     poolName = name
+                    // Database's own constant, never a copy of its text.
+                    if (productionSession) connectionInitSql = Database.SESSION_INIT_SQL
                 },
             )
         return TestDb(ds, Database.jdbi(ds), url)

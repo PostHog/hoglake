@@ -162,6 +162,42 @@ class CleanupServiceIntegrationTest {
     }
 
     @Test
+    fun `two undrained rows over one path settle deleted then absent`() {
+        // The other half of V16's non-unique argument. That migration
+        // declines to make `(catalog_id, path) WHERE drained_at IS NULL`
+        // unique because expiry can legitimately queue one path twice
+        // (nothing makes a file path unique, and no writer carries
+        // `ON CONFLICT`), and V16's own test proves the pair is
+        // REACHABLE. This is what makes it HARMLESS, which is the claim
+        // the migration actually rests on: the queue is a suggestion and
+        // never an authorization, so the drain treats the second row as
+        // an ordinary entry whose object is already gone.
+        //
+        // One sweep, one batch, so both rows are in the same sub-batch
+        // and the second is settled by the first's DELETE — the
+        // narrowest version of the race.
+        val catalogId = seedCatalog("cl-dup")
+        val path = "s3://$BUCKET/cl-dup/shared.parquet"
+        putObject(path)
+        val first = queue(catalogId, path)
+        val second = queue(catalogId, path)
+
+        val result = svc.runOnce("cl-dup", batchSize = 100)
+
+        assertThat(result.removed).describedAs("one object, deleted once").isEqualTo(1)
+        assertThat(result.missing).describedAs("the twin finds it already gone").isEqualTo(1)
+        assertThat(result.stillReferenced)
+            .describedAs("a duplicate is not an invariant violation")
+            .isZero()
+        assertThat(queuedPaths(catalogId)).describedAs("both rows settle").isEmpty()
+        val rows = ledgerRows(catalogId)
+        assertThat(rows.map { it.drainedOutcome })
+            .describedAs("ledger, in queue order (removal_id %d then %d)", first, second)
+            .containsExactly("deleted", "absent")
+        assertThat(rows).allSatisfy { assertThat(it.drainedAt).isNotNull() }
+    }
+
+    @Test
     fun `happy drain deletes objects and empties the queue`() {
         val catalogId = seedCatalog("cl-happy")
         val paths = (1..3).map { "s3://$BUCKET/cl-happy/f$it.parquet" }

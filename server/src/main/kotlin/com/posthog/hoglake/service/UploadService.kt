@@ -197,18 +197,8 @@ class UploadService(
         // already claims must not even be OFFERED: it would show up in the
         // drain as a still_referenced invariant violation, which is an
         // alert, every run, forever.
-        h.createUpdate(
-            """
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalog, :path, :kind, 'trino_upload'
-            WHERE NOT EXISTS (SELECT 1 FROM hog_file_removal
-                    WHERE catalog_id = :catalog AND path = :path AND drained_at IS NULL)
-              AND NOT EXISTS (SELECT 1 FROM hog_data_file
-                    WHERE catalog_id = :catalog AND path = :path)
-              AND NOT EXISTS (SELECT 1 FROM hog_delete_file
-                    WHERE catalog_id = :catalog AND path = :path)
-        """,
-        ).bind("catalog", catalogId).bind("path", path).bind("kind", kind).execute()
+        h.createUpdate(QUEUE_ABANDONED_UPLOAD_SQL)
+            .bind("catalog", catalogId).bind("path", path).bind("kind", kind).execute()
         return 1
     }
 
@@ -240,6 +230,44 @@ class UploadService(
              OR (state = 'abandoned'
                  AND (last_scheduled_at IS NULL
                       OR last_scheduled_at <= now() - make_interval(secs => :retention))))
+            """
+
+        /**
+         * The reclaim insert for a fenced upload claim: queue the
+         * abandoned object's path, unless the queue already owns it or a
+         * file row still claims it. `internal` so
+         * `V16FileRemovalPathIndexMigrationIntegrationTest` can EXPLAIN
+         * what production runs rather than a restatement of it.
+         *
+         * The FIRST `NOT EXISTS` is the one V16 indexes — it shares the
+         * commit guard's `(catalog_id, path) WHERE drained_at IS NULL`
+         * predicate, and rode the same sequential scan of the catalog's
+         * whole queue (#199). It is a GUARD and never a constraint: two
+         * concurrent sweeps can both pass it under READ COMMITTED, which
+         * is one of the reasons `hog_file_removal_undrained_path` is not
+         * unique.
+         *
+         * The other two probe `hog_data_file` / `hog_delete_file` by
+         * path, and those tables carry no index on `path` deliberately
+         * (`VerifyQueryPlanIntegrationTest`: a path index there would be
+         * paid for by every commit, on the hottest insert in the
+         * system). They stay sequential scans, once per fenced claim —
+         * sized by the manifest rather than by the queue, and out of
+         * scope for #199.
+         *
+         * Binds `:catalog`, `:path`, `:kind`. No interpolated values
+         * (invariant 9 intact).
+         */
+        internal const val QUEUE_ABANDONED_UPLOAD_SQL: String =
+            """
+            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+            SELECT :catalog, :path, :kind, 'trino_upload'
+            WHERE NOT EXISTS (SELECT 1 FROM hog_file_removal
+                    WHERE catalog_id = :catalog AND path = :path AND drained_at IS NULL)
+              AND NOT EXISTS (SELECT 1 FROM hog_data_file
+                    WHERE catalog_id = :catalog AND path = :path)
+              AND NOT EXISTS (SELECT 1 FROM hog_delete_file
+                    WHERE catalog_id = :catalog AND path = :path)
             """
 
         private val claimMapper =
