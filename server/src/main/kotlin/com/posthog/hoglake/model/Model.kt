@@ -844,9 +844,11 @@ data class DataFile(
      * alone (GET .../files). The changefeed and the scan plan leave it
      * null: they answer "what changed" and "what to read", neither of
      * which is a question about one column's span. The changefeed would
-     * pay a stats join on every consumer poll; the scan plan already
-     * carries every column's bounds in [columnStats], the leading sort
-     * key's included.
+     * pay a stats join on every consumer poll; the scan plan can be
+     * ASKED for bounds instead, in [columnStats] — opt-in, and only for
+     * the columns `stats_fields` names when it is given, so a plan
+     * carries the leading sort key's bounds only if the caller asked
+     * for that column.
      */
     val orderingBounds: FileOrderingBounds? = null,
     /**

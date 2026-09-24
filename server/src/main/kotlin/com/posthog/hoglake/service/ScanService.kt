@@ -40,6 +40,53 @@ import java.time.Instant
  * stats query. Never a statement per file.
  */
 class ScanService(private val jdbi: Jdbi) {
+    companion object {
+        /**
+         * Most `column_stats` entries ONE scan plan may carry — the
+         * bound this response had none of.
+         *
+         * Every other listing on the API has a ceiling (`/files` 10,000
+         * per page, `/snapshots` 100, verify samples 20). This one
+         * multiplies: entries are provided files x requested columns,
+         * so a table that is unremarkable on both axes is enormous on
+         * the product. MEASURED at 106 bytes per rendered entry on the
+         * slim ScanColumnStats shape, which puts a 20,000-file,
+         * 30-column table at 66 MB from one GET and a 50,000-file,
+         * 40-column one at ~225 MB. A million entries is therefore
+         * about 100 MB: the largest answer this endpoint is willing to
+         * build in memory, and still a payload no engine should want.
+         *
+         * The lever for a caller over it is `stats_fields`, which
+         * divides the second factor by naming only the columns a
+         * pushed-down predicate uses — and which the refusal message
+         * names, because a 422 that does not say what to do instead is
+         * an outage to the operator reading it.
+         *
+         * IT ONLY DIVIDES THE SECOND FACTOR. One column costs one entry
+         * per file, so a table with more than a million provided files
+         * is past this cap at every narrowing and `include=column_stats`
+         * is unreachable for it — an engine planning such a table gets
+         * no bounds and must read every file. That is not hypothetical
+         * at the top of the fleet: 3M files x 15 columns is 45x the
+         * cap, and one column of it is still 3x. Raising the cap is not
+         * the answer either, because the number it bounds is a RESPONSE
+         * this server builds in memory; the answer, when a table needs
+         * it, is a paged or filtered statistics surface, which this
+         * endpoint is not and which is not built here.
+         *
+         * This bounds the STATISTICS only. The plan's file list is
+         * uncapped and stays that way: a scan that returned some of a
+         * table's files would be a wrong answer, where a scan that
+         * returns them without bounds is a slow one.
+         *
+         * Sibling of `FILES_MAX_LIMIT` in api/Routes.kt; it lives here
+         * rather than there because the count is only knowable once the
+         * plan and the table's columns are resolved, which is a service
+         * fact and not a route one.
+         */
+        const val SCAN_COLUMN_STATS_MAX_ENTRIES: Long = 1_000_000
+    }
+
     /**
      * Which column statistics a scan plan should carry. [fieldIds] null
      * means every stored row; a set narrows the rows to those field ids
@@ -50,6 +97,54 @@ class ScanService(private val jdbi: Jdbi) {
      */
     data class ColumnStatsRequest(val fieldIds: Set<Long>? = null)
 
+    /**
+     * THE TWO-STATEMENT ARGUMENT, in both directions.
+     *
+     * `withHandleUnchecked` runs on autocommit, so the file+DV query and
+     * the stats query are separate implicit transactions and see
+     * different Postgres snapshots. That is safe, and it is safe because
+     * of what can change between them — not because nothing can:
+     *
+     *  - **A file appearing.** A commit that lands between the two
+     *    statements mints a snapshot ABOVE `at`, so its files are
+     *    invisible to both under invariant 6's predicate, which the
+     *    stats statement re-applies verbatim ([FileRepo.visibleAt], the
+     *    same text). Nothing the second statement returns can belong to
+     *    a file the first did not see, and anything it did return is
+     *    keyed off the plan rather than off the query.
+     *
+     *  - **A file being retired.** A delete or a compaction
+     *    end-snapshots the row at a snapshot above `at`, so the file
+     *    stays visible at `at` on both sides. The row is not deleted.
+     *
+     *  - **A file's stats arriving.** The hydrator only moves
+     *    `pending` -> `provided`/`failed`, and the attachment skips any
+     *    file the PLAN did not call `provided`, so a flip in the window
+     *    leaves the file stat-less in this plan rather than
+     *    contradicting its own `stats_state`. `/maintenance/rehydrate`
+     *    moves `failed` -> `pending` and touches nothing `provided`.
+     *
+     *  - **A file's stats vanishing** — the direction the original
+     *    comment did not argue. Stats rows are deleted only by the
+     *    cascade from `hog_data_file`, and the only statement that
+     *    deletes those rows is the expiry sweep's step 2, which takes
+     *    files with `end_snapshot <= earliest_snapshot_id`. `at` was
+     *    checked at or above that floor, so a file visible at `at` is
+     *    not reclaimable — unless the sweep ADVANCES the floor past `at`
+     *    inside this window. Then the file the plan already returned can
+     *    lose its rows and arrive with an EMPTY `column_stats` array.
+     *    That is still a correct answer under the wire contract: an
+     *    empty array says the file has no statistics for the requested
+     *    columns, and a column absent from the array must not be pruned
+     *    on. The plan degrades to "read everything", never to "prune on
+     *    bounds that are not there" — and a reader racing expiry that
+     *    hard is about to get a 410 on its next explicit read anyway.
+     *
+     * A single REPEATABLE READ transaction would remove the window. It
+     * is not taken because the window has no unsafe direction, and
+     * holding a snapshot open across a read that can return a hundred
+     * megabytes is a cost paid by every commit vacuuming behind it.
+     */
     fun planScan(
         catalog: String,
         namespace: String,
@@ -200,6 +295,26 @@ class ScanService(private val jdbi: Jdbi) {
      * plan, not the query: a file the hydrator flips to `provided` between
      * the two statements was `pending` in the plan, and stays stat-less in
      * it rather than contradicting its own stats_state.
+     *
+     * BOUNDED BEFORE IT IS BUILT. The entry count is provided files x
+     * requested visible LEAF columns, and both factors are known here — the plan is
+     * already in hand and the column forest is read for the resolution
+     * this function performs anyway — so the refusal happens before the
+     * stats statement runs and before a row is materialized. It is an
+     * UPPER bound, deliberately: it counts the columns a request could
+     * match, not the rows stored for them, because a file that shipped
+     * statistics for three of its thirty columns cannot be distinguished
+     * from one that shipped all thirty without reading the very rows the
+     * cap exists to avoid reading. A request refused at 1.02 million
+     * possible entries that would have rendered 400,000 real ones is the
+     * price, and it is one `stats_fields` list away from being served.
+     *
+     * The requested ids are intersected with the visible LEAF columns
+     * first, so the bound tracks the answer rather than the question:
+     * an engine naming ten thousand field ids of which one exists on
+     * this table asks for files x 1 entries and is measured as such,
+     * and a container's field id is not counted because a container
+     * never has a statistics row to return.
      */
     private fun withColumnStats(
         h: Handle,
@@ -211,12 +326,73 @@ class ScanService(private val jdbi: Jdbi) {
     ): List<ScanFile> {
         if (files.none { it.dataFile.statsState == StatsState.PROVIDED }) return files
         val byFieldId = columnsByFieldId(TableRepo.columnsAt(h, catalogId, tableId, at))
+        // LEAVES only. list/struct/map nodes carry no values and never
+        // have a hog_file_column_stats row (iceberg-federation.md; a
+        // commit shipping one for a container's field id is refused by
+        // name), so counting them would refuse a request on columns
+        // that cannot contribute an entry. A deeply nested table is
+        // mostly containers, which is where the difference is large.
+        val leafFieldIds = byFieldId.filterValues { (_, column) -> column.children.isEmpty() }.keys
+        enforceEntryCap(files, leafFieldIds, request)
         val rowsByFile =
             FileRepo.providedColumnStatsAt(h, catalogId, tableId, at, request.fieldIds)
         return files.map { file ->
             if (file.dataFile.statsState != StatsState.PROVIDED) return@map file
             val rows = rowsByFile[file.dataFile.dataFileId].orEmpty()
             file.copy(dataFile = file.dataFile.copy(columnStats = resolveColumnStats(rows, byFieldId)))
+        }
+    }
+
+    /**
+     * Refuse a plan whose `column_stats` array would exceed
+     * [SCAN_COLUMN_STATS_MAX_ENTRIES] entries, stating the arithmetic
+     * and the one parameter that changes it.
+     *
+     * THE ARITHMETIC IS `provided files x requested visible leaf
+     * columns`, and the message says so, because only one of the two
+     * factors is under the caller's control. `stats_fields` divides the
+     * second. Nothing divides the first: `/scan` plans a table at one
+     * snapshot and has no range, page or limit parameter, so a table
+     * whose FILE count alone exceeds the cap cannot reach these
+     * statistics at any narrowing — one column still costs one entry
+     * per file. That is a real, reachable state (see the spec's 422
+     * text and server/README.md), and the honest answer for such a
+     * table is that the engine plans without bounds; suggesting a
+     * range this endpoint does not have would send the caller looking
+     * for a parameter that is not there.
+     *
+     * 422 and not 400: the request is well-formed and would have been
+     * legal against a smaller table, which is the same line
+     * `snapshot`-out-of-range and `stats_fields`-without-`include` sit
+     * on. Multiplied in Long, because the product overflows Int well
+     * inside what this catalog can hold — roughly 215,000 files at the
+     * 10,000-column maximum — and an overflowed product is a cap that
+     * passes the requests it exists to refuse.
+     */
+    private fun enforceEntryCap(
+        files: List<ScanFile>,
+        visibleLeafFieldIds: Set<Long>,
+        request: ColumnStatsRequest,
+    ) {
+        val providedFiles = files.count { it.dataFile.statsState == StatsState.PROVIDED }.toLong()
+        val requested = request.fieldIds
+        val columns =
+            if (requested == null) {
+                visibleLeafFieldIds.size.toLong()
+            } else {
+                requested.count { it in visibleLeafFieldIds }.toLong()
+            }
+        val entries = providedFiles * columns
+        if (entries > SCAN_COLUMN_STATS_MAX_ENTRIES) {
+            val narrowed = if (requested == null) "" else " already narrowed by stats_fields;"
+            throw HoglakeException.Validation(
+                "column_stats would carry up to $entries entries ($providedFiles files with statistics " +
+                    "x $columns requested column(s)), over the maximum $SCAN_COLUMN_STATS_MAX_ENTRIES " +
+                    "per scan;$narrowed narrow it with stats_fields, naming only the field ids a " +
+                    "predicate prunes on — one column costs one entry per file, so a table with more " +
+                    "than $SCAN_COLUMN_STATS_MAX_ENTRIES files cannot carry column_stats at all and " +
+                    "must be planned without bounds",
+            )
         }
     }
 }

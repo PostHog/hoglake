@@ -950,6 +950,129 @@ class FileStatsApiTest {
         }
 
     @Test
+    fun `at_timestamp resolves the snapshot that column_stats are read at`() =
+        api { client ->
+            // The two read-target parameters are not interchangeable in
+            // the code — `at_timestamp` goes through TimeTravelRepo and
+            // `snapshot` does not — so "snapshot= travels correctly"
+            // says nothing about the other one. A handler that resolved
+            // the timestamp for the FILE query and then read statistics
+            // at head would pass every test above.
+            val ids =
+                createTable(
+                    client,
+                    "tsstats",
+                    """{"name": "keep", "type": "long"}, {"name": "gone", "type": "long"}""",
+                )
+            val path = "s3://b/$catalog/tsstats/f1.parquet"
+            commitFile(
+                client,
+                "tsstats",
+                path,
+                2,
+                listOf(
+                    statsRow(ids.getValue("keep"), 2, 0, enc(ColType.LONG, 1L), enc(ColType.LONG, 2L)),
+                    statsRow(ids.getValue("gone"), 2, 0, enc(ColType.LONG, 5L), enc(ColType.LONG, 6L)),
+                ).joinToString(","),
+            )
+            val preDrop = body(client.get("/v1/catalogs/$catalog"))["head_snapshot_id"].asLong()
+            assertThat(
+                client.postJson("$tablesUrl/tsstats/alter", """{"ops": [{"op": "drop_column", "name": "gone"}]}""")
+                    .status,
+            ).isEqualTo(HttpStatusCode.OK)
+
+            // Snapshot times are minute-spaced off a fixed base so a
+            // timestamp can name one snapshot unambiguously (the same
+            // technique the stats endpoint's time-travel test uses).
+            val base = java.time.Instant.parse("2026-02-01T00:00:00Z")
+            db.jdbi.withHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    UPDATE hog_snapshot
+                    SET snapshot_time = :base + make_interval(mins => snapshot_id::int)
+                    WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                    """,
+                )
+                    .bind("base", base.atOffset(java.time.ZoneOffset.UTC))
+                    .bind("cat", catalog)
+                    .execute()
+            }
+            val atPreDrop = base.plusSeconds(preDrop * 60)
+
+            val travelled = client.get("$tablesUrl/tsstats/$statsScan&at_timestamp=$atPreDrop")
+            assertThat(travelled.status).isEqualTo(HttpStatusCode.OK)
+            val travelledFile = json.readTree(travelled.bodyAsText()).scanFile(path)
+            assertThat(travelledFile["column_stats"].map { it["field_id"].asLong() })
+                .describedAs("at the pre-drop instant the dropped column still resolves")
+                .containsExactly(ids.getValue("keep"), ids.getValue("gone"))
+
+            val atHead = body(client.get("$tablesUrl/tsstats/$statsScan")).scanFile(path)
+            assertThat(atHead["column_stats"].map { it["field_id"].asLong() })
+                .containsExactly(ids.getValue("keep"))
+
+            // And the two targets still refuse to be combined, with the
+            // statistics parameters in play.
+            assertThat(
+                client.get("$tablesUrl/tsstats/$statsScan&at_timestamp=$atPreDrop&snapshot=$preDrop").status,
+            ).isEqualTo(HttpStatusCode.UnprocessableEntity)
+        }
+
+    @Test
+    fun `a plan carries enough for a reader to prune one of two disjoint files`() =
+        api { client ->
+            // The consumer-facing property, over raw REST rather than
+            // through a client. The Trino connector — the one engine in
+            // the tree that plans splits from this endpoint — does NOT
+            // send `include` (PostHog/trino, HoglakeClient.listScan
+            // requests `/scan?snapshot=`, and its own test asserts
+            // `column_stats` is absent), so there is no harness case to
+            // add there and this stands in for one: the wire really does
+            // carry two disjoint ranges for the same column, decoded,
+            // under the field id an engine holds from the table schema.
+            val ids = createTable(client, "prune", """{"name": "ts", "type": "long"}""")
+            val ts = ids.getValue("ts")
+            val early = "s3://b/$catalog/prune/early.parquet"
+            val late = "s3://b/$catalog/prune/late.parquet"
+            commitFile(
+                client,
+                "prune",
+                early,
+                100,
+                statsRow(ts, 100, 0, enc(ColType.LONG, 1L), enc(ColType.LONG, 10L)),
+            )
+            commitFile(
+                client,
+                "prune",
+                late,
+                100,
+                statsRow(ts, 100, 0, enc(ColType.LONG, 100L), enc(ColType.LONG, 110L)),
+            )
+
+            val plan = body(client.get("$tablesUrl/prune/$statsScan&stats_fields=$ts"))
+            assertThat(plan).hasSize(2)
+
+            fun boundsOf(path: String): Pair<Long, Long> {
+                val entry =
+                    plan.scanFile(path)["column_stats"].single { it["field_id"].asLong() == ts }
+                return entry["lower_bound"].asLong() to entry["upper_bound"].asLong()
+            }
+            assertThat(boundsOf(early)).isEqualTo(1L to 10L)
+            assertThat(boundsOf(late)).isEqualTo(100L to 110L)
+
+            // What an engine would do with them: `ts > 50` keeps exactly
+            // the late file. Expressed as the pruning decision rather
+            // than as two bound comparisons, because the decision is the
+            // feature and a plan that reported both ranges as the same
+            // would satisfy the comparisons above only by accident.
+            val kept =
+                listOf(early, late).filter { path ->
+                    val (_, upper) = boundsOf(path)
+                    upper > 50L
+                }
+            assertThat(kept).containsExactly(late)
+        }
+
+    @Test
     fun `malformed or unusable stats parameters are refused, never ignored`() =
         api { client ->
             createTable(client, "badparams", """{"name": "a", "type": "long"}""")
@@ -959,10 +1082,41 @@ class FileStatsApiTest {
             val unknown = client.get("$base?include=column_stat")
             assertThat(unknown.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             assertThat(unknown.bodyAsText()).contains("column_stat").contains("column_stats")
-            assertThat(client.get("$base?include=").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             // ...including when it is the SECOND occurrence of the parameter.
             assertThat(client.get("$base?include=column_stats&include=column_stat").status)
                 .isEqualTo(HttpStatusCode.UnprocessableEntity)
+            // An EMPTY value is the malformed side of the line, not the
+            // unknown-name side, and now answers what an empty
+            // `stats_fields` answers. It used to reach the unknown-value
+            // arm and answer 422 while its twin answered 400 — one
+            // mistake, two verdicts. This assertion is the contract
+            // change, not a fixture adjusted to suit a new guard.
+            assertThat(client.get("$base?include=").status).isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(client.get("$base?include=column_stats,").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            // The echo in the unknown-value refusal is bounded on both
+            // axes: Identifiers.cap bounds each token's length, and the
+            // DISTINCT value count is capped, so a caller cannot make
+            // the server quote a kilobyte of their own input back.
+            val tooManyIncludes = (1..17).joinToString(",") { "v$it" }
+            assertThat(client.get("$base?include=$tooManyIncludes").status)
+                .isEqualTo(HttpStatusCode.BadRequest)
+            assertThat(client.get("$base?include=" + (1..16).joinToString(",") { "v$it" }).status)
+                .describedAs("sixteen distinct values is a well-formed list; they are simply unknown")
+                .isEqualTo(HttpStatusCode.UnprocessableEntity)
+            // ...and the caps count DISTINCT values, so the parameters'
+            // OWN canonical encoding is not an abuse. `explode: true`
+            // makes repetition how a generated client sends a list, and
+            // the route joins occurrences before the parse: one legal
+            // value seventeen times is a list of one.
+            assertThat(client.get("$base?" + (1..17).joinToString("&") { "include=column_stats" }).status)
+                .describedAs("one legal include value, repeated past the distinct cap")
+                .isEqualTo(HttpStatusCode.OK)
+            assertThat(
+                client.get(
+                    "$base?include=column_stats&" + (1..10_001).joinToString("&") { "stats_fields=1" },
+                ).status,
+            ).describedAs("one field id, repeated past the distinct cap").isEqualTo(HttpStatusCode.OK)
             // stats_fields alone would silently return no statistics.
             val orphan = client.get("$base?stats_fields=1")
             assertThat(orphan.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
@@ -976,6 +1130,7 @@ class FileStatsApiTest {
                 .isEqualTo(HttpStatusCode.BadRequest)
             val tooMany = (1..10_001).joinToString(",")
             assertThat(client.get("$base?include=column_stats&stats_fields=$tooMany").status)
+                .describedAs("10,001 DISTINCT field ids, which no legal table can have")
                 .isEqualTo(HttpStatusCode.BadRequest)
             // The well-formed spellings are accepted.
             assertThat(client.get("$base?include=column_stats,column_stats&stats_fields=1").status)

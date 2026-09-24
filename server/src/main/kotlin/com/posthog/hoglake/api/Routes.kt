@@ -7,6 +7,7 @@ import com.posthog.hoglake.observability.CatalogTotals
 import com.posthog.hoglake.observability.InstanceTotals
 import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.service.CatalogService
+import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.Identifiers
 import com.posthog.hoglake.service.ScanService
 import io.ktor.http.HttpStatusCode
@@ -425,34 +426,80 @@ fun Application.installScanRoutes(scan: ScanService) {
 internal val SCAN_INCLUDES = setOf("column_stats")
 
 /**
- * Most field ids `stats_fields` may name: the per-table column-node cap,
- * so every legal table's leaves fit and nothing larger is buffered.
+ * Most DISTINCT values `include` may name.
+ *
+ * The parameter names optional PARTS of the plan and there is one of
+ * them, so sixteen is already an order of magnitude of headroom. The
+ * cap exists because the unknown-value refusal ECHOES what it did not
+ * recognise: without a bound, sixteen hundred misspellings produce
+ * sixteen hundred quoted tokens in a 422 body. [Identifiers.cap]
+ * bounds each token's LENGTH; this bounds their COUNT, and a message
+ * needs both.
+ *
+ * DISTINCT is the whole of it. `explode: true` makes repetition the
+ * CANONICAL encoding of this parameter — `include=column_stats&include=column_stats`
+ * is what a generated client emits for a two-element list, and the
+ * route joins occurrences before the parse — so a cap counting raw
+ * tokens refuses a request that names one legal value seventeen times.
+ * The count that can hurt a reader is how many DIFFERENT values come
+ * back in the message, which is what this bounds. [MAX_RAW_SCAN_TOKENS]
+ * is the separate, generous guard on the work done BEFORE the dedupe.
  */
-internal const val MAX_STATS_FIELDS = 10_000
+internal const val MAX_SCAN_INCLUDES = 16
+
+/**
+ * Most field ids `stats_fields` may name.
+ *
+ * [ColumnTrees.MAX_COLUMN_NODES] itself, not a copy of its value: a
+ * request may legitimately name every column node a table is allowed to
+ * have, and nothing beyond that can resolve to anything. Restating the
+ * number would let the two drift apart silently, with the parser
+ * refusing ids the DDL had just allowed.
+ */
+internal const val MAX_STATS_FIELDS = ColumnTrees.MAX_COLUMN_NODES
+
+/**
+ * The raw-token guard both parameters share, applied BEFORE the
+ * dedupe: ten times the larger of the two distinct-value caps.
+ *
+ * The caps above are on DISTINCT values, which is the number that
+ * reaches a message or a query, and a distinct count cannot be taken
+ * without building the set first. This bounds that work. Ten times, and
+ * not the cap itself, because repetition is the canonical encoding
+ * under `explode: true`: a client sending each of ten thousand field
+ * ids as its own occurrence is well behaved, and even a client that
+ * sends each of them twice is only careless. A hundred thousand tokens
+ * is nobody's list.
+ */
+internal const val MAX_RAW_SCAN_TOKENS = 10 * ColumnTrees.MAX_COLUMN_NODES
 
 /**
  * `include` and `stats_fields` as a scan's stats request, or null when
- * none was asked for. Malformed values are 400s (BadRequestException);
- * well-formed but unusable ones are 422s (Validation): an `include` value
- * the server does not know — refused rather than ignored, so a caller
- * misspelling it cannot mistake "no stats" for "nothing to prune" — and
- * `stats_fields` without `include=column_stats`, which would otherwise
- * silently return no statistics at all.
+ * none was asked for.
+ *
+ * THE LINE BETWEEN 400 AND 422 is whether the VALUE is well formed.
+ * Malformed values are 400s (BadRequestException) on both parameters
+ * and for the same reasons: an empty token, a non-integer field id, too
+ * many of either. Well-formed but unusable ones are 422s (Validation):
+ * an `include` value the server does not know — refused rather than
+ * ignored, so a caller misspelling it cannot mistake "no stats" for
+ * "nothing to prune" — and `stats_fields` without `include=column_stats`,
+ * which would otherwise silently return no statistics at all.
+ *
+ * `include=` and `stats_fields=` therefore answer the SAME status. They
+ * did not: an empty `include` used to reach the unknown-value arm and
+ * answer 422 while an empty `stats_fields` answered 400, so one caller
+ * sending both empty got two different verdicts on one mistake.
+ *
+ * Both parameters UNION across repeated occurrences (the route joins
+ * them with commas before calling this), so `stats_fields=3&stats_fields=7`
+ * asks for both columns rather than silently dropping the second.
  */
 internal fun parseScanStatsRequest(
     include: String?,
     statsFields: String?,
 ): ScanService.ColumnStatsRequest? {
-    val includes =
-        include?.split(',')?.map { it.trim() }?.toSet()?.also { values ->
-            val unknown = values - SCAN_INCLUDES
-            if (unknown.isNotEmpty()) {
-                throw HoglakeException.Validation(
-                    "include: unknown value(s) ${unknown.sorted().joinToString { "'${Identifiers.cap(it)}'" }}; " +
-                        "supported: ${SCAN_INCLUDES.sorted().joinToString()}",
-                )
-            }
-        } ?: emptySet()
+    val includes = include?.let { parseScanIncludes(it) } ?: emptySet()
     val fieldIds = statsFields?.let { parseStatsFields(it) }
     if ("column_stats" !in includes) {
         if (fieldIds != null) {
@@ -463,18 +510,70 @@ internal fun parseScanStatsRequest(
     return ScanService.ColumnStatsRequest(fieldIds)
 }
 
+/**
+ * Split one of the two parameters into raw tokens, bounded by
+ * [MAX_RAW_SCAN_TOKENS].
+ *
+ * The guard is on the SPLIT, before anything is trimmed or deduped,
+ * because that is the only work whose size the caller controls
+ * directly. Everything after it counts distinct values.
+ */
+private fun scanTokens(
+    name: String,
+    raw: String,
+): List<String> {
+    val parts = raw.split(',')
+    if (parts.size > MAX_RAW_SCAN_TOKENS) {
+        throw BadRequestException(
+            "query parameter '$name' carries more than $MAX_RAW_SCAN_TOKENS values",
+        )
+    }
+    return parts
+}
+
+/** `include`: a comma-separated list of non-empty known part names. */
+internal fun parseScanIncludes(raw: String): Set<String> {
+    val values = scanTokens("include", raw).map { it.trim() }.toSet()
+    if (values.any { it.isEmpty() }) {
+        throw BadRequestException(
+            "query parameter 'include' must be a comma-separated list of non-empty values; " +
+                "supported: ${SCAN_INCLUDES.sorted().joinToString()}",
+        )
+    }
+    // DISTINCT values, after the dedupe: under `explode: true` a client
+    // repeating one legal value is sending a list of one, and refusing
+    // it would refuse the parameter's own canonical encoding.
+    if (values.size > MAX_SCAN_INCLUDES) {
+        throw BadRequestException("query parameter 'include' names more than $MAX_SCAN_INCLUDES distinct values")
+    }
+    val unknown = values - SCAN_INCLUDES
+    if (unknown.isNotEmpty()) {
+        throw HoglakeException.Validation(
+            "include: unknown value(s) ${unknown.sorted().joinToString { "'${Identifiers.cap(it)}'" }}; " +
+                "supported: ${SCAN_INCLUDES.sorted().joinToString()}",
+        )
+    }
+    return values
+}
+
 /** `stats_fields`: a non-empty comma-separated list of int64 field ids. */
 internal fun parseStatsFields(raw: String): Set<Long> {
-    val parts = raw.split(',')
-    if (parts.size > MAX_STATS_FIELDS) {
-        throw BadRequestException("query parameter 'stats_fields' names more than $MAX_STATS_FIELDS field ids")
+    val ids =
+        scanTokens("stats_fields", raw).map { part ->
+            part.trim().toLongOrNull()
+                ?: throw BadRequestException(
+                    "query parameter 'stats_fields' must be a comma-separated list of integer field ids",
+                )
+        }.toSet()
+    // Again DISTINCT: the cap is [ColumnTrees.MAX_COLUMN_NODES] because
+    // that is how many field ids a legal table can HAVE, and a caller
+    // naming one id ten thousand times has named one column.
+    if (ids.size > MAX_STATS_FIELDS) {
+        throw BadRequestException(
+            "query parameter 'stats_fields' names more than $MAX_STATS_FIELDS distinct field ids",
+        )
     }
-    return parts.map { part ->
-        part.trim().toLongOrNull()
-            ?: throw BadRequestException(
-                "query parameter 'stats_fields' must be a comma-separated list of integer field ids",
-            )
-    }.toSet()
+    return ids
 }
 
 // ---- parameter helpers ---------------------------------------------------

@@ -221,6 +221,33 @@ object FileRepo {
     }
 
     /**
+     * The scan plan's stats statement, as SQL text — `internal` so the
+     * query-plan test can EXPLAIN the statement production runs rather
+     * than a retyped copy of it (AGENT.md: an index proves itself
+     * against the query it serves, and V14's first index was green
+     * against a predicate no code path issues).
+     *
+     * [filtered] selects the `stats_fields` shape. The two shapes get
+     * different plans and both are asserted, so the flag is the whole
+     * reason this is a function rather than a constant; nothing but the
+     * literal filter text is spliced in (invariant 9).
+     */
+    internal fun providedColumnStatsSql(filtered: Boolean): String =
+        """
+        SELECT s.data_file_id, s.field_id, s.value_count, s.null_count, s.nan_count,
+               s.lower_bound, s.upper_bound
+          FROM hog_data_file df
+          JOIN hog_file_column_stats s
+            ON s.catalog_id = df.catalog_id
+           AND s.data_file_id = df.data_file_id
+         WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
+           AND df.stats_state = 'provided'
+           AND ${visibleAt("df")}
+           ${if (filtered) "AND s.field_id = ANY(:fieldIds)" else ""}
+         ORDER BY s.data_file_id, s.field_id
+        """
+
+    /**
      * The stats rows of every `provided` file of [tableId] visible at
      * [snapshot], grouped by data file id, field-id order within each —
      * narrowed to [fieldIds] when given (the scan plan's
@@ -231,6 +258,23 @@ object FileRepo {
      * plan uses) rather than taking the id list back as `IN (...)`: a large table's plan would otherwise bind one
      * parameter per file, and the protocol caps a statement at 65535.
      * The field narrowing is ONE array parameter however many ids.
+     *
+     * The `stats_state = 'provided'` filter is part of the STATEMENT and
+     * not only of the caller's guard: this function is the one place a
+     * `pending` file's half-written rows could reach a plan, and a
+     * reader that prunes on them prunes on bounds no writer vouched for.
+     * `FileColumnStatsRepoIntegrationTest` calls it directly, against a
+     * pending file that HAS rows, for exactly that reason.
+     *
+     * `size_bytes` is deliberately NOT selected. The scan plan's wire
+     * entry drops it (ScanColumnStats: it says nothing about whether a
+     * file can be pruned, which is the array's one job) and this
+     * function serves the scan plan alone, so selecting it would move
+     * one bigint per file per column across the wire for a value nobody
+     * renders. The returned [ColumnStats.sizeBytes] is therefore always
+     * null, and null here means NOT READ rather than NOT STORED — every
+     * other reader ([columnStats], [columnStatsFor]) selects the column
+     * and means the other thing.
      */
     fun providedColumnStatsAt(
         handle: Handle,
@@ -239,29 +283,14 @@ object FileRepo {
         snapshot: Long,
         fieldIds: Set<Long>?,
     ): Map<Long, List<ColumnStats>> {
-        val fieldFilter = if (fieldIds == null) "" else "AND s.field_id = ANY(:fieldIds)"
         val query =
-            handle.createQuery(
-                """
-                SELECT s.data_file_id, s.field_id, s.value_count, s.null_count, s.nan_count,
-                       s.size_bytes, s.lower_bound, s.upper_bound
-                  FROM hog_data_file df
-                  JOIN hog_file_column_stats s
-                    ON s.catalog_id = df.catalog_id
-                   AND s.data_file_id = df.data_file_id
-                 WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
-                   AND df.stats_state = 'provided'
-                   AND ${visibleAt("df")}
-                   $fieldFilter
-                 ORDER BY s.data_file_id, s.field_id
-                """,
-            )
+            handle.createQuery(providedColumnStatsSql(filtered = fieldIds != null))
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
                 .bind("snapshot", snapshot)
         if (fieldIds != null) query.bindArray("fieldIds", Long::class.javaObjectType, fieldIds.toList())
         return query
-            .map { rs, ctx -> rs.getLong("data_file_id") to columnStatsMapper.map(rs, ctx) }
+            .map { rs, ctx -> rs.getLong("data_file_id") to scanColumnStatsMapper.map(rs, ctx) }
             .list()
             .groupBy({ it.first }, { it.second })
     }
@@ -289,6 +318,27 @@ object FileRepo {
                 nullCount = rs.getLong("null_count"),
                 nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
                 sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
+                lowerBound = rs.getBytes("lower_bound"),
+                upperBound = rs.getBytes("upper_bound"),
+            )
+        }
+
+    /**
+     * [columnStatsMapper] minus `size_bytes`, for
+     * [providedColumnStatsAt] — the one read whose statement does not
+     * select the column (see that function). A separate mapper rather
+     * than a nullable lookup, so the omission is stated where the rows
+     * are built and a future column added to [columnStatsMapper] cannot
+     * silently start throwing here.
+     */
+    private val scanColumnStatsMapper =
+        RowMapper { rs, _ ->
+            ColumnStats(
+                fieldId = rs.getLong("field_id"),
+                valueCount = rs.getLong("value_count"),
+                nullCount = rs.getLong("null_count"),
+                nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
+                sizeBytes = null,
                 lowerBound = rs.getBytes("lower_bound"),
                 upperBound = rs.getBytes("upper_bound"),
             )

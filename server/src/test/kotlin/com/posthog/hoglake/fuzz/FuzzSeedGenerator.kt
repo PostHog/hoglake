@@ -332,10 +332,47 @@ object FuzzSeedGenerator {
                        "expected_table_uuid":"123e4567-e89b-12d3-a456-426614174009",
                        "files":[{"data_file_id":0,"data_file_path":"s3://b/g.parquet",
                        "path":"s3://b/g.dv","delete_count":1,"file_size_bytes":20}]}]}""",
-            )
+            ) + scanStatsSamples()
         for ((name, value) in samples) {
             write(out, name, value.trimIndent().toByteArray(Charsets.UTF_8))
         }
+    }
+
+    /**
+     * GET .../scan's `include` / `stats_fields` parsers
+     * (api/Routes.kt), which the DTO target reaches by splitting its
+     * input at the first NUL: everything before it is `include`,
+     * everything after is `stats_fields`, and an input with no NUL is
+     * an `include` alone.
+     *
+     * Before these seeds the block ran on every committed input and
+     * `parseStatsFields` never executed once in PR CI — no seed
+     * contained a NUL, so the second half was always empty. The names
+     * say which half each one exercises.
+     */
+    private fun scanStatsSamples(): Map<String, String> {
+        val nul = '\u0000'
+        return mapOf(
+            // include alone, no NUL: the accepted spelling, and the
+            // shapes the parser has to separate from it.
+            "scan_include_column_stats" to "column_stats",
+            "scan_include_unknown" to "column_stat",
+            "scan_include_repeated" to "column_stats,column_stats",
+            "scan_include_trailing_comma" to "column_stats,",
+            "scan_include_over_cap" to (1..17).joinToString(",") { "v$it" },
+            // An EMPTY include, which is a different refusal from an
+            // unknown one. The NUL is the only way to write it: an empty
+            // FILE is an absent parameter, not an empty value.
+            "scan_include_empty" to "$nul",
+            // The NUL-separated pair: both parsers and the
+            // cross-parameter rule, in one input.
+            "scan_stats_fields_pair" to "column_stats${nul}3,7,3",
+            "scan_stats_fields_orphan" to "${nul}3,7",
+            "scan_stats_fields_noninteger" to "column_stats${nul}3,abc,7",
+            "scan_stats_fields_empty_entry" to "column_stats${nul}1,,2",
+            "scan_stats_fields_int64" to "column_stats$nul-9223372036854775808,9223372036854775807",
+            "scan_stats_fields_over_cap" to "column_stats$nul" + (1..10_001).joinToString(","),
+        )
     }
 
     // ---- table creation definition codec ---------------------------------------
