@@ -7,6 +7,7 @@
 import type {
   ApiErrorBody,
   Catalog,
+  CatalogOptions,
   ConsumerOffset,
   DataFile,
   InstanceMaintenanceStatus,
@@ -51,6 +52,20 @@ export const namespacesFixture: Namespace[] = [
   { name: "events" },
   { name: "sessions" },
 ];
+
+/** The analytics catalog's retention options (GET /catalogs/analytics/options). */
+export const catalogOptionsFixture: CatalogOptions = {
+  // 604800s = 7d, rendered as a duration by the header.
+  snapshot_retention_seconds: "604800",
+  consumer_floor: true,
+  earliest_snapshot_id: "4099",
+};
+
+/** A catalog with expiry disabled: snapshot_retention_seconds absent. */
+export const catalogOptionsNoExpiryFixture: CatalogOptions = {
+  consumer_floor: false,
+  earliest_snapshot_id: "1",
+};
 
 export const tablesFixture: TableSummary[] = [
   {

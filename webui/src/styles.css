@@ -109,10 +109,15 @@ h3 {
 }
 
 .breadcrumbs {
-  flex: 1;
+  /* A sub-header row below the top bar, only present on catalog-scoped
+     pages (it returns null elsewhere). Slimmer than the top bar so it
+     reads as navigation, not as a second header. */
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 6px 16px;
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
   overflow: hidden;
   white-space: nowrap;
 }
@@ -172,7 +177,10 @@ h3 {
 
 .two-col {
   display: grid;
-  grid-template-columns: minmax(240px, 1fr) 2fr;
+  /* Namespaces at ~1/6, the snapshot timeline at ~5/6: the namespaces
+     list is short identifiers while the timeline carries long commit
+     messages, so the timeline earns the width. */
+  grid-template-columns: minmax(200px, 1fr) 5fr;
   gap: 24px;
   align-items: start;
 }

@@ -137,16 +137,16 @@ function HealthIndicator() {
 
 function Breadcrumbs() {
   const { catalog, namespace, table } = useParams();
+  // Only meaningful inside a catalog: on /, /metrics, /database and the
+  // maintenance pages there is no catalog to navigate back to, so the
+  // trail renders nothing rather than a bare "catalogs" stub.
+  if (!catalog) return null;
   return (
     <nav className="breadcrumbs" aria-label="Breadcrumb">
       <Link to="/">catalogs</Link>
-      {catalog && (
-        <>
-          <span className="crumb-sep">/</span>
-          <Link to={`/catalogs/${encodeURIComponent(catalog)}`}>{catalog}</Link>
-        </>
-      )}
-      {catalog && namespace && (
+      <span className="crumb-sep">/</span>
+      <Link to={`/catalogs/${encodeURIComponent(catalog)}`}>{catalog}</Link>
+      {namespace && (
         <>
           <span className="crumb-sep">/</span>
           <Link
@@ -156,7 +156,7 @@ function Breadcrumbs() {
           </Link>
         </>
       )}
-      {catalog && namespace && table && (
+      {namespace && table && (
         <>
           <span className="crumb-sep">/</span>
           <span className="crumb-current">{table}</span>
@@ -177,7 +177,6 @@ export function Layout() {
         <ServerVersion />
         <InstanceName />
         <InstanceTotals />
-        <Breadcrumbs />
         <div className="topbar-right">
           <Link to="/maintenance">maintenance</Link>
           <Link to="/database">database</Link>
@@ -189,6 +188,7 @@ export function Layout() {
           <HealthIndicator />
         </div>
       </header>
+      <Breadcrumbs />
       <main className="content">
         <Outlet />
       </main>

@@ -4,6 +4,7 @@
 import type {
   ApiErrorBody,
   Catalog,
+  CatalogOptions,
   ConsumerList,
   ConsumerOffset,
   CreateCatalogRequest,
@@ -102,6 +103,10 @@ export function createCatalog(req: CreateCatalogRequest): Promise<Catalog> {
 
 export function getCatalog(catalog: string): Promise<Catalog> {
   return request(buildUrl(`/catalogs/${seg(catalog)}`));
+}
+
+export function getCatalogOptions(catalog: string): Promise<CatalogOptions> {
+  return request(buildUrl(`/catalogs/${seg(catalog)}/options`));
 }
 
 // -- namespaces -------------------------------------------------------------
