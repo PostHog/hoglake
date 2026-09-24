@@ -178,17 +178,7 @@ object FileRepo {
         )
             .bind("catalogId", catalogId)
             .bind("dataFileId", dataFileId)
-            .map { rs, _ ->
-                ColumnStats(
-                    fieldId = rs.getLong("field_id"),
-                    valueCount = rs.getLong("value_count"),
-                    nullCount = rs.getLong("null_count"),
-                    nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
-                    sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
-                    lowerBound = rs.getBytes("lower_bound"),
-                    upperBound = rs.getBytes("upper_bound"),
-                )
-            }
+            .map(columnStatsMapper)
             .list()
 
     /**
@@ -225,21 +215,84 @@ object FileRepo {
             .bind("catalogId", catalogId)
             .bind("fieldId", fieldId)
             .bindList("dataFileIds", dataFileIds)
-            .map { rs, _ ->
-                rs.getLong("data_file_id") to
-                    ColumnStats(
-                        fieldId = rs.getLong("field_id"),
-                        valueCount = rs.getLong("value_count"),
-                        nullCount = rs.getLong("null_count"),
-                        nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
-                        sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
-                        lowerBound = rs.getBytes("lower_bound"),
-                        upperBound = rs.getBytes("upper_bound"),
-                    )
-            }
+            .map { rs, ctx -> rs.getLong("data_file_id") to columnStatsMapper.map(rs, ctx) }
             .list()
             .toMap()
     }
+
+    /**
+     * The stats rows of every `provided` file of [tableId] visible at
+     * [snapshot], grouped by data file id, field-id order within each —
+     * narrowed to [fieldIds] when given (the scan plan's
+     * `include=column_stats` / `stats_fields`).
+     *
+     * ONE statement for the whole plan. It re-applies the plan's
+     * file-visibility predicate as a join ([visibleAt], the same text the
+     * plan uses) rather than taking the id list back as `IN (...)`: a large table's plan would otherwise bind one
+     * parameter per file, and the protocol caps a statement at 65535.
+     * The field narrowing is ONE array parameter however many ids.
+     */
+    fun providedColumnStatsAt(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        fieldIds: Set<Long>?,
+    ): Map<Long, List<ColumnStats>> {
+        val fieldFilter = if (fieldIds == null) "" else "AND s.field_id = ANY(:fieldIds)"
+        val query =
+            handle.createQuery(
+                """
+                SELECT s.data_file_id, s.field_id, s.value_count, s.null_count, s.nan_count,
+                       s.size_bytes, s.lower_bound, s.upper_bound
+                  FROM hog_data_file df
+                  JOIN hog_file_column_stats s
+                    ON s.catalog_id = df.catalog_id
+                   AND s.data_file_id = df.data_file_id
+                 WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
+                   AND df.stats_state = 'provided'
+                   AND ${visibleAt("df")}
+                   $fieldFilter
+                 ORDER BY s.data_file_id, s.field_id
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+        if (fieldIds != null) query.bindArray("fieldIds", Long::class.javaObjectType, fieldIds.toList())
+        return query
+            .map { rs, ctx -> rs.getLong("data_file_id") to columnStatsMapper.map(rs, ctx) }
+            .list()
+            .groupBy({ it.first }, { it.second })
+    }
+
+    /**
+     * The versioned-row visibility predicate (invariant 6) for [alias] at
+     * `:snapshot`, as SQL text. The scan plan builds its file and
+     * deletion-vector joins from it and [providedColumnStatsAt] its stats
+     * join, so a plan's stats can never be read under different snapshot
+     * semantics than its files. [alias] is always a literal table alias at
+     * the call site; no value is ever spliced in (invariant 9).
+     */
+    internal fun visibleAt(alias: String): String =
+        "$alias.begin_snapshot <= :snapshot AND ($alias.end_snapshot IS NULL OR :snapshot < $alias.end_snapshot)"
+
+    /**
+     * One `hog_file_column_stats` row. Shared by every stats read so a new
+     * column on the table is mapped in one place, not in each query.
+     */
+    private val columnStatsMapper =
+        RowMapper { rs, _ ->
+            ColumnStats(
+                fieldId = rs.getLong("field_id"),
+                valueCount = rs.getLong("value_count"),
+                nullCount = rs.getLong("null_count"),
+                nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
+                sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
+                lowerBound = rs.getBytes("lower_bound"),
+                upperBound = rs.getBytes("upper_bound"),
+            )
+        }
 
     /**
      * Snapshot-scoped table aggregates: (file_count, record_count,

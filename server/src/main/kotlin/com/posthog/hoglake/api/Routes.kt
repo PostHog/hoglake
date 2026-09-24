@@ -402,7 +402,11 @@ fun Application.installApiRoutes(
 fun Application.installScanRoutes(scan: ScanService) {
     routing {
         get("/v1/catalogs/{catalog}/namespaces/{namespace}/tables/{table}/scan") {
-            val params = call.request.queryParameters
+            // getAll, joined: Parameters[...] is only the FIRST occurrence,
+            // so a repeated `stats_fields=3&stats_fields=7` would silently
+            // drop field 7's bounds and a second, misspelt `include` would
+            // be ignored rather than refused.
+            fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
             call.respond(
                 scan.planScan(
                     call.catalog(),
@@ -410,7 +414,7 @@ fun Application.installScanRoutes(scan: ScanService) {
                     call.table(),
                     call.longQuery("snapshot"),
                     call.instantQuery("at_timestamp"),
-                    parseScanStatsRequest(params["include"], params["stats_fields"]),
+                    parseScanStatsRequest(joined("include"), joined("stats_fields")),
                 ).map { it.toDto() },
             )
         }

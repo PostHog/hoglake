@@ -872,6 +872,14 @@ class FileStatsApiTest {
             // collapsed.
             assertThat(narrowed["column_stats"].map { it["field_id"].asLong() })
                 .containsExactlyElementsOf(listOf(ts, long).sorted())
+            // A REPEATED parameter is one list, not its first occurrence —
+            // otherwise the engine silently loses the second column's bounds.
+            val repeated =
+                body(
+                    client.get("$tablesUrl/narrowed/$statsScan&stats_fields=$ts&stats_fields=$long"),
+                ).scanFile(provided)
+            assertThat(repeated["column_stats"].map { it["field_id"].asLong() })
+                .containsExactlyElementsOf(listOf(ts, long).sorted())
             val tsEntry = narrowed["column_stats"].first { it["field_id"].asLong() == ts }
             assertThat(tsEntry["upper_bound"].asText()).isEqualTo("2026-09-05T23:59:59.999999")
 
@@ -952,6 +960,9 @@ class FileStatsApiTest {
             assertThat(unknown.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             assertThat(unknown.bodyAsText()).contains("column_stat").contains("column_stats")
             assertThat(client.get("$base?include=").status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            // ...including when it is the SECOND occurrence of the parameter.
+            assertThat(client.get("$base?include=column_stats&include=column_stat").status)
+                .isEqualTo(HttpStatusCode.UnprocessableEntity)
             // stats_fields alone would silently return no statistics.
             val orphan = client.get("$base?stats_fields=1")
             assertThat(orphan.status).isEqualTo(HttpStatusCode.UnprocessableEntity)

@@ -1,12 +1,12 @@
 package com.posthog.hoglake.service
 
-import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.DeleteFile
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.StatsState
 import com.posthog.hoglake.persistence.CatalogRepo
+import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
@@ -118,7 +118,7 @@ class ScanService(private val jdbi: Jdbi) {
               LEFT JOIN hog_delete_file dv
                 ON dv.catalog_id = df.catalog_id
                AND dv.data_file_id = df.data_file_id
-               AND ${visibleAt("dv")}
+               AND ${FileRepo.visibleAt("dv")}
               LEFT JOIN LATERAL (
                     SELECT array_agg(v.value ORDER BY v.key_index) AS partition_values
                       FROM hog_file_partition_value v
@@ -126,7 +126,7 @@ class ScanService(private val jdbi: Jdbi) {
                        AND v.data_file_id = df.data_file_id
                    ) pv ON true
              WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
-               AND ${visibleAt("df")}
+               AND ${FileRepo.visibleAt("df")}
              ORDER BY df.row_id_start, df.data_file_id
             """,
             )
@@ -190,30 +190,16 @@ class ScanService(private val jdbi: Jdbi) {
         }
 
     /**
-     * The versioned-row visibility predicate (invariant 6) for [alias] at
-     * `:snapshot` — one definition for the plan's files, their deletion
-     * vectors and the stats query, so the stats can never be read under
-     * different snapshot semantics than the files they belong to. The
-     * alias is a compile-time constant at every call site; no value is
-     * ever spliced in (invariant 9).
-     */
-    private fun visibleAt(alias: String): String =
-        "$alias.begin_snapshot <= :snapshot AND ($alias.end_snapshot IS NULL OR :snapshot < $alias.end_snapshot)"
-
-    /**
      * Attach each `provided` file's stats rows, resolved against the
      * columns visible at [at] exactly as GET .../files/{fileId}/stats
      * resolves them (same join, same omissions), so the two surfaces
      * answer identically for the same file and snapshot.
      *
-     * One stats query for the whole plan, not one per file. It re-applies
-     * the plan's own file-visibility predicate as a join rather than
-     * shipping the id list back as `IN (...)`: a large table's plan would
-     * otherwise bind one parameter per file, and the JDBC protocol caps a
-     * statement at 65535. The attachment is keyed off the plan, not the
-     * query: a file the hydrator flips to `provided` between the two
-     * statements was `pending` in the plan, and stays stat-less in it
-     * rather than contradicting its own stats_state.
+     * One stats query for the whole plan, not one per file
+     * ([FileRepo.providedColumnStatsAt]). The attachment is keyed off the
+     * plan, not the query: a file the hydrator flips to `provided` between
+     * the two statements was `pending` in the plan, and stays stat-less in
+     * it rather than contradicting its own stats_state.
      */
     private fun withColumnStats(
         h: Handle,
@@ -225,62 +211,12 @@ class ScanService(private val jdbi: Jdbi) {
     ): List<ScanFile> {
         if (files.none { it.dataFile.statsState == StatsState.PROVIDED }) return files
         val byFieldId = columnsByFieldId(TableRepo.columnsAt(h, catalogId, tableId, at))
-        val rowsByFile = providedColumnStats(h, catalogId, tableId, at, request.fieldIds)
+        val rowsByFile =
+            FileRepo.providedColumnStatsAt(h, catalogId, tableId, at, request.fieldIds)
         return files.map { file ->
             if (file.dataFile.statsState != StatsState.PROVIDED) return@map file
             val rows = rowsByFile[file.dataFile.dataFileId].orEmpty()
             file.copy(dataFile = file.dataFile.copy(columnStats = resolveColumnStats(rows, byFieldId)))
         }
-    }
-
-    /**
-     * The stats rows of every `provided` file visible at [snapshot],
-     * grouped by data file id, field-id order within each — narrowed to
-     * [fieldIds] when given. The narrowing is bound as ONE array
-     * parameter, however many field ids the engine names.
-     */
-    private fun providedColumnStats(
-        h: Handle,
-        catalogId: Long,
-        tableId: Long,
-        snapshot: Long,
-        fieldIds: Set<Long>?,
-    ): Map<Long, List<ColumnStats>> {
-        val fieldFilter = if (fieldIds == null) "" else "AND s.field_id = ANY(:fieldIds)"
-        val query =
-            h.createQuery(
-                """
-                SELECT s.data_file_id, s.field_id, s.value_count, s.null_count, s.nan_count,
-                       s.size_bytes, s.lower_bound, s.upper_bound
-                  FROM hog_data_file df
-                  JOIN hog_file_column_stats s
-                    ON s.catalog_id = df.catalog_id
-                   AND s.data_file_id = df.data_file_id
-                 WHERE df.catalog_id = :catalogId AND df.table_id = :tableId
-                   AND df.stats_state = 'provided'
-                   AND ${visibleAt("df")}
-                   $fieldFilter
-                 ORDER BY s.data_file_id, s.field_id
-                """,
-            )
-                .bind("catalogId", catalogId)
-                .bind("tableId", tableId)
-                .bind("snapshot", snapshot)
-        if (fieldIds != null) query.bindArray("fieldIds", Long::class.javaObjectType, fieldIds.toList())
-        return query
-            .map { rs, _ ->
-                rs.getLong("data_file_id") to
-                    ColumnStats(
-                        fieldId = rs.getLong("field_id"),
-                        valueCount = rs.getLong("value_count"),
-                        nullCount = rs.getLong("null_count"),
-                        nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
-                        sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
-                        lowerBound = rs.getBytes("lower_bound"),
-                        upperBound = rs.getBytes("upper_bound"),
-                    )
-            }
-            .list()
-            .groupBy({ it.first }, { it.second })
     }
 }
