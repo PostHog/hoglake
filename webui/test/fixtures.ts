@@ -15,6 +15,7 @@ import type {
   MaintenanceRunPage,
   MaintenanceStatus,
   Namespace,
+  PartitionValues,
   PartitionStatsResponse,
   ScanFile,
   SnapshotPage,
@@ -111,6 +112,30 @@ export const tableFixture: Table = {
       { source_field_id: "3", transform: "bucket", transform_param: 16 },
     ],
   },
+};
+
+/**
+ * The distinct stored values of tableFixture's partition fields, as
+ * GET .../partitions/values returns them. Matches the spec above:
+ * ts_day ordinals and url bucket indices, in the writer's stored strings.
+ */
+export const partitionValuesFixture: PartitionValues = {
+  spec_id: "1",
+  fields: [
+    {
+      source_field_id: "1",
+      transform: "day",
+      values: ["20697", "20698"],
+      truncated: false,
+    },
+    {
+      source_field_id: "3",
+      transform: "bucket",
+      transform_param: 16,
+      values: ["7", "12"],
+      truncated: false,
+    },
+  ],
 };
 
 /**

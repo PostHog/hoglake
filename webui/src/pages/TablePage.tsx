@@ -1,7 +1,7 @@
 import { Fragment, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { getFileStats, getTable, listFiles, planScan } from "../api/client";
+import { getFileStats, getPartitionValues, getTable, listFiles, planScan } from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
 import type {
@@ -10,6 +10,7 @@ import type {
   DecodedBound,
   Int64,
   PartitionSpec,
+  PartitionValues,
   ScanFile,
   SortField,
   SortSpec,
@@ -21,7 +22,7 @@ import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
 import { ClampedText } from "../components/ClampedText";
 import { CopyButton } from "../components/CopyButton";
-import { decodePartition, type PartitionDecode } from "../lib/partitions";
+import { decodePartition, decodeValue, type PartitionDecode } from "../lib/partitions";
 import {
   columnPath,
   formatBytes,
@@ -686,6 +687,68 @@ const FILE_SORT_WIRE: Record<FileSortKey, string> = {
 /** Files shown per page; "Load more" walks offsets in the current sort. */
 const FILE_PAGE_SIZE = 100;
 
+/**
+ * One dropdown per partition field, fed by GET .../partitions/values. The
+ * server returns the stored, transformed values (a day ordinal, an
+ * identity value); each is decoded for display exactly as the files
+ * table's partition column is, and echoed back verbatim as the filter.
+ * `key_index` is the field's position in the spec, which is what the
+ * `partition=key_index:value` query param addresses.
+ */
+function PartitionFilterBar({
+  spec,
+  values,
+  columns,
+  filter,
+  onChange,
+}: {
+  spec: PartitionSpec;
+  values: PartitionValues;
+  columns?: Column[];
+  filter: Record<number, string>;
+  onChange: (keyIndex: number, value: string) => void;
+}) {
+  const byFieldId = new Map(values.fields.map((f) => [String(f.source_field_id), f]));
+  return (
+    <div className="partition-filter">
+      {spec.fields.map((field, keyIndex) => {
+        const fieldValues = byFieldId.get(String(field.source_field_id));
+        const label =
+          field.transform === "identity"
+            ? (columnPath(columns, field.source_field_id) ?? `field_${field.source_field_id}`)
+            : `${columnPath(columns, field.source_field_id) ?? `field_${field.source_field_id}`}_${field.transform}`;
+        const current = filter[keyIndex] ?? "";
+        if (fieldValues?.truncated) {
+          // Over the distinct-value cap: a partial dropdown would mislead.
+          return (
+            <label key={keyIndex} className="partition-filter-field">
+              {label}
+              <span className="subtle">too many to list</span>
+            </label>
+          );
+        }
+        return (
+          <label key={keyIndex} className="partition-filter-field">
+            {label}
+            <select
+              value={current}
+              onChange={(e) => onChange(keyIndex, e.target.value)}
+              aria-label={`filter by ${label}`}
+            >
+              <option value="">all</option>
+              {(fieldValues?.values ?? []).map((v, i) => (
+                <option key={i} value={v ?? ""}>
+                  {decodeValue(field.transform, v, field.transform_param)}
+                </option>
+              ))}
+            </select>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 function FilesTab({
   catalog,
   namespace,
@@ -710,14 +773,31 @@ function FilesTab({
   // client sort would only order the loaded page.
   const [sort, setSort] = useState<SortState<FileSortKey> | null>(null);
   const onSort = (key: FileSortKey) => setSort((prev) => nextSort(prev, key));
+  // The active partition filter: key_index → the stored value to match.
+  // One value per key; a key set to "" is unfiltered. Changing it refetches
+  // from offset 0 via the query key.
+  const [partitionFilter, setPartitionFilter] = useState<Record<number, string>>({});
+  // The dropdown options, from the server. Only fetched for a partitioned
+  // table; the values are stored strings, echoed back verbatim on apply.
+  const valuesQuery = useQuery({
+    queryKey: ["partition-values", catalog, namespace, table, snapshot ?? "head"],
+    queryFn: () => getPartitionValues(catalog, namespace, table, snapshot),
+    enabled: (spec?.fields.length ?? 0) > 0,
+  });
+  const activeFilter = Object.fromEntries(
+    Object.entries(partitionFilter).filter(([, v]) => v !== ""),
+  );
   const query = useInfiniteQuery({
-    queryKey: ["files", catalog, namespace, table, snapshot ?? "head", sort],
+    queryKey: ["files", catalog, namespace, table, snapshot ?? "head", sort, activeFilter],
     queryFn: ({ pageParam }) =>
       listFiles(catalog, namespace, table, snapshot, {
         sort: sort ? FILE_SORT_WIRE[sort.key] : undefined,
         order: sort ? (sort.desc ? "desc" : "asc") : undefined,
         limit: FILE_PAGE_SIZE,
         offset: pageParam,
+        partition: Object.fromEntries(
+          Object.entries(activeFilter).map(([k, v]) => [Number(k), v]),
+        ),
       }),
     initialPageParam: 0,
     // A full page means there may be more; the next offset is the count
@@ -748,6 +828,17 @@ function FilesTab({
     .map((file) => ({ file, partition: decodePartition(file, spec, columns) }));
   return (
     <>
+      {partitioned && valuesQuery.data && (
+        <PartitionFilterBar
+          spec={spec!}
+          values={valuesQuery.data}
+          columns={columns}
+          filter={partitionFilter}
+          onChange={(keyIndex, value) =>
+            setPartitionFilter((prev) => ({ ...prev, [keyIndex]: value }))
+          }
+        />
+      )}
       <table className="data-table">
         <thead>
           <tr>

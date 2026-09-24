@@ -21,6 +21,8 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NamespaceInfo
+import com.posthog.hoglake.model.PartitionFieldValues
+import com.posthog.hoglake.model.PartitionValues
 import com.posthog.hoglake.model.ScanFile
 import com.posthog.hoglake.model.Snapshot
 import com.posthog.hoglake.model.StatsState
@@ -493,6 +495,42 @@ fun DataFile.toDto() =
         orderingBounds = orderingBounds?.toDto(),
         columnStats = columnStats?.map { it.toScanDto() },
     )
+
+// ---- distinct partition values (filter-by-partition dropdown) ----------------
+
+/**
+ * GET .../tables/{t}/partitions/values — one partition field with the
+ * distinct stored values it takes across the table's live files. `values`
+ * are the TRANSFORMED strings the writer stored, returned verbatim so the
+ * caller can echo one back as a `partition=key_index:value` filter with no
+ * encoding on either side; the caller decodes them for display exactly as
+ * it does the files table's partition column. `truncated` marks a field
+ * whose cardinality exceeded the cap, so a partial list is never mistaken
+ * for the whole set.
+ */
+data class PartitionFieldValuesDto(
+    val sourceFieldId: Long,
+    val transform: String,
+    val transformParam: Int? = null,
+    val values: List<String?>,
+    val truncated: Boolean,
+)
+
+data class PartitionValuesDto(
+    val specId: Long,
+    val fields: List<PartitionFieldValuesDto>,
+)
+
+fun PartitionFieldValues.toDto() =
+    PartitionFieldValuesDto(
+        sourceFieldId = sourceFieldId,
+        transform = transform.wire,
+        transformParam = transformParam,
+        values = values,
+        truncated = truncated,
+    )
+
+fun PartitionValues.toDto() = PartitionValuesDto(specId, fields.map { it.toDto() })
 
 // ---- per-file column statistics (decoded bounds) ---------------------------
 

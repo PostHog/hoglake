@@ -440,6 +440,32 @@ data class PartitionSpec(
     val fields: List<PartitionFieldDef>,
 )
 
+/**
+ * One partition field with the distinct stored values it takes across a
+ * table's live files — the building block of a "filter by partition" UI.
+ * [values] are the TRANSFORMED strings the writer stored (a day ordinal,
+ * a bucket index, an identity value), capped at [PARTITION_VALUES_CAP]
+ * and ordered most-frequent first; [truncated] marks a field whose
+ * cardinality exceeded the cap, so the UI renders "too many to list"
+ * rather than a misleading partial dropdown.
+ */
+data class PartitionFieldValues(
+    val sourceFieldId: Long,
+    val transform: Transform,
+    val transformParam: Int?,
+    val values: List<String?>,
+    val truncated: Boolean,
+)
+
+data class PartitionValues(
+    val specId: Long,
+    val fields: List<PartitionFieldValues>,
+) {
+    companion object {
+        const val PARTITION_VALUES_CAP = 500
+    }
+}
+
 /** Sort direction for one sort-spec field (hog_sort_field.direction). */
 enum class SortDirection {
     ASC,

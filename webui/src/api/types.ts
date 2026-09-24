@@ -237,6 +237,29 @@ export interface PartitionSpec {
   fields: PartitionField[];
 }
 
+/**
+ * One partition field with the distinct stored values it takes across a
+ * table's live files — what feeds a filter-by-partition dropdown. `values`
+ * are the TRANSFORMED strings the writer stored (a day ordinal, a bucket
+ * index, an identity value); the page decodes them for display exactly as
+ * it does the files table's partition column, and echoes one back as a
+ * `partition=key_index:value` filter. `truncated` marks a field whose
+ * cardinality exceeded the cap, so a partial list is never mistaken for
+ * the whole set.
+ */
+export interface PartitionFieldValues {
+  source_field_id: Int64;
+  transform: PartitionTransform;
+  transform_param?: number;
+  values: (string | null)[];
+  truncated: boolean;
+}
+
+export interface PartitionValues {
+  spec_id: Int64;
+  fields: PartitionFieldValues[];
+}
+
 export type SortDirection = "asc" | "desc";
 export type NullOrder = "nulls_first" | "nulls_last";
 

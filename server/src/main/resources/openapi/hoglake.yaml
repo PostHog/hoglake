@@ -528,6 +528,20 @@ paths:
           required: false
           description: Rows to skip; use with `limit` to page. Defaults to 0.
           schema: { type: integer, minimum: 0 }
+        - name: partition
+          in: query
+          required: false
+          description: >
+            Restrict to files in one partition, as `key_index:value` where
+            key_index is the field's position in the table's partition spec
+            (0-based) and value is the STORED, transformed string exactly as
+            GET .../partitions/values returns it (a day ordinal, a bucket
+            index, an identity value). Repeatable; multiple params AND
+            together. The match is plain string equality — the server never
+            encodes — so the value must come from /partitions/values (or a
+            file's own partition_values), never a typed date or number.
+          explode: true
+          schema: { type: array, items: { type: string } }
       responses:
         "200":
           description: >
@@ -540,6 +554,35 @@ paths:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/DataFile" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "422": { $ref: "#/components/responses/Validation" }
+
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/values:
+    get:
+      operationId: getPartitionValues
+      summary: Distinct stored values per partition field, for a filter-by-partition UI
+      description: >
+        The partition fields of the table at the read snapshot, each with
+        the distinct STORED, transformed values it takes across the live
+        files (most-frequent first, capped at 500; `truncated` marks a
+        field whose cardinality exceeded the cap). Values are returned
+        verbatim — the server never decodes them. A client offers them as
+        a filter and echoes one back as `partition=key_index:value` on
+        GET .../files; it decodes them for display exactly as it does the
+        files table's partition column.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
+      responses:
+        "200":
+          description: Partition fields with their distinct stored values.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionValues" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
 
@@ -2973,6 +3016,36 @@ components:
         fields:
           type: array
           items: { $ref: "#/components/schemas/PartitionField" }
+
+    PartitionFieldValues:
+      type: object
+      required: [source_field_id, transform, values, truncated]
+      description: >
+        One partition field with the distinct stored values it takes
+        across a table's live files. `values` are the TRANSFORMED strings
+        the writer stored, returned verbatim so the caller can echo one
+        back as `partition=key_index:value` with no encoding on either
+        side; `truncated` marks a field whose cardinality exceeded the cap,
+        so a partial list is never mistaken for the whole set.
+      properties:
+        source_field_id: { type: integer, format: int64 }
+        transform:
+          type: string
+          enum: [identity, bucket, year, month, day, hour]
+        transform_param: { type: integer }
+        values:
+          type: array
+          items: { type: [string, "null"] }
+        truncated: { type: boolean }
+
+    PartitionValues:
+      type: object
+      required: [spec_id, fields]
+      properties:
+        spec_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionFieldValues" }
 
     SortField:
       type: object

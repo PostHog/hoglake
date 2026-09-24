@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import {
@@ -6,6 +6,7 @@ import {
   filesFixture,
   longCommentTableFixture,
   notFoundError,
+  partitionValuesFixture,
   scanFixture,
   sortedFilesFixture,
   sortedTableFixture,
@@ -22,6 +23,7 @@ function happyHandler(url: string): Response | undefined {
   if (path === base) return jsonResponse(tableFixture);
   if (path === `${base}/files`) return jsonResponse(filesFixture);
   if (path === `${base}/scan`) return jsonResponse(scanFixture);
+  if (path === `${base}/partitions/values`) return jsonResponse(partitionValuesFixture);
   return undefined;
 }
 
@@ -178,21 +180,26 @@ describe("TablePage", () => {
     // The word the pill used to carry is gone from the table.
     expect(screen.queryByText("provided")).not.toBeInTheDocument();
 
-    // partition_values render when present, em-dash when absent.
+    // partition_values render when present, em-dash when absent. Scoped
+    // to the files table: the partition filter's dropdown decodes the
+    // same stored values to the same display strings, so a bare
+    // getByText("2026-09-01") now matches an <option> too.
+    const filesTable = screen.getByRole("table");
+    const inTable = (text: string) => within(filesTable).getByText(text);
     // Decoded against the spec rather than shown as a raw tuple: the day
     // ordinal 20697 is a date, and 7 is a bucket index, not a value.
-    expect(screen.getByText("2026-09-01")).toBeInTheDocument();
-    expect(screen.getByText("bucket 7/16")).toBeInTheDocument();
-    expect(screen.getByText("2026-09-02")).toBeInTheDocument();
+    expect(inTable("2026-09-01")).toBeInTheDocument();
+    expect(inTable("bucket 7/16")).toBeInTheDocument();
+    expect(inTable("2026-09-02")).toBeInTheDocument();
     // A null element stays visible rather than collapsing the tuple.
-    expect(screen.getByText("null")).toBeInTheDocument();
+    expect(inTable("null")).toBeInTheDocument();
     // Field names come from the spec, carrying the transform: "ts_day",
     // not a bare "ts" that would suggest the column holds a date.
-    expect(screen.getAllByText("ts_day").length).toBeGreaterThan(0);
+    expect(within(filesTable).getAllByText("ts_day").length).toBeGreaterThan(0);
     // The WHOLE cell, separator included. Asserting the parts
     // individually is what let a missing separator ship: every value was
     // present and the rendering still read "team_id=42ts_day=…".
-    const cell = screen.getAllByText("ts_day")[0].closest("td");
+    const cell = within(filesTable).getAllByText("ts_day")[0].closest("td");
     expect(cell?.textContent).toBe("ts_day=2026-09-01 / url_bucket=bucket 7/16");
   });
 
@@ -292,6 +299,55 @@ describe("TablePage", () => {
     expect(screen.getByText("1,250")).toBeInTheDocument();
     // The file without a DV shows "none".
     expect(screen.getByText("none")).toBeInTheDocument();
+  });
+
+  it("renders a partition filter dropdown per field, decoded for display", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    await screen.findByText("101");
+
+    // One dropdown per partition field, labelled with the transform:
+    // ts_day and url_bucket (matching the spec and the files column).
+    const daySelect = await screen.findByRole("combobox", { name: "filter by ts_day" });
+    expect(daySelect).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "filter by url_bucket" })).toBeInTheDocument();
+
+    // Options are decoded for display: the stored day ordinal is a date,
+    // the bucket index reads as a bucket. "all" is the empty (unfiltered) value.
+    expect(screen.getByRole("option", { name: "2026-09-01" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "2026-09-02" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "bucket 7/16" })).toBeInTheDocument();
+    expect(screen.getByRole("option", { name: "bucket 12/16" })).toBeInTheDocument();
+  });
+
+  it("filtering by a partition echoes the stored value and refetches", async () => {
+    const fetchMock = mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    const daySelect = await screen.findByRole("combobox", { name: "filter by ts_day" });
+
+    // Pick day 20697: the request carries partition=0:20697 verbatim
+    // (the stored string, not a decoded date).
+    await user.selectOptions(daySelect, "20697");
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("partition=0%3A20697"),
+        expect.anything(),
+      ),
+    );
+
+    // And it refetches from offset 0 (the filter changed).
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringContaining("offset=0"),
+        expect.anything(),
+      ),
+    );
   });
 
   it("drives ?snapshot through the selector (time travel)", async () => {

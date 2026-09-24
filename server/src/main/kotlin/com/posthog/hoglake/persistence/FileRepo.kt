@@ -90,6 +90,7 @@ object FileRepo {
         desc: Boolean = false,
         limit: Int? = null,
         offset: Int = 0,
+        partitionFilter: Map<Int, String> = emptyMap(),
     ): List<DataFile> {
         val dir = if (desc) "DESC" else "ASC"
         val orderBy =
@@ -101,20 +102,42 @@ object FileRepo {
                 "${sort.sql} $dir, data_file_id ASC"
             }
         val paging = if (limit == null) "" else "LIMIT :limit OFFSET :offset"
-        return handle.createQuery(
-            """
-            SELECT $COLUMNS
-            FROM hog_data_file f
-            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
-              AND f.begin_snapshot <= :snapshot
-              AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)
-            ORDER BY $orderBy
-            $paging
-            """,
-        )
-            .bind("catalogId", catalogId)
-            .bind("tableId", tableId)
-            .bind("snapshot", snapshot)
+        // One EXISTS per requested (key_index, value): the values are the
+        // stored, transformed strings the writer produced, so the match is
+        // plain string equality — the server never encodes. Multiple keys
+        // AND together; an unset key is unconstrained.
+        val partitionWhere =
+            partitionFilter.entries
+                .sortedBy { it.key }
+                .mapIndexed { i, (keyIndex, _) ->
+                    """EXISTS (SELECT 1 FROM hog_file_partition_value pfv$i
+                        WHERE pfv$i.catalog_id = f.catalog_id
+                          AND pfv$i.data_file_id = f.data_file_id
+                          AND pfv$i.key_index = :pk$i
+                          AND pfv$i.value = :pv$i)"""
+                }
+                .joinToString("\n              AND ")
+                .let { if (it.isEmpty()) "" else "\n              AND $it" }
+        val query =
+            handle.createQuery(
+                """
+                SELECT $COLUMNS
+                FROM hog_data_file f
+                WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+                  AND f.begin_snapshot <= :snapshot
+                  AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)$partitionWhere
+                ORDER BY $orderBy
+                $paging
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bind("snapshot", snapshot)
+        partitionFilter.entries.sortedBy { it.key }.forEachIndexed { i, (keyIndex, value) ->
+            query.bind("pk$i", keyIndex)
+            query.bind("pv$i", value)
+        }
+        return query
             .apply {
                 if (limit != null) {
                     bind("limit", limit)
@@ -124,6 +147,46 @@ object FileRepo {
             .map(fileMapper)
             .list()
     }
+
+    /**
+     * The distinct stored values of one partition key across the table's
+     * live files at [snapshot], most-frequent first, capped at [cap]. These
+     * are the TRANSFORMED strings the writer stored — returned verbatim so
+     * a caller can offer them as a filter and echo one back unchanged.
+     * [cap] keeps a high-cardinality key (150k teams) from shipping a
+     * dropdown that cannot be used; the caller renders "too many to list"
+     * when the result hits it.
+     */
+    fun distinctPartitionValues(
+        handle: Handle,
+        catalogId: Long,
+        tableId: Long,
+        snapshot: Long,
+        keyIndex: Int,
+        cap: Int,
+    ): List<String?> =
+        handle.createQuery(
+            """
+            SELECT pv.value, COUNT(*) AS n
+            FROM hog_data_file f
+            JOIN hog_file_partition_value pv
+              ON pv.catalog_id = f.catalog_id AND pv.data_file_id = f.data_file_id
+            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
+              AND f.begin_snapshot <= :snapshot
+              AND (f.end_snapshot IS NULL OR :snapshot < f.end_snapshot)
+              AND pv.key_index = :keyIndex
+            GROUP BY pv.value
+            ORDER BY n DESC, pv.value
+            LIMIT :cap
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("snapshot", snapshot)
+            .bind("keyIndex", keyIndex)
+            .bind("cap", cap)
+            .map { rs, _ -> rs.getString("value") }
+            .list()
 
     /**
      * One file by id, IF it belongs to [tableId] and is visible at
