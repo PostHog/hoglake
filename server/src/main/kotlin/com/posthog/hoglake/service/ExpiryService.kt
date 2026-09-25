@@ -104,12 +104,12 @@ class ExpiryService(private val jdbi: Jdbi) {
          * [DATA_FILE_EXPIRY_SQL] would cascade those away without
          * queueing them.
          *
-         * NO INDEX SERVES THIS, and V18 deliberately does not add one.
+         * NO INDEX SERVES THIS, and V19 deliberately does not add one.
          * The predicate is an `OR` whose second arm is a correlated
          * `EXISTS` over hog_data_file; the planner reads that as one
          * pass and never chooses a `(catalog_id, end_snapshot)` index
          * for the first arm, so an index built for it would be paid on
-         * every write and used by nothing (V18's header carries the
+         * every write and used by nothing (V19's header carries the
          * measurement). Splitting the statement into its two arms is
          * what would make an index choosable, and that is a change to
          * the sweep's behaviour, ticketed separately.
@@ -136,13 +136,13 @@ class ExpiryService(private val jdbi: Jdbi) {
          * SWEEP STEP 2, the data-file arm, `internal` for the same
          * reason.
          *
-         * THE STATEMENT V18 EXISTS FOR. `end_snapshot` appears in no
-         * index's leading columns before V18 — `hog_data_file_live` is
+         * THE STATEMENT V19 EXISTS FOR. `end_snapshot` appears in no
+         * index's leading columns before V19 — `hog_data_file_live` is
          * partial on its COMPLEMENT — so this was a sequential scan of
          * the whole manifest, inside the sweep transaction, under the
          * per-catalog commit lock. `hog_data_file_ended (catalog_id,
          * end_snapshot) WHERE end_snapshot IS NOT NULL` is exactly this
-         * predicate, and `V18DataFileEndedIndexMigrationIntegrationTest`
+         * predicate, and `V19DataFileEndedIndexMigrationIntegrationTest`
          * EXPLAINs THIS string before and after the migration.
          */
         internal const val DATA_FILE_EXPIRY_SQL: String =

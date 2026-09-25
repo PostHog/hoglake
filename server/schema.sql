@@ -319,7 +319,7 @@ CREATE INDEX hog_data_file_live
 CREATE INDEX hog_data_file_pending
     ON hog_data_file (catalog_id, data_file_id)
     WHERE stats_state = 'pending';
--- V18: ExpiryService's data-file DELETE (`end_snapshot IS NOT NULL AND
+-- V19: ExpiryService's data-file DELETE (`end_snapshot IS NOT NULL AND
 -- end_snapshot <= floor`), which was a sequential scan of the whole
 -- manifest inside the sweep transaction, under the per-catalog commit
 -- lock. PARTIAL on the complement of `hog_data_file_live`: an appended
@@ -328,7 +328,7 @@ CREATE INDEX hog_data_file_pending
 -- is only the rows expiry is looking for (~10 bytes each after
 -- deduplication). No matching index on hog_delete_file: expiry's DV arm
 -- is an OR with a correlated EXISTS and the planner never chooses one
--- (V18's header has the measurement and the ticket).
+-- (V19's header has the measurement and the ticket).
 CREATE INDEX hog_data_file_ended
     ON hog_data_file (catalog_id, end_snapshot)
     WHERE end_snapshot IS NOT NULL;
