@@ -1302,11 +1302,45 @@ data class HydratorSweepResult(
 
 /** One cleanup drain's outcome. */
 data class CleanupResult(
+    /**
+     * Queue ROWS settled `'deleted'`. Not a count of objects: two
+     * undrained rows over one path are legitimate state (nothing makes a
+     * file path unique — see V16), and one batched delete settles both.
+     * [objectsRemoved] is the physical count.
+     */
     val removed: Long,
+    /** Queue rows settled `'absent'` — staging tickets only, since every
+     *  other reason drains through a batched delete that cannot report a
+     *  key that was not there. */
     val missing: Long,
     /** Entries skipped because the path is still referenced — an
      *  invariant violation worth alerting on, never a deletion. */
     val stillReferenced: Long,
+    /**
+     * DISTINCT paths whose object this run physically deleted — what
+     * `hoglake_files_removed_total` counts, and one `file_deleted` audit
+     * event each. Always <= [removed].
+     *
+     * Defaulted, and `@JsonInclude(NON_DEFAULT)` for the stored-payload
+     * rule: the maintenance ledger holds rows an older replica wrote and
+     * a rolling deploy has both versions replaying each other's, so a
+     * counter that postdates a row must be absent from it rather than
+     * asserted as zero.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val objectsRemoved: Long = 0,
+    /**
+     * Rows dropped from a sub-batch because they were already settled
+     * between this run's batch select and the sub-batch's lock — a
+     * compaction group's commit settling its own staging ticket
+     * `'registered'`, which is that group committing normally. Not a
+     * failure, and deliberately NOT a `still_referenced` violation,
+     * which is what it used to be counted as.
+     *
+     * Defaulted and NON_DEFAULT for the same reason as [objectsRemoved].
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val settledElsewhere: Long = 0,
 )
 
 // ---- the maintenance run ledger (hog_maintenance_run) ---------------------

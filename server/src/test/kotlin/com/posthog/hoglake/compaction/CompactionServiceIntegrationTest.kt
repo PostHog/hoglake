@@ -85,7 +85,17 @@ class CompactionServiceIntegrationTest {
     // (2 x ~800B < 2048 < 3 x ~800B), so groups still contain all three.
     private val cfg = CompactionConfig(targetBytes = 8192, minInputFiles = 2, maxGroupsPerRun = 10)
     private val svc by lazy { CompactionService(db.jdbi, store, cfg) }
-    private val cleanup by lazy { CleanupService(db.jdbi, removalStore) }
+
+    /**
+     * No staging grace: these tests reclaim a `compaction_staging`
+     * ticket seconds after the group that staged it, which is exactly
+     * what HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS (1 h in production)
+     * makes the drain wait for. The grace protects a ticket whose group
+     * may still be uploading; here the group's fate is already decided
+     * by the time the drain runs, so the fixture says so rather than
+     * moving clocks.
+     */
+    private val cleanup by lazy { CleanupService(db.jdbi, removalStore, stagingGraceSeconds = 0) }
 
     private companion object {
         /**

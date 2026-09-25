@@ -542,9 +542,31 @@ export interface ExpiryResult {
 }
 
 export interface CleanupResult {
+  /**
+   * Queue ROWS settled 'deleted' — not objects. Two undrained removal
+   * rows over one path are legitimate state and one batched delete
+   * settles both, so this can exceed objects_removed.
+   */
   removed: Int64;
   missing: Int64;
   still_referenced: Int64;
+  /**
+   * DISTINCT paths physically deleted — what hoglake_files_removed_total
+   * counts.
+   *
+   * OPTIONAL although the server fills it in on read, for the same
+   * reason offsets_released and invalid_data are: a rolling deploy can
+   * serve this page from a build that predates the normalization, and
+   * the ledger holds rows written before the counter existed. Guard
+   * with `positive()`, which is undefined-safe.
+   */
+  objects_removed?: Int64;
+  /**
+   * Rows another writer had already settled when the sub-batch took the
+   * commit lock — a compaction group settling its own staging ticket
+   * 'registered'. Normal, not a failure. Optional for the same reason.
+   */
+  settled_elsewhere?: Int64;
 }
 
 export interface CompactionResult {

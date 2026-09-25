@@ -219,7 +219,43 @@ there would break that gate on every build.
    with an undrained row (path-reuse guard), drain sub-batches run
    under the per-catalog commit lock, and compaction pre-registers its
    output path as a `compaction_staging` claim settled
-   `'registered'` on group commit.
+   `'registered'` on group commit. A bulk sub-batch is
+   `HOGLAKE_CLEANUP_SUB_BATCH` rows (1,000) and one `DeleteObjects`
+   call PER BUCKET CHUNK (1,000 keys is S3's own request ceiling) — not
+   the 25 x (HeadObject + DeleteObject) it was, where one hold ran
+   ~3.2 s and a 2,000-row run spent ~255 s holding the lock across 80
+   slices, took commit latency from 200-400 ms to 12-22 s against the
+   30 s admission bound, and got both API pods liveness-killed. The
+   lock is still what serializes check-then-delete against the commit
+   tail; what changed is that holding it is cheap. `'absent'` is now
+   PRODUCED only by `compaction_staging` rows — it also remains on
+   every row settled before the change, which the 30-day ledger keeps
+   visible — and those rows keep HeadObject + DeleteObject because
+   `/verify`'s `staging_tickets` arm reads that outcome. Because they
+   cost two round trips each they drain in their OWN sub-batches of 25.
+   A hold is bounded in TIME, not in calls — each call may take a whole
+   `RemovalStore.apiCallTimeout`, so 25 probe pairs could otherwise
+   reach 500 s and a three-chunk bulk sub-batch 30 s: the deadline is
+   `hold <= HOLD_BUDGET + one call <= the idle-in-transaction bound`
+   (20 s + 10 s <= 30 s), all derived from
+   `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the effective
+   `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`. Past the idle bound Postgres kills
+   the backend and the sub-batch rolls back with its objects already
+   deleted, forever. Rows a deadline stops short of are left untouched
+   for the next hold. Typical is nowhere near it: ~64 ms for a
+   one-request bulk hold, ~3.2 s for 25 probe pairs. And the drain
+   leaves a staging row
+   alone until it is past `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h,
+   which must stay well under `/verify`'s 6 h staging-ticket age) so a
+   ticket whose group is still uploading is not settled out from under
+   it. The first statement under the lock RE-CHECKS that each row is
+   still undrained, because a compaction commit can settle one between
+   the batch select and the lock, and treating that as a
+   `still_referenced` violation alerts on a group committing normally;
+   both ledger writes are fenced on `drained_at IS NULL` as the
+   backstop. `hoglake_files_removed_total` counts DISTINCT paths
+   (`objects_removed`), not the settled rows, which a duplicate path
+   makes two of.
 5. **Expiry never passes head or (when `consumer_floor`) the min
    consumer offset**, and names the pinning consumer. Ranges below
    `earliest_snapshot_id` are 410 Gone — consumers reconcile, never

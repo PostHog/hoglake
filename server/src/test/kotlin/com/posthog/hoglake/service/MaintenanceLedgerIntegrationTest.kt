@@ -188,6 +188,56 @@ class MaintenanceLedgerIntegrationTest {
             )
     }
 
+    @Test
+    fun `a pre-upgrade cleanup row is returned with the counters it predates`() {
+        // The compaction twin above, for the cleanup counters. A row
+        // written before objects_removed and settled_elsewhere existed
+        // has neither, and both are NON_DEFAULT on the stored model, so
+        // even a row this build wrote omits a zero. The schema declares
+        // them optional for exactly that reason, and the read path fills
+        // 0 (CLEANUP_COUNTERS_ADDED_LATER) so a client's zero is a fact
+        // and not a guess.
+        val catalogId = seedCatalog("led-preupgrade-cleanup")
+        val stored = """{"removed":7,"missing":1,"still_referenced":0}"""
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_maintenance_run
+                    (catalog_id, task, run_trigger, started_at, finished_at, status, result)
+                VALUES (:catalogId, 'cleanup', 'loop', now(), now(), 'ok', CAST(:result AS jsonb))
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("result", stored)
+                .execute()
+        }
+        // Absent on the way in — otherwise this passes for the wrong reason.
+        val raw = json.readTree(ledgerRows("led-preupgrade-cleanup").single().result)
+        assertThat(raw.has("objects_removed")).isFalse()
+        assertThat(raw.has("settled_elsewhere")).isFalse()
+
+        val run =
+            jdbi.withHandleUnchecked { h ->
+                MaintenanceRunStore(jdbi).history(h, catalogId, null, null, 10)
+            }.single()
+        val result = wireObjectMapper().valueToTree<JsonNode>(run.toDto())["result"]
+        assertThat(result["objects_removed"].asLong())
+            .describedAs("normalized on READ; the counter did not exist, so nothing it counts happened")
+            .isZero()
+        assertThat(result["settled_elsewhere"].asLong()).isZero()
+        // Everything the row did carry survives untouched.
+        assertThat(result["removed"].asLong()).isEqualTo(7)
+        assertThat(result["missing"].asLong()).isEqualTo(1)
+        assertThat(result.fieldNames().asSequence().toList())
+            .containsExactlyInAnyOrder(
+                "removed",
+                "missing",
+                "still_referenced",
+                "objects_removed",
+                "settled_elsewhere",
+            )
+    }
+
     private fun ledgerRows(catalog: String): List<LedgerRow> =
         jdbi.withHandleUnchecked { h ->
             h.createQuery(

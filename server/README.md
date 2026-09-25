@@ -424,15 +424,78 @@ Physical deletion is decoupled and paranoid
 time every path is re-checked against live references — a
 still-referenced path is skipped and counted as an **invariant
 violation** (alertable), never deleted. Missing objects count as done.
-S3 deletes run in sub-batches (25 paths) whose ledger updates commit
-independently, so a mid-drain failure never rolls back completed work
-— and each sub-batch's check-then-delete pair runs **under the
-per-catalog commit lock**, paired with commit's refusal to register a
-path that has an undrained removal row: the two sides together make
-delete-under-path-reuse structurally impossible (the liveness answer
-can't go stale between check and delete, and a new commit can't slip a
-live file under a queued path). The lock hold is bounded — sub-batch
-size × one S3 round-trip — which is why the sub-batch is kept small.
+S3 deletes run in sub-batches (`HOGLAKE_CLEANUP_SUB_BATCH`, 1,000
+paths) whose ledger updates commit independently, so a mid-drain
+failure never rolls back completed work — and each sub-batch's
+check-then-delete pair runs **under the per-catalog commit lock**,
+paired with commit's refusal to register a path that has an undrained
+removal row: the two sides together make delete-under-path-reuse
+structurally impossible (the liveness answer can't go stale between
+check and delete, and a new commit can't slip a live file under a
+queued path).
+
+A bulk sub-batch's deletes are one `DeleteObjects` call **per bucket
+chunk** — 1,000 keys is S3's own ceiling on one request, which is where
+the default sub-batch comes from — rather than the
+`25 x (HeadObject + DeleteObject)` it used to be. That old shape held
+the lock ~3.2 s per sub-batch and ~255 s per 2,000-row run, which took
+commit latency on gigahog-prod-us from 200-400 ms to 12-22 s against a
+30 s admission bound and got both API pods liveness-killed. What scales
+the hold is the number of REQUESTS, not the sub-batch: keys past 1,000,
+or spread across buckets, chunk into more requests inside the same hold,
+so raising the knob past the ceiling buys nothing.
+
+`reason = 'compaction_staging'` rows are the carve-out, on three
+counts. They keep HeadObject + DeleteObject, because a `DeleteObjects`
+response cannot distinguish a key it removed from one that was never
+there and `/verify`'s `staging_tickets` check reads exactly that
+distinction as `'absent'`. Because that costs two round trips per row,
+they drain in their OWN sub-batches of 25, so a run that is all staging
+tickets cannot put 1,000 probes inside one hold.
+And the drain leaves them alone until they are past
+`HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h), because the ticket is
+inserted before the rewrite starts and settling a fresh one while its
+group is still uploading leaves the object with no ticket naming it;
+that grace plus the cleanup interval has to stay well under
+`/verify`'s 6 h staging-ticket age, or the check alerts on tickets the
+drain is deliberately leaving alone. Every other reason settles
+`'deleted'`, whether or not the key was there.
+
+The hold is bounded in TIME as well as in calls, and the time bound is
+the one that matters: each call may take a whole
+`RemovalStore.apiCallTimeout`, so 25 probe pairs could reach 500 s and a
+three-chunk bulk sub-batch 30 s. A sub-batch therefore carries a
+deadline —
+
+    hold <= HOLD_BUDGET + one call <= idle_in_transaction_session_timeout
+
+(20 s + 10 s <= 30 s at the defaults) — checked before every
+object-store call, with a whole call bound of headroom so the last call
+it starts cannot run past the idle bound. All three numbers are derived
+from `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the effective
+`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so lowering
+the admission bound lowers the call bound with it. Past the idle bound
+Postgres kills the backend: the sub-batch rolls back with its objects
+already deleted and its ledger rows unsettled, and the next run does the
+same thing again. Rows a deadline stops short of are left exactly as
+found — no settle, no `attempts` bump — and are the next hold's work.
+Typical holds are nowhere near the budget: ~64 ms for a one-request bulk
+sub-batch, ~3.2 s for 25 probe pairs.
+
+Two writers can settle a `hog_file_removal` row: this drain, and a
+compaction group's commit settling its own staging ticket
+`'registered'`. The batch select runs outside the lock, so the first
+statement under it re-checks that each row is still undrained and drops
+the ones that are not — without that, a group committing normally
+arrives at the reference check as a `still_referenced` invariant
+violation, with an alert and an `attempts` bump on a settled row. Both
+ledger writes carry `drained_at IS NULL` as the backstop for a settle
+that lands inside the hold itself.
+
+`hoglake_files_removed_total` counts `objects_removed` — DISTINCT paths
+physically deleted — and not `removed`, which counts ledger rows: two
+undrained rows over one path are legitimate state and one batched
+delete settles both.
 
 Draining **soft-deletes**: a settled `hog_file_removal` row keeps its
 place with `drained_at` + `drained_outcome` (`'deleted'` for a

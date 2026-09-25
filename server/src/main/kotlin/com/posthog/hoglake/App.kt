@@ -93,8 +93,10 @@ class App private constructor(
         CleanupService(
             jdbi,
             removalStore,
+            subBatchSize = cfg.cleanupSubBatchSize,
             ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
             maintenanceLedgerRetentionSeconds = cfg.maintenanceLedgerRetentionSeconds,
+            stagingGraceSeconds = cfg.cleanupStagingGraceSeconds,
         )
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */

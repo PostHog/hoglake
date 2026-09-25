@@ -86,6 +86,8 @@ const INT64_FIELDS = new Set([
   "removed",
   "missing",
   "still_referenced",
+  "objects_removed",
+  "settled_elsewhere",
   "groups_compacted",
   "files_in",
   "files_out",

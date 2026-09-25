@@ -372,6 +372,7 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
             )
                 .bind("catalogId", catalogId)
                 .bind("limit", CleanupService.SUB_BATCH)
+                .bind("stagingGraceSeconds", CleanupService.STAGING_GRACE_SECONDS.toDouble())
                 .mapTo(String::class.java).list().joinToString("\n")
         }
 
@@ -725,6 +726,7 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
                     )
                         .bind("catalogId", cat)
                         .bind("limit", CleanupService.SUB_BATCH)
+                        .bind("stagingGraceSeconds", CleanupService.STAGING_GRACE_SECONDS.toDouble())
                         .mapTo(String::class.java).list().joinToString("\n")
                 }
             assertThat(scannedIndex(plan))
@@ -865,9 +867,9 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
                 }
             assertThat(undrained)
                 .describedAs(
-                    "two undrained rows over one path are legitimate state; the drain settles " +
-                        "the first 'deleted' and the second 'absent', because the queue is a " +
-                        "suggestion and never an authorization",
+                    "two undrained rows over one path are legitimate state; one batched " +
+                        "delete settles both 'deleted', because the queue is a suggestion and " +
+                        "never an authorization",
                 )
                 .isEqualTo(2)
         }
