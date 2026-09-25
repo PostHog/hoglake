@@ -415,6 +415,62 @@ there would break that gate on every build.
     measurement rather than on analogy. What makes a concurrent build
     safe to deploy, and what still cannot make it safe on its own, is
     the CIC rule above.
+  - **`hog_data_file_ended (catalog_id, end_snapshot) WHERE end_snapshot
+    IS NOT NULL`** (V18, #193) is the third entry, and the one that
+    INVERTS V17's partial-index decision for a reason rather than a
+    preference. It serves `ExpiryService.DATA_FILE_EXPIRY_SQL` — the
+    sweep's data-file DELETE, which carries `end_snapshot IS NOT NULL
+    AND end_snapshot <= floor` and, before V18, matched NO index's
+    leading columns at all: `hog_data_file_live` is partial on the
+    COMPLEMENT of those rows, and everything else leads on ids or
+    paths. So the statement was a sequential scan of the whole
+    manifest, inside the sweep transaction, under the per-catalog
+    commit lock. Measured on a fixture with production's mostly-live
+    ratio (204,000 rows / 4,747 heap pages, 4,000 of them ended;
+    `V18DataFileEndedIndexMigrationIntegrationTest` runs the migration against
+    rows seeded BEFORE it and EXPLAINs the repo's own `internal`
+    constant) with the ended rows SCATTERED through the manifest, scan
+    node only: **4,445 buffers as a `Seq Scan` with `Rows Removed by
+    Filter: 198,000` -> 2,003 buffers as an `Index Scan using
+    hog_data_file_ended` with `Index Searches: 1` and nothing
+    filtered** — 2.2x at a 1.0% ended fraction.
+    THE SCATTER IS THE MEASUREMENT. An earlier draft clustered the
+    ended rows and read 91x, which was an artifact of insert order:
+    contiguous rows share heap pages. Production's ended rows are
+    wherever expiry and compaction left them, so the index path costs
+    roughly ONE HEAP BUFFER PER ENDED ROW and the win is
+    `seq pages / ended rows` — **2-6x at prod-us's standing 30-90k of
+    ~5.0M**, and a WASH right after a large batch of rows ends (measured at
+    300k scattered ended rows: 300,003 buffers with the index against
+    112,655 without, i.e. marginally slower). It is still the right
+    index, because the steady state is the low fraction and because a
+    sequential scan grows with the CATALOG while this grows with the
+    WORK. It also does NOT bound the row work: the RI triggers for the
+    three cascading children (~4 s per 300k rows against an EMPTY child
+    table) and the CTE's tuplestore spilling at `work_mem` 4 MB are the
+    dominant costs of that DELETE, and neither moves. PARTIAL here where V17's is not, because V17's
+    statement covers "any file row, live or not" while this one carries
+    `end_snapshot IS NOT NULL` in its own text — and the rows the
+    predicate excludes are the overwhelming majority (4.94M of
+    gigahog-prod-us's ~5.0M are live), so the index holds only the
+    ~30-90k ended rows at a measured 12 bytes each and AN APPENDED ROW
+    NEVER ENTERS IT. The hottest write in the system pays nothing,
+    which is the whole argument. Built `CONCURRENTLY` in V17's shape:
+    the build is a full heap scan whatever the index holds, so at
+    production size it is V17's 26-35 s and a plain build's SHARE lock
+    would block every commit for it — and the cold estimate is a FLOOR:
+    two heap passes over 1,491 MiB is ~24 s at an idle volume's
+    125 MB/s and 30-60 s on a busy one, against a 60 s session
+    statement bound. NO MATCHING INDEX ON
+    `hog_delete_file` — expiry's DV arm is an `OR` whose second arm is
+    a correlated `EXISTS` and the planner never chooses one for it, so
+    an index there would be paid on every write and used by nothing;
+    splitting that statement into two arms is the fix, and it is
+    ticketed.
+    V18 IS ITS OWN MIGRATION, ahead of the rest of #193, because it
+    takes no ACCESS EXCLUSIVE lock and therefore needs no window in
+    which no expiry sweep is running; V19 carries the two `ALTER
+    TABLE`s and does.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
