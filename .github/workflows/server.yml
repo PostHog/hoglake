@@ -63,10 +63,14 @@ jobs:
           fi
 
           # Version collision: one basename per V<number> across the
-          # union of latest main and this branch.
-          { git ls-tree -r --name-only origin/main -- "$MIG"
-            git ls-files -- "$MIG"; } |
-            grep -E '/V[0-9]+__[^/]+\.sql$' | sed 's:.*/::' | sort -u |
+          # union of latest main and this branch. A file this branch
+          # removes from main (only possible under the override) leaves
+          # the union, or a repair of a duplicate on main could never
+          # pass its own check.
+          removed=$(git diff --name-only --no-renames --diff-filter=D origin/main HEAD -- "$MIG" | sed 's:.*/::')
+          { git ls-tree -r --name-only origin/main -- "$MIG" | sed 's:.*/::' | grep -v -x -F -f <(printf '%s\n' "$removed")
+            git ls-files -- "$MIG" | sed 's:.*/::'; } |
+            grep -E '^V[0-9]+__[^/]+\.sql$' | sort -u |
             sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
             awk '$1 == prev { printf "::error::Duplicate migration version V%s: %s and %s\n", $1, last, $2; dup = 1 }
                  { prev = $1; last = $2 }
