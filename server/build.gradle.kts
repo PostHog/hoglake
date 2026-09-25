@@ -11,7 +11,7 @@ repositories {
     mavenCentral()
 }
 
-val ktorVersion = "3.5.2"
+val ktorVersion = "3.6.0"
 val jdbiVersion = "3.54.0"
 // Current stable, looked up on Maven Central rather than recalled (the
 // 11.8.2 this replaced was 16 months old). Anything before ~11.10 warns
@@ -28,7 +28,7 @@ val jdbiVersion = "3.54.0"
 val flywayVersion = "13.7.0"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.54.17"
+val awsSdkVersion = "2.55.1"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
