@@ -49,6 +49,23 @@ object Database {
      */
     val SESSION_INIT_SQL_IDLE_TIMEOUT: java.time.Duration = java.time.Duration.ofSeconds(30)
 
+    /**
+     * The statement half of [SESSION_INIT_SQL], as a Duration, for the
+     * code that has to derive a bound from it.
+     *
+     * `RetirementService` is the caller: a retirement batch runs
+     * DELETEs under the per-catalog commit lock and sets a `SET LOCAL
+     * statement_timeout` well under this, so a batch that turns out to
+     * be too big for the table's cascade fan-out is CANCELLED and
+     * halved rather than holding the lock for the whole session bound.
+     * Derived from this rather than written down, so changing the
+     * session bound moves it.
+     *
+     * [SESSION_INIT_SQL] stays the single source of truth — a test
+     * parses the value out of it rather than trusting this to agree.
+     */
+    val SESSION_INIT_SQL_STATEMENT_TIMEOUT: java.time.Duration = java.time.Duration.ofSeconds(60)
+
     fun dataSource(cfg: Config): HikariDataSource {
         val hc =
             HikariConfig().apply {

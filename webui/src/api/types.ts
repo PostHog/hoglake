@@ -511,7 +511,8 @@ export type MaintenanceTask =
   | "expiry"
   | "cleanup"
   | "compaction"
-  | "verify";
+  | "verify"
+  | "retirement";
 
 export type MaintenanceTrigger = "loop" | "manual";
 
@@ -669,6 +670,52 @@ export interface VerifyReport {
   checks: VerifyCheck[];
 }
 
+/**
+ * One retirement run: the paced deletion of the file rows a dropped table
+ * left behind.
+ *
+ * Dropping a table is O(columns) — it sets hog_table.dropped_snapshot and
+ * ends the version and column rows, and touches no file row — so this loop
+ * is where a dropped table's storage actually goes away. It may only delete
+ * rows whose table was dropped at or below the catalog's expiry floor,
+ * because above the floor time travel can still read them, which is why a
+ * catalog with no snapshot retention never retires anything.
+ *
+ * Ledger-only: retirement has no POST trigger, the loop is its one driver.
+ */
+export interface RetirementResult {
+  /** Eligible dropped tables this run retired at least one batch of. */
+  tables: Int64;
+  /** hog_data_file rows deleted (their stats and partition rows cascade). */
+  rows_retired: Int64;
+  /** hog_delete_file rows deleted, superseded vectors included. */
+  dvs_retired: Int64;
+  /** Paths queued for the cleanup drain: rows_retired + dvs_retired. */
+  paths_queued: Int64;
+  /** Batch transactions that committed; one hold of the commit lock each. */
+  batches: Int64;
+  /**
+   * Batches their own statement bound cancelled (each halves the batch size
+   * for that table), plus a run that gave up waiting for the commit lock.
+   */
+  timeouts: Int64;
+  /** Tables whose batch selected rows and deleted none — impossible when healthy. */
+  skipped_tables: Int64;
+  /** 1 = the run declined to start; the cleanup queue was over its ceiling. */
+  skipped_queue_full: Int64;
+  /** 1 = another maintainer held this catalog's retirement lock. */
+  skipped_locked: Int64;
+  /**
+   * 1 = the run gave up because the per-catalog COMMIT lock was not
+   * available inside the admission window. Separate from `timeouts`:
+   * that one means the batch is too big for the table, this one means
+   * something else is holding the catalog's lock.
+   */
+  convoyed: Int64;
+  /** Eligible tables the run's wall-clock budget stopped it reaching. */
+  tables_remaining: Int64;
+}
+
 interface MaintenanceRunBase {
   run_id: Int64;
   /** The catalog the run acted on (the ledger is per-catalog). */
@@ -689,7 +736,8 @@ export type MaintenanceRun =
   | (MaintenanceRunBase & { task: "expiry"; result: ExpiryResult | null })
   | (MaintenanceRunBase & { task: "cleanup"; result: CleanupResult | null })
   | (MaintenanceRunBase & { task: "compaction"; result: CompactionResult | null })
-  | (MaintenanceRunBase & { task: "verify"; result: VerifyReport | null });
+  | (MaintenanceRunBase & { task: "verify"; result: VerifyReport | null })
+  | (MaintenanceRunBase & { task: "retirement"; result: RetirementResult | null });
 
 export interface HydratorBacklog {
   pending_files?: Int64;
@@ -718,6 +766,15 @@ export interface CompactionBacklog {
 }
 
 export type VerifyBacklog = Record<string, never>;
+
+/**
+ * Empty, like VerifyBacklog, and on purpose: the honest backlog is live file
+ * rows on dropped tables, which is a manifest scan and forbidden on the
+ * dashboard path, while a count of dropped TABLES would answer a different
+ * question (one dropped 3M-row table and forty dropped empty ones read the
+ * same). Read the run ledger's rows_retired / tables_remaining instead.
+ */
+export type RetirementBacklog = Record<string, never>;
 
 /** Ledger-derived, so fleet-wide — see `loop` below. */
 export interface LoopObservation {
@@ -758,7 +815,8 @@ export type MaintenanceTaskStatus =
   | (MaintenanceTaskStatusBase & { task: "expiry"; backlog: ExpiryBacklog })
   | (MaintenanceTaskStatusBase & { task: "cleanup"; backlog: CleanupBacklog })
   | (MaintenanceTaskStatusBase & { task: "compaction"; backlog: CompactionBacklog })
-  | (MaintenanceTaskStatusBase & { task: "verify"; backlog: VerifyBacklog });
+  | (MaintenanceTaskStatusBase & { task: "verify"; backlog: VerifyBacklog })
+  | (MaintenanceTaskStatusBase & { task: "retirement"; backlog: RetirementBacklog });
 
 export interface MaintenanceStatus {
   catalog: string;

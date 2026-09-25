@@ -1379,6 +1379,107 @@ data class CleanupResult(
     val deadlineSkipped: Long = 0,
 )
 
+/**
+ * One retirement run's outcome for ONE catalog: what the paced deletion
+ * of dropped tables' file rows got through this time.
+ *
+ * A run is bounded three ways — the queue ceiling, the wall-clock run
+ * budget and the interval — so a partial result is the NORMAL result on
+ * a large table. Nothing here is a failure; the next run continues from
+ * where this one stopped, because the victim select is "whatever is
+ * still live on this dropped table" and carries no cursor.
+ */
+data class RetirementResult(
+    /**
+     * Eligible dropped tables this run committed at least one batch
+     * against.
+     *
+     * A table the run budget interrupted is counted HERE and in
+     * [tablesRemaining] both, and that is not double counting: this one
+     * says work was done on it, that one says work is left on it, and
+     * on an interrupted table both are true. `tables +
+     * tables_remaining` is therefore not the candidate count and must
+     * not be read as one.
+     */
+    val tables: Long,
+    /** hog_data_file rows deleted. */
+    val rowsRetired: Long,
+    /** hog_delete_file rows deleted — DVs, superseded ones included. */
+    val dvsRetired: Long,
+    /**
+     * Paths queued into hog_file_removal with reason `table_drop_gc`:
+     * [rowsRetired] + [dvsRetired], since every deleted row queues its
+     * path exactly once. Carried separately because it is what the
+     * cleanup drain has to absorb, and the two must agree — a gap
+     * between them is an object that lost its only reference.
+     */
+    val pathsQueued: Long,
+    /** Batch transactions that committed. */
+    val batches: Long,
+    /**
+     * Batches cancelled by their own `statement_timeout` and rolled
+     * back. Each one halves the batch size for that table for the rest
+     * of the run: a wide table's cascade fan-out is per ROW, so the
+     * right batch size is a property of the table, not of the config.
+     * A standing nonzero here means the configured batch is too big for
+     * some table in the catalog and the run is paying a rollback to
+     * find that out every time.
+     */
+    val timeouts: Long,
+    /**
+     * Tables whose batch selected rows and deleted none, which ends the
+     * run for that table. Structurally impossible on a healthy catalog
+     * — the select and the delete name the same primary keys — so a
+     * nonzero here is a concurrent writer or a broken cascade, and the
+     * point of the counter is that the loop stops rather than spins.
+     */
+    val skippedTables: Long,
+    /**
+     * 1 when this run declined to start because the catalog's undrained
+     * cleanup queue was already over HOGLAKE_RETIREMENT_QUEUE_CEILING,
+     * 0 otherwise. Retirement's output IS cleanup's input, so a run
+     * that ignored a backed-up drain would trade a bounded metadata
+     * problem for an unbounded queue.
+     */
+    val skippedQueueFull: Long,
+    /**
+     * 1 when another maintainer already held this catalog's retirement
+     * lock and this run stepped aside, 0 otherwise.
+     *
+     * Not a failure and not contention to fix: single flight per
+     * catalog is the design (queueing W maintainers behind each other's
+     * commit-lock holds taxes every foreground commit by
+     * `(W - 0.5) x hold` and buys nothing, the work being idempotent).
+     * It is counted because a run row that says "0 rows retired" with
+     * no reason attached is indistinguishable from a broken loop.
+     */
+    val skippedLocked: Long,
+    /**
+     * Runs that gave up because the per-catalog COMMIT LOCK was not
+     * available inside `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` (0 or 1 — a
+     * convoy ends the run).
+     *
+     * Separate from [timeouts] because the two ask for opposite
+     * remedies. A timeout says the BATCH is too big for the table and
+     * the answer is a smaller batch; a convoy says somebody else holds
+     * the catalog's lock and the answer is to look at what. Summed into
+     * one counter they cancel each other out as a signal.
+     */
+    val convoyed: Long,
+    /**
+     * Eligible tables this run did not FINISH — the one it was
+     * interrupted part way through, if any, plus the ones after it that
+     * the run budget never reached. The honest reading of a run that
+     * "did nothing": the loop is pacing itself, not idle.
+     *
+     * "Did not finish" rather than "did not reach", because an
+     * interrupted table is both reached and remaining; see [tables].
+     * There is no cursor to carry, so the next run simply re-selects
+     * what is still live and continues.
+     */
+    val tablesRemaining: Long,
+)
+
 // ---- the maintenance run ledger (hog_maintenance_run) ---------------------
 
 /** The maintenance-task vocabulary (hog_maintenance_run.task's CHECK). */
@@ -1409,6 +1510,14 @@ enum class MaintenanceTask(
     // records one per catalog, pass or fail), so the gaps between loop
     // rows really are the loop's cadence.
     VERIFY(hasLoop = true, loopRecordsEverySweep = true),
+
+    // Every retirement sweep records a row too — including the ones that
+    // retire nothing because no drop has sunk under the floor yet, and
+    // the ones the queue ceiling or the run budget cut short. That is
+    // the point: a catalog whose dropped tables are not shrinking needs
+    // to be distinguishable from a catalog nobody is sweeping, and only
+    // a row per sweep can do that.
+    RETIREMENT(hasLoop = true, loopRecordsEverySweep = true),
     ;
 
     val wire: String get() = name.lowercase()
@@ -1502,6 +1611,23 @@ sealed interface MaintenanceBacklog {
     ) : MaintenanceBacklog
 
     data object VerifyBacklog : MaintenanceBacklog
+
+    /**
+     * No backlog number, deliberately, and the same shape as
+     * [VerifyBacklog] for the same reason.
+     *
+     * The honest backlog here is "live file rows on dropped tables",
+     * and that is a count over the MANIFEST — the one thing the
+     * dashboard path may never do (MaintenanceStatusService's KDoc).
+     * A count of dropped TABLES would be cheap but would answer a
+     * different question: a catalog with one dropped 3M-row table and
+     * one with forty dropped empty ones read identically. So this
+     * carries nothing, and what an operator reads instead is the run
+     * ledger's own counters (`rows_retired`, `tables_remaining`) plus
+     * `/verify`'s orphans check, both of which are already per-run
+     * facts rather than a per-request scan.
+     */
+    data object RetirementBacklog : MaintenanceBacklog
 }
 
 /**
@@ -1550,7 +1676,7 @@ data class MaintenanceTaskStatus(
 
 data class MaintenanceStatus(
     val catalog: String,
-    /** All five tasks, always present. */
+    /** All six tasks, always present. */
     val tasks: List<MaintenanceTaskStatus>,
     /** Absent until the first complete async sample; backlogs then remain unknown. */
     val sampledAt: Instant? = null,
@@ -1614,4 +1740,23 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * no-CASCADE position) -> HTTP 409.
      */
     class NamespaceNotEmpty(detail: String) : HoglakeException(detail)
+
+    /**
+     * A commit named a table that EXISTS but has been dropped -> HTTP
+     * 409 `table_dropped`, carrying the snapshot it was dropped in.
+     *
+     * Typed because the two cases a writer has to tell apart used to
+     * arrive as the same 422 `unknown table`: a typo or a stale
+     * namespace (fix the request) and a table someone dropped out from
+     * under a running writer (stop, or recreate — and the drop snapshot
+     * says when it happened, which the writer can line up against its
+     * own last successful commit). 409 rather than 404 for the same
+     * reason [CommitConflict] is: the request was well-formed against
+     * the catalog it was planned against, and the catalog moved.
+     *
+     * Raised only after the live resolution MISSES, so it costs nothing
+     * on the commit path (one extra statement on a path that is already
+     * failing).
+     */
+    class TableDropped(detail: String) : HoglakeException(detail)
 }

@@ -31,6 +31,15 @@ class MaintenanceStatusService(
     private val cleanupIntervalMs: Long,
     private val compactionIntervalMs: Long,
     private val verifyIntervalMs: Long,
+    /**
+     * NOT defaulted, unlike everything else optional on this class.
+     * The value is what `GET /maintenance/status` reports as
+     * retirement's `loop_interval_ms`, and a default of 0 would let
+     * App forget to wire it while the endpoint kept answering
+     * "disabled" — which is a claim about the fleet that nothing
+     * would contradict. Making it required means the compiler asks.
+     */
+    private val retirementIntervalMs: Long,
     private val smallFileThresholdBytes: Long,
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
@@ -192,6 +201,21 @@ class MaintenanceStatusService(
                         runs[MaintenanceTask.VERIFY],
                         MaintenanceBacklog.VerifyBacklog,
                         loop(MaintenanceTask.VERIFY),
+                    ),
+                    // Appended, never inserted: the task list's ORDER is
+                    // what the webui's matrix and every positional test
+                    // read, and a new task in the middle silently
+                    // renumbers both.
+                    MaintenanceTaskStatus(
+                        MaintenanceTask.RETIREMENT,
+                        retirementIntervalMs,
+                        runs[MaintenanceTask.RETIREMENT],
+                        // No backlog number, and see
+                        // MaintenanceBacklog.RetirementBacklog for why:
+                        // the honest one is a manifest scan, which this
+                        // path may never do.
+                        MaintenanceBacklog.RetirementBacklog,
+                        loop(MaintenanceTask.RETIREMENT),
                     ),
                 ),
         )

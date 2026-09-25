@@ -120,17 +120,7 @@ class Hydrator(
         h: Handle,
         limit: Int,
     ): List<PendingFile> =
-        h.createQuery(
-            """
-            SELECT catalog_id, data_file_id, table_id, path, record_count,
-                   file_size_bytes, footer_size, begin_snapshot
-            FROM hog_data_file
-            WHERE stats_state = 'pending'
-            ORDER BY catalog_id, data_file_id
-            LIMIT :limit
-            FOR UPDATE SKIP LOCKED
-            """,
-        )
+        h.createQuery(CLAIM_PENDING_SQL)
             .bind("limit", limit)
             .map { rs, _ ->
                 PendingFile(
@@ -280,11 +270,25 @@ class Hydrator(
                     }
                 val requeued =
                     h.createUpdate(
+                        // The named-table form is already refused by
+                        // `TableRepo.findLive` above, which excludes a
+                        // dropped table and 404s. This clause is the
+                        // WHOLE-CATALOG form's half of the same rule:
+                        // requeueing a dropped table's failed rows to
+                        // 'pending' would hand the sweep work it now
+                        // declines to claim, so the rows would sit
+                        // 'pending' forever and the hydrator backlog
+                        // gauge would report a queue nothing is draining.
                         """
-                        UPDATE hog_data_file
+                        UPDATE hog_data_file f
                            SET stats_state = 'pending'
-                        WHERE catalog_id = :catalogId AND stats_state = 'failed'
-                          AND (:tableId::bigint IS NULL OR table_id = :tableId)
+                        WHERE f.catalog_id = :catalogId AND f.stats_state = 'failed'
+                          AND (:tableId::bigint IS NULL OR f.table_id = :tableId)
+                          AND EXISTS (
+                              SELECT 1 FROM hog_table t
+                              WHERE t.catalog_id = f.catalog_id
+                                AND t.table_id = f.table_id
+                                AND t.dropped_snapshot IS NULL)
                         """,
                     )
                         .bind("catalogId", cat.catalogId)
@@ -708,6 +712,51 @@ class Hydrator(
     }
 
     companion object {
+        /**
+         * The sweep's claim, `internal` so the plan test EXPLAINs the
+         * SQL PRODUCTION runs rather than a lookalike (AGENT.md: V14's
+         * first index was proven against a predicate no code path
+         * issues).
+         *
+         * A DROPPED TABLE'S PENDING FILES ARE NOT WORK. Since #193 a
+         * drop touches no file row, so a dropped table's `pending` rows
+         * stay pending and this sweep would otherwise keep claiming
+         * them — fetching footers from S3 to write stats onto rows the
+         * retirement loop is about to delete, and holding row locks on
+         * a dropped table while it does. The sweep is instance-wide and
+         * ordered by (catalog_id, data_file_id), so a big dropped
+         * table's pending backlog would sit at the HEAD of the queue
+         * and starve every live table behind it, forever, on a catalog
+         * whose floor has not reached the drop yet.
+         *
+         * It is also what lets the retirement batch's victim select
+         * drop its `FOR UPDATE`: the hydrator was the only row-level
+         * writer that could otherwise touch a dropped table's file
+         * rows.
+         *
+         * `FOR UPDATE OF f`, not a bare `FOR UPDATE`: the join must not
+         * take row locks on `hog_table`, which every DDL path writes.
+         * The scan stays driven by `hog_data_file_pending` (the partial
+         * index on `stats_state = 'pending'`) with a primary-key probe
+         * into `hog_table` per claimed row — asserted in
+         * `HydratorClaimPlanIntegrationTest`, because a join added to a
+         * hot loop with no plan test is how an index stops being used
+         * without anything saying so.
+         */
+        internal const val CLAIM_PENDING_SQL: String =
+            """
+            SELECT f.catalog_id, f.data_file_id, f.table_id, f.path, f.record_count,
+                   f.file_size_bytes, f.footer_size, f.begin_snapshot
+            FROM hog_data_file f
+            JOIN hog_table t
+              ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+            WHERE f.stats_state = 'pending'
+              AND t.dropped_snapshot IS NULL
+            ORDER BY f.catalog_id, f.data_file_id
+            LIMIT :limit
+            FOR UPDATE OF f SKIP LOCKED
+            """
+
         /**
          * Files claimed per sweep.
          *

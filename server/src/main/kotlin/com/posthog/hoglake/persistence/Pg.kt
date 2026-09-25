@@ -20,6 +20,15 @@ internal object Pg {
     const val CHECK_VIOLATION = "23514"
     const val LOCK_NOT_AVAILABLE = "55P03"
 
+    /**
+     * `query_canceled` — what BOTH `statement_timeout` expiry and an
+     * explicit `pg_cancel_backend` raise. A caller that treats this
+     * as "my own bound fired" must be one that SET that bound
+     * itself, transaction-locally, for the statement it is running
+     * (RetirementService does).
+     */
+    const val QUERY_CANCELED = "57014"
+
     private val json: ObjectMapper = jacksonObjectMapper()
     private val mapType = object : TypeReference<Map<String, Any?>>() {}
 
@@ -32,6 +41,9 @@ internal object Pg {
 
     /** lock_timeout expiry ("canceling statement due to lock timeout"). */
     fun isLockTimeout(e: UnableToExecuteStatementException): Boolean = sqlState(e) == LOCK_NOT_AVAILABLE
+
+    /** statement_timeout expiry (or a cancel): "canceling statement due to ...". */
+    fun isQueryCanceled(e: UnableToExecuteStatementException): Boolean = sqlState(e) == QUERY_CANCELED
 
     /** Serialize column type params for a jsonb column; null stays null. */
     fun toJson(params: Map<String, Any?>?): String? = params?.let { json.writeValueAsString(it) }

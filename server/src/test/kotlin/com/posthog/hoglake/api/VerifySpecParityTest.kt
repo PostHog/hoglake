@@ -50,7 +50,7 @@ class VerifySpecParityTest {
     /** The server's own list, from a report rather than a literal. */
     private val serverChecks: List<String> by lazy {
         CatalogService(db.jdbi).createCatalog("spec-parity", "s3://spec-parity")
-        VerifyService(db.jdbi).runOnce("spec-parity").checks.map { it.check }
+        VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce("spec-parity").checks.map { it.check }
     }
 
     private fun block(header: String): String {
@@ -187,7 +187,7 @@ class VerifySpecParityTest {
             },
         )
         CatalogService(instrumented).createCatalog("spec-sql", "s3://spec-sql")
-        VerifyService(instrumented).runOnce("spec-sql")
+        VerifyService(instrumented, retirementIntervalMs = 0).runOnce("spec-sql")
 
         // Two of the path-keyed tables AND the word `path` anywhere in
         // the statement. Deliberately not "`.path =` twice": `USING

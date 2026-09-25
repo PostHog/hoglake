@@ -557,6 +557,28 @@ export const maintenanceRunsFixture: MaintenanceRun[] = [
     },
   },
   {
+    run_id: "98",
+    catalog: "analytics",
+    task: "retirement",
+    trigger: "loop",
+    started_at: "2026-09-11T09:58:00Z",
+    finished_at: "2026-09-11T09:58:44.000Z",
+    status: "ok",
+    result: {
+      tables: "1",
+      rows_retired: "24000",
+      dvs_retired: "12",
+      paths_queued: "24012",
+      batches: "3",
+      timeouts: "0",
+      skipped_tables: "0",
+      skipped_queue_full: "0",
+      skipped_locked: "0",
+      convoyed: "0",
+      tables_remaining: "1",
+    },
+  },
+  {
     run_id: "99",
     catalog: "analytics",
     task: "expiry",
@@ -624,6 +646,20 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       backlog: {},
       loop: { records_every_sweep: true },
     },
+    {
+      // Retirement, like compaction and verify, runs on the maintenance
+      // workload: this fixture is the API pod, so its own interval is 0
+      // while the ledger shows the other pod's sweeps arriving.
+      task: "retirement",
+      loop_interval_ms: "0",
+      last_run: maintenanceRunsFixture[5],
+      backlog: {},
+      loop: {
+        observed_interval_ms: "60000",
+        last_run_at: "2026-09-11T09:58:00Z",
+        records_every_sweep: true,
+      },
+    },
   ],
 };
 
@@ -675,6 +711,15 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
           loop: { records_every_sweep: true },
         },
         { task: "verify", last_run: null, backlog: {}, loop: null },
+        {
+          // Not `loop: null` (verify's shape above is deliberately the
+          // OLDER-SERVER one): retirement has a loop, this catalog has
+          // simply never had an eligible drop for it to run on.
+          task: "retirement",
+          last_run: null,
+          backlog: {},
+          loop: { records_every_sweep: true },
+        },
       ],
     },
   ],

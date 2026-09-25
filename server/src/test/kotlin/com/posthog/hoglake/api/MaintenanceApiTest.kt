@@ -55,7 +55,12 @@ class MaintenanceApiTest {
     // loop is an ops decision per workload), and asserting the endpoint
     // reports 0 would not distinguish "reports this process's config"
     // from "still reports nothing for verify".
-    private val cfg = Config(hydratorIntervalMs = 0, verifyIntervalMs = 3_600_000)
+    // A NONZERO retirement interval, because the assertion below is
+    // about the endpoint reporting THIS PROCESS's cadence and a 0 on
+    // both sides could not tell "reported correctly" from "defaulted
+    // on both sides" — the same trap verify's assertion names.
+    private val cfg =
+        Config(hydratorIntervalMs = 0, verifyIntervalMs = 3_600_000, retirementIntervalMs = 120_000)
     private val app = App.build(cfg, db.jdbi)
     private val json = ObjectMapper()
 
@@ -103,7 +108,7 @@ class MaintenanceApiTest {
                             maxGroupsPerRun = 1,
                         ),
                     ),
-                    VerifyService(db.jdbi),
+                    VerifyService(db.jdbi, retirementIntervalMs = 0),
                     // Rehydrate is metadata-only (a stats_state flip); the
                     // store is never contacted by these tests.
                     Hydrator(db.jdbi, compactionStore),
@@ -114,6 +119,7 @@ class MaintenanceApiTest {
                         cleanupIntervalMs = 60_000,
                         compactionIntervalMs = 0,
                         verifyIntervalMs = 3_600_000,
+                        retirementIntervalMs = cfg.retirementIntervalMs,
                         smallFileThresholdBytes = 512L * 1024 * 1024,
                     ),
                     DatabaseHealthService(db.jdbi),
@@ -528,7 +534,14 @@ class MaintenanceApiTest {
             assertThat(status["catalog"].asText()).isEqualTo("mnt-status")
             val tasks = status["tasks"].associateBy { it["task"].asText() }
             assertThat(tasks.keys)
-                .containsExactlyInAnyOrder("hydrator", "expiry", "cleanup", "compaction", "verify")
+                .containsExactlyInAnyOrder(
+                    "hydrator",
+                    "expiry",
+                    "cleanup",
+                    "compaction",
+                    "verify",
+                    "retirement",
+                )
 
             val expiry = tasks.getValue("expiry")
             // The endpoint's job is to report the interval this app was
@@ -553,6 +566,24 @@ class MaintenanceApiTest {
             assertThat(verify["loop_interval_ms"].asLong()).isEqualTo(cfg.verifyIntervalMs)
             assertThat(cfg.verifyIntervalMs).describedAs("a value 0 could not tell the two apart").isNotZero()
             assertThat(verify["last_run"].isNull).isTrue()
+            // Retirement has a loop too, reported the same way — and an
+            // EMPTY backlog, which is a deliberate absence rather than an
+            // omission: the honest number is live file rows on dropped
+            // tables, which is a manifest scan this path may never do.
+            val retirement = tasks.getValue("retirement")
+            assertThat(retirement["loop_interval_ms"].asLong()).isEqualTo(cfg.retirementIntervalMs)
+            assertThat(cfg.retirementIntervalMs)
+                .describedAs("a value of 0 could not tell a wired cadence from a defaulted one")
+                .isNotZero()
+            assertThat(retirement["last_run"].isNull).isTrue()
+            assertThat(retirement["backlog"].isEmpty).isTrue()
+            // There is no POST /maintenance/retire, deliberately: a
+            // trigger would reach every replica, and a retirement batch
+            // takes the per-catalog COMMIT lock. The loop is the only
+            // driver, and the route must 404 rather than quietly exist.
+            assertThat(client.postJson("/v1/catalogs/mnt-status/maintenance/retire").status)
+                .isEqualTo(HttpStatusCode.NotFound)
+
             // No sampler has run: unknown backlogs must not masquerade as zero.
             assertThat(tasks.getValue("cleanup")["backlog"].has("queued_removals")).isFalse()
             assertThat(status.has("sampled_at")).isFalse()
@@ -642,7 +673,7 @@ class MaintenanceApiTest {
             val byName = status["catalogs"].associateBy { it["catalog"].asText() }
             val a = byName.getValue("mnt-inst-a")
             assertThat(a["tasks"].map { it["task"].asText() })
-                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "verify")
+                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "verify", "retirement")
             // The one expire run is visible, carrying its catalog name.
             assertThat(a["tasks"].first { it["task"].asText() == "expiry" }["last_run"]["catalog"].asText())
                 .isEqualTo("mnt-inst-a")

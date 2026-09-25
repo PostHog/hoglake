@@ -203,6 +203,38 @@ class MaintenanceSummarySampler(
                 scan = begin(h, job.catalogId)
             }
             if (scan.phase == "files") {
+                // DROPPED TABLES ARE SKIPPED BY KEY RANGE, not by page.
+                //
+                // Since #193 a drop touches no file row, so a dropped
+                // 3M-row table stays in this scan's key space in full.
+                // At the default 10,000 rows a tick and a 1 s interval
+                // that is five hours of ticks spent paging through rows
+                // the compaction planner will never plan (its
+                // `liveTables` excludes dropped tables) — and the
+                // catalog publishes no sample at all until the scan
+                // finishes, so every dashboard on the instance goes
+                // stale for those five hours.
+                //
+                // Read FRESH EVERY TICK rather than at `begin()`, so a
+                // table dropped mid-scan is skipped from the next tick
+                // instead of at the next generation. Cheap: it is a
+                // range scan of this catalog's slice of hog_table's
+                // primary key, against a page of 10,000 manifest rows
+                // with their partition values and DV probes.
+                //
+                // NOT IN `scan_state`. That column is parsed with
+                // `runCatching` and a shape change DISCARDS the
+                // checkpoint (see the Job mapper), so putting a
+                // mutable set in it would throw away every in-flight
+                // scan on the deploy that added it — and the set would
+                // be stale by construction anyway.
+                val dropped =
+                    h.createQuery(
+                        """
+                    SELECT table_id FROM hog_table
+                    WHERE catalog_id = :id AND dropped_snapshot IS NOT NULL
+                    """,
+                    ).bind("id", job.catalogId).mapTo(Long::class.javaObjectType).list().toSet()
                 val rows =
                     h.createQuery(
                         """
@@ -241,7 +273,34 @@ class MaintenanceSummarySampler(
                                 rs.getBoolean("has_dv"),
                             )
                         }.list()
-                accumulate(h, job.catalogId, generation, scan, rows)
+                // THE PAGE'S FIRST ROW DECIDES. If it belongs to a
+                // dropped table, the whole page is discarded unread and
+                // the cursor jumps PAST that table's key range —
+                // (table_id, +inf, +inf) — so the table costs ONE page
+                // however many million rows it holds. A page that
+                // starts live and runs into a dropped table mid-way is
+                // accumulated minus the dropped rows; the next tick
+                // starts inside the dropped table and takes this
+                // branch, so the waste is bounded at one page per
+                // dropped table per scan.
+                //
+                // That page is not free, and it is worth being honest
+                // about: it is a FULL batch (10,000 rows by default)
+                // carrying a per-row `EXISTS` over hog_delete_file and
+                // a per-row `array_agg` over the partition values,
+                // fetched and then thrown away. One of those per
+                // dropped table per generation is the price of an O(1)
+                // skip; paging the table instead costs one of them per
+                // 10,000 ROWS.
+                val leadsInDroppedTable = rows.firstOrNull()?.takeIf { it.table in dropped }
+                if (leadsInDroppedTable != null) {
+                    scan.table = leadsInDroppedTable.table
+                    scan.size = Long.MAX_VALUE
+                    scan.file = Long.MAX_VALUE
+                    checkpoint(h, job.catalogId, generation, scan)
+                    return@inTransactionUnchecked true
+                }
+                accumulate(h, job.catalogId, generation, scan, rows.filter { it.table !in dropped })
                 rows.lastOrNull()?.let {
                     scan.table = it.table
                     scan.size = it.size

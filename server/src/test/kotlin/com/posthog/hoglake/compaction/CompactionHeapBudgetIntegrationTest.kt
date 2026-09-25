@@ -74,7 +74,7 @@ class CompactionHeapBudgetIntegrationTest {
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
-    private val verify = VerifyService(db.jdbi)
+    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val counter = AtomicInteger(0)
 
     private companion object {

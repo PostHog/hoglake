@@ -287,6 +287,42 @@ there would break that gate on every build.
 9. **All SQL is parameterized.** No string-built values, anywhere.
 10. **Rows-then-offset everywhere** (server offset API is monotonic;
     hedgerow commits offsets only after destination durability).
+11. **The table is the authority: no code path may treat a dropped
+    table's file rows as reachable data.** Table state is established
+    BEFORE file rows are read, written or counted. `DROP TABLE` is
+    O(columns) — `TableRepo.markDropped` sets
+    `hog_table.dropped_snapshot` and end-snapshots the one live version
+    row and the column rows, and touches NO `hog_data_file` or
+    `hog_delete_file` row. It used to end-snapshot all of them in the
+    same transaction, under the per-catalog commit lock: 3,008,849 rows
+    measured at 44.6 s and 3.9 GB of WAL warm and uncontended, which on
+    gigahog-prod-us was a drop that could not complete at all (#193).
+    The rows leave later, paced, through `RetirementService`, and only
+    once `dropped_snapshot <= hog_catalog.earliest_snapshot_id` —
+    above the floor a read at S < drop is still legal and still needs
+    them. One predicate expresses the rule (`t.dropped_snapshot IS
+    NULL`, or `:snapshot < t.dropped_snapshot` for a time-travel read)
+    and every resolver, loop, gauge and check below uses it:
+    `TableRepo.findLive`/`findAt`, `CommitService.resolveLiveTable`,
+    `CompactionService`'s planner AND its commit re-verification,
+    `Hydrator.claimPending`/`rehydrateFailed`, `CatalogMetrics`'s
+    sample, `MaintenanceSummarySampler`'s scan, `/verify`'s `orphans`.
+    THREE CARVE-OUTS, and they are the whole list:
+    - **path-keyed liveness** (`CleanupService.referencedPaths`,
+      `UploadService`'s reclaim/register probes) asks "does ANY row name
+      this path", live or not, and MUST keep seeing dropped tables'
+      rows: that is what fences their objects against physical deletion
+      until retirement queues them;
+    - **the retirement loop itself**, whose entire job is those rows;
+    - **maintenance surfaces that count rows at NO snapshot** (the
+      hydrator, the gauges, the debt sampler, verify) filter on
+      `hog_table` rather than resolving visibility at a snapshot,
+      because there is no snapshot to resolve at.
+    TRUNCATE IS NOT COVERED. `CatalogService.truncateTable` is the one
+    remaining caller of `FileRepo.endLiveFiles`/`endLiveDeleteFiles` and
+    keeps the O(rows) pass under the commit lock; `POST .../truncate` on
+    a multi-million-row table has today's hazard, and redesigning it is
+    its own change.
 
 ## Working conventions
 
@@ -589,7 +625,8 @@ there would break that gate on every build.
   failures 400). New failure modes get a typed exception, not a status
   code sprinkled in a route.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, verify, metrics sampler) registers with
+  expiry, cleanup, compaction, verify, retirement, metrics sampler)
+  registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
   `intervalMs <= 0` = disabled; a failed iteration is logged + counted
@@ -616,6 +653,87 @@ there would break that gate on every build.
   Incomplete generations are never published; old samples remain visible
   with freshness timestamps. Expiry overtaking a scan restarts it. The
   central status endpoint pages catalogs (50 default, max 100).
+  - **Retirement** (`MaintenanceTask.RETIREMENT`, loop `retirement`,
+    invariant 11) is the loop that deletes a dropped table's file rows
+    and queues their objects.
+    `HOGLAKE_RETIREMENT_INTERVAL_MS` is **0 = off** by default, the
+    position compaction and verify take and for a sharper reason: a
+    batch TAKES THE PER-CATALOG COMMIT LOCK, hundreds of times per run,
+    so on an API replica it would tax the commit tail it serves. The
+    chart turns it on for the maintenance Deployment alone. There is no
+    manual trigger and no `POST /maintenance/retire`: the loop is the
+    only driver, deliberately, because a trigger reaches every replica.
+    The knobs, and every one of them is a TIME knob:
+    `HOGLAKE_RETIREMENT_BATCH` (**8,000** rows per transaction, a
+    ~160 ms lock hold at the measured 19.6 us/row and 2,902 B of WAL per
+    row — `RetirementCostIntegrationTest`, on a fixture with the
+    production 9:1 stats ratio; the time moves with the machine and the
+    WAL does not, and what the test asserts is that both are FLAT in the
+    batch size), `HOGLAKE_RETIREMENT_PAUSE_MS` (**750**,
+    so an 18-25% duty cycle on the lock — a foreground commit's p99 tax
+    is about one hold), `HOGLAKE_RETIREMENT_RUN_BUDGET_MS`
+    (**60,000** of wall clock per run per catalog, so a 50M-row table
+    is paced by the interval rather than by one continuously-held run
+    — there is no cursor to lose, the victim select is just "what is
+    still live on this dropped table"), and
+    `HOGLAKE_RETIREMENT_QUEUE_CEILING` (**500,000** undrained
+    `hog_file_removal` rows, above which a run declines to start;
+    ~125 hours of drain at the STANDING cleanup defaults, which makes
+    it a circuit breaker there, and ~50 minutes at the runbook's event
+    settings of 10,000 per 60 s, which makes it a throttle).
+    THE ELAPSED TIME OF A LARGE RETIREMENT IS SET BY THE CLEANUP
+    DRAIN, not by this loop's knobs, and the arithmetic is worth doing
+    before touching either. One 60 s run is ~66 batches (a ~160 ms hold
+    plus a 750 ms pause each, and the pause is charged against the
+    budget because the budget is wall clock), so at
+    `HOGLAKE_RETIREMENT_BATCH` 8,000 a run retires **~528,000 rows**
+    and, at a 60 s interval plus a 60 s budget, lands every ~120 s —
+    **~15.8M rows/hour of CAPACITY**. The drain is 600,000 paths/hour
+    at the event settings and 4,000/h at the standing ones, so
+    retirement outruns it by more than an order of magnitude and
+    `HOGLAKE_RETIREMENT_QUEUE_CEILING` is what actually paces it:
+    bursts of ~60 s of holds, once per ~50 minutes of drain. Elapsed
+    time for a 3M-row table is `queued paths / cleanup rate` — **~5
+    hours** at the event settings — and shortening the interval or
+    lengthening the budget does not move it. The only lever is
+    `HOGLAKE_CLEANUP_BATCH` / `HOGLAKE_CLEANUP_INTERVAL_MS`. The candidate
+    read and the eligibility stamp are bounded at
+    `RetirementService.MAX_TABLES_PER_RUN` (1,000) tables per run,
+    ordered by `table_id` so the bound is a stable PREFIX: a mass drop
+    on a 54,000-table catalog must not make a run that the budget stops
+    after a handful of tables read and stamp all of them first.
+    SINGLE FLIGHT per catalog through a SESSION advisory lock on its own
+    lock class (`Locks.tryAcquireCatalogRetirementLock`): a second
+    maintainer SKIPS rather than queues, because Postgres's lock queue
+    is FIFO so W maintainers tax every foreground commit by
+    `(W - 0.5) x hold` and the work is idempotent. A batch sets its own
+    transaction-local `statement_timeout` —
+    `min(session statement_timeout / 4, admission / 2)` — and a batch it
+    cancels halves the batch size FOR THAT TABLE for the rest of the
+    run, because the per-row cost is the row plus its cascade and a
+    200-column table has ~20x the fan-out. CleanupService's hold-budget
+    arithmetic deliberately does NOT apply: a retirement connection
+    makes no object-store calls, so it is never idle in transaction and
+    the idle bound cannot fire on it. A batch deletes DELETION VECTORS
+    FIRST, by `data_file_id`, with NO `end_snapshot` clause — the
+    data-file delete cascades `hog_delete_file`, so any DV left when it
+    runs is taken away UN-QUEUED and its puffin leaks forever (bug hunt
+    #16's exact failure, carried forward).
+  - **Retirement feeds cleanup, and the two are coupled by the queue
+    ceiling.** Every row a retirement batch deletes queues one path, and
+    the drain is much the slower of the two (`HOGLAKE_CLEANUP_BATCH` per
+    `HOGLAKE_CLEANUP_INTERVAL_MS`, against a hold that has to pay one
+    `DeleteObjects` round trip). Unpaced, a 3M-row table converts a
+    bounded metadata problem into a 3M-row queue — ~1.9 GB of ledger at
+    the measured 631 bytes per undrained row — so a run whose catalog is
+    already over `HOGLAKE_RETIREMENT_QUEUE_CEILING` declines to start.
+    That count is ONE count per RUN, never one per batch: at 3M queued
+    rows it is ~100k buffers, and per batch it would be that times 376.
+    The other direction of the coupling is expiry's: retirement DELETES
+    rows rather than end-snapshotting them, so it adds nothing to
+    expiry's below-floor sweep — but a dropped table's rows sit in
+    `hog_data_file` until it runs, which is what V18's partial index and
+    the gauges' `hog_table` join both exist to survive.
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only
   through the integrating session; agents report needed changes rather

@@ -5,6 +5,7 @@ import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.persistence.Locks
@@ -63,7 +64,7 @@ class CompactionParallelIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
-    private val verify = VerifyService(db.jdbi)
+    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val counter = AtomicInteger(0)
 
     private companion object {
@@ -1036,6 +1037,82 @@ class CompactionParallelIntegrationTest {
         // ticket is undrained, so the cleanup drain reclaims them.
         assertThat(stagingTicketOutcomes(fx.cat))
             .describedAs("an interrupted sweep's staged outputs must stay queued for cleanup")
+            .allMatch { it == null }
+    }
+
+    @Test
+    fun `a DROP landing mid-rewrite is a conflict at commit, and the staged output stays reclaimable`() {
+        // THE FENCE USED TO BE ACCIDENTAL, and #193 removed the thing
+        // that provided it. A drop end-snapshotted every file row in
+        // its own transaction, so `commitGroup`'s liveState re-check
+        // caught a drop that landed during a rewrite. A drop now
+        // touches NO file row — the table is the authority — so every
+        // input is still `end_snapshot IS NULL` at commit time and
+        // nothing in the old re-verification notices.
+        //
+        // The planner already excludes dropped tables, so the ONLY
+        // window is this one: a group's rewrite, which is ~8.5 s of
+        // object-store latency in production. What a commit into it
+        // would produce is a data file, a snapshot and a change row on
+        // a table that no longer exists, plus a staging ticket settled
+        // 'registered' — so the object it just uploaded would never be
+        // reclaimed either.
+        //
+        // The race is DRIVEN rather than simulated: the store blocks
+        // inside the rewrite, the drop commits while it is blocked, and
+        // the rewrite is then released into its own commit.
+        //
+        // MUTATION: remove the `dropped_snapshot` read from
+        // `CompactionService.commitGroup` and this reds — the group
+        // commits, the head moves, and the staging ticket settles.
+        val fx = fixture("compact-par-dropped", groups = 1)
+        val inRewrite = java.util.concurrent.CountDownLatch(1)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val blocking = BlockingStore(inRewrite, release)
+        val cfg = policy(fx).copy(inputOpenParallelism = 1)
+        val svc = CompactionService(db.jdbi, blocking, cfg)
+        val outcome = java.util.concurrent.atomic.AtomicReference<CompactionResult?>(null)
+        val sweep = Thread({ outcome.set(runCatching { svc.runOnce(fx.cat, cfg) }.getOrNull()) }, "drop-race")
+        val dropSnapshot: Long
+        try {
+            sweep.start()
+            assertThat(inRewrite.await(60, TimeUnit.SECONDS))
+                .describedAs("the rewrite never reached its first object-store read")
+                .isTrue()
+            // The drop takes the commit lock, marks the table, and
+            // commits — all while the rewrite is parked.
+            dropSnapshot = catalogs.dropTable(fx.cat, "ns", "t").snapshotId
+        } finally {
+            release.countDown()
+        }
+        sweep.join(60_000)
+        blocking.close()
+        assertThat(sweep.isAlive).isFalse()
+
+        assertThat(outcome.get()?.skippedConflicts)
+            .describedAs("the group must be refused at commit, not committed into a dropped table")
+            .isEqualTo(1)
+        assertThat(outcome.get()?.groupsCompacted).isZero()
+        assertThat(catalogs.getCatalog(fx.cat).headSnapshotId)
+            .describedAs("no snapshot may be allocated into a dropped table")
+            .isEqualTo(dropSnapshot)
+        // The inputs are exactly as the drop left them: live rows on a
+        // dropped table, which is retirement's work and nobody else's.
+        assertThat(
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_data_file f
+                    JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                    WHERE c.name = :n AND f.end_snapshot IS NULL
+                    """,
+                ).bind("n", fx.cat).mapTo(Long::class.java).one()
+            },
+        ).isEqualTo(fx.expectedFiles.toLong())
+        // And the object the rewrite uploaded is still claimed by an
+        // UNDRAINED ticket, so the cleanup drain reclaims it.
+        assertThat(stagingTicketOutcomes(fx.cat))
+            .describedAs("a refused group's staged output must stay queued for cleanup")
             .allMatch { it == null }
     }
 

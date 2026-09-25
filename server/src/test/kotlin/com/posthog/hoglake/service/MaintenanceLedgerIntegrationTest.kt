@@ -335,7 +335,7 @@ class MaintenanceLedgerIntegrationTest {
     fun `verify runOnce records a manual run with the report payload`() {
         seedCatalog("led-verify")
 
-        val report = VerifyService(jdbi).runOnce("led-verify")
+        val report = VerifyService(jdbi, retirementIntervalMs = 0).runOnce("led-verify")
         assertThat(report.status).isEqualTo("pass")
 
         val row = ledgerRows("led-verify").single()
@@ -441,6 +441,9 @@ class MaintenanceLedgerIntegrationTest {
             MaintenanceTask.CLEANUP,
             MaintenanceTask.COMPACTION,
             MaintenanceTask.VERIFY,
+            // Appended, never inserted: this order is the wire order and
+            // the central matrix's column order.
+            MaintenanceTask.RETIREMENT,
         )
 
         val hydrator = status.tasks[0]
@@ -481,7 +484,7 @@ class MaintenanceLedgerIntegrationTest {
         val svc = ExpiryService(jdbi)
         svc.runOnce("led-runs", 10)
         svc.runOnce("led-runs", 10)
-        VerifyService(jdbi).runOnce("led-runs")
+        VerifyService(jdbi, retirementIntervalMs = 0).runOnce("led-runs")
 
         val statusSvc = statusSvc()
 
@@ -522,6 +525,7 @@ class MaintenanceLedgerIntegrationTest {
             cleanupIntervalMs = 60_000,
             compactionIntervalMs = 0,
             verifyIntervalMs = 3_600_000,
+            retirementIntervalMs = 0,
             smallFileThresholdBytes = 512L * 1024 * 1024,
         )
 
@@ -531,7 +535,7 @@ class MaintenanceLedgerIntegrationTest {
         seedCatalog("led-inst-b")
         seedPendingFile(aId)
         ExpiryService(jdbi).runOnce("led-inst-a", 10)
-        VerifyService(jdbi).runOnce("led-inst-b")
+        VerifyService(jdbi, retirementIntervalMs = 0).runOnce("led-inst-b")
 
         // (The test database is shared per class; narrow to this test's pair.)
         val sampler =
@@ -668,7 +672,7 @@ class MaintenanceLedgerIntegrationTest {
         // of hourly runs per catalog. The live response carries them;
         // the ledger records what the run FOUND.
         seedCatalog("led-verify-desc")
-        val live = VerifyService(jdbi).runOnce("led-verify-desc")
+        val live = VerifyService(jdbi, retirementIntervalMs = 0).runOnce("led-verify-desc")
         assertThat(live.checks).allSatisfy { assertThat(it.description).isNotBlank() }
 
         val stored =

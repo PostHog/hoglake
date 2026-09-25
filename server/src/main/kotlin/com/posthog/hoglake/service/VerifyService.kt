@@ -86,6 +86,35 @@ class VerifyService(
      * one. Constructor-tunable for tests.
      */
     private val compactionClaimMaxAgeSeconds: Long = DEFAULT_COMPACTION_CLAIM_MAX_AGE_SECONDS,
+    /**
+     * How long a table may sit RETIREMENT-ELIGIBLE — dropped, and its
+     * drop snapshot at or below the expiry floor — with live file rows
+     * still on it before `orphans` calls it a leak.
+     *
+     * Not a statement about how fast retirement runs: it is the bound
+     * past which "still going" stops being a credible explanation. The
+     * default is a day, which is `N x HOGLAKE_RETIREMENT_INTERVAL_MS`
+     * for any N >= 2 at any interval a deployment would plausibly set,
+     * and is generous on purpose — retirement is paced against the
+     * commit lock and against the cleanup queue, so a big table
+     * legitimately takes many runs, and an alert that fires on a system
+     * working as designed is an alert nobody reads. Constructor-tunable
+     * for tests.
+     */
+    private val retirementOrphanGraceSeconds: Long = DEFAULT_RETIREMENT_ORPHAN_GRACE_SECONDS,
+    /**
+     * `HOGLAKE_RETIREMENT_INTERVAL_MS` as this process has it, for the
+     * `orphans` description alone — the same treatment
+     * [cleanupIntervalMs] gets, and for the same reason: a description
+     * that quoted the default would be wrong on any deployment that
+     * tunes it.
+     *
+     * NOT defaulted, unlike its neighbours. Retirement's default is 0
+     * (off), so a forgotten wire-up and a correctly-wired API pod
+     * produce the SAME description, and nothing would ever say which
+     * one a report came from. The compiler asks instead.
+     */
+    private val retirementIntervalMs: Long,
 ) {
     private val log = KotlinLogging.logger {}
 
@@ -453,6 +482,18 @@ class VerifyService(
         h: Handle,
         catalogId: Long,
     ): VerifyCheck {
+        /**
+         * The DDL arms, VERBATIM from before #193 and now the only
+         * assertion that `TableRepo.markDropped` did its job.
+         *
+         * A drop is three UPDATEs: the identity row's
+         * `dropped_snapshot`, the live version row's `end_snapshot`,
+         * and the live column rows'. The file rows are deliberately NOT
+         * touched any more, so a live one is the normal state of a
+         * dropped table awaiting retirement — but a live COLUMN or
+         * VERSION row still means one of those three UPDATEs did not
+         * run, which is a half-dropped table and unreachable state.
+         */
         fun liveChildrenOfDroppedTable(
             table: String,
             idColumn: String,
@@ -473,12 +514,163 @@ class VerifyService(
                 "$table $idColumn=${rs.getLong("child_id")} still live on dropped " +
                     "table_id=${rs.getLong("table_id")}"
             }
-        // Table names are compile-time literals (invariant 9 intact).
+
+        /**
+         * A FILE arm: a table whose retirement should have finished and
+         * has not.
+         *
+         * THE OLD ARM CANNOT SURVIVE #193. It called any live
+         * `hog_data_file` row on a dropped table a violation, which
+         * used to be true because the drop end-snapshotted every one of
+         * them in the same transaction. Now the drop leaves them alone
+         * and the retirement sweep deletes them later, so that
+         * predicate fires on every drop, on every catalog, from the
+         * moment the drop commits until the sweep gets there — an alert
+         * on the design.
+         *
+         * What IS still a defect is a table the sweep should have
+         * finished, so the arm is qualified twice:
+         *
+         *  - `dropped_snapshot <= earliest_snapshot_id`: below the
+         *    floor, the rows are deletable. ABOVE it they are still
+         *    readable by time travel and retirement must not touch
+         *    them, so a table waiting for the floor is not a leak. This
+         *    is also why a retention-NULL catalog can never trip this
+         *    arm, and why the informational count below exists;
+         *  - `retirement_eligible_at < now() - grace`: the sweep has
+         *    SEEN this table (it stamps that column on first
+         *    observation) and has had [retirementOrphanGraceSeconds] to
+         *    finish it. Dating from the DROP instead would fire on a
+         *    catalog whose floor simply moved slowly, and an alert that
+         *    fires on a healthy system stops being read. A NULL stamp
+         *    with a passed floor means no sweep has observed the table
+         *    at all — retirement is off, or wedged — and it cannot be
+         *    distinguished here from "eligible for one second", so it
+         *    is deliberately NOT a violation; the run ledger's silence
+         *    is what says the loop is not running.
+         *
+         * `EXISTS`, not a count: this is a yes/no about a table, driven
+         * from `hog_data_file_live` / `hog_delete_file_live` — one
+         * index probe per dropped table rather than a pass over
+         * whatever the table still holds.
+         */
+        fun unretired(
+            relation: String,
+            index: String,
+        ): Violations =
+            violations(
+                h,
+                catalogId,
+                """
+                SELECT t.table_id, t.dropped_snapshot,
+                       extract(epoch FROM (now() - t.retirement_eligible_at))::bigint AS eligible_age
+                FROM hog_table t
+                JOIN hog_catalog c ON c.catalog_id = t.catalog_id
+                WHERE t.catalog_id = :c
+                  AND t.dropped_snapshot IS NOT NULL
+                  AND t.dropped_snapshot <= c.earliest_snapshot_id
+                  AND t.retirement_eligible_at IS NOT NULL
+                  AND t.retirement_eligible_at < now() - make_interval(secs => :grace)
+                  AND EXISTS (
+                      SELECT 1 FROM $relation x
+                      WHERE x.catalog_id = t.catalog_id
+                        AND x.table_id = t.table_id
+                        AND x.end_snapshot IS NULL)
+                """,
+                orderBy = "table_id",
+                binds = mapOf("grace" to retirementOrphanGraceSeconds.toDouble()),
+            ) { rs ->
+                "table_id=${rs.getLong("table_id")} was dropped in snapshot " +
+                    "${rs.getLong("dropped_snapshot")} and has been retirement-eligible for " +
+                    "${rs.getLong("eligible_age")}s (bound ${retirementOrphanGraceSeconds}s) but " +
+                    "still holds live $relation rows ($index); retirement is not draining it"
+            }
+
+        /**
+         * INFORMATIONAL, and never a violation: live file rows on
+         * dropped tables, whatever the floor says.
+         *
+         * DRIVEN FROM `hog_table`, WITH A CAPPED LATERAL, because the
+         * obvious shape is a trap. A `GROUP BY table_id` over
+         * `hog_data_file` is O(THE LIVE MANIFEST) — it reads every live
+         * row in the catalog to find the ones on dropped tables — and
+         * `/verify` is an aggregate pass that runs hourly against the
+         * database serving the commit tail. This form visits only
+         * DROPPED tables (a range scan of `hog_table`'s primary key)
+         * and, for each, stops counting at [INFORMATIONAL_ROW_CAP]
+         * rows through `hog_data_file_live`. The cost is bounded by
+         * `dropped tables x cap` rather than by the manifest, and
+         * `VerifyQueryPlanIntegrationTest` holds it to that.
+         *
+         * THE `ORDER BY` IS WHAT FORCES THE INDEX, and it is free.
+         * Without it the planner is entitled to satisfy `LIMIT n` with
+         * a SEQUENTIAL SCAN that stops once it has found n matching
+         * rows — which is cheap on a dropped table holding a third of
+         * the manifest and reads the WHOLE MANIFEST on one holding
+         * five rows, so the arm would cost `dropped tables x manifest`
+         * on the shape production actually has (many dropped tables,
+         * most of them small). Sorting by `hog_data_file_live`'s own
+         * key columns makes any other plan pay for a Sort, so the
+         * planner takes the index; the index already provides that
+         * order, so the clause costs nothing. `VerifyQueryPlan-
+         * IntegrationTest` seeds a big dropped table AND a tiny one for
+         * exactly this reason — with only the big one, the sequential
+         * plan passes.
+         *
+         * The price is that the count SATURATES, and the sample line
+         * says so ("at least N"). That is the right trade for a line
+         * whose job is "this dropped table is still holding storage":
+         * an operator needs to know WHICH table and roughly how much,
+         * and 10,000 is already "a lot". The exact number is a
+         * `SELECT count(*)` away for anyone who wants it.
+         *
+         * The failing arms above are floor-qualified, so on a catalog
+         * with no snapshot retention — several production catalogs have
+         * none — they can never fire, because the floor never advances
+         * and the rows are never deletable. That is correct, and it
+         * also means the population would be completely invisible: a
+         * dropped 3M-row table would hold its storage forever with
+         * nothing reporting it. This reports it, as a sample line on a
+         * PASSING check, so an operator can see what configuring
+         * retention (or unblocking a consumer's offset) would reclaim.
+         *
+         * Counted per table in ONE grouped pass over
+         * `hog_data_file_live`, which is strictly cheaper than the arm
+         * it replaces: that one returned a row per FILE.
+         */
+        val informational =
+            violations(
+                h,
+                catalogId,
+                ORPHANS_INFORMATIONAL_SQL,
+                orderBy = "live_rows DESC, table_id",
+                binds = mapOf("sampleCap" to INFORMATIONAL_ROW_CAP),
+            ) { rs ->
+                val why =
+                    if (rs.getBoolean("eligible")) {
+                        ""
+                    } else {
+                        " (not yet eligible: the drop snapshot has not sunk to the expiry floor " +
+                            "— a catalog with no retention never retires, by design)"
+                    }
+                val rows = rs.getLong("live_rows")
+                val howMany = if (rows >= INFORMATIONAL_ROW_CAP) "at least $rows" else "$rows"
+                "note: table_id=${rs.getLong("table_id")} (dropped in snapshot " +
+                    "${rs.getLong("dropped_snapshot")}) still holds $howMany " +
+                    "live data-file rows awaiting retirement" + why
+            }
+
+        // Table names and index names are compile-time literals
+        // (invariant 9 intact).
         val found =
-            liveChildrenOfDroppedTable("hog_data_file", "data_file_id") +
+            unretired("hog_data_file", "hog_data_file_live") +
+                unretired("hog_delete_file", "hog_delete_file_live") +
                 liveChildrenOfDroppedTable("hog_column", "field_id") +
                 liveChildrenOfDroppedTable("hog_table_version", "begin_snapshot")
-        return check("orphans", ORPHANS_DESCRIPTION, found)
+        // The informational group contributes SAMPLES and never COUNT,
+        // so it can never turn a pass into a fail. `check` decides
+        // status from the count alone.
+        return check("orphans", orphansDescription, found + Violations(0, informational.samples))
     }
 
     // ---- 4: removal queue --------------------------------------------------
@@ -905,11 +1097,44 @@ class VerifyService(
     // ---- descriptions ------------------------------------------------------
 
     /**
-     * The one description that is not a constant: it NAMES the bound
-     * and the two config values it is judged against, and all three are
-     * per-process, so a report from a service built with different ones
-     * must not quote the defaults.
+     * Instance-level, not a constant: it NAMES the bound and the
+     * cadence it is judged against, both of which are per-process, so a
+     * report from a service built with different ones must not quote
+     * the defaults. [stagingTicketsDescription] below is the same shape
+     * for the same reason.
      */
+    private val orphansDescription: String =
+        "A dropped table's rows leave in two stages, and this asserts both of them finished. " +
+            "DDL: the drop end-snapshots the table's columns and its versioned name row in the " +
+            "drop snapshot, so a live (end_snapshot IS NULL) hog_column or hog_table_version row " +
+            "on a table carrying a dropped_snapshot is a HALF-DROPPED table — a row no read path " +
+            "can reach and no sweep will ever collect, and these two arms are now the only thing " +
+            "asserting that the drop's three UPDATEs all ran. FILES: the drop deliberately does " +
+            "NOT touch them. That pass was O(rows) under the per-catalog commit lock and could " +
+            "not complete on a large table, so a dropped table's file rows stay live and the " +
+            "paced retirement sweep deletes them later — which it may only do once the drop " +
+            "snapshot has sunk to or below the catalog's expiry floor, because above the floor " +
+            "they are still readable by time travel. Live file rows on a dropped table are " +
+            "therefore the NORMAL state, and a violation only when the table is at or below the " +
+            "floor AND has been retirement-eligible for longer than " +
+            "$retirementOrphanGraceSeconds seconds — meaning retirement has seen it (the sweep " +
+            "stamps hog_table.retirement_eligible_at on first observation) and has not drained " +
+            "it. That bound is an operational judgement rather than a derivation: retirement is " +
+            "paced against the commit lock and against the cleanup queue, so a large table " +
+            "legitimately takes many runs (" +
+            (
+                if (retirementIntervalMs > 0) {
+                    "HOGLAKE_RETIREMENT_INTERVAL_MS, every $retirementIntervalMs ms here"
+                } else {
+                    "HOGLAKE_RETIREMENT_INTERVAL_MS, disabled in this process — the loop belongs " +
+                        "to one maintenance workload"
+                }
+            ) +
+            "). A catalog with no snapshot retention never advances its floor and therefore never " +
+            "retires anything, which is correct and can never trip this check; the live rows it " +
+            "is holding appear instead as informational sample lines on a PASSING check, so the " +
+            "storage they are keeping is visible to somebody."
+
     private val stagingTicketsDescription: String =
         "Invariant 4's compaction half: compaction pre-registers its output path as an undrained " +
             "hog_file_removal row with reason 'compaction_staging' — a claim ticket — before " +
@@ -1015,6 +1240,51 @@ class VerifyService(
          * positive here is an operator chasing a leak that is not one.
          */
         const val DEFAULT_COMPACTION_CLAIM_MAX_AGE_SECONDS = 60L * 60
+
+        /**
+         * A day. See the constructor parameter for why it is generous;
+         * the short version is that it bounds "retirement is not
+         * running at all", not "retirement is slow".
+         */
+        const val DEFAULT_RETIREMENT_ORPHAN_GRACE_SECONDS = 24L * 60 * 60
+
+        /**
+         * The informational arm, `internal` so the plan test EXPLAINs
+         * what production runs. It is the one `orphans` sub-query whose
+         * cost is not bounded by the number of dropped tables alone, so
+         * it is the one that needs a budget.
+         */
+        internal const val ORPHANS_INFORMATIONAL_SQL: String =
+            """
+                SELECT t.table_id, n.live_rows, t.dropped_snapshot,
+                       (t.retirement_eligible_at IS NOT NULL) AS eligible
+                FROM hog_table t
+                CROSS JOIN LATERAL (
+                    SELECT count(*) AS live_rows FROM (
+                        SELECT 1 FROM hog_data_file f
+                        WHERE f.catalog_id = t.catalog_id
+                          AND f.table_id = t.table_id
+                          AND f.end_snapshot IS NULL
+                        ORDER BY f.catalog_id, f.table_id, f.begin_snapshot
+                        LIMIT :sampleCap
+                    ) capped
+                ) n
+                WHERE t.catalog_id = :c
+                  AND t.dropped_snapshot IS NOT NULL
+                  AND n.live_rows > 0
+            """
+
+        /**
+         * Live rows the `orphans` informational line counts per dropped
+         * table before it stops and says "at least N".
+         *
+         * The cap is what turns an O(live manifest) aggregate into a
+         * bounded one: the whole arm costs `dropped tables x this`,
+         * and on gigahog-prod-us's `main.events_raw` the uncapped form
+         * would count three million rows to print one line. 10,000 is
+         * already "a lot" to an operator reading it.
+         */
+        const val INFORMATIONAL_ROW_CAP = 10_000L
 
         /**
          * One path-equality sub-query, with the ordering its samples are
@@ -1274,13 +1544,6 @@ class VerifyService(
                 "asserts the state those rules produce at rest: at most one live DV per data file, " +
                 "no supersession chain whose delete_count shrinks, and no vector claiming more " +
                 "deletes than its data file has rows."
-
-        const val ORPHANS_DESCRIPTION =
-            "The corollary of invariant 6 at rest: dropping a table end-snapshots its data files, " +
-                "its columns and its versioned name rows in the drop snapshot, so a live " +
-                "(end_snapshot IS NULL) hog_data_file, hog_column or hog_table_version row on a " +
-                "table carrying a dropped_snapshot is a write that outlived its parent — a row no " +
-                "read path can reach and no sweep will ever collect."
 
         const val REMOVAL_QUEUE_DESCRIPTION =
             "Invariant 4: physical deletion is never authorized by the queue — cleanup " +

@@ -26,6 +26,8 @@ private val log = KotlinLogging.logger("com.posthog.hoglake.api.ErrorMapping")
  * - OffsetRegression    -> 409
  * - IdlessFilesPresent  -> 409
  * - NamespaceNotEmpty   -> 409
+ * - TableDropped        -> 409 (a commit to a table that was dropped;
+ *                          the detail names the drop snapshot)
  * - Validation          -> 422
  * - Expired             -> 410
  * - CommitQueueTimeout  -> 503 + Retry-After (retryable backpressure,
@@ -52,6 +54,7 @@ fun StatusPagesConfig.installErrorMapping() {
                 is HoglakeException.OffsetRegression -> HttpStatusCode.Conflict to "offset_regression"
                 is HoglakeException.IdlessFilesPresent -> HttpStatusCode.Conflict to "idless_files_present"
                 is HoglakeException.NamespaceNotEmpty -> HttpStatusCode.Conflict to "namespace_not_empty"
+                is HoglakeException.TableDropped -> HttpStatusCode.Conflict to "table_dropped"
                 is HoglakeException.Validation -> HttpStatusCode.UnprocessableEntity to "validation"
                 is HoglakeException.Expired -> HttpStatusCode.Gone to "expired"
                 is HoglakeException.CommitQueueTimeout -> {

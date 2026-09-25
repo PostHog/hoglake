@@ -134,6 +134,13 @@ data class CatalogTotals(
  *    rows are the soft-deleted cleanup ledger, not pending work.
  *  - hoglake_missing_field_id_files counts LIVE flagged files — the
  *    same population the rename guard refuses on.
+ *  - EVERY hog_data_file gauge joins hog_table and excludes dropped
+ *    tables. Since #193 a drop touches no file row, so `end_snapshot IS
+ *    NULL` is no longer the whole of "live" — the rows of a dropped
+ *    table stay open until the retirement sweep deletes them, which on
+ *    a catalog with no retention is never. The five of them are
+ *    computed in ONE grouped pass (CatalogMetrics.SAMPLE_SQL), not five
+ *    correlated subqueries per catalog.
  *  - hoglake_consumer_lag_snapshots{consumer} is head - min committed
  *    snapshot across the consumer's tables (its worst table). To cap
  *    cardinality, per-consumer series are only emitted while a catalog
@@ -178,21 +185,28 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
     private val removalQueueDepth =
         multiGauge("hoglake_removal_queue_depth", "hog_file_removal entries awaiting cleanup")
     private val statsPendingFiles =
-        multiGauge("hoglake_stats_pending_files", "Data files with stats_state = 'pending'")
+        multiGauge(
+            "hoglake_stats_pending_files",
+            "Data files with stats_state = 'pending' on a live table — the hydrator's actual queue",
+        )
     private val statsFailedFiles =
         multiGauge(
             "hoglake_stats_failed_files",
-            "Data files with stats_state = 'failed' (hydration failed loudly; B1)",
+            "Data files with stats_state = 'failed' on a live table (hydration failed loudly; B1)",
         )
     private val missingFieldIdFiles =
         multiGauge(
             "hoglake_missing_field_id_files",
-            "Live data files whose parquet schema lacks field ids (rename-blocking)",
+            "Live data files whose parquet schema lacks field ids (rename-blocking); " +
+                "dropped tables excluded",
         )
     private val liveRows =
-        multiGauge("hoglake_live_rows", "Live registered rows per catalog (gross of DV masking)")
+        multiGauge(
+            "hoglake_live_rows",
+            "Live registered rows per catalog (gross of DV masking; dropped tables excluded)",
+        )
     private val liveBytes =
-        multiGauge("hoglake_live_bytes", "Live data-file bytes per catalog")
+        multiGauge("hoglake_live_bytes", "Live data-file bytes per catalog (dropped tables excluded)")
     private val tableCount =
         multiGauge("hoglake_table_count", "Live (non-dropped) tables")
     private val consumerLag =
@@ -304,42 +318,7 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
     private fun readSample(): Pair<List<CatalogRow>, List<Triple<String, String, Long>>> =
         jdbi.inTransactionUnchecked { h ->
             val rows =
-                h.createQuery(
-                    """
-                SELECT c.name,
-                       c.last_snapshot_id,
-                       c.earliest_snapshot_id,
-                       (SELECT extract(epoch FROM (now() - s.snapshot_time))
-                          FROM hog_snapshot s
-                         WHERE s.catalog_id = c.catalog_id
-                           AND s.snapshot_id = c.last_snapshot_id) AS head_age_seconds,
-                       (SELECT min(s.snapshot_time) FROM hog_snapshot s
-                         WHERE s.catalog_id = c.catalog_id) AS oldest_snapshot_time,
-                       (SELECT count(*) FROM hog_file_removal r
-                         WHERE r.catalog_id = c.catalog_id
-                           AND r.drained_at IS NULL) AS removal_depth,
-                       (SELECT count(*) FROM hog_data_file f
-                         WHERE f.catalog_id = c.catalog_id
-                           AND f.stats_state = 'pending') AS stats_pending,
-                       (SELECT count(*) FROM hog_data_file f
-                         WHERE f.catalog_id = c.catalog_id
-                           AND f.stats_state = 'failed') AS stats_failed,
-                       (SELECT count(*) FROM hog_data_file f
-                         WHERE f.catalog_id = c.catalog_id
-                           AND f.missing_field_ids
-                           AND f.end_snapshot IS NULL) AS missing_field_ids,
-                       (SELECT count(*) FROM hog_table t
-                         WHERE t.catalog_id = c.catalog_id
-                           AND t.dropped_snapshot IS NULL) AS table_count,
-                       (SELECT COALESCE(SUM(f.record_count), 0) FROM hog_data_file f
-                         WHERE f.catalog_id = c.catalog_id
-                           AND f.end_snapshot IS NULL) AS live_rows,
-                       (SELECT COALESCE(SUM(f.file_size_bytes), 0) FROM hog_data_file f
-                         WHERE f.catalog_id = c.catalog_id
-                           AND f.end_snapshot IS NULL) AS live_bytes
-                  FROM hog_catalog c
-                """,
-                )
+                h.createQuery(SAMPLE_SQL)
                     .map { rs, _ ->
                         CatalogRow(
                             name = rs.getString("name"),
@@ -391,5 +370,99 @@ class CatalogMetrics(private val jdbi: Jdbi, private val registry: MeterRegistry
     companion object {
         /** Per-catalog cap on hoglake_consumer_lag_snapshots series. */
         const val MAX_CONSUMER_SERIES = 100
+
+        /**
+         * The per-catalog sample, `internal` so the plan test EXPLAINs
+         * the SQL PRODUCTION runs rather than a lookalike.
+         *
+         * ONE PASS OVER THE MANIFEST, not five. Every 15 seconds, for
+         * every catalog, this used to issue five CORRELATED subqueries
+         * over `hog_data_file` — stats_pending, stats_failed,
+         * missing_field_ids, live_rows, live_bytes — each of which the
+         * planner runs once per catalog row. At two catalogs and a 5M-row
+         * manifest that was measured at 1.6M buffers and 2.2 s per
+         * sample, i.e. ten full scans of the manifest a minute against
+         * the database that also serves the commit tail, and it scaled
+         * with catalogs x subqueries. The `files` CTE reads the manifest
+         * ONCE and splits it with aggregate FILTERs: measured 213k
+         * buffers and 0.53 s on the same fixture.
+         *
+         * THE JOIN TO hog_table IS THE POINT, not a detail. Since #193 a
+         * dropped table's file rows are still `end_snapshot IS NULL` —
+         * the drop touches none of them, and the retirement sweep
+         * deletes them later — so `end_snapshot IS NULL` alone is no
+         * longer "live". Without this join `hoglake_live_rows` and
+         * `hoglake_live_bytes` would keep counting a dropped 3M-row
+         * table's data as live data for as long as its rows survived,
+         * which on a retention-NULL catalog is forever. This is the
+         * invariant's third carve-out in practice: a gauge counts rows
+         * at NO snapshot, so it filters on `hog_table` instead of
+         * resolving visibility at one.
+         *
+         * `stats_pending` and `stats_failed` carry the same filter for
+         * a second-order reason: the HYDRATOR no longer claims a
+         * dropped table's pending files, so counting them would publish
+         * a backlog nothing is draining — an alert that can never clear
+         * and a number no operator can act on.
+         *
+         * `LEFT JOIN`, and the COALESCEs, because a catalog with no
+         * file rows at all must still publish zeros. An INNER join
+         * would make an empty catalog's whole gauge row vanish, and a
+         * MultiGauge refreshed with `overwrite = true` retires a series
+         * that stops appearing — an empty catalog would look deleted.
+         *
+         * The three subqueries that remain are over other relations
+         * (hog_snapshot twice, hog_file_removal once, hog_table once)
+         * and are index-driven per catalog; folding them in would trade
+         * four cheap probes for extra grouped scans.
+         */
+        internal const val SAMPLE_SQL: String =
+            """
+            WITH files AS (
+                SELECT f.catalog_id,
+                       count(*) FILTER (
+                           WHERE f.stats_state = 'pending'
+                             AND t.dropped_snapshot IS NULL) AS stats_pending,
+                       count(*) FILTER (
+                           WHERE f.stats_state = 'failed'
+                             AND t.dropped_snapshot IS NULL) AS stats_failed,
+                       count(*) FILTER (
+                           WHERE f.missing_field_ids
+                             AND f.end_snapshot IS NULL
+                             AND t.dropped_snapshot IS NULL) AS missing_field_ids,
+                       COALESCE(SUM(f.record_count) FILTER (
+                           WHERE f.end_snapshot IS NULL
+                             AND t.dropped_snapshot IS NULL), 0) AS live_rows,
+                       COALESCE(SUM(f.file_size_bytes) FILTER (
+                           WHERE f.end_snapshot IS NULL
+                             AND t.dropped_snapshot IS NULL), 0) AS live_bytes
+                  FROM hog_data_file f
+                  JOIN hog_table t
+                    ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+                 GROUP BY f.catalog_id
+            )
+            SELECT c.name,
+                   c.last_snapshot_id,
+                   c.earliest_snapshot_id,
+                   (SELECT extract(epoch FROM (now() - s.snapshot_time))
+                      FROM hog_snapshot s
+                     WHERE s.catalog_id = c.catalog_id
+                       AND s.snapshot_id = c.last_snapshot_id) AS head_age_seconds,
+                   (SELECT min(s.snapshot_time) FROM hog_snapshot s
+                     WHERE s.catalog_id = c.catalog_id) AS oldest_snapshot_time,
+                   (SELECT count(*) FROM hog_file_removal r
+                     WHERE r.catalog_id = c.catalog_id
+                       AND r.drained_at IS NULL) AS removal_depth,
+                   (SELECT count(*) FROM hog_table t
+                     WHERE t.catalog_id = c.catalog_id
+                       AND t.dropped_snapshot IS NULL) AS table_count,
+                   COALESCE(fl.stats_pending, 0) AS stats_pending,
+                   COALESCE(fl.stats_failed, 0) AS stats_failed,
+                   COALESCE(fl.missing_field_ids, 0) AS missing_field_ids,
+                   COALESCE(fl.live_rows, 0) AS live_rows,
+                   COALESCE(fl.live_bytes, 0) AS live_bytes
+              FROM hog_catalog c
+              LEFT JOIN files fl ON fl.catalog_id = c.catalog_id
+            """
     }
 }

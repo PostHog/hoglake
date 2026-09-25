@@ -202,6 +202,27 @@ export function isQuietRun(run: MaintenanceRun): boolean {
       if (!r) return false;
       return r.status === "pass" && !r.checks.some((c) => positive(c.violations));
     }
+    case "retirement": {
+      const r = run.result;
+      if (!r) return false;
+      // A run that retired nothing AND was not stopped by anything is a
+      // catalog with no eligible drop, which is the steady state. Every
+      // other zero-row shape has a REASON attached — the queue ceiling,
+      // the run budget, the single-flight lock, a timeout, a stuck table
+      // — and those are exactly the runs where "0 rows" is the
+      // interesting part, on the same rule as compaction's skip
+      // counters above.
+      return ![
+        r.rows_retired,
+        r.dvs_retired,
+        r.timeouts,
+        r.skipped_tables,
+        r.skipped_queue_full,
+        r.skipped_locked,
+        r.convoyed,
+        r.tables_remaining,
+      ].some(positive);
+    }
   }
 }
 
@@ -211,7 +232,8 @@ export function RunOutcomeBadge({ run }: { run: MaintenanceRun }) {
     (run.task === "compaction" && positive(run.result?.failed_groups)) ||
     (run.task === "cleanup" && positive(run.result?.still_referenced)) ||
     (run.task === "verify" && run.result?.status === "fail") ||
-    (run.task === "hydrator" && run.result && "failed" in run.result && positive(run.result.failed));
+    (run.task === "hydrator" && run.result && "failed" in run.result && positive(run.result.failed)) ||
+    (run.task === "retirement" && positive(run.result?.skipped_tables));
   if (run.status === "ok" && issues) {
     return <span className="badge stats-failed" title="Invocation completed, but its result contains failures or violations">issues</span>;
   }
@@ -328,6 +350,40 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
         </>
       );
     }
+    case "retirement": {
+      const r = run.result;
+      if (!r) return <span className="empty">—</span>;
+      return (
+        <>
+          <span className="mono">
+            {formatCount(r.rows_retired)} rows / {formatCount(r.dvs_retired)} DVs retired
+          </span>
+          <span className="subtle mono">{formatCount(r.batches)} batches</span>
+          {positive(r.tables_remaining) && (
+            <span className="subtle mono">
+              {formatCount(r.tables_remaining)} tables left for the next run
+            </span>
+          )}
+          {positive(r.skipped_queue_full) && (
+            <span className="mono backlog-bad">cleanup queue over its ceiling</span>
+          )}
+          {positive(r.skipped_locked) && (
+            <span className="subtle mono">another maintainer holds this catalog</span>
+          )}
+          {positive(r.timeouts) && (
+            <span className="mono">{formatCount(r.timeouts)} timed-out batches</span>
+          )}
+          {positive(r.convoyed) && (
+            <span className="mono">gave up waiting for the commit lock</span>
+          )}
+          {positive(r.skipped_tables) && (
+            <span className="mono backlog-bad">
+              {formatCount(r.skipped_tables)} stuck tables
+            </span>
+          )}
+        </>
+      );
+    }
   }
 }
 
@@ -358,6 +414,7 @@ export const RUN_TASK_FILTERS = [
   "cleanup",
   "compaction",
   "verify",
+  "retirement",
 ] as const;
 export type RunTaskFilter = (typeof RUN_TASK_FILTERS)[number];
 

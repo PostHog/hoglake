@@ -77,6 +77,11 @@ describe("CentralMaintenancePage", () => {
     const headerRow = screen.getAllByRole("row")[0];
     expect(within(headerRow).getByText(/every ~69s/)).toBeInTheDocument();
     expect(within(headerRow).getByText(/manual only/)).toBeInTheDocument(); // verify
+    // Retirement is a loop task on a pod that runs it off, exactly like
+    // compaction: its column must report the sweeps the LEDGER saw, and
+    // "scratch" having never run one must not blank the column.
+    const retirementHead = within(headerRow).getByText(/retirement/);
+    expect(retirementHead.textContent).toMatch(/every ~60s/);
     expect(within(headerRow).queryByText(/disabled/)).not.toBeInTheDocument();
     // The hydrator's cadence is not derivable from a ledger that records
     // work rather than sweeps, and a column head must not borrow one
@@ -93,6 +98,9 @@ describe("CentralMaintenancePage", () => {
     expect(within(analyticsRow).getByText("113 snapshots kept")).toBeInTheDocument();
     expect(within(analyticsRow).getByText("0 queued")).toBeInTheDocument();
     expect(within(analyticsRow).getByText("42 small files")).toBeInTheDocument();
+    // Retirement has no backlog number to show (the honest one is a
+    // manifest scan), so its cell carries the last run's headline.
+    expect(within(analyticsRow).getByText("24,000 rows retired")).toBeInTheDocument();
 
     // scratch row: never ran anything -> the never-ran dash badge.
     const scratchRow = scratchLink.closest("tr")!;
@@ -156,7 +164,7 @@ describe("CentralMaintenancePage", () => {
       .getAllByRole("table")
       .find((t) => within(t).queryByText("outcome"))!;
     const rows = within(table).getAllByRole("row").slice(1);
-    expect(rows).toHaveLength(6);
+    expect(rows).toHaveLength(7);
     expect(within(rows[0]).getByText("104")).toBeInTheDocument();
     expect(within(rows[1]).getByText("cleanup")).toBeInTheDocument();
     const catalogLinks = within(rows[1]).getByRole("link", { name: "analytics" });

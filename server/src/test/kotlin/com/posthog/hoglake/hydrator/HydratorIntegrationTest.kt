@@ -530,6 +530,103 @@ class HydratorIntegrationTest {
     }
 
     @Test
+    fun `a dropped table's pending files are never claimed, and rehydrate refuses the table`() {
+        // Since #193 a drop touches no file row, so a dropped table's
+        // `pending` rows stay pending forever unless this sweep
+        // declines them. Two things would go wrong if it did not: the
+        // sweep would fetch footers from S3 to write stats onto rows
+        // the retirement loop is about to delete, and — because the
+        // claim is ordered by (catalog_id, data_file_id) and the sweep
+        // is instance-wide — a big dropped table's backlog would sit at
+        // the head of the queue and starve every live table behind it.
+        //
+        // It is also what lets the retirement batch's victim select
+        // drop its `FOR UPDATE`: the hydrator was the only row-level
+        // writer that could otherwise touch a dropped table's rows.
+        val catalogId = seedCatalogAndTable()
+        val live = "s3://$BUCKET/t1/live-table.parquet"
+        val dropped = "s3://$BUCKET/t2/dropped-table.parquet"
+        store.put(live, parquetBytes)
+        store.put(dropped, parquetBytes)
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) " +
+                    "VALUES (?, 2, 1, 2)",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_table_version
+                    (catalog_id, table_id, begin_snapshot, end_snapshot, namespace_id, name)
+                VALUES (?, 1, 1, NULL, 1, 't_live'), (?, 2, 1, 2, 1, 't_dropped')
+                """,
+                catalogId,
+                catalogId,
+            )
+            // The dropped table's row is FIRST by data_file_id, which is
+            // the order the claim uses: without the guard it is what a
+            // limited sweep would pick.
+            h.execute(
+                """
+                INSERT INTO hog_data_file
+                    (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                     record_count, file_size_bytes, row_id_start, stats_state)
+                VALUES (?, 1, 2, 1, ?, ?, ?, 0, 'pending')
+                """,
+                catalogId,
+                dropped,
+                ROWS.toLong(),
+                parquetBytes.size.toLong(),
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file
+                    (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                     record_count, file_size_bytes, row_id_start, stats_state)
+                VALUES (?, 2, 1, 1, ?, ?, ?, 0, 'pending')
+                """,
+                catalogId,
+                live,
+                ROWS.toLong(),
+                parquetBytes.size.toLong(),
+            )
+        }
+
+        // MUTATION: remove the `hog_table` join (or its
+        // `dropped_snapshot IS NULL` clause) from `claimPending` and
+        // this reds — the sweep processes two files and the dropped
+        // table's row leaves 'pending'.
+        assertThat(hydrator.runOnce()).describedAs("only the live table's file is work").isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("pending")
+        assertThat(statsState(catalogId, 2)).isEqualTo("provided")
+
+        // REHYDRATE, both forms. The named-table form resolves through
+        // TableRepo.findLive, which excludes a dropped table, so it is
+        // a 404 rather than a requeue of rows nothing will claim.
+        val cat = catalogName(catalogId)
+        org.assertj.core.api.Assertions.assertThatThrownBy {
+            hydrator.rehydrateFailed(cat, "ns", "t_dropped")
+        }.isInstanceOf(com.posthog.hoglake.model.HoglakeException.NotFound::class.java)
+
+        // The whole-catalog form must skip it too. MUTATION: remove the
+        // `EXISTS` clause from the requeue UPDATE and this reds — the
+        // dropped table's failed row flips to 'pending' and joins a
+        // backlog nothing drains, which the hydrator gauge then
+        // reports as work.
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'failed' WHERE catalog_id = ?",
+                catalogId,
+            )
+        }
+        assertThat(hydrator.rehydrateFailed(cat).requeued)
+            .describedAs("only the live table's row is requeued")
+            .isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("failed")
+        assertThat(statsState(catalogId, 2)).isEqualTo("pending")
+    }
+
+    @Test
     fun `rehydrate table scope hits only that table and half a scope is a validation`() {
         val catalogId = seedCatalogAndTable()
         // A second table with its own failed file, plus a live version row

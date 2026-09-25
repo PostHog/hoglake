@@ -397,7 +397,18 @@ class CommitService(
             val (namespace, table) = key
             val live =
                 resolveLiveTable(h, catalogId, namespace, table)
-                    ?: throw HoglakeException.Validation("unknown table $namespace.$table")
+                    // The miss path, and only the miss path, asks WHY:
+                    // a name that never existed is still the 422 it was,
+                    // while a name whose table was dropped is a typed
+                    // 409 naming the drop snapshot. Before #193 a drop
+                    // also end-snapshotted the files, so a writer that
+                    // kept committing into a dropped table got
+                    // "unknown table" and had no way to tell a typo
+                    // from a table pulled out from under it. Now that
+                    // the table row is the ONLY thing that says a
+                    // dropped table's rows are unreachable, the refusal
+                    // says so too.
+                    ?: throw droppedTableRefusal(h, catalogId, namespace, table)
             for (expected in expectedUuids[key].orEmpty()) {
                 // The atomic incarnation guard: the name resolved, but to a
                 // different incarnation than the writer planned against —
@@ -1020,6 +1031,62 @@ class CommitService(
 
     /** A live table's id + identity uuid (the incarnation the name currently binds to). */
     private data class LiveTable(val tableId: Long, val tableUuid: UUID)
+
+    /**
+     * The refusal for a commit whose table did not resolve live: a
+     * typed [HoglakeException.TableDropped] naming the drop snapshot
+     * when the name belonged to a dropped table, and the historical
+     * [HoglakeException.Validation] otherwise.
+     *
+     * "Belonged to a dropped table" is asked precisely: a version row
+     * under this (namespace, name) whose `end_snapshot` is exactly its
+     * table's `dropped_snapshot` — the row `TableRepo.markDropped`
+     * closed. A rename closes a version row too, and a table renamed
+     * away is NOT a dropped table under the old name; matching the drop
+     * snapshot is what separates the two. The newest such incarnation
+     * wins, because a name can have been dropped and recreated and
+     * dropped again, and the last drop is the one a writer is racing.
+     *
+     * Runs on the failing path only; a successful commit never issues
+     * it.
+     */
+    private fun droppedTableRefusal(
+        h: Handle,
+        catalogId: Long,
+        namespace: String,
+        table: String,
+    ): HoglakeException {
+        val droppedAt =
+            h.createQuery(
+                """
+            SELECT t.dropped_snapshot
+              FROM hog_table_version tv
+              JOIN hog_namespace ns
+                ON ns.catalog_id = tv.catalog_id AND ns.namespace_id = tv.namespace_id
+              JOIN hog_table t
+                ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
+             WHERE tv.catalog_id = :catalogId
+               AND tv.name = :table
+               AND ns.name = :namespace
+               AND NOT ns.dropped
+               AND t.dropped_snapshot IS NOT NULL
+               AND tv.end_snapshot = t.dropped_snapshot
+             ORDER BY t.dropped_snapshot DESC
+             LIMIT 1
+            """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("namespace", namespace)
+                .bind("table", table)
+                .mapTo(Long::class.javaObjectType)
+                .findOne()
+                .orElse(null)
+                ?: return HoglakeException.Validation("unknown table $namespace.$table")
+        return HoglakeException.TableDropped(
+            "table '$namespace.$table' was dropped in snapshot $droppedAt; its files are " +
+                "no longer part of the catalog and are being retired",
+        )
+    }
 
     /** A table is live iff its head version row is open and neither it nor its namespace is dropped. */
     private fun resolveLiveTable(

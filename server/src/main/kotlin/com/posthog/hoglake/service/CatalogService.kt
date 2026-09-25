@@ -311,9 +311,14 @@ class CatalogService(private val jdbi: Jdbi) {
         SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
         if (replacementTableId != null) {
             SnapshotRepo.insertChange(h, cat.catalogId, alloc.snapshotId, ChangeKind.TABLE_DROPPED, replacementTableId)
+            // The retired incarnation is dropped the same way DROP TABLE
+            // drops: three O(columns) UPDATEs and NOT a pass over its
+            // file rows. A replacement of a large table used to pay the
+            // whole end-snapshot cost inside this DDL transaction, under
+            // the commit lock, for a table the publish is about to
+            // replace anyway. Its rows retire through the retirement
+            // sweep, on the same gate as any other drop.
             TableRepo.markDropped(h, cat.catalogId, replacementTableId, alloc.snapshotId)
-            FileRepo.endLiveDeleteFiles(h, cat.catalogId, replacementTableId, alloc.snapshotId)
-            FileRepo.endLiveFiles(h, cat.catalogId, replacementTableId, alloc.snapshotId)
         }
         val tableId = CatalogRepo.allocateTableId(h, cat.catalogId)
         SnapshotRepo.insertChange(
@@ -420,16 +425,26 @@ class CatalogService(private val jdbi: Jdbi) {
                     ChangeKind.TABLE_DROPPED,
                     t.tableId,
                 )
+                // THE WHOLE DROP, and it is O(columns): TableRepo.markDropped
+                // and nothing else. The file rows stay exactly as they
+                // are — live, on a table that is now dropped — and
+                // RetirementService deletes them in paced batches once
+                // `dropped_snapshot` sinks under the catalog's expiry
+                // floor, queueing every data and puffin path (DVs first)
+                // with reason `table_drop_gc`.
+                //
+                // Ending them here was the outage: 3,008,849 rows =
+                // 44.6 s and 3.9 GB of WAL under the commit lock, past
+                // every admission bound, rolled back by the statement
+                // timeout, table left undroppable (#193). Bug hunt #16's
+                // rule — a live DV must never outlive its data file
+                // un-queued — is not weakened, it MOVED: the retirement
+                // batch deletes `hog_delete_file` rows for its victims
+                // BEFORE the `hog_data_file` rows, with no `end_snapshot`
+                // clause, so a superseded DV cannot be taken away by the
+                // data-file cascade without being queued
+                // (DropDvLifecycleIntegrationTest).
                 TableRepo.markDropped(h, cat.catalogId, t.tableId, alloc.snapshotId)
-                // DVs FIRST, same end-snapshot pattern as the data files: a
-                // live DV left open on a dropped table would be invisible
-                // to expiry's range predicates (end_snapshot IS NULL never
-                // sinks below the floor), leaking the row AND the object
-                // forever. End-snapshotted here, the superseded-DV
-                // lifecycle reclaims it: expiry queues the path once the
-                // drop snapshot falls under the retention floor.
-                FileRepo.endLiveDeleteFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
-                FileRepo.endLiveFiles(h, cat.catalogId, t.tableId, alloc.snapshotId)
                 CommitResult(snapshotId = alloc.snapshotId, schemaVersion = alloc.schemaVersion)
             }
         }
