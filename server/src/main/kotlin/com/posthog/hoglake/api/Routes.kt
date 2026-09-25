@@ -438,8 +438,9 @@ fun Application.installApiRoutes(
  * GET .../tables/{table}/scan?snapshot= — read planning (openapi
  * planScan): data files paired with their visible deletion vectors, and
  * with `include=column_stats` each provided file's column statistics
- * (narrowed by `stats_fields`). Installed separately so App.kt wires it
- * with its own ScanService.
+ * (narrowed by `stats_fields`), with `include=split_offsets` each file's
+ * stored row-group start offsets. Installed separately so App.kt wires
+ * it with its own ScanService.
  */
 fun Application.installScanRoutes(scan: ScanService) {
     routing {
@@ -449,6 +450,7 @@ fun Application.installScanRoutes(scan: ScanService) {
             // drop field 7's bounds and a second, misspelt `include` would
             // be ignored rather than refused.
             fun joined(name: String) = call.request.queryParameters.getAll(name)?.joinToString(",")
+            val request = parseScanRequest(joined("include"), joined("stats_fields"))
             call.respond(
                 scan.planScan(
                     call.catalog(),
@@ -456,21 +458,37 @@ fun Application.installScanRoutes(scan: ScanService) {
                     call.table(),
                     call.longQuery("snapshot"),
                     call.instantQuery("at_timestamp"),
-                    parseScanStatsRequest(joined("include"), joined("stats_fields")),
+                    columnStats = request.columnStats,
+                    splitOffsets = request.splitOffsets,
                 ).map { it.toDto() },
             )
         }
     }
 }
 
-/** The `include` values GET .../scan understands. */
-internal val SCAN_INCLUDES = setOf("column_stats")
+/**
+ * The `include` values GET .../scan understands. Each names one optional
+ * PART of the plan, and each part is a property that ONLY the scan plan
+ * carries (the files listing and the changefeed never do):
+ * `column_stats` attaches DataFile.column_stats, `split_offsets`
+ * attaches DataFile.split_offsets.
+ */
+internal val SCAN_INCLUDES = setOf("column_stats", "split_offsets")
+
+/**
+ * The optional parts one GET .../scan asked for: column statistics
+ * (null when not asked) and row-group split offsets.
+ */
+internal data class ScanRequest(
+    val columnStats: ScanService.ColumnStatsRequest?,
+    val splitOffsets: Boolean,
+)
 
 /**
  * Most DISTINCT values `include` may name.
  *
- * The parameter names optional PARTS of the plan and there is one of
- * them, so sixteen is already an order of magnitude of headroom. The
+ * The parameter names optional PARTS of the plan and there are two of
+ * them, so sixteen is already ample headroom. The
  * cap exists because the unknown-value refusal ECHOES what it did not
  * recognise: without a bound, sixteen hundred misspellings produce
  * sixteen hundred quoted tokens in a 422 body. [Identifiers.cap]
@@ -539,16 +557,30 @@ internal const val MAX_RAW_SCAN_TOKENS = 10 * ColumnTrees.MAX_COLUMN_NODES
 internal fun parseScanStatsRequest(
     include: String?,
     statsFields: String?,
-): ScanService.ColumnStatsRequest? {
+): ScanService.ColumnStatsRequest? = parseScanRequest(include, statsFields).columnStats
+
+/**
+ * `include` and `stats_fields` as the whole of a scan's optional parts:
+ * [parseScanStatsRequest]'s rules for the statistics, plus whether
+ * `split_offsets` was named. The two values combine freely
+ * (`include=column_stats,split_offsets`); `stats_fields` narrows the
+ * statistics only, so it still requires `column_stats` and naming only
+ * `split_offsets` beside it is the same 422.
+ */
+internal fun parseScanRequest(
+    include: String?,
+    statsFields: String?,
+): ScanRequest {
     val includes = include?.let { parseScanIncludes(it) } ?: emptySet()
     val fieldIds = statsFields?.let { parseStatsFields(it) }
+    val splitOffsets = "split_offsets" in includes
     if ("column_stats" !in includes) {
         if (fieldIds != null) {
             throw HoglakeException.Validation("stats_fields requires include=column_stats")
         }
-        return null
+        return ScanRequest(columnStats = null, splitOffsets = splitOffsets)
     }
-    return ScanService.ColumnStatsRequest(fieldIds)
+    return ScanRequest(ScanService.ColumnStatsRequest(fieldIds), splitOffsets)
 }
 
 /**

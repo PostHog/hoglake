@@ -10,9 +10,11 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.validateFooterSize
+import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -681,10 +683,10 @@ class CommitService(
                 """
             INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
                                        path, record_count, file_size_bytes, footer_size,
-                                       row_id_start, stats_state, spec_id)
+                                       row_id_start, stats_state, spec_id, split_offsets)
             VALUES (:catalogId, :dataFileId, :tableId, :beginSnapshot,
                     :path, :recordCount, :fileSizeBytes, :footerSize,
-                    :rowIdStart, :statsState, :specId)
+                    :rowIdStart, :statsState, :specId, :splitOffsets)
             """,
             )
         val statsBatch =
@@ -789,6 +791,7 @@ class CommitService(
                     .bind("rowIdStart", rowId)
                     .bind("statsState", if (file.columnStats != null) "provided" else "pending")
                     .bind("specId", append.spec?.specId)
+                    .bindBigintArrayOrNull("splitOffsets", file.splitOffsets)
                     .add()
                 rowId += file.recordCount
                 if (append.spec != null) {
@@ -1131,6 +1134,14 @@ class CommitService(
                     "negative file_size_bytes for ${file.path} in $qualified",
                 )
             }
+            // Refused, not repaired: unlike a stats row there is no
+            // partial list worth keeping — readers ignore a list that
+            // breaks the contract, and a sorted-but-wrong one misplaces
+            // every cut. Absent stays absent (NULL), for provided and
+            // pending registrations alike. The one check for BOTH doors:
+            // atomic table creation publishes through registerInitialFiles,
+            // which runs this function too.
+            file.validateSplitOffsets()
             val spec = append.spec
             val values = file.partitionValues
             if (spec != null) {

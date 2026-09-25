@@ -86,4 +86,25 @@ class ScanStatsParameterParsingTest {
         // refuse ids the DDL had just allowed.
         assertThat(MAX_STATS_FIELDS).isEqualTo(com.posthog.hoglake.service.ColumnTrees.MAX_COLUMN_NODES)
     }
+
+    @Test
+    fun `split_offsets is its own part, combinable with column_stats and independent of it`() {
+        assertThat(parseScanRequest(null, null)).isEqualTo(ScanRequest(columnStats = null, splitOffsets = false))
+        assertThat(parseScanRequest("split_offsets", null)).isEqualTo(ScanRequest(null, splitOffsets = true))
+        assertThat(parseScanRequest("column_stats", null).splitOffsets).isFalse()
+        val both = parseScanRequest("column_stats,split_offsets", "3")
+        assertThat(both.splitOffsets).isTrue()
+        assertThat(both.columnStats?.fieldIds).containsExactly(3L)
+        // The route joins repeated occurrences with commas; the parser
+        // sees one list and must not care which occurrence named which.
+        assertThat(parseScanRequest("split_offsets,column_stats,split_offsets", null))
+            .isEqualTo(ScanRequest(com.posthog.hoglake.service.ScanService.ColumnStatsRequest(), true))
+        // The statistics-only projection is unchanged by the new part.
+        assertThat(parseScanStatsRequest("split_offsets", null)).isNull()
+        // stats_fields narrows statistics; naming split_offsets does not
+        // make it legal without column_stats.
+        assertThatThrownBy { parseScanRequest("split_offsets", "3") }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("include=column_stats")
+    }
 }

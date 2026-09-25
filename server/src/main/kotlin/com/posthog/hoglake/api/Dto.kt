@@ -300,6 +300,8 @@ data class FileRegistrationDto(
     val footerSize: Long? = null,
     val columnStats: List<ColumnStatsDto>? = null,
     val partitionValues: List<String?>? = null,
+    /** Optional row-group start offsets from a footer-shipping writer; validated at commit. */
+    val splitOffsets: List<Long>? = null,
 ) {
     fun toModel() =
         FileRegistration(
@@ -309,6 +311,7 @@ data class FileRegistrationDto(
             footerSize = footerSize,
             columnStats = columnStats?.map { it.toModel() },
             partitionValues = partitionValues,
+            splitOffsets = splitOffsets,
         )
 }
 
@@ -413,6 +416,13 @@ data class DataFileDto(
      * carry it, and NON_NULL omits it for a pending or failed file.
      */
     val columnStats: List<ScanColumnStatsDto>? = null,
+    /**
+     * The file's row-group start offsets, filled by the scan plan only
+     * when asked (`include=split_offsets`) and only when the catalog has
+     * them; the listing and the changefeed never carry it, and NON_NULL
+     * omits it for a file with none.
+     */
+    val splitOffsets: List<Long>? = null,
 )
 
 /**
@@ -494,6 +504,7 @@ fun DataFile.toDto() =
         explicitRowIds = explicitRowIds,
         orderingBounds = orderingBounds?.toDto(),
         columnStats = columnStats?.map { it.toScanDto() },
+        splitOffsets = splitOffsets,
     )
 
 // ---- distinct partition values (filter-by-partition dropdown) ----------------

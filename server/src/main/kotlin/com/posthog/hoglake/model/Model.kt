@@ -887,6 +887,14 @@ data class DataFile(
      * empty list. The listing and the changefeed leave it null.
      */
     val columnStats: List<FileColumnStats>? = null,
+    /**
+     * The file's row-group start offsets ([SplitOffsets]), ascending, one
+     * per row group — populated by the SCAN PLAN alone (GET .../scan with
+     * include=split_offsets), and only when the catalog has them: null
+     * means "unknown, cut evenly". The listing and the changefeed leave
+     * it null.
+     */
+    val splitOffsets: List<Long>? = null,
 )
 
 /**
@@ -1005,6 +1013,18 @@ data class FileRegistration(
      * forbidden when it is not.
      */
     val partitionValues: List<String?>? = null,
+    /**
+     * Optional row-group start offsets from a writer that holds the
+     * footer ([SplitOffsets]); validated at commit, stored verbatim.
+     * Absent leaves `hog_data_file.split_offsets` NULL — for a pending
+     * file the hydrator fills it from the footer; a provided-stats file
+     * registered without it simply has none, and readers cut it evenly.
+     * NON_NULL so a stored payload (commit receipt, table-creation
+     * files) written without it reads back identically on a replica
+     * that predates it.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val splitOffsets: List<Long>? = null,
 )
 
 data class TableAppend(

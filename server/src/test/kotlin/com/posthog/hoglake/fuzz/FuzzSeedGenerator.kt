@@ -291,6 +291,17 @@ object FuzzSeedGenerator {
                        {"data_file_id":5,"path":"s3://b/dv.puffin","delete_count":3,
                         "file_size_bytes":99}]}]}""",
                 "commit_empty" to """{}""",
+                // A footer-shipping registration's split_offsets: one the
+                // contract accepts, and one it refuses (unsorted, and the
+                // last entry at file_size_bytes).
+                "commit_split_offsets" to
+                    """{"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
+                        "footer_size":256,"split_offsets":[4,300,700]}]}]}""",
+                "commit_split_offsets_invalid" to
+                    """{"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
+                        "split_offsets":[700,300,1024]}]}]}""",
                 "alter_all_ops" to
                     """{"ops":[
                        {"op":"add_column","column":{"name":"c1","type":"long"}},
@@ -356,6 +367,10 @@ object FuzzSeedGenerator {
             // include alone, no NUL: the accepted spelling, and the
             // shapes the parser has to separate from it.
             "scan_include_column_stats" to "column_stats",
+            "scan_include_split_offsets" to "split_offsets",
+            "scan_include_both" to "column_stats,split_offsets${nul}3",
+            // split_offsets does not license stats_fields.
+            "scan_include_split_offsets_orphan_fields" to "split_offsets${nul}3",
             "scan_include_unknown" to "column_stat",
             "scan_include_repeated" to "column_stats,column_stats",
             "scan_include_trailing_comma" to "column_stats,",

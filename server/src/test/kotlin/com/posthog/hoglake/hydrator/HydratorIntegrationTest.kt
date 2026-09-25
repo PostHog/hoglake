@@ -1,8 +1,10 @@
 package com.posthog.hoglake.hydrator
 
+import com.posthog.hoglake.persistence.getBigintListOrNull
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
+import com.posthog.hoglake.testing.ThriftRowGroupStarts
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
@@ -86,7 +88,11 @@ class HydratorIntegrationTest {
             )
         }
 
-        fun writeSampleParquet(schema: MessageType): ByteArray {
+        /** [rowGroupRows] non-null closes a row group every that many rows. */
+        fun writeSampleParquet(
+            schema: MessageType,
+            rowGroupRows: Int? = null,
+        ): ByteArray {
             val tmp = Files.createTempFile("hoglake-hydrator", ".parquet")
             try {
                 Files.deleteIfExists(tmp)
@@ -94,10 +100,19 @@ class HydratorIntegrationTest {
                 ExampleParquetWriter.builder(LocalOutputFile(tmp))
                     .withType(schema)
                     .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+                    .apply {
+                        if (rowGroupRows != null) {
+                            withRowGroupRowCountLimit(rowGroupRows)
+                            // The row-group check otherwise first runs at
+                            // 100 records, past this file's 25.
+                            withMinRowCountForPageSizeCheck(1)
+                        }
+                    }
                     .build()
                     .use { writer ->
                         for (i in 0 until ROWS) {
                             val g = factory.newGroup()
+                            if (schema.containsField("bucket")) g.add("bucket", (i % 2).toLong())
                             g.add("id", i.toLong())
                             if (i % 5 != 0) g.add("score", i * 1.5)
                             if (i != 13) g.add("name", "row-%02d".format(i))
@@ -674,5 +689,103 @@ class HydratorIntegrationTest {
                 assertThat(statsState(catalogId, 1)).isEqualTo("provided")
             }
         }
+    }
+
+    // ---- split_offsets ----------------------------------------------------
+
+    private fun splitOffsets(
+        catalogId: Long,
+        dataFileId: Long,
+    ): List<Long>? =
+        jdbi.withHandle<List<Long>?, Exception> { h ->
+            h.createQuery(
+                "SELECT split_offsets FROM hog_data_file WHERE catalog_id = ? AND data_file_id = ?",
+            ).bind(0, catalogId).bind(1, dataFileId)
+                .map { rs, _ -> rs.getBigintListOrNull("split_offsets") }
+                .one()
+        }
+
+    /**
+     * The sample schema behind a leading low-cardinality `bucket` column
+     * (i % 2, field id 5 — not a catalog column, so the hydrator binds no
+     * stats to it). parquet-java drops a dictionary that does not pay for
+     * itself, which a row group of seven unique ids never does, so without
+     * this lead column the dictionary arm of the starting-position rule
+     * would never be exercised.
+     */
+    private fun bucketFirstSchema(): MessageType =
+        MessageType(
+            "hoglake_test",
+            listOf(Types.required(PrimitiveType.PrimitiveTypeName.INT64).id(5).named("bucket")) +
+                sampleSchema(withIds = true).fields,
+        )
+
+    @Test
+    fun `a multi-row-group file stores each row group's first column chunk start as split_offsets`() {
+        val catalogId = seedCatalogAndTable()
+        val bytes = writeSampleParquet(bucketFirstSchema(), rowGroupRows = 7)
+        val (expected, dictionaryFirst) = ThriftRowGroupStarts.of(bytes)
+        // 25 rows at 7 per group: 7 + 7 + 7 + 4. Pinned so a writer
+        // change that silently made this a one-group file cannot pass.
+        assertThat(expected).hasSize(4)
+        // The two-value `bucket` column leads every row group and keeps
+        // its dictionary, so the list must be the DICTIONARY page
+        // offsets, not the data page ones (the arm a wrong rule misses).
+        assertThat(dictionaryFirst).isEqualTo(4)
+        val path = "s3://$BUCKET/t1/rowgroups.parquet"
+        store.put(path, bytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), bytes.size.toLong(), footerSizeOf(bytes))
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(splitOffsets(catalogId, 1)).containsExactlyElementsOf(expected)
+        // Stats still aggregate across all four groups.
+        assertSampleStats(catalogId, 1)
+    }
+
+    @Test
+    fun `a single-row-group file stores a one-element list`() {
+        val catalogId = seedCatalogAndTable()
+        val expected = ThriftRowGroupStarts.of(parquetBytes).offsets
+        assertThat(expected).hasSize(1)
+        val path = "s3://$BUCKET/t1/one-group.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(splitOffsets(catalogId, 1)).containsExactlyElementsOf(expected)
+    }
+
+    @Test
+    fun `over the row-group cap the file still hydrates, with no split_offsets`() {
+        val catalogId = seedCatalogAndTable()
+        val bytes = writeSampleParquet(bucketFirstSchema(), rowGroupRows = 7)
+        val path = "s3://$BUCKET/t1/over-cap.parquet"
+        store.put(path, bytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), bytes.size.toLong(), footerSizeOf(bytes))
+        // Four row groups against a cap of three. The production cap
+        // (100,000) is pinned on constructed metadata in
+        // FooterSplitOffsetsTest; this is the same branch end to end.
+        val capped = Hydrator(jdbi, store, maxSplitOffsetRowGroups = 3)
+
+        assertThat(capped.runOnce()).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("provided")
+        assertThat(splitOffsets(catalogId, 1)).isNull()
+        assertSampleStats(catalogId, 1)
+    }
+
+    @Test
+    fun `the footer replaces a list the pending registration shipped`() {
+        val catalogId = seedCatalogAndTable()
+        val expected = ThriftRowGroupStarts.of(parquetBytes).offsets
+        val path = "s3://$BUCKET/t1/shipped.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(catalogId, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+        jdbi.useHandle<Exception> { h ->
+            h.execute("UPDATE hog_data_file SET split_offsets = '{1,2}' WHERE catalog_id = ?", catalogId)
+        }
+
+        assertThat(hydrator.runOnce()).isEqualTo(1)
+        assertThat(splitOffsets(catalogId, 1)).containsExactlyElementsOf(expected)
     }
 }

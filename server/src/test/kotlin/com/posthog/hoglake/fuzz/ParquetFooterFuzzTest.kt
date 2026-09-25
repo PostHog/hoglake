@@ -3,9 +3,11 @@ package com.posthog.hoglake.fuzz
 import com.code_intelligence.jazzer.junit.FuzzTest
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
+import com.posthog.hoglake.hydrator.FooterSplitOffsets
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.memoryInput
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.SplitOffsets
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -43,7 +45,8 @@ import java.nio.ByteOrder
  *    usesFieldIds / aggregate are total: they never throw, whatever the
  *    schema shape (that is the hydrator's "bounds NULL, never guessed"
  *    contract — the TransformGlobalStatsRow crash class from the defect
- *    ledger).
+ *    ledger), and so is FooterSplitOffsets.of, whose list — when it
+ *    gives one — must honour the split_offsets contract in full.
  */
 class ParquetFooterFuzzTest {
     @FuzzTest(maxDuration = "180s")
@@ -64,6 +67,17 @@ class ParquetFooterFuzzTest {
         FooterStats.missingFieldIds(schema)
         FooterStats.usesFieldIds(schema)
         FooterStats.aggregate(footer, CATALOG_COLUMNS, "fuzz://footer")
+
+        // Row-group offsets: total too (never throws on a parsed footer),
+        // and NEVER a list that breaks the contract a reader relies on —
+        // checked here from first principles, not by the shared
+        // validator the code under test already calls.
+        FooterSplitOffsets.of(footer, file.size.toLong())?.let { offsets ->
+            check(offsets.isNotEmpty() && offsets.size <= SplitOffsets.MAX_ROW_GROUPS) { "bad size ${offsets.size}" }
+            check(offsets.size == footer.blocks.size) { "partial list: ${offsets.size} of ${footer.blocks.size}" }
+            check(offsets.first() >= 0 && offsets.last() < file.size) { "out of range: $offsets" }
+            check(offsets.zipWithNext().all { (a, b) -> a < b }) { "not strictly increasing: $offsets" }
+        }
     }
 
     private fun checkAllowedParseFailure(e: Exception) {

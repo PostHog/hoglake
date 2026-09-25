@@ -375,7 +375,10 @@ paths:
         vectors at a snapshot. With `include=column_stats`, each
         `provided` data file also carries its per-column statistics
         (DataFile.column_stats) so an engine can prune files before
-        planning splits for them.
+        planning splits for them. With `include=split_offsets`, each
+        data file the catalog holds row-group start offsets for carries
+        them (DataFile.split_offsets) so an engine can cut byte-range
+        splits on row-group boundaries.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
@@ -388,11 +391,16 @@ paths:
           style: form
           explode: true
           description: >
-            Optional parts of the plan. The one value is `column_stats`:
-            attach DataFile.column_stats to every `provided` file.
-            Omitted, the plan carries no statistics and costs no
-            statistics read — the right default for a consumer that
-            cannot prune (an unfiltered scan).
+            Optional parts of the plan. `column_stats` attaches
+            DataFile.column_stats to every `provided` file; omitted, the
+            plan carries no statistics and costs no statistics read — the
+            right default for a consumer that cannot prune (an unfiltered
+            scan). `split_offsets` attaches DataFile.split_offsets to
+            every file that has them; it adds no statement to the plan
+            (the offsets live on the file row) but does add up to one
+            array per file to the response, so it too is opt-in. The two
+            combine freely: `include=column_stats,split_offsets` returns
+            both.
 
             Values may be comma-separated in one occurrence, or spread
             over repeated occurrences, or both: every occurrence is read
@@ -410,8 +418,8 @@ paths:
             more than 100000 raw values on either parameter.
           schema:
             type: array
-            items: { type: string, enum: [column_stats] }
-          example: [column_stats]
+            items: { type: string, enum: [column_stats, split_offsets] }
+          example: [column_stats, split_offsets]
         - name: stats_fields
           in: query
           required: false
@@ -2876,6 +2884,32 @@ components:
             spec. Required with matching arity when the table is
             partitioned; forbidden when not.
           items: { type: string, nullable: true }
+        split_offsets:
+          type: array
+          minItems: 1
+          maxItems: 100000
+          items: { type: integer, format: int64, minimum: 0 }
+          description: >
+            OPTIONAL row-group start offsets, for a writer that holds the
+            footer (footer-shipping) — the list GET .../scan returns as
+            DataFile.split_offsets with `include=split_offsets`; see that
+            property for the exact definition of each entry. One entry
+            per row group, in row-group order.
+
+            Validated, never repaired: the list must be non-empty, hold
+            at most 100000 entries, be STRICTLY increasing, start at or
+            above 0, and end below `file_size_bytes`. Anything else is a
+            422 and the commit stores nothing. The server does not open
+            the file, so it cannot check the entries against the footer;
+            a writer that ships a list vouches for it.
+
+            Omitted, the file's offsets are unknown. For a deferred-stats
+            registration (no `column_stats`) the hydrator fills them from
+            the footer it reads anyway, and its list REPLACES one shipped
+            here. For a provided-stats registration nothing ever fills
+            them: the file simply has none, readers cut it evenly, and
+            that is acceptable — row-group alignment is an optimization,
+            never a correctness input.
 
     TableAppend:
       type: object
@@ -3263,6 +3297,47 @@ components:
             numbers is not sound — count(*), min() and max() pushed down
             to metadata are wrong by exactly the vector for any file that
             carries one. Apply the deletion vector, or read the file.
+        split_offsets:
+          type: array
+          minItems: 1
+          maxItems: 100000
+          items: { type: integer, format: int64, minimum: 0 }
+          description: >
+            The file's row-group start offsets, for cutting byte-range
+            splits on row-group boundaries (the Iceberg `split_offsets`
+            convention).
+
+            Populated by GET .../scan ONLY, only with
+            `include=split_offsets`, and there only when the catalog holds
+            offsets for the file. GET .../files and the changefeed embed
+            the same DataFile schema and omit this property. An ABSENT
+            property means the offsets are unknown: cut the file however
+            you would without them (even byte ranges are always correct).
+            Absence does not follow `stats_state` — a `provided` file
+            registered without offsets has none, and a `pending` file may
+            carry offsets its writer shipped.
+
+            ONE ENTRY PER ROW GROUP, in row-group order. Entry i is the
+            absolute byte offset in the file at which row group i's FIRST
+            column chunk starts: that chunk's `dictionary_page_offset`
+            when it has a dictionary page that precedes its first data
+            page (parquet-java: `dictionary_page_offset > 0` and
+            `< data_page_offset`), else its `data_page_offset` — exactly
+            parquet-java's `ColumnChunkMetaData.getStartingPos()`. It is
+            NOT the thrift `RowGroup.file_offset`, which some writers set
+            wrongly. A reader that assigns a row group to the split
+            containing this offset reads every row group exactly once for
+            any cover of `[0, file_size_bytes)`.
+
+            GUARANTEES when present: non-empty; at most 100000 entries;
+            STRICTLY increasing; the first entry >= 0; the last entry <
+            `file_size_bytes`. The server never returns a partial,
+            unsorted or out-of-range list — it stores nothing instead —
+            so a reader may use the list as given. These are the checks
+            the server runs, not a proof the offsets match the bytes: for
+            a footer-shipping registration they are the writer's claim;
+            for a hydrated or compacted file they come from the footer
+            the server read or wrote.
 
     ScanColumnStats:
       type: object

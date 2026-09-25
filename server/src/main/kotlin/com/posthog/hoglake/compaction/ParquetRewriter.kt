@@ -17,6 +17,7 @@ import org.apache.parquet.hadoop.ParquetFileWriter
 import org.apache.parquet.hadoop.ParquetWriter
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.InputFile
 import org.apache.parquet.io.OutputFile
@@ -162,7 +163,7 @@ object ParquetRewriter {
         outputSchema: MessageType,
         codec: OutputCodec,
         body: (ParquetWriter<Group>) -> T,
-    ): T {
+    ): Pair<T, ParquetMetadata?> {
         // Inside the guard too: newWriter calls output.createOrOverwrite,
         // which for a streaming sink STARTS the upload — so a throw
         // between that and the first write would leave one dangling.
@@ -190,7 +191,11 @@ object ParquetRewriter {
             (output as? DiscardableOutputFile)?.discard()
             throw e
         }
-        return result
+        // The written footer, for the output's row-group offsets. Asked
+        // for only after a successful close (parquet-java refuses an
+        // unfinished one) and never allowed to fail the rewrite: the
+        // offsets are optional metadata, and the file is already whole.
+        return result to runCatching { writer.footer }.getOrNull()
     }
 
     /**
@@ -424,8 +429,16 @@ object ParquetRewriter {
     /**
      * [rowsWritten] survivors; [minRowId] their smallest row id (the
      * output's row_id_start), null when every input row was deleted.
+     * [footer] is the footer the writer just wrote — already in memory
+     * once the writer closes, so compaction can register the output's
+     * row-group offsets without reading anything back — or null if
+     * parquet-java would not hand it over.
      */
-    data class RewriteResult(val rowsWritten: Long, val minRowId: Long?)
+    data class RewriteResult(
+        val rowsWritten: Long,
+        val minRowId: Long?,
+        val footer: ParquetMetadata? = null,
+    )
 
     private class Row(val group: Group, val rowId: Long)
 
@@ -680,24 +693,25 @@ object ParquetRewriter {
             // worst case is one counted invalid_data skip.
             var written = 0L
             var minRowId: Long? = null
-            writingTo(output, outputSchema, codec) { writer ->
-                forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
-                    forEachSurvivor(
-                        input,
-                        reader,
-                        liveColumns,
-                        dataFields,
-                        rowIdIndex,
-                        factory,
-                        maxNodesPerRow,
-                    ) { group, rowId ->
-                        writer.write(group)
-                        written++
-                        minRowId = minOf(minRowId ?: rowId, rowId)
+            val (_, footer) =
+                writingTo(output, outputSchema, codec) { writer ->
+                    forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
+                        forEachSurvivor(
+                            input,
+                            reader,
+                            liveColumns,
+                            dataFields,
+                            rowIdIndex,
+                            factory,
+                            maxNodesPerRow,
+                        ) { group, rowId ->
+                            writer.write(group)
+                            written++
+                            minRowId = minOf(minRowId ?: rowId, rowId)
+                        }
                     }
                 }
-            }
-            return RewriteResult(written, minRowId)
+            return RewriteResult(written, minRowId, footer)
         }
 
         // Sorted: survivors must be materialized to sort. Sorting is safe
@@ -737,8 +751,9 @@ object ParquetRewriter {
             }
         }
         val ordered = rows.sortedWith(comparator(outputSchema, sortFields))
-        writingTo(output, outputSchema, codec) { writer -> for (row in ordered) writer.write(row.group) }
-        return RewriteResult(ordered.size.toLong(), minRowId)
+        val (_, footer) =
+            writingTo(output, outputSchema, codec) { writer -> for (row in ordered) writer.write(row.group) }
+        return RewriteResult(ordered.size.toLong(), minRowId, footer)
     }
 
     /**
