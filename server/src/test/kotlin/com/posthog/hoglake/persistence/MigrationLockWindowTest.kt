@@ -76,6 +76,22 @@ class MigrationLockWindowTest {
 
         val SET_TIMEOUT = Regex("""\bSET\s+(LOCAL\s+)?lock_timeout\b""", RegexOption.IGNORE_CASE)
 
+        /** A concurrent build: the one heavy statement that belongs OUTSIDE the window. */
+        val CONCURRENT_BUILD =
+            Regex("""\bCREATE\s+INDEX\s+CONCURRENTLY\b""", RegexOption.IGNORE_CASE)
+
+        /** Lifting the statement bound for a build that may outlast it. */
+        val SET_STATEMENT_TIMEOUT_ZERO =
+            Regex("""\bSET\s+statement_timeout\s*=\s*0\b""", RegexOption.IGNORE_CASE)
+
+        /** Putting the session's own statement bound back. */
+        val RESTORE_STATEMENT_TIMEOUT =
+            Regex(
+                """set_config\(\s*'statement_timeout'\s*,\s*""" +
+                    """current_setting\(\s*'hoglake\.migration_statement_timeout'""",
+                RegexOption.IGNORE_CASE,
+            )
+
         /** The save-and-restore pair's restore half (V9's shape). */
         val RESTORE_TIMEOUT =
             Regex(
@@ -165,6 +181,94 @@ class MigrationLockWindowTest {
                     text,
                 )
                 .isLessThan(closesAt)
+        }
+    }
+
+    @Test
+    fun `a concurrent build sits outside the window, with the statement bound lifted and restored`() {
+        // The other half of the rule, and the half V17 made load-bearing.
+        // `CREATE INDEX CONCURRENTLY` is exempt from the lock_timeout
+        // window because it WAITS OUT older transactions by design — a
+        // 5 s bound aborts exactly that wait — and it is exempt from the
+        // session's `statement_timeout` for the same reason: V17's build
+        // is 26 s at production size against a 60 s session bound
+        // (Database.SESSION_INIT_SQL), and a build the bound kills leaves
+        // an INVALID index behind and a failed history row that fails
+        // Flyway's validate on every replica.
+        //
+        // So a file that builds concurrently must (a) close the
+        // lock_timeout window BEFORE the build, and (b) lift the
+        // statement bound around it and put it back — never leave a
+        // session with no statement bound at all, because these files
+        // run with executeInTransaction=false and the session outlives
+        // them.
+        //
+        // NEITHER RESTORE RUNS IF A STATEMENT BETWEEN THEM FAILS, and
+        // this test cannot see that: it reads the file, and the file
+        // has no failure path to read. What makes it survivable is the
+        // CALLER — `Main.kt` migrates before Netty binds, so a throw
+        // takes the JVM and the pooled connection carrying the settings
+        // with it, and nothing later can inherit them. A future caller
+        // that migrates on a live pool (an admin endpoint, a harness
+        // reusing the pool) would leak `lock_timeout = 5s` /
+        // `statement_timeout = 0` into every later statement on that
+        // connection. V14, V15 and V17 all have this shape.
+        for (file in guardedMigrations()) {
+            val lines = statementLines(Files.readString(Path.of(DIR, file)))
+            val builds = lines.filter { CONCURRENT_BUILD.containsMatchIn(it.second) }
+            if (builds.isEmpty()) continue
+
+            val restoreLock = lines.firstOrNull { RESTORE_TIMEOUT.containsMatchIn(it.second) }?.first
+            assertThat(restoreLock)
+                .describedAs(
+                    "%s builds CONCURRENTLY (line %d) and never closes the lock_timeout window; " +
+                        "a 5 s bound aborts the build's own wait for older transactions",
+                    file,
+                    builds.first().first,
+                )
+                .isNotNull()
+
+            val lifted = lines.firstOrNull { SET_STATEMENT_TIMEOUT_ZERO.containsMatchIn(it.second) }?.first
+            val restored = lines.firstOrNull { RESTORE_STATEMENT_TIMEOUT.containsMatchIn(it.second) }?.first
+            assertThat(lifted)
+                .describedAs(
+                    "%s builds CONCURRENTLY (line %d) under the session's own statement_timeout; " +
+                        "a build the bound kills leaves an INVALID index and a failed history row",
+                    file,
+                    builds.first().first,
+                )
+                .isNotNull()
+            assertThat(restored)
+                .describedAs(
+                    "%s lifts statement_timeout and never restores it; the session outlives the " +
+                        "file (executeInTransaction=false), so every later statement runs unbounded",
+                    file,
+                )
+                .isNotNull()
+
+            for ((line, text) in builds) {
+                assertThat(line)
+                    .describedAs(
+                        "%s:%d — a concurrent build must follow the lock_timeout restore (line " +
+                            "%d):%n  %s",
+                        file,
+                        line,
+                        restoreLock,
+                        text.trim(),
+                    )
+                    .isGreaterThan(restoreLock!!)
+                assertThat(line)
+                    .describedAs(
+                        "%s:%d — a concurrent build must sit between the statement_timeout lift " +
+                            "(line %d) and its restore (line %d):%n  %s",
+                        file,
+                        line,
+                        lifted,
+                        restored,
+                        text.trim(),
+                    )
+                    .isBetween(lifted!! + 1, restored!! - 1)
+            }
         }
     }
 

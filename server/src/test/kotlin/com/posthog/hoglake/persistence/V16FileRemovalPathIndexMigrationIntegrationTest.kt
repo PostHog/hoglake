@@ -582,12 +582,12 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
     fun `the upload reclaim's queue probe rides the index too`() {
         // Only the FIRST of the three `NOT EXISTS` is V16's business.
         // The other two probe hog_data_file and hog_delete_file by
-        // `path`, and those tables carry no path index by design
-        // (VerifyQueryPlanIntegrationTest states the argument: it would
-        // be paid for by every commit, on the hottest insert in the
-        // system). They stay sequential scans of the MANIFEST — a
-        // different and bounded cost — and asserting that they are not
-        // would pin a decision this change did not make.
+        // `path`, which carried no path index when V16 shipped and got
+        // one in V17. This test runs at V16 — the database stops there
+        // and the migration under test is the last one applied — so
+        // they are still scans of the MANIFEST here, and asserting
+        // anything about them would pin a decision this change did not
+        // make.
         assertThat(uploadPlanAfterV16)
             .describedAs("upload reclaim plan:%n%s", uploadPlanAfterV16)
             .contains(INDEX)

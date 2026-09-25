@@ -328,25 +328,38 @@ there would break that gate on every build.
     used to leave the whole suite green, which is why the rule was
     broken four times and caught by review four times.
   - **`CREATE INDEX CONCURRENTLY` is not the safe default; it is a
-    trade, and it is measured.** The exemption above says CIC MAY sit
-    outside the window, not that it should be preferred. On PG 18.6 at
-    `hog_file_removal`'s production size (164k undrained rows) a plain
-    build blocks INSERTs for 1.37 s while CIC takes 1.48 s uncontended
-    — no faster, two passes instead of one — and CIC's first phase
-    waits out older transactions, which on a rolling deploy includes a
-    SECOND replica blocked inside `pg_advisory_lock` in
-    `Database.migrate`. A blocked lock wait is an open transaction with
-    a live xmin, so CIC parks in WaitForOlderSnapshots behind a
-    transaction waiting on the very migration CIC is part of: a CHAIN,
-    not a cycle, so the deadlock detector never fires and it unwinds
-    only when that replica's 60 s `statement_timeout` kills it —
-    crash-looping pods, and an INVALID index left behind by every
-    cancelled build. So: seconds of blocked writes inside the 5 s
+    trade, and it is measured PER MIGRATION.** The exemption above says
+    CIC MAY sit outside the window, not that it should be preferred.
+    Both halves are table-size questions and neither answer transfers:
+    at `hog_file_removal`'s production size (164k undrained rows, PG
+    18.6) a plain build blocks INSERTs for 1.37 s and CIC takes 1.48 s
+    — no faster, two passes instead of one, so V16 blocks — while at
+    `hog_data_file`'s (5M rows, 175-byte keys) a plain build blocks
+    every commit in the fleet for 27-31 s against a 30 s admission
+    bound, so V17 does not. State the measurement in the file, from a
+    run rather than from the neighbouring migration.
+    A blocking build's cost is seconds of blocked writes inside the 5 s
     window (V13's/V16's transactional shape, where a failure rolls back
-    and writes no history row) unless the build is long enough that a
-    blocking one is untenable (V14). Either way the file states which
-    and why, from a measurement rather than from the neighbouring
-    migration.
+    and writes no history row). A CIC's cost is that its phases WAIT
+    OUT every transaction older than themselves, and a parked build is
+    a pod that never binds: `Main.kt` migrates before the listener
+    opens, and the chart's startup probe SIGKILLs at 30 x 5 s. Hoglake's
+    own parker is gone — `Database.awaitMigrationLock` polls
+    `pg_try_advisory_lock` instead of blocking inside it, because a
+    blocked lock wait is an open statement with a live xmin and CIC
+    parked behind a replica waiting on the very migration CIC belongs
+    to (a CHAIN, not a cycle, so the deadlock detector never fires;
+    measured 26 s / 58 s / 26 s for no waiter, a blocking waiter, a
+    polling one). What remains are FOREIGN snapshots — an operator's
+    psql in a transaction, `pg_dump`, an RDS export, a logical-decoding
+    reader — none of which carry hoglake's idle bound. So a CIC on a
+    big table is announced in its file as an OUT-OF-BAND step
+    (`CREATE INDEX CONCURRENTLY IF NOT EXISTS`, run before promoting,
+    after checking `pg_stat_activity` for old transactions), which
+    makes the migration a no-op; V17's header carries the statements.
+    Every cancelled build leaves an INVALID index, so a file that
+    builds concurrently clears one first — `CREATE INDEX CONCURRENTLY
+    IF NOT EXISTS` matches on NAME and would skip it forever.
   - **An index proves itself against the query it serves.** The
     migration test runs the migration FILE (`Database.migrate()` after
     `PgTestSupport.freshDatabaseAt(<previous version>)`, or after
@@ -385,7 +398,23 @@ there would break that gate on every build.
     NOT unique: nothing makes a file path unique, so expiry can queue
     one path twice from one `DELETE ... RETURNING`, and with no writer
     carrying `ON CONFLICT` a unique violation would abort the sweep that
-    advances the retention floor.
+    advances the retention floor. The OTHER half of that statement pair
+    is `hog_data_file_path` / `hog_delete_file_path` (catalog_id, path)
+    (V17): the drain's liveness check asks those two tables the same
+    question once per sub-batch, under the commit lock, and until V17
+    both legs were a full scan of the manifest — 190,884 buffers and
+    692 ms at 5M rows against 8,728 and 33 ms. NOT partial, because the
+    check covers "any file row, live or not". `hog_upload`'s leg needs
+    nothing: `UNIQUE (catalog_id, path)` (V12) is already that key, and its
+    fallback is bounded by the catalog's ACTIVE claims rather than by an
+    append-only history. The index is paid on the hottest write in the
+    system (+31 us and +7,343 bytes of WAL per file row, 1.47 GB/hour at
+    production churn; the index is 1,157 MiB / 243 bytes per row at 5M
+    rows), and it is built `CONCURRENTLY` — at that size a plain build
+    blocks every commit for 27-31 s, which reverses V16's trade on
+    measurement rather than on analogy. What makes a concurrent build
+    safe to deploy, and what still cannot make it safe on its own, is
+    the CIC rule above.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
@@ -874,11 +903,22 @@ there would break that gate on every build.
   distinct failing-check set, not once per sweep.
   Every path-equality sub-query is registered in
   `VerifyService.PATH_EQUALITY_QUERIES` and EXPLAINed against a
-  50k-file manifest (`VerifyQueryPlanIntegrationTest`): `hog_data_file`
-  and `hog_delete_file` carry no index on `path` at all, and
-  `hog_file_removal`'s (V16) covers only its UNDRAINED rows — so a
-  query the planner cannot flatten is quadratic and invisible on any
-  fixture-sized catalog.
+  50k-file manifest (`VerifyQueryPlanIntegrationTest`): the aggregate
+  shapes there read whole relations by design, and `hog_file_removal`'s
+  path index (V16) covers only its UNDRAINED rows — so a query the
+  planner cannot flatten is quadratic and invisible on any
+  fixture-sized catalog. Since `hog_data_file` and `hog_delete_file`
+  carry `(catalog_id, path)` too (V17), a per-candidate index probe is a
+  plan the planner can now pick, and the rule is FOUR clauses rather
+  than "nothing runs twice": a repeated node must be an `Index Scan
+  using <index>`; it may repeat at most once per CANDIDATE (bounded by
+  the ledger + upload rows this catalog owns, counted, and the fixture
+  asserts that bound is below the manifest or it discriminates nothing);
+  each loop must cost a descent (EXPLAIN is asked for `BUFFERS`
+  explicitly — PG 18 emits them by default and 16/17 do not); and the
+  probe must not demote `path` to a `Filter`. A Nested Loop may still
+  never carry a sequential or bitmap scan of a manifest table on its
+  INNER side.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
   NOT yet in CI and not yet released — no path-scoped workflow, and its

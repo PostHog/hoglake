@@ -2,6 +2,7 @@ package com.posthog.hoglake
 
 import com.zaxxer.hikari.HikariConfig
 import com.zaxxer.hikari.HikariDataSource
+import io.github.oshai.kotlinlogging.KotlinLogging
 import org.flywaydb.core.Flyway
 import org.flywaydb.core.api.configuration.FluentConfiguration
 import org.flywaydb.database.postgresql.PostgreSQLConfigurationExtension
@@ -16,6 +17,8 @@ import javax.sql.DataSource
  * under an advisory lock so concurrent replicas don't race DDL.
  */
 object Database {
+    private val log = KotlinLogging.logger {}
+
     const val MIGRATION_LOCK_KEY: Long = 0x486F674C616B6531 // "HogLake1"
 
     /**
@@ -89,11 +92,39 @@ object Database {
                     .isTransactionalLock = false
             }
 
+    /**
+     * How long a replica waits for another replica's migration before
+     * giving up.
+     *
+     * UNDER THE DEPLOY'S OWN BUDGET, DELIBERATELY. `Main.kt` runs
+     * [migrate] before Netty binds :8080, and the chart's TCP startup
+     * probe allows 30 x 5 s = 150 s before the kubelet SIGKILLs the
+     * container. A bound above that can never fire: the pod dies first,
+     * with no message about what it was waiting for. 120 s leaves the
+     * probe 30 s of headroom and turns the wait into a NAMED failure —
+     * the exception below says which lock and for how long — which is
+     * the whole reason the bound exists. A replica that gives up
+     * crash-loops and tries again, so nothing is lost by failing early
+     * and a wedged fleet says why.
+     *
+     * It also sizes the migrations this is compatible with: V17's
+     * concurrent build is 26-35 s at production size, depending on
+     * `maintenance_work_mem`, so a first replica finishes well inside
+     * it. A migration that cannot — or one whose build can PARK behind a
+     * foreign snapshot, which is any concurrent build — is one to
+     * pre-apply out of band; V17's header says how.
+     */
+    val MIGRATION_LOCK_WAIT: java.time.Duration = java.time.Duration.ofSeconds(120)
+
+    /** How often [awaitMigrationLock] retries. */
+    val MIGRATION_LOCK_POLL: java.time.Duration = java.time.Duration.ofMillis(250)
+
+    /** How often the wait says it is still waiting. */
+    val MIGRATION_LOCK_LOG_EVERY: java.time.Duration = java.time.Duration.ofSeconds(5)
+
     fun migrate(ds: DataSource) {
         ds.connection.use { conn ->
-            conn.createStatement().use { st ->
-                st.execute("SELECT pg_advisory_lock($MIGRATION_LOCK_KEY)")
-            }
+            awaitMigrationLock(conn)
             try {
                 flywayConfig(ds).load().migrate()
             } finally {
@@ -101,6 +132,78 @@ object Database {
                     st.execute("SELECT pg_advisory_unlock($MIGRATION_LOCK_KEY)")
                 }
             }
+        }
+    }
+
+    /**
+     * Take the migration lock by POLLING `pg_try_advisory_lock`, never
+     * by waiting inside `pg_advisory_lock`.
+     *
+     * The difference is a SNAPSHOT. A blocking `SELECT
+     * pg_advisory_lock(...)` is an open statement, and an open statement
+     * publishes an xmin for as long as it waits — so a replica queued
+     * behind another replica's migration is a transaction older than
+     * anything that migration starts. `CREATE INDEX CONCURRENTLY` waits
+     * out exactly those transactions (WaitForOlderSnapshots), which
+     * makes the build park behind a session that is itself waiting on
+     * the migration the build belongs to: a chain, not a cycle, so the
+     * deadlock detector never fires, and it unwinds only when the
+     * waiting replica's 60 s `statement_timeout` ([SESSION_INIT_SQL])
+     * kills it — a failed boot, a restarted pod, and a fresh snapshot
+     * for the build's next phase to park behind.
+     *
+     * Measured on a 5M-row `hog_data_file` (V17's fixture), with writers
+     * committing throughout, each duration on its own session's clock:
+     * CIC alone 26 s; CIC with a second replica blocking on the old
+     * code 58 s, of which 32 s was spent in `wait_event = virtualxid`
+     * against that replica's virtual transaction (read out of
+     * pg_stat_activity), while the replica's own boot failed when its
+     * blocked `pg_advisory_lock` hit the 60 s `statement_timeout` its
+     * session carries; CIC with a second replica polling 26 s, and the
+     * replica takes the lock as soon as the first is done. What ended
+     * the park is not claimed — the numbers are the three durations and
+     * the wait event. A poll holds its snapshot for the microseconds one
+     * `pg_try_advisory_lock` takes.
+     *
+     * The sleep is CLIENT-side for the same reason: `pg_sleep` is a
+     * statement, and a statement has a snapshot.
+     */
+    private fun awaitMigrationLock(conn: java.sql.Connection) {
+        val start = System.nanoTime()
+        val deadline = start + MIGRATION_LOCK_WAIT.toNanos()
+        var nextLog = start + MIGRATION_LOCK_LOG_EVERY.toNanos()
+        while (true) {
+            val acquired =
+                conn.createStatement().use { st ->
+                    st.executeQuery("SELECT pg_try_advisory_lock($MIGRATION_LOCK_KEY)").use { rs ->
+                        rs.next() && rs.getBoolean(1)
+                    }
+                }
+            val waited = java.time.Duration.ofNanos(System.nanoTime() - start)
+            if (acquired) {
+                if (waited >= MIGRATION_LOCK_LOG_EVERY) {
+                    log.info { "migration lock $MIGRATION_LOCK_KEY acquired after $waited" }
+                }
+                return
+            }
+            check(System.nanoTime() < deadline) {
+                "timed out after $MIGRATION_LOCK_WAIT waiting for the migration advisory lock " +
+                    "($MIGRATION_LOCK_KEY); another replica has been migrating for longer than that"
+            }
+            // A silent wait is the failure mode this replaces: the pod
+            // sits pre-bind, the startup probe counts down, and the
+            // kubelet's SIGKILL is the only evidence anyone gets. Say it
+            // every few seconds, with the elapsed time, so the log
+            // distinguishes "waiting for the other replica's migration"
+            // from "hung on the database".
+            if (System.nanoTime() >= nextLog) {
+                log.info {
+                    "waiting for the migration advisory lock ($MIGRATION_LOCK_KEY): $waited " +
+                        "elapsed of $MIGRATION_LOCK_WAIT — another replica is migrating"
+                }
+                nextLog = System.nanoTime() + MIGRATION_LOCK_LOG_EVERY.toNanos()
+            }
+            Thread.sleep(MIGRATION_LOCK_POLL.toMillis())
         }
     }
 

@@ -708,3 +708,32 @@ CREATE TABLE hog_compaction_claim (
 -- catalog with no table, which the key cannot serve.
 CREATE INDEX hog_compaction_claim_expiry
     ON hog_compaction_claim (catalog_id, expires_at);
+
+-- The cleanup drain's liveness check (V17): `CleanupService.referencedPaths`
+-- asks (catalog_id, path) of hog_data_file and hog_delete_file once per
+-- sub-batch, holding the per-catalog commit lock while it does. Every
+-- other index on these tables is keyed on ids and snapshots, so both
+-- legs were a sequential scan of the whole relation — 190,884 buffers
+-- and 692 ms at 5M rows against 8,728 and 33 ms with these (see the V17
+-- migration for the measurements and the build-strategy trade).
+--
+-- NOT partial: the check covers "any file row, live or not", because a
+-- historical row still claims its object at every retained snapshot.
+-- Restricting to live rows would hide exactly the rows whose absence
+-- authorizes a physical delete.
+--
+-- hog_upload needs no index of its own — UNIQUE (catalog_id, path)
+-- above (V12) is already that key, and the planner drives its leg of
+-- the same statement from it once the catalog's active claims are worth
+-- probing, with `state` as a filter on the rows it fetches. Where it
+-- prefers a bitmap scan of those claims instead, that fallback is
+-- bounded by the ACTIVE set, which settles at commit — unlike these two
+-- tables, which keep every historical row.
+--
+-- Paid for on every hog_data_file INSERT, which is the hottest write in
+-- the system: +31 us and +7,343 bytes of WAL per row at 5M rows (1.47
+-- GB/hour at the production churn of ~200k rows/hour), the WAL being
+-- full-page images of a random 175-byte key's leaf. The index itself is
+-- 1,157 MiB at 5M rows, 243 bytes/row.
+CREATE INDEX hog_data_file_path ON hog_data_file (catalog_id, path);
+CREATE INDEX hog_delete_file_path ON hog_delete_file (catalog_id, path);
