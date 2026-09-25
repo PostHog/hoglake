@@ -107,6 +107,119 @@ class DropNamespaceIntegrationTest {
     }
 
     @Test
+    fun `a dropped but unretired table does not block the namespace drop`() {
+        // SINCE #193 A DROPPED TABLE'S ROWS OUTLIVE THE DROP. The drop
+        // is O(columns) — it marks `hog_table.dropped_snapshot` and
+        // ends the version and column rows — and the file rows are
+        // deleted later by the retirement sweep, which may not run for
+        // hours and never runs at all on a catalog without retention.
+        //
+        // `dropNamespace`'s emptiness precondition reads
+        // `TableRepo.listLive`, and if that function counted a dropped
+        // table as a live child the namespace could not be dropped
+        // until a FLOOR MOVED — a 409 naming a table the catalog no
+        // longer has, which no operator could clear by any action of
+        // their own.
+        //
+        // ON WELL-FORMED DATA THE VERSION ROW ALREADY EXCLUDES IT —
+        // `markDropped` closes it in the same transaction — so this
+        // half of the case passes with or without the clause. That is
+        // the honest position: the clause is DEFENCE IN DEPTH, the same
+        // kind `findLive` carries, and the case below is the one that
+        // shows what it defends.
+        val cat = "nsdrop-unretired"
+        catalogs.createCatalog(cat, "s3://bucket/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val catalogId = catalogs.getCatalog(cat).catalogId
+        val tableId = catalogs.getTable(cat, "ns", "t").tableId
+        // A live file row, so the table is one retirement still owes
+        // work on rather than an empty shell.
+        jdbi.withHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start)
+                VALUES (:c, 1, :t, 1, 's3://bucket/$cat/f.parquet', 10, 100, 0)
+                """,
+            ).bind("c", catalogId).bind("t", tableId).execute()
+        }
+
+        catalogs.dropTable(cat, "ns", "t")
+
+        // The row is STILL LIVE — that is the state this case is about,
+        // and asserting it keeps the test honest if retirement ever
+        // starts running inline.
+        val liveRows =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_data_file WHERE catalog_id = :c AND end_snapshot IS NULL",
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        assertThat(liveRows)
+            .describedAs("the drop must leave the file row for retirement; otherwise this asserts nothing")
+            .isEqualTo(1)
+
+        // And the namespace drops, because the table it holds is gone.
+        val result = catalogs.dropNamespace(cat, "ns")
+        assertThat(result.snapshotId).isGreaterThan(0)
+        assertThatThrownBy { catalogs.getNamespace(cat, "ns") }
+            .isInstanceOf(HoglakeException.NotFound::class.java)
+    }
+
+    @Test
+    fun `a dropped table with an open version row still does not block the namespace drop`() {
+        // THE STATE THE CLAUSE ACTUALLY DEFENDS, and the only one that
+        // can tell it apart from its absence. `TableRepo.listLive`
+        // filters on TWO facts that agree on well-formed data — the
+        // version row is open, and the identity row is not dropped —
+        // so a test against a normal drop cannot distinguish them.
+        //
+        // Here the two DISAGREE: the identity row says dropped, the
+        // version row is still open. Nothing the server does produces
+        // that (markDropped writes both in one transaction), which is
+        // exactly why it is worth defending against — it is what a
+        // hand-repair, a partial restore, or a future change that
+        // forgets one of the three UPDATEs leaves behind. Without the
+        // clause the namespace becomes undroppable, and the 409 names a
+        // table the catalog no longer has.
+        //
+        // MUTATION: remove `AND t.dropped_snapshot IS NULL` from
+        // `TableRepo.listLive` and this reds with exactly that 409.
+        val cat = "nsdrop-halfdropped"
+        catalogs.createCatalog(cat, "s3://bucket/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
+        val catalogId = catalogs.getCatalog(cat).catalogId
+
+        catalogs.dropTable(cat, "ns", "t")
+        // Re-open the version row the drop closed, leaving the identity
+        // row dropped: the half-dropped table.
+        jdbi.withHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table_version SET end_snapshot = NULL
+                WHERE catalog_id = :c AND table_id IN (
+                    SELECT table_id FROM hog_table
+                    WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL)
+                """,
+            ).bind("c", catalogId).execute()
+        }
+        val openVersions =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_table_version WHERE catalog_id = :c AND end_snapshot IS NULL",
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        assertThat(openVersions)
+            .describedAs("the fixture must really be half-dropped, or this asserts nothing")
+            .isEqualTo(1)
+
+        val result = catalogs.dropNamespace(cat, "ns")
+        assertThat(result.snapshotId).isGreaterThan(0)
+    }
+
+    @Test
     fun `drop audits one namespace_drop line with the committed snapshot`() {
         val cat = "nsdrop-audit"
         catalogs.createCatalog(cat, "s3://bucket/$cat")

@@ -462,10 +462,12 @@ there would break that gate on every build.
     paths. So the statement was a sequential scan of the whole
     manifest, inside the sweep transaction, under the per-catalog
     commit lock. Measured on a fixture with production's mostly-live
-    ratio (204,000 rows / 4,747 heap pages, 4,000 of them ended;
-    `V19DataFileEndedIndexMigrationIntegrationTest` runs the migration against
-    rows seeded BEFORE it and EXPLAINs the repo's own `internal`
-    constant) with the ended rows SCATTERED through the manifest, scan
+    ratio (200,000 rows / 4,445 heap pages, 4,000 of them ended — one
+    row in every hundred, the fraction the test's `ENDED_EVERY` fixes;
+    `V19DataFileEndedIndexMigrationIntegrationTest` runs the migration
+    against rows seeded BEFORE it and EXPLAINs the repo's own
+    `internal` constant) with the ended rows SCATTERED through the
+    manifest, scan
     node only: **4,445 buffers as a `Seq Scan` with `Rows Removed by
     Filter: 198,000` -> 2,003 buffers as an `Index Scan using
     hog_data_file_ended` with `Index Searches: 1` and nothing
@@ -503,10 +505,38 @@ there would break that gate on every build.
     an index there would be paid on every write and used by nothing;
     splitting that statement into two arms is the fix, and it is
     ticketed.
-    V19 IS ITS OWN MIGRATION, ahead of the rest of #193, because it
-    takes no ACCESS EXCLUSIVE lock and therefore needs no window in
-    which no expiry sweep is running; V19 carries the two `ALTER
-    TABLE`s and does.
+    V19 IS ITS OWN MIGRATION, ahead of the rest of #193, and the split
+    is a DEPLOY decision rather than a tidiness one. **It takes no
+    ACCESS EXCLUSIVE lock**, so it needs no quiet window: pre-build it
+    out of band (`CREATE INDEX CONCURRENTLY IF NOT EXISTS`, after
+    checking `pg_stat_activity` for transactions older than a minute),
+    and the migration is the no-op it then is. **V20 carries the two
+    `ALTER TABLE`s and MUST be timed**, because both need ACCESS
+    EXCLUSIVE and an EXPIRY SWEEP HOLDS ACCESS SHARE ON `hog_table` for
+    its whole transaction (step 5 deletes from `hog_table_version`,
+    whose FK references it). A sweep that runs long makes V20's `SET
+    LOCAL lock_timeout = '5s'` fire, which rolls the migration back
+    cleanly and crash-loops the pod until the sweep finishes — the
+    designed behaviour, and a deploy that looks hung. Confirm no sweep
+    is in flight before promoting:
+
+    ```sql
+    SELECT pid, state, now() - xact_start AS xact_age, left(query, 120)
+    FROM pg_stat_activity
+    WHERE datname = current_database()
+      AND query ILIKE '%hog_snapshot%' AND state <> 'idle'
+    ORDER BY xact_start;
+    ```
+
+    and keep sweeps short while a lagging floor catches up with
+    `HOGLAKE_EXPIRY_BATCH` (snapshots per sweep, default 10,000; 1,000
+    with a five-minute interval on the maintenance workload, or
+    `POST .../maintenance/expire?batch=500` by hand). Do NOT raise
+    retention to make the sweep easier — that makes it zero-work and
+    the floor stops moving at all. V20 is TRANSACTIONAL, so a failure
+    rolls back and writes no history row and the next pod retries; V19
+    is not, so a half-applied V19 needs `flyway repair` before any
+    replica can validate again.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
@@ -680,7 +710,18 @@ there would break that gate on every build.
     `hog_file_removal` rows, above which a run declines to start;
     ~125 hours of drain at the STANDING cleanup defaults, which makes
     it a circuit breaker there, and ~50 minutes at the runbook's event
-    settings of 10,000 per 60 s, which makes it a throttle).
+    settings of 10,000 per 60 s, which makes it a throttle). IT IS
+    CHECKED ONCE PER RUN, so the EFFECTIVE CAP IS ABOUT TWICE IT: a run
+    that starts just under the ceiling commits ~528,000 more rows
+    before the next one can stop it, so 500,000 admits a peak of
+    ~1,030,000 undrained rows — about **631 MB** of `hog_file_removal`
+    at 631 bytes per undrained row, not the ~315 MB the number alone
+    suggests. Size storage against the doubled figure. A run the
+    ceiling stops STILL STAMPS `retirement_eligible_at` first, so
+    `/verify`'s orphans arm can report a wedged retirement instead of
+    it being silent; and `HOGLAKE_RETIREMENT_QUEUE_CEILING=0` with the
+    loop ON is REFUSED AT BOOT, because every run would skip forever
+    with nothing saying so.
     THE ELAPSED TIME OF A LARGE RETIREMENT IS SET BY THE CLEANUP
     DRAIN, not by this loop's knobs, and the arithmetic is worth doing
     before touching either. One 60 s run is ~66 batches (a ~160 ms hold
@@ -732,7 +773,7 @@ there would break that gate on every build.
     The other direction of the coupling is expiry's: retirement DELETES
     rows rather than end-snapshotting them, so it adds nothing to
     expiry's below-floor sweep — but a dropped table's rows sit in
-    `hog_data_file` until it runs, which is what V18's partial index and
+    `hog_data_file` until it runs, which is what V19's partial index and
     the gauges' `hog_table` join both exist to survive.
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only

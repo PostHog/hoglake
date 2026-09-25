@@ -209,6 +209,16 @@ class RetirementService(
      * already answers. It RESETS ON RESTART, which costs one run's
      * worth of rollbacks on the tables that need them.
      *
+     * MONOTONE DOWN UNTIL RESTART. Nothing ever raises an entry: the
+     * halving writes it and only a DRAIN removes it, so a table whose
+     * per-row cost FELL — an `ALTER TABLE ... DROP COLUMN` that slims
+     * the stats cascade, a partition spec removed — keeps the small
+     * batch the wide schema earned until the process restarts. That is
+     * a throughput cost and never a correctness one, it is bounded by
+     * the deploy cadence, and the alternative (probing upward) would
+     * pay a rolled-back lock hold to discover the schema changed. If it
+     * ever matters, restart the maintenance pod.
+     *
      * Keyed by (catalog, table). Bounded by the same thing the
      * candidate query is: only eligible tables ever enter it, and an
      * entry is removed when its table drains.
@@ -396,18 +406,42 @@ class RetirementService(
                     .mapTo(Long::class.java)
                     .one()
             }
+        // ELIGIBILITY IS RECORDED BEFORE THE CEILING CAN STOP THE RUN,
+        // and the order is the whole point.
+        //
+        // `retirement_eligible_at` is what `/verify`'s orphans arm dates
+        // a leak from: a dropped table under the floor that STILL holds
+        // live file rows is a violation only once it has been stamped
+        // for longer than the grace. Stamping after the ceiling check
+        // meant a catalog whose cleanup queue never drains — the exact
+        // state an operator most needs told about — was never stamped,
+        // so the arm could never fire and retirement wedged in SILENCE:
+        // every run a no-op, every counter zero, and `/verify` green.
+        //
+        // Stamping first costs one UPDATE on a handful of rows and
+        // turns that silence into an alert after the grace. The stamp
+        // is not a promise that anything was retired; it is the
+        // observation that the table BECAME retirable, which is true
+        // whether or not this run got to it.
+        val candidates = candidates(catalogId)
+        if (candidates.isEmpty()) return RetirementResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        stampEligible(catalogId, candidates.map { it.tableId })
+
         if (queued > queueCeiling) {
             log.info {
                 "retirement for catalog '$catalog' skipped: $queued undrained cleanup-queue rows " +
                     "exceed the ceiling of $queueCeiling; retiring more would grow a queue that " +
-                    "is already not draining"
+                    "is already not draining. ${candidates.size} eligible table(s) stamped, so " +
+                    "/verify's orphans check will report them once they are past its grace"
             }
-            return RetirementResult(0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0)
+            return RetirementResult(
+                0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
+                // The eligible tables ARE remaining work, and saying so
+                // is what keeps a ceiling-skipped run out of the "quiet"
+                // branch of the audit stream.
+                candidates.size.toLong(),
+            )
         }
-
-        val candidates = candidates(catalogId)
-        if (candidates.isEmpty()) return RetirementResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
-        stampEligible(catalogId, candidates.map { it.tableId })
 
         var tables = 0L
         var rows = 0L
@@ -863,7 +897,30 @@ class RetirementService(
             LIMIT :n
             """
 
-        /** The DV arm, `internal` for the plan test. See [batch] for the ordering rule. */
+        /**
+         * The DV arm, `internal` for the plan test.
+         *
+         * NO `end_snapshot` CLAUSE, and this is the load-bearing
+         * omission rather than an oversight. `hog_delete_file`'s FK to
+         * `hog_data_file` is ON DELETE CASCADE, so any vector still
+         * present when [DATA_DELETE_SQL] runs is taken away WITHOUT its
+         * path being queued — the puffin object is then referenced by
+         * nothing and reclaimed by nobody, forever. Restricting this to
+         * LIVE vectors would leave exactly the superseded ones to be
+         * cascaded away un-queued: bug hunt #16's failure, one layer
+         * down and harder to see, because the row vanishes instead of
+         * lingering. `DropDvLifecycleIntegrationTest` seeds a
+         * superseded vector for that reason.
+         *
+         * It runs BEFORE the data-file delete, in the same transaction,
+         * for the same reason.
+         *
+         * `data_file_id = ANY(:victims)` is served by
+         * `hog_delete_file_data_lookup` (V2, non-partial on
+         * `(catalog_id, data_file_id)`) — the partial
+         * `one_live_per_data_file` index could not serve a statement
+         * that carries no `end_snapshot` predicate.
+         */
         internal const val DV_DELETE_SQL: String =
             """
             WITH doomed AS (

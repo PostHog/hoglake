@@ -63,7 +63,7 @@ object HogSchemaColumns {
                     // TableRepo.insertTable and read by
                     // OffsetRepo.releaseSupersededOffsets.
                     "replaced_table_id",
-                    // V19: when the retirement sweep FIRST saw this
+                    // V20: when the retirement sweep FIRST saw this
                     // dropped table under the expiry floor. Written by
                     // RetirementService, read by /verify's orphans
                     // check, which dates a leak from eligibility rather

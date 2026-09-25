@@ -691,6 +691,55 @@ class RetirementServiceIntegrationTest {
         assertThat(result.rowsRetired).isZero()
         assertThat(liveFiles(f.catalogId)).isEqualTo(4)
 
+        // A SKIPPED RUN STILL STAMPS ELIGIBILITY, and that is what
+        // keeps the skip out of SILENCE. `/verify`'s orphans arm dates
+        // a leak from `retirement_eligible_at`, so a catalog whose
+        // cleanup queue never drains — the state an operator most needs
+        // told about — would otherwise never be stamped, the arm could
+        // never fire, and retirement would wedge with every counter at
+        // zero and every check green.
+        //
+        // MUTATION: move `stampEligible` back below the ceiling check
+        // and this reds.
+        val stamped =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_table WHERE catalog_id = :c " +
+                        "AND retirement_eligible_at IS NOT NULL",
+                ).bind("c", f.catalogId).mapTo(Long::class.java).one()
+            }
+        assertThat(stamped)
+            .describedAs("a run the ceiling stopped must still record that the table became retirable")
+            .isEqualTo(1)
+        // ...and it says so in the result, rather than presenting as a
+        // run that found nothing to do.
+        assertThat(result.tablesRemaining)
+            .describedAs("the eligible table is remaining work, not absence of work")
+            .isEqualTo(1)
+
+        // /verify AGREES, once the table is past the grace: the arm
+        // that could never fire now does. This is the end-to-end form
+        // of the same assertion, through the check an operator reads.
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table SET retirement_eligible_at = now() - interval '1 hour'
+                WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL
+                """,
+            ).bind("c", f.catalogId).execute()
+        }
+        val orphans =
+            VerifyService(jdbi, retirementOrphanGraceSeconds = 1, retirementIntervalMs = 0)
+                .runOnce(catalog)
+                .checks
+                .single { it.check == "orphans" }
+        assertThat(orphans.status)
+            .describedAs("a wedged retirement must be visible in /verify, not only in the logs")
+            .isEqualTo("fail")
+        assertThat(orphans.samples).anySatisfy {
+            assertThat(it).contains("retirement is not draining it")
+        }
+
         // One more than the queue holds: the run proceeds.
         assertThat(service(ceiling = 5).runOnce(catalog).rowsRetired).isEqualTo(4)
     }

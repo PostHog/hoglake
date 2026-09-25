@@ -9,7 +9,7 @@
 -- the catalog's expiry floor, queueing every object path for the
 -- cleanup drain.
 --
--- SPLIT FROM V18 DELIBERATELY. V18 adds `hog_data_file_ended`, which is
+-- SPLIT FROM V19 DELIBERATELY. V19 adds `hog_data_file_ended`, which is
 -- a pure read-path win for the EXISTING expiry sweep, ships on its own,
 -- and touches no table this file touches. This one carries the two
 -- statements that take ACCESS EXCLUSIVE on `hog_table` and
@@ -58,10 +58,10 @@
 -- has no `IF NOT EXISTS`.
 --
 -- ============================================================
--- WHY THIS FILE IS TRANSACTIONAL AND V18 IS NOT
+-- WHY THIS FILE IS TRANSACTIONAL AND V19 IS NOT
 -- ============================================================
 --
--- V18 builds an index CONCURRENTLY, which cannot run inside a
+-- V19 builds an index CONCURRENTLY, which cannot run inside a
 -- transaction, so it pays V17's price: `executeInTransaction=false`, a
 -- save-and-restore `lock_timeout` pair, and a partial failure that
 -- leaves a `success = false` history row failing Flyway's validate on
@@ -71,7 +71,7 @@
 -- no `.conf` at all, Flyway's default `executeInTransaction=true`,
 -- `SET LOCAL` that expires with the transaction and needs no restore,
 -- and — the part that matters — A FAILURE ROLLS THE WHOLE FILE BACK AND
--- WRITES NO HISTORY ROW, so the next pod simply runs V19 again. The
+-- WRITES NO HISTORY ROW, so the next pod simply runs V20 again. The
 -- statements are still idempotent, because being re-runnable costs
 -- nothing and being wrong about which shape you are in costs a manual
 -- repair on every replica.

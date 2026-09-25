@@ -135,7 +135,7 @@ CREATE TABLE hog_table (
     -- referenced row is in this same table and is retired, never deleted,
     -- and a cascade is exactly the behaviour we do not want.
     replaced_table_id bigint,
-    -- V19: when the retirement sweep FIRST observed this dropped table
+    -- V20: when the retirement sweep FIRST observed this dropped table
     -- at or below the catalog's expiry floor — i.e. when its file rows
     -- became deletable. NULL for a live table, and for a dropped one no
     -- sweep has reached yet. Not read on any request path;

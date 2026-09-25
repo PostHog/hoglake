@@ -241,12 +241,27 @@ data class Config(
      *    it is ~50 minutes of drain, which is the throttle: retirement
      *    runs ahead, hits the ceiling, waits for the drain, resumes.
      *
+     * IT IS CHECKED ONCE PER RUN, so the EFFECTIVE CAP IS ABOUT TWICE
+     * THIS NUMBER. A run that starts just under the ceiling is not
+     * stopped again until the next one, and at the default batch a
+     * 60 s run commits ~528,000 more rows — so 500,000 admits a peak
+     * queue of ~1,030,000 undrained rows, about **631 MB** of
+     * `hog_file_removal` at the measured 631 bytes per undrained row,
+     * not the ~315 MB the number on its own suggests. Checking per
+     * BATCH would tighten it to ~the ceiling, and would cost that
+     * count — ~100k buffers at three million rows — 376 times per run
+     * instead of once. Size storage against the doubled figure.
+     *
      * An operator running a large retirement raises the cleanup rate
      * FIRST; this number is what stops a forgotten step from becoming a
      * 1.9 GB queue. It costs ONE count per run — about 100k buffers at
      * 3M queued rows — never one per batch.
      */
-    val retirementQueueCeiling: Long = env("HOGLAKE_RETIREMENT_QUEUE_CEILING", "500000").toLong(),
+    val retirementQueueCeiling: Long =
+        env(
+            "HOGLAKE_RETIREMENT_QUEUE_CEILING",
+            "$DEFAULT_RETIREMENT_QUEUE_CEILING",
+        ).toLong(),
     /**
      * Catalog-health gauge sample interval; <= 0 disables the sampler
      * loop.
@@ -540,6 +555,27 @@ data class Config(
         // check exists so that forgetting to is a boot failure naming
         // both knobs rather than a Hikari timeout during the first busy
         // sweep.
+        // A CEILING OF ZERO IS NOT "NO PACING", IT IS "NEVER RUN", and
+        // it fails in the worst available way: the run skips, and
+        // before #193's stamp reordering it skipped before recording
+        // eligibility too, so `/verify`'s orphans arm could not fire
+        // either. Retirement would sit at zero forever while every
+        // counter and every check said the system was healthy.
+        //
+        // `count(*) > 0` is true of any catalog with a single undrained
+        // row, which a live catalog always has, so there is no reading
+        // of 0 that means anything an operator wants. Refuse it at
+        // boot, naming BOTH knobs, because the mistake is a pair: a
+        // ceiling of 0 is harmless while the loop is off and fatal the
+        // moment somebody turns it on.
+        require(retirementIntervalMs <= 0 || retirementQueueCeiling > 0) {
+            "HOGLAKE_RETIREMENT_QUEUE_CEILING=0 with HOGLAKE_RETIREMENT_INTERVAL_MS=" +
+                "$retirementIntervalMs would disable retirement silently: every run would skip " +
+                "on the cleanup-queue check and nothing — not the run ledger, not the metrics, " +
+                "not /verify's orphans check — would say so. Set a positive ceiling (the default " +
+                "is $DEFAULT_RETIREMENT_QUEUE_CEILING) or set HOGLAKE_RETIREMENT_INTERVAL_MS=0 " +
+                "to turn the loop off on purpose."
+        }
         require(compactionParallelGroups <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
             "HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups needs a database pool " +
                 "of at least ${compactionParallelGroups + FOREGROUND_CONNECTION_RESERVE} " +
@@ -557,6 +593,13 @@ data class Config(
          * not a model of demand.
          */
         const val FOREGROUND_CONNECTION_RESERVE = 4
+
+        /**
+         * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so
+         * the boot refusal above can quote it rather than restate the
+         * literal the property already carries.
+         */
+        const val DEFAULT_RETIREMENT_QUEUE_CEILING = 500_000L
 
         /** Env vars that no longer exist, and what replaced them. */
         private val REMOVED_ENV =

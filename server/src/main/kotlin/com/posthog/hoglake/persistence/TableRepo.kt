@@ -365,7 +365,24 @@ object TableRepo {
             .findOne()
             .orElse(null)
 
-    /** All live tables in a namespace, ordered by name. */
+    /**
+     * All live tables in a namespace, ordered by name.
+     *
+     * Carries [findLive]'s `dropped_snapshot IS NULL` clause, and the
+     * symmetry is not cosmetic: the consumer is `dropNamespace`'s
+     * emptiness precondition, and since #193 a dropped table's rows
+     * survive until retirement collects them. Without the clause a
+     * table that was dropped but not yet retired would be counted as a
+     * live child and would REFUSE the namespace drop — a 409 naming a
+     * table the catalog no longer has, which no operator could clear
+     * except by waiting for a floor to move.
+     *
+     * On well-formed data `tv.end_snapshot IS NULL` already excludes
+     * it, because `markDropped` closes the version row in the same
+     * transaction; this is the same defence in depth [findLive] carries,
+     * in the one place where being wrong is a refusal rather than a
+     * missing row.
+     */
     fun listLive(
         handle: Handle,
         catalogId: Long,
@@ -380,6 +397,7 @@ object TableRepo {
             WHERE tv.catalog_id = :catalogId
               AND tv.namespace_id = :namespaceId
               AND tv.end_snapshot IS NULL
+              AND t.dropped_snapshot IS NULL
             ORDER BY tv.name
             """,
         )

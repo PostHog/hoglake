@@ -333,7 +333,7 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
         val statements =
             v18.lines().map { it.substringBefore("--") }.filter { it.isNotBlank() }.joinToString("\n")
         assertThat(statements.uppercase())
-            .describedAs("V19 must take no ACCESS EXCLUSIVE lock; its ALTERs belong to V19:%n%s", statements)
+            .describedAs("V19 must take no ACCESS EXCLUSIVE lock; its ALTERs belong to V20:%n%s", statements)
             .doesNotContain("ALTER TABLE")
         assertThat(statements)
             .describedAs("and it must actually build the index")

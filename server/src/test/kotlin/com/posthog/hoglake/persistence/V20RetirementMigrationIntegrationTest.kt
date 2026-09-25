@@ -14,18 +14,18 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 
 /**
- * V19 — `hog_table.retirement_eligible_at` and the
+ * V20 — `hog_table.retirement_eligible_at` and the
  * `hog_maintenance_run.task` CHECK — plus the plans of the three
  * statements a retirement BATCH issues.
  *
- * SPLIT FROM V18 DELIBERATELY. V18 is an index on `hog_data_file` that
+ * SPLIT FROM V19 DELIBERATELY. V19 is an index on `hog_data_file` that
  * helps the EXISTING expiry sweep and can ship on its own; this file
  * carries the two `ALTER TABLE`s, which take ACCESS EXCLUSIVE and have
  * to be timed against in-flight sweeps. Keeping them apart is what lets
  * the index go out first.
  *
- * The migration RUNS here: the database arrives at V18, rows are
- * seeded, then [Database.migrate] applies V19 — so "the column was not
+ * The migration RUNS here: the database arrives at V19, rows are
+ * seeded, then [Database.migrate] applies V20 — so "the column was not
  * there before" is observed rather than asserted about a file.
  *
  * Every statement EXPLAINed below comes from `RetirementService`'s own
@@ -35,7 +35,7 @@ import org.junit.jupiter.api.TestInstance
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class V19RetirementMigrationIntegrationTest {
+class V20RetirementMigrationIntegrationTest {
     private companion object {
         const val LIVE_FILES = 200_000
 
@@ -44,10 +44,10 @@ class V19RetirementMigrationIntegrationTest {
         /** Rows the retirement batch asks for. */
         const val BATCH = 8_000
 
-        const val REAPPLY_V19 = "DELETE FROM flyway_schema_history WHERE version::numeric >= 19"
+        const val REAPPLY_V20 = "DELETE FROM flyway_schema_history WHERE version::numeric >= 20"
     }
 
-    private val db = PgTestSupport.freshDatabaseAt("18", productionSession = true)
+    private val db = PgTestSupport.freshDatabaseAt("19", productionSession = true)
     private var catalogId = 0L
     private var otherCatalogId = 0L
     private val droppedTableId = 2L
@@ -62,13 +62,13 @@ class V19RetirementMigrationIntegrationTest {
 
     @BeforeAll
     fun seedThenMigrate() {
-        catalogId = createCatalog("v19")
-        otherCatalogId = createCatalog("v19-neighbour")
+        catalogId = createCatalog("v20")
+        otherCatalogId = createCatalog("v20-neighbour")
         seedManifest()
         analyze()
 
         assertThat(column("hog_table", "retirement_eligible_at"))
-            .describedAs("the column arrives with V19")
+            .describedAs("the column arrives with V20")
             .isNull()
 
         Database.migrate(db.dataSource)
@@ -84,7 +84,7 @@ class V19RetirementMigrationIntegrationTest {
         db.jdbi.withHandleUnchecked { h ->
             h.createQuery(
                 "INSERT INTO hog_catalog (name, data_path, earliest_snapshot_id, last_snapshot_id) " +
-                    "VALUES (:n, 's3://v19/' || :n, :f, 1000) RETURNING catalog_id",
+                    "VALUES (:n, 's3://v20/' || :n, :f, 1000) RETURNING catalog_id",
             ).bind("n", name).bind("f", FLOOR).mapTo(Long::class.java).one()
         }
 
@@ -131,7 +131,7 @@ class V19RetirementMigrationIntegrationTest {
                        -- ended rows the two indexes hold the same rows
                        -- and either is a correct choice.
                        CASE WHEN g % 7 = 3 THEN 2 ELSE NULL END,
-                       's3://v19/live/' || md5(g::text) || '/part-' || g || '.parquet',
+                       's3://v20/live/' || md5(g::text) || '/part-' || g || '.parquet',
                        120000, 268435456, g::bigint * 120000
                 FROM generate_series(1, :n) g
                 """,
@@ -268,7 +268,7 @@ class V19RetirementMigrationIntegrationTest {
     // ---- the migration -----------------------------------------------------
 
     @Test
-    fun `V19 adds the column and widens the task vocabulary, and nothing else`() {
+    fun `V20 adds the column and widens the task vocabulary, and nothing else`() {
         assertThat(column("hog_table", "retirement_eligible_at")).isEqualTo("timestamp with time zone")
         db.jdbi.useHandleUnchecked { h ->
             h.execute(
@@ -293,8 +293,8 @@ class V19RetirementMigrationIntegrationTest {
     }
 
     @Test
-    fun `V19 is re-appliable, so a rolled-back deploy can simply run it again`() {
-        db.jdbi.useHandleUnchecked { h -> h.execute(REAPPLY_V19) }
+    fun `V20 is re-appliable, so a rolled-back deploy can simply run it again`() {
+        db.jdbi.useHandleUnchecked { h -> h.execute(REAPPLY_V20) }
         Database.migrate(db.dataSource)
         assertThat(column("hog_table", "retirement_eligible_at")).isEqualTo("timestamp with time zone")
         assertThat(
@@ -355,9 +355,17 @@ class V19RetirementMigrationIntegrationTest {
         assertThat(victimPlan)
             .describedAs("a Bitmap scan materialises the whole table before the LIMIT:%n%s", victimPlan)
             .doesNotContain("Bitmap")
-        // The ORDER BY is the index's own order with two leading
-        // equalities, so there is no Sort — which is what lets the LIMIT
-        // stop the scan early.
+        // NO SORT, and this is the assertion that is easiest to lose.
+        // The statement says `ORDER BY table_id, begin_snapshot` while
+        // the index is keyed `(catalog_id, table_id, begin_snapshot)` —
+        // the leading column is OMITTED, because it is an equality
+        // constant in the WHERE clause. Postgres sees that and reads
+        // the index in order; if it did not, it would have to
+        // materialise every live row of the table and SORT it before
+        // the LIMIT could take eight thousand — which on a 3M-row
+        // dropped table is the whole table, inside a transaction
+        // holding the commit lock. Nothing but the plan says which of
+        // the two happened.
         assertThat(victimPlan)
             .describedAs("a Sort would read every live row before the LIMIT could apply:%n%s", victimPlan)
             .doesNotContain("Sort")
