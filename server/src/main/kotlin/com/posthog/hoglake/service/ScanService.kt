@@ -10,6 +10,7 @@ import com.posthog.hoglake.persistence.FileRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
+import com.posthog.hoglake.persistence.getBigintListOrNull
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -33,6 +34,17 @@ import java.time.Instant
  * footer. Opt-in because most scan consumers (the DuckDB client,
  * pyhoglake, an unfiltered engine scan) cannot use bounds and should not
  * pay the join or the payload.
+ *
+ * Also on request (`splitOffsets`), every file the catalog holds
+ * row-group start offsets for carries them (`hog_data_file.split_offsets`,
+ * [com.posthog.hoglake.model.SplitOffsets]), so an engine can cut
+ * byte-range splits on row-group boundaries. That column lives on the
+ * file row itself, so asking for it adds no statement — the file query
+ * selects it under a bound flag and returns NULL for it otherwise, which
+ * keeps the arrays out of an ordinary plan's result set. A file with no
+ * stored offsets simply carries none; `stats_state` does not matter here,
+ * because a provided-stats registration may lack offsets and a pending
+ * one may have shipped them.
  *
  * Statement shape, independent of the file count: the catalog /
  * namespace / table resolution, ONE file+DV query, then (only when stats
@@ -152,6 +164,7 @@ class ScanService(private val jdbi: Jdbi) {
         snapshot: Long? = null,
         atTimestamp: Instant? = null,
         columnStats: ColumnStatsRequest? = null,
+        splitOffsets: Boolean = false,
     ): List<ScanFile> =
         jdbi.withHandleUnchecked { h ->
             val cat =
@@ -204,6 +217,7 @@ class ScanService(private val jdbi: Jdbi) {
                    df.record_count, df.file_size_bytes, df.footer_size,
                    df.row_id_start, df.stats_state, df.begin_snapshot, df.spec_id,
                    df.explicit_row_ids,
+                   CASE WHEN :splitOffsets THEN df.split_offsets END AS split_offsets,
                    pv.partition_values,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path,
                    dv.file_format AS dv_format, dv.delete_count AS dv_delete_count,
@@ -228,6 +242,7 @@ class ScanService(private val jdbi: Jdbi) {
                 .bind("catalogId", cat.catalogId)
                 .bind("tableId", t.tableId)
                 .bind("snapshot", at)
+                .bind("splitOffsets", splitOffsets)
                 .map { rs, _ ->
                     val specId = rs.getLong("spec_id").let { if (rs.wasNull()) null else it }
                     val values =
@@ -249,6 +264,7 @@ class ScanService(private val jdbi: Jdbi) {
                             specId = specId,
                             partitionValues = values,
                             explicitRowIds = rs.getBoolean("explicit_row_ids"),
+                            splitOffsets = rs.getBigintListOrNull("split_offsets"),
                         )
                     val dvId = rs.getLong("dv_id")
                     val deleteFile =

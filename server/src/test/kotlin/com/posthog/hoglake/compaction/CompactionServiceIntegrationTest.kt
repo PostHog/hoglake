@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.persistence.getBigintListOrNull
 import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
@@ -30,6 +31,7 @@ import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
+import com.posthog.hoglake.testing.ThriftRowGroupStarts
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
@@ -713,6 +715,43 @@ class CompactionServiceIntegrationTest {
             .describedAs("overridden sweep: every column chunk of %s", out.path)
             .containsOnly(CompressionCodecName.GZIP)
     }
+
+    @Test
+    fun `a compacted output registers its row-group offsets from the footer it wrote`() {
+        val fx = fixture(dvOnMiddle = false)
+        // The inputs registered without offsets, so any list the output
+        // carries was produced by the compaction commit itself.
+        assertThat(fx.fileIds.map { storedSplitOffsets(fx.cat, it) }).containsOnlyNulls()
+        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
+        // Independent reading of the committed OBJECT's thrift footer,
+        // not of the writer's in-memory metadata the commit used.
+        val expected = ThriftRowGroupStarts.of(store.get(output.path)).offsets
+        assertThat(expected).isNotEmpty()
+        assertThat(storedSplitOffsets(fx.cat, output.dataFileId)).containsExactlyElementsOf(expected)
+        // And served: the scan plan hands the same list to an engine.
+        val scanned =
+            scans.planScan(fx.cat, "ns", "t", splitOffsets = true).single { it.dataFile.explicitRowIds }
+        assertThat(scanned.dataFile.splitOffsets).containsExactlyElementsOf(expected)
+    }
+
+    private fun storedSplitOffsets(
+        cat: String,
+        dataFileId: Long,
+    ): List<Long>? =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT f.split_offsets FROM hog_data_file f
+                JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                WHERE c.name = :cat AND f.data_file_id = :fileId
+                """,
+            )
+                .bind("cat", cat)
+                .bind("fileId", dataFileId)
+                .map { rs, _ -> rs.getBigintListOrNull("split_offsets") }
+                .one()
+        }
 
     /** Every column chunk's recorded codec, across every row group. */
     private fun codecsOf(bytes: ByteArray): List<CompressionCodecName> {
@@ -2278,6 +2317,10 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isEqualTo(3)
         assertThat(readSchemaOnly(store.get(output.path)).fields.map { it.name })
             .containsExactly("id", ParquetRewriter.ROW_ID_COLUMN)
+        // Offsets do not wait for the hydrator: they come off the footer
+        // compaction wrote, whatever the stats state.
+        assertThat(storedSplitOffsets(cat, output.dataFileId))
+            .containsExactlyElementsOf(ThriftRowGroupStarts.of(store.get(output.path)).offsets)
     }
 
     private fun readSchemaOnly(bytes: ByteArray): MessageType {

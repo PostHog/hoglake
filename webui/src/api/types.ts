@@ -329,6 +329,13 @@ export interface DataFile {
    * and the changefeed never carry it.
    */
   column_stats?: ScanColumnStats[];
+  /**
+   * Row-group start offsets (one per row group, strictly increasing),
+   * filled by the scan plan ONLY (with `include=split_offsets`) and only
+   * when the catalog has them; the listing and the changefeed never
+   * carry it.
+   */
+  split_offsets?: Int64[];
 }
 
 /**

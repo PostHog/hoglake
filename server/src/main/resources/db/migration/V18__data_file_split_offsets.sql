@@ -1,0 +1,43 @@
+-- Row-group start offsets per data file, so a query engine can cut
+-- byte-range splits on row-group boundaries instead of at even byte
+-- offsets that land inside a row group (GET .../scan with
+-- include=split_offsets; the Iceberg `split_offsets` convention).
+--
+-- ONE ENTRY PER ROW GROUP, ascending: the byte offset at which the row
+-- group's FIRST column chunk starts — parquet-java's
+-- ColumnChunkMetaData.getStartingPos(), i.e. the dictionary page offset
+-- when the chunk has a dictionary page that precedes its first data
+-- page, else the first data page offset. NOT the thrift RowGroup
+-- file_offset, which some writers set wrongly.
+--
+-- NULLABLE, with no backfill: NULL means "not known", and every reader
+-- treats it as "cut evenly", which is what every file got before this
+-- column existed. Three writers fill it: the commit path from a
+-- footer-shipping registration that carried the list, the hydrator from
+-- the footer it reads for a pending file, and compaction from the footer
+-- its own writer just produced. A provided-stats registration that did
+-- not ship a list simply has none.
+--
+-- NO CHECK CONSTRAINT, deliberately. The contract (non-empty, strictly
+-- increasing, first >= 0, last < file_size_bytes, at most 100,000
+-- entries) is enforced by the one validator all three writers share
+-- (model/SplitOffsets.kt). A CHECK added with the column would make
+-- Postgres verify it against every existing hog_data_file row under the
+-- ACCESS EXCLUSIVE lock this statement already holds, and hog_data_file
+-- is the largest table in the schema; the NOT VALID + VALIDATE dance
+-- buys a backstop for a column only server code writes.
+--
+-- A metadata-only ADD COLUMN (no default, no rewrite), but still ACCESS
+-- EXCLUSIVE, so it sits inside the lock_timeout window (AGENT.md's
+-- migration rule; MigrationLockWindowTest reads this file). V16's
+-- transactional shape: no `.conf`, so `SET LOCAL` expires with the
+-- transaction, and a failure rolls back without writing a history row.
+--
+-- IF NOT EXISTS because the file must be re-runnable over its own
+-- result: the V14-V17 migration tests rewind the history with `version
+-- >= N` and migrate again, which re-applies every later file (V15-V17
+-- are idempotent for the same reason), and an operator repairing a
+-- history row gets the same no-op.
+SET LOCAL lock_timeout = '5s';
+
+ALTER TABLE hog_data_file ADD COLUMN IF NOT EXISTS split_offsets bigint[];

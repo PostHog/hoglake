@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.hydrator.FooterSplitOffsets
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
@@ -23,6 +24,7 @@ import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -2110,6 +2112,13 @@ class CompactionService(
         }
         val outputBytes = sink.bytesWritten
         val footerSize = sink.footerSize
+        // The output's row-group offsets, off the footer the writer just
+        // built and still holds — no read-back, no extra IO, a walk over
+        // the row groups. Registered for pending outputs too (the
+        // hydrator would compute the same list from the same footer);
+        // null only when that footer gives no list honouring the
+        // contract, and then readers cut the file evenly.
+        val splitOffsets = rewritten.footer?.let { FooterSplitOffsets.of(it, outputBytes) }
 
         val stats =
             if (group.files.all { it.statsProvided && it.dv == null }) {
@@ -2122,6 +2131,7 @@ class CompactionService(
         val outcome =
             commitGroup(
                 ctx, group, outputPath, outputBytes, footerSize, stats,
+                splitOffsets = splitOffsets,
                 survivors = rewritten.rowsWritten,
                 rowIdStart = rewritten.minRowId ?: group.files.minOf { it.rowIdStart },
                 stagingId = stagingId,
@@ -2187,6 +2197,7 @@ class CompactionService(
         outputBytes: Long,
         footerSize: Long,
         stats: List<ColumnStats>?,
+        splitOffsets: List<Long>?,
         survivors: Long,
         rowIdStart: Long,
         stagingId: Long,
@@ -2316,10 +2327,12 @@ class CompactionService(
                 """
                 INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
                                            path, record_count, file_size_bytes, footer_size,
-                                           row_id_start, stats_state, spec_id, explicit_row_ids)
+                                           row_id_start, stats_state, spec_id, explicit_row_ids,
+                                           split_offsets)
                 VALUES (:catalogId, :dataFileId, :tableId, :beginSnapshot,
                         :path, :recordCount, :fileSizeBytes, :footerSize,
-                        :rowIdStart, :statsState, :specId, true)
+                        :rowIdStart, :statsState, :specId, true,
+                        :splitOffsets)
                 """,
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2333,6 +2346,7 @@ class CompactionService(
                 .bind("rowIdStart", rowIdStart)
                 .bind("statsState", if (stats != null) "provided" else "pending")
                 .bind("specId", group.specId)
+                .bindBigintArrayOrNull("splitOffsets", splitOffsets)
                 .execute()
 
             val values = group.partitionValues

@@ -296,6 +296,19 @@ CREATE TABLE hog_data_file (
     -- while a live flagged file exists). The reserved `_hog_row_id` id
     -- 2147483646 counts as an id like any other.
     missing_field_ids boolean NOT NULL DEFAULT false,
+    -- Row-group start offsets (V18), ascending, one per row group: where
+    -- each row group's FIRST column chunk starts (parquet-java
+    -- ColumnChunkMetaData.getStartingPos — the dictionary page offset
+    -- when a dictionary page precedes the first data page, else the
+    -- first data page offset; never RowGroup.file_offset). Served on
+    -- GET /scan with include=split_offsets so engines cut byte-range
+    -- splits on row-group boundaries. NULL = unknown (cut evenly).
+    -- Filled by a footer-shipping registration that carried it, by the
+    -- hydrator for pending files, and by compaction for its outputs;
+    -- the contract (non-empty, strictly increasing, within
+    -- [0, file_size_bytes), at most 100,000 entries) is enforced in
+    -- code by model/SplitOffsets.kt, not by a CHECK.
+    split_offsets   bigint[],
     PRIMARY KEY (catalog_id, data_file_id),
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)

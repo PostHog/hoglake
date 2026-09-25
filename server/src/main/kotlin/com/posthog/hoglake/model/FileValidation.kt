@@ -11,3 +11,17 @@ fun FileRegistration.validateFooterSize(required: Boolean = false) {
         throw HoglakeException.Validation("invalid footer_size")
     }
 }
+
+/**
+ * Validate a footer-shipping registration's optional `split_offsets`
+ * against [SplitOffsets.violation]: a list that breaks the contract is
+ * refused (422), never stored and never silently dropped — a writer
+ * whose footer walk is wrong should hear about it, not find its files
+ * cut evenly with no explanation. Absent is always fine.
+ */
+fun FileRegistration.validateSplitOffsets() {
+    val offsets = splitOffsets ?: return
+    SplitOffsets.violation(offsets, fileSizeBytes)?.let { reason ->
+        throw HoglakeException.Validation("invalid split_offsets for $path: $reason")
+    }
+}

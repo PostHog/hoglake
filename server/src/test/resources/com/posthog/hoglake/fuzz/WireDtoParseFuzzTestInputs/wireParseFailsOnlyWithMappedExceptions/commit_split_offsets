@@ -1,0 +1,3 @@
+{"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
+                        "footer_size":256,"split_offsets":[4,300,700]}]}]}

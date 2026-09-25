@@ -7,12 +7,14 @@ import com.posthog.hoglake.model.HydratorSweepResult
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RehydrateResult
+import com.posthog.hoglake.model.SplitOffsets
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
@@ -46,6 +48,12 @@ import java.time.Instant
  * CatalogMetrics gauges the flagged population
  * (`hoglake_missing_field_id_files`).
  *
+ * The same footer also yields the file's row-group start offsets
+ * (`hog_data_file.split_offsets`, [FooterSplitOffsets]), written in the
+ * statement that flips the file to `provided` — or NULL past
+ * [SplitOffsets.MAX_ROW_GROUPS] row groups or when the footer gives no
+ * list honouring the contract. Readers cut such a file evenly.
+ *
  * Footer-only: nothing here decodes data pages. When the registration
  * carried `footer_size`, only the object's tail is fetched (ranged GET);
  * otherwise (or if the tail turns out not to contain everything the footer
@@ -74,6 +82,13 @@ class Hydrator(
     private val store: ObjectStore,
     /** Whole-object fallback cap; see class KDoc. */
     private val maxWholeObjectBytes: Long = DEFAULT_MAX_WHOLE_OBJECT_BYTES,
+    /**
+     * Most row groups whose offsets a hydrated file stores
+     * ([SplitOffsets.MAX_ROW_GROUPS]); past it the file hydrates with no
+     * split_offsets. A parameter only so a test can reach the over-cap
+     * path without writing a 100,001-row-group parquet file.
+     */
+    private val maxSplitOffsetRowGroups: Int = SplitOffsets.MAX_ROW_GROUPS,
 ) {
     private val log = KotlinLogging.logger {}
     private val json = ObjectMapper()
@@ -318,16 +333,36 @@ class Hydrator(
         // column_stats).
         val aggs = FooterStats.aggregate(footer, columns, file.path)
         for (agg in aggs) upsertStats(h, file, agg)
+        // Row-group start offsets ride the same footer and the same flip,
+        // so a file is never `provided` in one statement and offset-less
+        // in the next. The FOOTER is authoritative: it overwrites any
+        // list the registration shipped, and null (no usable list) clears
+        // one, because a list the footer contradicts is worse than none.
+        val splitOffsets = FooterSplitOffsets.of(footer, file.fileSizeBytes, maxSplitOffsetRowGroups)
+        if (splitOffsets == null) {
+            val rowGroups = footer.blocks.size
+            log.debug {
+                if (rowGroups > maxSplitOffsetRowGroups) {
+                    "file ${file.dataFileId} (${file.path}) has $rowGroups row groups, over the " +
+                        "$maxSplitOffsetRowGroups cap; storing no split_offsets (readers cut it evenly)"
+                } else {
+                    "file ${file.dataFileId} (${file.path}): footer gives no usable row-group " +
+                        "offsets ($rowGroups row groups); storing no split_offsets"
+                }
+            }
+        }
         val flipped =
             h.createUpdate(
                 """
                 UPDATE hog_data_file
-                   SET stats_state = 'provided', missing_field_ids = :missingFieldIds
+                   SET stats_state = 'provided', missing_field_ids = :missingFieldIds,
+                       split_offsets = :splitOffsets
                 WHERE catalog_id = :catalogId AND data_file_id = :dataFileId
                   AND stats_state = 'pending'
                 """,
             )
                 .bind("missingFieldIds", missingFieldIds)
+                .bindBigintArrayOrNull("splitOffsets", splitOffsets)
                 .bind("catalogId", file.catalogId)
                 .bind("dataFileId", file.dataFileId)
                 .execute()

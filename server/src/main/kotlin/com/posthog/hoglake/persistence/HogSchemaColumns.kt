@@ -89,6 +89,11 @@ object HogSchemaColumns {
                     "path", "file_format", "record_count", "file_size_bytes", "footer_size",
                     "row_id_start", "stats_state", "spec_id", "explicit_row_ids",
                     "missing_field_ids",
+                    // V18: row-group start offsets. Written by
+                    // CommitService.writeAppends, Hydrator.hydrate and
+                    // CompactionService.commitGroup; read by
+                    // ScanService.planScan (include=split_offsets) only.
+                    "split_offsets",
                 ),
             // FileRepo stats mappers, Hydrator.upsertStats,
             // CompactionService.aggregateStats.

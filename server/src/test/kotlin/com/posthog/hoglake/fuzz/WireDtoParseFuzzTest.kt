@@ -14,9 +14,12 @@ import com.posthog.hoglake.api.PublishTableCreationDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
+import com.posthog.hoglake.api.parseScanRequest
 import com.posthog.hoglake.api.parseScanStatsRequest
 import com.posthog.hoglake.commit.commitFingerprint
 import com.posthog.hoglake.model.HoglakeException
+import com.posthog.hoglake.model.SplitOffsets
+import com.posthog.hoglake.model.validateSplitOffsets
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationDefinitionCodec
 import com.posthog.hoglake.wireObjectMapper
@@ -71,20 +74,24 @@ class WireDtoParseFuzzTest {
             }
         }
 
-        // GET .../scan's stats request: the fuzz input split at its first
+        // GET .../scan's optional parts: the fuzz input split at its first
         // NUL into `include` and `stats_fields`, so both halves (and the
-        // cross-parameter rule) see arbitrary text. Oracle: any request it
-        // accepts names column_stats, and its field ids re-parse to
+        // cross-parameter rule) see arbitrary text. Oracle, against the
+        // raw tokens rather than the parser's own sets: a request asks
+        // for statistics iff a token is `column_stats`, for split offsets
+        // iff a token is `split_offsets`, and its field ids re-parse to
         // themselves.
         try {
             val raw = data.toString(Charsets.UTF_8)
             val include = raw.substringBefore('\u0000')
             val fields = raw.substringAfter('\u0000', missingDelimiterValue = "").ifEmpty { null }
-            parseScanStatsRequest(include, fields)?.let { request ->
-                check(include.split(',').any { it.trim() == "column_stats" })
-                request.fieldIds?.let { ids ->
-                    check(parseScanStatsRequest("column_stats", ids.joinToString(","))?.fieldIds == ids)
-                }
+            val tokens = include.split(',').map { it.trim() }
+            val request = parseScanRequest(include, fields)
+            check((request.columnStats != null) == ("column_stats" in tokens))
+            check(request.splitOffsets == ("split_offsets" in tokens))
+            check(parseScanStatsRequest(include, fields) == request.columnStats)
+            request.columnStats?.fieldIds?.let { ids ->
+                check(parseScanStatsRequest("column_stats", ids.joinToString(","))?.fieldIds == ids)
             }
         } catch (e: Exception) {
             checkAllowed("scan include/stats_fields", e)
@@ -105,6 +112,21 @@ class WireDtoParseFuzzTest {
         parseOrNull { mapper.readValue<CommitRequestDto>(data) }?.let { dto ->
             try {
                 val request = dto.toModel()
+                // split_offsets validation: refuses with the mapped 422
+                // or accepts a list that meets the contract, checked here
+                // from first principles rather than by the validator.
+                request.appends.flatMap { it.files }.forEach { file ->
+                    try {
+                        file.validateSplitOffsets()
+                        file.splitOffsets?.let { offsets ->
+                            check(offsets.isNotEmpty() && offsets.size <= SplitOffsets.MAX_ROW_GROUPS)
+                            check(offsets.first() >= 0 && offsets.last() < file.fileSizeBytes)
+                            check(offsets.zipWithNext().all { (a, b) -> a < b })
+                        }
+                    } catch (e: HoglakeException.Validation) {
+                        check(file.splitOffsets != null) { "validation refused a registration with no split_offsets" }
+                    }
+                }
                 val fingerprint = commitFingerprint(request)
                 check(commitFingerprint(request.copy(allowPendingDeletes = true)) != fingerprint)
                 val pending = request.deletes.flatMap { it.files }.filter { it.dataFilePath != null }

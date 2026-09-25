@@ -197,6 +197,24 @@ slip through the commit-to-hydration window. `rename_table` is
 unaffected, and the flag clears from relevance when the file is
 compacted away, dropped, or expired.
 
+The same footer read also records the file's **row-group start
+offsets** (`hog_data_file.split_offsets`, served on
+`GET /scan?include=split_offsets`): per row group, where its first
+column chunk starts (the dictionary page when one precedes the first
+data page, else the first data page). They are written in the statement
+that flips the file to `provided`, and the footer is authoritative — it
+replaces any list the registration shipped. A file with more than
+100,000 row groups, or whose footer gives no strictly increasing
+in-range list, stores none. Writers that hold the footer can ship the
+list themselves as `split_offsets` on the registration; it is validated
+(non-empty, strictly increasing, within `[0, file_size_bytes)`, at most
+100,000 entries) and a bad list is a 422, never stored or repaired. A
+provided-stats registration that ships no list never passes through the
+hydrator, so it simply has none — acceptable, because row-group
+alignment is an optimization and even cuts are always correct.
+Compaction registers the list for every output from the footer its
+writer just produced, at no extra IO.
+
 ### Row lineage
 
 Every append gets a contiguous row-id range per file
@@ -279,6 +297,20 @@ it:
   three shapes, for the four index candidates that were measured and
   rejected, and for the one alternative (CLUSTER) that does change the
   answer and why it is not taken.
+
+A plan can also carry each file's **row-group start offsets**, so an
+engine cuts byte-range splits on row-group boundaries instead of at
+even offsets that land mid-row-group: `GET /scan?include=split_offsets`
+(combinable: `include=column_stats,split_offsets`). Entry i is where row
+group i's FIRST column chunk starts — parquet-java's
+`ColumnChunkMetaData.getStartingPos()`, never the thrift
+`RowGroup.file_offset` — and a list is only ever served whole, strictly
+increasing and inside `[0, file_size_bytes)`; a file without one simply
+carries no property and is cut evenly. The offsets live on the file row
+(`hog_data_file.split_offsets`), so asking adds no statement to the
+plan. Like `column_stats`, it is a scan-plan-only property: the files
+listing and the changefeed never carry it. Where the lists come from is
+under "File registration" above.
 
 ### Partitioning
 
