@@ -151,6 +151,22 @@ safely (e.g. a timestamp whose unit conversion would overflow) stores
 as NULL — bounds are never guessed. Until hydrated, a pending file
 simply matches every scan: correctness holds, pruning quality lags.
 
+`null_count` is mandatory in `hog_file_column_stats`, so a leaf whose
+footer omits it in any row group gets **no row** — unless the leaf's
+max definition level is 0 (it and every ancestor REQUIRED), where the
+parquet format guarantees no nulls and the omitted count is taken as 0.
+That case is not hypothetical: ClickHouse writes its non-`Nullable`
+columns REQUIRED and omits their `null_count` (it does set it on
+`Nullable` ones), and before this rule such files hydrated to
+`provided` with no rows for those columns (for the benchmark dataset,
+no rows at all). A nullable leaf (OPTIONAL,
+or under an OPTIONAL/repeated ancestor) with no count still gets no row,
+with a warning naming it. Files hydrated before the rule are `provided`
+with those rows missing and are never swept again; `POST
+/maintenance/rehydrate` requeues only `failed` files, so backfilling them
+means flipping the affected `provided` files back to `pending` (the
+upsert makes a re-hydration idempotent) — not yet an endpoint.
+
 Hydration failure has a **two-class taxonomy**. Transient fetch errors
 (S3 5xx/SlowDown, timeouts, connection resets) leave the file
 `pending` — logged and counted
