@@ -2,6 +2,7 @@ package com.posthog.hoglake.service
 
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -237,6 +238,23 @@ class VerifyQueryPlanIntegrationTest {
             ).bind("c", catalogId).bind("next", (DATA_FILES + 1L) * 10).execute()
             for (table in MANIFEST_TABLES + "hog_upload") h.execute("ANALYZE $table")
         }
+        // The loops bound (rule 2) says a node may repeat at most once
+        // per CANDIDATE. That only EXCLUDES anything while the candidate
+        // set is smaller than the manifest: raise LEDGER_ROWS or
+        // UPLOAD_CLAIMS past DATA_FILES and a node repeating once per
+        // manifest row would satisfy it, the rule would go quiet, and
+        // nothing in this class would fail. Asserted here rather than
+        // assumed, because it is a property of the FIXTURE and the
+        // fixture is edited by people who are not thinking about rule 2.
+        val manifestRows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery("SELECT count(*) FROM hog_data_file WHERE catalog_id = :c")
+                    .bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        check(candidateBound() < manifestRows) {
+            "the candidate bound (${candidateBound()}) must stay below the manifest " +
+                "($manifestRows rows) or the loops-per-candidate rule excludes nothing"
+        }
     }
 
     /**
@@ -415,42 +433,13 @@ class VerifyQueryPlanIntegrationTest {
     }
 
     /**
-     * A plan node: its line, how many times it ran, what it read, and
-     * whether it threw rows away on `path` — which is what separates a
-     * probe on `(catalog_id, path)` from a probe on a prefix of it.
+     * The nodes of a plan, through the shared parser. `ExplainPlanTest`
+     * pins its polarity without a container — in particular
+     * [ExplainPlan.Node.filtersPath], which no plan in this class
+     * carries and which a parser that always answered `false` would
+     * leave green forever.
      */
-    private data class Node(
-        val line: String,
-        val loops: Long,
-        val buffers: Long,
-        val filtersPath: Boolean,
-    )
-
-    /**
-     * Every node of a plan with its OWN buffers.
-     *
-     * A node's detail lines follow it until the next `->` (a child) or a
-     * line at its own indentation or shallower, so a leaf's `Buffers:`
-     * is its own and a parent's is cumulative — which is why the budget
-     * above is only applied to nodes that repeat, and those are leaves.
-     */
-    private fun nodes(text: String): List<Node> {
-        val lines = text.lines()
-
-        fun indent(l: String) = l.length - l.trimStart().length
-        return lines.mapIndexedNotNull { i, line ->
-            val loops = loopCount.find(line)?.groupValues?.get(1)?.toLong() ?: return@mapIndexedNotNull null
-            val detail =
-                lines.drop(i + 1)
-                    .takeWhile { it.isNotBlank() && indent(it) > indent(line) && !it.contains("->") }
-            val buffersLine = detail.firstOrNull { it.trim().startsWith("Buffers:") }
-            val hit = buffersLine?.let { Regex("""\bhit=(\d+)""").find(it)?.groupValues?.get(1)?.toLong() } ?: 0L
-            val read = buffersLine?.let { Regex("""\bread=(\d+)""").find(it)?.groupValues?.get(1)?.toLong() } ?: 0L
-            val filtersPath =
-                detail.any { it.trim().startsWith("Filter:") && it.contains("path") }
-            Node(line.trim(), loops, hit + read, filtersPath)
-        }
-    }
+    private fun nodes(text: String) = ExplainPlan.nodes(text)
 
     /**
      * Fails if the INNER side of a `Nested Loop` SCANS a manifest table

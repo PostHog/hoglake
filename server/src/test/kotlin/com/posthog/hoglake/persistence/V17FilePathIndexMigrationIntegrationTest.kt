@@ -634,9 +634,17 @@ class V17FilePathIndexMigrationIntegrationTest {
         Regex("""Scan(?: Backward)? using (\S+) on hog_upload\b""").find(text)
             ?.let { return it.groupValues[1] }
         val lines = text.lines()
+
+        fun indent(l: String) = l.length - l.trimStart().length
         val heap = lines.indexOfFirst { it.contains("Bitmap Heap Scan on hog_upload") }
         if (heap < 0) return null
+        // SCOPED TO THE HEAP NODE'S SUBTREE, not "the next line that
+        // looks like one": the leg is one branch of a UNION, so the
+        // textually next `Bitmap Index Scan` could belong to a sibling
+        // and this would report another relation's index as the upload
+        // leg's driver.
         return lines.drop(heap + 1)
+            .takeWhile { it.isBlank() || indent(it) > indent(lines[heap]) }
             .firstOrNull { it.contains("Bitmap Index Scan on ") }
             ?.let { Regex("""Bitmap Index Scan on (\S+)""").find(it)?.groupValues?.get(1) }
     }

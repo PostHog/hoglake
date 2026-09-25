@@ -153,14 +153,16 @@ object Database {
      * for the build's next phase to park behind.
      *
      * Measured on a 5M-row `hog_data_file` (V17's fixture), with writers
-     * committing throughout, each clock started when that session's
-     * statement began: CIC alone 26 s; CIC with a second replica
-     * blocking on the old code 58 s, the replica's blocked
-     * `pg_advisory_lock` killed by its own 60 s `statement_timeout`
-     * 2 s later (it started 2 s before the build) — the build unparked
-     * the moment that snapshot went away; CIC with a second replica
-     * polling 26 s, and the replica takes the lock as soon as the first
-     * is done. A poll holds its snapshot for the microseconds one
+     * committing throughout, each duration on its own session's clock:
+     * CIC alone 26 s; CIC with a second replica blocking on the old
+     * code 58 s, of which 32 s was spent in `wait_event = virtualxid`
+     * against that replica's virtual transaction (read out of
+     * pg_stat_activity), while the replica's own boot failed when its
+     * blocked `pg_advisory_lock` hit the 60 s `statement_timeout` its
+     * session carries; CIC with a second replica polling 26 s, and the
+     * replica takes the lock as soon as the first is done. What ended
+     * the park is not claimed — the numbers are the three durations and
+     * the wait event. A poll holds its snapshot for the microseconds one
      * `pg_try_advisory_lock` takes.
      *
      * The sleep is CLIENT-side for the same reason: `pg_sleep` is a

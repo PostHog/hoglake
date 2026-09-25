@@ -26,10 +26,18 @@
 --
 -- MEASURED, on a production-shaped fixture (PG 18.6, 5,000,000
 -- hog_data_file rows over two catalogs — one dropped table's 3,000,000
--- ended rows plus a live set — 175-byte hash-scattered paths, 1.5 GB
+-- ended rows plus a live set — 175-byte hash-scattered paths, 1,491 MiB
 -- heap / 190,884 pages, 100,000 hog_delete_file rows, 200,000
--- hog_upload rows), EXPLAIN (ANALYZE, BUFFERS) of that exact statement
--- with a 1,000-path probe:
+-- hog_upload rows). THE FIXTURE IS THE SIZE OF THE REAL THING: counted
+-- through the API on 2026-09-25 02:40 UTC, catalog millpond-prod-us
+-- holds 4,941,469 LIVE data files (ingest.events_raw 1,917,940;
+-- main.events_raw 3,008,849 — the dropped-but-undroppable table; the
+-- rest ~10k), and hog_data_file also carries the historical rows inside
+-- the 3 h retention, roughly 10-30k per hour of expiry churn, so the
+-- table is about 5.0-5.1M rows. Its relation size was NOT measured (the
+-- deploy tooling has no database access); at the fixture's 243 bytes of
+-- index per row that is ~1.2 GiB of new index. EXPLAIN (ANALYZE,
+-- BUFFERS) of the exact statement with a 1,000-path probe:
 --
 --   before   197,752 buffers, 692 ms  (Seq Scan on hog_data_file:
 --            190,884 buffers, `Rows Removed by Filter: 4,999,998`;
@@ -98,10 +106,14 @@
 -- build belongs to. Measured on the fixture, with writers running:
 --
 --   * no second replica:                     CIC 26 s
---   * second replica blocking (old code):    CIC 58 s, and the replica
---     died at 62 s on its own 60 s statement_timeout — a boot failure,
---     a pod restart, and a fresh snapshot for the next phase to park
---     behind;
+--   * second replica blocking (old code):    CIC 58 s — 32 s of it
+--     parked, observed directly as `wait_event = virtualxid` in
+--     pg_stat_activity against the waiting replica's virtual
+--     transaction. That replica's own boot then FAILED: its blocked
+--     `pg_advisory_lock` was killed by the 60 s statement_timeout its
+--     session carries. Which of the two ended the park is not claimed
+--     here — the durations are what were measured, on separate session
+--     clocks, and the build was demonstrably waiting on the waiter;
 --   * second replica POLLING (this change):  CIC 26 s, no park, and the
 --     replica takes the lock as soon as the first one is done.
 --
@@ -158,23 +170,28 @@
 -- fixture, 20,000 rows inserted as 100 transactions of 200 files (a
 -- commit's shape), each run after a CHECKPOINT:
 --
---   without the index   345 ms, 16 MB WAL     (836 bytes/row)
---   with the index      955 ms, 156 MB WAL  (8,192 bytes/row)
+--   without the index   345 ms,  16 MiB WAL    (836 bytes/row)
+--   with the index      955 ms, 156 MiB WAL  (8,179 bytes/row)
 --
--- +31 us and +7.4 KB of WAL per file row: a 200-file commit pays ~6 ms
--- and ~1.5 MB more. The WAL is full-page images, not tuples — a random
--- 175-byte key lands on its own leaf of a 1,157 MB / 148,158-page index,
--- so the first insert into each leaf after a checkpoint images the page.
--- An operator who wants it back can turn on `wal_compression` (measured
--- lz4: 5,033 bytes/row, -39%); this file does not, because that is a
+-- +31 us and +7,343 BYTES of WAL per file row: a 200-file commit pays
+-- ~6 ms and ~1.5 MiB more, and at the production churn of ~200k file
+-- rows/hour that is 1.47 GB/hour, ~35 GB/day, and ~250 GB of extra
+-- retained WAL at a 7-day PITR window (plus the same bytes on every
+-- replication stream). The WAL is full-page images, not tuples — a
+-- random 175-byte key lands on its own leaf of a 1,157 MiB /
+-- 148,158-page index, so the first insert into each leaf after a
+-- checkpoint images the page. The IOPS are not the problem: ~56 random
+-- 8 KiB page writes per second at that insert rate. An operator who
+-- wants the bytes back can turn on `wal_compression` (measured lz4:
+-- 5,033 bytes/row, -39%); this file does not, because that is a
 -- cluster-wide setting and not a schema decision.
 --
--- The index is 1,157 MB against a 1,491 MB heap at 5M rows (232
+-- The index is 1,157 MiB against a 1,491 MiB heap at 5M rows (243
 -- bytes/row, the key plus tuple overhead), taking hog_data_file's total
--- relation size from 2,264 MB to 3,421 MB. hog_delete_file's is 19 MB
--- at 100,000 rows and its build takes 473 ms; it is the same shape for
--- the same statement, and its inserts are a small fraction of the data
--- files'.
+-- relation size from 2,264 MiB to 3,421 MiB. hog_delete_file's is
+-- 19 MiB at 100,000 rows and its build takes 473 ms; it is the same
+-- shape for the same statement, and its inserts are a small fraction of
+-- the data files'.
 --
 -- WHAT ELSE THE INDEX SERVES (all measured on the fixture, all the same
 -- `(catalog_id, path)` shape):
@@ -251,17 +268,14 @@ SELECT set_config('lock_timeout', current_setting('hoglake.migration_lock_timeou
 
 -- `statement_timeout = 0` for the builds and nothing else. A pod's
 -- session carries 60 s (Database.SESSION_INIT_SQL) and the measured
--- build is 26 s at 5M rows, so the bound is not far away and it grows
--- with the table. A build killed by it leaves an INVALID index and a
--- failed history row; the DO block above is the other half of that
--- story. Both indexes can also be pre-built out of band --
---
---   CREATE INDEX CONCURRENTLY hog_data_file_path
---       ON hog_data_file (catalog_id, path);
---   CREATE INDEX CONCURRENTLY hog_delete_file_path
---       ON hog_delete_file (catalog_id, path);
---
--- after which these statements find them and are no-ops.
+-- build is 26 s at 5M rows with 256 MB of `maintenance_work_mem` and
+-- 35 s with 64 MB, so the bound is not far away, it grows with the
+-- table, and it shrinks with that setting. A build killed by it leaves
+-- an INVALID index and a failed history row; the DO block above is the
+-- other half of that story. Pre-building the indexes out of band is the
+-- RECOMMENDED path at this size — the statements, the pre-flight check
+-- and the reason are above, under "THE DEPLOY BUDGET" — after which
+-- these two statements find them and are no-ops.
 SELECT set_config('hoglake.migration_statement_timeout', current_setting('statement_timeout'), false);
 SET statement_timeout = 0;
 

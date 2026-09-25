@@ -731,7 +731,9 @@ CREATE INDEX hog_compaction_claim_expiry
 -- tables, which keep every historical row.
 --
 -- Paid for on every hog_data_file INSERT, which is the hottest write in
--- the system: +31 us and +7.4 KB of WAL per row at 5M rows, the WAL
--- being full-page images of a random 175-byte key's leaf.
+-- the system: +31 us and +7,343 bytes of WAL per row at 5M rows (1.47
+-- GB/hour at the production churn of ~200k rows/hour), the WAL being
+-- full-page images of a random 175-byte key's leaf. The index itself is
+-- 1,157 MiB at 5M rows, 243 bytes/row.
 CREATE INDEX hog_data_file_path ON hog_data_file (catalog_id, path);
 CREATE INDEX hog_delete_file_path ON hog_delete_file (catalog_id, path);

@@ -408,15 +408,13 @@ there would break that gate on every build.
     nothing: `UNIQUE (catalog_id, path)` (V12) is already that key, and its
     fallback is bounded by the catalog's ACTIVE claims rather than by an
     append-only history. The index is paid on the hottest write in the
-    system (+31 us and +7.4 KB of WAL per file row), and it is built
-    `CONCURRENTLY` — at that size a plain build blocks every commit for
-    27 s, which reverses V16's trade on measurement rather than on
-    analogy. A concurrent build is only safe because `Database.migrate`
-    POLLS `pg_try_advisory_lock`: a replica blocking inside
-    `pg_advisory_lock` is an open statement with a published snapshot,
-    and CIC parks behind it until that replica's `statement_timeout`
-    kills its boot (measured 26 s / 58 s / 26 s for no waiter, a
-    blocking waiter, a polling one).
+    system (+31 us and +7,343 bytes of WAL per file row, 1.47 GB/hour at
+    production churn; the index is 1,157 MiB / 243 bytes per row at 5M
+    rows), and it is built `CONCURRENTLY` — at that size a plain build
+    blocks every commit for 27-31 s, which reverses V16's trade on
+    measurement rather than on analogy. What makes a concurrent build
+    safe to deploy, and what still cannot make it safe on its own, is
+    the CIC rule above.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
@@ -909,9 +907,18 @@ there would break that gate on every build.
   shapes there read whole relations by design, and `hog_file_removal`'s
   path index (V16) covers only its UNDRAINED rows — so a query the
   planner cannot flatten is quadratic and invisible on any
-  fixture-sized catalog. `hog_data_file` and `hog_delete_file` do now
-  carry `(catalog_id, path)` (V17), which is why that test asserts how
-  many TIMES a relation is read rather than which index reads it.
+  fixture-sized catalog. Since `hog_data_file` and `hog_delete_file`
+  carry `(catalog_id, path)` too (V17), a per-candidate index probe is a
+  plan the planner can now pick, and the rule is FOUR clauses rather
+  than "nothing runs twice": a repeated node must be an `Index Scan
+  using <index>`; it may repeat at most once per CANDIDATE (bounded by
+  the ledger + upload rows this catalog owns, counted, and the fixture
+  asserts that bound is below the manifest or it discriminates nothing);
+  each loop must cost a descent (EXPLAIN is asked for `BUFFERS`
+  explicitly — PG 18 emits them by default and 16/17 do not); and the
+  probe must not demote `path` to a `Filter`. A Nested Loop may still
+  never carry a sequential or bitmap scan of a manifest table on its
+  INNER side.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
   NOT yet in CI and not yet released — no path-scoped workflow, and its
