@@ -698,6 +698,39 @@ sampler draw on the same pool, and a busy instance's foreground wants
 more than four of its own. Raise the pool with the knob — at the
 default pool of 10 the ceiling is 6.
 
+**`HOGLAKE_REQUEST_THREADS`** (default **`HOGLAKE_DB_POOL_SIZE`**) is
+the pool's other customer, and it is sized against the same arithmetic
+(#218). It is the width of the blocking dispatcher every route handler
+runs on, so it is the ceiling on concurrent requests inside a blocking
+call — and nearly every handler's first act is to borrow a connection.
+Handler threads ABOVE the pool therefore buy no concurrency for those
+routes: they queue inside `HikariPool.getConnection`, which gives up
+after 5 s and throws a 500, instead of queueing in the dispatcher where
+the wait is FIFO, measured (`hoglake_request_queue_wait_seconds`) and
+shed with the typed 503 once it passes the admission bound. The server
+**refuses to boot** on
+
+```
+HOGLAKE_REQUEST_THREADS > HOGLAKE_DB_POOL_SIZE
+```
+
+for the same reason it refuses the compaction inequality: raising it is
+a pair of knobs, and forgetting the second one converts dispatcher
+queueing into Hikari timeouts fleet-wide.
+
+What the default does NOT promise is a reserve for the loops. On the
+API workload the chart turns every background loop off, so the
+foreground is the pool's only customer and `requestThreads ==
+dbPoolSize` is exact. On a pod that runs loops AND serves traffic —
+the maintenance Deployment, a dev stack, anything on the defaults —
+the foreground alone can take every connection, and a hydrator or
+expiry iteration then waits Hikari's 5 s and fails (logged, counted as
+`hoglake_background_loop_failures_total`, retried next interval: a
+delay, not a loss). `FOREGROUND_CONNECTION_RESERVE` bounds
+COMPACTION's draw, not the foreground's. Such a workload should set
+`HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
+runs.
+
 Compaction's own commits now pass `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` like
 every other acquirer of that lock. It is transaction-local, so it bounds
 the whole commit tail rather than only the advisory lock: a group whose
@@ -1171,14 +1204,51 @@ transaction (`observability/`):
   maintenance tail (the convoy early-warning). HTTP server metrics
   come with the Ktor Micrometer plugin. The webui renders a `/metrics`
   snapshot visually on its metrics page.
+  Plus the two POOL gauge families (#218), read straight off the pools
+  rather than sampled by a loop:
+  `hoglake_db_pool_active`/`_idle`/`_pending`/`_max` (Hikari's request
+  pool — `pending` is the one to alert on: `active == max` is a busy
+  instance, `pending > 0` is a caller queued inside `getConnection`
+  with 5 s before it becomes a 500) and
+  `hoglake_request_pool_active`/`_queued`/`_max` (the blocking request
+  dispatcher). Read them together: handlers waiting in the dispatcher
+  hold no catalog connection, handlers pending on Hikari do. `active`
+  is an approximation and counts THREADS (a handler parsing its body
+  runs on `Dispatchers.IO` and is not one); `queued` counts calls
+  waiting for their FIRST thread, not the executor's queue depth, which
+  also holds the re-dispatch of every coroutine that resumed. Their
+  companion is the `hoglake_request_queue_wait_seconds` histogram —
+  what the saturation COST, recorded once per request at handler entry.
+  Its p99 against `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` is the reading that
+  matters: a wait that reaches the bound is shed as a typed 503
+  (`hoglake_requests_shed_total`), so a rising tail is the warning that
+  precedes visible refusals. **The histogram is conditioned on
+  survival** — it records at handler entry, so a wait that ended in the
+  caller giving up contributes nothing, and under a convoy bad enough
+  that most callers time out first the surviving waits are the SHORT
+  ones and the p99 can FALL while the instance gets worse. Read it with
+  `hoglake_request_queue_abandoned_total`, which counts exactly those.
+  Finally `hoglake_health_probe_attempts_hung` is the probe's own
+  outstanding attempts: normally 0, and **2 (the cap) against a
+  database that is demonstrably answering means the pod is stuck and
+  must be restarted** — both probe threads are parked on connection
+  attempts nothing can interrupt, so `/healthz` will report 503 for the
+  rest of that pod's life. The refusal is logged at ERROR.
 - **Audit log**: every consequential action (DDL, commits with
   outcome, options changes, expiry/cleanup runs, offset commits) emits
   one structured JSON line on the `hoglake.audit` logger — actor,
   action, object, outcome, request id — strictly *after* its
   transaction resolves. Request ids ride `X-Request-Id` in and out.
-- **Health**: `/healthz` proves the catalog is reachable (`SELECT 1`,
-  503 within the pool's fail-fast timeout when it isn't); `/livez` is
-  process liveness only.
+- **Health**: `/healthz` proves the catalog is reachable (`SELECT 1`
+  on the probe's OWN one-connection pool, bounded four ways by
+  `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` — Hikari `connectionTimeout`,
+  pgjdbc `connectTimeout`/`socketTimeout`, session `statement_timeout`
+  — with a wall-clock deadline of twice it); `/livez` is process
+  liveness only. The probe shares nothing with the request path, so a
+  full pool reads 200 and only a database that does not answer reads
+  503 (#218). Before that it borrowed a request connection, and a
+  commit convoy that filled the pool read as "database dead" and got
+  both API pods liveness-killed.
 
 ### Background assembly
 
@@ -1194,6 +1264,44 @@ isolation (a failed iteration is logged + counted and the loop keeps
 running), and structured, bounded shutdown (cancel + join, 5s cap).
 `Main.kt` = migrate (under an advisory lock, so replicas don't race
 DDL) → assemble → start loops → serve.
+
+**Every route handler's blocking work runs off the Netty event loop**
+(`api/BlockingDispatch.kt`, #218): one interceptor at the `Plugins`
+phase, installed once by `App.module`, runs the rest of the pipeline
+under a bounded dispatcher of `HOGLAKE_REQUEST_THREADS` threads
+(default `HOGLAKE_DB_POOL_SIZE`). `/healthz`, `/livez` and `/metrics`
+bypass it, matched on a path normalised for trailing slashes, so a full
+dispatcher is still observable and still probes green. Measured, not
+assumed: `/healthz/` is a **404** today, because this server does not
+install Ktor 3's `IgnoreTrailingSlash` — configure the probe without
+the slash. Normalising makes that a *fast* 404 rather than a queued
+timeout, and removes the trap where installing that one-line plugin
+later would route a real probe through the saturated pool.
+
+Excess requests QUEUE, and the queue is bounded by AGE rather than by
+depth. The interceptor stamps `System.nanoTime()` before the hand-off,
+records the wait as `hoglake_request_queue_wait_seconds` at handler
+entry, sheds a request whose wait already passed
+`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` with the typed 503 + Retry-After
+*before* it borrows a connection, and charges the rest of the wait
+against the advisory-lock bound inside `Locks.acquireCatalogCommitLock`
+— so a request cannot spend the admission budget twice (25 s queued
+plus a fresh 30 s lock wait was 55 s of server time for a caller that
+had gone). The shed is judged at ADMISSION, when a call reaches a
+thread: a transient convoy drains and discards its stale head, while a
+pod whose pool never frees a thread queues rather than refuses, which
+is why readiness-on-sustained-saturation is still a follow-up.
+
+`Main.kt` also floors Netty's CALL group at
+`HOGLAKE_NETTY_CALL_GROUP_SIZE` (default `max(4, availableProcessors)`),
+which is defence in depth rather than the fix: Ktor sizes that group at
+the CPU count exactly, and the production pod has one CPU, so a probe's
+dispatch — or a `/metrics` scrape, which shares the bypass and is real
+CPU work on that thread — would otherwise queue behind another call.
+The WORKER group keeps Ktor's own default (`parallelism / 2 + 1`): it
+does socket IO, it is not where blocking work or the probe handler
+runs, and applying this floor there would RAISE it on every pod with
+more than two CPUs.
 
 The **verify loop** runs `VerifyService.runOnceAllCatalogs()`: one
 report per catalog, recorded in the run ledger with trigger `loop`,
@@ -1237,7 +1345,7 @@ Served at the root (not under `/v1`), documented in
 | Endpoint | What | Kubernetes probe |
 |---|---|---|
 | `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
-| `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` through the pool, fail-fast on a dead pool; the zombie-server incident is why) | **readiness** (an unready pod leaves the Service) |
+| `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool) | **readiness** (an unready pod leaves the Service) |
 | `GET /metrics` | Prometheus text exposition | scrape target, never a probe |
 
 The webui container serves its own static `GET /health` (nginx `return

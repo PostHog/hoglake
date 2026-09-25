@@ -30,6 +30,12 @@ class IntegrationTagGateTest {
                 "Minio" + "TestSupport",
                 "Testcontainers",
                 "GenericContainer(",
+                // A class that starts its OWN Postgres rather than
+                // going through the shared harness — HealthProbeIntegrationTest
+                // does, because its subject is STOPPING one. Without
+                // this entry it matched no harness symbol and the gate
+                // had nothing to say about it.
+                "PostgreSQLContainer(",
             )
         val untagged =
             Files.walk(root).asSequence()

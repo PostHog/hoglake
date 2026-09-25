@@ -1,6 +1,9 @@
 package com.posthog.hoglake.observability
 
+import com.posthog.hoglake.api.RequestDispatcher
 import com.posthog.hoglake.model.HoglakeException
+import com.zaxxer.hikari.HikariDataSource
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import java.util.concurrent.TimeUnit
@@ -17,6 +20,43 @@ object Metrics {
     private var registry: MeterRegistry? = null
 
     /**
+     * The two histograms on per-request / per-commit paths, resolved
+     * ONCE per bound registry.
+     *
+     * `Timer.builder(...).register(r)` is idempotent but not free: it
+     * allocates a builder and walks the registry's meter map on every
+     * call, and these two are hit on every request and every commit.
+     * Held beside the registry rather than in a lazy of their own so
+     * that [bind] and [clear] cannot leave a timer pointing at a
+     * registry nobody scrapes — which is the shape a test that rebinds
+     * would produce.
+     */
+    private class BoundTimers(private val registry: MeterRegistry) {
+        // LAZY, not eager. Registering at bind() would mint both series
+        // on a registry nothing has recorded into yet, and this facade's
+        // contract is that a metric appears when its event happens —
+        // `MetricsFacadeTest.zero-count expiry and removal increments
+        // create no series` pins exactly that for the counters, and a
+        // timer family materializing out of `bind` alone would be the
+        // same lie with more buckets.
+        val commitLockWait: Timer by lazy {
+            Timer.builder("hoglake_commit_lock_wait")
+                .description("Advisory catalog-commit-lock acquisition wait")
+                .publishPercentileHistogram()
+                .register(registry)
+        }
+        val requestQueueWait: Timer by lazy {
+            Timer.builder("hoglake_request_queue_wait")
+                .description("Wait for a blocking-dispatcher thread, before the handler started")
+                .publishPercentileHistogram()
+                .register(registry)
+        }
+    }
+
+    @Volatile
+    private var timers: BoundTimers? = null
+
+    /**
      * The bound registry, for the one observability surface in this
      * package that is a GAUGE rather than a counter and is therefore not
      * served by [increment]: [VerifyGauges]. Internal — nothing outside
@@ -28,11 +68,13 @@ object Metrics {
     /** Bind the process registry (App.build). Last bind wins. */
     fun bind(r: MeterRegistry) {
         registry = r
+        timers = BoundTimers(r)
     }
 
     /** Unbind (tests). */
     fun clear() {
         registry = null
+        timers = null
     }
 
     /** hoglake_commits_total{catalog, result=committed|conflict|validation|error} */
@@ -272,13 +314,64 @@ object Metrics {
      * before it is an incident.
      */
     fun commitLockWait(nanos: Long) {
-        val r = registry ?: return
-        Timer.builder("hoglake_commit_lock_wait")
-            .description("Advisory catalog-commit-lock acquisition wait")
-            .publishPercentileHistogram()
-            .register(r)
-            .record(nanos, TimeUnit.NANOSECONDS)
+        timers?.commitLockWait?.record(nanos, TimeUnit.NANOSECONDS)
     }
+
+    /**
+     * `hoglake_request_queue_wait_seconds` histogram (#218): how long a
+     * request waited for a thread of the blocking dispatcher before its
+     * handler started.
+     *
+     * Recorded at handler entry, once per request, so it measures FIRST
+     * dispatch and not the resumptions that follow. It is the latency
+     * the dispatch seam introduced and the only place saturation shows
+     * up as a number a caller would recognise: `hoglake_request_pool_*`
+     * says how full the pool is, this says what that cost.
+     *
+     * Its p99 against `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` is the reading
+     * that matters — a request whose wait reaches the bound is shed
+     * with a typed 503 before it borrows a connection, so a rising tail
+     * here is the warning that precedes visible refusals.
+     */
+    fun requestQueueWait(millis: Long) {
+        timers?.requestQueueWait?.record(millis, TimeUnit.MILLISECONDS)
+    }
+
+    /**
+     * `hoglake_request_queue_abandoned_total` — calls that left the
+     * dispatcher queue without ever reaching a thread (the client
+     * disconnected, the call was cancelled).
+     *
+     * The companion to [requestQueueWait], and the reason that
+     * histogram cannot be read alone: the histogram is CONDITIONED ON
+     * SURVIVAL. It records at handler entry, so a wait that ended in
+     * the caller giving up contributes nothing — under a convoy bad
+     * enough that most callers time out first, the surviving waits are
+     * the SHORT ones and the p99 can fall while the instance gets
+     * worse. This counter is what says that happened.
+     */
+    fun requestQueueAbandoned() = increment("hoglake_request_queue_abandoned_total", 1.0)
+
+    /**
+     * `hoglake_requests_shed_total` — requests refused at handler entry
+     * because their queue wait had already exhausted the admission
+     * bound (`api/BlockingDispatch.kt`).
+     *
+     * NOT counted in `hoglake_commits_total{result="timeout"}`, and the
+     * asymmetry is deliberate rather than an oversight: a shed request
+     * is refused BEFORE Routing has run, so its catalog path parameter
+     * has not been parsed and there is no catalog to tag. Tagging them
+     * `unknown` would put a meaningless series inside the per-catalog
+     * counter that commit alerts key on, and dropping the shed on the
+     * floor would leave the refusals invisible. So they live here, and
+     * the two are read TOGETHER during saturation: a gap between the
+     * 503s a client sees and `hoglake_commits_total{result="timeout"}`
+     * is this counter.
+     *
+     * For the same reason a shed request carries no `route` tag on
+     * `ktor.http.server.requests` — Routing never resolved one.
+     */
+    fun requestShed() = increment("hoglake_requests_shed_total", 1.0)
 
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
@@ -292,6 +385,140 @@ object Metrics {
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null
         }
+
+    /**
+     * `hoglake_db_pool_active` / `_idle` / `_pending` / `_max` — the
+     * Hikari request pool, sampled off its own `HikariPoolMXBean`
+     * (#218).
+     *
+     * The pool filling is the state every commit convoy passes through
+     * on its way to an incident, and until #218 it had NO series at
+     * all: the only evidence was the 5 s `connectionTimeout` 500s that
+     * arrive after it is already too late, and — before the probe got a
+     * connection of its own — a liveness kill. `active` is connections
+     * in use, `idle` connections free, `pending` THREADS WAITING for
+     * one, and `max` the configured ceiling, which is here so that
+     * saturation is expressible as `active / max` without an alert
+     * hard-coding `HOGLAKE_DB_POOL_SIZE`.
+     *
+     * `pending` is the one to alert on. `active == max` is the normal
+     * state of a busy instance; `pending > 0` means a caller is queued
+     * inside `getConnection` and has at most 5 s before it gets a 500.
+     *
+     * Gauges, not counters, and sampled by the scrape: Hikari's MXBean
+     * is O(1) over the pool's own bookkeeping, so there is no sampler
+     * loop and nothing to fall behind.
+     */
+    fun registerDbPoolGauges(
+        registry: MeterRegistry,
+        pool: HikariDataSource,
+    ) {
+        // hikariPoolMXBean is resolved INSIDE each lambda, never once at
+        // registration, and every read tolerates its absence.
+        // HikariDataSource builds its pool LAZILY — on the first
+        // getConnection, or on construction only when
+        // initializationFailTimeout says so — so at registration time
+        // the bean may not exist yet, and after `close()` it is gone
+        // again. A captured reference would be null or stale; an
+        // unguarded read would THROW, and a gauge supplier that throws
+        // fails the whole `/metrics` scrape, taking every other series
+        // with it precisely when somebody is looking.
+        gauge(registry, "hoglake_db_pool_active", "Pooled catalog connections in use") {
+            pool.hikariPoolMXBean?.activeConnections ?: 0
+        }
+        gauge(registry, "hoglake_db_pool_idle", "Pooled catalog connections free") {
+            pool.hikariPoolMXBean?.idleConnections ?: 0
+        }
+        gauge(
+            registry,
+            "hoglake_db_pool_pending",
+            "Threads waiting inside HikariPool.getConnection for a catalog connection",
+        ) { pool.hikariPoolMXBean?.threadsAwaitingConnection ?: 0 }
+        gauge(registry, "hoglake_db_pool_max", "Configured maximum size of the catalog connection pool") {
+            pool.maximumPoolSize
+        }
+    }
+
+    /**
+     * `hoglake_request_pool_active` / `_queued` / `_max` — the blocking
+     * request dispatcher (#218), the pool route handlers run on now
+     * that they are off the Netty event loop.
+     *
+     * `active` is THREADS inside a handler's blocking call — an
+     * approximation (`ThreadPoolExecutor.getActiveCount` walks the
+     * worker set) that undercounts requests, because a handler
+     * suspended parsing its body runs on `Dispatchers.IO` and holds no
+     * thread here. `queued` is requests waiting for their FIRST thread,
+     * counted by the interceptor rather than read off
+     * `executor.queue.size`: the executor's queue also holds the
+     * re-dispatch of every already-admitted coroutine that resumed
+     * after a suspension, so its depth counts admitted work as if it
+     * were waiting. `max` is the width (`HOGLAKE_REQUEST_THREADS`,
+     * defaulting to the database pool size).
+     *
+     * `queued` is the saturation signal and
+     * `hoglake_request_queue_wait_seconds` is what it costs; the
+     * dispatcher is bounded by the AGE of a wait rather than by its
+     * depth (see `api/BlockingDispatch.kt`), so the histogram is the
+     * one to alert on and this is the one that explains it.
+     *
+     * Read the two TOGETHER with `hoglake_db_pool_pending`. Handlers
+     * queued here are NOT holding catalog connections; handlers pending
+     * there are. `active == max` with `queued` climbing and
+     * `db_pool_pending` at zero is the dispatcher doing its job —
+     * requests waiting instead of timing out on Hikari.
+     */
+    fun registerRequestPoolGauges(
+        registry: MeterRegistry,
+        requests: RequestDispatcher,
+    ) {
+        gauge(registry, "hoglake_request_pool_active", "Request threads inside a blocking handler call") {
+            requests.active
+        }
+        gauge(registry, "hoglake_request_pool_queued", "Requests dispatched and waiting for a request thread") {
+            requests.queued
+        }
+        gauge(registry, "hoglake_request_pool_max", "Width of the blocking request dispatcher") {
+            requests.threads
+        }
+    }
+
+    /**
+     * `hoglake_health_probe_attempts_hung` — probe attempts started and
+     * not finished (`HealthProbe`'s own cap is 2).
+     *
+     * THE CAP IS AN ABSORBING STATE, which is why it needs a series of
+     * its own. Two attempts hung at any point in a pod's life park both
+     * threads forever — the connection attempts have no way to be
+     * interrupted — and from then on `/healthz` answers 503 without
+     * launching anything, which is indistinguishable from a dead
+     * database. `hoglake_health_probe_attempts_hung == 2` against a
+     * Postgres that is demonstrably answering means the pod is stuck
+     * and needs restarting; that is the only reading of this gauge and
+     * it is in the README.
+     */
+    fun registerHealthProbeGauge(
+        registry: MeterRegistry,
+        outstandingAttempts: () -> Int,
+    ) {
+        gauge(
+            registry,
+            "hoglake_health_probe_attempts_hung",
+            "Health-probe attempts started and not finished (2 = the cap; the pod is stuck)",
+        ) { outstandingAttempts() }
+    }
+
+    private fun gauge(
+        registry: MeterRegistry,
+        name: String,
+        description: String,
+        value: () -> Number,
+    ) {
+        Gauge.builder(name) { value().toDouble() }
+            .description(description)
+            .strongReference(true)
+            .register(registry)
+    }
 
     private fun increment(
         name: String,

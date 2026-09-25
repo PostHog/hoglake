@@ -34,16 +34,35 @@ object PgTestSupport {
      * failures a version move produces are rarely in application code:
      * they are statistics views that moved columns, catalog shapes, and
      * planner changes — none of which a unit test can see.
+     *
+     * VISIBLE, not private, for the one class that must run its OWN
+     * container because its subject is stopping it
+     * (`HealthProbeIntegrationTest`): it has to start the same image the
+     * rest of the suite pins, or a version override would silently skip
+     * it.
      */
-    private val image: String =
+    val image: String =
         System.getProperty("pgImage")
             ?: System.getenv("HOGLAKE_TEST_PG_IMAGE")
             ?: "postgres:18"
 
+    /**
+     * The role every test database is created with — the same spelling
+     * `Config`'s own defaults carry, so a fixture that points a
+     * `Config` at [TestDb.jdbcUrl] needs no credential overrides.
+     *
+     * Named here rather than copied into each test: the health probe
+     * (#218) builds its connection from `Config`, so a fixture that
+     * restated these would silently stop matching the container the day
+     * either moved.
+     */
+    const val USER: String = "hoglake"
+    const val PASSWORD: String = "hoglake"
+
     private val container: PostgreSQLContainer<*> by lazy {
         PostgreSQLContainer(image)
-            .withUsername("hoglake")
-            .withPassword("hoglake")
+            .withUsername(USER)
+            .withPassword(PASSWORD)
             .also { it.start() }
     }
 
