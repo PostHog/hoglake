@@ -1,6 +1,6 @@
 [project]
 name = "pyhoglake"
-version = "1.3.2"
+version = "1.3.3.dev0"
 description = "Python client for hoglake, the Postgres-native lakehouse-catalog control plane"
 readme = "README.md"
 license = "MIT"
