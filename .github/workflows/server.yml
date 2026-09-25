@@ -38,17 +38,28 @@ jobs:
           persist-credentials: false
 
       - name: No duplicate versions, no edits to shipped migrations
+        env:
+          OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'migration-chain-override') }}
         run: |
           git fetch --no-tags --depth=1 origin main
           MIG=server/src/main/resources/db/migration
 
           # Append-only: every migration file on CURRENT main must be
-          # byte-identical here. Only additions are allowed.
+          # byte-identical here. Only additions are allowed. The
+          # `migration-chain-override` label skips this half for a PR
+          # that repairs a chain no database can have applied (two
+          # PRs each added the same version; the second to merge left
+          # main unable to boot, and its file had to be renumbered).
+          # The duplicate-version half below never skips.
           bad=$(git diff --name-status origin/main HEAD -- "$MIG" | grep -v '^A' || true)
-          if [ -n "$bad" ]; then
+          if [ -n "$bad" ] && [ "$OVERRIDE" != "true" ]; then
             echo "::error::Migration chain is append-only; changed or removed vs latest main:"
             echo "$bad"
+            echo "::error::A repair of an unapplied chain may carry the migration-chain-override label."
             exit 1
+          elif [ -n "$bad" ]; then
+            echo "::warning::migration-chain-override label present; append-only check skipped for:"
+            echo "$bad"
           fi
 
           # Version collision: one basename per V<number> across the
