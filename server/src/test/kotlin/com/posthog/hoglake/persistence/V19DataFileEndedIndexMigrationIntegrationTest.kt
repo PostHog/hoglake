@@ -15,12 +15,12 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
 
 /**
- * V18 against the statement it exists for: `ExpiryService`'s data-file
+ * V19 against the statement it exists for: `ExpiryService`'s data-file
  * DELETE, which before this migration matched no index's leading
  * columns at all.
  *
  * THE MIGRATION RUNS HERE — the database arrives at V17, the rows are
- * seeded, and then [Database.migrate] applies V18 — so the BEFORE half
+ * seeded, and then [Database.migrate] applies V19 — so the BEFORE half
  * is a measurement on the same rows rather than a claim about a file
  * that is not there. That is V16's and V17's shape, and AGENT.md's
  * rule.
@@ -55,7 +55,7 @@ import org.junit.jupiter.api.TestInstance
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
-class V18DataFileEndedIndexMigrationIntegrationTest {
+class V19DataFileEndedIndexMigrationIntegrationTest {
     private companion object {
         const val INDEX = "hog_data_file_ended"
 
@@ -89,11 +89,11 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
          */
         const val BUFFERS_PER_ENDED_ROW = 1.2
 
-        /** Put the history back to before V18 (V16's helper, and its reasoning). */
-        const val REAPPLY_V18 = "DELETE FROM flyway_schema_history WHERE version::numeric >= 18"
+        /** Put the history back to before V19 (V16's helper, and its reasoning). */
+        const val REAPPLY_V19 = "DELETE FROM flyway_schema_history WHERE version::numeric >= 18"
     }
 
-    // productionSession: V18 builds CONCURRENTLY with statement_timeout
+    // productionSession: V19 builds CONCURRENTLY with statement_timeout
     // lifted for the build and restored after, and a booting pod's
     // session carries the 60 s bound. The fixture reaches that
     // behaviour rather than running with no bounds at all.
@@ -115,7 +115,7 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
         seedManifest()
         analyze()
 
-        assertThat(indexDef(INDEX)).describedAs("%s absent before V18", INDEX).isNull()
+        assertThat(indexDef(INDEX)).describedAs("%s absent before V19", INDEX).isNull()
         expiryPlanBefore = explainExpiry()
 
         val start = System.nanoTime()
@@ -315,7 +315,7 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
             .isNotNull()
             .satisfies({ assertThat(it).contains("end_snapshot IS NOT NULL") })
 
-        // V18 TOUCHES NOTHING ELSE, and that is what lets it ship on
+        // V19 TOUCHES NOTHING ELSE, and that is what lets it ship on
         // its own: an operator promoting this file takes no ACCESS
         // EXCLUSIVE lock on any table, so it needs no window in which
         // no expiry sweep is running. The two ALTERs #193 also needs
@@ -328,12 +328,12 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
         // about what THIS migration contains.
         val v18 =
             java.nio.file.Files.readString(
-                java.nio.file.Path.of("src/main/resources/db/migration/V18__data_file_ended_index.sql"),
+                java.nio.file.Path.of("src/main/resources/db/migration/V19__data_file_ended_index.sql"),
             )
         val statements =
             v18.lines().map { it.substringBefore("--") }.filter { it.isNotBlank() }.joinToString("\n")
         assertThat(statements.uppercase())
-            .describedAs("V18 must take no ACCESS EXCLUSIVE lock; its ALTERs belong to V19:%n%s", statements)
+            .describedAs("V19 must take no ACCESS EXCLUSIVE lock; its ALTERs belong to V19:%n%s", statements)
             .doesNotContain("ALTER TABLE")
         assertThat(statements)
             .describedAs("and it must actually build the index")
@@ -341,7 +341,7 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
     }
 
     @Test
-    fun `before V18 expiry's data-file DELETE reads the catalog's whole manifest`() {
+    fun `before V19 expiry's data-file DELETE reads the catalog's whole manifest`() {
         // The red half, measured on the same rows the after half runs
         // on. THE ASSERTION IS THE WORK, NOT THE PLAN NODE: what makes
         // this statement a problem is that it reads every live row to
@@ -360,10 +360,10 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
     }
 
     @Test
-    fun `after V18 the work sizes with the ENDED rows, at about one heap buffer each`() {
+    fun `after V19 the work sizes with the ENDED rows, at about one heap buffer each`() {
         val after = scanNode(expiryPlanAfter, "hog_data_file")
         assertThat(after.index)
-            .describedAs("the DELETE must be driven by V18's index:%n%s", expiryPlanAfter)
+            .describedAs("the DELETE must be driven by V19's index:%n%s", expiryPlanAfter)
             .isEqualTo(INDEX)
         assertThat(after.seqScan).isFalse()
         // ONE descent: `catalog_id` is an equality and `end_snapshot` a
@@ -408,7 +408,7 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
             .describedAs("at a 1%% ended fraction the index must beat the scan:%n%s", expiryPlanAfter)
             .isLessThan(before.buffers)
         println(
-            "[#193] V18 (SCATTERED ended rows, the production shape): expiry's data-file DELETE " +
+            "[#193] V19 (SCATTERED ended rows, the production shape): expiry's data-file DELETE " +
                 "scan node went from ${before.buffers} buffers (Seq Scan over a " +
                 "${heapPages("hog_data_file")}-page manifest, ${before.rowsRemovedByFilter} rows " +
                 "removed by filter) to ${after.buffers} (Index Scan using $INDEX, Index Searches " +
@@ -461,7 +461,7 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
                     .mapTo(Long::class.java).one()
             }
         println(
-            "[#193] V18 build over $TOTAL_FILES rows ($endedRows of them ended): whole migration " +
+            "[#193] V19 build over $TOTAL_FILES rows ($endedRows of them ended): whole migration " +
                 "${buildMillis}ms cold, CREATE INDEX CONCURRENTLY ${warmMillis}ms warm, plain " +
                 "${plainMillis}ms warm; index ${sizes.first} bytes " +
                 "(${sizes.first / endedRows} B per ENDED row) against a ${sizes.second}-byte heap",
@@ -475,23 +475,23 @@ class V18DataFileEndedIndexMigrationIntegrationTest {
     }
 
     @Test
-    fun `V18 is re-appliable, which executeInTransaction=false makes a requirement`() {
+    fun `V19 is re-appliable, which executeInTransaction=false makes a requirement`() {
         // A file Flyway runs outside a transaction leaves a
         // `success = false` history row on a partial failure, which
         // fails validate on every replica until an operator runs
         // `flyway repair`. Re-running has to be free, so every
         // statement is idempotent — and this asserts it by running the
         // whole file again over a schema that already has all of it.
-        db.jdbi.useHandleUnchecked { h -> h.execute(REAPPLY_V18) }
+        db.jdbi.useHandleUnchecked { h -> h.execute(REAPPLY_V19) }
         Database.migrate(db.dataSource)
         assertThat(indexDef(INDEX)).isNotNull()
     }
 
     @Test
-    fun `findAt's plan is unchanged by V18`() {
+    fun `findAt's plan is unchanged by V19`() {
         // The index is on hog_data_file and the resolver reads
         // hog_table_version joined to hog_table, so there is nothing for
-        // V18 to steal — but "nothing to steal" is a claim, and V16's
+        // V19 to steal — but "nothing to steal" is a claim, and V16's
         // file is about an index that stole a query it served worse.
         val plan =
             db.jdbi.inTransactionUnchecked { h ->

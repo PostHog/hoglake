@@ -635,7 +635,7 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
         // scan's — and it sizes with the number of INDEXES on the
         // relations, not with the statement. This assertion took the
         // maximum over every line, so the number it bounded was the
-        // planner's catalog lookups: adding V18's
+        // planner's catalog lookups: adding V19's
         // `hog_data_file_ended` moved it from 138 to 141 buffers
         // without touching the execution plan at all, which is the
         // measurement going stale rather than the statement getting

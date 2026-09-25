@@ -25,7 +25,7 @@
 -- CHECK) are V19, which does need that window.
 --
 -- MEASURED, WITH THE ENDED ROWS SCATTERED, which is the only honest
--- way to measure this. `V18DataFileEndedIndexMigrationIntegrationTest`
+-- way to measure this. `V19DataFileEndedIndexMigrationIntegrationTest`
 -- runs the migration against rows seeded BEFORE it and EXPLAINs
 -- `ExpiryService.DATA_FILE_EXPIRY_SQL` — the repo function's own SQL,
 -- exposed `internal` — on both sides. Fixture: PG 18.6, 200,000
@@ -108,7 +108,7 @@
 --
 --   CREATE INDEX CONCURRENTLY   14 ms
 --   plain CREATE INDEX           8 ms
---   whole V18 migration         46 ms (colder: first touch after the
+--   whole V19 migration         46 ms (colder: first touch after the
 --                                      bulk insert)
 --   index size              49,152 bytes = 12 B per ENDED row
 --   heap size           36,413,440 bytes
@@ -122,7 +122,7 @@
 -- volume's 125 MB/s, and 30-60 s on a busy one**, which is the number
 -- to plan against. V17 measured a CONCURRENT build over exactly this
 -- relation at 26 s (256 MB maintenance_work_mem) and 35 s (64 MB)
--- while ALSO writing a 1,157 MiB index; V18's index is about a
+-- while ALSO writing a 1,157 MiB index; V19's index is about a
 -- megabyte at the same row count, so the write is noise and the two
 -- estimates agree. Against a 60 s session `statement_timeout`, that is
 -- a margin rather than a guarantee — which is the whole argument for

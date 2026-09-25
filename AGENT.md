@@ -416,18 +416,18 @@ there would break that gate on every build.
     safe to deploy, and what still cannot make it safe on its own, is
     the CIC rule above.
   - **`hog_data_file_ended (catalog_id, end_snapshot) WHERE end_snapshot
-    IS NOT NULL`** (V18, #193) is the third entry, and the one that
+    IS NOT NULL`** (V19, #193) is the third entry, and the one that
     INVERTS V17's partial-index decision for a reason rather than a
     preference. It serves `ExpiryService.DATA_FILE_EXPIRY_SQL` — the
     sweep's data-file DELETE, which carries `end_snapshot IS NOT NULL
-    AND end_snapshot <= floor` and, before V18, matched NO index's
+    AND end_snapshot <= floor` and, before V19, matched NO index's
     leading columns at all: `hog_data_file_live` is partial on the
     COMPLEMENT of those rows, and everything else leads on ids or
     paths. So the statement was a sequential scan of the whole
     manifest, inside the sweep transaction, under the per-catalog
     commit lock. Measured on a fixture with production's mostly-live
     ratio (204,000 rows / 4,747 heap pages, 4,000 of them ended;
-    `V18DataFileEndedIndexMigrationIntegrationTest` runs the migration against
+    `V19DataFileEndedIndexMigrationIntegrationTest` runs the migration against
     rows seeded BEFORE it and EXPLAINs the repo's own `internal`
     constant) with the ended rows SCATTERED through the manifest, scan
     node only: **4,445 buffers as a `Seq Scan` with `Rows Removed by
@@ -467,7 +467,7 @@ there would break that gate on every build.
     an index there would be paid on every write and used by nothing;
     splitting that statement into two arms is the fix, and it is
     ticketed.
-    V18 IS ITS OWN MIGRATION, ahead of the rest of #193, because it
+    V19 IS ITS OWN MIGRATION, ahead of the rest of #193, because it
     takes no ACCESS EXCLUSIVE lock and therefore needs no window in
     which no expiry sweep is running; V19 carries the two `ALTER
     TABLE`s and does.
