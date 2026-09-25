@@ -310,10 +310,198 @@ class FooterStatsTest {
     }
 
     @Test
-    fun `missing null count drops the whole stats row`() {
+    fun `missing null count on a nullable leaf drops the whole stats row`() {
         val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
         val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, le(1L), le(2L), nulls = null))))
         assertThat(agg(m, CatalogColumn(1, "a", ColType.LONG, null))).isEmpty()
+    }
+
+    // ---- writers that omit null_count (ClickHouse) ------------------------
+    //
+    // ClickHouse writes non-Nullable columns REQUIRED and omits their
+    // null_count from the chunk statistics, so parquet-java hands back
+    // min/max with isNumNullsSet false. A leaf whose max definition level
+    // is 0 cannot hold a null, so its count is 0 whatever the writer
+    // recorded; a leaf that CAN hold one (optional itself, or under an
+    // optional or repeated ancestor) keeps the old refusal.
+
+    private fun requiredLeaf(
+        name: String,
+        physical: PrimitiveType.PrimitiveTypeName,
+        fieldId: Int,
+        logical: LogicalTypeAnnotation? = null,
+    ): PrimitiveType {
+        var b = Types.required(physical).id(fieldId)
+        if (logical != null) b = b.`as`(logical)
+        return b.named(name)
+    }
+
+    /** WARN lines FooterStats logs while [block] runs. */
+    private fun warningsDuring(block: () -> Unit): List<String> {
+        val events = java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>()
+        val appender =
+            object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+                override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+                    events += event
+                }
+            }
+        appender.context = org.slf4j.LoggerFactory.getILoggerFactory() as ch.qos.logback.classic.LoggerContext
+        appender.start()
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(FooterStats::class.java.name) as ch.qos.logback.classic.Logger
+        logger.addAppender(appender)
+        try {
+            block()
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+        return events.filter { it.level == ch.qos.logback.classic.Level.WARN }.map { it.formattedMessage }
+    }
+
+    @Test
+    fun `a required leaf whose writer omitted null_count counts zero nulls and keeps its bounds`() {
+        val id = requiredLeaf("id", PrimitiveType.PrimitiveTypeName.INT64, 1)
+        val name = requiredLeaf("name", PrimitiveType.PrimitiveTypeName.BINARY, 2, LogicalTypeAnnotation.stringType())
+        // Two row groups, neither carrying a null count: the shape of a
+        // ClickHouse footer.
+        val m =
+            meta(
+                schema(id, name),
+                10,
+                listOf(
+                    chunk(id, 10, stats(id, le(5L), le(9L), nulls = null)),
+                    chunk(name, 10, stats(name, "b".toByteArray(), "k".toByteArray(), nulls = null)),
+                ),
+                listOf(
+                    chunk(id, 10, stats(id, le(-3L), le(4L), nulls = null)),
+                    chunk(name, 10, stats(name, "a".toByteArray(), "c".toByteArray(), nulls = null)),
+                ),
+            )
+        lateinit var got: Map<Long, FooterStats.ColumnAgg>
+        val warnings =
+            warningsDuring {
+                got =
+                    agg(
+                        m,
+                        CatalogColumn(1, "id", ColType.LONG, null),
+                        CatalogColumn(2, "name", ColType.STRING, null),
+                    )
+            }
+        assertThat(warnings).isEmpty()
+        assertThat(got).containsOnlyKeys(1L, 2L)
+        with(got[1L]!!) {
+            // value_count comes from the chunk, not the statistics, and
+            // for a required top-level leaf is the row count.
+            assertThat(valueCount).isEqualTo(20)
+            assertThat(nullCount).isEqualTo(0)
+            assertThat(lowerBound).isEqualTo(le(-3L))
+            assertThat(upperBound).isEqualTo(le(9L))
+        }
+        with(got[2L]!!) {
+            assertThat(valueCount).isEqualTo(20)
+            assertThat(nullCount).isEqualTo(0)
+            assertThat(lowerBound).isEqualTo("a".toByteArray())
+            assertThat(upperBound).isEqualTo("k".toByteArray())
+        }
+    }
+
+    @Test
+    fun `a required leaf mixing recorded and omitted null counts sums the recorded ones`() {
+        // One chunk says 0, the other says nothing; a required leaf's
+        // unrecorded count is 0, so the file's is the recorded sum.
+        val a = requiredLeaf("a", PrimitiveType.PrimitiveTypeName.INT64, 1)
+        val m =
+            meta(
+                schema(a),
+                10,
+                listOf(chunk(a, 10, stats(a, le(1L), le(2L), nulls = 0))),
+                listOf(chunk(a, 10, stats(a, le(3L), le(4L), nulls = null))),
+            )
+        with(agg(m, CatalogColumn(1, "a", ColType.LONG, null))[1L]!!) {
+            assertThat(valueCount).isEqualTo(20)
+            assertThat(nullCount).isEqualTo(0)
+            assertThat(lowerBound).isEqualTo(le(1L))
+            assertThat(upperBound).isEqualTo(le(4L))
+        }
+    }
+
+    @Test
+    fun `an optional leaf whose writer omitted null_count still gets no row, and the warning says nullable`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64, fieldId = 1)
+        val b = requiredLeaf("b", PrimitiveType.PrimitiveTypeName.INT64, 2)
+        val m =
+            meta(
+                schema(a, b),
+                10,
+                listOf(
+                    chunk(a, 10, stats(a, le(1L), le(2L), nulls = null)),
+                    chunk(b, 10, stats(b, le(1L), le(2L), nulls = null)),
+                ),
+            )
+        lateinit var out: Map<Long, FooterStats.ColumnAgg>
+        val warnings =
+            warningsDuring {
+                out =
+                    agg(
+                        m,
+                        CatalogColumn(1, "a", ColType.LONG, null),
+                        CatalogColumn(2, "b", ColType.LONG, null),
+                    )
+            }
+        // The optional column is refused; the required one beside it is not.
+        assertThat(out).containsOnlyKeys(2L)
+        assertThat(warnings).singleElement().asString()
+            .contains("column a (field 1)")
+            .contains("is nullable (max definition level 1)")
+            .contains("writer omitted null_count")
+            .contains("skipping its stats row")
+    }
+
+    @Test
+    fun `a required leaf under an OPTIONAL struct gets no row, since the struct itself can be null`() {
+        // root { g: optional group { x: required int64 } } -- x's max
+        // definition level is 1, and a null g makes x null.
+        val x = requiredLeaf("x", PrimitiveType.PrimitiveTypeName.INT64, 11)
+        val g = Types.optionalGroup().addField(x).id(10).named("g")
+        val m = meta(schema(g), 10, listOf(nestedChunk(x, "g", 10, stats(x, le(1L), le(2L), nulls = null))))
+        val struct =
+            CatalogColumn(10, "g", ColType.STRUCT, null, children = listOf(CatalogColumn(11, "x", ColType.LONG, null)))
+        lateinit var out: Map<Long, FooterStats.ColumnAgg>
+        val warnings = warningsDuring { out = agg(m, struct) }
+        assertThat(out).isEmpty()
+        assertThat(warnings).singleElement().asString().contains("column x (field 11)").contains("is nullable")
+    }
+
+    @Test
+    fun `a required leaf under a REQUIRED struct counts zero nulls, since nothing on its path can be null`() {
+        // The contrast to the optional-struct case: every level required,
+        // max definition level 0.
+        val x = requiredLeaf("x", PrimitiveType.PrimitiveTypeName.INT64, 11)
+        val g = Types.requiredGroup().addField(x).id(10).named("g")
+        val m = meta(schema(g), 10, listOf(nestedChunk(x, "g", 10, stats(x, le(1L), le(2L), nulls = null))))
+        val struct =
+            CatalogColumn(10, "g", ColType.STRUCT, null, children = listOf(CatalogColumn(11, "x", ColType.LONG, null)))
+        with(agg(m, struct)[11L]!!) {
+            assertThat(valueCount).isEqualTo(10)
+            assertThat(nullCount).isEqualTo(0)
+            assertThat(lowerBound).isEqualTo(le(1L))
+            assertThat(upperBound).isEqualTo(le(2L))
+        }
+    }
+
+    @Test
+    fun `a required leaf with no statistics at all keeps its counts, without bounds`() {
+        // Nothing but the chunk's value count: the null count is still
+        // provably 0, and bounds stay NULL as always.
+        val a = requiredLeaf("a", PrimitiveType.PrimitiveTypeName.INT64, 1)
+        val m = meta(schema(a), 10, listOf(chunk(a, 10, stats(a, null, null, nulls = null))))
+        with(agg(m, CatalogColumn(1, "a", ColType.LONG, null))[1L]!!) {
+            assertThat(valueCount).isEqualTo(10)
+            assertThat(nullCount).isEqualTo(0)
+            assertThat(lowerBound).isNull()
+            assertThat(upperBound).isNull()
+        }
     }
 
     @Test

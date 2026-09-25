@@ -384,7 +384,11 @@ object FooterStats {
 
         val out = ArrayList<ColumnAgg>(matched.size)
         for ((col, leaf) in matched.values) {
-            aggregateColumn(footer.blocks, col, leaf, filePath)?.let { out.add(sane(it, col, filePath)) }
+            // The leaf's path was built from this schema's own field
+            // names (see matchInto), so the lookup cannot miss.
+            val maxDefinitionLevel = schema.getMaxDefinitionLevel(*leaf.path.toTypedArray())
+            aggregateColumn(footer.blocks, col, leaf, maxDefinitionLevel, filePath)
+                ?.let { out.add(sane(it, col, filePath)) }
         }
         return out
     }
@@ -779,12 +783,27 @@ object FooterStats {
         return null
     }
 
+    /**
+     * Counts and bounds for one leaf across every row group.
+     *
+     * [maxDefinitionLevel] is the leaf's, from the file schema. At 0 the
+     * leaf is REQUIRED and so is every ancestor, and the parquet format
+     * then guarantees no value can be null at any level: a definition
+     * level counts how many optional/repeated nodes on the path are
+     * defined, and with a maximum of 0 there is none that could be
+     * undefined. Such a leaf's null count is 0 whether or not the writer
+     * recorded it — and ClickHouse writes its non-Nullable columns
+     * REQUIRED and omits their `null_count`, so without this those
+     * columns hydrated to 'provided' with no rows, and so no zone maps.
+     */
     private fun aggregateColumn(
         blocks: List<BlockMetaData>,
         col: CatalogColumn,
         leaf: Leaf,
+        maxDefinitionLevel: Int,
         filePath: String,
     ): ColumnAgg? {
+        val nullFree = maxDefinitionLevel == 0
         var valueCount = 0L
         var nullCount = 0L
         var nullCountKnown = true
@@ -804,7 +823,15 @@ object FooterStats {
                 valueCount += chunk.valueCount
                 sizeBytes += chunk.totalSize
                 val st: Statistics<*>? = chunk.statistics
-                if (st == null || !st.isNumNullsSet) nullCountKnown = false else nullCount += st.numNulls
+                when {
+                    st != null && st.isNumNullsSet -> nullCount += st.numNulls
+                    // Parquet spec: a max definition level of 0 means no
+                    // value can be null at any level, so the omitted
+                    // count is exactly 0. value_count needs no such
+                    // argument — it comes from the chunk, not the stats.
+                    nullFree -> Unit
+                    else -> nullCountKnown = false
+                }
                 if (boundsOk) {
                     val bounds = chunkBounds(col, leaf, st)
                     if (bounds == null) {
@@ -824,9 +851,12 @@ object FooterStats {
         }
         if (!nullCountKnown) {
             // null_count is NOT NULL in hog_file_column_stats; without it we
-            // cannot write an honest row for this column.
+            // cannot write an honest row for this column. Only a NULLABLE
+            // leaf gets here: a required one's count is known to be 0.
             log.warn {
-                "column ${col.name} in $filePath is missing null counts; skipping its stats row"
+                "column ${col.name} (field ${col.fieldId}) in $filePath is nullable (max definition " +
+                    "level $maxDefinitionLevel) and its writer omitted null_count from at least one " +
+                    "column chunk; skipping its stats row"
             }
             return null
         }
