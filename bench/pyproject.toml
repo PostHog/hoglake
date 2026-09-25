@@ -25,7 +25,7 @@ dev = [
     "pytest>=8.0",
     # Pinned: see pyhoglake's note — an unpinned ruff resolves a
     # different rule set per machine. Same pin as the sibling trees.
-    "ruff==0.16.7",
+    "ruff==0.16.8",
 ]
 
 [tool.uv.sources]
