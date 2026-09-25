@@ -465,22 +465,27 @@ The hold is bounded in TIME as well as in calls, and the time bound is
 the one that matters: each call may take a whole
 `RemovalStore.apiCallTimeout`, so 25 probe pairs could reach 500 s and a
 three-chunk bulk sub-batch 30 s. A sub-batch therefore carries a
-deadline —
+deadline, checked before every object-store call and refusing to START
+one without a whole call bound of room left — so what it enforces is
 
-    hold <= HOLD_BUDGET + one call <= idle_in_transaction_session_timeout
+    hold <= HOLD_BUDGET = 2 x call bound
+    HOLD_BUDGET + one call <= min(idle bound, admission bound)
 
-(20 s + 10 s <= 30 s at the defaults) — checked before every
-object-store call, with a whole call bound of headroom so the last call
-it starts cannot run past the idle bound. All three numbers are derived
+(20 s, and 20 s + 10 s <= 30 s at the defaults). Both terms are derived
 from `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the effective
-`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so lowering
-the admission bound lowers the call bound with it. Past the idle bound
-Postgres kills the backend: the sub-batch rolls back with its objects
-already deleted and its ledger rows unsettled, and the next run does the
-same thing again. Rows a deadline stops short of are left exactly as
-found — no settle, no `attempts` bump — and are the next hold's work.
-Typical holds are nowhere near the budget: ~64 ms for a one-request bulk
-sub-batch, ~3.2 s for 25 probe pairs.
+`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so an
+operator who lowers the admission bound to keep commits responsive gets
+a shorter hold with it: a budget written against the idle bound alone
+would hold the lock 20 s inside a 6 s admission window and 503 every
+writer, which is the failure this whole change removes. Past the idle
+bound Postgres kills the backend: the sub-batch rolls back with its
+objects already deleted and its ledger rows unsettled, and the next run
+does the same thing again. Rows a deadline stops short of are left
+exactly as found — no settle, no `attempts` bump — are the next hold's
+work, and are counted `deadline_skipped`, which is also what keeps a
+budget-wedged drain from reporting as idle. Typical holds are nowhere
+near the budget: ~64 ms for a one-request bulk sub-batch, ~3.2 s for 25
+probe pairs.
 
 Two writers can settle a `hog_file_removal` row: this drain, and a
 compaction group's commit settling its own staging ticket

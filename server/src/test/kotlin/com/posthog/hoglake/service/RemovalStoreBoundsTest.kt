@@ -106,18 +106,50 @@ class RemovalStoreBoundsTest {
     }
 
     @Test
-    fun `the hold budget plus one call fits inside the idle bound`() {
-        // The whole inequality, in one assertion:
-        //   hold <= HOLD_BUDGET + one call <= the idle bound.
-        // CleanupService checks the budget before every object-store
-        // call and requires a whole call bound of headroom, so the last
-        // call a sub-batch starts cannot run past the idle bound.
-        assertThat(CleanupService.HOLD_BUDGET.plus(store.apiCallTimeout))
-            .describedAs("a sub-batch's worst-case hold must fit inside idle_in_transaction_session_timeout")
-            .isLessThanOrEqualTo(idleFromSql)
-        assertThat(CleanupService.HOLD_BUDGET)
-            .describedAs("and the budget must leave room for at least one call, or nothing drains")
-            .isGreaterThanOrEqualTo(store.apiCallTimeout)
+    fun `the hold budget is two call bounds, and both fit inside the smaller of the two bounds`() {
+        // The property the gate enforces, stated as the code enforces it
+        // rather than as it reads:
+        //
+        //   hold <= HOLD_BUDGET = 2 x call bound
+        //   HOLD_BUDGET + one call <= min(idle, admission)
+        //
+        // The gate is `elapsed <= holdBudget - apiCallTimeout`, so the
+        // LAST call a sub-batch starts always has a full call bound of
+        // room INSIDE the budget — the hold never reaches the budget
+        // plus a call, which is what the earlier wording claimed.
+        val admission = Duration.ofMillis(CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
+        val binding = minOf(idleFromSql, admission)
+        assertThat(store.holdBudget)
+            .describedAs("the budget is exactly two call bounds, so both derive from the same quantity")
+            .isEqualTo(store.apiCallTimeout.multipliedBy(2))
+        assertThat(store.holdBudget.plus(store.apiCallTimeout))
+            .describedAs("budget + one call must fit inside whichever of the two bounds is smaller")
+            .isLessThanOrEqualTo(binding)
+        assertThat(store.holdBudget)
+            .describedAs("and the budget must EXCEED one call, or the gate reads `elapsed <= 0`")
+            .isGreaterThan(store.apiCallTimeout)
+    }
+
+    @Test
+    fun `the hold budget follows the admission bound down, not just the idle bound`() {
+        // The defect this closes: a budget written against the idle
+        // bound alone survives an operator lowering
+        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep commits responsive, and
+        // then holds the catalog's commit lock for 20 s inside a 6 s
+        // admission window — 503ing every writer, which is the
+        // production failure the whole change exists to remove.
+        val lowered = 6_000L
+        assertThat(RemovalStore.callBoundFor(lowered)).isEqualTo(Duration.ofSeconds(2))
+        assertThat(RemovalStore.holdBudgetFor(lowered))
+            .describedAs("a 6s admission bound buys a 4s hold budget, not the idle bound's 20s")
+            .isEqualTo(Duration.ofSeconds(4))
+        assertThat(RemovalStore.holdBudgetFor(lowered).plus(RemovalStore.callBoundFor(lowered)))
+            .describedAs("and budget + one call still fits inside the bound the operator chose")
+            .isLessThanOrEqualTo(Duration.ofMillis(lowered))
+        // 0 is an unbounded admission wait, so the idle bound is left in
+        // charge of both.
+        assertThat(RemovalStore.holdBudgetFor(0))
+            .isEqualTo(idleFromSql.multipliedBy(2).dividedBy(3))
     }
 
     @Test

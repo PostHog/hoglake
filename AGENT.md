@@ -235,15 +235,22 @@ there would break that gate on every build.
    cost two round trips each they drain in their OWN sub-batches of 25.
    A hold is bounded in TIME, not in calls — each call may take a whole
    `RemovalStore.apiCallTimeout`, so 25 probe pairs could otherwise
-   reach 500 s and a three-chunk bulk sub-batch 30 s: the deadline is
-   `hold <= HOLD_BUDGET + one call <= the idle-in-transaction bound`
-   (20 s + 10 s <= 30 s), all derived from
-   `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the effective
-   `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`. Past the idle bound Postgres kills
-   the backend and the sub-batch rolls back with its objects already
-   deleted, forever. Rows a deadline stops short of are left untouched
-   for the next hold. Typical is nowhere near it: ~64 ms for a
-   one-request bulk hold, ~3.2 s for 25 probe pairs. And the drain
+   reach 500 s and a three-chunk bulk sub-batch 30 s. The gate refuses
+   to START a call without a whole call bound of room left, so what it
+   enforces is `hold <= HOLD_BUDGET = 2 x call bound`, with
+   `HOLD_BUDGET + one call <= min(idle bound, admission bound)`
+   (20 s + 10 s <= 30 s at the defaults). Both terms derive from
+   `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the EFFECTIVE
+   `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, so lowering admission shortens the
+   hold with it — a budget written against the idle bound alone holds
+   the lock for 20 s inside a 6 s admission window and 503s every
+   writer. Past the idle bound Postgres kills the backend and the
+   sub-batch rolls back with its objects already deleted, forever. Rows
+   a deadline stops short of are left untouched for the next hold and
+   COUNTED (`deadline_skipped`), which is also what keeps a
+   budget-wedged drain out of the "nothing to do" branch. Typical is
+   nowhere near the budget: ~64 ms for a one-request bulk hold, ~3.2 s
+   for 25 probe pairs. And the drain
    leaves a staging row
    alone until it is past `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h,
    which must stay well under `/verify`'s 6 h staging-ticket age) so a

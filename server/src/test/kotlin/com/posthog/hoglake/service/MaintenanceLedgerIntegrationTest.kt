@@ -225,6 +225,7 @@ class MaintenanceLedgerIntegrationTest {
             .describedAs("normalized on READ; the counter did not exist, so nothing it counts happened")
             .isZero()
         assertThat(result["settled_elsewhere"].asLong()).isZero()
+        assertThat(result["deadline_skipped"].asLong()).isZero()
         // Everything the row did carry survives untouched.
         assertThat(result["removed"].asLong()).isEqualTo(7)
         assertThat(result["missing"].asLong()).isEqualTo(1)
@@ -235,6 +236,7 @@ class MaintenanceLedgerIntegrationTest {
                 "still_referenced",
                 "objects_removed",
                 "settled_elsewhere",
+                "deadline_skipped",
             )
     }
 

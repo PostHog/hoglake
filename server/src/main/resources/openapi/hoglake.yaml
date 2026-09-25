@@ -3638,6 +3638,13 @@ components:
             Rows dropped from a sub-batch because another writer had already
             settled them — a compaction group settling its own staging ticket
             'registered'. Normal, not a failure.
+        deadline_skipped:
+          type: integer
+          format: int64
+          description: >
+            Rows a sub-batch's hold budget stopped short of: claimed by the run,
+            never attempted, and drained by a later hold. Standing nonzero means
+            holds are ending on their budget rather than on their work.
 
     RehydrateResult:
       type: object

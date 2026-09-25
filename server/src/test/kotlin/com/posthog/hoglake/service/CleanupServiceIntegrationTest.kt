@@ -737,8 +737,9 @@ class CleanupServiceIntegrationTest {
             putObject(it)
             stagingTicket(catalogId, it)
         }
-        // The clock advances only when an object-store call is issued,
-        // so the deadline is a function of calls made and nothing else.
+        // The clock advances only when a call is ISSUED — one gated call
+        // is one 4 s step — so the deadline is a function of calls made
+        // and nothing else.
         val now = java.util.concurrent.atomic.AtomicLong(0)
         val perCall = Duration.ofSeconds(4)
         val slow =
@@ -751,11 +752,18 @@ class CleanupServiceIntegrationTest {
                         mayIssueCall().also { if (it) now.addAndGet(perCall.toNanos()) }
                     }
             }
-        // Budget 20 s, call bound 10 s: a call may start while at most
-        // 10 s is spent. At 4 s per call that is HEAD+DELETE for rows
-        // one and two (8 s spent), then row three's HEAD at 8 s, its
-        // DELETE at 12 s — past the line — so the drain stops mid-row
-        // and row three is untouched along with the rest.
+        // Budget 20 s, call bound 10 s, so the gate passes while at most
+        // 10 s is spent. At 4 s per call:
+        //
+        //   row 1 HEAD    elapsed  0 <= 10, runs,  0 ->  4
+        //   row 1 DELETE  elapsed  4 <= 10, runs,  4 ->  8   (removed)
+        //   row 2 HEAD    elapsed  8 <= 10, runs,  8 -> 12
+        //   row 2 DELETE  elapsed 12 >  10, REFUSED
+        //
+        // so one row drains, row 2 is left mid-probe with its object
+        // intact, and rows 2..6 are deadline_skipped. The hold ends at
+        // 12 s, inside the 20 s budget, which is the one-call headroom
+        // the gate reserves.
         val drain =
             CleanupService(
                 jdbi,
@@ -767,15 +775,19 @@ class CleanupServiceIntegrationTest {
         val first = drain.runOnce("cl-hold-budget", batchSize = 100)
 
         assertThat(first.removed)
-            .describedAs("the deadline stopped the hold well short of the six queued rows")
-            .isLessThan(tickets.size.toLong())
-            .isGreaterThan(0)
+            .describedAs("only row 1 fits: its DELETE is the last call that starts inside the budget")
+            .isEqualTo(1)
+        assertThat(first.missing).isZero()
+        assertThat(first.deadlineSkipped)
+            .describedAs("rows 2..6 were claimed and never attempted")
+            .isEqualTo(5)
         val undrained = queuedPaths(catalogId)
-        assertThat(undrained).describedAs("the remainder is still queued").isNotEmpty()
+        assertThat(undrained).describedAs("the remainder is still queued").hasSize(5)
         assertThat(ledgerRows(catalogId).filter { it.path in undrained })
             .describedAs(
                 "a row the deadline never reached was not ATTEMPTED: no attempts bump, no " +
-                    "last_attempt_at, and its object is untouched",
+                    "last_attempt_at, and its object is untouched — including row 2, whose HEAD " +
+                    "ran but whose DELETE was refused",
             )
             .allSatisfy {
                 assertThat(it.attempts).isZero()
@@ -783,9 +795,8 @@ class CleanupServiceIntegrationTest {
             }
         undrained.forEach { assertThat(removals.exists(it)).isTrue() }
 
-        // And they are simply the next run's work: a fresh drain (fresh
-        // budget) takes them.
-        now.set(0)
+        // And they are simply the next run's work: a fresh drain gets a
+        // fresh budget.
         var drained = first.removed + first.missing
         repeat(6) {
             now.set(0)
@@ -793,6 +804,57 @@ class CleanupServiceIntegrationTest {
         }
         assertThat(drained).isEqualTo(tickets.size.toLong())
         assertThat(queuedPaths(catalogId)).isEmpty()
+    }
+
+    @Test
+    fun `a drain whose budget settles nothing is not silent`() {
+        // The counter's whole reason. A hold that ends on its budget
+        // before a single row settles reports removed = missing =
+        // still_referenced = 0, which is the shape of an idle drain — so
+        // without deadline_skipped in the audit condition, a drain
+        // wedged on a slow object store looks exactly like a drain with
+        // an empty queue, in the audit stream AND in the maintenance run
+        // ledger.
+        //
+        // 11 s per call against a 20 s budget and a 10 s call bound:
+        // row 1's HEAD runs (elapsed 0), row 1's DELETE is refused
+        // (elapsed 11 > 10), and the run settles nothing at all.
+        val catalogId = seedCatalog("cl-hold-wedged")
+        val tickets = (1..6).map { "s3://$BUCKET/cl-hold-wedged/s$it.parquet" }
+        tickets.forEach {
+            putObject(it)
+            stagingTicket(catalogId, it)
+        }
+        val now = java.util.concurrent.atomic.AtomicLong(0)
+        val stalled =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteIfExists(
+                    pathUri: String,
+                    mayIssueCall: () -> Boolean,
+                ): Outcome =
+                    super.deleteIfExists(pathUri) {
+                        mayIssueCall().also { if (it) now.addAndGet(Duration.ofSeconds(11).toNanos()) }
+                    }
+            }
+
+        withAuditCapture { capture ->
+            val result =
+                CleanupService(jdbi, stalled, stagingGraceSeconds = 0, nanoTime = { now.get() })
+                    .runOnce("cl-hold-wedged", batchSize = 100)
+
+            assertThat(result.removed).isZero()
+            assertThat(result.missing).isZero()
+            assertThat(result.stillReferenced).isZero()
+            assertThat(result.deadlineSkipped)
+                .describedAs("every row was claimed and none was attempted")
+                .isEqualTo(tickets.size.toLong())
+            assertThat(capture.lines())
+                .describedAs("a run that settled nothing because its budget ran out must say so")
+                .anySatisfy {
+                    assertThat(it).contains("action=cleanup").contains("deadline_skipped=6")
+                }
+        }
+        assertThat(queuedPaths(catalogId)).hasSize(6)
     }
 
     @Test

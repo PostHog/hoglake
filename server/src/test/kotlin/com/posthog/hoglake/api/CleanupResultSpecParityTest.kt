@@ -84,6 +84,7 @@ class CleanupResultSpecParityTest {
                 stillReferenced = 3,
                 objectsRemoved = 4,
                 settledElsewhere = 5,
+                deadlineSkipped = 6,
             ).toDto()
         assertThat(dto.removed).isEqualTo(1)
         assertThat(dto.missing).isEqualTo(2)
@@ -92,6 +93,7 @@ class CleanupResultSpecParityTest {
             .describedAs("the physical-delete count the metric reads, distinct from the row count")
             .isEqualTo(4)
         assertThat(dto.settledElsewhere).isEqualTo(5)
+        assertThat(dto.deadlineSkipped).isEqualTo(6)
     }
 
     @Test
@@ -105,7 +107,7 @@ class CleanupResultSpecParityTest {
         // CompactionResultSpecParityTest pins for claimed_elsewhere.
         val block = schemaBlock("    CleanupResult:")
         val required = requiredOf(block)
-        for (counter in listOf("objects_removed", "settled_elsewhere")) {
+        for (counter in listOf("objects_removed", "settled_elsewhere", "deadline_skipped")) {
             assertThat(properties(block)).contains(counter)
             assertThat(required)
                 .describedAs("a required counter cannot be one the ledger has rows without")

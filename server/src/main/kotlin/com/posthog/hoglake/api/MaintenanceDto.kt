@@ -85,6 +85,8 @@ data class CleanupResultDto(
     val objectsRemoved: Long,
     /** Rows already settled by another writer when the sub-batch took the lock. */
     val settledElsewhere: Long,
+    /** Rows a sub-batch's hold budget stopped short of; a later hold drains them. */
+    val deadlineSkipped: Long,
 )
 
 fun CleanupResult.toDto() =
@@ -94,6 +96,7 @@ fun CleanupResult.toDto() =
         stillReferenced = stillReferenced,
         objectsRemoved = objectsRemoved,
         settledElsewhere = settledElsewhere,
+        deadlineSkipped = deadlineSkipped,
     )
 
 data class CompactionResultDto(
@@ -273,7 +276,8 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
 private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")
 
 /** The same, for CleanupResult. Append-only for the same reason. */
-private val CLEANUP_COUNTERS_ADDED_LATER = listOf("objects_removed", "settled_elsewhere")
+private val CLEANUP_COUNTERS_ADDED_LATER =
+    listOf("objects_removed", "settled_elsewhere", "deadline_skipped")
 
 /**
  * What the run ledger observed about a task's loop — fleet-wide, unlike

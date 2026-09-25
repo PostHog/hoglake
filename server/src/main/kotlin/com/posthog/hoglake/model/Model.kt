@@ -1341,6 +1341,22 @@ data class CleanupResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val settledElsewhere: Long = 0,
+    /**
+     * Rows a sub-batch's hold budget stopped short of: claimed by the
+     * run, never attempted, left exactly as found and drained by a later
+     * hold.
+     *
+     * A standing nonzero here means holds are ending on their budget
+     * rather than on their work — a slow object store, or a sub-batch
+     * size the budget cannot cover — and it is the ONE counter that can
+     * be nonzero while `removed`, `missing` and `stillReferenced` are
+     * all zero, which is why the run's audit event is emitted for it
+     * too. A drain wedged on its budget must not present as idle.
+     *
+     * Defaulted and NON_DEFAULT for the same reason as [objectsRemoved].
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val deadlineSkipped: Long = 0,
 )
 
 // ---- the maintenance run ledger (hog_maintenance_run) ---------------------

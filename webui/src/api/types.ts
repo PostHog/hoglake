@@ -567,6 +567,13 @@ export interface CleanupResult {
    * 'registered'. Normal, not a failure. Optional for the same reason.
    */
   settled_elsewhere?: Int64;
+  /**
+   * Rows a sub-batch's hold budget stopped short of — claimed by the
+   * run, never attempted, drained by a later hold. Standing nonzero
+   * means holds are ending on their budget rather than on their work.
+   * Optional for the same reason as the two above.
+   */
+  deadline_skipped?: Int64;
 }
 
 export interface CompactionResult {

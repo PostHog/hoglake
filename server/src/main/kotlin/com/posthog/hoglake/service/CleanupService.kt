@@ -78,6 +78,26 @@ open class RemovalStore(
     /** Half [apiCallTimeout] — see [callBoundFor] for what that buys. */
     val apiCallAttemptTimeout: Duration = apiCallTimeout.dividedBy(2)
 
+    /**
+     * How long one `CleanupService` sub-batch may spend on object-store
+     * calls — EXACTLY two of [apiCallTimeout], and defined here rather
+     * than on the drain because it is derived from the same two bounds
+     * and has to move with them.
+     *
+     * That is the whole point: a hold budget written against the idle
+     * bound alone survives an operator lowering
+     * HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep commits responsive, and
+     * then holds the lock for longer than the admission window the
+     * operator just chose — 503ing every writer, which is the
+     * production failure this change exists to remove. Two thirds of
+     * `min(idle, admission)`, with the last third left as the one call
+     * the budget's own gate reserves room for:
+     *
+     *   hold <= holdBudget = 2 x apiCallTimeout
+     *   holdBudget + one call <= min(idle, admission)
+     */
+    val holdBudget: Duration = apiCallTimeout.multipliedBy(2)
+
     private val s3: S3Client =
         S3Client.builder()
             .region(Region.of(region))
@@ -345,8 +365,9 @@ open class RemovalStore(
          *
          * So the call bound is derived from the smaller of the two,
          * divided by three: one third leaves room for the SDK to fail,
-         * retry, and still finish inside both bounds, and it is what
-         * `CleanupService.HOLD_BUDGET` is sized against in turn.
+         * retry, and still finish inside both bounds, and [holdBudget]
+         * is the other two thirds — so a drain's whole hold plus one
+         * more call still fits inside `min(idle, admission)`.
          *
          * `apiCallTimeout` is an OVERALL budget for the call —
          * every attempt and all the backoff between them share it,
@@ -363,9 +384,16 @@ open class RemovalStore(
             return minOf(idle, admission).dividedBy(3)
         }
 
+        /** See [holdBudget]: two call bounds, at any admission bound. */
+        fun holdBudgetFor(commitLockTimeoutMs: Long): Duration = callBoundFor(commitLockTimeoutMs).multipliedBy(2)
+
         /** The bound at the compiled admission default, for no-arg construction. */
         val API_CALL_TIMEOUT: Duration =
             callBoundFor(com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
+
+        /** The hold budget at the compiled admission default. */
+        val HOLD_BUDGET: Duration =
+            holdBudgetFor(com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
     }
 }
 
@@ -468,16 +496,20 @@ open class RemovalStore(
  * THE WORST CASE IS NOT THAT COUNT TIMES 64 ms, and this is the part a
  * call-count bound cannot state: each call may take a whole
  * [RemovalStore.apiCallTimeout]. So the hold is bounded in TIME by
- * [HOLD_BUDGET], checked before every call with one call bound of
- * headroom:
+ * [RemovalStore.holdBudget], checked before every call and requiring a
+ * whole call bound of headroom — so the last call a sub-batch starts
+ * always has room to finish inside the budget:
  *
- *   hold <= HOLD_BUDGET + one call <= the idle-in-transaction bound
+ *   hold <= HOLD_BUDGET = 2 x call bound
+ *   HOLD_BUDGET + one call <= min(idle bound, admission bound)
  *
- * — 20 s + 10 s <= 30 s at the defaults, all three derived from
- * `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the commit admission
- * bound rather than written down. A sub-batch the deadline stops short
- * of leaves its remaining rows exactly as it found them and they are
- * the next hold's work; without it, the backend is killed
+ * — 20 s, and 20 s + 10 s <= 30 s at the defaults, every term derived
+ * from `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the EFFECTIVE
+ * `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so
+ * lowering the admission bound shortens the hold with it. A sub-batch
+ * the deadline stops short of leaves its remaining rows exactly as it
+ * found them and they are the next hold's work (counted
+ * `deadline_skipped`); without it, the backend is killed
  * idle-in-transaction and the sub-batch rolls back with its objects
  * already deleted.
  *
@@ -511,10 +543,16 @@ class CleanupService(
     private val stagingGraceSeconds: Long = STAGING_GRACE_SECONDS,
     /**
      * How long one sub-batch may spend on object-store calls before it
-     * stops issuing them. See [HOLD_BUDGET]; constructor-tunable so a
-     * test can shrink it rather than sleep through it.
+     * stops issuing them.
+     *
+     * Defaults to the store's own [RemovalStore.holdBudget], which is
+     * two of its call bounds — so it is derived from
+     * `min(idle, admission)` exactly as the call bound is, and an
+     * operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS gets a shorter
+     * hold with it. Constructor-tunable so a test can shrink it rather
+     * than sleep through it.
      */
-    private val holdBudget: Duration = HOLD_BUDGET,
+    private val holdBudget: Duration = store.holdBudget,
     /**
      * The clock the hold deadline reads, as nanoseconds. Injected so a
      * test can drive the deadline exactly instead of sleeping — a
@@ -538,8 +576,13 @@ class CleanupService(
         require(stagingGraceSeconds >= 0) {
             "stagingGraceSeconds must not be negative (got $stagingGraceSeconds)"
         }
-        require(holdBudget >= store.apiCallTimeout) {
-            "holdBudget ($holdBudget) must leave room for one object-store call " +
+        // STRICT: the gate is `elapsed <= holdBudget - apiCallTimeout`, so
+        // at equality it reads `elapsed <= 0` and only a call issued in
+        // the same nanosecond as the lock could ever pass it. A drain
+        // that issues no calls is not a smaller drain, it is a stopped
+        // one.
+        require(holdBudget > store.apiCallTimeout) {
+            "holdBudget ($holdBudget) must exceed one object-store call " +
                 "(${store.apiCallTimeout}), or no sub-batch can issue one"
         }
     }
@@ -584,7 +627,14 @@ class CleanupService(
         // objectsRemoved, not removed: the metric is documented as
         // physical deletes and `removed` counts ledger rows.
         Metrics.filesRemoved(catalog, result.objectsRemoved)
-        if (result.removed == 0L && result.missing == 0L && result.stillReferenced == 0L) {
+        // deadlineSkipped is in the condition, not just the detail: a
+        // drain whose holds all end on their budget settles nothing, and
+        // without it here that run takes the "nothing to do" branch and
+        // a wedged drain is indistinguishable from an idle one in both
+        // the audit stream and the run ledger.
+        if (result.removed == 0L && result.missing == 0L && result.stillReferenced == 0L &&
+            result.deadlineSkipped == 0L
+        ) {
             log.debug { "cleanup drain for catalog '$catalog': nothing to do" }
         } else {
             Audit.event(
@@ -596,7 +646,8 @@ class CleanupService(
                     "removed=${result.removed} missing=${result.missing} " +
                         "still_referenced=${result.stillReferenced} " +
                         "objects_removed=${result.objectsRemoved} " +
-                        "settled_elsewhere=${result.settledElsewhere}",
+                        "settled_elsewhere=${result.settledElsewhere} " +
+                        "deadline_skipped=${result.deadlineSkipped}",
             )
         }
         return result
@@ -650,6 +701,7 @@ class CleanupService(
         var stillReferenced = 0L
         var objectsRemoved = 0L
         var settledElsewhere = 0L
+        var deadlineSkipped = 0L
 
         for ((sub, probeEachPath) in subBatches) {
             val result = drainSubBatch(catalog, catalogId, sub, probeEachPath)
@@ -658,10 +710,18 @@ class CleanupService(
             stillReferenced += result.stillReferenced
             objectsRemoved += result.objectsRemoved
             settledElsewhere += result.settledElsewhere
+            deadlineSkipped += result.deadlineSkipped
         }
         purgeDrainedLedger(catalog, catalogId)
         purgeMaintenanceLedger(catalog, catalogId)
-        return CleanupResult(removed, missing, stillReferenced, objectsRemoved, settledElsewhere)
+        return CleanupResult(
+            removed,
+            missing,
+            stillReferenced,
+            objectsRemoved,
+            settledElsewhere,
+            deadlineSkipped,
+        )
     }
 
     /** One sub-batch's tally, accumulated only after its transaction commits. */
@@ -671,6 +731,7 @@ class CleanupService(
         val stillReferenced: Long,
         val objectsRemoved: Long,
         val settledElsewhere: Long,
+        val deadlineSkipped: Long,
     )
 
     /**
@@ -703,6 +764,7 @@ class CleanupService(
         var subStillReferenced = 0L
         var subObjects = 0L
         var subSettledElsewhere = 0L
+        var subDeadlineSkipped = 0L
         jdbi.useTransactionUnchecked { h ->
             // The check+delete pair is serialized against the commit
             // tail by the SAME per-catalog advisory lock every commit
@@ -744,10 +806,12 @@ class CleanupService(
 
             // THE HOLD DEADLINE. The clock starts once the lock is ours,
             // and no object-store call may START unless the budget can
-            // still absorb a whole one:
+            // still absorb a whole one — so the LAST call always has a
+            // full call bound of room inside the budget, and what the
+            // gate enforces is:
             //
-            //   hold <= HOLD_BUDGET + one call <= the idle-in-transaction
-            //   bound this connection was opened with.
+            //   hold <= HOLD_BUDGET = 2 x call bound
+            //   HOLD_BUDGET + one call <= min(idle, admission)
             //
             // Without it the hold is bounded only in CALLS, and a call is
             // bounded by RemovalStore.apiCallTimeout — so 25 probe pairs
@@ -759,7 +823,10 @@ class CleanupService(
             //
             // Rows the deadline stops short of are left exactly as found
             // — no settle, no attempts bump — because nothing was
-            // attempted on them. They are simply the next hold's work.
+            // attempted on them. They are simply the next hold's work,
+            // and they are COUNTED (`deadline_skipped`), because a drain
+            // whose every hold ends on the budget settles nothing and
+            // would otherwise look idle.
             val holdStart = nanoTime()
             val mayIssueCall = {
                 Duration.ofNanos(nanoTime() - holdStart) <= holdBudget.minus(store.apiCallTimeout)
@@ -905,6 +972,10 @@ class CleanupService(
             for (path in removedPaths) {
                 events += PathEvent("file_deleted", path, "ok", null)
             }
+            // Rows the deadline never reached. Counted, not settled and
+            // not attempted — see CleanupResult.deadlineSkipped for why
+            // a run has to report them rather than look idle.
+            subDeadlineSkipped = unattempted.size.toLong()
             // Undrained entries (still-referenced, transient S3
             // failure) record the attempt and stay queued. Fenced on
             // `drained_at IS NULL` for the same reason the settle is:
@@ -922,7 +993,14 @@ class CleanupService(
         for (e in events) {
             Audit.event(e.action, catalog, e.path, outcome = e.outcome, detail = e.detail)
         }
-        return SubBatchResult(subRemoved, subMissing, subStillReferenced, subObjects, subSettledElsewhere)
+        return SubBatchResult(
+            subRemoved,
+            subMissing,
+            subStillReferenced,
+            subObjects,
+            subSettledElsewhere,
+            subDeadlineSkipped,
+        )
     }
 
     /**
@@ -1051,38 +1129,6 @@ class CleanupService(
          * knob at all; see [STAGING_SUB_BATCH].
          */
         const val SUB_BATCH = 1000
-
-        /**
-         * How long a sub-batch may spend on object-store calls before it
-         * stops issuing them, derived from the bound that actually
-         * matters: two thirds of the idle-in-transaction timeout every
-         * pooled connection is opened with
-         * ([Database.SESSION_INIT_SQL_IDLE_TIMEOUT], 30 s), so 20 s.
-         *
-         * THE INVARIANT IS ONE INEQUALITY:
-         *
-         *   hold <= HOLD_BUDGET + one call <= the idle bound
-         *
-         * The deadline is checked before every object-store call and
-         * requires a whole [RemovalStore.apiCallTimeout] of headroom, so
-         * the last call this sub-batch starts cannot run past the idle
-         * bound. The third that is left over IS that call.
-         *
-         * Why the bound has to be time and not call count: the call
-         * count is already bounded ([STAGING_SUB_BATCH] probe pairs, one
-         * request per bucket chunk) but each call may take a whole
-         * `apiCallTimeout`, so 25 staging rows could reach 500 s and a
-         * three-chunk bulk sub-batch 30 s. Past the idle bound Postgres
-         * kills the backend and the sub-batch rolls back WITH ITS
-         * OBJECTS ALREADY DELETED and its ledger rows unsettled — and
-         * the next run drains the same rows and does it again.
-         *
-         * It is a ceiling, not a target. A healthy sub-batch never comes
-         * near it: at the 64 ms per round trip measured on
-         * gigahog-prod-us, 25 probe pairs is ~3.2 s and a one-request
-         * bulk sub-batch is ~64 ms.
-         */
-        val HOLD_BUDGET: Duration = Database.SESSION_INIT_SQL_IDLE_TIMEOUT.multipliedBy(2).dividedBy(3)
 
         /**
          * Staging tickets per sub-batch, and therefore per lock hold.
