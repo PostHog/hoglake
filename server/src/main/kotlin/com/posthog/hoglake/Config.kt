@@ -13,6 +13,118 @@ data class Config(
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
+    /**
+     * How many threads serve blocking route handlers (#218).
+     *
+     * Every handler's JDBC and object-store work runs on this bounded
+     * pool, not on the Netty event loop — see
+     * `api/BlockingDispatch.kt` for why that seam exists at all. This
+     * knob is the pool's width, and it is therefore the ceiling on
+     * CONCURRENT REQUESTS IN A BLOCKING CALL.
+     *
+     * DEFAULT = [dbPoolSize], and the reason is what happens on the
+     * other side of the handler. Nearly every handler's first act is to
+     * borrow a Hikari connection, so handler threads above the pool
+     * size do not buy concurrency: they queue inside
+     * `HikariPool.getConnection`, which gives up after
+     * `Database.dataSource`'s 5 s `connectionTimeout` and throws — a
+     * 500, not the typed 503 + Retry-After the admission contract
+     * promises, and nothing in it says which knob caused it (the same
+     * failure `HOGLAKE_COMPACTION_PARALLEL_GROUPS`' boot check exists to
+     * prevent). Sizing the dispatcher AT the pool makes the dispatcher's
+     * own queue the backpressure instead: excess requests wait in a
+     * FIFO queue with no timeout of their own until a thread frees, and
+     * whatever bound they hit is the client's or the commit admission
+     * bound's, both of which are typed.
+     *
+     * It is NOT sized at `dbPoolSize` minus the background loops'
+     * draw. The loops (hydrator, expiry, cleanup, compaction, verify,
+     * retirement, the metrics sampler) share the pool, so under a full
+     * dispatcher some foreground requests can still queue on Hikari for
+     * up to 5 s and 500. That is the PRE-EXISTING behaviour, unchanged
+     * by this knob, and deriving a smaller default from a loop set that
+     * is mostly off in the API workload would idle handler threads
+     * whenever the loops are quiet. What #218 fixes is that none of it
+     * reaches `/healthz` any more (see [healthProbeTimeoutMs]).
+     *
+     * REFUSED ABOVE THE POOL at boot, for that reason: raising it is a
+     * pair of knobs, and forgetting the second one turns dispatcher
+     * queueing into Hikari timeouts across the whole fleet. Raise
+     * `HOGLAKE_DB_POOL_SIZE` first (a workload dominated by
+     * object-store rather than SQL work can genuinely use more handler
+     * threads than connections — Ktor parses request bodies on
+     * `Dispatchers.IO`, off this pool entirely), then this.
+     *
+     * THE RESERVE, and what the default does NOT promise. On the API
+     * workload the chart turns every background loop off, so the
+     * foreground is the pool's only customer and `requestThreads ==
+     * dbPoolSize` is exact. On a pod that also runs loops — the
+     * maintenance Deployment, a dev stack, anything inheriting the
+     * defaults — the foreground alone can take every connection, and a
+     * hydrator or expiry sweep then waits Hikari's 5 s and fails its
+     * iteration (logged and counted as
+     * `hoglake_background_loop_failures_total`, and retried on the next
+     * interval, so it is a delay rather than a loss). There is no
+     * arithmetic here that prevents it: `Config.FOREGROUND_CONNECTION_RESERVE`
+     * bounds COMPACTION's draw on the pool, not the foreground's. A
+     * workload that runs loops and serves traffic should set
+     * `HOGLAKE_REQUEST_THREADS` below `HOGLAKE_DB_POOL_SIZE` by the
+     * number of loops it runs.
+     */
+    val requestThreads: Int = env("HOGLAKE_REQUEST_THREADS", dbPoolSize.toString()).toInt(),
+    /**
+     * The per-operation bound on the `/healthz` probe's own connection,
+     * in milliseconds (#218).
+     *
+     * The probe does not share the request pool: it owns a
+     * one-connection pool of its own (`HealthProbe`), so "the pool is
+     * busy serving commits" reads as 200 and only "Postgres does not
+     * answer" reads as 503. This value is applied FOUR times over —
+     * Hikari `connectionTimeout`, pgjdbc `connectTimeout`, pgjdbc
+     * `socketTimeout`, and the session `statement_timeout` — so that
+     * no layer can outlast the kubelet's probe timeout. The probe's
+     * wall-clock deadline is twice it (connect, then query), which at
+     * the default is 4 s inside the kubelet's usual 5 s.
+     *
+     * pgjdbc's socket bounds have ONE-SECOND granularity, so anything
+     * below 1000 still buys a one-second floor on those two; the
+     * Hikari and statement bounds honour the millisecond value.
+     */
+    val healthProbeTimeoutMs: Long = env("HOGLAKE_HEALTH_PROBE_TIMEOUT_MS", "2000").toLong(),
+    /**
+     * Netty's CALL group: the threads Ktor starts a call on, before
+     * `installBlockingDispatch` hands the blocking part off (#218).
+     *
+     * Ktor's default for this group is `parallelism` exactly — that is,
+     * `Runtime.getRuntime().availableProcessors()` — so on the
+     * production pod's ONE CPU it is a single thread named
+     * `eventLoopGroupProxy-4-1`: the thread every request in the
+     * incident log ran on, and the thread a 30 s commit-lock wait held
+     * while three `/healthz` probes timed out and liveness killed the
+     * pod. The blocking dispatcher is the fix; this is the floor that
+     * keeps the fix from having a single thread in front of it, so a
+     * probe's dispatch — and a `/metrics` scrape, which shares the same
+     * bypass and is real CPU work on this thread — cannot queue behind
+     * another call's.
+     *
+     * [DEFAULT_NETTY_GROUP_SIZE] is a FLOOR, not a replacement: it is a
+     * `max` over the SAME `availableProcessors` Ktor reads, so a pod
+     * with more CPUs than the floor keeps Ktor's own sizing. Both
+     * readings move together if the container's CPU allocation or
+     * `-XX:ActiveProcessorCount` changes; what the floor fixes is only
+     * the small end.
+     *
+     * The WORKER group (Netty's IO event loops) is deliberately left at
+     * Ktor's own default, which is `parallelism / 2 + 1` — NOT the same
+     * formula as this one, so applying this floor there would RAISE the
+     * worker count on every pod with more than two CPUs. Those threads
+     * do socket IO, they are not where blocking work or the probe
+     * handler runs, and #218 produced no evidence about them; changing
+     * their number would be an unmeasured change to Netty's own
+     * scheduling, smuggled in beside a fix.
+     */
+    val nettyCallGroupSize: Int =
+        env("HOGLAKE_NETTY_CALL_GROUP_SIZE", DEFAULT_NETTY_GROUP_SIZE.toString()).toInt(),
     /** S3/MinIO endpoint for the hydrator; empty = AWS default resolution. */
     val s3Endpoint: String = env("HOGLAKE_S3_ENDPOINT", ""),
     val s3Region: String = env("HOGLAKE_S3_REGION", "us-east-1"),
@@ -576,6 +688,51 @@ data class Config(
                 "is $DEFAULT_RETIREMENT_QUEUE_CEILING) or set HOGLAKE_RETIREMENT_INTERVAL_MS=0 " +
                 "to turn the loop off on purpose."
         }
+        // A dispatcher of zero threads is a server that accepts every
+        // request and serves none of them, forever: the Netty call
+        // thread hands the call to a pool with nobody in it and the
+        // client waits until it gives up. There is no reading of 0 that
+        // means "do not dispatch" — that is what the bypass list is for
+        // — so refuse it at boot rather than hang at the first request.
+        require(requestThreads >= 1) {
+            "HOGLAKE_REQUEST_THREADS=$requestThreads: the blocking request dispatcher needs at " +
+                "least one thread (the default is HOGLAKE_DB_POOL_SIZE, currently $dbPoolSize). " +
+                "A dispatcher with no threads queues every request forever."
+        }
+        // Each of the four layers this value configures — Hikari's
+        // connectionTimeout, pgjdbc's connectTimeout and socketTimeout,
+        // the session statement_timeout — has its own floor, and
+        // Hikari's is 250 ms. Below that the probe would take a bound
+        // Hikari silently replaces with its own, so the number in the
+        // values file would stop being the number in force.
+        require(healthProbeTimeoutMs >= MIN_HEALTH_PROBE_TIMEOUT_MS) {
+            "HOGLAKE_HEALTH_PROBE_TIMEOUT_MS=$healthProbeTimeoutMs is below Hikari's " +
+                "$MIN_HEALTH_PROBE_TIMEOUT_MS ms connectionTimeout floor, which Hikari would " +
+                "silently replace with its own default — set at least $MIN_HEALTH_PROBE_TIMEOUT_MS"
+        }
+        // Netty refuses a group of zero with an IllegalArgumentException
+        // from deep inside its own constructor, naming neither the knob
+        // nor the value — and it does it AFTER migrations have run.
+        require(nettyCallGroupSize >= 1) {
+            "HOGLAKE_NETTY_CALL_GROUP_SIZE=$nettyCallGroupSize must be >= 1 (the default is " +
+                "max(4, availableProcessors), currently $DEFAULT_NETTY_GROUP_SIZE)"
+        }
+        // Handler threads above pool connections do not buy concurrency
+        // for a handler whose first act is to borrow one: they queue
+        // inside HikariPool.getConnection and fail with a 500 after its
+        // 5 s connectionTimeout, instead of queueing in the dispatcher
+        // where the wait is FIFO, measured
+        // (hoglake_request_queue_wait_seconds) and shed with a typed
+        // 503 once it passes the admission bound. Raising the
+        // dispatcher is therefore a PAIR of knobs, and this is what
+        // makes forgetting the second one a boot failure that names
+        // both rather than a fleet-wide 500 rate nobody can attribute.
+        require(requestThreads <= dbPoolSize) {
+            "HOGLAKE_REQUEST_THREADS=$requestThreads exceeds HOGLAKE_DB_POOL_SIZE=$dbPoolSize: " +
+                "handler threads past the pool queue inside HikariPool.getConnection and 500 " +
+                "after its 5s connectionTimeout instead of queueing in the dispatcher, where a " +
+                "wait is measured and shed with a typed 503. Raise HOGLAKE_DB_POOL_SIZE with it."
+        }
         require(compactionParallelGroups <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
             "HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups needs a database pool " +
                 "of at least ${compactionParallelGroups + FOREGROUND_CONNECTION_RESERVE} " +
@@ -593,6 +750,26 @@ data class Config(
          * not a model of demand.
          */
         const val FOREGROUND_CONNECTION_RESERVE = 4
+
+        /**
+         * The FLOOR under Netty's CALL group (#218), which Ktor
+         * otherwise sizes at `availableProcessors` exactly. Four, not a
+         * larger number, because with the blocking work dispatched off
+         * these threads they do dispatch, the probe handler and a
+         * `/metrics` scrape and nothing else: what the floor buys is
+         * that a one-CPU pod has more than one of them, so a probe
+         * never waits behind another call. A pod with more CPUs than
+         * this keeps Ktor's own sizing. It is NOT applied to the worker
+         * group — see [nettyCallGroupSize].
+         */
+        val DEFAULT_NETTY_GROUP_SIZE: Int = maxOf(4, Runtime.getRuntime().availableProcessors())
+
+        /**
+         * Hikari refuses a `connectionTimeout` below 250 ms and
+         * substitutes its own 30 s default, so this is the floor the
+         * health-probe bound is checked against at boot.
+         */
+        const val MIN_HEALTH_PROBE_TIMEOUT_MS = 250L
 
         /**
          * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so

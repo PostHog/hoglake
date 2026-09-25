@@ -1,7 +1,9 @@
 package com.posthog.hoglake
 
+import com.posthog.hoglake.api.RequestDispatcher
 import com.posthog.hoglake.api.installAlterRoutes
 import com.posthog.hoglake.api.installApiRoutes
+import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
@@ -37,6 +39,7 @@ import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.service.ViewService
+import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.jackson.jackson
@@ -63,7 +66,21 @@ import org.jdbi.v3.core.Jdbi
 class App private constructor(
     val cfg: Config,
     val jdbi: Jdbi,
-) {
+    /**
+     * `/healthz`'s own one-connection probe (#218). Injected so a test
+     * can point it at a database it is allowed to stop; defaulted from
+     * [cfg] otherwise, and LAZY inside, so building an App opens no
+     * second connection until something asks.
+     */
+    val healthProbe: HealthProbe,
+) : AutoCloseable {
+    /**
+     * The bounded pool every route handler's blocking work runs on.
+     * Installed once, in [module], by [installBlockingDispatch] — see
+     * that file for the mechanism and the rejected alternatives.
+     */
+    val requestDispatcher = RequestDispatcher(cfg.requestThreads)
+
     private val catalogService = CatalogService(jdbi)
     private val commitService = CommitService(jdbi, commitLockTimeoutMs = cfg.commitLockTimeoutMs)
     private val alterService = AlterService(jdbi)
@@ -189,16 +206,38 @@ class App private constructor(
     val catalogMetrics = CatalogMetrics(jdbi, meterRegistry)
 
     companion object {
+        /**
+         * @param dataSource the REQUEST pool, when the caller has it —
+         *   `Main.kt` does. It is only ever read through its MXBean, to
+         *   publish the `hoglake_db_pool_*` saturation gauges; null
+         *   (the test default, where Jdbi is all most fixtures hold)
+         *   simply publishes no pool gauges.
+         * @param healthProbe `/healthz`'s own connection; defaults to
+         *   one built from [cfg].
+         */
         fun build(
             cfg: Config,
             jdbi: Jdbi,
+            dataSource: HikariDataSource? = null,
+            healthProbe: HealthProbe = HealthProbe.fromConfig(cfg),
         ): App =
-            App(cfg, jdbi).also {
+            App(cfg, jdbi, healthProbe).also {
                 Metrics.bind(it.meterRegistry)
+                Metrics.registerRequestPoolGauges(it.meterRegistry, it.requestDispatcher)
+                Metrics.registerHealthProbeGauge(it.meterRegistry) { it.healthProbe.outstandingAttempts }
+                if (dataSource != null) Metrics.registerDbPoolGauges(it.meterRegistry, dataSource)
             }
     }
 
     fun module(app: Application) {
+        // FIRST, and once: every handler installed below this line runs
+        // its blocking database/object-store work on requestDispatcher
+        // rather than on the Netty event loop. The probe paths are
+        // bypassed, the queue wait is stamped and measured, and a
+        // request that queued past the commit admission bound is shed
+        // with the typed 503 before it borrows a connection
+        // (api/BlockingDispatch.kt).
+        app.installBlockingDispatch(requestDispatcher, cfg.commitLockTimeoutMs)
         app.install(ContentNegotiation) {
             // One definition, shared with the tests that pin this
             // behaviour (api/WireJson.kt).
@@ -230,16 +269,16 @@ class App private constructor(
             get("/livez") {
                 call.respondText("ok")
             }
-            // Readiness: the catalog must be reachable. A dead pool must
-            // read as unhealthy, not hang (the zombie-server incident:
-            // /healthz said ok while every /v1 call hung on a dead PG).
+            // Readiness: the catalog must be reachable. A dead database
+            // must read as unhealthy, not hang (the zombie-server
+            // incident: /healthz said ok while every /v1 call hung on a
+            // dead PG) — and a BUSY REQUEST POOL must read as healthy,
+            // which is the half #218 added. The probe answers on its own
+            // connection and its own thread, bounded four ways by
+            // HOGLAKE_HEALTH_PROBE_TIMEOUT_MS, so neither a full Hikari
+            // pool nor a full request dispatcher can delay it.
             get("/healthz") {
-                val ok =
-                    runCatching {
-                        jdbi.withHandle<Int, Exception> { h ->
-                            h.createQuery("SELECT 1").mapTo(Int::class.javaObjectType).one()
-                        }
-                    }.isSuccess
+                val ok = healthProbe.reachable()
                 if (ok) {
                     call.respondText("ok")
                 } else {
@@ -325,5 +364,17 @@ class App private constructor(
             removalStore.close()
             objectStore.close()
         }
+    }
+
+    /**
+     * Release what [module] and the probe own: the blocking request
+     * dispatcher's threads and `/healthz`'s connection. Separate from
+     * [startBackground]'s handle because a process can serve without
+     * any loops running (and most test fixtures do); `Main.kt` closes
+     * both.
+     */
+    override fun close() {
+        requestDispatcher.close()
+        healthProbe.close()
     }
 }

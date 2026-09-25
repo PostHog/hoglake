@@ -41,14 +41,16 @@ paths:
     get:
       operationId: healthz
       summary: >
-        Readiness — the catalog database must answer (SELECT 1 through
-        the pool, fail-fast on a dead pool). Use as the Kubernetes
-        readiness probe.
+        Readiness — the catalog database must answer (SELECT 1 on the
+        probe's own dedicated connection, not through the request pool,
+        bounded by HOGLAKE_HEALTH_PROBE_TIMEOUT_MS). A busy request
+        pool reads 200; only a database that does not answer reads 503.
+        Use as the Kubernetes readiness probe.
       responses:
         "200":
           description: The catalog is reachable.
         "503":
-          description: The catalog is unreachable or the pool is dead.
+          description: The catalog database did not answer inside the probe's deadline.
   /metrics:
     servers: [{ url: / }]
     get:
