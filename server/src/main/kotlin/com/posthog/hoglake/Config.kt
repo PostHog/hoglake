@@ -135,7 +135,162 @@ data class Config(
      * its own commit tail, which is the one place it must not run.
      */
     val verifyIntervalMs: Long = env("HOGLAKE_VERIFY_INTERVAL_MS", "0").toLong(),
-    /** Catalog-health gauge sample interval; <= 0 disables the sampler loop. */
+    /**
+     * Retirement sweep interval; <= 0 disables. Default **0 — OFF**, the
+     * position compaction and verify take, and for the same reason: the
+     * loop belongs to ONE workload. A retirement batch takes the
+     * per-catalog COMMIT lock, so a sweep running on the API replicas
+     * would tax the commit tail they exist to serve. The chart turns it
+     * on for the maintenance Deployment.
+     *
+     * What it does: deletes the file rows of tables that were dropped
+     * at or below the catalog's expiry floor, in paced batches, queueing
+     * every path for the cleanup drain. Drop itself is O(columns) and
+     * leaves those rows alone (TableRepo.markDropped), so this loop is
+     * where a dropped table's storage actually goes away.
+     *
+     * A catalog with NO snapshot retention never retires anything,
+     * because its floor never advances and every snapshot below the
+     * drop is still readable. That is correct, not a gap: retiring
+     * there would delete rows a legal time-travel read can still ask
+     * for. `/verify`'s orphans check reports that population as an
+     * informational count rather than a violation.
+     */
+    val retirementIntervalMs: Long = env("HOGLAKE_RETIREMENT_INTERVAL_MS", "0").toLong(),
+    /**
+     * Rows per retirement batch — one transaction, one hold of the
+     * per-catalog commit lock.
+     *
+     * 8,000 rows is a ~160 ms hold at the measured 19.6 us per row
+     * (`RetirementCostIntegrationTest`, a fixture with the production
+     * 9:1 stats ratio and two partition values per file), or ~250 ms on
+     * the slower fixture the design was sized against. Either way it is
+     * well inside a quarter of the 30 s commit admission bound, and
+     * with HOGLAKE_RETIREMENT_PAUSE_MS of 750 it is an 18-25% duty
+     * cycle on the commit lock.
+     *
+     * The cost per row is NOT a constant of the code: it is the row
+     * plus its cascade — the per-column stats rows and the partition
+     * values — so a 200-column table costs ~20x a narrow one per row.
+     * That is why a batch that hits its statement bound halves this for
+     * the table that did it rather than failing the run.
+     *
+     * At 3,008,849 rows (gigahog-prod-us `main.events_raw`) these
+     * defaults are ~376 batches and ~8.7 GB of WAL in total (2,902
+     * measured bytes per row, a figure that does not move with the
+     * machine), of which the commit lock is held for ~60 s ALTOGETHER.
+     *
+     * THE WALL CLOCK IS SET BY THE LOOP, NOT BY THE WORK. A batch costs
+     * ~160 ms of hold plus a 750 ms pause, and the pause is charged
+     * against HOGLAKE_RETIREMENT_RUN_BUDGET_MS because the budget is
+     * wall clock — so one 60 s run is ~66 batches, and 376 batches is
+     * ~6 RUNS. Elapsed time is therefore
+     * `runs x (HOGLAKE_RETIREMENT_INTERVAL_MS + run budget)`: about
+     * 12 minutes at a one-minute interval, about 1.6 hours at fifteen.
+     * That is the knob to move if a retirement has to finish sooner —
+     * not the batch size, which is the commit lock's problem.
+     */
+    val retirementBatch: Int = env("HOGLAKE_RETIREMENT_BATCH", "8000").toInt(),
+    /**
+     * Pause between retirement batches, in ms. This is the duty cycle,
+     * and it is the knob that decides what a retirement run costs the
+     * writers: at the default batch the hold is ~250 ms, so 750 ms of
+     * pause means the lock is available three quarters of the time and
+     * a foreground commit's expected wait is ~62 ms (its p99 tax is
+     * about one hold, ~250 ms).
+     *
+     * 0 makes the run continuous, which is the old drop's behaviour
+     * spread over many transactions: correct, much faster, and not
+     * something to do while anything is writing.
+     */
+    val retirementPauseMs: Long = env("HOGLAKE_RETIREMENT_PAUSE_MS", "750").toLong(),
+    /**
+     * Wall-clock budget for ONE retirement run, per catalog, in ms.
+     *
+     * A 50M-row table must be paced by the LOOP INTERVAL rather than by
+     * one continuously-held run: without this a single run would work
+     * for hours, keep a pooled connection and a session advisory lock
+     * for all of it, and make every deploy of the maintenance pod
+     * throw away however much of that run was in flight. With it, a
+     * run does a minute of work and the next interval continues —
+     * there is no cursor to lose, because the victim select is just
+     * "what is still live on this dropped table".
+     */
+    val retirementRunBudgetMs: Long = env("HOGLAKE_RETIREMENT_RUN_BUDGET_MS", "60000").toLong(),
+    /**
+     * Undrained hog_file_removal rows past which a retirement run
+     * declines to start for that catalog.
+     *
+     * RETIREMENT'S OUTPUT IS CLEANUP'S INPUT: every row it deletes
+     * queues a path. Left unpaced against the drain, a 3M-row table
+     * converts a bounded metadata problem into a 3M-row queue — ~1.9 GB
+     * of ledger at ~631 bytes per undrained row — and the
+     * drain is the slower of the two by a wide margin.
+     *
+     * WHAT 500,000 IS, IN BOTH CONFIGURATIONS, because the drain rate
+     * is `HOGLAKE_CLEANUP_BATCH` per `HOGLAKE_CLEANUP_INTERVAL_MS` and
+     * the two differ by two orders of magnitude:
+     *
+     *  - at the STANDING defaults (2,000 per 30 min = 4,000/h) the
+     *    ceiling is ~125 hours of drain — which is the point. On a
+     *    normally-configured instance this ceiling is not a throttle,
+     *    it is a CIRCUIT BREAKER: reaching it means the drain has been
+     *    failing or turned off, and retiring more would be filling a
+     *    bucket with no bottom;
+     *  - at the runbook's EVENT settings (10,000 per 60 s = 600,000/h)
+     *    it is ~50 minutes of drain, which is the throttle: retirement
+     *    runs ahead, hits the ceiling, waits for the drain, resumes.
+     *
+     * IT IS CHECKED ONCE PER RUN, so the EFFECTIVE CAP IS ABOUT TWICE
+     * THIS NUMBER. A run that starts just under the ceiling is not
+     * stopped again until the next one, and at the default batch a
+     * 60 s run commits ~528,000 more rows — so 500,000 admits a peak
+     * queue of ~1,030,000 undrained rows, about **631 MB** of
+     * `hog_file_removal` at the measured 631 bytes per undrained row,
+     * not the ~315 MB the number on its own suggests. Checking per
+     * BATCH would tighten it to ~the ceiling, and would cost that
+     * count — ~100k buffers at three million rows — 376 times per run
+     * instead of once. Size storage against the doubled figure.
+     *
+     * An operator running a large retirement raises the cleanup rate
+     * FIRST; this number is what stops a forgotten step from becoming a
+     * 1.9 GB queue. It costs ONE count per run — about 100k buffers at
+     * 3M queued rows — never one per batch.
+     */
+    val retirementQueueCeiling: Long =
+        env(
+            "HOGLAKE_RETIREMENT_QUEUE_CEILING",
+            "$DEFAULT_RETIREMENT_QUEUE_CEILING",
+        ).toLong(),
+    /**
+     * Catalog-health gauge sample interval; <= 0 disables the sampler
+     * loop.
+     *
+     * STILL 15 s, AND STILL ON EVERY REPLICA — deliberately left alone
+     * by #193, which is a decision rather than an omission.
+     * `CatalogMetrics.SAMPLE_SQL` is now ONE pass over the manifest
+     * instead of five correlated subqueries per catalog (measured
+     * 9,467 -> 1,168 execution buffers on a 60,000-row fixture), but
+     * one pass is still a FULL SCAN of `hog_data_file`: there is no
+     * index that answers "sum the live rows", and at
+     * gigahog-prod-us's ~1.5 GiB manifest that is ~1.5 GiB of buffer
+     * traffic every 15 seconds on every pod that registers the loop —
+     * which `App.startBackground` does unconditionally.
+     *
+     * Turning the DEFAULT to 0, the way compaction, verify and
+     * retirement default off, would be a one-line change here and a
+     * fleet-wide observability regression: every `hoglake_*` gauge,
+     * `/v1/info`'s instance totals and the catalogs listing's per-
+     * catalog totals are served from this sample, and a deployment
+     * that did not know to set the variable would simply go dark. So
+     * the default stays and the runbook carries the ops step instead —
+     * `HOGLAKE_METRICS_INTERVAL_MS=0` on the API replicas, or >= 300000
+     * fleet-wide — which is a chart change somebody makes on purpose.
+     *
+     * The real fix is a sample that does not scan the manifest at all
+     * (the asynchronous summary the maintenance sampler already
+     * maintains is the shape); that is a separate change.
+     */
     val metricsIntervalMs: Long = env("HOGLAKE_METRICS_INTERVAL_MS", "15000").toLong(),
     /**
      * Commit admission bound (B2): lock_timeout on the commit
@@ -400,6 +555,27 @@ data class Config(
         // check exists so that forgetting to is a boot failure naming
         // both knobs rather than a Hikari timeout during the first busy
         // sweep.
+        // A CEILING OF ZERO IS NOT "NO PACING", IT IS "NEVER RUN", and
+        // it fails in the worst available way: the run skips, and
+        // before #193's stamp reordering it skipped before recording
+        // eligibility too, so `/verify`'s orphans arm could not fire
+        // either. Retirement would sit at zero forever while every
+        // counter and every check said the system was healthy.
+        //
+        // `count(*) > 0` is true of any catalog with a single undrained
+        // row, which a live catalog always has, so there is no reading
+        // of 0 that means anything an operator wants. Refuse it at
+        // boot, naming BOTH knobs, because the mistake is a pair: a
+        // ceiling of 0 is harmless while the loop is off and fatal the
+        // moment somebody turns it on.
+        require(retirementIntervalMs <= 0 || retirementQueueCeiling > 0) {
+            "HOGLAKE_RETIREMENT_QUEUE_CEILING=0 with HOGLAKE_RETIREMENT_INTERVAL_MS=" +
+                "$retirementIntervalMs would disable retirement silently: every run would skip " +
+                "on the cleanup-queue check and nothing — not the run ledger, not the metrics, " +
+                "not /verify's orphans check — would say so. Set a positive ceiling (the default " +
+                "is $DEFAULT_RETIREMENT_QUEUE_CEILING) or set HOGLAKE_RETIREMENT_INTERVAL_MS=0 " +
+                "to turn the loop off on purpose."
+        }
         require(compactionParallelGroups <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
             "HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups needs a database pool " +
                 "of at least ${compactionParallelGroups + FOREGROUND_CONNECTION_RESERVE} " +
@@ -417,6 +593,13 @@ data class Config(
          * not a model of demand.
          */
         const val FOREGROUND_CONNECTION_RESERVE = 4
+
+        /**
+         * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so
+         * the boot refusal above can quote it rather than restate the
+         * literal the property already carries.
+         */
+        const val DEFAULT_RETIREMENT_QUEUE_CEILING = 500_000L
 
         /** Env vars that no longer exist, and what replaced them. */
         private val REMOVED_ENV =

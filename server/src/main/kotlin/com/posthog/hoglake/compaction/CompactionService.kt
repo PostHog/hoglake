@@ -2251,6 +2251,43 @@ class CompactionService(
                 return@inTransactionUnchecked GroupOutcome.SkippedConflict
             }
 
+            // THE TABLE IS STILL THE AUTHORITY AT COMMIT TIME. The
+            // planner's `liveTables` already excludes dropped tables, so
+            // a group is only ever planned against a live one; what this
+            // covers is the IN-FLIGHT window — a rewrite takes ~8.5 s of
+            // object-store latency, and a DROP can land inside it.
+            //
+            // Until #193 the fence was accidental: the drop end-snapshotted
+            // every file row, so the `live` check below caught it. Now a
+            // drop touches no file row at all, so every input is still
+            // `end_snapshot IS NULL` and the group would COMMIT — writing
+            // a new data file, a snapshot and a change row into a table
+            // that no longer exists, and settling its staging ticket
+            // `registered` so cleanup would never reclaim the object it
+            // just uploaded. Read under the same lock as everything else
+            // here, so a drop either precedes this read or waits behind
+            // this transaction.
+            val droppedSnapshot =
+                h.createQuery(
+                    """
+                SELECT dropped_snapshot FROM hog_table
+                WHERE catalog_id = :catalogId AND table_id = :tableId
+                """,
+                )
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("tableId", ctx.tableId)
+                    .mapTo(Long::class.javaObjectType)
+                    .findOne()
+                    .orElse(null)
+            if (droppedSnapshot != null) {
+                log.info {
+                    "compaction group for ${ctx.namespace}.${ctx.table} was rewritten against a " +
+                        "table dropped in snapshot $droppedSnapshot; skipping the commit. The " +
+                        "uploaded output stays staged and the normal cleanup drain reclaims it"
+                }
+                return@inTransactionUnchecked GroupOutcome.SkippedConflict
+            }
+
             // Re-verify under the lock: every input must still be live and
             // must still carry EXACTLY its planned DV (supersession mints a
             // new delete_file_id; growth without supersession is impossible).

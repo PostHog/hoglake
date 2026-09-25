@@ -24,6 +24,11 @@ const TASKS: MaintenanceTask[] = [
   "cleanup",
   "compaction",
   "verify",
+  // Appended, not inserted: this array is the matrix's COLUMN ORDER and
+  // an operator reads it left to right in the order the pipeline runs.
+  // Retirement feeds cleanup, so it sits at the end rather than beside
+  // it.
+  "retirement",
 ];
 
 /**
@@ -90,6 +95,31 @@ function taskCell(t: MaintenanceTaskStatus): {
         warn: false,
         title: "Metadata-only invariant scan; runs on demand",
       };
+    case "retirement": {
+      // No backlog number exists for this task (the honest one is a
+      // manifest scan), so the cell carries the LAST RUN's headline
+      // instead — which is also the only thing that can say whether the
+      // loop is getting anywhere. A run stopped by the cleanup queue's
+      // ceiling is the one shape worth a warning: it means retirement
+      // has outrun the drain and neither is making progress.
+      const last = t.last_run;
+      const result = last && last.task === "retirement" ? last.result : null;
+      const held =
+        result !== null &&
+        result.skipped_queue_full !== "0" &&
+        result.skipped_queue_full !== undefined;
+      return {
+        number: result ? `${formatCount(result.rows_retired)} rows retired` : "",
+        warn: held,
+        title: held
+          ? "Retirement is paused: the cleanup queue is over " +
+            "HOGLAKE_RETIREMENT_QUEUE_CEILING, so more retiring would only " +
+            "grow a queue that is not draining"
+          : "Paced deletion of dropped tables' file rows. Only runs once a " +
+            "drop has sunk to the catalog's expiry floor, so a catalog with " +
+            "no snapshot retention never retires anything.",
+      };
+    }
   }
 }
 
@@ -178,7 +208,7 @@ export function CentralMaintenancePage() {
               ))}
             </tr>
           </thead>
-          <SkeletonRows rows={3} cols={6} />
+          <SkeletonRows rows={3} cols={TASKS.length + 1} />
         </table>
       )}
       {status.data && (
@@ -196,7 +226,7 @@ export function CentralMaintenancePage() {
           <tbody>
             {catalogs.length === 0 && (
               <tr>
-                <td colSpan={6} className="empty">
+                <td colSpan={TASKS.length + 1} className="empty">
                   No catalogs yet.
                 </td>
               </tr>

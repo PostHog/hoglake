@@ -2126,6 +2126,16 @@ paths:
           description: >
             Commit conflict (concurrent DDL on a touched table). The
             client refreshes its read snapshot and retries.
+
+
+            Error code `table_dropped` is the one 409 a retry cannot
+            fix: a table the commit named EXISTS but has been dropped,
+            and the detail carries the snapshot it was dropped in. It is
+            typed apart from the 422 below because "you named a table
+            that does not exist" and "the table you were writing to was
+            dropped out from under you" are different facts with
+            different remedies, and both used to arrive as the same
+            `unknown table` validation failure.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -3957,9 +3967,135 @@ components:
             response this server serves carries it explicitly and only
             a replayed historical row can lack it.
 
+    RetirementResult:
+      type: object
+      required: [tables, rows_retired, dvs_retired, paths_queued, batches,
+                 timeouts, skipped_tables, skipped_queue_full, skipped_locked,
+                 convoyed, tables_remaining]
+      description: >
+        One retirement run's outcome for one catalog: the paced deletion
+        of the file rows a dropped table left behind.
+
+
+        DROP IS O(COLUMNS). Dropping a table sets
+        hog_table.dropped_snapshot and end-snapshots its version and
+        column rows, and touches none of its file rows — the table is
+        the authority on whether its rows are reachable. This loop is
+        what later deletes those rows and queues their objects, in
+        batches, once the drop snapshot has sunk to or below the
+        catalog's expiry floor (below the floor no retained snapshot can
+        read them; above it, time travel still can).
+
+
+        A catalog with no snapshot retention never retires anything,
+        because its floor never advances. That is correct rather than a
+        gap, and /verify's orphans check reports that population as an
+        informational count instead of a violation.
+
+
+        This payload appears only in the maintenance run ledger. There
+        is no POST trigger for retirement: the loop
+        (HOGLAKE_RETIREMENT_INTERVAL_MS, default 0 = off, turned on for
+        one maintenance workload) is its only driver, because a batch
+        takes the per-catalog commit lock and must not run on a replica
+        serving the commit tail.
+      properties:
+        tables:
+          type: integer
+          format: int64
+          description: Eligible dropped tables this run retired at least one batch of.
+        rows_retired:
+          type: integer
+          format: int64
+          description: >
+            hog_data_file rows deleted. Their per-column stats and
+            partition-value rows go with them through the existing FK
+            cascades.
+        dvs_retired:
+          type: integer
+          format: int64
+          description: >
+            hog_delete_file rows deleted, SUPERSEDED ones included. The
+            batch deletes deletion vectors before their data files and
+            without an end_snapshot predicate, because the data-file
+            delete cascades them away otherwise — un-queued, leaving a
+            puffin object nothing references and nothing reclaims.
+        paths_queued:
+          type: integer
+          format: int64
+          description: >
+            Paths queued into the cleanup queue with reason
+            `table_drop_gc` — rows_retired + dvs_retired, every deleted
+            row queueing its path exactly once. A gap between the sum
+            and this number is an object that lost its only reference.
+        batches:
+          type: integer
+          format: int64
+          description: >
+            Batch transactions that committed. One batch is one hold of
+            the per-catalog commit lock, HOGLAKE_RETIREMENT_BATCH rows
+            wide, with HOGLAKE_RETIREMENT_PAUSE_MS between holds.
+        timeouts:
+          type: integer
+          format: int64
+          description: >
+            Batches cancelled by their own transaction-local
+            statement_timeout and rolled back whole, plus a run that
+            gave up waiting for the commit lock. Each cancelled batch
+            halves the batch size for that table for the rest of the
+            run: the per-row cost is the row plus its cascade, so a wide
+            table's right batch size is a property of the table. A
+            standing nonzero means HOGLAKE_RETIREMENT_BATCH is too big
+            for some table here.
+        skipped_tables:
+          type: integer
+          format: int64
+          description: >
+            Tables whose batch selected rows and deleted none, which
+            ends the run for that table. The select and the deletes name
+            the same primary keys, so this cannot happen on a healthy
+            catalog; the counter exists so the loop stops instead of
+            spinning.
+        skipped_queue_full:
+          type: integer
+          format: int64
+          description: >
+            1 when the run declined to start because the catalog's
+            undrained cleanup queue already exceeded
+            HOGLAKE_RETIREMENT_QUEUE_CEILING. Retirement's output is
+            cleanup's input, and the drain is much the slower of the
+            two.
+        skipped_locked:
+          type: integer
+          format: int64
+          description: >
+            1 when another maintainer already held this catalog's
+            retirement lock and this run stepped aside. Single flight
+            per catalog is the design: queued maintainers tax every
+            foreground commit by roughly one lock hold each and the
+            work is idempotent, so waiting buys nothing.
+        convoyed:
+          type: integer
+          format: int64
+          description: >
+            1 when the run gave up because the per-catalog commit lock
+            was not available inside HOGLAKE_COMMIT_LOCK_TIMEOUT_MS.
+            Counted apart from `timeouts` because the two ask for
+            opposite remedies: a timeout means the batch is too big for
+            the table, a convoy means something else is holding the
+            catalog's lock. Summed together they cancel out as a signal.
+        tables_remaining:
+          type: integer
+          format: int64
+          description: >
+            Eligible tables the run's wall-clock budget
+            (HOGLAKE_RETIREMENT_RUN_BUDGET_MS) stopped it from reaching.
+            Nonzero is the loop pacing itself, not failing: there is no
+            cursor to lose, so the next run simply continues.
+
     MaintenanceTask:
       type: string
-      enum: [hydrator, expiry, cleanup, compaction, verify]
+      enum: [hydrator, expiry, cleanup, compaction, verify, retirement]
       description: The maintenance-task vocabulary of hog_maintenance_run.
 
     MaintenanceRun:
@@ -3996,7 +4132,9 @@ components:
           description: >
             The task's result payload — the matching POST response body:
             ExpiryResult for expiry, CleanupResult for cleanup,
-            CompactionResult for compaction, VerifyReport for verify.
+            CompactionResult for compaction, VerifyReport for verify,
+            RetirementResult for retirement (which has no trigger
+            endpoint: the loop is its only driver).
             Hydrator loop rows carry the sweep's per-catalog counts
             (claimed, hydrated, failed, transient); manual hydrator rows
             carry RehydrateResult.
@@ -4041,7 +4179,8 @@ components:
           description: >
             Whether every sweep of this task records a run, which is how
             a reader must interpret SILENCE here. True (expiry, cleanup,
-            compaction, verify): no runs means no loop is running the
+            compaction, verify, retirement): no runs means no loop is
+            running the
             task. False (hydrator): its sweep is instance-wide and
             records only for the catalogs it claimed files for, so no
             runs means no work arrived for this catalog and says nothing
@@ -4088,7 +4227,14 @@ components:
             cleanup -> queued_removals, oldest_queued_age_seconds
             (absent on an empty queue); compaction -> small_files
             (files the planner would put in a group, excluding groups
-            under their scaled minimum), target_bytes; verify -> none.
+            under their scaled minimum), target_bytes; verify -> none;
+            retirement -> none. Retirement carries no backlog number on
+            purpose: the honest one is live file rows on dropped tables,
+            which is a scan of the manifest and therefore forbidden on
+            this path, and a count of dropped TABLES would answer a
+            different question (one dropped 3M-row table and forty
+            dropped empty ones would read identically). Its run ledger's
+            rows_retired and tables_remaining are the numbers to watch.
 
     DatabaseHealth:
       type: object

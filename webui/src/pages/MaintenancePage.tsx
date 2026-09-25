@@ -140,6 +140,22 @@ function Backlog({
       );
     case "verify":
       return <VerifyPanel catalog={catalog} />;
+    case "retirement":
+      // Deliberately no numbers: this task has no backlog the dashboard
+      // path may compute (see RetirementBacklog). What it has instead is
+      // the rule an operator needs to know before reading the run rows
+      // below, because "0 rows retired, forever" is a CORRECT answer on
+      // a catalog with no retention and looks identical to a broken loop.
+      return (
+        <p className="empty">
+          Deletes the file rows a dropped table left behind, in paced batches,
+          queueing each object for the cleanup drain. A table only becomes
+          eligible once its drop snapshot has sunk to the catalog&rsquo;s
+          expiry floor — above the floor its rows are still readable by time
+          travel — so a catalog with no snapshot retention never retires
+          anything. The runs below are what this task did.
+        </p>
+      );
   }
 }
 

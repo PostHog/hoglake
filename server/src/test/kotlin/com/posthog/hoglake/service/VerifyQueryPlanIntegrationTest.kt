@@ -68,6 +68,15 @@ class VerifyQueryPlanIntegrationTest {
         const val LEDGER_ROWS = 4_000
         const val UPLOAD_CLAIMS = 2_000
 
+        /**
+         * Live file rows on a DROPPED table — the population
+         * `orphans`'s informational arm reports on. Bigger than
+         * `VerifyService.INFORMATIONAL_ROW_CAP` on purpose: the whole
+         * point of the cap is that the arm stops, and a fixture below
+         * it could not tell a capped count from an uncapped one.
+         */
+        const val DROPPED_TABLE_FILES = 20_000
+
         /** The relations these checks read whole; a RESCAN of one is the bug. */
         val MANIFEST_TABLES = listOf("hog_data_file", "hog_delete_file", "hog_file_removal")
 
@@ -168,6 +177,49 @@ class VerifyQueryPlanIntegrationTest {
                 FROM generate_series(1, :n) g
                 """,
             ).bind("c", catalogId).bind("n", UPLOAD_CLAIMS).execute()
+
+            // A DROPPED TABLE STILL HOLDING LIVE FILE ROWS — #193's
+            // normal state between a drop and the retirement sweep, and
+            // the candidate set for `orphans`'s informational arm. Its
+            // rows are a third of the manifest, so an arm that counted
+            // them all would be visibly more expensive than one that
+            // stops at the cap.
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) " +
+                    "VALUES (?, 4242, 1, 1)",
+                catalogId,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start)
+                SELECT :c, 900000 + g, 4242, :begin,
+                       's3://plan/dropped/' || g || '.parquet', 10, 1024, g * 10
+                FROM generate_series(1, :n) g
+                """,
+            ).bind("c", catalogId).bind("begin", head).bind("n", DROPPED_TABLE_FILES).execute()
+            // A SECOND dropped table holding a HANDFUL of rows, and it
+            // is what makes the budget below discriminate. A LATERAL
+            // driven by a sequential scan stops early on the big table
+            // (it finds the cap quickly) and reads the WHOLE MANIFEST
+            // on this one, because there is almost nothing to find — so
+            // a fixture with only the big table would let that plan
+            // pass. Production is mostly this shape: many dropped
+            // tables, most of them small.
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) " +
+                    "VALUES (?, 4243, 1, 1)",
+                catalogId,
+            )
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start)
+                SELECT :c, 990000 + g, 4243, :begin,
+                       's3://plan/dropped-small/' || g || '.parquet', 10, 1024, g * 10
+                FROM generate_series(1, 5) g
+                """,
+            ).bind("c", catalogId).bind("begin", head).execute()
 
             // --- and now one row of EVERY violation class, so no query
             // --- plans against an empty candidate set.
@@ -517,13 +569,103 @@ class VerifyQueryPlanIntegrationTest {
     }
 
     @Test
+    fun `the orphans informational arm is bounded by dropped tables, not by the manifest`() {
+        // THE SHAPE THIS EXCLUDES is a `GROUP BY table_id` over
+        // `hog_data_file` — the obvious way to write "live rows per
+        // dropped table", and O(THE LIVE MANIFEST): it reads every live
+        // row in the catalog to find the ones on dropped tables, on an
+        // hourly aggregate pass against the database that serves the
+        // commit tail. The arm is driven from `hog_table` instead, with
+        // a LATERAL that stops at VerifyService.INFORMATIONAL_ROW_CAP
+        // rows per table.
+        val plan =
+            db.jdbi.inTransactionUnchecked { h ->
+                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                h.createQuery(
+                    "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
+                        VerifyService.ORPHANS_INFORMATIONAL_SQL,
+                ).bind("c", catalogId)
+                    .bind("sampleCap", VerifyService.INFORMATIONAL_ROW_CAP)
+                    .mapTo(String::class.java).list().joinToString("\n")
+            }
+        // The claim is about COST, not about a plan-node name. A
+        // sequential scan is not wrong in itself — on a dropped table
+        // holding a third of the manifest it can stop at the cap
+        // quickly — it is wrong on the SMALL dropped table, where it
+        // has to read everything to find five rows. So what is
+        // asserted is the budget, plus the one structural fact behind
+        // it: the manifest is visited once per DROPPED TABLE, never
+        // once per manifest row.
+        val manifestNode =
+            ExplainPlan.nodes(plan)
+                .firstOrNull { Regex(""" on hog_data_file\b""").containsMatchIn(it.line) }
+        assertThat(manifestNode)
+            .describedAs("the arm must read the manifest at all:%n%s", plan)
+            .isNotNull()
+
+        // THE BUDGET IS DERIVED FROM THE DROPPED TABLES, which is what
+        // the arm is allowed to cost. One dropped table here, capped at
+        // 10,000 rows, against a manifest of 70,000 — so a plan that
+        // counted the table's 20,000 rows, or scanned the manifest,
+        // fails this even though it returns the same answer.
+        val droppedTables =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_table WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL",
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        val executionBuffers =
+            ExplainPlan.nodes(plan.lines().takeWhile { !it.trim().startsWith("Planning:") }.joinToString("\n"))
+                .maxOf { it.buffers }
+        assertThat(manifestNode!!.loops)
+            .describedAs("one visit per dropped table:%n%s", plan)
+            .isLessThanOrEqualTo(droppedTables)
+        // THE BUDGET EXCLUDES THE SEQUENTIAL PLAN, which is the only
+        // way it means anything. Measured on this fixture: the
+        // index-only path costs 196 buffers, the sequential-scan-per-
+        // dropped-table plan 2,367 (1,092 to stop at the cap on the big
+        // table plus the whole 1,275-page manifest to find five rows on
+        // the small one). `cap / 50` per table sits an order of
+        // magnitude below the shape it excludes rather than beside it —
+        // the trap V16's file records, where a constant sat 1.27x under
+        // the degraded plan and discriminated nothing.
+        val budget = droppedTables * VerifyService.INFORMATIONAL_ROW_CAP / 50
+        assertThat(executionBuffers)
+            .describedAs(
+                "%d buffers for %d dropped tables capped at %d rows each, over a manifest of " +
+                    "%d rows:%n%s",
+                executionBuffers,
+                droppedTables,
+                VerifyService.INFORMATIONAL_ROW_CAP,
+                DATA_FILES + DROPPED_TABLE_FILES,
+                plan,
+            )
+            .isLessThanOrEqualTo(budget)
+
+        // And the count SATURATES rather than lying: the fixture holds
+        // more rows than the cap, so the line says "at least".
+        val report = VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce("plan")
+        val orphans = report.checks.single { it.check == "orphans" }
+        assertThat(orphans.status)
+            .describedAs("a dropped table awaiting retirement is not a violation")
+            .isEqualTo("pass")
+        assertThat(orphans.samples)
+            .anySatisfy { assertThat(it).contains("at least ${VerifyService.INFORMATIONAL_ROW_CAP}") }
+        println(
+            "[#193] /verify orphans informational arm: $executionBuffers buffers for " +
+                "$droppedTables dropped tables (cap ${VerifyService.INFORMATIONAL_ROW_CAP}) over a " +
+                "${DATA_FILES + DROPPED_TABLE_FILES}-row manifest",
+        )
+    }
+
+    @Test
     fun `the scan resolves on a 50k-file catalog and reports exactly the seeded violations`() {
         // Not a wall-clock budget — that is a property of the machine.
         // What is worth pinning is that twelve aggregate queries over a
         // manifest this size RESOLVE, and that the checks see exactly
         // the violations the fixture planted: the same rows that give
         // every plan above its candidates.
-        val report = VerifyService(db.jdbi).runOnce("plan")
+        val report = VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce("plan")
         assertThat(report.checks).hasSize(12)
         val failing = report.checks.filter { it.status != "pass" }.associate { it.check to it.violations }
         assertThat(failing)

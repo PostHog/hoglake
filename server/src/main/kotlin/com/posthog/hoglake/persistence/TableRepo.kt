@@ -276,7 +276,26 @@ object TableRepo {
             .execute()
     }
 
-    /** Resolve a table by (namespace, name) visible at [snapshot]. */
+    /**
+     * Resolve a table by (namespace, name) visible at [snapshot].
+     *
+     * THE VERSION ROW IS THE GATE, and the `hog_table` clause is
+     * defence in depth. [markDropped] closes the live `hog_table_version`
+     * row AT the drop snapshot, so invariant 6's predicate on `tv`
+     * already excludes every S >= dropped_snapshot; the extra clause
+     * restates the same fact from the identity row, which is the row a
+     * retirement sweep reads. It is free — the plan is unchanged, the
+     * join to `hog_table` is already there for `table_uuid` — and it is
+     * what makes "no code path treats a dropped table's rows as
+     * reachable" true of this function on its own terms rather than
+     * only as a consequence of another function's UPDATE.
+     *
+     * The `:snapshot < t.dropped_snapshot` arm is load-bearing and must
+     * never be simplified to `dropped_snapshot IS NULL`: time travel
+     * BELOW the drop is still legal, and that is exactly what the
+     * retirement gate (`dropped_snapshot <= earliest_snapshot_id`)
+     * preserves until the floor has passed the drop.
+     */
     fun findAt(
         handle: Handle,
         catalogId: Long,
@@ -295,6 +314,7 @@ object TableRepo {
               AND tv.name = :name
               AND tv.begin_snapshot <= :snapshot
               AND (tv.end_snapshot IS NULL OR :snapshot < tv.end_snapshot)
+              AND (t.dropped_snapshot IS NULL OR :snapshot < t.dropped_snapshot)
             """,
         )
             .bind("catalogId", catalogId)
@@ -305,7 +325,20 @@ object TableRepo {
             .findOne()
             .orElse(null)
 
-    /** Resolve a live (head-visible) table by (namespace, name). */
+    /**
+     * Resolve a live (head-visible) table by (namespace, name).
+     *
+     * `dropped_snapshot IS NULL` is CommitService's own
+     * `resolveLiveTable` clause, verbatim, and it is here for the same
+     * reason it is there:
+     * the table is the authority on whether its rows are reachable.
+     * [markDropped] ends the version row in the same transaction, so on
+     * well-formed data the two clauses agree; this one holds when the
+     * other cannot (a version row a future change leaves open, a row
+     * repaired by hand) and it is what every caller of this function —
+     * drop, truncate, alter, rehydrate, compaction's table resolution —
+     * inherits without having to remember.
+     */
     fun findLive(
         handle: Handle,
         catalogId: Long,
@@ -322,6 +355,7 @@ object TableRepo {
               AND tv.namespace_id = :namespaceId
               AND tv.name = :name
               AND tv.end_snapshot IS NULL
+              AND t.dropped_snapshot IS NULL
             """,
         )
             .bind("catalogId", catalogId)
@@ -331,7 +365,24 @@ object TableRepo {
             .findOne()
             .orElse(null)
 
-    /** All live tables in a namespace, ordered by name. */
+    /**
+     * All live tables in a namespace, ordered by name.
+     *
+     * Carries [findLive]'s `dropped_snapshot IS NULL` clause, and the
+     * symmetry is not cosmetic: the consumer is `dropNamespace`'s
+     * emptiness precondition, and since #193 a dropped table's rows
+     * survive until retirement collects them. Without the clause a
+     * table that was dropped but not yet retired would be counted as a
+     * live child and would REFUSE the namespace drop — a 409 naming a
+     * table the catalog no longer has, which no operator could clear
+     * except by waiting for a floor to move.
+     *
+     * On well-formed data `tv.end_snapshot IS NULL` already excludes
+     * it, because `markDropped` closes the version row in the same
+     * transaction; this is the same defence in depth [findLive] carries,
+     * in the one place where being wrong is a refusal rather than a
+     * missing row.
+     */
     fun listLive(
         handle: Handle,
         catalogId: Long,
@@ -346,6 +397,7 @@ object TableRepo {
             WHERE tv.catalog_id = :catalogId
               AND tv.namespace_id = :namespaceId
               AND tv.end_snapshot IS NULL
+              AND t.dropped_snapshot IS NULL
             ORDER BY tv.name
             """,
         )
@@ -584,8 +636,29 @@ object TableRepo {
 
     /**
      * Drop bookkeeping at [snapshot]: sets hog_table.dropped_snapshot
-     * and end-snapshots the live version and column rows. Data files
-     * are end-snapshotted by [FileRepo.endLiveFiles].
+     * and end-snapshots the live version and column rows.
+     *
+     * THIS IS THE WHOLE DROP. Three UPDATEs, O(columns) — the identity
+     * row, the one live version row, and one row per live column — and
+     * nothing that sizes with the table's DATA. The file rows are NOT
+     * touched: a dropped table's files stop being reachable because the
+     * TABLE says so (`dropped_snapshot`), not because every row was
+     * rewritten to say so, and the rows themselves leave later, paced,
+     * through the retirement sweep once the drop snapshot sinks under
+     * the catalog's expiry floor.
+     *
+     * It used to end-snapshot them here, under the per-catalog commit
+     * lock, in this transaction: 3,008,849 rows measured at 44.6 s and
+     * 3.9 GB of WAL warm and uncontended on gigahog-prod-us's
+     * `main.events_raw`, which is every commit in the catalog blocked
+     * for that long and a statement timeout that rolls the drop back
+     * and leaves the table undroppable. `dropped_snapshot` is set in
+     * the same statement it always was; what changed is that it is now
+     * the only thing anything has to read.
+     *
+     * `FileRepo.endLiveFiles` / `endLiveDeleteFiles` still exist and
+     * still have exactly one caller: truncate, which is out of scope
+     * here and keeps that hazard (its own design doc).
      */
     fun markDropped(
         handle: Handle,

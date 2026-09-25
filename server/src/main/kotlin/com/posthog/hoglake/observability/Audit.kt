@@ -120,6 +120,11 @@ object Audit {
         when (e) {
             is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.AlreadyExists -> "conflict"
+            // A commit into a dropped table is a 409 like the other
+            // two, and it used to arrive here as Validation. Without
+            // this branch the typed refusal would fall to "error" and
+            // a writer racing a drop would read as a server fault.
+            is HoglakeException.TableDropped -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"

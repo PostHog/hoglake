@@ -78,7 +78,7 @@ class CompactionServiceIntegrationTest {
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
     private val scans = ScanService(db.jdbi)
-    private val verify = VerifyService(db.jdbi)
+    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val creations = TableCreationService(db.jdbi, catalogs, commits)
     private val counter = AtomicInteger(0)
 

@@ -50,7 +50,10 @@ describe("MaintenancePage", () => {
     // Wait for the status query to land (the runs table's h3 renders first).
     await screen.findByText("every ~69s");
 
-    // All five tasks, in the server's fixed order.
+    // All six tasks, in the server's fixed order. Retirement is LAST:
+    // MaintenanceStatusService appends it rather than inserting it,
+    // because this order is what the central matrix's columns and every
+    // positional assertion read.
     const panels = screen
       .getAllByRole("heading", { level: 3 })
       .map((h) => h.textContent ?? "")
@@ -61,6 +64,7 @@ describe("MaintenancePage", () => {
       expect.stringContaining("cleanup"),
       expect.stringContaining("compaction"),
       expect.stringContaining("verify"),
+      expect.stringContaining("retirement"),
     ]);
 
     // Panels by their heading (the runs table repeats task names in cells).
@@ -261,7 +265,7 @@ describe("MaintenancePage", () => {
 
     const table = screen.getAllByRole("table")[0];
     const rows = within(table).getAllByRole("row").slice(1); // drop header
-    expect(rows).toHaveLength(6);
+    expect(rows).toHaveLength(7);
 
     // Newest first: run 104 (expiry) on top, 99 (failed expiry) last.
     expect(within(rows[0]).getByText("104")).toBeInTheDocument();
@@ -271,7 +275,7 @@ describe("MaintenancePage", () => {
     ).toBeInTheDocument();
 
     // The failed run shows its error, not a result.
-    const last = rows[5];
+    const last = rows[6];
     expect(within(last).getByText("failed")).toBeInTheDocument();
     expect(
       within(last).getByText("FATAL: connection to server lost"),
@@ -358,7 +362,7 @@ describe("MaintenancePage", () => {
     renderApp("/catalogs/analytics/maintenance");
 
     await screen.findByText("every ~69s");
-    expect(screen.getAllByText("No recorded run yet.")).toHaveLength(5);
+    expect(screen.getAllByText("No recorded run yet.")).toHaveLength(6);
     expect(
       await screen.findByText("No runs recorded yet."),
     ).toBeInTheDocument();

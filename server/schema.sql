@@ -135,6 +135,16 @@ CREATE TABLE hog_table (
     -- referenced row is in this same table and is retired, never deleted,
     -- and a cascade is exactly the behaviour we do not want.
     replaced_table_id bigint,
+    -- V20: when the retirement sweep FIRST observed this dropped table
+    -- at or below the catalog's expiry floor — i.e. when its file rows
+    -- became deletable. NULL for a live table, and for a dropped one no
+    -- sweep has reached yet. Not read on any request path;
+    -- `/verify`'s orphans check reads it, so it can date a leak from
+    -- ELIGIBILITY rather than from the drop (on a catalog whose floor
+    -- moves slowly those are very different instants, and dating from
+    -- the drop would alert on a system working as designed). Stamped
+    -- once, never cleared.
+    retirement_eligible_at timestamptz,
     PRIMARY KEY (catalog_id, table_id),
     UNIQUE (catalog_id, table_uuid),
     -- The edge has no FK, so this is its only structural defence: a
@@ -575,7 +585,7 @@ CREATE TABLE hog_maintenance_run (
     run_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     catalog_id  bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
     task        text   NOT NULL CHECK (task IN ('hydrator', 'expiry', 'cleanup',
-                                                'compaction', 'verify')),
+                                                'compaction', 'verify', 'retirement')),
     -- 'loop' = a BackgroundLoops sweep; 'manual' = a /maintenance/*
     -- trigger (for task 'hydrator', manual rows are rehydrate calls).
     run_trigger text   NOT NULL CHECK (run_trigger IN ('loop', 'manual')),

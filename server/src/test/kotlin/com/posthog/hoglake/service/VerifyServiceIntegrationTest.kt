@@ -37,7 +37,7 @@ class VerifyServiceIntegrationTest {
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
     private val expiry = ExpiryService(db.jdbi)
-    private val verify = VerifyService(db.jdbi)
+    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val creations = TableCreationService(db.jdbi, catalogs, commits)
 
     /** Ids for synthetic rows, well above anything the services allocate. */
@@ -295,8 +295,28 @@ class VerifyServiceIntegrationTest {
             .contains("shrank")
     }
 
+    /**
+     * REWRITTEN for #193, and the reason is the whole point of the
+     * check now.
+     *
+     * This case used to seed a live `hog_data_file` row on a dropped
+     * table and assert `orphans` failed. That predicate was correct
+     * while a drop end-snapshotted every file row in its own
+     * transaction; it is now the NORMAL state of every dropped table
+     * between the drop and the retirement sweep, so asserting it fails
+     * would be asserting that the design is a defect — the check would
+     * fire on every drop on every catalog, which is an alert nobody
+     * reads.
+     *
+     * What is still a defect, and what this now pins, is a table
+     * retirement should have FINISHED: its drop snapshot at or below
+     * the expiry floor, and stamped retirement-eligible longer ago than
+     * the grace, with live file rows left on it. The fixture builds
+     * exactly that state, and the case below it builds the same state
+     * one step earlier and asserts the check stays GREEN.
+     */
     @Test
-    fun `a live file row on a dropped table trips orphans only`() {
+    fun `a dropped table past its retirement grace with live file rows trips orphans only`() {
         val catalog = "vfy-orphan"
         val cid = seed(catalog) // no files: nothing for tiling/next_row_id to see
         catalogs.dropTable(catalog, "ns", "t")
@@ -310,7 +330,89 @@ class VerifyServiceIntegrationTest {
                 """,
             ).bind("c", cid).execute()
         }
-        assertOnlyFails(verify.runOnce(catalog), "orphans")
+        // The floor passes the drop, and retirement saw the table an
+        // hour ago. Both halves are load-bearing: with either one
+        // missing the check must stay green (the two cases below).
+        //
+        // The floor is moved by the REAL sweep, never by UPDATEing
+        // `earliest_snapshot_id`: the floor is that column PLUS the
+        // reclamation that goes with it (the snapshots below it, and
+        // the versioned DDL rows ending under it), and moving only the
+        // column leaves a state the service never produces —
+        // `snapshot_density` and `expiry_floor` then both fire, and
+        // this case would be asserting three violations while claiming
+        // to assert one.
+        advanceFloor(catalog)
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table SET retirement_eligible_at = now() - interval '1 hour'
+                WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL
+                """,
+            ).bind("c", cid).execute()
+        }
+        // A one-second grace, so "an hour ago" is past it. MUTATION:
+        // drop either qualifier from the arm (the floor comparison or
+        // the eligible-age comparison) and the two cases below go red
+        // instead.
+        val tight = VerifyService(db.jdbi, retirementOrphanGraceSeconds = 1, retirementIntervalMs = 0)
+        assertOnlyFails(tight.runOnce(catalog), "orphans")
+        assertThat(tight.runOnce(catalog).check("orphans").samples.first())
+            .contains("retirement is not draining it")
+    }
+
+    @Test
+    fun `orphans stays green while a dropped table is still legitimately awaiting retirement`() {
+        val catalog = "vfy-orphan-waiting"
+        val cid = seed(catalog)
+        catalogs.dropTable(catalog, "ns", "t")
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                           path, record_count, file_size_bytes, row_id_start)
+                SELECT :c, 996, table_id, 1, 's3://vfy/$catalog/live-on-dropped.parquet', 0, 0, 0
+                FROM hog_table_stats WHERE catalog_id = :c
+                """,
+            ).bind("c", cid).execute()
+        }
+        val tight = VerifyService(db.jdbi, retirementOrphanGraceSeconds = 1, retirementIntervalMs = 0)
+
+        // (a) The floor has NOT reached the drop. The rows are still
+        // readable by time travel, so retirement may not touch them.
+        // This is the retention-NULL catalog's permanent state.
+        assertOnlyFails(tight.runOnce(catalog))
+        // ...and the population is still VISIBLE, as an informational
+        // sample on a passing check. MUTATION: delete the informational
+        // arm and this reds while every status assertion stays green,
+        // which is the failure mode it exists to prevent — storage held
+        // by a dropped table with nothing reporting it.
+        val waiting = tight.runOnce(catalog).check("orphans")
+        assertThat(waiting.status).isEqualTo("pass")
+        assertThat(waiting.violations).isZero()
+        assertThat(waiting.samples)
+            .anySatisfy { assertThat(it).contains("still holds 1 live data-file rows") }
+        assertThat(waiting.samples)
+            .anySatisfy { assertThat(it).contains("not yet eligible") }
+
+        // (b) The floor passes, but no sweep has stamped the table yet:
+        // retirement is off, or has not reached it. Not distinguishable
+        // from "eligible one second ago", so not a violation.
+        advanceFloor(catalog)
+        assertOnlyFails(tight.runOnce(catalog))
+
+        // (c) The floor passes AND the sweep saw it, but only just.
+        db.jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                UPDATE hog_table SET retirement_eligible_at = now()
+                WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL
+                """,
+            ).bind("c", cid).execute()
+        }
+        val generous =
+            VerifyService(db.jdbi, retirementOrphanGraceSeconds = 3600, retirementIntervalMs = 0)
+        assertOnlyFails(generous.runOnce(catalog))
     }
 
     @Test
@@ -1148,7 +1250,7 @@ class VerifyServiceIntegrationTest {
         // — and the number it quotes has to be the number it enforces.
         val catalog = "vfy-staging-bound"
         val cid = seed(catalog)
-        val tight = VerifyService(db.jdbi, stagingTicketMaxAgeSeconds = 5)
+        val tight = VerifyService(db.jdbi, stagingTicketMaxAgeSeconds = 5, retirementIntervalMs = 0)
         assertThat(tight.runOnce(catalog).check("staging_tickets").description)
             .contains("older than 5 seconds")
             .doesNotContain("${VerifyService.DEFAULT_STAGING_TICKET_MAX_AGE_SECONDS} seconds")
@@ -1169,11 +1271,21 @@ class VerifyServiceIntegrationTest {
                 db.jdbi,
                 compactionTargetBytes = 64L * 1024 * 1024,
                 cleanupIntervalMs = 120_000,
+                retirementIntervalMs = 300_000,
             )
         assertThat(tuned.runOnce(catalog).check("staging_tickets").description)
             .contains("HOGLAKE_COMPACTION_TARGET_BYTES, 64 MiB here")
             .contains("HOGLAKE_CLEANUP_INTERVAL_MS, every 120 seconds here")
-        val off = VerifyService(db.jdbi, cleanupIntervalMs = 0)
+        // The orphans description quotes the retirement cadence the
+        // same way, and both branches of it are asserted: a nonzero
+        // interval names itself, a zero one says the loop belongs
+        // somewhere else rather than quoting a default nobody runs.
+        assertThat(tuned.runOnce(catalog).check("orphans").description)
+            .contains("HOGLAKE_RETIREMENT_INTERVAL_MS, every 300000 ms here")
+        val retirementOff = VerifyService(db.jdbi, retirementIntervalMs = 0)
+        assertThat(retirementOff.runOnce(catalog).check("orphans").description)
+            .contains("HOGLAKE_RETIREMENT_INTERVAL_MS, disabled in this process")
+        val off = VerifyService(db.jdbi, cleanupIntervalMs = 0, retirementIntervalMs = 0)
         assertThat(off.runOnce(catalog).check("staging_tickets").description)
             .describedAs("a drain that is off must not be quoted as a cadence")
             .contains("HOGLAKE_CLEANUP_INTERVAL_MS, disabled here")
@@ -1189,7 +1301,7 @@ class VerifyServiceIntegrationTest {
             mapOf(
                 "row_id_tiling" to "tile [0, total) per table",
                 "delete_vectors" to "one live deletion vector per data file",
-                "orphans" to "outlived its parent",
+                "orphans" to "HALF-DROPPED table",
                 "removal_queue" to "never authorized by the queue",
                 "snapshot_density" to "dense per catalog",
                 "next_row_id" to "allocator can never have handed out a range it does not remember",

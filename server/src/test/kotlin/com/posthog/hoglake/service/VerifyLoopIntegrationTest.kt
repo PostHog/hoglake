@@ -153,7 +153,7 @@ class VerifyLoopIntegrationTest {
         VerifyGauges.clear()
         // ONE service: the warn-once memory is per instance, exactly as
         // App.startBackground wires it.
-        val verify = VerifyService(db.jdbi)
+        val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
 
         // The list seam, like the other two cases: this class shares one
         // database, so sweeping EVERY catalog would drag other cases'
@@ -228,7 +228,7 @@ class VerifyLoopIntegrationTest {
         Metrics.bind(registry)
         VerifyGauges.clear()
         try {
-            val verify = VerifyService(db.jdbi)
+            val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
             verify.runOnceAllCatalogs(listOf("loop-isolated-a", "loop-isolated-b"))
             assertThat(gauge(registry, "loop-isolated-a", "orphans")).isEqualTo(0.0)
             assertThat(gauge(registry, "loop-isolated-b", "orphans")).isEqualTo(0.0)
@@ -278,7 +278,7 @@ class VerifyLoopIntegrationTest {
         Metrics.bind(registry)
         VerifyGauges.clear()
         try {
-            VerifyService(db.jdbi).runOnce("loop-manual")
+            VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce("loop-manual")
 
             // The trigger works on every replica, including the ones
             // running HOGLAKE_VERIFY_INTERVAL_MS=0. A series minted

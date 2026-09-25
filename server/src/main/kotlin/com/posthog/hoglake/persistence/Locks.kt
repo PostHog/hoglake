@@ -23,6 +23,18 @@ object Locks {
     const val CATALOG_COMMIT_LOCK_CLASS: Int = 4740871
 
     /**
+     * Discriminator for the per-catalog RETIREMENT lock: a distinct
+     * class, so a retirement sweep excluding its own siblings can never
+     * collide with the commit lock's key space.
+     *
+     * Held SESSION-scoped ([tryAcquireCatalogRetirementLock]), not
+     * transaction-scoped, because a retirement run is MANY transactions
+     * — one per batch — and an xact lock would be released and re-taken
+     * between every pair of them, which is not single flight at all.
+     */
+    const val CATALOG_RETIREMENT_LOCK_CLASS: Int = 4740872
+
+    /**
      * Take the per-catalog commit lock for the current transaction.
      * Blocks until the holder commits or rolls back. Must be called
      * inside an open transaction (xact-scoped locks are meaningless
@@ -78,5 +90,51 @@ object Locks {
         } finally {
             Metrics.commitLockWait(System.nanoTime() - start)
         }
+    }
+
+    /**
+     * Try to take the per-catalog retirement lock on [handle]'s SESSION.
+     * Returns false immediately when another maintainer holds it.
+     *
+     * SINGLE FLIGHT, NOT A QUEUE, and that distinction is the whole
+     * reason this is `pg_try_advisory_lock` rather than a blocking wait.
+     * A retirement run takes the per-catalog COMMIT lock once per batch;
+     * with W maintainers queued on one catalog a foreground commit's p99
+     * tax is `(W - 0.5) x hold` — Postgres's lock queue is FIFO, so
+     * nobody starves, but everybody waits behind every holder. A second
+     * maintainer that simply SKIPS the catalog costs nothing and loses
+     * nothing: the work is idempotent and the next interval picks it up.
+     *
+     * The lock lives on the CONNECTION, so the caller must hold
+     * [handle] open for the whole run and release it through
+     * [releaseCatalogRetirementLock] in a `finally`. A session lock
+     * survives a rolled-back batch — which is exactly what is wanted,
+     * since the run continues — and dies with the connection if the pod
+     * does, so a killed maintainer costs one interval and nothing else.
+     */
+    fun tryAcquireCatalogRetirementLock(
+        handle: Handle,
+        catalogId: Long,
+    ): Boolean =
+        handle.createQuery(
+            "SELECT pg_try_advisory_lock(($CATALOG_RETIREMENT_LOCK_CLASS::bigint << 32) | " +
+                "(?::bigint & 4294967295))",
+        )
+            .bind(0, catalogId)
+            .mapTo(Boolean::class.javaObjectType)
+            .one()
+
+    /** Release what [tryAcquireCatalogRetirementLock] took, on the same session. */
+    fun releaseCatalogRetirementLock(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        handle.createQuery(
+            "SELECT pg_advisory_unlock(($CATALOG_RETIREMENT_LOCK_CLASS::bigint << 32) | " +
+                "(?::bigint & 4294967295))",
+        )
+            .bind(0, catalogId)
+            .mapTo(Boolean::class.javaObjectType)
+            .one()
     }
 }

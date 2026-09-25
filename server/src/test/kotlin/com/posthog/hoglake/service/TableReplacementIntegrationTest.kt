@@ -158,6 +158,85 @@ class TableReplacementIntegrationTest {
     ) = catalogs.listOffsets(cat, consumer).map { it.tableUuid }
 
     @Test
+    fun `an atomic replacement leaves the retired incarnation's files for retirement`() {
+        // CREATE OR REPLACE calls the SAME drop bookkeeping DROP TABLE
+        // does, so it inherited the O(rows) end-snapshot pass and
+        // inherits the fix: the retired incarnation is marked dropped
+        // and its file rows are left exactly where they are, for
+        // RetirementService to delete once the replacement snapshot
+        // sinks under the expiry floor.
+        //
+        // That matters more here than for a plain drop, because a
+        // replacement is a PUBLISH: the whole point is that it lands in
+        // one snapshot, and a multi-second UPDATE inside it is a
+        // multi-second hold on the commit lock while the new
+        // incarnation's writers are already queueing.
+        //
+        // MUTATION: restore the `FileRepo.endLiveFiles` /
+        // `endLiveDeleteFiles` calls in `CatalogService.createTable`'s
+        // replacement branch and the first assertion reds.
+        val cat = fixture()
+        val old = catalogs.createTable(cat, "ns", "t", columns)
+        commits.commit(cat, append(cat))
+        val retiredTableId = catalogs.getTable(cat, "ns", "t").tableId
+        val beforeReplacement = catalogs.getCatalog(cat).headSnapshotId
+        // A consumer offset on the retired incarnation: offsets survive
+        // a replacement on purpose, and retirement touches no offset.
+        catalogs.commitOffset(cat, "c", old.tableUuid, beforeReplacement)
+
+        val prepared = prepare(cat, old.tableUuid)
+        val receipt = creations.publish(cat, prepared.operationId, emptyList())
+        val replacement = receipt.snapshotId!!
+
+        val catalogId = catalogs.getCatalog(cat).catalogId
+
+        fun liveFilesOfRetired(): Long =
+            db.jdbi.withHandle<Long, Exception> { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_data_file WHERE catalog_id = :c AND table_id = :t " +
+                        "AND end_snapshot IS NULL",
+                ).bind("c", catalogId).bind("t", retiredTableId).mapTo(Long::class.java).one()
+            }
+        assertThat(liveFilesOfRetired())
+            .describedAs("the replacement must not end-snapshot the retired incarnation's files")
+            .isEqualTo(1)
+        // Its history is still readable, which is why retirement must
+        // wait for the floor rather than run with the publish.
+        assertThat(catalogs.listFiles(cat, "ns", "t", beforeReplacement)).hasSize(1)
+
+        // Above the floor, retirement declines.
+        val retirement = RetirementService(db.jdbi, batchSize = 100, pauseMs = 0)
+        assertThat(retirement.runOnce(cat).rowsRetired).isZero()
+        assertThat(liveFilesOfRetired()).isEqualTo(1)
+
+        // The consumer reconciles onto the new incarnation, expiry
+        // advances past the replacement, and the retired incarnation's
+        // rows are retired — path queued, object reclaimable.
+        catalogs.commitOffset(cat, "c", prepared.tableUuid, replacement)
+        ageForExpiry(cat)
+        ExpiryService(db.jdbi).runOnce(cat, batchSize = 1000)
+        assertThat(catalogs.getCatalog(cat).earliestSnapshotId).isGreaterThanOrEqualTo(replacement)
+
+        val result = retirement.runOnce(cat)
+        assertThat(result.rowsRetired).isEqualTo(1)
+        assertThat(liveFilesOfRetired()).isZero()
+        assertThat(
+            db.jdbi.withHandle<Long, Exception> { h ->
+                h.createQuery(
+                    "SELECT count(*) FROM hog_file_removal WHERE catalog_id = :c AND reason = 'table_drop_gc'",
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            },
+        ).isEqualTo(1)
+
+        // The NEW incarnation is untouched, the receipt still replays
+        // to the same answer, and the consumer's position is whatever
+        // the release rules left it — retirement is not in that story.
+        assertThat(catalogs.getTable(cat, "ns", "t").tableUuid).isEqualTo(prepared.tableUuid)
+        assertThat(creations.publish(cat, prepared.operationId, emptyList())).isEqualTo(receipt)
+        assertThat(offsetUuids(cat)).containsExactly(prepared.tableUuid)
+    }
+
+    @Test
     fun `reconciling onto the replacement releases the retired incarnation's offset`() {
         val cat = fixture()
         val old = catalogs.createTable(cat, "ns", "t", columns)
@@ -275,7 +354,7 @@ class TableReplacementIntegrationTest {
         assertThat(ExpiryService(db.jdbi).runOnce(cat, batchSize = 1000).offsetsReleased).isZero()
         // And the invariant scan agrees, which is the surface that would
         // otherwise have alerted on it forever.
-        val report = VerifyService(db.jdbi).runOnce(cat)
+        val report = VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce(cat)
         assertThat(report.checks.single { it.check == "offset_release" }.violations).isZero()
     }
 

@@ -506,11 +506,21 @@ object FileRepo {
             .list()
 
     /**
-     * Drop tail, DV half: end-snapshot every live deletion vector of the
-     * table (same UPDATE pattern as [endLiveFiles]). Runs BEFORE the
-     * data-file pass in dropTable so no live DV survives its data file's
-     * retirement; expiry's step-1 range predicate then reclaims the row
-     * and queues the object once the drop snapshot sinks under the floor.
+     * TRUNCATE tail, DV half: end-snapshot every live deletion vector of
+     * the table (same UPDATE pattern as [endLiveFiles]). Runs BEFORE the
+     * data-file pass so no live DV survives its data file's retirement;
+     * expiry's step-1 range predicate then reclaims the row and queues
+     * the object once the truncate snapshot sinks under the floor.
+     *
+     * ONE CALLER, and that is the point: `CatalogService.truncateTable`.
+     * Drop and atomic replacement stopped calling this pair in #193 —
+     * a table's rows are unreachable because the TABLE is dropped, and
+     * the paced retirement sweep deletes them — so what is left here is
+     * the statement whose cost still sizes with the table, on the one
+     * path that has not been redesigned yet. `POST .../truncate` on a
+     * multi-million-row table therefore keeps today's hazard: an
+     * O(rows) UPDATE under the per-catalog commit lock. That is stated,
+     * not fixed, and it has its own design doc.
      */
     fun endLiveDeleteFiles(
         handle: Handle,
@@ -529,7 +539,12 @@ object FileRepo {
             .bind("snapshot", snapshot)
             .execute()
 
-    /** Drop tail: end-snapshot every live file of the table. */
+    /**
+     * TRUNCATE tail: end-snapshot every live file of the table.
+     * O(live files) under the commit lock — see
+     * [endLiveDeleteFiles] for the one caller that is left and
+     * why drop no longer pays this.
+     */
     fun endLiveFiles(
         handle: Handle,
         catalogId: Long,

@@ -32,6 +32,7 @@ import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
+import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
 import com.posthog.hoglake.service.VerifyService
@@ -78,6 +79,7 @@ class App private constructor(
             // never against the defaults.
             compactionTargetBytes = cfg.compactionTargetBytes,
             cleanupIntervalMs = cfg.cleanupIntervalMs,
+            retirementIntervalMs = cfg.retirementIntervalMs,
         )
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
@@ -97,6 +99,22 @@ class App private constructor(
             ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
             maintenanceLedgerRetentionSeconds = cfg.maintenanceLedgerRetentionSeconds,
             stagingGraceSeconds = cfg.cleanupStagingGraceSeconds,
+        )
+
+    /**
+     * Paced retirement of dropped tables' file rows — the other half of
+     * the O(columns) drop. Off by default; the chart turns it on for the
+     * maintenance workload alone, because a batch takes the per-catalog
+     * commit lock.
+     */
+    private val retirementService =
+        RetirementService(
+            jdbi,
+            batchSize = cfg.retirementBatch,
+            pauseMs = cfg.retirementPauseMs,
+            runBudgetMs = cfg.retirementRunBudgetMs,
+            queueCeiling = cfg.retirementQueueCeiling,
+            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
         )
 
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
@@ -135,6 +153,7 @@ class App private constructor(
             cleanupIntervalMs = cfg.cleanupIntervalMs,
             compactionIntervalMs = cfg.compactionIntervalMs,
             verifyIntervalMs = cfg.verifyIntervalMs,
+            retirementIntervalMs = cfg.retirementIntervalMs,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
@@ -291,6 +310,14 @@ class App private constructor(
         // commit tail. The manual trigger stays live everywhere.
         loops.register("verify", cfg.verifyIntervalMs) {
             verifyService.runOnceAllCatalogs()
+        }
+        // Default 0 = off, like compaction and verify, and for a sharper
+        // reason than either: a retirement batch TAKES THE PER-CATALOG
+        // COMMIT LOCK, hundreds of times per run. On an API replica that
+        // is the commit tail taxing itself. The chart turns it on for the
+        // maintenance Deployment, where the drain it feeds also runs.
+        loops.register("retirement", cfg.retirementIntervalMs) {
+            retirementService.runOnceAllCatalogs()
         }
         loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
         return AutoCloseable {

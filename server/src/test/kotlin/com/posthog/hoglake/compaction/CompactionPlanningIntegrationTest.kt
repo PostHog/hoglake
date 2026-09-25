@@ -405,6 +405,7 @@ class CompactionPlanningIntegrationTest {
                 cleanupIntervalMs = 0,
                 compactionIntervalMs = 0,
                 verifyIntervalMs = 0,
+                retirementIntervalMs = 0,
                 smallFileThresholdBytes = 1024,
                 minInputFiles = policy.minInputFiles,
                 maxInputFiles = policy.maxInputFiles,

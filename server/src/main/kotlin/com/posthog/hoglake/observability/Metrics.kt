@@ -104,6 +104,69 @@ object Metrics {
      */
     fun hydratorTransientError() = increment("hoglake_hydrator_transient_errors_total", 1.0)
 
+    /**
+     * hoglake_rows_retired_total{catalog} — file METADATA rows a
+     * retirement run deleted off dropped tables (data files + deletion
+     * vectors), each of which queued one path for the cleanup drain.
+     *
+     * Deliberately not the same thing as `hoglake_files_removed_total`,
+     * which counts OBJECTS cleanup physically deleted. The gap between
+     * the two is the queue depth, and watching it is how an operator
+     * sees retirement outrunning the drain.
+     */
+    fun rowsRetired(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_rows_retired_total", count.toDouble(), "catalog", catalog)
+    }
+
+    /** hoglake_retirement_batches_total{catalog} — batch transactions that committed. */
+    fun retirementBatches(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_retirement_batches_total", count.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_retirement_timeouts_total{catalog} — batches rolled back
+     * by their OWN transaction-local statement bound. Each one halves
+     * the batch size for that table, and the size is remembered for
+     * the rest of the process's life, so a standing nonzero means new
+     * tables keep arriving that the configured batch is too big for —
+     * not that the same table is rediscovering it every run.
+     *
+     * The remedy is HOGLAKE_RETIREMENT_BATCH. Convoys are NOT counted
+     * here (see [retirementConvoyed]): they ask for the opposite
+     * remedy, and summing the two hides both.
+     */
+    fun retirementTimeouts(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_retirement_timeouts_total", count.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_retirement_convoyed_total{catalog} — runs that gave up
+     * because the per-catalog COMMIT LOCK was not available inside
+     * HOGLAKE_COMMIT_LOCK_TIMEOUT_MS.
+     *
+     * Not a retirement problem and not fixed by a smaller batch: it
+     * says the catalog's commit lock is held by something else long
+     * enough to exhaust the admission window — a long expiry sweep, a
+     * cleanup drain, a truncate. Retirement stepping aside is the
+     * correct response; a rising line is a pointer at whatever is
+     * holding the lock.
+     */
+    fun retirementConvoyed(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_retirement_convoyed_total", count.toDouble(), "catalog", catalog)
+    }
+
     /** hoglake_compaction_groups_total{catalog} — groups successfully rewritten + committed. */
     fun compactionGroups(
         catalog: String,
@@ -221,6 +284,10 @@ object Metrics {
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
             is HoglakeException.CommitConflict -> "conflict"
+            // Counted, and counted as a conflict: it is a 409, and
+            // before it was typed it was counted as "validation".
+            // Left in the `else` it would stop being counted at all.
+            is HoglakeException.TableDropped -> "conflict"
             is HoglakeException.Validation -> "validation"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null

@@ -220,7 +220,7 @@ class CatalogServiceIntegrationTest {
     // ---- drop + time travel ----------------------------------------------
 
     @Test
-    fun `dropTable ends all live rows and enables time travel`() {
+    fun `dropTable ends the DDL rows, leaves the file rows, and enables time travel`() {
         svc.createCatalog("drop-cat", "s3://bucket/dr")
         svc.createNamespace("drop-cat", "ns") // S1
         val t = svc.createTable("drop-cat", "ns", "t", listOf(idCol, nameCol)) // S2
@@ -262,7 +262,18 @@ class CatalogServiceIntegrationTest {
         assertThatThrownBy { svc.getTable("drop-cat", "ns", "t", snapshot = createdAt - 1) }
             .isInstanceOf(HoglakeException.NotFound::class.java)
 
-        // The drop end-snapshotted identity, version, columns, and files.
+        // The drop marked the identity row and end-snapshotted the DDL
+        // rows — and DELIBERATELY LEFT THE FILE ROW ALONE.
+        //
+        // `hog_data_file` used to be in the list below. It is not any
+        // more, and the row it names is asserted to be STILL LIVE a few
+        // lines down, because that is the change #193 made: a drop is
+        // three O(columns) UPDATEs, the table is what says its rows are
+        // unreachable, and the rows themselves leave through the paced
+        // retirement sweep once the drop snapshot sinks under the
+        // catalog's expiry floor. Ending them here was 44.6 s and
+        // 3.9 GB of WAL at 3,008,849 rows, under the commit lock, on a
+        // drop that then rolled back on the statement timeout.
         db.jdbi.withHandleUnchecked { h ->
             val droppedSnapshot =
                 h.createQuery(
@@ -271,7 +282,22 @@ class CatalogServiceIntegrationTest {
                     .mapTo(Long::class.javaObjectType).one()
             assertThat(droppedSnapshot).isEqualTo(drop.snapshotId)
 
-            for (table in listOf("hog_table_version", "hog_column", "hog_data_file")) {
+            // MUTATION: put `FileRepo.endLiveFiles` back into
+            // CatalogService.dropTable and this reds — the row is live,
+            // and it must stay live until retirement.
+            val liveFiles =
+                h.createQuery(
+                    """
+                    SELECT count(*) FROM hog_data_file
+                    WHERE catalog_id = :cid AND table_id = :tid AND end_snapshot IS NULL
+                    """,
+                ).bind("cid", catId).bind("tid", t.tableId)
+                    .mapTo(Long::class.javaObjectType).one()
+            assertThat(liveFiles)
+                .describedAs("the drop must not touch file rows; retirement deletes them later")
+                .isEqualTo(1)
+
+            for (table in listOf("hog_table_version", "hog_column")) {
                 val liveRows =
                     h.createQuery(
                         """
