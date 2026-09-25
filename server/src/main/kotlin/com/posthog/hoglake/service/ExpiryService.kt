@@ -96,6 +96,68 @@ class ExpiryService(private val jdbi: Jdbi) {
             """
 
         /**
+         * SWEEP STEP 1, the deletion-vector arm, `internal` so the plan
+         * test EXPLAINs the SQL PRODUCTION runs rather than a lookalike.
+         *
+         * Superseded DVs (their own `end_snapshot` in range) plus live
+         * DVs riding an expiring data file — the data-file delete in
+         * [DATA_FILE_EXPIRY_SQL] would cascade those away without
+         * queueing them.
+         *
+         * NO INDEX SERVES THIS, and V18 deliberately does not add one.
+         * The predicate is an `OR` whose second arm is a correlated
+         * `EXISTS` over hog_data_file; the planner reads that as one
+         * pass and never chooses a `(catalog_id, end_snapshot)` index
+         * for the first arm, so an index built for it would be paid on
+         * every write and used by nothing (V18's header carries the
+         * measurement). Splitting the statement into its two arms is
+         * what would make an index choosable, and that is a change to
+         * the sweep's behaviour, ticketed separately.
+         */
+        internal const val DELETE_FILE_EXPIRY_SQL: String =
+            """
+            WITH doomed AS (
+                DELETE FROM hog_delete_file dv
+                WHERE dv.catalog_id = :catalogId
+                  AND ((dv.end_snapshot IS NOT NULL AND dv.end_snapshot <= :newEarliest)
+                       OR EXISTS (
+                              SELECT 1 FROM hog_data_file df
+                              WHERE df.catalog_id = dv.catalog_id
+                                AND df.data_file_id = dv.data_file_id
+                                AND df.end_snapshot IS NOT NULL
+                                AND df.end_snapshot <= :newEarliest))
+                RETURNING path
+            )
+            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+            SELECT :catalogId, path, 'delete', 'snapshot_expiry' FROM doomed
+            """
+
+        /**
+         * SWEEP STEP 2, the data-file arm, `internal` for the same
+         * reason.
+         *
+         * THE STATEMENT V18 EXISTS FOR. `end_snapshot` appears in no
+         * index's leading columns before V18 — `hog_data_file_live` is
+         * partial on its COMPLEMENT — so this was a sequential scan of
+         * the whole manifest, inside the sweep transaction, under the
+         * per-catalog commit lock. `hog_data_file_ended (catalog_id,
+         * end_snapshot) WHERE end_snapshot IS NOT NULL` is exactly this
+         * predicate, and `V18DataFileEndedIndexMigrationIntegrationTest`
+         * EXPLAINs THIS string before and after the migration.
+         */
+        internal const val DATA_FILE_EXPIRY_SQL: String =
+            """
+            WITH doomed AS (
+                DELETE FROM hog_data_file
+                WHERE catalog_id = :catalogId
+                  AND end_snapshot IS NOT NULL AND end_snapshot <= :newEarliest
+                RETURNING path
+            )
+            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+            SELECT :catalogId, path, 'data', 'snapshot_expiry' FROM doomed
+            """
+
+        /**
          * The end-snapshotted-but-never-deleted versioned tables (DDL
          * churn grows them without bound); sweep step 5 deletes their
          * below-floor corpses. Table names are a fixed compile-time
@@ -290,42 +352,14 @@ class ExpiryService(private val jdbi: Jdbi) {
         // range) plus live DVs riding an expiring data file — the data-file
         // delete below would cascade those away without queueing them.
         val deleteFilesQueued =
-            h.createUpdate(
-                """
-            WITH doomed AS (
-                DELETE FROM hog_delete_file dv
-                WHERE dv.catalog_id = :catalogId
-                  AND ((dv.end_snapshot IS NOT NULL AND dv.end_snapshot <= :newEarliest)
-                       OR EXISTS (
-                              SELECT 1 FROM hog_data_file df
-                              WHERE df.catalog_id = dv.catalog_id
-                                AND df.data_file_id = dv.data_file_id
-                                AND df.end_snapshot IS NOT NULL
-                                AND df.end_snapshot <= :newEarliest))
-                RETURNING path
-            )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'delete', 'snapshot_expiry' FROM doomed
-            """,
-            )
+            h.createUpdate(DELETE_FILE_EXPIRY_SQL)
                 .bind("catalogId", cat.catalogId)
                 .bind("newEarliest", newEarliest)
                 .execute()
 
         // 2) Unreachable data files (cascades stats + partition values).
         val dataFilesQueued =
-            h.createUpdate(
-                """
-            WITH doomed AS (
-                DELETE FROM hog_data_file
-                WHERE catalog_id = :catalogId
-                  AND end_snapshot IS NOT NULL AND end_snapshot <= :newEarliest
-                RETURNING path
-            )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'data', 'snapshot_expiry' FROM doomed
-            """,
-            )
+            h.createUpdate(DATA_FILE_EXPIRY_SQL)
                 .bind("catalogId", cat.catalogId)
                 .bind("newEarliest", newEarliest)
                 .execute()
@@ -410,7 +444,11 @@ class ExpiryService(private val jdbi: Jdbi) {
             try {
                 results += name to runOnce(name, batchSize, MaintenanceTrigger.LOOP)
             } catch (e: Exception) {
-                log.error(e) { "expiry sweep failed for catalog '$" }
+                // '$name', not '$': the string interpolation was
+                // truncated, so every failure line named no catalog at
+                // all — on a fan-out across the fleet that is a log
+                // entry an operator cannot act on.
+                log.error(e) { "expiry sweep failed for catalog '$name'; continuing" }
             }
         }
         return results

@@ -626,14 +626,41 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
             .isNull()
         // And the manifest halves stay what they were: bounded by the
         // manifest, which this change does not touch.
-        val manifestBuffers =
+        //
+        // THE `Planning:` SECTION IS EXCLUDED, and that is this file's
+        // own rule applied to itself. AGENT.md (and the KDoc further up
+        // this class) says to take buffers from the SCAN NODES rather
+        // than from the plan's maximum, because EXPLAIN's `Planning:`
+        // block carries a `Buffers:` line that dwarfs a well-indexed
+        // scan's — and it sizes with the number of INDEXES on the
+        // relations, not with the statement. This assertion took the
+        // maximum over every line, so the number it bounded was the
+        // planner's catalog lookups: adding V18's
+        // `hog_data_file_ended` moved it from 138 to 141 buffers
+        // without touching the execution plan at all, which is the
+        // measurement going stale rather than the statement getting
+        // worse. The claim being made — the reclaim costs the manifest
+        // it probes, never the queue's depth — is about EXECUTION, so
+        // execution is what is measured.
+        val executionLines =
             uploadPlanAfterV16.lines()
+                .takeWhile { !it.trim().startsWith("Planning:") }
+        val manifestBuffers =
+            executionLines
                 .filter { it.trim().startsWith("Buffers:") }
                 .maxOfOrNull { line ->
                     val hit = Regex("""shared hit=(\d+)""").find(line)?.groupValues?.get(1)?.toLong() ?: 0L
                     val read = Regex("""shared read=(\d+)""").find(line)?.groupValues?.get(1)?.toLong() ?: 0L
                     hit + read
                 } ?: 0L
+        assertThat(executionLines)
+            .describedAs(
+                "the plan must carry a Planning: section for this exclusion to mean anything; " +
+                    "without one this filter is a no-op and the assertion silently goes back to " +
+                    "measuring the planner:%n%s",
+                uploadPlanAfterV16,
+            )
+            .hasSizeLessThan(uploadPlanAfterV16.lines().size)
         assertThat(manifestBuffers)
             .describedAs(
                 "the reclaim read %d buffers in total; the two manifest scans are worth %d " +
