@@ -57,7 +57,17 @@ object Metrics {
         if (count > 0) increment("hoglake_snapshots_expired_total", count.toDouble(), "catalog", catalog)
     }
 
-    /** hoglake_files_removed_total{catalog} — physical S3 deletes only. */
+    /**
+     * hoglake_files_removed_total{catalog} — physical S3 deletes only.
+     *
+     * Fed from `CleanupResult.objectsRemoved`, which is DISTINCT paths,
+     * NOT `removed`, which is queue rows. The two differ: two undrained
+     * `hog_file_removal` rows over one path are legitimate state
+     * (nothing makes a file path unique — see V16's non-unique
+     * argument), and one batched delete settles both while removing one
+     * object. Counting rows here would make a duplicate look like extra
+     * storage reclaimed.
+     */
     fun filesRemoved(
         catalog: String,
         count: Long,

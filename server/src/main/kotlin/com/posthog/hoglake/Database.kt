@@ -31,6 +31,21 @@ object Database {
     const val SESSION_INIT_SQL: String =
         "SET idle_in_transaction_session_timeout = '30s'; SET statement_timeout = '60s'"
 
+    /**
+     * The idle-in-transaction half of [SESSION_INIT_SQL], as a Duration,
+     * for the code that has to stay under it.
+     *
+     * `RemovalStore` is the caller: the cleanup drain makes object-store
+     * calls inside a transaction that holds the per-catalog commit lock,
+     * and a connection awaiting an S3 response IS idle in transaction.
+     * Its SDK timeouts are derived from this rather than written down,
+     * so changing the session bound moves them with it.
+     *
+     * [SESSION_INIT_SQL] stays the single source of truth — a test
+     * parses the value out of it rather than trusting this to agree.
+     */
+    val SESSION_INIT_SQL_IDLE_TIMEOUT: java.time.Duration = java.time.Duration.ofSeconds(30)
+
     fun dataSource(cfg: Config): HikariDataSource {
         val hc =
             HikariConfig().apply {

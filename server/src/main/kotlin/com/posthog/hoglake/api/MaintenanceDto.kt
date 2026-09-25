@@ -71,9 +71,22 @@ fun ExpiryResult.toDto() =
     )
 
 data class CleanupResultDto(
+    /** Queue rows settled 'deleted' — see [objectsRemoved] for objects. */
     val removed: Long,
     val missing: Long,
     val stillReferenced: Long,
+    /**
+     * DISTINCT paths whose object was physically deleted. Serialized
+     * unconditionally here, unlike on the stored model: this DTO is the
+     * RESPONSE, and a response that omits a counter it declares makes
+     * every client's zero a guess. The ledger's read path is what fills
+     * 0 for rows an older server wrote — see CLEANUP_COUNTERS_ADDED_LATER.
+     */
+    val objectsRemoved: Long,
+    /** Rows already settled by another writer when the sub-batch took the lock. */
+    val settledElsewhere: Long,
+    /** Rows a sub-batch's hold budget stopped short of; a later hold drains them. */
+    val deadlineSkipped: Long,
 )
 
 fun CleanupResult.toDto() =
@@ -81,6 +94,9 @@ fun CleanupResult.toDto() =
         removed = removed,
         missing = missing,
         stillReferenced = stillReferenced,
+        objectsRemoved = objectsRemoved,
+        settledElsewhere = settledElsewhere,
+        deadlineSkipped = deadlineSkipped,
     )
 
 data class CompactionResultDto(
@@ -238,6 +254,7 @@ private fun normalizeLedgerResult(
         when (task) {
             MaintenanceTask.COMPACTION -> COMPACTION_COUNTERS_ADDED_LATER
             MaintenanceTask.EXPIRY -> EXPIRY_COUNTERS_ADDED_LATER
+            MaintenanceTask.CLEANUP -> CLEANUP_COUNTERS_ADDED_LATER
             else -> return node
         }
     val obj = node as ObjectNode
@@ -257,6 +274,10 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
 
 /** The same, for ExpiryResult. Append-only for the same reason. */
 private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")
+
+/** The same, for CleanupResult. Append-only for the same reason. */
+private val CLEANUP_COUNTERS_ADDED_LATER =
+    listOf("objects_removed", "settled_elsewhere", "deadline_skipped")
 
 /**
  * What the run ledger observed about a task's loop — fleet-wide, unlike

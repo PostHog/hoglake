@@ -58,8 +58,50 @@ data class Config(
      * drains. Draining sooner buys nothing a reader can observe.
      */
     val cleanupIntervalMs: Long = env("HOGLAKE_CLEANUP_INTERVAL_MS", "1800000").toLong(),
-    /** Queue entries drained per cleanup run; S3 deletes sub-batch at 500. */
+    /** Queue entries drained per cleanup run, per catalog. */
     val cleanupBatchSize: Int = env("HOGLAKE_CLEANUP_BATCH", "2000").toInt(),
+    /**
+     * Rows per drain sub-batch — one transaction, which holds the
+     * per-catalog commit lock across its reference check, its
+     * object-store calls and its settle.
+     *
+     * 1,000 is S3's own ceiling on ONE DeleteObjects request, so a
+     * default sub-batch whose paths share a bucket is one round trip.
+     * It was 25, sized for a drain that issued a HEAD and a DELETE per
+     * path: each hold ran ~3.2 s and a 2,000-row run spent ~255 s
+     * holding the lock, which took commit latency from 200-400 ms to
+     * 12-22 s and got both API pods liveness-killed (gigahog-prod-us,
+     * 2026-09-24).
+     *
+     * What scales the hold is the number of CALLS, not this number:
+     * keys past 1,000, or spread across buckets, chunk into more calls
+     * inside the same hold, so raising this past the ceiling buys
+     * nothing. It does not apply to `compaction_staging` rows, which
+     * drain in their own sub-batches of 25 because they cost a HEAD and
+     * a DELETE each — see CleanupService.STAGING_SUB_BATCH.
+     */
+    val cleanupSubBatchSize: Int = env("HOGLAKE_CLEANUP_SUB_BATCH", "1000").toInt(),
+    /**
+     * How long the drain leaves a fresh `compaction_staging` ticket
+     * alone.
+     *
+     * The ticket is inserted BEFORE the rewrite starts, so with an empty
+     * queue a drain can settle it while the group is still uploading;
+     * the group then aborts and re-stages, and between the two the
+     * object exists with no ticket naming it. One hour is comfortably
+     * longer than a group (~8.5 s on gigahog-prod-us), so the case
+     * disappears for every group that finishes, while a ticket left by a
+     * group that died is still reclaimed — an hour later, by the same
+     * drain.
+     *
+     * 0 does not disable the predicate; it makes every ticket from an
+     * already-committed transaction eligible. The UPPER bound is
+     * `/verify`: this plus HOGLAKE_CLEANUP_INTERVAL_MS plus the backlog
+     * must stay well under VerifyService's 6 h staging-ticket age, or
+     * `staging_tickets` alerts on tickets the drain is deliberately
+     * leaving alone.
+     */
+    val cleanupStagingGraceSeconds: Long = env("HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS", "3600").toLong(),
     /**
      * How long drained hog_file_removal rows (the soft-deleted cleanup
      * ledger) are kept before the sweep purges them. Default 30 days.
@@ -101,7 +143,11 @@ data class Config(
      * lock. Expiry -> typed CommitQueueTimeout -> HTTP 503 with
      * Retry-After (retryable backpressure). 0 disables (unbounded wait).
      */
-    val commitLockTimeoutMs: Long = env("HOGLAKE_COMMIT_LOCK_TIMEOUT_MS", "30000").toLong(),
+    val commitLockTimeoutMs: Long =
+        env(
+            "HOGLAKE_COMMIT_LOCK_TIMEOUT_MS",
+            com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS.toString(),
+        ).toLong(),
     /**
      * Compaction sweep interval; default 0 = OFF for now (the manual
      * /maintenance/compact trigger still works). Rate-awareness is by

@@ -3604,11 +3604,47 @@ components:
 
     CleanupResult:
       type: object
+      # objects_removed and settled_elsewhere are NOT required, for the
+      # reason claimed_elsewhere is not on CompactionResult: they are
+      # NON_DEFAULT on the stored model and the maintenance ledger holds
+      # rows written before they existed, so `required` would be a
+      # promise the ledger's own history breaks. The read path fills 0.
       required: [removed, missing, still_referenced]
       properties:
-        removed: { type: integer, format: int64 }
-        missing: { type: integer, format: int64 }
+        removed:
+          type: integer
+          format: int64
+          description: >
+            Queue ROWS settled 'deleted'. Not a count of objects: two undrained
+            rows over one path are legitimate state and one batched delete
+            settles both. See objects_removed.
+        missing:
+          type: integer
+          format: int64
+          description: >
+            Queue rows settled 'absent' — compaction staging tickets only, the
+            one reason the drain still probes with HeadObject before deleting.
         still_referenced: { type: integer, format: int64 }
+        objects_removed:
+          type: integer
+          format: int64
+          description: >
+            DISTINCT paths whose object was physically deleted — what
+            hoglake_files_removed_total counts. Always <= removed.
+        settled_elsewhere:
+          type: integer
+          format: int64
+          description: >
+            Rows dropped from a sub-batch because another writer had already
+            settled them — a compaction group settling its own staging ticket
+            'registered'. Normal, not a failure.
+        deadline_skipped:
+          type: integer
+          format: int64
+          description: >
+            Rows a sub-batch's hold budget stopped short of: claimed by the run,
+            never attempted, and drained by a later hold. Standing nonzero means
+            holds are ending on their budget rather than on their work.
 
     RehydrateResult:
       type: object

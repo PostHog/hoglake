@@ -301,7 +301,11 @@ class CompactionHeapBudgetIntegrationTest {
         // settles it. The object never made it to MinIO, so the honest
         // outcome is 'missing' — the ledger row is what stops it being an
         // orphan nothing knows about.
-        val drained = CleanupService(db.jdbi, removalStore).runOnce(fx, batchSize = 100)
+        // stagingGraceSeconds = 0: the ticket is seconds old, and the
+        // production grace (1 h) exists to protect one whose group may
+        // still be uploading — this group's upload already failed.
+        val drained =
+            CleanupService(db.jdbi, removalStore, stagingGraceSeconds = 0).runOnce(fx, batchSize = 100)
         assertThat(drained.removed + drained.missing).isEqualTo(1)
         assertThat(drained.stillReferenced).describedAs("never an invariant violation").isZero()
         assertThat(removalRows(fx).single().drainedAt).isNotNull()
