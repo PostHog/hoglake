@@ -248,12 +248,14 @@ class UploadService(
          * unique.
          *
          * The other two probe `hog_data_file` / `hog_delete_file` by
-         * path, and those tables carry no index on `path` deliberately
-         * (`VerifyQueryPlanIntegrationTest`: a path index there would be
-         * paid for by every commit, on the hottest insert in the
-         * system). They stay sequential scans, once per fenced claim —
-         * sized by the manifest rather than by the queue, and out of
-         * scope for #199.
+         * path, and V17 indexes those as well —
+         * `hog_data_file_path` / `hog_delete_file_path` (catalog_id,
+         * path). They were deliberately sequential until then ("a path
+         * index there would be paid for by every commit, on the hottest
+         * insert in the system, to serve an hourly read"), and what
+         * re-decided it was finding the SAME scan on the cleanup
+         * drain's commit-lock hold, once per sub-batch, rather than
+         * hourly.
          *
          * Binds `:catalog`, `:path`, `:kind`. No interpolated values
          * (invariant 9 intact).

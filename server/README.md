@@ -424,6 +424,13 @@ Physical deletion is decoupled and paranoid
 time every path is re-checked against live references — a
 still-referenced path is skipped and counted as an **invariant
 violation** (alertable), never deleted. Missing objects count as done.
+That re-check is ONE statement per sub-batch and it is INDEXED: it
+probes `hog_data_file`, `hog_delete_file` (V17's `(catalog_id, path)`)
+and `hog_upload` (V12's unique key) by path, so its cost sizes with the
+sub-batch and not with the catalog's manifest — before V17 it read
+every file row the catalog has ever registered, once per sub-batch,
+while holding the commit lock (190,884 buffers and 692 ms at 5M rows,
+against 8,728 and 33 ms after).
 S3 deletes run in sub-batches (`HOGLAKE_CLEANUP_SUB_BATCH`, 1,000
 paths) whose ledger updates commit independently, so a mid-drain
 failure never rolls back completed work — and each sub-batch's

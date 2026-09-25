@@ -493,6 +493,19 @@ open class RemovalStore(
  *  - staging: the same database statements + at most
  *    [STAGING_SUB_BATCH] HEAD/DELETE pairs — 25, so ~3.2 s.
  *
+ * THE DATABASE HALF OF THAT HOLD IS INDEXED, AND IT WAS NOT. The
+ * reference check ([referencedPaths]) probes three tables by
+ * `(catalog_id, path)`; hog_upload has carried that key since V12, and
+ * hog_data_file and hog_delete_file got it in V17. Before V17 both of
+ * those legs read EVERY file row the catalog has ever registered — live
+ * and historical — to answer a 1,000-path question, inside the lock:
+ * 190,884 buffers and 692 ms on a 5M-row fixture, against 8,728 and
+ * 33 ms after, and on gigahog-prod-us a warm hold of ~3 s (up to ~30 s
+ * cold, or against a rollout) of which the `DeleteObjects` call is a
+ * fraction of a second. So both kinds of hold are now their
+ * object-store calls plus milliseconds of database, and the sub-batch
+ * size scales the calls rather than the scan.
+ *
  * THE WORST CASE IS NOT THAT COUNT TIMES 64 ms, and this is the part a
  * call-count bound cannot state: each call may take a whole
  * [RemovalStore.apiCallTimeout]. So the hold is bounded in TIME by
@@ -1054,6 +1067,21 @@ class CleanupService(
      * Paths from [paths] that any file row (live or not) still claims.
      * Runs on the sub-batch transaction's handle, under the catalog
      * commit lock, so the answer cannot go stale against a commit.
+     *
+     * LIVE OR NOT is the load-bearing half, and it is why V17's indexes
+     * are not partial: a historical row still claims its object at
+     * every retained snapshot, so `end_snapshot IS NULL` here — or in
+     * the index that serves it — would authorize deleting an object a
+     * time-travel read still needs.
+     *
+     * Each leg is one `(catalog_id, path)` probe per sub-batch path:
+     * `hog_data_file_path` and `hog_delete_file_path` (V17), and
+     * hog_upload's own `UNIQUE (catalog_id, path)` from V12, with
+     * `state` a filter on the rows it fetches. The statement is
+     * unchanged by V17 — the indexes serve it as written — and
+     * `V17FilePathIndexMigrationIntegrationTest` EXPLAINs the text this
+     * function actually issues, captured off a real drain, rather than
+     * a copy of it.
      */
     private fun referencedPaths(
         h: Handle,
