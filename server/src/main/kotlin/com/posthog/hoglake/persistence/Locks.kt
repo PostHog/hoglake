@@ -1,5 +1,6 @@
 package com.posthog.hoglake.persistence
 
+import com.posthog.hoglake.RequestAdmission
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.observability.Metrics
 import org.jdbi.v3.core.Handle
@@ -59,15 +60,32 @@ object Locks {
      *    behavior. The timeout stays in force for the rest of the
      *    transaction, so a pathological row-lock convoy later in the
      *    tail is bounded by the same admission contract.
+     *
+     * THE BOUND IS CHARGED THE TIME THE REQUEST ALREADY SPENT QUEUED
+     * (#218). Since route handlers run on a bounded dispatcher rather
+     * than the Netty event loop, a request can wait for a handler
+     * thread before it ever reaches this line, and the admission
+     * contract promises ONE bounded wait, not one per queue: a commit
+     * that queued 25 s for a thread and then waited the full 30 s here
+     * would spend 55 s of server time on a caller that has gone.
+     * [RequestAdmission.remainingLockTimeoutMs] subtracts the queue
+     * wait, floored at [RequestAdmission.MIN_REMAINING_LOCK_TIMEOUT_MS]
+     * so a commit never arrives with a bound too small to be worth
+     * trying. It is applied HERE rather than at the seven call sites
+     * because the subtraction is one rule, and a call site that forgot
+     * it would be a path where the admission bound silently doubled.
+     * Background loops carry no ambient request, so their bound is
+     * unchanged — they never queued for a handler thread.
      */
     fun acquireCatalogCommitLock(
         handle: Handle,
         catalogId: Long,
         lockTimeoutMs: Long = 0,
     ) {
-        if (lockTimeoutMs > 0) {
+        val effectiveTimeoutMs = RequestAdmission.remainingLockTimeoutMs(lockTimeoutMs)
+        if (effectiveTimeoutMs > 0) {
             handle.createQuery("SELECT set_config('lock_timeout', ?, true)")
-                .bind(0, lockTimeoutMs.toString())
+                .bind(0, effectiveTimeoutMs.toString())
                 .mapToMap()
                 .one()
         }
@@ -82,8 +100,9 @@ object Locks {
         } catch (e: UnableToExecuteStatementException) {
             if (Pg.isLockTimeout(e)) {
                 throw HoglakeException.CommitQueueTimeout(
-                    "commit admission timed out after ${lockTimeoutMs}ms waiting for the " +
-                        "catalog commit lock (catalog_id=$catalogId); the catalog is busy — retry",
+                    "commit admission timed out after ${effectiveTimeoutMs}ms waiting for the " +
+                        "catalog commit lock (catalog_id=$catalogId); the catalog is busy — retry" +
+                        queueWaitSuffix(lockTimeoutMs, effectiveTimeoutMs),
                 )
             }
             throw e
@@ -91,6 +110,22 @@ object Locks {
             Metrics.commitLockWait(System.nanoTime() - start)
         }
     }
+
+    /**
+     * Names the queue wait in the 503 when it shortened the bound, so an
+     * operator reading "timed out after 4000ms" against a 30 s setting
+     * is not left to wonder which knob lied.
+     */
+    private fun queueWaitSuffix(
+        configuredMs: Long,
+        effectiveMs: Long,
+    ): String =
+        if (effectiveMs >= configuredMs) {
+            ""
+        } else {
+            " (the configured ${configuredMs}ms admission bound less the " +
+                "${configuredMs - effectiveMs}ms this request already spent queued for a handler thread)"
+        }
 
     /**
      * Try to take the per-catalog retirement lock on [handle]'s SESSION.

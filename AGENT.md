@@ -654,6 +654,135 @@ there would break that gate on every build.
   (404/409/410/422; commit admission timeout 503 + Retry-After; parse
   failures 400). New failure modes get a typed exception, not a status
   code sprinkled in a route.
+- **The request path never blocks the event loop, and the probe never
+  borrows a request connection** (#218). `App.module` installs ONE
+  interceptor (`api/BlockingDispatch.kt`, `ApplicationCallPipeline`'s
+  `Plugins` phase) that runs the rest of the pipeline — routing, the
+  handler, serialization — under a bounded dispatcher of
+  `HOGLAKE_REQUEST_THREADS` threads, default `HOGLAKE_DB_POOL_SIZE`.
+  One seam, not ~90 `withContext` calls, because the failure mode of
+  the per-handler form is a new route that looks like its neighbours
+  and reintroduces the incident with nothing redding. Handlers ran on
+  `eventLoopGroupProxy-4-1` — Ktor sizes Netty's call group from
+  `availableProcessors` and the pod has one CPU — so a `commit/prepared`
+  waiting the 30 s admission bound owned the only thread, three 5 s
+  `/healthz` probes went unserved, liveness killed the pod, and the
+  restart discarded every queued commit. `Main.kt` also FLOORS NETTY'S
+  CALL GROUP, and only that (`HOGLAKE_NETTY_CALL_GROUP_SIZE`,
+  `max(4, availableProcessors)`), which is defence in depth, not the
+  fix. Ktor sizes the call group at `availableProcessors` exactly and
+  the worker group at `parallelism / 2 + 1`, so the same floor on the
+  worker group would RAISE it on every pod with more than two CPUs;
+  there is no `HOGLAKE_NETTY_WORKER_GROUP_SIZE` and there should not
+  be —
+  those threads do socket IO, not blocking work, and #218 produced no
+  evidence about them.
+  Excess requests QUEUE, and THE QUEUE IS BOUNDED BY AGE, NOT DEPTH.
+  The interceptor stamps `System.nanoTime()` before the hand-off and
+  FREEZES the wait at admission (`RequestAdmission.admit`), records
+  `hoglake_request_queue_wait_seconds`, sheds
+  a request whose wait already passed the admission bound with the
+  typed 503 + Retry-After BEFORE it borrows a connection
+  (`RequestAdmission.refuseIfQueueExhausted`, counted as
+  `hoglake_requests_shed_total`), and charges the rest of
+  the wait against the advisory-lock bound inside
+  `Locks.acquireCatalogCommitLock`
+  (`RequestAdmission.remainingLockTimeoutMs`, an ambient
+  `ThreadLocal.asContextElement` established at the same seam, floored
+  so a request never arrives with a useless remainder and never raised
+  above a bound an operator set lower). One budget, charged once: 25 s
+  queued plus a fresh 30 s lock wait was 55 s of server time for a
+  caller that had gone. FROZEN, not read live, and the difference is
+  not cosmetic: elapsed-since-dispatch grows with THE HANDLER'S OWN
+  EXECUTION, so `POST .../maintenance/compact` — a synchronous sweep on
+  the handler thread — would take the lock with the 1 s floor for every
+  group after the first 30 s of the run and 503 blaming a queue wait
+  that never happened. The seam lives in its OWN PHASE between
+  `Plugins` and `Call`, not in `Plugins`: same-phase interceptors run
+  in registration order, so at `Plugins` it shed AHEAD of `RequestId`
+  and the 503 went out with no `X-Request-Id` — the response class most
+  likely to be investigated being the one that could not be. A DEPTH cap was rejected — the number that
+  matters to a caller is how long it waited, and a cap turns a brief
+  burst into refusals while a slow wedge under it stays invisible.
+  The shed is judged at ADMISSION (when a call reaches a thread), so a
+  pool that never frees one queues rather than refuses, and
+  readiness-on-sustained-saturation is still the follow-up: today a
+  wedged pod answers `/healthz` 200 and stays in the Service.
+  Sizing at the pool rather than above it is the same argument
+  `HOGLAKE_COMPACTION_PARALLEL_GROUPS`' boot check makes, and it is a
+  BOOT REFUSAL for the same reason: handler threads above the pool
+  queue inside `getConnection` and 500 after Hikari's 5 s bound instead
+  of queueing in the dispatcher. `HOGLAKE_REQUEST_THREADS >
+  HOGLAKE_DB_POOL_SIZE` is refused naming both knobs, as are a
+  dispatcher of zero threads, a probe timeout under Hikari's own 250 ms
+  floor, and a call group of zero. The default reserves NOTHING for the
+  background loops: on the API workload the chart turns them all off,
+  but a pod that runs loops and serves traffic should set
+  `HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
+  runs. SHUTDOWN ORDER IS PART OF THE FIX: `Main.kt` stops the ENGINE
+  first and only then closes the loops and the pools, and both new
+  pools close with `shutdown()` + a bounded wait rather than
+  `shutdownNow()` — interrupting an in-flight commit to save a second
+  of shutdown is the behaviour #218 complains about.
+  `/healthz`, `/livez` and `/metrics` BYPASS the dispatcher
+  (`PROBE_PATHS`, matched on a path normalised for trailing slashes —
+  MEASURED: `/healthz/` is a 404 today, because this server does not
+  install Ktor 3's `IgnoreTrailingSlash`, and normalising makes it a
+  FAST 404 rather than a queued timeout and removes the trap where
+  installing that one-line plugin later would route a real probe
+  through the saturated pool with nothing redding) — they are the
+  surfaces an operator reaches for exactly when the queue is longest — and `/healthz` runs on its own threads over
+  its own ONE-CONNECTION pool (`HealthProbe`),
+  bounded four ways by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` (Hikari
+  `connectionTimeout`, pgjdbc `connectTimeout`/`socketTimeout`, session
+  `statement_timeout`) with a wall-clock deadline of twice it. The
+  zombie-server property is unchanged — a database that does not answer
+  is still a 503 — but "the pool is busy serving commits" is no longer
+  indistinguishable from it. The deadline ABANDONS its task rather than
+  cancelling it (`withTimeoutOrNull` cannot interrupt a blocking JDBC
+  call), and probes single-flight WITH AN AGE BOUND: an in-flight
+  attempt is joined only while it is younger than its own deadline,
+  because joining on "still running" alone lets one hung task pin
+  `/healthz` at 503 for the rest of the pod's life — a permanently
+  unready pod, the same outage in a different costume. Past that it is
+  abandoned and a fresh attempt runs on the SECOND thread (which is why
+  there are two, and why two is also the cap: with both hung the probe
+  refuses to launch a third and answers 503, so a permanent hang costs
+  a fixed number of parked threads).
+  Metrics: `hoglake_db_pool_active`/`_idle`/`_pending`/`_max` (Hikari's
+  request pool; `pending > 0` is the alert — a caller queued inside
+  `getConnection` with 5 s before it is a 500),
+  `hoglake_request_pool_active`/`_queued`/`_max` (the dispatcher) and
+  the `hoglake_request_queue_wait_seconds` histogram (what the
+  saturation cost), `hoglake_request_queue_abandoned_total` (calls that
+  left the queue without ever reaching a thread — the histogram is
+  CONDITIONED ON SURVIVAL, so under a convoy bad enough that callers
+  give up first the surviving waits are the SHORT ones and its p99 can
+  FALL while the instance gets worse; read the two together),
+  `hoglake_requests_shed_total` (refusals at handler entry — NOT in
+  `hoglake_commits_total{result="timeout"}`, because a shed request is
+  refused before Routing has parsed a catalog to tag, and for the same
+  reason it carries no `route` tag) and
+  `hoglake_health_probe_attempts_hung` (the probe's outstanding
+  attempts; 2 is the cap and an ABSORBING STATE — two hangs park both
+  threads forever and `/healthz` then answers 503 indistinguishably
+  from a dead database, so 2 against a live Postgres means restart the
+  pod). Handlers queued in the dispatcher hold no catalog
+  connection; handlers pending on Hikari do, so the two families are
+  read together. The pool gauges are read straight off the pools at
+  scrape time — no sampler — and the Hikari MXBean is resolved INSIDE
+  each lambda, because a reference captured at registration can be null
+  (the pool is lazy) or stale across a reopen, and a gauge frozen on a
+  dead pool reports calm while the live one saturates. `active` counts
+  THREADS and is an approximation; `queued` counts calls waiting for
+  their FIRST thread and is NOT `executor.queue.size`, which also holds
+  the re-dispatch of every already-admitted coroutine that resumed.
+  The Ktor TEST ENGINE cannot see any of this: it has no call group and
+  no event loop, so a blocked handler starves nothing and `/healthz`
+  answers whether or not the fix exists. The property is pinned against
+  the REAL Netty engine on a real port
+  (`api/RequestDispatchIntegrationTest`), and any future change to
+  request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
   expiry, cleanup, compaction, verify, retirement, metrics sampler)
   registers with
