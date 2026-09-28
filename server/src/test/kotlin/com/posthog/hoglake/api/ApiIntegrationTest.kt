@@ -35,11 +35,19 @@ import java.util.Base64
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class ApiIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
-    private val app = App.build(Config(hydratorIntervalMs = 0), db.jdbi)
+
+    // jdbcUrl is what /healthz's OWN connection is built from (#218):
+    // the probe no longer borrows from the request pool, so the fixture
+    // has to say which database it should reach. Without it the probe
+    // would dial Config's localhost:5432 default and report 503.
+    private val app = App.build(Config(hydratorIntervalMs = 0, jdbcUrl = db.jdbcUrl), db.jdbi)
     private val json = ObjectMapper()
 
     @AfterAll
-    fun tearDown() = db.close()
+    fun tearDown() {
+        app.close()
+        db.close()
+    }
 
     // ---- harness ---------------------------------------------------------
 
