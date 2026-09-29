@@ -14,16 +14,28 @@ import java.time.Duration
  * plumbing, and that no integration test can see: the SDK call bounds,
  * and how one `DeleteObjects` response's error list is read.
  *
- * The cleanup drain's object-store calls run INSIDE a transaction that
- * holds the per-catalog commit lock, so the SDK's call bound is not a
- * number somebody liked — it is an INEQUALITY against two bounds that
- * are already in force on that transaction, and it is worth nothing
- * unless it sits under both.
+ * THE CALL BOUND IS NO LONGER AN INEQUALITY, and these tests say so
+ * rather than asserting one that stopped being load-bearing. The drain
+ * used to make its object-store calls inside a transaction that held the
+ * per-catalog commit lock, so the bound had to sit under both
+ * `idle_in_transaction_session_timeout` and the commit admission bound
+ * or it could never fire usefully. Cleanup is now a claimed work queue:
+ * the claim commits before the first call, the settle opens a new
+ * transaction after the last, and no lock is taken at all — so what a
+ * hung call costs is one parked worker holding a claim until its lease
+ * expires.
  *
- * A unit test, deliberately: the failure it guards is a bound that
- * silently stops being reachable when one of the other two moves, and
- * that is a fact about three constants rather than about a running
- * system. It reds in the fast lane, with no Docker.
+ * What is still worth pinning is that the number FOLLOWS the admission
+ * knob (an operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS gets
+ * shorter calls, which is the only reason it is derived rather than
+ * written down) and that it stays under both of the bounds it was
+ * derived from — not because they constrain it any more, but because a
+ * bound above them would be a number chosen by nothing at all.
+ *
+ * A unit test, deliberately: the failure it guards is a derived bound
+ * silently changing meaning when one of its inputs moves, and that is a
+ * fact about three constants rather than about a running system. It reds
+ * in the fast lane, with no Docker.
  *
  * The idle bound is PARSED out of [Database.SESSION_INIT_SQL] rather
  * than restated, because `SESSION_INIT_SQL` is the single source of
@@ -65,36 +77,94 @@ class RemovalStoreBoundsTest {
     }
 
     @Test
-    fun `the call bound sits under the idle-in-transaction bound`() {
-        // A connection waiting on an S3 response IS idle in transaction.
-        // Past this bound Postgres kills the backend, the sub-batch
-        // rolls back with its objects already deleted and its ledger
-        // rows unsettled, and the SDK's own timeout never fires — so a
-        // call bound at or above it cannot do its job.
+    fun `the call bound sits under both of the bounds it is derived from`() {
+        // NEITHER CONSTRAINS IT ANY MORE — no transaction is open across
+        // an object-store call and cleanup takes no lock, so a slow call
+        // can neither be killed idle-in-transaction nor convoy a commit.
+        // The bound is kept under both because `min(idle, admission) / 3`
+        // is where the number came from and a bound above its own inputs
+        // would be arbitrary.
         assertThat(store.apiCallTimeout)
-            .describedAs("the SDK call bound must be able to fire before Postgres kills the backend")
+            .describedAs("derived from min(idle, admission), so it sits under the idle bound")
             .isLessThan(idleFromSql)
+        assertThat(store.apiCallTimeout)
+            .describedAs("and under the admission bound, which is the one an operator tunes")
+            .isLessThan(Duration.ofMillis(CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS))
     }
 
     @Test
-    fun `the call bound sits under the commit admission bound`() {
-        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS is how long a foreground commit
-        // waits for this lock before answering a typed 503. A hold
-        // longer than that turns every concurrent writer's commit into
-        // backpressure, which is the production failure this whole
-        // change is about.
-        assertThat(store.apiCallTimeout)
-            .describedAs("a hold longer than commit admission 503s every concurrent writer")
-            .isLessThan(Duration.ofMillis(CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS))
+    fun `a whole CLAIM's worst case fits inside the claim lease, for both arms`() {
+        // THE INEQUALITY THAT REPLACED THE HOLD BUDGET, and it is about a
+        // CLAIM — the unit the lease is stamped on — not about a
+        // sub-batch. An earlier version of this test priced
+        // STAGING_SUB_BATCH probe pairs and called that a claim; the claim
+        // then had no reason predicate and could hold SUB_BATCH tickets,
+        // so the real worst case was 2 x 1,000 x 10 s = 20,000 s against a
+        // 900 s lease, 22x. The claim is now reason-aware, which is what
+        // makes the inequality true rather than the arithmetic convenient.
+        val lease = Duration.ofSeconds(CleanupService.CLAIM_LEASE_SECONDS)
+
+        // STAGING: STAGING_SUB_BATCH tickets, two calls each (HEAD then
+        // DELETE, because only that pair can report 'absent'), every call
+        // at the bound.
+        val stagingWorstCase =
+            store.apiCallTimeout.multipliedBy(2L * CleanupService.STAGING_SUB_BATCH)
+        assertThat(stagingWorstCase)
+            .describedAs(
+                "a staging CLAIM is %d tickets x 2 calls at the %s call bound",
+                CleanupService.STAGING_SUB_BATCH,
+                store.apiCallTimeout,
+            )
+            .isLessThan(lease)
+
+        // BULK: SUB_BATCH paths, but the calls are DeleteObjects requests,
+        // one per bucket chunk of MAX_KEYS_PER_DELETE keys — so the call
+        // count is the chunk count, not the row count. Priced at the
+        // ceiling with a generous allowance for paths spread across
+        // several buckets.
+        // AN ASSUMPTION, NOT A WORST CASE, and worth saying so: a claim's
+        // 1,000 paths are one DeleteObjects request per bucket, and
+        // nothing in the schema caps the buckets a catalog's paths span.
+        // Eight is generous against today's deployments, where a catalog's
+        // `data_path` is one bucket; ninety would exceed the lease.
+        val chunksPerBucketSpread = 8
+        val chunksPerSubBatch =
+            (CleanupService.SUB_BATCH + RemovalStore.MAX_KEYS_PER_DELETE - 1) /
+                RemovalStore.MAX_KEYS_PER_DELETE
+        val bulkChunks = chunksPerBucketSpread * chunksPerSubBatch
+        val bulkWorstCase = store.apiCallTimeout.multipliedBy(bulkChunks.toLong())
+        assertThat(bulkWorstCase)
+            .describedAs(
+                "a bulk CLAIM is %d rows = %d DeleteObjects requests even spread over %d buckets",
+                CleanupService.SUB_BATCH,
+                bulkChunks,
+                chunksPerBucketSpread,
+            )
+            .isLessThan(lease)
+
+        // And the shape that does NOT fit — the ARITHMETIC THAT MOTIVATES
+        // the split, not a guard against undoing it: this is an assertion
+        // over constants, and merging the two claim statements back into
+        // one would leave it green. What actually reds that mutation is
+        // `CleanupServiceIntegrationTest.a claim never mixes the two
+        // reasons, and a staging claim is capped at STAGING_SUB_BATCH`,
+        // which counts the statements a run issues.
+        assertThat(store.apiCallTimeout.multipliedBy(2L * CleanupService.SUB_BATCH))
+            .describedAs(
+                "one claim of SUB_BATCH staging tickets could not fit inside the lease, which is " +
+                    "why no such claim is issued",
+            )
+            .isGreaterThan(lease)
     }
 
     @Test
     fun `the bound follows the admission bound this process actually runs with`() {
         // Derived, not written down: an operator who lowers
-        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep commits responsive must
-        // get a lower call bound with it, or the drain's hold outlives
-        // the admission window the operator just chose. App.kt passes
-        // cfg.commitLockTimeoutMs into RemovalStore for this reason.
+        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep a pod responsive gets
+        // shorter object-store calls with it, which is the ONLY property
+        // the derivation still buys now that no call runs inside a
+        // transaction. App.kt passes cfg.commitLockTimeoutMs into
+        // RemovalStore for this reason.
         assertThat(RemovalStore.callBoundFor(6_000))
             .describedAs("a 6s admission bound is the binding one; the call bound follows it")
             .isEqualTo(Duration.ofSeconds(2))
@@ -103,53 +173,6 @@ class RemovalStoreBoundsTest {
         assertThat(RemovalStore.callBoundFor(0))
             .describedAs("an unbounded admission wait leaves the idle bound in charge")
             .isEqualTo(idleFromSql.dividedBy(3))
-    }
-
-    @Test
-    fun `the hold budget is two call bounds, and both fit inside the smaller of the two bounds`() {
-        // The property the gate enforces, stated as the code enforces it
-        // rather than as it reads:
-        //
-        //   hold <= HOLD_BUDGET = 2 x call bound
-        //   HOLD_BUDGET + one call <= min(idle, admission)
-        //
-        // The gate is `elapsed <= holdBudget - apiCallTimeout`, so the
-        // LAST call a sub-batch starts always has a full call bound of
-        // room INSIDE the budget — the hold never reaches the budget
-        // plus a call, which is what the earlier wording claimed.
-        val admission = Duration.ofMillis(CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
-        val binding = minOf(idleFromSql, admission)
-        assertThat(store.holdBudget)
-            .describedAs("the budget is exactly two call bounds, so both derive from the same quantity")
-            .isEqualTo(store.apiCallTimeout.multipliedBy(2))
-        assertThat(store.holdBudget.plus(store.apiCallTimeout))
-            .describedAs("budget + one call must fit inside whichever of the two bounds is smaller")
-            .isLessThanOrEqualTo(binding)
-        assertThat(store.holdBudget)
-            .describedAs("and the budget must EXCEED one call, or the gate reads `elapsed <= 0`")
-            .isGreaterThan(store.apiCallTimeout)
-    }
-
-    @Test
-    fun `the hold budget follows the admission bound down, not just the idle bound`() {
-        // The defect this closes: a budget written against the idle
-        // bound alone survives an operator lowering
-        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep commits responsive, and
-        // then holds the catalog's commit lock for 20 s inside a 6 s
-        // admission window — 503ing every writer, which is the
-        // production failure the whole change exists to remove.
-        val lowered = 6_000L
-        assertThat(RemovalStore.callBoundFor(lowered)).isEqualTo(Duration.ofSeconds(2))
-        assertThat(RemovalStore.holdBudgetFor(lowered))
-            .describedAs("a 6s admission bound buys a 4s hold budget, not the idle bound's 20s")
-            .isEqualTo(Duration.ofSeconds(4))
-        assertThat(RemovalStore.holdBudgetFor(lowered).plus(RemovalStore.callBoundFor(lowered)))
-            .describedAs("and budget + one call still fits inside the bound the operator chose")
-            .isLessThanOrEqualTo(Duration.ofMillis(lowered))
-        // 0 is an unbounded admission wait, so the idle bound is left in
-        // charge of both.
-        assertThat(RemovalStore.holdBudgetFor(0))
-            .isEqualTo(idleFromSql.multipliedBy(2).dividedBy(3))
     }
 
     @Test

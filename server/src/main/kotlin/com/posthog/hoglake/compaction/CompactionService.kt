@@ -764,10 +764,15 @@ data class CompactionPlan(
  * skip, crash, failed upload — the ticket stays undrained and the
  * NORMAL cleanup drain reclaims the object (its liveness check passes:
  * the path was never registered). Because cleanup may legally drain the
- * ticket while the group is still in flight (it holds no lock between
- * upload and commit), the commit transaction first re-claims the ticket
- * (still undrained?) and aborts the group if cleanup got there first —
- * the object is already gone; re-plan next sweep.
+ * ticket while the group is still in flight (it holds no lock at all
+ * between upload and commit), the commit transaction first re-claims the
+ * ticket — `FOR UPDATE`, and NOT OURS unless it is untouched
+ * (`drained_at IS NULL AND claimed_at IS NULL AND attempts = 0`), because
+ * a claimed or attempted row's object may already be gone and no lock can
+ * stand between a DELETE nobody holds and this registration — and aborts
+ * the group if cleanup got there first, re-staging the path so the object
+ * can never outlive a ticket naming it. Re-plan next sweep, with a fresh
+ * UUID path.
  *
  * Inputs are END-SNAPSHOTTED, never deleted: they remain visible to
  * time travel below the compaction snapshot, and expiry queues their
@@ -2205,14 +2210,56 @@ class CompactionService(
         jdbi.inTransactionUnchecked { h ->
             Locks.acquireCatalogCommitLock(h, ctx.catalogId, ctx.commitLockTimeoutMs)
 
-            // Re-claim the staging ticket under the lock: cleanup drains
-            // under the SAME lock, so "still undrained" here means the
-            // uploaded object still exists and is ours to register.
+            // RE-CLAIM THE STAGING TICKET: THE OBJECT IS ONLY OURS TO
+            // REGISTER IF NOBODY HAS TOUCHED THE TICKET. It used to be the
+            // catalog commit lock that made this safe; cleanup no longer
+            // takes one.
+            //
+            // Cleanup is a claimed work queue: it stamps
+            // `claimed_at`/`claimed_by` in one short transaction, then
+            // deletes objects with NOTHING OPEN — no transaction, no row
+            // lock — and settles in another. So the row lock this read
+            // takes serializes the two writers on the ROW and does
+            // nothing whatsoever about the S3 DELETE, which is why the
+            // predicate is three terms and not one:
+            //
+            //  - `drained_at IS NULL` — a settled ticket is somebody's
+            //    finished work;
+            //  - `claimed_at IS NULL` — ANY claim, live or lapsed. A
+            //    lapsed claim does not mean the object survived; it means
+            //    NOBODY KNOWS. A worker whose lease ran out mid-work, or
+            //    that was killed after its DELETE and before its settle,
+            //    leaves exactly this row — and registering it produces a
+            //    live `hog_data_file` row pointing at a deleted object,
+            //    which no check in the system can see (every
+            //    `staging_tickets` arm passes once the file row exists);
+            //  - `attempts = 0` — nobody has tried and failed either. A
+            //    lost `DeleteObjects` RESPONSE fails the chunk, bumps
+            //    `attempts` and RELEASES the claim, so `claimed_at` is
+            //    null again while the object may well be gone server-side.
+            //    `attempts` is the monotone "somebody has been here" mark
+            //    that closes that route.
+            //
+            // FOR UPDATE takes the row lock, so this read and the settle
+            // below see the same row and no drain can claim or settle it
+            // in between — which is what makes the settle's
+            // `check(settled == 1)` unreachable. It waits at most for one
+            // claim statement (a single UPDATE) because the claim uses
+            // SKIP LOCKED and never waits on us.
+            //
+            // The cost of refusing a touched ticket is ONE GROUP: the
+            // rewrite is thrown away, the path is re-staged so the object
+            // cannot outlive a ticket naming it, and the next sweep plans
+            // a fresh group with a NEW UUID output path. Compaction
+            // therefore does not know or care how long a cleanup lease is
+            // — the lease is CleanupService's business alone.
             val ticketLive =
                 h.createQuery(
                     """
-                SELECT (drained_at IS NULL) FROM hog_file_removal
+                SELECT (drained_at IS NULL AND claimed_at IS NULL AND attempts = 0)
+                FROM hog_file_removal
                 WHERE catalog_id = :catalogId AND removal_id = :removalId
+                FOR UPDATE
                 """,
                 )
                     .bind("catalogId", ctx.catalogId)
@@ -2221,8 +2268,13 @@ class CompactionService(
                     .findOne()
                     .orElse(false)
             if (!ticketLive) {
-                // The object is NOT necessarily gone, and that is a
-                // consequence of streaming the output. The old ordering
+                // The object is NOT necessarily gone — it may be settled
+                // and deleted, or merely CLAIMED by a worker that is
+                // deleting it as this runs. Either way the path is not
+                // this group's to register.
+                //
+                // That it may still exist is a consequence of streaming
+                // the output. The old ordering
                 // claimed the ticket immediately before a single PUT, so
                 // a drain that beat the commit almost always beat the
                 // object's existence too. Now the claim precedes the
@@ -2244,8 +2296,8 @@ class CompactionService(
                 // commit lock to save nothing.
                 stageOutputPath(h, ctx.catalogId, outputPath)
                 log.warn {
-                    "compaction staging ticket $stagingId for $outputPath was drained by " +
-                        "cleanup before the group committed; aborting the group and " +
+                    "compaction staging ticket $stagingId for $outputPath was drained or claimed " +
+                        "by cleanup before the group committed; aborting the group and " +
                         "re-staging the path so the object cannot outlive its ticket"
                 }
                 return@inTransactionUnchecked GroupOutcome.SkippedConflict
@@ -2472,7 +2524,18 @@ class CompactionService(
             // Settle the staging ticket in the SAME transaction that makes
             // the path live: cleanup's drain and the commit path guard only
             // act on UNDRAINED rows, so the registered output can never be
-            // reclaimed or refused.
+            // reclaimed or refused. It leaves `claimed_at`/`claimed_by`
+            // alone, and must — it only runs when they are already NULL,
+            // because the re-read above refuses a ticket carrying ANY
+            // claim, live or lapsed.
+            //
+            // THE PREDICATE IS THE RE-READ'S, VERBATIM — all three terms.
+            // The row has been locked since the re-read, so the two
+            // statements see the same row and `check(settled == 1)` is
+            // unreachable rather than merely unlikely; a settle with a
+            // different predicate from the read that authorised it would
+            // make that check fire on a row this transaction had already
+            // called its own.
             val settled =
                 h.createUpdate(
                     """
@@ -2480,7 +2543,7 @@ class CompactionService(
                        SET drained_at = now(), drained_outcome = 'registered',
                            last_attempt_at = now()
                      WHERE catalog_id = :catalogId AND removal_id = :removalId
-                       AND drained_at IS NULL
+                       AND drained_at IS NULL AND claimed_at IS NULL AND attempts = 0
                     """,
                 )
                     .bind("catalogId", ctx.catalogId)

@@ -476,37 +476,140 @@ That re-check is ONE statement per sub-batch and it is INDEXED: it
 probes `hog_data_file`, `hog_delete_file` (V17's `(catalog_id, path)`)
 and `hog_upload` (V12's unique key) by path, so its cost sizes with the
 sub-batch and not with the catalog's manifest — before V17 it read
-every file row the catalog has ever registered, once per sub-batch,
-while holding the commit lock (190,884 buffers and 692 ms at 5M rows,
-against 8,728 and 33 ms after).
-S3 deletes run in sub-batches (`HOGLAKE_CLEANUP_SUB_BATCH`, 1,000
-paths) whose ledger updates commit independently, so a mid-drain
-failure never rolls back completed work — and each sub-batch's
-check-then-delete pair runs **under the per-catalog commit lock**,
-paired with commit's refusal to register a path that has an undrained
-removal row: the two sides together make delete-under-path-reuse
-structurally impossible (the liveness answer can't go stale between
-check and delete, and a new commit can't slip a live file under a
-queued path).
+every file row the catalog has ever registered, once per sub-batch
+(190,884 buffers and 692 ms at 5M rows, against 8,728 and 33 ms after).
+
+**The drain is a claimed work queue, and it takes no catalog lock
+anywhere** (V21). Each sub-batch is three steps with the transaction
+boundaries as the design:
+
+1. **CLAIM** — `UPDATE hog_file_removal SET claimed_at = now(),
+   claimed_by = :worker WHERE removal_id IN (SELECT ... FOR UPDATE SKIP
+   LOCKED) RETURNING`, one statement in its own transaction, committed
+   **before the first object-store call**. So no transaction is open
+   while a worker waits on S3, and `idle_in_transaction_session_timeout`
+   bounds nothing here.
+2. **WORK** — the reference check, then the deletes. No transaction, no
+   lock, nobody waiting.
+3. **SETTLE** — one short transaction, fenced on `drained_at IS NULL AND
+   claimed_by = :worker` and `RETURNING` the rows it actually took. The
+   ones it did not are `settled_elsewhere`.
+
+The lock it used to hold protected nothing, and cost ~19 s per 1,000-row
+sub-batch on gigahog-prod-us (2026-09-24), during which every commit on
+the catalog waited — which is why cleanup is off in production. As of
+2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h, about
+9.4k of them orphaned `compaction_staging` tickets past their grace.
+
+The reason the lock was unnecessary is the pair it was half of: a commit
+passes the path-reuse guard only when no UNDRAINED row names the path, and
+the drain reads only undrained rows — a claimed row is still undrained, so
+the refusal covers the whole time a path is somebody's work. What remains
+is a queue INSERT racing a registration, and there are **four inserters
+with three serializers**, which is worth stating because two of them take
+no commit lock:
+
+- `ExpiryService` and `RetirementService` insert under the commit lock,
+  and only for paths whose file rows they have just deleted;
+- `CompactionService.stageOutputPath`'s initial stage takes **no** lock
+  (autocommit, before the rewrite): safe because the path is a UUID that
+  sweep just minted and nobody else knows. Its re-stage runs inside
+  `commitGroup` and so under the lock;
+- `UploadService.fenceAndQueue` takes **no** commit lock either, and
+  deliberately — taking one would convoy the catalog. It is serialized
+  against a concurrent registration by the `hog_upload` **row lock**:
+  `UploadService.register` takes `SELECT ... FOR UPDATE` on the claim rows
+  inside the commit transaction and raises `CommitConflict` unless the
+  claim is still active, while the sweep re-evaluates its candidate
+  predicate after waiting on that lock. This is the arm the removed commit
+  lock was actually standing in for.
+
+The standing constraint that falls out: a commit that registers a path
+with **no `hog_upload` claim** has no serializer against a concurrent
+queue insert for that path. It is unreachable today because paths are
+never reused and every externally-supplied path arrives through an upload
+claim — a future path that is neither must bring its own serializer.
+
+`FOR UPDATE SKIP LOCKED` is what lets `HOGLAKE_CLEANUP_WORKERS`
+(default **1**) workers per run — and any number of replicas —
+partition the queue with no coordination and no single-flight lock: a row
+another claim holds is skipped rather than waited for.
+`HOGLAKE_CLEANUP_BATCH` is a budget **per worker**, so a run asks for
+`workers x batch` rows and the standing rate is
+
+    rows/h = workers x batch x 3600000 / HOGLAKE_CLEANUP_INTERVAL_MS
+
+which is **4,000 rows/h at the compiled defaults** — a deliberately
+conservative floor, and nowhere near a busy catalog's arrivals. The
+defaults do not clear a backlog; the values that do live in the chart, and
+they are a pair (a batch large enough to keep the workers busy, an
+interval near a run's own duration, which the reference check sets at ~20 s
+cold for 4 x 1,000 rows). A worker holds a pooled connection across that
+check, so `HOGLAKE_COMPACTION_PARALLEL_GROUPS + HOGLAKE_CLEANUP_WORKERS`
+is refused at boot above `HOGLAKE_DB_POOL_SIZE -
+FOREGROUND_CONNECTION_RESERVE`: at the production shape (pool 10, reserve
+4, groups 6) the pool has to be raised before any worker count is legal. A claim is a
+**lease**, not a lock (`HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS`, 900 s): a
+worker killed between its claim and its settle leaves rows claimed until
+the lease lapses, and `DeleteObjects` is idempotent so the re-drain
+settles exactly as the first attempt would have. The `claimed_by` fence
+is the other half of that: a worker whose lease lapsed while it was
+talking to S3 can no longer write the ledger, so it cannot stamp its
+outcome over the worker that took the row from it. The fence is also
+where `still_referenced` is COUNTED from — the attempts bump returns the
+rows it really touched, and a compaction group that commits between a
+claim and its reference check makes the path live without being a
+violation.
+
+Two writers can settle a `hog_file_removal` row: this drain, and a
+compaction group's commit settling its own staging ticket
+`'registered'`. `CompactionService.commitGroup` re-reads the ticket `FOR
+UPDATE` and takes it **only if nobody has touched it** — `drained_at IS
+NULL AND claimed_at IS NULL AND attempts = 0`, the same three terms in its
+settle — otherwise it re-stages the path and skips the group. A LAPSED
+claim counts as touched, and that is the point: an expired claim does not
+mean the object survived, it means nobody knows, and the row lock cannot
+stand between a DELETE no transaction holds and a registration. The three
+routes to a touched-but-unsettled ticket are a worker past its lease, a
+worker killed after its DELETE, and a lost `DeleteObjects` response (which
+bumps `attempts` and releases the claim); each costs one group's CPU and a
+fresh UUID path next sweep, rather than a live file row pointing at a
+deleted object. Compaction therefore never reads the lease — it is
+cleanup's alone. The re-read's wait is at most one claim transaction (a
+single UPDATE), because the claim skips locked rows and never waits on
+compaction.
+
+The drain also **reads back the rows its settle did not match** and
+classifies them: another writer's `'registered'` over a path this
+sub-batch had not deleted is ordinary contention (`settled_elsewhere`), a
+claim that moved is a lapsed lease (a WARN naming both workers), and a
+`'registered'` over a path this sub-batch **had** deleted is an invariant
+violation — an ERROR, a `cleanup_violation` audit event and a counted
+`still_referenced`. That last case is unreachable given the re-read above;
+it is instrumented because nothing else in the system could see it (every
+`staging_tickets` arm passes once the file row exists).
 
 A bulk sub-batch's deletes are one `DeleteObjects` call **per bucket
 chunk** — 1,000 keys is S3's own ceiling on one request, which is where
-the default sub-batch comes from — rather than the
-`25 x (HeadObject + DeleteObject)` it used to be. That old shape held
-the lock ~3.2 s per sub-batch and ~255 s per 2,000-row run, which took
-commit latency on gigahog-prod-us from 200-400 ms to 12-22 s against a
-30 s admission bound and got both API pods liveness-killed. What scales
-the hold is the number of REQUESTS, not the sub-batch: keys past 1,000,
-or spread across buckets, chunk into more requests inside the same hold,
-so raising the knob past the ceiling buys nothing.
+the default sub-batch (and therefore the size of one claim) comes from —
+rather than the `25 x (HeadObject + DeleteObject)` it used to be. That
+old shape held the commit lock ~3.2 s per sub-batch and ~255 s per
+2,000-row run, which took commit latency on gigahog-prod-us from
+200-400 ms to 12-22 s against a 30 s admission bound and got both API
+pods liveness-killed. What scales the work is the number of REQUESTS,
+not the sub-batch: keys past 1,000, or spread across buckets, chunk into
+more requests, so raising the knob past the ceiling buys nothing.
 
 `reason = 'compaction_staging'` rows are the carve-out, on three
-counts. They keep HeadObject + DeleteObject, because a `DeleteObjects`
+counts, and they are **claimed by their own statement** so that the lease
+bounds the work one claim carries: 25 tickets is 50 round trips (500 s at
+the call bound, inside the 900 s lease), where a single claim of 1,000
+tickets would have been 20,000 s of calls under one lease. They keep HeadObject + DeleteObject, because a `DeleteObjects`
 response cannot distinguish a key it removed from one that was never
 there and `/verify`'s `staging_tickets` check reads exactly that
 distinction as `'absent'`. Because that costs two round trips per row,
-they drain in their OWN sub-batches of 25, so a run that is all staging
-tickets cannot put 1,000 probes inside one hold.
+they are claimed and settled 25 at a time — a unit of progress (each
+sub-batch settles in its own transaction) and the unit the lease bounds.
 And the drain leaves them alone until they are past
 `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h), because the ticket is
 inserted before the rewrite starts and settling a fresh one while its
@@ -516,46 +619,36 @@ that grace plus the cleanup interval has to stay well under
 drain is deliberately leaving alone. Every other reason settles
 `'deleted'`, whether or not the key was there.
 
-The hold is bounded in TIME as well as in calls, and the time bound is
-the one that matters: each call may take a whole
-`RemovalStore.apiCallTimeout`, so 25 probe pairs could reach 500 s and a
-three-chunk bulk sub-batch 30 s. A sub-batch therefore carries a
-deadline, checked before every object-store call and refusing to START
-one without a whole call bound of room left — so what it enforces is
-
-    hold <= HOLD_BUDGET = 2 x call bound
-    HOLD_BUDGET + one call <= min(idle bound, admission bound)
-
-(20 s, and 20 s + 10 s <= 30 s at the defaults). Both terms are derived
-from `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the effective
-`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so an
-operator who lowers the admission bound to keep commits responsive gets
-a shorter hold with it: a budget written against the idle bound alone
-would hold the lock 20 s inside a 6 s admission window and 503 every
-writer, which is the failure this whole change removes. Past the idle
-bound Postgres kills the backend: the sub-batch rolls back with its
-objects already deleted and its ledger rows unsettled, and the next run
-does the same thing again. Rows a deadline stops short of are left
-exactly as found — no settle, no `attempts` bump — are the next hold's
-work, and are counted `deadline_skipped`, which is also what keeps a
-budget-wedged drain from reporting as idle. Typical holds are nowhere
-near the budget: ~64 ms for a one-request bulk sub-batch, ~3.2 s for 25
-probe pairs.
-
-Two writers can settle a `hog_file_removal` row: this drain, and a
-compaction group's commit settling its own staging ticket
-`'registered'`. The batch select runs outside the lock, so the first
-statement under it re-checks that each row is still undrained and drops
-the ones that are not — without that, a group committing normally
-arrives at the reference check as a `still_referenced` invariant
-violation, with an alert and an `attempts` bump on a settled row. Both
-ledger writes carry `drained_at IS NULL` as the backstop for a settle
-that lands inside the hold itself.
+The object-store call bound (`RemovalStore.apiCallTimeout`, 10 s at the
+defaults, derived as `min(idle bound, admission bound) / 3` so an
+operator who lowers `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` gets shorter calls
+with it) is no longer an inequality against a lock hold: nothing is open
+across a call. What a hung call costs is one parked worker holding a
+claim until its lease expires. The `deadline_skipped` counter and the
+`HOLD_BUDGET` arithmetic it belonged to bounded that hold and are gone;
+the counter stays on the wire, always 0, because the maintenance ledger
+holds rows that carry it.
 
 `hoglake_files_removed_total` counts `objects_removed` — DISTINCT paths
 physically deleted — and not `removed`, which counts ledger rows: two
 undrained rows over one path are legitimate state and one batched
 delete settles both.
+
+The ledger's own retention purge is a **loop of bounded deletes** that
+pages the primary key from the bottom, where an append-only queue keeps
+its oldest rows: up to `LEDGER_PURGE_PAGE` ids per page through the key,
+delete the ones past the cutoff, stop at the first page with nothing to
+purge or when the wall budget expires. It used to be one
+`DELETE ... WHERE catalog_id = :c AND drained_at < cutoff`, which **no
+index on this table can serve** — both are partial on `drained_at IS
+NULL`, the complement of the rows it deletes — so it was a sequential scan
+with an unbounded row count, once per catalog per run, against a ledger
+heading for ~137M rows at 190k/h drained and the 30-day default. That is
+the shape of the 2026-09-28 expiry-lock outage, and it is why this is
+bounded before cleanup is re-enabled rather than after. The cost of the
+early stop is stated rather than hidden: a page with nothing to purge ends
+the walk, so rows above a long-undrained row wait for the run after it
+settles.
 
 Draining **soft-deletes**: a settled `hog_file_removal` row keeps its
 place with `drained_at` + `drained_outcome` (`'deleted'` for a

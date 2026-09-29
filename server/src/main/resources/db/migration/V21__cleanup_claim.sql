@@ -1,0 +1,108 @@
+-- THE CLEANUP DRAIN BECOMES A CLAIMED WORK QUEUE, and these two
+-- columns are the claim.
+--
+-- Until now a drain sub-batch held the per-catalog COMMIT lock across
+-- its reference check, its object-store deletes and its settle, so that
+-- check-then-delete could not go stale against a commit registering one
+-- of its paths. Two claims replace it. A commit passes
+-- `CommitService.REMOVAL_QUEUE_COLLISION_SQL` only when no UNDRAINED row
+-- names the path, and the drain reads only undrained rows — a claimed row
+-- is still undrained — so the guard refuses that path for as long as it is
+-- somebody's work. What remains is a queue INSERT racing a registration of
+-- the same path, and that is per-inserter: expiry and retirement insert
+-- under the commit lock and only for paths whose file rows they just
+-- deleted; compaction's initial `stageOutputPath` takes NO lock but mints
+-- a UUID nobody else knows; `UploadService.fenceAndQueue` takes no commit
+-- lock either and is serialized by the `hog_upload` ROW LOCK that
+-- `UploadService.register` takes inside the commit transaction, plus its
+-- `CommitConflict` on a claim that is no longer active. That last arm is
+-- what the removed commit lock was actually standing in for. See
+-- `CleanupService`'s class KDoc for the full statement of all four.
+--
+-- What the lock cost was measured on gigahog-prod-us 2026-09-24: ~19 s
+-- per 1,000-row sub-batch, during which every commit on the catalog
+-- waits. Cleanup has been off in production because of it; as of
+-- 2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h,
+-- about 9.4k of them orphaned `compaction_staging` tickets past grace.
+--
+-- The one genuine two-writer case is compaction's staging ticket: the
+-- same row is a deletion ticket for cleanup and a claim to settle
+-- 'registered' for the group commit. Postgres row locking serializes
+-- that (`SELECT ... FOR UPDATE` in `CompactionService.commitGroup`), and
+-- these columns are what tell the group that the row is already
+-- somebody's work.
+--
+-- claimed_at — when a cleanup worker took the row; NULL = unclaimed.
+--              A claim is a LEASE, not a lock: past
+--              HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS (900) the row is
+--              reclaimable, so a worker killed between its claim and
+--              its settle costs one lease and not a stuck row. The
+--              claim is committed BEFORE any object-store call, so no
+--              transaction is open while a worker waits on S3 and
+--              `idle_in_transaction_session_timeout` no longer bounds
+--              the drain at all.
+-- claimed_by — which worker (pod name + a per-worker UUID). It is the
+--              FENCE, not documentation: the settle and the attempts
+--              bump both carry `AND claimed_by = :worker`, so a worker
+--              whose lease lapsed can never stamp its outcome over the
+--              writer that took the row from it.
+--
+-- NO NEW INDEX. The claim's candidate select is the drain's old batch
+-- select with two more filters, so `hog_file_removal_drain
+-- (catalog_id, removal_id) WHERE drained_at IS NULL` (V16) still
+-- supplies both its predicate and its `ORDER BY`, and the claim clause
+-- is a FILTER over rows that index has already narrowed to one
+-- catalog's queue — at most a batch of them.
+-- `V21CleanupClaimMigrationIntegrationTest` EXPLAINs the statement
+-- CleanupService issues (its `internal` constant) against rows seeded
+-- BEFORE this file ran, and asserts that.
+--
+-- Two metadata-only ADD COLUMNs (NULL default, no rewrite) and still
+-- ACCESS EXCLUSIVE, so they sit inside the lock_timeout window
+-- (AGENT.md's migration rule; `MigrationLockWindowTest` reads this file
+-- off disk). V20's transactional shape: no `.conf`, so `SET LOCAL`
+-- expires with the transaction and needs no restore, and a failure rolls
+-- the whole file back and writes no history row — the next pod simply
+-- runs V21 again. `IF NOT EXISTS` because a re-run must be free.
+--
+-- DEPLOY NOTE: TIME IT, AND KNOW WHAT QUEUES BEHIND IT. Each statement
+-- is metadata-only and takes ACCESS EXCLUSIVE for milliseconds ONCE IT
+-- HAS THE LOCK — the risk is the wait, not the work. On prod
+-- `hog_file_removal` is read or written by, at least: every commit
+-- (`REMOVAL_QUEUE_COLLISION_SQL`, ~1/s), the expiry sweep's queue inserts
+-- (under the commit lock, up to the 60 s statement timeout), retirement's
+-- batch inserts (same), compaction's `stageOutputPath` and its ticket
+-- re-read/settle (every few seconds), the cleanup drain itself when it is
+-- on, `UploadService`'s reclaim sweep, `/verify`'s staging-ticket arms and
+-- `MaintenanceStatusService`. ACCESS EXCLUSIVE conflicts with the ACCESS
+-- SHARE / ROW EXCLUSIVE every one of those holds — AND WHILE IT WAITS IT
+-- BLOCKS THEM ALL BEHIND IT IN THE LOCK QUEUE, so a pending ALTER stalls
+-- every commit on every catalog for as long as it waits.
+--
+-- Hence `lock_timeout = '1s'` rather than the chain's usual 5 s: the
+-- timeout is the width of that stall, a failed attempt costs only a
+-- rolled-back migration and a pod retry, and this file has nothing to
+-- roll back but two catalog writes. Prefer a quiet window anyway —
+-- check `pg_stat_activity` for an in-flight expiry or retirement sweep,
+-- since either can hold its lock for tens of seconds:
+--
+--   SELECT pid, state, now() - xact_start AS xact_age, left(query, 120)
+--   FROM pg_stat_activity
+--   WHERE datname = current_database()
+--     AND query ILIKE '%hog_file_removal%' AND state <> 'idle'
+--   ORDER BY xact_start;
+--
+-- ROLLING DEPLOY AND ROLLBACK ARE BOTH SAFE. Flyway runs before a pod
+-- serves, so a new pod always has these columns and a pod whose V21 fails
+-- simply does not start. An OLD pod with V21 applied ignores them: its
+-- drain has no claim predicate and no `claimed_by` fence, so it can drain
+-- a row a new worker has claimed — two idempotent DELETEs, with the
+-- loser's settle refused — and the old drain still takes the commit lock,
+-- so old-cleanup-versus-compaction is serialized exactly as it is on
+-- main. Rolling back to a release without V21 is likewise safe: the
+-- columns are ignored and any row left claimed is drained regardless.
+SET LOCAL lock_timeout = '1s';
+
+ALTER TABLE hog_file_removal
+    ADD COLUMN IF NOT EXISTS claimed_at timestamptz,
+    ADD COLUMN IF NOT EXISTS claimed_by text;

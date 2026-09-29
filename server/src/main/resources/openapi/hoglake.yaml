@@ -986,6 +986,18 @@ paths:
         liveness-checked against live references before physical
         deletion; still-referenced entries are skipped and counted (an
         invariant violation, never a deletion).
+      description: >
+        The drain itself is scoped to this catalog. Its retention purge is
+        NOT: the same run hard-deletes settled ledger rows past
+        HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS across EVERY catalog,
+        because the purge walks the removal table's primary key rather
+        than one catalog's rows — a per-catalog walk would bound the rows
+        it deletes without bounding the rows it reads. The cutoff is a
+        per-process constant, so every catalog's rows are judged by the
+        same rule. The run also uses one worker rather than
+        HOGLAKE_CLEANUP_WORKERS when this pod's cleanup loop is disabled,
+        so a hand-triggered drain cannot take more of the connection pool
+        than the pod's configuration reserved for it.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -3722,16 +3734,21 @@ components:
           type: integer
           format: int64
           description: >
-            Rows dropped from a sub-batch because another writer had already
-            settled them — a compaction group settling its own staging ticket
-            'registered'. Normal, not a failure.
+            Rows a sub-batch could not settle because the row was no longer
+            its own: another writer had already settled it (a compaction group
+            settling its own staging ticket 'registered'), or this worker's
+            claim lease lapsed and another worker took the row. Normal, not a
+            failure — the one alarming case, a path registered after this drain
+            deleted its object, is reported as an invariant violation in
+            still_referenced instead, with a cleanup_violation audit event.
         deadline_skipped:
           type: integer
           format: int64
           description: >
-            Rows a sub-batch's hold budget stopped short of: claimed by the run,
-            never attempted, and drained by a later hold. Standing nonzero means
-            holds are ending on their budget rather than on their work.
+            Always 0. It counted rows a sub-batch's hold budget stopped short
+            of, and that budget bounded a commit-lock hold the drain no longer
+            takes. Retained on the wire because the maintenance run ledger
+            holds rows that carry it.
 
     RehydrateResult:
       type: object

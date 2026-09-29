@@ -266,6 +266,14 @@ class V17FilePathIndexMigrationIntegrationTest {
         assertThat(indexDef(DATA_INDEX)).describedAs("%s absent before V17", DATA_INDEX).isNull()
         assertThat(indexDef(DV_INDEX)).describedAs("%s absent before V17", DV_INDEX).isNull()
 
+        // The capture below runs a REAL drain, and a drain claims its
+        // rows (V21's `claimed_at`/`claimed_by`) before it checks any
+        // path. This fixture sits at V16 because that is where V17's
+        // indexes are absent, so V21's own FILE is applied out of order —
+        // read off disk rather than restated here, and idempotent, so the
+        // `Database.migrate` below re-applies it for free.
+        PgTestSupport.applyMigrationFile(db, "V21__cleanup_claim.sql")
+
         // The statements, off the services that issue them.
         referenceCheckSql = captureReferenceCheck()
         retainedProbeSql = captureRetainedProbe()
