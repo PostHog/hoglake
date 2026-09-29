@@ -124,6 +124,44 @@ object PgTestSupport {
                 .migrate()
         }
 
+    /**
+     * Apply ONE migration file OUT OF ORDER, read off disk, without
+     * touching Flyway's history.
+     *
+     * For the fixture that has to sit BELOW a migration to observe what
+     * it changed, while running a service whose statements need a LATER
+     * migration's columns: `V17FilePathIndexMigrationIntegrationTest`
+     * arrives at V16 because that is where V17's indexes are absent, and
+     * it captures its statement off a real cleanup drain — whose claim
+     * needs V21's `claimed_at`/`claimed_by`. The alternative, restating
+     * the DDL in the test, is the shape AGENT.md calls out: a copy
+     * asserts only that it compiles, and it would silently stop matching
+     * the day the migration moved.
+     *
+     * The history is deliberately UNTOUCHED, so the fixture's later
+     * `Database.migrate` applies the file again. Every migration this is
+     * used with must therefore be idempotent — which the repo's are, for
+     * the separate reason that a retried migration must be free.
+     */
+    fun applyMigrationFile(
+        db: TestDb,
+        fileName: String,
+    ) {
+        val file = java.io.File("src/main/resources/db/migration/$fileName")
+        require(file.isFile) { "no such migration file: $fileName (looked in ${file.absolutePath})" }
+        val sql = file.readText()
+        db.jdbi.useHandle<Exception> { h ->
+            h.begin()
+            try {
+                h.createScript(sql).execute()
+                h.commit()
+            } catch (e: Exception) {
+                h.rollback()
+                throw e
+            }
+        }
+    }
+
     @Synchronized
     private fun freshEmpty(productionSession: Boolean = false): TestDb {
         val name = "hoglake_test_${dbCounter++}"

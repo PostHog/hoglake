@@ -548,7 +548,21 @@ CREATE TABLE hog_file_removal (
     -- Outcome and timestamp travel together.
     drained_at      timestamptz,
     drained_outcome text CHECK (drained_outcome IN ('deleted', 'absent', 'registered')),
-    CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))
+    CHECK ((drained_at IS NULL) = (drained_outcome IS NULL)),
+    -- The CLAIM (V21). The drain is a claimed work queue and takes no
+    -- catalog lock at all: a worker claims rows in one short transaction
+    -- (UPDATE ... WHERE removal_id IN (SELECT ... FOR UPDATE SKIP
+    -- LOCKED)), commits it BEFORE any object-store call, and settles in
+    -- another. claimed_at is a LEASE — past
+    -- HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS (900) another worker may
+    -- reclaim the row, so a killed worker costs one lease and not a
+    -- stuck row — and claimed_by is the FENCE every ledger write
+    -- carries (`AND claimed_by = :worker`), so a lapsed worker cannot
+    -- stamp its outcome over the one that took the row from it.
+    -- CompactionService's group commit reads this row FOR UPDATE and
+    -- treats an unexpired claim as somebody else's work.
+    claimed_at      timestamptz,
+    claimed_by      text
 );
 CREATE INDEX hog_file_removal_drain
     ON hog_file_removal (catalog_id, removal_id)

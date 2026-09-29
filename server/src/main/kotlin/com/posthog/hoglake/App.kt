@@ -108,15 +108,16 @@ class App private constructor(
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
     private val removalStore = RemovalStore(cfg)
-    private val cleanupService =
-        CleanupService(
-            jdbi,
-            removalStore,
-            subBatchSize = cfg.cleanupSubBatchSize,
-            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
-            maintenanceLedgerRetentionSeconds = cfg.maintenanceLedgerRetentionSeconds,
-            stagingGraceSeconds = cfg.cleanupStagingGraceSeconds,
-        )
+
+    /**
+     * Every cleanup knob comes from `CleanupService`'s own `Config`
+     * constructor rather than being spelled out here, because one of the
+     * derivations is load-bearing: the clamp that makes `Config`'s pool
+     * refusal true (one worker when the loop is off) has to key on the
+     * same predicate the refusal prices on, and stating it at this call
+     * site is how the two could quietly diverge.
+     */
+    private val cleanupService = CleanupService(jdbi, removalStore, cfg)
 
     /**
      * Paced retirement of dropped tables' file rows — the other half of

@@ -184,6 +184,61 @@ class CommitRetentionAndPathGuardIntegrationTest {
     }
 
     @Test
+    fun `a CLAIMED undrained removal row still 409s - the drain's half of the pair`() {
+        // THE OTHER HALF OF THE CLEANUP CLAIM'S SAFETY ARGUMENT (V21).
+        // The drain now deletes objects with no catalog lock at all, and
+        // what makes that safe is this guard: a claimed row is still an
+        // UNDRAINED row, so a commit registering its path is refused
+        // until the row settles. If the guard looked at `claimed_at` —
+        // "somebody is already handling it" — the commit would land a
+        // live file row for a path a worker is deleting right now.
+        val cat = fixture()
+        val id = catalogId(cat)
+        val path = "s3://bucket/$cat/claimed.parquet"
+        val removalId =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason,
+                                                  claimed_at, claimed_by)
+                    VALUES (?, ?, 'data', 'snapshot_expiry', now(), 'worker-1')
+                    RETURNING removal_id
+                    """,
+                ).bind(0, id).bind(1, path).mapTo(Long::class.java).one()
+            }
+
+        assertThatThrownBy { append(cat, path) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("scheduled for deletion")
+            .hasMessageContaining(path)
+
+        // A LAPSED claim is no different: the row is undrained either way,
+        // and the lease only says who may work it, never whether the path
+        // is free.
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET claimed_at = now() - interval '1 day' WHERE removal_id = ?",
+                removalId,
+            )
+        }
+        assertThatThrownBy { append(cat, path) }
+            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("scheduled for deletion")
+
+        // Settled — claim cleared, as both writers of that row leave it —
+        // and the path is registrable again.
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET drained_at = now(), drained_outcome = 'deleted', " +
+                    "claimed_at = NULL, claimed_by = NULL WHERE removal_id = ?",
+                removalId,
+            )
+        }
+        append(cat, path)
+        assertThat(dataFileCount(cat)).isEqualTo(1)
+    }
+
+    @Test
     fun `a DV path with an undrained removal row is a 409 too`() {
         val cat = fixture()
         val id = catalogId(cat)

@@ -149,11 +149,20 @@ object HogSchemaColumns {
                     "catalog_id", "upload_id", "owner", "prefix", "path", "file_kind", "state",
                     "expires_at", "last_scheduled_at",
                 ),
-            // CleanupService (drain + ledger), ExpiryService queue inserts.
+            // CleanupService (claim + drain + ledger), ExpiryService queue
+            // inserts, CompactionService's staging ticket (stage, re-read
+            // FOR UPDATE, settle 'registered').
             "hog_file_removal" to
                 setOf(
                     "removal_id", "catalog_id", "path", "file_kind", "reason", "scheduled_at",
                     "attempts", "last_attempt_at", "drained_at", "drained_outcome",
+                    // V21: the cleanup claim's lease and its fence. Written
+                    // by CleanupService's claim / settle / attempts bump and
+                    // cleared by CompactionService's 'registered' settle;
+                    // read as a predicate only — no mapper carries them,
+                    // because nothing outside the drain asks whose work a
+                    // row is.
+                    "claimed_at", "claimed_by",
                 ),
             // TableCreationService: immutable preparation and terminal receipts.
             "hog_table_creation" to

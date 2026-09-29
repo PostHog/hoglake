@@ -1278,6 +1278,293 @@ class CompactionServiceIntegrationTest {
         assertVerifyPasses(fx.cat)
     }
 
+    // ---- the cleanup claim vs. the group commit (V21) -----------------------
+
+    /**
+     * A store that marks the staging ticket the way a cleanup worker
+     * would, the moment the output object becomes real —
+     * `completeMultipartUpload` is the last thing that happens before
+     * `commitGroup` runs, so this is exactly the window a drain occupies:
+     * ticket undrained, object uploaded, commit not yet attempted.
+     *
+     * [claimAgeSeconds] ages the claim; [attempts] stands for a worker
+     * that tried and did not settle (a lost `DeleteObjects` response,
+     * which fails the chunk, bumps `attempts` and RELEASES the claim). The
+     * three combinations are the three routes by which a ticket can be
+     * "touched but not settled" — and a group must refuse ALL of them,
+     * because in every one the object may already be gone and nothing
+     * anywhere would notice a live file row pointing at it.
+     *
+     * The mark is written by SQL rather than by running a drain because a
+     * drain would also DELETE the object and settle the row, which is the
+     * already-covered case; what these cases are about is a ticket the
+     * group can still see.
+     */
+    private fun touchingStore(
+        claimAgeSeconds: Long? = 0,
+        attempts: Int = 0,
+        /**
+         * Settle the ticket outright — the #174 case, and the only route of
+         * the four that happens every day: a drain that gets its
+         * `DeleteObjects` response deletes the object and settles the row.
+         * It is also the only route that exercises `drained_at IS NULL`.
+         */
+        settledOutcome: String? = null,
+    ): ObjectStore =
+        object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+            override fun completeMultipartUpload(
+                pathUri: String,
+                uploadId: String,
+                etags: List<String>,
+            ) {
+                super.completeMultipartUpload(pathUri, uploadId, etags)
+                val touched =
+                    db.jdbi.withHandleUnchecked { h ->
+                        h.createUpdate(
+                            """
+                            UPDATE hog_file_removal
+                               SET claimed_at = CASE WHEN :claimed
+                                                     THEN now() - make_interval(secs => :age)
+                                                     END,
+                                   claimed_by = CASE WHEN :claimed THEN 'cleanup-worker' END,
+                                   attempts = :attempts,
+                                   drained_at = CASE WHEN :outcome IS NOT NULL THEN now() END,
+                                   drained_outcome = :outcome
+                             WHERE path = :path AND reason = 'compaction_staging'
+                               AND drained_at IS NULL
+                            """,
+                        )
+                            .bind("claimed", claimAgeSeconds != null)
+                            .bind("age", (claimAgeSeconds ?: 0L).toDouble())
+                            .bind("attempts", attempts)
+                            .bind("outcome", settledOutcome)
+                            .bind("path", pathUri)
+                            .execute()
+                    }
+                check(touched == 1) {
+                    "the fixture must mark exactly one undrained staging ticket for $pathUri, not $touched"
+                }
+            }
+        }
+
+    /** Every claim column and the outcome of this catalog's removal rows, in queue order. */
+    private fun ticketState(cat: String): List<Triple<String?, String?, Int>> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                "SELECT drained_outcome, claimed_by, attempts FROM hog_file_removal r " +
+                    "JOIN hog_catalog c USING (catalog_id) WHERE c.name = :cat ORDER BY r.removal_id",
+            )
+                .bind("cat", cat)
+                .map { rs, _ ->
+                    Triple(rs.getString("drained_outcome"), rs.getString("claimed_by"), rs.getInt("attempts"))
+                }
+                .list()
+        }
+
+    /**
+     * Every way a cleanup worker can have TOUCHED a staging ticket, and
+     * the one property that has to hold for all of them: **no live file
+     * row may ever name a path a drain may already have deleted.**
+     *
+     * FOUR FIXTURES OVER THREE PREDICATE TERMS, and the mapping is worth
+     * stating so a reader auditing coverage counts terms rather than
+     * cases:
+     *
+     * 1. a live claim — `claimed_at IS NULL`;
+     * 2. a LAPSED claim (a worker past its lease, or one killed after its
+     *    DELETE) — the SAME term, deliberately. The predicate carries no
+     *    lease, so 1 and 2 reach one branch; case 2 is the regression
+     *    guard against re-introducing a lease into it, which is what
+     *    round 1 of this change got wrong;
+     * 3. a released claim with `attempts > 0` — a LOST `DeleteObjects`
+     *    response: the chunk failed, `attempts` was bumped and the claim
+     *    RELEASED, so `claimed_at` is null again while the object may be
+     *    gone server-side. `attempts = 0` is the term that covers it;
+     * 4. a ticket the drain fully SETTLED — `drained_at IS NULL`, the
+     *    #174 case, the original reason the re-read exists and the only
+     *    one of the four that happens every day, since a drain that gets
+     *    its response settles the row.
+     *
+     * An earlier version of this change treated 1 and 2 as reclaimable —
+     * "the claim expired, so the worker is gone, so the ticket is mine" —
+     * which is exactly wrong: an expired claim does not mean the object
+     * survived, it means nobody knows. `commitGroup`'s re-read therefore
+     * refuses any ticket that is not UNTOUCHED, and these cases pin that
+     * in the only terms that matter: outcome `SkippedConflict`, no file
+     * row for the output, and a fresh ticket so the object cannot outlive
+     * a ticket naming it.
+     */
+    @Test
+    fun `a group whose staging ticket cleanup has TOUCHED loses the group, however it was touched`() {
+        data class Route(
+            val name: String,
+            val term: String,
+            val store: ObjectStore,
+            val claimant: String?,
+            val attempts: Int,
+            val outcome: String? = null,
+        )
+
+        val routes =
+            listOf(
+                Route("a live claim", "claimed_at IS NULL", touchingStore(claimAgeSeconds = 0), "cleanup-worker", 0),
+                Route(
+                    "a LAPSED claim (a worker past its lease, or one killed after its delete)",
+                    "claimed_at IS NULL (the same term as route 1: the predicate has no lease)",
+                    touchingStore(claimAgeSeconds = 10 * CleanupService.CLAIM_LEASE_SECONDS),
+                    "cleanup-worker",
+                    0,
+                ),
+                Route(
+                    "a released claim with attempts > 0 (a lost DeleteObjects response)",
+                    "attempts = 0",
+                    touchingStore(claimAgeSeconds = null, attempts = 1),
+                    null,
+                    1,
+                ),
+                Route(
+                    "a ticket the drain already SETTLED (#174, and the only route that is routine)",
+                    "drained_at IS NULL",
+                    touchingStore(claimAgeSeconds = null, settledOutcome = "deleted"),
+                    null,
+                    0,
+                    outcome = "deleted",
+                ),
+            )
+        for (route in routes) {
+            val fx = fixture(dvOnMiddle = false)
+            val plan = svc.planTable(fx.cat, "ns", "t", cfg)
+            val group = plan.groups.single()
+            val headBefore = catalogs.getCatalog(fx.cat).headSnapshotId
+
+            val outcome =
+                CompactionService(db.jdbi, route.store, cfg)
+                    .compactPlannedGroup(fx.cat, "ns", "t", group)
+
+            assertThat(outcome)
+                .describedAs(
+                    "%s: a touched ticket is not this group's to register (the term that refuses " +
+                        "it is `%s`)",
+                    route.name,
+                    route.term,
+                )
+                .isEqualTo(CompactionService.GroupOutcome.SkippedConflict)
+            assertThat(catalogs.getCatalog(fx.cat).headSnapshotId)
+                .describedAs("%s: no snapshot, so nothing registered the output", route.name)
+                .isEqualTo(headBefore)
+            val files = catalogs.listFiles(fx.cat, "ns", "t")
+            assertThat(files.map { it.path })
+                .describedAs(
+                    "%s: THE PROPERTY — no live file row may name a path a drain may have deleted",
+                    route.name,
+                )
+                .containsExactlyElementsOf(fx.paths)
+            assertThat(files.none { it.explicitRowIds })
+                .describedAs("%s: and no compaction output was registered at all", route.name)
+                .isTrue()
+
+            // TWO tickets for the one path: the touched original, still
+            // the drain's to settle, and the re-stage that guarantees the
+            // object is reclaimed even if that worker never comes back.
+            val tickets = removalRows(fx.cat).filter { it.reason == "compaction_staging" }
+            assertThat(tickets).describedAs("%s: the path is re-staged", route.name).hasSize(2)
+            assertThat(tickets.map { it.path }.distinct())
+                .describedAs("%s: both tickets name the same staged object", route.name)
+                .hasSize(1)
+            assertThat(tickets.map { it.drainedOutcome })
+                .describedAs("%s: the original keeps its outcome and the re-stage has none", route.name)
+                .containsExactly(route.outcome, null)
+            assertThat(ticketState(fx.cat))
+                .describedAs(
+                    "%s: the original keeps the mark cleanup left; the re-stage is untouched " +
+                        "and drainable",
+                    route.name,
+                )
+                .containsExactly(
+                    Triple(route.outcome, route.claimant, route.attempts),
+                    Triple(null, null, 0),
+                )
+            assertThat(removalStore.exists(tickets.first().path))
+                .describedAs("%s: this fixture never deleted the object", route.name)
+                .isTrue()
+        }
+    }
+
+    @Test
+    fun `the re-staged ticket restarts the staging grace instead of inheriting it`() {
+        // The re-stage is a FRESH row, so its `scheduled_at` is now: the
+        // drain leaves it alone for HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS,
+        // which is what stops it settling the object out from under the
+        // NEXT group while that group is uploading. A re-stage that copied
+        // the original's timestamp would be eligible immediately.
+        val fx = fixture(dvOnMiddle = false)
+        val plan = svc.planTable(fx.cat, "ns", "t", cfg)
+        CompactionService(db.jdbi, touchingStore(claimAgeSeconds = 0), cfg)
+            .compactPlannedGroup(fx.cat, "ns", "t", plan.groups.single())
+
+        val scheduled =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT scheduled_at FROM hog_file_removal r JOIN hog_catalog c " +
+                        "USING (catalog_id) WHERE c.name = :cat ORDER BY r.removal_id",
+                ).bind("cat", fx.cat).mapTo(java.time.OffsetDateTime::class.java).list()
+            }
+        assertThat(scheduled).hasSize(2)
+        // BOTH TIMESTAMPS COME FROM THE SAME CLOCK — Postgres's, via
+        // `now()` in two different transactions — so the assertion is the
+        // literal statement of "restarts instead of inheriting" and no JVM
+        // clock enters it. Comparing against `Instant.now()` would be the
+        // shape that flakes elsewhere in this suite, and it would also be
+        // WEAKER: a re-stage that copied the original's `scheduled_at`
+        // would pass it whenever the original was itself recent.
+        assertThat(scheduled.last().toInstant())
+            .describedAs("the re-stage starts its OWN grace rather than inheriting the original's")
+            .isAfter(scheduled.first().toInstant())
+    }
+
+    @Test
+    fun `the ticket re-read takes the row lock it holds until the settle`() {
+        // AGENT.md names "FOR UPDATE dropped" as a mutation that must red
+        // a test. The behavioural version needs a latch inside
+        // `commitGroup` that has no seam today, so this is the statement
+        // assertion: without the row lock the re-read and the
+        // 'registered' settle are two separate snapshots of the row, and
+        // the `check(settled == 1)` the KDoc calls unreachable becomes a
+        // thrown IllegalStateException out of a sweep.
+        val fx = fixture(dvOnMiddle = false)
+        val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val recording =
+            com.posthog.hoglake.Database.jdbi(db.dataSource).also { j ->
+                j.setSqlLogger(
+                    object : org.jdbi.v3.core.statement.SqlLogger {
+                        override fun logAfterExecution(context: org.jdbi.v3.core.statement.StatementContext) {
+                            issued += context.renderedSql
+                        }
+                    },
+                )
+            }
+        assertThat(CompactionService(recording, store, cfg).runOnce(fx.cat, cfg).groupsCompacted)
+            .describedAs("the group must commit, or the settle never runs")
+            .isEqualTo(1)
+
+        val reread = issued.filter { it.contains("FROM hog_file_removal") && it.contains("claimed_at") }
+        assertThat(reread)
+            .describedAs("the ticket re-read must be issued:%n%s", issued.joinToString("\n---\n"))
+            .isNotEmpty()
+            .allSatisfy {
+                assertThat(it)
+                    .describedAs("and it must hold the row from the re-read to the settle")
+                    .contains("FOR UPDATE")
+            }
+        // And the settle carries the SAME three terms, so it cannot
+        // refuse a row the re-read just authorised.
+        assertThat(issued.filter { it.contains("drained_outcome = 'registered'") })
+            .isNotEmpty()
+            .allSatisfy {
+                assertThat(it).contains("drained_at IS NULL AND claimed_at IS NULL AND attempts = 0")
+            }
+    }
+
     @Test
     fun `an input end-snapshotted after planning skips the group as a conflict`() {
         val fx = fixture()

@@ -10,7 +10,6 @@ import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.CatalogRepo
-import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -32,6 +31,9 @@ import software.amazon.awssdk.services.s3.model.S3Error
 import software.amazon.awssdk.services.s3.model.S3Exception
 import java.net.URI
 import java.time.Duration
+import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 
 /**
  * Physical-delete side of the file-removal queue [ObjectStore] cannot
@@ -56,10 +58,9 @@ open class RemovalStore(
     pathStyle: Boolean,
     /**
      * The commit admission bound THIS process runs with
-     * (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS), not the compiled default: it is
-     * one of the two bounds [apiCallTimeout] is derived from, and an
-     * operator who lowers it must lower the call bound with it. 0 means
-     * an unbounded wait, so only the idle bound applies.
+     * (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS), not the compiled default: see
+     * [callBoundFor] for what the call bound still derives from it, now
+     * that a drain holds no lock. 0 means an unbounded wait.
      */
     commitLockTimeoutMs: Long = com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
 ) : AutoCloseable {
@@ -77,26 +78,6 @@ open class RemovalStore(
 
     /** Half [apiCallTimeout] — see [callBoundFor] for what that buys. */
     val apiCallAttemptTimeout: Duration = apiCallTimeout.dividedBy(2)
-
-    /**
-     * How long one `CleanupService` sub-batch may spend on object-store
-     * calls — EXACTLY two of [apiCallTimeout], and defined here rather
-     * than on the drain because it is derived from the same two bounds
-     * and has to move with them.
-     *
-     * That is the whole point: a hold budget written against the idle
-     * bound alone survives an operator lowering
-     * HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep commits responsive, and
-     * then holds the lock for longer than the admission window the
-     * operator just chose — 503ing every writer, which is the
-     * production failure this change exists to remove. Two thirds of
-     * `min(idle, admission)`, with the last third left as the one call
-     * the budget's own gate reserves room for:
-     *
-     *   hold <= holdBudget = 2 x apiCallTimeout
-     *   holdBudget + one call <= min(idle, admission)
-     */
-    val holdBudget: Duration = apiCallTimeout.multipliedBy(2)
 
     private val s3: S3Client =
         S3Client.builder()
@@ -120,23 +101,8 @@ open class RemovalStore(
 
     private val log = KotlinLogging.logger {}
 
-    /**
-     * What one path's probe-and-delete did. [SKIPPED] is not a failure:
-     * the caller's hold ran out of budget before a call could be issued,
-     * so nothing was attempted and the row is the next hold's work.
-     */
-    enum class Outcome { REMOVED, MISSING, SKIPPED }
-
-    /**
-     * One [deleteBatch]'s result. [unattempted] is separate from
-     * [failures] because the two settle differently: a failure is a
-     * touch that did not drain the row (`attempts + 1`), an unattempted
-     * path was never reached and must be left exactly as it was found.
-     */
-    data class BatchOutcome(
-        val failures: Map<String, String>,
-        val unattempted: List<String>,
-    )
+    /** What one path's probe-and-delete did. */
+    enum class Outcome { REMOVED, MISSING }
 
     fun exists(pathUri: String): Boolean {
         val loc = ObjectStore.parse(pathUri)
@@ -164,21 +130,8 @@ open class RemovalStore(
      * a live file row is the staged-output race resolved the wrong way).
      * Everything else goes through [deleteBatch].
      */
-    open fun deleteIfExists(
-        pathUri: String,
-        mayIssueCall: () -> Boolean = { true },
-    ): Outcome {
-        // TWO calls, gated SEPARATELY. The gate's contract is per CALL —
-        // no request may start unless the hold can absorb a whole
-        // [apiCallTimeout] — so the DELETE has to ask again after the
-        // HEAD returns. A gate that closed in between leaves the row
-        // queued and the object present, which is the state the next
-        // run re-probes; the alternative, one gate check for a pair,
-        // would need two call bounds of headroom and at a budget of two
-        // call bounds that lets exactly one row through per hold.
-        if (!mayIssueCall()) return Outcome.SKIPPED
+    open fun deleteIfExists(pathUri: String): Outcome {
         if (!exists(pathUri)) return Outcome.MISSING
-        if (!mayIssueCall()) return Outcome.SKIPPED
         val loc = ObjectStore.parse(pathUri)
         s3.deleteObject(DeleteObjectRequest.builder().bucket(loc.bucket).key(loc.key).build())
         return Outcome.REMOVED
@@ -206,25 +159,17 @@ open class RemovalStore(
      *
      * Paths are grouped by bucket and chunked to [MAX_KEYS_PER_DELETE]
      * because both are S3's rules, not the caller's; each chunk is one
-     * [deleteChunk] request, which is the unit the drain's lock hold is
-     * measured in.
+     * [deleteChunk] request, which is the unit a sub-batch's object-store
+     * cost is measured in.
      */
-    open fun deleteBatch(
-        paths: Collection<String>,
-        mayIssueCall: () -> Boolean = { true },
-    ): BatchOutcome {
+    open fun deleteBatch(paths: Collection<String>): Map<String, String> {
         val failures = mutableMapOf<String, String>()
-        val unattempted = mutableListOf<String>()
         val byBucket = mutableMapOf<String, MutableList<Pair<String, String>>>()
         for (path in paths.distinct()) {
             val loc =
                 try {
                     ObjectStore.parse(path)
                 } catch (e: IllegalArgumentException) {
-                    // A parse failure costs no call, so the gate is not
-                    // consulted: this path is a failure whatever the
-                    // hold's budget is, and a retry will fail the same
-                    // way.
                     failures[path] = e.message ?: "unparseable object path"
                     continue
                 }
@@ -232,18 +177,10 @@ open class RemovalStore(
         }
         for ((bucket, entries) in byBucket) {
             for (chunk in entries.chunked(MAX_KEYS_PER_DELETE)) {
-                // Per REQUEST, because a request is what the hold pays
-                // for: a sub-batch spanning several buckets, or past the
-                // key ceiling, is several requests and the budget has to
-                // be asked between them.
-                if (!mayIssueCall()) {
-                    unattempted += chunk.map { (_, path) -> path }
-                    continue
-                }
                 failures += deleteChunk(bucket, chunk)
             }
         }
-        return BatchOutcome(failures, unattempted)
+        return failures
     }
 
     /**
@@ -252,8 +189,8 @@ open class RemovalStore(
      * failures keyed by path.
      *
      * A named, `open` function rather than an inline loop because it is
-     * the unit the cleanup drain's lock hold is measured in, and that
-     * unit is the whole point of the change: a test that counts the
+     * the unit a sub-batch's object-store cost is measured in, and that
+     * unit is the whole point of the batching: a test that counts the
      * paths handed to [deleteBatch] cannot tell a batched implementation
      * from a per-key loop — the outcomes are identical and only the
      * round trips differ. Counting THESE is what tells them apart.
@@ -341,41 +278,52 @@ open class RemovalStore(
         const val MAX_KEYS_PER_DELETE = 1000
 
         /**
-         * THE CALL BOUND, AND IT IS AN INEQUALITY, NOT A NUMBER.
+         * THE CALL BOUND, and what it is FOR has changed even though the
+         * number has not.
          *
-         * `CleanupService`'s object-store calls run INSIDE a transaction
-         * that holds the per-catalog commit lock, so a call that hangs
-         * is a transaction that sits idle-in-transaction holding the one
-         * lock the catalog's writers queue on. Two bounds are already in
-         * force on that transaction, and this one has to sit under BOTH
-         * of them or it can never fire usefully:
+         * It used to be an inequality. `CleanupService`'s object-store
+         * calls ran inside a transaction that held the per-catalog
+         * commit lock, so a call that hung was a connection sitting
+         * idle-in-transaction holding the one lock the catalog's writers
+         * queue on — and the bound had to sit under BOTH
+         * `Database.SESSION_INIT_SQL`'s 30 s
+         * `idle_in_transaction_session_timeout` and
+         * [commitLockTimeoutMs] or it could never fire usefully.
          *
-         *  - `Database.SESSION_INIT_SQL` sets
-         *    `idle_in_transaction_session_timeout = '30s'` on every
-         *    pooled connection, and a connection waiting on an S3
-         *    response is exactly idle-in-transaction. Past that bound
-         *    Postgres kills the backend, the sub-batch rolls back with
-         *    its objects already deleted and its ledger rows unsettled,
-         *    and the next run does the same thing again.
-         *  - [commitLockTimeoutMs] (HOGLAKE_COMMIT_LOCK_TIMEOUT_MS, 30 s
-         *    by default) is what a foreground commit will wait for this
-         *    lock before answering a typed 503. A hold longer than that
-         *    turns every concurrent writer's commit into backpressure.
-         *    0 means an unbounded wait, so it constrains nothing.
+         * NEITHER BOUND APPLIES ANY MORE. The drain is a claimed work
+         * queue: the claim commits before the first call and the settle
+         * opens a new transaction after the last one, so no transaction
+         * is open across an object-store call and cleanup takes no
+         * catalog lock at any point. What a hung call costs now is one
+         * PARKED WORKER holding a claim until its lease expires
+         * (HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS, 900 s) — work delayed,
+         * never a convoy and never a lost object.
          *
-         * So the call bound is derived from the smaller of the two,
-         * divided by three: one third leaves room for the SDK to fail,
-         * retry, and still finish inside both bounds, and [holdBudget]
-         * is the other two thirds — so a drain's whole hold plus one
-         * more call still fits inside `min(idle, admission)`.
+         * The number is KEPT rather than re-derived, deliberately:
+         * `min(idle, admission) / 3` is 10 s at the defaults, it is the
+         * bound every measured drain in this repo ran under, and nothing
+         * measured argues for another. What it still buys is that an
+         * operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep a
+         * pod responsive gets shorter object-store calls with it, and
+         * that A WHOLE CLAIM'S WORST CASE FITS INSIDE THE LEASE at this
+         * bound — which is a statement about a CLAIM and is only true
+         * because the claim is reason-aware: a staging claim is
+         * `STAGING_SUB_BATCH` rows and two calls each (25 x 2 x 10 s =
+         * 500 s), a bulk claim is one call per bucket chunk. It was NOT
+         * true of a claim with no reason predicate, which could hold
+         * `SUB_BATCH` tickets and 20,000 s of calls under one 900 s
+         * lease. `RemovalStoreBoundsTest` asserts both arms.
+         * A drain that wanted a different bound would get its own knob;
+         * inventing one here, with no measurement behind it, would only
+         * move the arbitrariness.
          *
-         * `apiCallTimeout` is an OVERALL budget for the call —
-         * every attempt and all the backoff between them share it,
-         * rather than each attempt getting its own. That is why the
-         * per-attempt bound exists and is half of it: without it one
-         * stalled attempt consumes the whole budget and the call fails
-         * having never retried, which is the opposite of what a
-         * retryable object-store fault wants.
+         * `apiCallTimeout` is an OVERALL budget for the call — every
+         * attempt and all the backoff between them share it, rather than
+         * each attempt getting its own. That is why the per-attempt
+         * bound exists and is half of it: without it one stalled attempt
+         * consumes the whole budget and the call fails having never
+         * retried, which is the opposite of what a retryable
+         * object-store fault wants.
          */
         fun callBoundFor(commitLockTimeoutMs: Long): Duration {
             val idle = Database.SESSION_INIT_SQL_IDLE_TIMEOUT
@@ -384,16 +332,9 @@ open class RemovalStore(
             return minOf(idle, admission).dividedBy(3)
         }
 
-        /** See [holdBudget]: two call bounds, at any admission bound. */
-        fun holdBudgetFor(commitLockTimeoutMs: Long): Duration = callBoundFor(commitLockTimeoutMs).multipliedBy(2)
-
         /** The bound at the compiled admission default, for no-arg construction. */
         val API_CALL_TIMEOUT: Duration =
             callBoundFor(com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
-
-        /** The hold budget at the compiled admission default. */
-        val HOLD_BUDGET: Duration =
-            holdBudgetFor(com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
     }
 }
 
@@ -416,27 +357,112 @@ open class RemovalStore(
  * marked drained_at + drained_outcome ('deleted' for a physical
  * removal, 'absent' for verified-already-gone) instead of losing its
  * row, so what cleanup touched, when, and after how many attempts
- * stays queryable. The drain query reads only undrained rows (partial
+ * stays queryable. The drain reads only undrained rows (partial
  * index), and every sweep also PURGES drained rows older than
  * [ledgerRetentionSeconds] — the ledger must not itself become the
  * unbounded-accumulation problem it documents.
  *
- * Deletes run in sub-batches of [subBatchSize]
- * (HOGLAKE_CLEANUP_SUB_BATCH, 1,000 in production). Each sub-batch is
- * ONE transaction that (1) takes the per-catalog advisory commit lock
- * (Locks.kt — the SAME key as every commit/DDL tail), (2) re-checks
- * references, (3) physically deletes, (4) settles the ledger rows — so
- * a later sub-batch failure never rolls back completed ones. A
- * per-object delete failure bumps attempts and leaves the row queued
- * for the next run without wedging the rest of the batch.
+ * IT IS A CLAIMED WORK QUEUE, AND IT TAKES NO CATALOG LOCK ANYWHERE.
+ * That is the change, and what has to be true for it is that the pair
+ * (this drain, the commit path) cannot make a path live and delete its
+ * object at the same time. TWO CLAIMS DO THE WORK:
  *
- * STEP 3 IS ONE `DeleteObjects` CALL PER BUCKET CHUNK, not a HEAD and a
- * DELETE per path. S3 caps that call at 1,000 keys, which is where
- * [subBatchSize]'s default comes from; a sub-batch whose paths span
- * several buckets, or exceed the key ceiling, is that many calls. A key
- * that was never there is reported exactly like one that was removed —
- * deleting a missing key IS the end state the queue asks for — so those
- * rows settle 'deleted' and `missing` is no longer produced for them.
+ *  - a commit passes `CommitService.REMOVAL_QUEUE_COLLISION_SQL` only
+ *    when no UNDRAINED row names the path it is registering, and this
+ *    drain only ever reads undrained rows — a claimed row is still an
+ *    undrained row, so the guard refuses that path for the whole time it
+ *    is somebody's work;
+ *  - so what remains is a queue INSERT racing a registration of the same
+ *    path. That is per-inserter, and THERE ARE FOUR INSERTERS WITH THREE
+ *    DIFFERENT SERIALIZERS. They are listed here because the previous
+ *    version of this argument said "every queue insert happens under the
+ *    commit lock", and two of the four do not:
+ *
+ *      1. `ExpiryService` and `RetirementService` queue paths whose file
+ *         rows they have just deleted, inside a transaction that holds
+ *         the per-catalog COMMIT LOCK. A commit cannot register those
+ *         paths in that window, and cannot reuse them afterwards: no
+ *         writer in this system reuses a path (the Python writer, the
+ *         Trino connector and compaction all mint fresh names).
+ *      2. `CompactionService.stageOutputPath`'s INITIAL stage takes NO
+ *         lock — it is an autocommit INSERT before the rewrite starts.
+ *         It is safe for a different reason: the path is a UUID minted
+ *         by that sweep and known to nobody else, so no concurrent
+ *         commit can be registering it. (The RE-stage on the
+ *         `SkippedConflict` path does run under the commit lock, because
+ *         it is inside `commitGroup`'s transaction.)
+ *      3. `UploadService.fenceAndQueue` takes NO commit lock either, and
+ *         deliberately — its own comment says taking one would convoy
+ *         the catalog. It is serialized against a concurrent
+ *         registration by the `hog_upload` ROW LOCK:
+ *         `UploadService.register` takes `SELECT ... FOR UPDATE` on the
+ *         claim rows inside the commit transaction and raises
+ *         `CommitConflict` unless the claim is still `'active'`, while
+ *         the sweep's own fence re-evaluates its candidate predicate
+ *         after waiting on that same row lock. THIS is the arm the
+ *         removed commit lock was actually standing in for.
+ *
+ *    The standing constraint that falls out of (3), and it is an
+ *    invariant rather than a coincidence: A COMMIT THAT REGISTERS A PATH
+ *    WITH NO `hog_upload` CLAIM HAS NO SERIALIZER AGAINST A CONCURRENT
+ *    QUEUE INSERT FOR THAT PATH. Today that is unreachable because paths
+ *    are never reused and every externally-supplied path arrives through
+ *    an upload claim; a future path that is neither must bring its own
+ *    serializer.
+ *
+ * What the lock cost, measured on gigahog-prod-us 2026-09-24: ~19 s of
+ * held lock per 1,000-row sub-batch, during which every commit on the
+ * catalog waits. Cleanup has been OFF in production for it; as of
+ * 2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h,
+ * about 9.4k of them orphaned `compaction_staging` tickets past their
+ * grace. The ONE genuine two-writer case on one ROW —
+ * compaction's staging ticket, which is legitimately both a deletion
+ * ticket here and a row to settle `'registered'` in the group's commit —
+ * is serialized by POSTGRES ROW LOCKING, which is all it ever needed:
+ * `CompactionService.commitGroup` re-reads the ticket `FOR UPDATE` and
+ * refuses it unless it is UNTOUCHED (`drained_at IS NULL AND claimed_at
+ * IS NULL AND attempts = 0`), re-staging the path and returning
+ * `SkippedConflict` when it loses. It refuses a LAPSED claim too, and
+ * that is the point: a lapsed claim does not mean the object survived, it
+ * means nobody knows, and the row lock cannot stand between a DELETE no
+ * transaction holds and a registration.
+ *
+ * THE THREE STEPS, and the transaction boundaries are the design:
+ *
+ *  1. CLAIM ([CLAIM_BULK_SQL] / [CLAIM_STAGING_SQL]) — one short
+ *     transaction per sub-batch, one statement per REASON:
+ *     `UPDATE ... WHERE removal_id IN (SELECT ... FOR UPDATE SKIP
+ *     LOCKED) RETURNING`, stamping `claimed_at`/`claimed_by`. It commits
+ *     BEFORE any object-store call, so nothing is open while a worker
+ *     waits on S3 and `idle_in_transaction_session_timeout` no longer
+ *     bounds this class at all. `SKIP LOCKED` is what lets [workers]
+ *     workers and any number of replicas partition the queue with no
+ *     coordination, which is why there is no single-flight advisory lock
+ *     either.
+ *  2. WORK — the reference check ([referencedPaths], unchanged SQL, now
+ *     blocking nobody) and then the deletes. No transaction, no lock.
+ *  3. SETTLE ([SETTLE_SQL]) — one short transaction, FENCED on
+ *     `drained_at IS NULL AND claimed_by = :worker`. Rows it does not
+ *     return were settled by another writer (a compaction group
+ *     registering the path) and are counted `settled_elsewhere`.
+ *
+ * A CLAIM IS A LEASE, NOT A LOCK. A worker killed between its claim and
+ * its settle leaves rows claimed; after [claimLeaseSeconds] (900 s) any
+ * worker may reclaim them. `DeleteObjects` is idempotent, so a re-drain
+ * of an already-deleted object settles exactly as the first attempt
+ * would have. The fence is what makes the lapse safe in the other
+ * direction: the lapsed worker's own settle and attempts bump match no
+ * row, so it can never stamp its outcome over the writer that took the
+ * row from it.
+ *
+ * STEP 2'S BULK DELETE IS ONE `DeleteObjects` CALL PER BUCKET CHUNK, not
+ * a HEAD and a DELETE per path. S3 caps that call at 1,000 keys, which
+ * is where [subBatchSize]'s default comes from; a sub-batch whose paths
+ * span several buckets, or exceed the key ceiling, is that many calls. A
+ * key that was never there is reported exactly like one that was removed
+ * — deleting a missing key IS the end state the queue asks for — so
+ * those rows settle 'deleted' and `missing` is no longer produced for
+ * them.
  *
  * THE ONE CARVE-OUT is `reason = 'compaction_staging'`, which keeps
  * HEAD + DELETE per path: `/verify`'s `staging_tickets` check reads
@@ -447,14 +473,18 @@ open class RemovalStore(
  * on every row settled before batching landed, which the 30-day ledger
  * keeps visible.
  *
- * BECAUSE THEY COST TWO ROUND TRIPS EACH, STAGING TICKETS DRAIN IN
- * THEIR OWN SUB-BATCHES, of [STAGING_SUB_BATCH] rather than
- * [subBatchSize]. The batch is partitioned by reason before any
- * sub-batch is formed. Mixed, a 1,000-row sub-batch of tickets would be
- * 1,000 probe pairs in one hold — ~128 s at the measured 64 ms per
- * round trip, 40x the hold this class exists to bound — and the staging
- * grace clusters them, because tickets become eligible in the order
- * their groups ran.
+ * BECAUSE THEY COST TWO ROUND TRIPS EACH, STAGING TICKETS ARE CLAIMED
+ * [STAGING_SUB_BATCH] AT A TIME rather than [subBatchSize], as their own
+ * claim statement. THE CLAIM IS THE UNIT THE LEASE BOUNDS, which is why
+ * the reason predicate is in the SQL and not in the code that partitions
+ * what came back: one claim with no reason predicate could hold 1,000
+ * tickets — 2,000 HEAD/DELETE round trips under a single lease, ~128 s at
+ * the 64 ms measured on gigahog-prod-us but 20,000 s if every call takes
+ * a whole `RemovalStore.apiCallTimeout`, which is 22x the lease. Claimed
+ * at 25 the worst case is 50 calls, 500 s, inside the lease. Each claim
+ * is then exactly one sub-batch, and a sub-batch settles in its own
+ * transaction, so a claim that ends badly never loses what earlier ones
+ * did.
  *
  * Staging tickets are additionally left alone until they are past
  * [stagingGraceSeconds] (HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS, 1 h).
@@ -467,85 +497,14 @@ open class RemovalStore(
  * group that died is still reclaimed — an hour later, by the same
  * drain.
  *
- * WHY the lock (the check-then-delete TOCTOU): without it, a commit
- * transaction could pass ITS removal-queue check, insert a hog_data_file
- * row for a queued path, and be mid-flight (uncommitted, invisible to
- * READ COMMITTED) exactly when this drain computes referencedPaths —
- * the drain would see the path unreferenced, delete the object, and the
- * commit would then land a live row pointing at a deleted object.
- * Holding the catalog commit lock across the check+delete pair
- * serializes the two: either the commit finished first (its rows are
- * visible to the check, path skipped as still-referenced... and its own
- * queue-collision check would have 409'd anyway while the entry was
- * undrained), or the drain finishes first and the commit's collision
- * check runs after the entry settles. No interleaving remains.
- *
- * LOCK-HOLD BOUND, and it is the reason this class was rewritten.
- *
- * A sub-batch holds rows of ONE kind, so the TYPICAL hold is whichever
- * of these its kind costs, at the 64 ms per round trip measured on
- * gigahog-prod-us:
- *
- *  - bulk: an undrained re-check + a reference check + ONE
- *    `DeleteObjects` call per bucket chunk + two ledger UPDATEs. At the
- *    default sub-batch and a single bucket that is one round trip,
- *    ~64 ms;
- *  - staging: the same database statements + at most
- *    [STAGING_SUB_BATCH] HEAD/DELETE pairs — 25, so ~3.2 s.
- *
- * THE DATABASE HALF OF THAT HOLD IS INDEXED, AND IT WAS NOT. The
- * reference check ([referencedPaths]) probes three tables by
- * `(catalog_id, path)`; hog_upload has carried that key since V12, and
- * hog_data_file and hog_delete_file got it in V17. Before V17 both of
- * those legs read EVERY file row the catalog has ever registered — live
- * and historical — to answer a 1,000-path question, inside the lock:
- * 190,884 buffers and 692 ms on a 5M-row fixture, against 8,728 and
- * 33 ms after, and on gigahog-prod-us a warm hold of ~3 s (up to ~30 s
- * cold, or against a rollout) of which the `DeleteObjects` call is a
- * fraction of a second. So both kinds of hold are now their
- * object-store calls plus milliseconds of database, and the sub-batch
- * size scales the calls rather than the scan.
- *
- * THE WORST CASE IS NOT THAT COUNT TIMES 64 ms, and this is the part a
- * call-count bound cannot state: each call may take a whole
- * [RemovalStore.apiCallTimeout]. So the hold is bounded in TIME by
- * [RemovalStore.holdBudget], checked before every call and requiring a
- * whole call bound of headroom — so the last call a sub-batch starts
- * always has room to finish inside the budget:
- *
- *   hold <= HOLD_BUDGET = 2 x call bound
- *   HOLD_BUDGET + one call <= min(idle bound, admission bound)
- *
- * — 20 s, and 20 s + 10 s <= 30 s at the defaults, every term derived
- * from `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the EFFECTIVE
- * `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` rather than written down, so
- * lowering the admission bound shortens the hold with it. A sub-batch
- * the deadline stops short of leaves its remaining rows exactly as it
- * found them and they are the next hold's work (counted
- * `deadline_skipped`); without it, the backend is killed
- * idle-in-transaction and the sub-batch rolls back with its objects
- * already deleted.
- *
- * THE HOLD WAS NEVER THE PROBLEM; THE DUTY CYCLE WAS. Sub-batches run
- * back to back, so a run of [batchSize] rows takes
- * `batchSize / subBatchSize` holds IN A ROW, and the old arithmetic
- * bounded one of them and not the run. Measured on gigahog-prod-us
- * (2026-09-24, catalog millpond-prod-us): at the old sub-batch of 25 x
- * (HEAD + DELETE) each hold ran ~3.2 s, so a 2,000-row run spent ~255 s
- * holding the lock across 80 slices. Commit latency on the API pods
- * went from 200-400 ms average to 12-22 s (max 34 s, against the 30 s
- * admission bound) and both gigahog-server pods were liveness-killed:
- * every queued commit holds a pool connection and `/healthz` needs one
- * too.
- *
- * With one round trip per 1,000 rows instead of 50 per 25, that same
- * 2,000-row run is two holds of a few hundred milliseconds. The lock
- * stays exactly where it was — it is still what serializes the
- * check-then-delete pair against the commit tail — and what changed is
- * that holding it is now cheap. [subBatchSize] is still the knob that
- * scales the hold, and it should stay at or below the 1,000-key ceiling
- * of one `DeleteObjects` call: past that a sub-batch is several round
- * trips inside one hold, which is the shape this change removed.
+ * THE DATABASE HALF IS INDEXED, AND IT WAS NOT. The reference check
+ * ([referencedPaths]) probes three tables by `(catalog_id, path)`;
+ * hog_upload has carried that key since V12, and hog_data_file and
+ * hog_delete_file got it in V17. Before V17 both of those legs read
+ * EVERY file row the catalog has ever registered — live and historical —
+ * to answer a 1,000-path question: 190,884 buffers and 692 ms on a
+ * 5M-row fixture, against 8,728 and 33 ms after. That statement is now
+ * the drain's rate, and nothing waits on it.
  */
 class CleanupService(
     private val jdbi: Jdbi,
@@ -555,24 +514,110 @@ class CleanupService(
     private val maintenanceLedgerRetentionSeconds: Long = MAINTENANCE_LEDGER_RETENTION_SECONDS,
     private val stagingGraceSeconds: Long = STAGING_GRACE_SECONDS,
     /**
-     * How long one sub-batch may spend on object-store calls before it
-     * stops issuing them.
+     * How long a claim is honoured before any worker may reclaim the row
+     * (HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS, 900 s).
      *
-     * Defaults to the store's own [RemovalStore.holdBudget], which is
-     * two of its call bounds — so it is derived from
-     * `min(idle, admission)` exactly as the call bound is, and an
-     * operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS gets a shorter
-     * hold with it. Constructor-tunable so a test can shrink it rather
-     * than sleep through it.
+     * ONE VALUE, SHARED WITH COMPACTION: `CompactionConfig`'s copy
+     * decides when a group commit treats a claimed ticket as reclaimable,
+     * and two different numbers would give the two services different
+     * answers about the same row. App.kt passes `cfg` to both.
      */
-    private val holdBudget: Duration = store.holdBudget,
+    private val claimLeaseSeconds: Long = CLAIM_LEASE_SECONDS,
     /**
-     * The clock the hold deadline reads, as nanoseconds. Injected so a
-     * test can drive the deadline exactly instead of sleeping — a
-     * deadline test that sleeps is a deadline test that is flaky.
+     * Parallel workers per run (HOGLAKE_CLEANUP_WORKERS, 1).
+     *
+     * Each worker runs its own claim -> work -> settle loop over its own
+     * sub-batches until the run's `batchSize` is consumed or the queue is
+     * empty for this catalog. They need no coordination: `SKIP LOCKED` in
+     * the claim partitions the queue between them, and between replicas,
+     * for free.
+     *
+     * A worker holds a pooled connection for the claim, the reference
+     * check and the settle and NEVER across an object-store call, so N
+     * workers do not need N permanent pool slots — see Config's
+     * `cleanupWorkers` for the boot check that still keeps them clear of
+     * the foreground's reserve.
      */
-    private val nanoTime: () -> Long = System::nanoTime,
+    private val workers: Int = 1,
+    /**
+     * Whether this process's cleanup LOOP is registered
+     * (`HOGLAKE_CLEANUP_INTERVAL_MS > 0`).
+     *
+     * It exists to CLAMP [workers] on a pod whose loop is off. The
+     * manual `POST /v1/maintenance/cleanup` runs this same drain on
+     * whichever pod serves it, so without the clamp a pod that boots with
+     * `HOGLAKE_CLEANUP_WORKERS=4` and no loop — a configuration `Config`'s
+     * pool refusal deliberately prices at ONE worker, because that is all
+     * a loop-off pod can spend — would take four connections the moment
+     * somebody curled the endpoint, which is the failure that refusal
+     * exists to prevent. With the loop on, the configured count is what
+     * the refusal priced and what runs.
+     *
+     * DERIVED IN ONE PLACE — the `Config` secondary constructor below,
+     * which is what `App.kt` uses — because the predicate has to be the
+     * one the pool refusal prices on. The default of `true` is for the
+     * tests that construct a service by hand.
+     */
+    private val loopEnabled: Boolean = true,
+    /**
+     * The identity the claim fence is written against: pod name plus a
+     * per-process UUID, with the worker index appended per worker.
+     *
+     * Per PROCESS, not per catalog: it only has to be unique among
+     * everything that might claim the same row, and a restarted pod must
+     * NOT inherit its predecessor's id — that is what makes the lease
+     * the only way a dead worker's rows come back. Injectable so a test
+     * can read the value out of a statement's bindings instead of
+     * reverse-engineering a UUID.
+     */
+    private val workerIdPrefix: String = defaultWorkerIdPrefix(),
+    /**
+     * Ids the drained-ledger purge reads per page (see
+     * [purgeDrainedLedger]). Constructor-tunable so a test can make the
+     * WALK observable — several pages and a page that purges nothing —
+     * without seeding a production-sized ledger.
+     */
+    private val ledgerPurgePage: Int = LEDGER_PURGE_PAGE,
+    /**
+     * Wall clock the drained-ledger purge may spend per run (see
+     * [LEDGER_PURGE_BUDGET_MS]). Constructor-tunable so a test can make
+     * the budget's stop observable — 0 stops the walk before its first
+     * page — rather than sleeping a second.
+     */
+    private val ledgerPurgeBudgetMs: Long = LEDGER_PURGE_BUDGET_MS,
 ) {
+    /**
+     * The production wiring, and the ONLY place the service's knobs are
+     * derived from [Config].
+     *
+     * It exists because one of those derivations is load-bearing and used
+     * to be stated in `App.kt`, where nothing could test it:
+     * `loopEnabled = cleanupIntervalMs > 0` is the predicate `Config`'s
+     * pool refusal prices on, and if the two ever disagreed — a later
+     * edit writing `loopEnabled = true` for convenience — the refusal's
+     * argument would stop holding in the deployed binary with every test
+     * still green, because [loopEnabled] has a default and no test
+     * constructed the app's wiring. Here the expression is inside the
+     * class, where `the production wiring clamps the manual path when the
+     * loop is off` builds it directly, and `App.kt` has no way to state
+     * it differently.
+     */
+    constructor(
+        jdbi: Jdbi,
+        store: RemovalStore,
+        config: Config,
+    ) : this(
+        jdbi = jdbi,
+        store = store,
+        subBatchSize = config.cleanupSubBatchSize,
+        ledgerRetentionSeconds = config.removalLedgerRetentionSeconds,
+        maintenanceLedgerRetentionSeconds = config.maintenanceLedgerRetentionSeconds,
+        stagingGraceSeconds = config.cleanupStagingGraceSeconds,
+        claimLeaseSeconds = config.cleanupClaimLeaseSeconds,
+        workers = config.cleanupWorkers,
+        loopEnabled = config.cleanupIntervalMs > 0,
+    )
+
     private val log = KotlinLogging.logger {}
 
     /** The maintenance run ledger; also the owner of its retention purge. */
@@ -589,38 +634,59 @@ class CleanupService(
         require(stagingGraceSeconds >= 0) {
             "stagingGraceSeconds must not be negative (got $stagingGraceSeconds)"
         }
-        // STRICT: the gate is `elapsed <= holdBudget - apiCallTimeout`, so
-        // at equality it reads `elapsed <= 0` and only a call issued in
-        // the same nanosecond as the lock could ever pass it. A drain
-        // that issues no calls is not a smaller drain, it is a stopped
-        // one.
-        require(holdBudget > store.apiCallTimeout) {
-            "holdBudget ($holdBudget) must exceed one object-store call " +
-                "(${store.apiCallTimeout}), or no sub-batch can issue one"
+        // A lease of 0 makes every claim immediately reclaimable, so two
+        // workers drain one row by construction — and a negative one
+        // pushes the reclaim horizon into the future, so a row is
+        // claimable BEFORE it is claimed. Config refuses both at boot;
+        // this is the same refusal for a service built by hand.
+        require(claimLeaseSeconds > 0) {
+            "claimLeaseSeconds must be positive (got $claimLeaseSeconds): a lease of 0 makes " +
+                "every claim immediately reclaimable"
+        }
+        require(workers >= 1) { "workers must be at least 1 (got $workers)" }
+        require(ledgerPurgePage > 0) { "ledgerPurgePage must be positive (got $ledgerPurgePage)" }
+        // 0 is legal and means "do not purge this run", which is what a
+        // test uses to make the budget's stop observable without sleeping.
+        require(ledgerPurgeBudgetMs >= 0) {
+            "ledgerPurgeBudgetMs must not be negative (got $ledgerPurgeBudgetMs)"
         }
     }
 
     private data class Entry(val removalId: Long, val path: String, val reason: String)
 
-    /** A per-path audit event, collected in a sub-batch and emitted after it commits. */
+    /** A per-path audit event, collected in a sub-batch and emitted after it settles. */
     private data class PathEvent(val action: String, val path: String, val outcome: String, val detail: String?)
 
     /**
      * Drain up to [batchSize] queue entries for [catalog]. The summary
      * audit event and the files-removed counter are emitted at the end
-     * of the run (each sub-batch's queue drain is its own transaction;
-     * nothing is emitted inside one); per-path events (file_deleted /
-     * cleanup_violation) are emitted as the drain progresses, bounded by
-     * the batch size. still_referenced > 0 is an invariant violation and
-     * flags the run's audit outcome accordingly. A ZERO-WORK drain
-     * (nothing removed, missing, or violated) emits no audit event —
-     * app-log debug only, so idle background loops stay out of the
-     * audit stream.
+     * of the run (each sub-batch's claim and settle are their own
+     * transactions; nothing is emitted inside one); per-path events
+     * (file_deleted / cleanup_violation) are emitted as the drain
+     * progresses, bounded by the batch size. still_referenced > 0 is an
+     * invariant violation and flags the run's audit outcome accordingly.
+     * A ZERO-WORK drain (nothing removed, missing, or violated) emits no
+     * audit event — app-log debug only, so idle background loops stay out
+     * of the audit stream.
      */
     fun runOnce(
         catalog: String,
         batchSize: Int,
         trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
+    ): CleanupResult =
+        drainCatalog(catalog, batchSize, trigger).also {
+            // ONCE PER RUN, after the drain: the retention purge is
+            // instance-wide, so a fan-out must not pay for it per catalog
+            // (see [runOnceAllCatalogs], which is why this is not inside
+            // `doRunOnce`).
+            purgeAfterRun("manual run for '$catalog'")
+        }
+
+    /** One catalog's drain and its run-ledger row, with no instance-wide work. */
+    private fun drainCatalog(
+        catalog: String,
+        batchSize: Int,
+        trigger: MaintenanceTrigger,
     ): CleanupResult =
         runStore.recorded(catalog, MaintenanceTask.CLEANUP, trigger) {
             runDrain(catalog, batchSize)
@@ -640,14 +706,7 @@ class CleanupService(
         // objectsRemoved, not removed: the metric is documented as
         // physical deletes and `removed` counts ledger rows.
         Metrics.filesRemoved(catalog, result.objectsRemoved)
-        // deadlineSkipped is in the condition, not just the detail: a
-        // drain whose holds all end on their budget settles nothing, and
-        // without it here that run takes the "nothing to do" branch and
-        // a wedged drain is indistinguishable from an idle one in both
-        // the audit stream and the run ledger.
-        if (result.removed == 0L && result.missing == 0L && result.stillReferenced == 0L &&
-            result.deadlineSkipped == 0L
-        ) {
+        if (result.removed == 0L && result.missing == 0L && result.stillReferenced == 0L) {
             log.debug { "cleanup drain for catalog '$catalog': nothing to do" }
         } else {
             Audit.event(
@@ -677,79 +736,248 @@ class CleanupService(
             jdbi.withHandleUnchecked { h ->
                 CatalogRepo.require(h, catalog).catalogId
             }
-        val batch =
-            jdbi.withHandleUnchecked { h ->
-                h.createQuery(DRAIN_BATCH_SQL)
-                    .bind("catalogId", catalogId)
-                    .bind("limit", batchSize)
-                    .bind("stagingGraceSeconds", stagingGraceSeconds.toDouble())
-                    .map { rs, _ ->
-                        Entry(rs.getLong("removal_id"), rs.getString("path"), rs.getString("reason"))
+        // What this run has already handled. A still-referenced row (and
+        // a row whose delete failed) has its claim RELEASED so the next
+        // run, and an operator reading the queue, can see it — which also
+        // makes it claimable again inside THIS run, and a second pass
+        // would bump `attempts` twice and count one violation twice. A
+        // row this set already holds is released immediately rather than
+        // left claimed, because a claim this run will not act on is a
+        // lease of invisibility for nothing.
+        val handled = ConcurrentHashMap.newKeySet<Long>()
+
+        val tallies =
+            if (effectiveWorkers == 1) {
+                listOf(drainWorker(catalog, catalogId, workerId(0), batchSize, handled))
+            } else {
+                val pool = Executors.newFixedThreadPool(effectiveWorkers)
+                try {
+                    pool.invokeAll(
+                        (0 until effectiveWorkers).map { i ->
+                            java.util.concurrent.Callable {
+                                drainWorker(catalog, catalogId, workerId(i), batchSize, handled)
+                            }
+                        },
+                    ).map { future ->
+                        try {
+                            future.get()
+                        } catch (e: java.util.concurrent.ExecutionException) {
+                            // THE CAUSE, NOT THE WRAPPER. A worker's
+                            // failure has to reach the run ledger's
+                            // `error`, the audit event's detail and the
+                            // manual POST's status as itself — otherwise
+                            // the same object-store fault is reported as
+                            // an `IllegalStateException` at one worker and
+                            // an `ExecutionException` at two, and which
+                            // one an operator sees depends on a knob.
+                            throw e.cause ?: e
+                        }
                     }
-                    .list()
+                } finally {
+                    pool.shutdown()
+                }
             }
-
-        // PARTITIONED BY REASON, and this is a lock-hold decision, not
-        // tidiness. A `compaction_staging` row costs a HEAD and a DELETE
-        // (see [RemovalStore.deleteIfExists] for why it may not be
-        // batched); every other row costs a share of one DeleteObjects
-        // call. Left mixed, one 1,000-row sub-batch of staging tickets
-        // would be 1,000 probe pairs inside ONE lock hold — ~128 s at the
-        // 64 ms per round trip measured on gigahog-prod-us, which is
-        // 40x the hold this change exists to remove — and the staging
-        // grace CLUSTERS them, because tickets become eligible in the
-        // order their groups ran. So the two reasons drain in their own
-        // sub-batches, at their own sizes, each its own transaction and
-        // its own lock hold. Ordering across the two is not a contract:
-        // the queue is age-ordered within each, and `staging_tickets`
-        // stops firing because the run drains, not because of where in
-        // the run a row sits.
-        val (stagingRows, bulkRows) = batch.partition { it.reason == STAGING_REASON }
-        val subBatches =
-            bulkRows.chunked(subBatchSize).map { it to false } +
-                stagingRows.chunked(STAGING_SUB_BATCH).map { it to true }
-
-        var removed = 0L
-        var missing = 0L
-        var stillReferenced = 0L
-        var objectsRemoved = 0L
-        var settledElsewhere = 0L
-        var deadlineSkipped = 0L
-
-        for ((sub, probeEachPath) in subBatches) {
-            val result = drainSubBatch(catalog, catalogId, sub, probeEachPath)
-            removed += result.removed
-            missing += result.missing
-            stillReferenced += result.stillReferenced
-            objectsRemoved += result.objectsRemoved
-            settledElsewhere += result.settledElsewhere
-            deadlineSkipped += result.deadlineSkipped
-        }
-        purgeDrainedLedger(catalog, catalogId)
+        // The DRAINED-LEDGER purge is not here: it is instance-wide (it
+        // walks the removal table's primary key, not one catalog's rows),
+        // so it runs ONCE PER RUN rather than once per catalog — see
+        // [runOnce] and [runOnceAllCatalogs]. The maintenance-run ledger's
+        // purge IS per catalog, and stays.
         purgeMaintenanceLedger(catalog, catalogId)
+        val total = tallies.fold(Tally()) { a, b -> a + b }
         return CleanupResult(
-            removed,
-            missing,
-            stillReferenced,
-            objectsRemoved,
-            settledElsewhere,
-            deadlineSkipped,
+            total.removed,
+            total.missing,
+            total.stillReferenced,
+            total.objectsRemoved,
+            total.settledElsewhere,
+            // Always 0. The counter belongs to the hold budget that
+            // bounded a lock this class no longer takes; it stays on the
+            // wire because the maintenance ledger holds rows that carry
+            // it and every client already reads it (see
+            // CleanupResult.deadlineSkipped).
+            deadlineSkipped = 0,
         )
     }
 
-    /** One sub-batch's tally, accumulated only after its transaction commits. */
-    private data class SubBatchResult(
-        val removed: Long,
-        val missing: Long,
-        val stillReferenced: Long,
-        val objectsRemoved: Long,
-        val settledElsewhere: Long,
-        val deadlineSkipped: Long,
-    )
+    /** One worker's, or one sub-batch's, tally. Summed, never reported alone. */
+    private data class Tally(
+        val removed: Long = 0,
+        val missing: Long = 0,
+        val stillReferenced: Long = 0,
+        val objectsRemoved: Long = 0,
+        val settledElsewhere: Long = 0,
+    ) {
+        operator fun plus(o: Tally) =
+            Tally(
+                removed + o.removed,
+                missing + o.missing,
+                stillReferenced + o.stillReferenced,
+                objectsRemoved + o.objectsRemoved,
+                settledElsewhere + o.settledElsewhere,
+            )
+    }
 
     /**
-     * ONE sub-batch: one transaction, one lock hold, one flush of audit
-     * events after it commits.
+     * The workers a run actually starts: [workers] while the loop is
+     * registered, and ONE otherwise.
+     *
+     * A loop-off pod still serves `POST /v1/maintenance/cleanup`, and
+     * `Config`'s pool refusal prices exactly one worker for it (it cannot
+     * price more without refusing every API pod in the fleet). The clamp
+     * is what makes that price true: a hand-triggered drain on a pod whose
+     * loop is disabled can never take more of the pool than was reserved
+     * for it, however `HOGLAKE_CLEANUP_WORKERS` is set.
+     */
+    private val effectiveWorkers: Int = if (loopEnabled) workers else 1
+
+    /** `pod/uuid#n` — see [workerIdPrefix] for why it is per process. */
+    private fun workerId(index: Int): String = "$workerIdPrefix#$index"
+
+    /**
+     * ONE worker: claim, work, settle, repeat, until its own budget is
+     * spent or the queue is empty for this catalog.
+     *
+     * THE BUDGET IS PER WORKER AND PER REASON, and that is the knob's
+     * whole arithmetic: a run asks for at most `workers x 2 x batchSize`
+     * rows — `batchSize` of bulk and `batchSize` of staging tickets per
+     * worker — so HOGLAKE_CLEANUP_WORKERS multiplies the drain rate
+     * instead of dividing one shared budget (which is what a shared
+     * counter did — four workers at a 2,000-row batch and a 1,000-row
+     * sub-batch left two of them with nothing to claim), and the bulk
+     * backlog cannot starve the staging tickets (see the loop below). See
+     * Config's cleanup knobs for the rows/hour this works out to at a
+     * given interval.
+     *
+     * TWO CLAIMS PER ITERATION, one per REASON, because the lease has to
+     * bound the WORK A CLAIM CARRIES and the two kinds cost different
+     * numbers of round trips: a bulk claim is [subBatchSize] rows and one
+     * `DeleteObjects` call per bucket chunk, a staging claim is
+     * [STAGING_SUB_BATCH] rows and two round trips EACH. Claiming them
+     * together — one statement with no reason predicate — let one claim
+     * hold 1,000 tickets, which is 2,000 round trips under a single
+     * lease: 128 s at the measured 64 ms, but 20,000 s at the call bound,
+     * 22x the lease. Each claim is now exactly one sub-batch, so the
+     * lease bounds what it has to.
+     *
+     * A SHORT CLAIM ENDS THAT ARM FOR THIS ITERATION, and when neither
+     * arm filled a claim the worker stops. Rows are missing from a claim for exactly two reasons: the
+     * queue is empty for this catalog and this reason, or a concurrent
+     * worker's claim holds them under `SKIP LOCKED` — and that worker
+     * claims and works them, since its UPDATE is what locked them. So a
+     * worker that stops leaves behind only what another worker has
+     * already taken. What keeps a row a still-referenced skip RELEASED
+     * from being handled twice inside one run is `handled`, not this
+     * condition.
+     */
+    private fun drainWorker(
+        catalog: String,
+        catalogId: Long,
+        worker: String,
+        /** THIS worker's budget, PER REASON, not the run's: see the KDoc above. */
+        batchSize: Int,
+        handled: MutableSet<Long>,
+    ): Tally {
+        var tally = Tally()
+        // ONE BUDGET PER ARM, and it is not tidiness. Shared, the bulk arm
+        // spends it first — it claims [subBatchSize] rows to staging's 25 —
+        // so on a catalog whose bulk queue is bigger than the batch, a
+        // staging ticket got at most 25 per worker per run, and with
+        // `batchSize <= subBatchSize` (a natural setting once the interval
+        // drops to seconds) it got NONE: the bulk arm consumed the budget
+        // in the first iteration and the staging `want` was 0 for ever
+        // after. On gigahog-prod-us that is ~9.4k orphaned tickets at 50/h
+        // — eight days, with `/verify`'s `staging_tickets.leaked` arm
+        // firing for all of it, on a drain working exactly as designed.
+        // Per arm, the same queue clears in ~5 runs.
+        val budgets = mutableMapOf(false to batchSize, true to batchSize)
+        while (budgets.values.any { it > 0 }) {
+            var progressed = false
+            for (staging in listOf(false, true)) {
+                val budget = budgets.getValue(staging)
+                val want = minOf(budget, if (staging) STAGING_SUB_BATCH else subBatchSize)
+                if (want <= 0) continue
+                val claimed = claim(catalogId, worker, want, staging)
+                if (claimed.isEmpty()) {
+                    // This arm is empty for this catalog. Zero its budget
+                    // rather than asking again every iteration: the other
+                    // arm can still have 80 iterations left in it, and
+                    // each one would spend a round trip re-discovering
+                    // that this one has nothing.
+                    budgets[staging] = 0
+                    continue
+                }
+                budgets[staging] = budget - claimed.size
+                if (claimed.size == want) progressed = true
+                val (fresh, again) = claimed.partition { handled.add(it.removalId) }
+                if (again.isNotEmpty()) {
+                    releaseClaims(catalogId, worker, again.map { it.removalId })
+                    log.debug {
+                        "cleanup: ${again.size} rows this run already handled were claimed again " +
+                            "(a still-referenced skip releases its claim); released without a " +
+                            "second touch"
+                    }
+                }
+                if (fresh.isNotEmpty()) {
+                    tally += drainSubBatch(catalog, catalogId, worker, fresh, probeEachPath = staging)
+                }
+            }
+            // Neither kind filled a claim: the queue is empty for this
+            // worker and there is nothing left to ask for.
+            if (!progressed) return tally
+        }
+        return tally
+    }
+
+    /**
+     * Claim up to [want] rows of ONE reason for [worker]: ONE statement,
+     * its own transaction, committed before anything touches an object
+     * store.
+     *
+     * No explicit transaction is opened, so this is autocommit — one
+     * statement is one transaction, which is the shortest form the claim
+     * can take and the one a test can assert cannot span an S3 call.
+     *
+     * The returned order is the UPDATE's, not the inner select's
+     * (`RETURNING` does not carry an `ORDER BY`), and nothing depends on
+     * it: one claim is one sub-batch, so there is no partition of the
+     * claim for an order to decide.
+     */
+    private fun claim(
+        catalogId: Long,
+        worker: String,
+        want: Int,
+        staging: Boolean,
+    ): List<Entry> =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(if (staging) CLAIM_STAGING_SQL else CLAIM_BULK_SQL)
+                .bind("catalogId", catalogId)
+                .bind("worker", worker)
+                .bind("limit", want)
+                .bind("leaseSeconds", claimLeaseSeconds.toDouble())
+                .apply { if (staging) bind("stagingGraceSeconds", stagingGraceSeconds.toDouble()) }
+                .map { rs, _ ->
+                    Entry(rs.getLong("removal_id"), rs.getString("path"), rs.getString("reason"))
+                }
+                .list()
+        }
+
+    private fun releaseClaims(
+        catalogId: Long,
+        worker: String,
+        ids: List<Long>,
+    ) {
+        jdbi.withHandleUnchecked { h ->
+            h.createUpdate(RELEASE_CLAIM_SQL)
+                .bind("catalogId", catalogId)
+                .bind("worker", worker)
+                .bindArray("ids", Long::class.javaObjectType, ids)
+                .execute()
+        }
+    }
+
+    /**
+     * ONE sub-batch of a worker's claim: reference check, deletes, one
+     * settle transaction, one flush of audit events after it commits.
      *
      * [probeEachPath] is what separates the two shapes. False (the bulk
      * path) deletes with [RemovalStore.deleteBatch] — one call per bucket
@@ -758,262 +986,306 @@ class CleanupService(
      * `'absent'` still reaches the ledger for `/verify`, and is called
      * with at most [STAGING_SUB_BATCH] rows for exactly that reason.
      *
-     * Nothing is accumulated into the run's counters until the
-     * transaction has committed: a sub-batch that rolls back must
-     * contribute nothing, including its violations.
+     * Nothing is accumulated into the run's counters until the settle
+     * transaction has committed: a settle that rolls back must contribute
+     * nothing, including its violations.
      */
     private fun drainSubBatch(
         catalog: String,
         catalogId: Long,
+        worker: String,
         sub: List<Entry>,
         probeEachPath: Boolean,
-    ): SubBatchResult {
-        // Per-path audit events are collected inside the sub-batch
-        // transaction and emitted AFTER it commits (invariant 8: audit
-        // never rides a transaction — and never rides the catalog lock).
-        val events = mutableListOf<PathEvent>()
-        var subRemoved = 0L
-        var subMissing = 0L
-        var subStillReferenced = 0L
-        var subObjects = 0L
-        var subSettledElsewhere = 0L
-        var subDeadlineSkipped = 0L
-        jdbi.useTransactionUnchecked { h ->
-            // The check+delete pair is serialized against the commit
-            // tail by the SAME per-catalog advisory lock every commit
-            // takes (see class KDoc for the race and the hold bound):
-            // the reference check below can never go stale against an
-            // in-flight commit registering one of these paths.
-            Locks.acquireCatalogCommitLock(h, catalogId)
+    ): Tally {
+        // Liveness is checked at drain time, on the freshest answer the
+        // database can give — and it now blocks nobody. The claim already
+        // committed, so this runs on a connection with no transaction of
+        // its own and no lock of any kind.
+        val referenced = referencedPaths(catalogId, sub.map { it.path })
+        val violations = mutableListOf<Entry>()
+        val survivors = mutableListOf<Entry>()
+        for (entry in sub) {
+            if (entry.path in referenced) violations += entry else survivors += entry
+        }
 
-            // FIRST STATEMENT UNDER THE LOCK: is each row still
-            // undrained? The batch select ran outside the lock, and the
-            // one writer besides this drain that settles a row —
-            // CompactionService's group commit, which settles its
-            // staging ticket 'registered' in the transaction that makes
-            // the path live — can land in between. Without this
-            // re-check that row reaches the reference check, whose
-            // answer is now "referenced" because the path is a live
-            // file: an ERROR log, a `cleanup_violation` audit event, a
-            // `still_referenced` count that pages someone, and an
-            // attempts bump on a settled row. All four of them are
-            // wrong, and the state that produced them is a compaction
-            // group committing normally.
-            val live =
-                h.createQuery(STILL_UNDRAINED_SQL)
-                    .bind("catalogId", catalogId)
-                    .bindArray("ids", Long::class.javaObjectType, sub.map { it.removalId })
-                    .mapTo(Long::class.javaObjectType)
-                    .list()
-                    .toSet()
-            val entries = sub.filter { it.removalId in live }
-            subSettledElsewhere = (sub.size - entries.size).toLong()
-            if (subSettledElsewhere > 0) {
-                log.debug {
-                    "cleanup: $subSettledElsewhere of ${sub.size} rows in this sub-batch were " +
-                        "settled between the batch select and the lock (a compaction group's " +
-                        "'registered'); dropping them from the sub-batch"
+        // Ledger outcomes for this sub-batch: settled entries by outcome,
+        // plus the ones that stay queued (attempts bump).
+        val drainedByOutcome = mapOf("deleted" to mutableListOf<Long>(), "absent" to mutableListOf())
+        val failed = mutableListOf<Entry>()
+        // Paths whose object this sub-batch physically removed. A SET
+        // because two queue rows over one path are legitimate state
+        // (V16's non-unique argument) and one object went: this is what
+        // the physical-delete metric and the audit events count.
+        val removedPaths = LinkedHashSet<String>()
+
+        if (probeEachPath) {
+            // Staging tickets: HEAD before DELETE, one path at a time.
+            for (entry in survivors) {
+                try {
+                    when (store.deleteIfExists(entry.path)) {
+                        RemovalStore.Outcome.REMOVED -> {
+                            removedPaths += entry.path
+                            drainedByOutcome.getValue("deleted") += entry.removalId
+                        }
+                        RemovalStore.Outcome.MISSING -> {
+                            log.info { "cleanup: '${entry.path}' already gone; draining queue row" }
+                            drainedByOutcome.getValue("absent") += entry.removalId
+                        }
+                    }
+                } catch (e: Exception) {
+                    // Leave the row queued (attempts bumped, claim
+                    // released); the next run retries it.
+                    log.error(e) {
+                        "cleanup: delete failed for '${entry.path}' " +
+                            "(removal_id ${entry.removalId}); leaving queued"
+                    }
+                    failed += entry
                 }
             }
-            if (entries.isEmpty()) return@useTransactionUnchecked
-
-            // THE HOLD DEADLINE. The clock starts once the lock is ours,
-            // and no object-store call may START unless the budget can
-            // still absorb a whole one — so the LAST call always has a
-            // full call bound of room inside the budget, and what the
-            // gate enforces is:
-            //
-            //   hold <= HOLD_BUDGET = 2 x call bound
-            //   HOLD_BUDGET + one call <= min(idle, admission)
-            //
-            // Without it the hold is bounded only in CALLS, and a call is
-            // bounded by RemovalStore.apiCallTimeout — so 25 probe pairs
-            // could reach 500 s and a three-chunk bulk sub-batch 30 s,
-            // both past the idle bound. Past it Postgres kills the
-            // backend: the sub-batch rolls back with its objects DELETED
-            // and its ledger rows unsettled, and the next run re-drains
-            // the same rows and does it again, forever.
-            //
-            // Rows the deadline stops short of are left exactly as found
-            // — no settle, no attempts bump — because nothing was
-            // attempted on them. They are simply the next hold's work,
-            // and they are COUNTED (`deadline_skipped`), because a drain
-            // whose every hold ends on the budget settles nothing and
-            // would otherwise look idle.
-            val holdStart = nanoTime()
-            val mayIssueCall = {
-                Duration.ofNanos(nanoTime() - holdStart) <= holdBudget.minus(store.apiCallTimeout)
-            }
-            val unattempted = mutableListOf<String>()
-
-            // Liveness is checked per sub-batch at drain time, under
-            // the lock: the freshest answer possible before touching
-            // the object.
-            val referenced = referencedPaths(h, catalogId, entries.map { it.path })
-            // Ledger outcomes for this sub-batch: settled entries by
-            // outcome, plus the ones that stay queued (attempts bump).
-            val drainedByOutcome = mapOf("deleted" to mutableListOf<Long>(), "absent" to mutableListOf())
-            val attempted = mutableListOf<Long>()
-            // Paths whose object this sub-batch physically removed. A SET
-            // because two queue rows over one path are legitimate state
-            // (V16's non-unique argument) and one object went: this is
-            // what the physical-delete metric and the audit events count.
-            val removedPaths = LinkedHashSet<String>()
-            val survivors = mutableListOf<Entry>()
-            for (entry in entries) {
-                if (entry.path in referenced) {
+        } else if (survivors.isNotEmpty()) {
+            // Everything else: one DeleteObjects call per bucket chunk.
+            // A key that was not there comes back indistinguishable from
+            // one that was removed, and that is the end state the queue
+            // asked for, so the row settles 'deleted' either way.
+            val rowsByPath = survivors.groupBy { it.path }
+            val failures = store.deleteBatch(rowsByPath.keys)
+            for ((path, rows) in rowsByPath) {
+                val failure = failures[path]
+                if (failure == null) {
+                    removedPaths += path
+                    drainedByOutcome.getValue("deleted") += rows.map { it.removalId }
+                } else {
                     log.error {
-                        "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is " +
-                            "still referenced by the catalog — invariant violation; skipping"
+                        "cleanup: batched delete failed for '$path' (removal_id " +
+                            rows.joinToString { it.removalId.toString() } +
+                            "): $failure; leaving queued"
                     }
-                    // Per-path audit trail for the alert-worthy case: WHICH
-                    // path the queue wrongly suggested. Bounded by batch size.
-                    events +=
-                        PathEvent(
-                            "cleanup_violation",
-                            entry.path,
-                            "invariant_violation",
-                            "removal_id=${entry.removalId} still referenced; not deleted",
-                        )
-                    subStillReferenced++
-                    attempted += entry.removalId
-                    continue
-                }
-                survivors += entry
-            }
-
-            if (probeEachPath) {
-                // Staging tickets: HEAD before DELETE, one path at a
-                // time, at most STAGING_SUB_BATCH of them in this hold.
-                for (entry in survivors) {
-                    try {
-                        when (store.deleteIfExists(entry.path, mayIssueCall)) {
-                            RemovalStore.Outcome.SKIPPED -> {
-                                // The budget closed. Everything from here
-                                // on is untouched, including this row.
-                                unattempted += survivors.dropWhile { it !== entry }.map { it.path }
-                                break
-                            }
-                            RemovalStore.Outcome.REMOVED -> {
-                                removedPaths += entry.path
-                                drainedByOutcome.getValue("deleted") += entry.removalId
-                            }
-                            RemovalStore.Outcome.MISSING -> {
-                                log.info { "cleanup: '${entry.path}' already gone; draining queue row" }
-                                drainedByOutcome.getValue("absent") += entry.removalId
-                            }
-                        }
-                    } catch (e: Exception) {
-                        // Leave the row queued (attempts bumped); the next run
-                        // retries it.
-                        log.error(e) {
-                            "cleanup: delete failed for '${entry.path}' " +
-                                "(removal_id ${entry.removalId}); leaving queued"
-                        }
-                        attempted += entry.removalId
-                    }
-                }
-                if (unattempted.isNotEmpty()) {
-                    log.warn {
-                        "cleanup: hold budget ($holdBudget) spent after " +
-                            "${survivors.size - unattempted.size} of ${survivors.size} staging " +
-                            "tickets; leaving the rest untouched for the next sub-batch"
-                    }
-                }
-            } else if (survivors.isNotEmpty()) {
-                // Everything else: one DeleteObjects call per bucket
-                // chunk. A key that was not there comes back
-                // indistinguishable from one that was removed, and that
-                // is the end state the queue asked for, so the row
-                // settles 'deleted' either way.
-                val rowsByPath = survivors.groupBy { it.path }
-                val outcome = store.deleteBatch(rowsByPath.keys, mayIssueCall)
-                val failures = outcome.failures
-                unattempted += outcome.unattempted
-                if (outcome.unattempted.isNotEmpty()) {
-                    log.warn {
-                        "cleanup: hold budget ($holdBudget) spent after " +
-                            "${rowsByPath.size - outcome.unattempted.size} of " +
-                            "${rowsByPath.size} paths; leaving the rest untouched for the next " +
-                            "sub-batch"
-                    }
-                }
-                val skipped = outcome.unattempted.toSet()
-                for ((path, rows) in rowsByPath) {
-                    if (path in skipped) continue
-                    val failure = failures[path]
-                    if (failure == null) {
-                        removedPaths += path
-                        drainedByOutcome.getValue("deleted") += rows.map { it.removalId }
-                    } else {
-                        log.error {
-                            "cleanup: batched delete failed for '$path' (removal_id " +
-                                rows.joinToString { it.removalId.toString() } +
-                                "): $failure; leaving queued"
-                        }
-                        attempted += rows.map { it.removalId }
-                    }
+                    failed += rows
                 }
             }
+        }
 
-            // Soft-delete the settled entries: the row survives as
-            // the queryable ledger of what cleanup did and when.
+        var tally = Tally(objectsRemoved = removedPaths.size.toLong())
+        val events = mutableListOf<PathEvent>()
+        // Settles this sub-batch lost to a 'registered' over a path it had
+        // already deleted — B1's signature, counted as an invariant
+        // violation rather than as ordinary contention.
+        var registeredAfterDelete = 0L
+        // ONE transaction for every ledger write this sub-batch makes, so
+        // its accounting is atomic: either the settles, the bumps and the
+        // releases all landed or none did.
+        jdbi.useTransactionUnchecked { h ->
+            var removed = 0L
+            var missing = 0L
+            var settledElsewhere = 0L
+            // Soft-delete the settled entries: the row survives as the
+            // queryable ledger of what cleanup did and when.
             for ((outcome, ids) in drainedByOutcome) {
                 if (ids.isEmpty()) continue
                 val settled =
                     h.createQuery(SETTLE_SQL)
                         .bind("outcome", outcome)
                         .bind("catalogId", catalogId)
+                        .bind("worker", worker)
                         .bindArray("ids", Long::class.javaObjectType, ids)
                         .mapTo(Long::class.javaObjectType)
                         .list()
-                for (lost in ids - settled.toSet()) {
-                    log.warn {
-                        "cleanup: removal_id $lost was settled by another writer inside this " +
-                            "sub-batch's own lock hold; leaving that row alone and not counting " +
-                            "it as '$outcome'"
+                val missed = ids - settled.toSet()
+                if (missed.isNotEmpty()) {
+                    // WHY THE SETTLE MISSED IS NOT A DETAIL, and the fence
+                    // cannot say: `drained_at IS NULL AND claimed_by =
+                    // :worker` refuses two events with opposite meanings.
+                    // One is a compaction group registering the path
+                    // (normal). The other is A LIVE FILE ROW FOR A PATH
+                    // THIS SUB-BATCH JUST DELETED, which is an invariant
+                    // violation and the ONLY observable signature it has —
+                    // nothing else in the system can see it, because
+                    // /verify's staging_tickets arms all pass once the file
+                    // row exists. So the missed ids are read back and
+                    // classified.
+                    //
+                    // It is unreachable as of this change: compaction's
+                    // re-read refuses any ticket cleanup has TOUCHED
+                    // (claimed or attempted), not merely one whose lease
+                    // is live. This is the detector for the day that stops
+                    // being true.
+                    for (row in missedRows(h, catalogId, missed)) {
+                        val deletedHere = row.path in removedPaths
+                        if (row.drainedOutcome == "registered" && deletedHere) {
+                            log.error {
+                                "cleanup: removal_id ${row.removalId} path '${row.path}' was " +
+                                    "settled 'registered' by a compaction group AFTER this " +
+                                    "sub-batch deleted the object — a live file row now points " +
+                                    "at a deleted object; invariant violation"
+                            }
+                            events +=
+                                PathEvent(
+                                    "cleanup_violation",
+                                    row.path,
+                                    "invariant_violation",
+                                    "removal_id=${row.removalId} registered after this drain " +
+                                        "deleted the object",
+                                )
+                            registeredAfterDelete++
+                        } else if (row.claimedBy != null && row.claimedBy != worker) {
+                            log.warn {
+                                "cleanup: removal_id ${row.removalId} is now claimed by " +
+                                    "'${row.claimedBy}' rather than '$worker' — this worker's " +
+                                    "lease lapsed while it was working; the new claimant settles it"
+                            }
+                        } else {
+                            log.warn {
+                                "cleanup: removal_id ${row.removalId} was settled by another " +
+                                    "writer ('${row.drainedOutcome}') before this sub-batch " +
+                                    "could; leaving it alone and not counting it as '$outcome'"
+                            }
+                        }
                     }
                 }
+                settledElsewhere += missed.size
                 when (outcome) {
-                    "deleted" -> subRemoved = settled.size.toLong()
-                    "absent" -> subMissing = settled.size.toLong()
+                    "deleted" -> removed = settled.size.toLong()
+                    "absent" -> missing = settled.size.toLong()
                 }
             }
-            // Physical deletions are the audit log's whole point: one
-            // event per object actually removed.
-            subObjects = removedPaths.size.toLong()
-            for (path in removedPaths) {
-                events += PathEvent("file_deleted", path, "ok", null)
+            // THE FENCE DECIDES WHAT WAS A VIOLATION, and it has to,
+            // because the reference check is not authoritative about
+            // WHOSE row it read. A compaction group that committed
+            // between this worker's claim and its check makes the path a
+            // live file and settles the ticket 'registered' in one
+            // transaction — a group committing normally. Counting the
+            // check's hit would page someone for it. So the bump is
+            // asked first and only the rows it actually touched are
+            // violations; the rest were settled elsewhere.
+            val trueViolations = bumpAttempts(h, catalogId, worker, violations)
+            tally = tally.copy(stillReferenced = trueViolations.size.toLong())
+            settledElsewhere += violations.size - trueViolations.size
+            for (entry in trueViolations) {
+                log.error {
+                    "cleanup: path '${entry.path}' (removal_id ${entry.removalId}) is " +
+                        "still referenced by the catalog — invariant violation; skipping"
+                }
+                // Per-path audit trail for the alert-worthy case: WHICH
+                // path the queue wrongly suggested. Bounded by batch size.
+                events +=
+                    PathEvent(
+                        "cleanup_violation",
+                        entry.path,
+                        "invariant_violation",
+                        "removal_id=${entry.removalId} still referenced; not deleted",
+                    )
             }
-            // Rows the deadline never reached. Counted, not settled and
-            // not attempted — see CleanupResult.deadlineSkipped for why
-            // a run has to report them rather than look idle.
-            subDeadlineSkipped = unattempted.size.toLong()
-            // Undrained entries (still-referenced, transient S3
-            // failure) record the attempt and stay queued. Fenced on
-            // `drained_at IS NULL` for the same reason the settle is:
-            // this statement must never touch a row another writer
-            // settled, and `last_attempt_at` on a settled row is a lie
-            // about what cleanup did to it.
-            if (attempted.isNotEmpty()) {
-                h.createUpdate(BUMP_ATTEMPTS_SQL)
-                    .bind("catalogId", catalogId)
-                    .bindArray("ids", Long::class.javaObjectType, attempted)
-                    .execute()
-            }
+            settledElsewhere += failed.size - bumpAttempts(h, catalogId, worker, failed).size
+            tally =
+                tally.copy(
+                    removed = removed,
+                    missing = missing,
+                    // A settle lost over a path this sub-batch deleted is
+                    // an invariant violation, not contention: it flags the
+                    // run `invariant_violation` exactly as a
+                    // still-referenced path does.
+                    stillReferenced = tally.stillReferenced + registeredAfterDelete,
+                    settledElsewhere = settledElsewhere,
+                )
         }
-        // Sub-batch committed (lock released): emit its audit events.
+        // Physical deletions are the audit log's whole point: one event
+        // per object actually removed.
+        for (path in removedPaths) {
+            events += PathEvent("file_deleted", path, "ok", null)
+        }
+        // Settled (no transaction open): emit this sub-batch's events.
         for (e in events) {
             Audit.event(e.action, catalog, e.path, outcome = e.outcome, detail = e.detail)
         }
-        return SubBatchResult(
-            subRemoved,
-            subMissing,
-            subStillReferenced,
-            subObjects,
-            subSettledElsewhere,
-            subDeadlineSkipped,
-        )
+        return tally
+    }
+
+    /** A row a settle did not match, read back so the miss can be classified. */
+    private data class MissedRow(
+        val removalId: Long,
+        val path: String,
+        val drainedOutcome: String?,
+        val claimedBy: String?,
+    )
+
+    /**
+     * Read back the rows a settle did not match, in the settle's own
+     * transaction. Four columns, because the classification needs all of
+     * them: which row, which path (to compare against what this
+     * sub-batch deleted), what outcome another writer recorded, and
+     * whether the claim moved.
+     */
+    private fun missedRows(
+        h: Handle,
+        catalogId: Long,
+        ids: List<Long>,
+    ): List<MissedRow> =
+        h.createQuery(MISSED_SETTLE_SQL)
+            .bind("catalogId", catalogId)
+            .bindArray("ids", Long::class.javaObjectType, ids)
+            .map { rs, _ ->
+                MissedRow(
+                    rs.getLong("removal_id"),
+                    rs.getString("path"),
+                    rs.getString("drained_outcome"),
+                    rs.getString("claimed_by"),
+                )
+            }
+            .list()
+
+    /**
+     * Bump `attempts` on rows that were touched and NOT drained — a
+     * still-referenced skip, or a delete that failed — releasing the
+     * claim with it, and return the entries the fence actually matched.
+     *
+     * The RETURNING is the point: a row this worker no longer holds (its
+     * lease lapsed, or a compaction group settled it 'registered') must
+     * not be counted, logged or audited as anything, and the only way to
+     * know is to let the database say which rows the statement touched.
+     */
+    private fun bumpAttempts(
+        h: Handle,
+        catalogId: Long,
+        worker: String,
+        entries: List<Entry>,
+    ): List<Entry> {
+        if (entries.isEmpty()) return emptyList()
+        val bumped =
+            h.createQuery(BUMP_ATTEMPTS_SQL)
+                .bind("catalogId", catalogId)
+                .bind("worker", worker)
+                .bindArray("ids", Long::class.javaObjectType, entries.map { it.removalId })
+                .mapTo(Long::class.javaObjectType)
+                .list()
+                .toSet()
+        return entries.filter { it.removalId in bumped }
+    }
+
+    /**
+     * The retention purge as a run's LAST act, and never as its verdict.
+     *
+     * It sits OUTSIDE `MaintenanceRunStore.recorded` because it is
+     * instance-wide rather than a catalog's task, and that placement has a
+     * consequence worth fencing: unfenced, a purge failure would escape as
+     * the manual endpoint's 500 or as a counted background-loop failure
+     * while every ledger row for the drain it followed said `ok` — a run
+     * reported two ways at once. Retention is hygiene: it is allowed to
+     * fail, it is not allowed to misreport the drain, and the next run
+     * starts again from the bottom of the key.
+     *
+     * WARN rather than debug because it is the only trace: nothing counts
+     * it, and a purge that has been failing for a week is a ledger growing
+     * without bound.
+     */
+    private fun purgeAfterRun(label: String) {
+        try {
+            purgeDrainedLedger(label)
+        } catch (e: Exception) {
+            log.warn(e) {
+                "cleanup: the drained-ledger retention purge failed after the $label; the drain " +
+                    "itself is unaffected and the next run retries from the bottom of the key"
+            }
+        }
     }
 
     /**
@@ -1037,36 +1309,158 @@ class CleanupService(
 
     /**
      * Ledger retention: drained rows older than [ledgerRetentionSeconds]
-     * are hard-deleted so the soft-delete ledger cannot itself
-     * accumulate without bound (the A1 lesson, applied to the fix for
-     * A3). Undrained rows are never touched here.
+     * are hard-deleted so the soft-delete ledger cannot itself accumulate
+     * without bound (the A1 lesson, applied to the fix for A3). Undrained
+     * rows are never touched — `drained_at < cutoff` is NULL on them, so
+     * the cutoff predicate is the whole fence.
+     *
+     * IT IS A LOOP OF BOUNDED DELETES, and that is the change. It used to
+     * be one statement — `DELETE ... WHERE catalog_id = :c AND drained_at
+     * < cutoff` — with NO access path: both indexes on the table are
+     * partial on `drained_at IS NULL`, i.e. on the complement of the rows
+     * this deletes, so the predicate could only be answered by a
+     * sequential scan of the whole table, and the DELETE was unbounded in
+     * rows AND in duration. At 190k rows/h drained and the 30-day default
+     * the drained ledger heads for ~137M rows, and re-enabling cleanup on
+     * prod-us is what would have fired that statement against it: an
+     * unbounded, PK-uncorrelated DELETE, which is the exact shape of the
+     * 2026-09-28 expiry-lock outage.
+     *
+     * THE PAGE BOUNDS THE ROWS EXAMINED, not only the rows deleted, and
+     * that distinction is why the walk carries NO `catalog_id`. There is
+     * no non-partial `(catalog_id, removal_id)` index, so a per-catalog
+     * page would descend the primary key and FILTER on catalog: a catalog
+     * holding a tenth of the table would read ten pages' worth of tuples
+     * to fill one page, with the wall budget checked only BETWEEN pages
+     * and nothing bounding the statement itself. Dropping the column makes
+     * the window a dense prefix of the key. It is also correct rather than
+     * merely cheaper: [ledgerRetentionSeconds] is a per-PROCESS constant,
+     * so "drained longer ago than the retention" means the same thing for
+     * every catalog, and the outer DELETE needs no `catalog_id` for the
+     * reason `CLAIM_BULK_SQL`'s KDoc gives — `removal_id` is the table's
+     * own global identity primary key.
+     *
+     * The cursor therefore advances over the rows EXAMINED (the window's
+     * max id), not over the rows deleted. Advancing over deletions cannot
+     * pass an un-purgeable row at all, so it re-read the same tail every
+     * iteration; this form makes each page strictly new work.
+     *
+     * A SKIP, AND A CAP ON THE SKIPPING. A page that purges nothing is
+     * SKIPPED — the cursor moves past it — rather than ending the walk,
+     * because the walk is global and stopping at the first one would park
+     * EVERY catalog's retention behind ONE catalog's un-purgeable window
+     * (a tenant whose drain is wedged on bad credentials or a
+     * still-referenced cluster holds ~[LEDGER_PURGE_PAGE] consecutive
+     * undrained ids, and nothing in the deployment would purge again).
+     *
+     * But only [LEDGER_PURGE_EMPTY_PAGES] in a row, and the reason is day
+     * one: the cursor restarts at the bottom of the key every run, and on
+     * gigahog-prod-us the bottom is the 2.6M-row UNDRAINED backlog, so an
+     * uncapped walk would spend its whole wall budget on ~200 pages that
+     * purge nothing — every run, every interval, for as long as the
+     * backlog stands. The cap keeps the wedge-skip (a wedge narrower than
+     * it is still walked past) and bounds what a wedge costs. The walk
+     * also stops on an EMPTY or SHORT window — the end of the table — or
+     * on [LEDGER_PURGE_BUDGET_MS] of wall clock.
+     *
+     * A RUN THAT EXAMINED PAGES AND PURGED NOTHING SAYS SO AT INFO. Either
+     * it is behind a wedge or it ran out of budget, and at debug that is
+     * indistinguishable from a purge with nothing to do.
+     *
+     * IT IS GLOBAL, AND THAT IS OPERATOR-VISIBLE. A run for catalog A
+     * purges the expired ledger rows of catalogs B, C, … as well; the
+     * cutoff is [ledgerRetentionSeconds], a per-process constant, so every
+     * catalog's rows are judged by the same rule and nothing is deleted
+     * early. Because it is instance-wide it runs ONCE PER RUN rather than
+     * once per catalog — [runOnce] calls it after its drain and
+     * [runOnceAllCatalogs] calls it once for the whole sweep, where the
+     * per-catalog form would have paid N wall budgets to re-walk the same
+     * prefix of the key. The endpoint's OpenAPI description says so,
+     * because an operator running a single-catalog cleanup during an
+     * incident should not be surprised by another catalog's ledger
+     * shrinking.
      */
-    private fun purgeDrainedLedger(
-        catalog: String,
-        catalogId: Long,
-    ) {
-        val purged =
-            jdbi.withHandleUnchecked { h ->
-                h.createUpdate(
-                    """
-                    DELETE FROM hog_file_removal
-                    WHERE catalog_id = :catalogId
-                      AND drained_at < now() - make_interval(secs => :retention)
-                    """,
-                )
-                    .bind("catalogId", catalogId)
-                    .bind("retention", ledgerRetentionSeconds)
-                    .execute()
+    private fun purgeDrainedLedger(runLabel: String) {
+        val deadline = System.nanoTime() + Duration.ofMillis(ledgerPurgeBudgetMs).toNanos()
+        var after = 0L
+        var purged = 0L
+        var pages = 0
+        var skipped = 0
+        var consecutiveEmpty = 0
+        // A BUDGET STOP IS A BUDGET STOP EVEN BEFORE THE FIRST PAGE. The
+        // earlier form reported it as `pages > 0`, so a purge that never
+        // got to run at all looked exactly like an idle one — the class of
+        // indistinguishability that made the 2026-09-28 misdiagnosis take
+        // as long as it did.
+        var stop = "the end of the ledger"
+        while (true) {
+            if (System.nanoTime() >= deadline) {
+                stop = "the ${ledgerPurgeBudgetMs}ms budget"
+                break
             }
-        if (purged > 0) {
-            log.debug { "cleanup: purged $purged drained ledger rows for catalog '$catalog'" }
+            val page =
+                jdbi.withHandleUnchecked { h ->
+                    h.createQuery(PURGE_PAGE_SQL)
+                        .bind("after", after)
+                        .bind("page", ledgerPurgePage)
+                        .bind("retention", ledgerRetentionSeconds)
+                        .map { rs, _ ->
+                            Triple(rs.getInt("examined"), rs.getLong("cursor_id"), rs.getInt("purged"))
+                        }
+                        .one()
+                }
+            pages++
+            val (examined, cursor, gone) = page
+            purged += gone
+            // An empty window is the end of the table.
+            if (examined == 0) break
+            // A page that purged NOTHING is SKIPPED, not a stop: the walk
+            // is global, so stopping at the first one would park every
+            // catalog's retention behind one catalog's un-purgeable
+            // window. The cursor moves past it.
+            if (gone == 0) {
+                skipped++
+                consecutiveEmpty++
+            } else {
+                consecutiveEmpty = 0
+            }
+            after = cursor
+            // BUT ONLY [LEDGER_PURGE_EMPTY_PAGES] IN A ROW, because on day
+            // one the bottom of the global key is the UNDRAINED backlog
+            // (2.6M rows on gigahog-prod-us), and the cursor restarts at
+            // the bottom every run: without this cap every run spends its
+            // whole wall budget re-scanning ~200 pages that purge nothing,
+            // every interval, for as long as the backlog stands. The cap
+            // buys the wedge-skip — a wedge narrower than it is still
+            // walked past — at a bounded cost per run.
+            if (consecutiveEmpty >= LEDGER_PURGE_EMPTY_PAGES) {
+                stop = "$LEDGER_PURGE_EMPTY_PAGES consecutive pages with nothing to purge"
+                break
+            }
+            // A page the window could not fill has nothing above it.
+            if (examined < ledgerPurgePage) break
         }
+        val summary =
+            "cleanup: purged $purged drained ledger rows over $pages pages of $ledgerPurgePage " +
+                "($skipped with nothing to purge), stopped on $stop (after the $runLabel)"
+        // AT INFO WHEN IT GOT NOWHERE, because that is the state an
+        // operator has to be able to see: a purge that examined pages and
+        // deleted nothing is either behind a wedge or out of budget, and
+        // at debug it is indistinguishable from a purge with nothing to do
+        // — which is the shape that made the 2026-09-28 misdiagnosis slow.
+        if (pages > 0 && purged == 0L) log.info { summary } else log.debug { summary }
     }
 
     /**
      * Paths from [paths] that any file row (live or not) still claims.
-     * Runs on the sub-batch transaction's handle, under the catalog
-     * commit lock, so the answer cannot go stale against a commit.
+     *
+     * NO LOCK AND NO TRANSACTION. It used to run under the per-catalog
+     * commit lock so its answer could not go stale against an in-flight
+     * commit; that window does not exist (see the class KDoc: a commit
+     * cannot register a path while an undrained row names it), and what
+     * the lock actually bought was ~19 s of blocked commits per
+     * sub-batch. What makes the check safe is the CLAIM plus the commit
+     * path's own refusal, not a lock.
      *
      * LIVE OR NOT is the load-bearing half, and it is why V17's indexes
      * are not partial: a historical row still claims its object at
@@ -1084,27 +1478,28 @@ class CleanupService(
      * a copy of it.
      */
     private fun referencedPaths(
-        h: Handle,
         catalogId: Long,
         paths: List<String>,
     ): Set<String> =
-        h.createQuery(
-            """
-            SELECT path FROM hog_data_file
-            WHERE catalog_id = :catalogId AND path = ANY(:paths)
-            UNION
-            SELECT path FROM hog_delete_file
-            WHERE catalog_id = :catalogId AND path = ANY(:paths)
-            UNION
-            SELECT path FROM hog_upload
-            WHERE catalog_id = :catalogId AND path = ANY(:paths) AND state = 'active'
-            """,
-        )
-            .bind("catalogId", catalogId)
-            .bindArray("paths", String::class.java, paths)
-            .mapTo(String::class.java)
-            .list()
-            .toSet()
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT path FROM hog_data_file
+                WHERE catalog_id = :catalogId AND path = ANY(:paths)
+                UNION
+                SELECT path FROM hog_delete_file
+                WHERE catalog_id = :catalogId AND path = ANY(:paths)
+                UNION
+                SELECT path FROM hog_upload
+                WHERE catalog_id = :catalogId AND path = ANY(:paths) AND state = 'active'
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bindArray("paths", String::class.java, paths)
+                .mapTo(String::class.java)
+                .list()
+                .toSet()
+        }
 
     /**
      * One drain across every catalog, for the background loop
@@ -1116,11 +1511,16 @@ class CleanupService(
         val results = mutableListOf<Pair<String, CleanupResult>>()
         for (name in names) {
             try {
-                results += name to runOnce(name, batchSize, MaintenanceTrigger.LOOP)
+                results += name to drainCatalog(name, batchSize, MaintenanceTrigger.LOOP)
             } catch (e: Exception) {
                 log.error(e) { "cleanup drain failed for catalog '$name'; continuing" }
             }
         }
+        // ONE retention purge for the whole sweep, not one per catalog:
+        // the walk is instance-wide, so N catalogs would have paid N times
+        // for the same work — and on a catalog-rich deployment that is N
+        // wall budgets spent re-walking the same prefix of the key.
+        purgeAfterRun("sweep over ${names.size} catalog(s)")
         return results
     }
 
@@ -1136,49 +1536,43 @@ class CleanupService(
 
         /**
          * Production sub-batch size for physical deletes
-         * (HOGLAKE_CLEANUP_SUB_BATCH).
+         * (HOGLAKE_CLEANUP_SUB_BATCH) — and therefore the size of one
+         * CLAIM.
          *
-         * 1,000 is S3's own ceiling on ONE `DeleteObjects` request, so
-         * the default sub-batch is exactly one object-store round trip
-         * inside the commit-lock hold. It was 25, and that number was
-         * sized for a different statement: the drain then issued
-         * subBatchSize x (HEAD + DELETE), so the constant was a
-         * commit-latency bound (~3.2 s per hold, ~255 s of holding per
-         * 2,000-row run — see the class KDoc's measurement) rather than
-         * a batching decision.
+         * 1,000 is S3's own ceiling on ONE `DeleteObjects` request, so a
+         * default sub-batch whose paths share a bucket is exactly one
+         * object-store round trip. It was 25, and that number was sized
+         * for a different statement: the drain then issued
+         * subBatchSize x (HEAD + DELETE) under the per-catalog commit
+         * lock, so the constant was a commit-latency bound (~3.2 s per
+         * hold, ~255 s of holding per 2,000-row run) rather than a
+         * batching decision.
          *
-         * The lock hold scales with the number of CALLS a sub-batch
-         * makes, not with this number directly: 1,000 keys in one bucket
-         * is one call, and 2,500 keys spread over three buckets is four
-         * whatever this is set to. Raising it past 1,000 buys nothing —
-         * the extra keys chunk into extra calls inside the same hold —
-         * so the ceiling is where it stops being free, not where it
-         * starts being wrong. `compaction_staging` rows do not use this
-         * knob at all; see [STAGING_SUB_BATCH].
+         * Raising it past 1,000 buys nothing — the extra keys chunk into
+         * extra calls inside the same sub-batch — so the ceiling is where
+         * it stops being free, not where it starts being wrong.
+         * `compaction_staging` rows are settled in their own sub-batches
+         * of [STAGING_SUB_BATCH] whatever this is.
          */
         const val SUB_BATCH = 1000
 
         /**
-         * Staging tickets per sub-batch, and therefore per lock hold.
+         * Staging tickets settled per sub-batch.
          *
          * 25 is the OLD whole-queue sub-batch, kept for the one reason
-         * that still costs what the old one did: a
-         * `compaction_staging` row is a HeadObject and a DeleteObject,
-         * and there is no batched form that reports `'absent'`. At the
-         * 64 ms per round trip measured on gigahog-prod-us that is
-         * ~3.2 s of TYPICAL hold — the bound the old design claimed for
-         * the whole drain, now paid only by the rows that genuinely need
-         * two probes, and only when a run actually holds that many stale
-         * tickets. The WORST case is not this count times 64 ms; it is
-         * [HOLD_BUDGET], because a slow call takes what the call bound
-         * allows and the deadline is what stops the hold.
+         * that still costs what the old one did: a `compaction_staging`
+         * row is a HeadObject and a DeleteObject, and there is no
+         * batched form that reports `'absent'`. At the 64 ms per round
+         * trip measured on gigahog-prod-us that is ~3.2 s of
+         * object-store work per sub-batch. It is no longer a LOCK bound
+         * — there is no lock — it is the unit of PROGRESS: each
+         * sub-batch settles in its own transaction, so a claim that ends
+         * badly forty tickets in keeps the first twenty-five.
          *
-         * Splitting the reasons is not cosmetic. One sub-batch of 1,000
-         * tickets would be ~128 s of typical hold, 40x what this change
-         * removed, and [STAGING_GRACE_SECONDS] clusters them: tickets
-         * become eligible in the order their groups ran, so a compaction
-         * sweep that aborted a run of groups puts its whole run into one
-         * sub-batch an hour later.
+         * [STAGING_GRACE_SECONDS] clusters them, which is why the size
+         * still matters: tickets become eligible in the order their
+         * groups ran, so a compaction sweep that aborted a run of groups
+         * puts its whole run into one claim an hour later.
          */
         const val STAGING_SUB_BATCH = 25
 
@@ -1212,12 +1606,63 @@ class CleanupService(
         const val STAGING_GRACE_SECONDS = 3600L
 
         /**
-         * The drain's batch select: the oldest undrained rows of one
-         * catalog, in queue order. This is the statement
-         * `hog_file_removal_drain (catalog_id, removal_id) WHERE
-         * drained_at IS NULL` exists for — when it is chosen, the index
-         * supplies both the predicate and the `ORDER BY`, so the LIMIT
-         * stops the scan rather than trimming a sort.
+         * How long a claim is honoured (HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS):
+         * 900 s.
+         *
+         * A LEASE, not a lock, and the quantity it has to cover is how
+         * long ONE CLAIM's work can take AT THE CALL BOUND, not at a
+         * measured average — which is the whole reason the claim is
+         * reason-aware. A bulk claim is [SUB_BATCH] paths and one
+         * `DeleteObjects` call per bucket chunk: a handful of calls, so
+         * ~64 ms measured and ~`chunks x 10 s` worst case. A staging
+         * claim is [STAGING_SUB_BATCH] tickets and two calls each: 50
+         * calls, 500 s worst case, inside this lease with 400 s to
+         * spare. A single claim of [SUB_BATCH] TICKETS would be 20,000 s
+         * worst case and could not fit — which is why no such claim can
+         * be issued (`CLAIM_STAGING_SQL`), and
+         * `RemovalStoreBoundsTest` asserts both arms against this
+         * constant.
+         *
+         * Wrong in either direction costs work, never an object. Too
+         * short and two workers do the same delete — idempotent, and the
+         * loser's settle is refused by the `claimed_by` fence, counted
+         * `settled_elsewhere`. Too long and a killed worker's rows wait
+         * out the lease before anyone retries them.
+         *
+         * It is ALSO compaction's number: `CompactionConfig`'s copy is
+         * what decides when a group commit may take a claimed staging
+         * ticket back, and the two services must not disagree about the
+         * same row.
+         */
+        const val CLAIM_LEASE_SECONDS = 900L
+
+        /**
+         * `pod/uuid` for this process's workers. `HOSTNAME` is the pod
+         * name on Kubernetes and the machine name locally; the UUID is
+         * what makes a restarted pod a DIFFERENT claimant, so its
+         * predecessor's rows come back through the lease rather than
+         * being silently re-adopted by a process that never claimed them.
+         */
+        internal fun defaultWorkerIdPrefix(): String =
+            "${System.getenv("HOSTNAME")?.takeIf { it.isNotBlank() } ?: "local"}/${UUID.randomUUID()}"
+
+        /**
+         * THE CLAIM'S INNER SELECT, bulk arm: the oldest claimable rows
+         * of one catalog that are NOT `compaction_staging`, in queue
+         * order, locked and skipped over rather than waited for.
+         *
+         * `internal` and separate from its UPDATE because it is the half
+         * whose PLAN matters, and a plan test must EXPLAIN the statement
+         * production issues rather than a copy of it
+         * (`V16FileRemovalPathIndexMigrationIntegrationTest` and
+         * `V21CleanupClaimMigrationIntegrationTest` both do). EXPLAIN
+         * ANALYZE of the UPDATE itself would claim rows for real.
+         *
+         * This is the statement `hog_file_removal_drain (catalog_id,
+         * removal_id) WHERE drained_at IS NULL` exists for — when it is
+         * chosen, the index supplies both the predicate and the
+         * `ORDER BY`, so the LIMIT stops the scan rather than trimming a
+         * sort.
          *
          * WHEN IT IS CHOSEN is a real qualifier, and it is the SPARSE
          * shape: a catalog whose undrained rows are a small fraction of
@@ -1225,104 +1670,322 @@ class CleanupService(
          * drains. Where they are DENSE — a catalog that is behind, which
          * is the state #199 describes — the primary key on `removal_id`
          * already arrives in the right order and discards only a row or
-         * two per row it emits, and the planner takes THAT instead.
-         * Both plans are correct and both stop at the LIMIT; the drain
-         * index is the one that keeps the cost bounded as the settled
-         * ledger grows around the queue.
+         * two per row it emits, and the planner takes THAT instead. Both
+         * plans are correct and both stop at the LIMIT; the drain index
+         * is the one that keeps the cost bounded as the settled ledger
+         * grows around the queue.
          *
-         * `internal` so `V16FileRemovalPathIndexMigrationIntegrationTest`
-         * can prove the drain index survives V16 — on both shapes. A new
-         * index the planner prefers HERE would be a regression, not a
+         * The claim and reason clauses are FILTERS on rows the index has
+         * already narrowed to one catalog's queue, at most a batch past
+         * the leading columns — neither is something to index. A new
+         * index the planner preferred here would be a regression, not a
          * win: `(catalog_id, path)` supplies no `removal_id` ordering, so
          * the LIMIT would sit on top of a sort of every undrained row.
          *
-         * The `compaction_staging` clause is a FILTER on rows the index
-         * has already narrowed to one catalog's queue, at most a batch
-         * past the leading columns — it is not something to index. See
-         * [STAGING_GRACE_SECONDS] for what it is for.
+         * THE CLAIM CLAUSE IS `claimed_at IS NULL OR claimed_at < now() -
+         * lease`, which is the lease read as a predicate: an unclaimed
+         * row, or one whose claimant has been gone longer than
+         * [CLAIM_LEASE_SECONDS]. Drop it and two workers drain one row at
+         * once; invert it and a fresh claim is stolen immediately.
          *
-         * Binds `:catalogId`, `:limit` and `:stagingGraceSeconds`. No
-         * interpolated values (invariant 9 intact).
+         * Binds `:catalogId`, `:limit` and `:leaseSeconds`.
          */
-        internal const val DRAIN_BATCH_SQL: String =
+        internal const val CLAIM_CANDIDATE_SQL: String =
             """
-            SELECT removal_id, path, reason FROM hog_file_removal
-            WHERE catalog_id = :catalogId AND drained_at IS NULL
-              AND (reason <> 'compaction_staging'
-                   OR scheduled_at < now() - make_interval(secs => :stagingGraceSeconds))
-            ORDER BY removal_id
-            LIMIT :limit
+            SELECT removal_id FROM hog_file_removal
+                    WHERE catalog_id = :catalogId AND drained_at IS NULL
+                      AND reason <> 'compaction_staging'
+                      AND (claimed_at IS NULL
+                           OR claimed_at < now() - make_interval(secs => :leaseSeconds))
+                    ORDER BY removal_id
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
             """
 
         /**
-         * Which of this sub-batch's rows are STILL undrained, asked as
-         * the first statement under the commit lock.
+         * The same, STAGING arm: `compaction_staging` tickets past
+         * [STAGING_GRACE_SECONDS].
          *
-         * The batch select runs outside the lock, and one other writer
-         * settles rows: `CompactionService`'s group commit, which
-         * settles its staging ticket `'registered'` in the same
-         * transaction that registers the output path. A row it settled
-         * in that window is not this drain's to touch — and worse, its
-         * path is now a live file, so the reference check would call it
-         * an invariant violation and page someone about a compaction
-         * group committing normally.
+         * A SEPARATE STATEMENT BECAUSE THE LEASE HAS TO BOUND THE WORK A
+         * CLAIM CARRIES. One claim with no reason predicate could hold
+         * [SUB_BATCH] tickets — 2,000 HEAD/DELETE round trips under a
+         * single lease, 128 s at the measured 64 ms but 20,000 s at
+         * `RemovalStore.apiCallTimeout`, which is 22x
+         * [CLAIM_LEASE_SECONDS]. Claimed at [STAGING_SUB_BATCH] the worst
+         * case is 50 calls, 500 s, inside the lease — and that is the
+         * inequality `RemovalStoreBoundsTest` asserts, for both arms.
+         *
+         * Binds `:catalogId`, `:limit`, `:leaseSeconds` and
+         * `:stagingGraceSeconds`.
+         */
+        internal const val CLAIM_STAGING_CANDIDATE_SQL: String =
+            """
+            SELECT removal_id FROM hog_file_removal
+                    WHERE catalog_id = :catalogId AND drained_at IS NULL
+                      AND reason = 'compaction_staging'
+                      AND scheduled_at < now() - make_interval(secs => :stagingGraceSeconds)
+                      AND (claimed_at IS NULL
+                           OR claimed_at < now() - make_interval(secs => :leaseSeconds))
+                    ORDER BY removal_id
+                    LIMIT :limit
+                    FOR UPDATE SKIP LOCKED
+            """
+
+        /**
+         * The claim: the candidate select above, wrapped in the UPDATE
+         * that makes those rows this worker's.
+         *
+         * One statement, one transaction, committed before any
+         * object-store call — so a worker waiting on S3 holds no
+         * transaction, no row lock and no advisory lock, and
+         * `idle_in_transaction_session_timeout` bounds nothing here.
+         *
+         * `FOR UPDATE SKIP LOCKED` on the inner select is what makes
+         * concurrent workers and concurrent replicas partition the queue
+         * with no coordination: a row another claim is holding is SKIPPED
+         * rather than waited for, so a claim's cost never depends on how
+         * many drains are running. It is also why there is no
+         * single-flight advisory lock: the thing such a lock would
+         * prevent — two workers draining the same row — cannot happen.
+         *
+         * THE OUTER UPDATE CARRIES NO `catalog_id` AND NO `drained_at IS
+         * NULL`, unlike every other statement here, and that is safe for
+         * two specific reasons: `removal_id` is the table's own
+         * `GENERATED ALWAYS AS IDENTITY PRIMARY KEY`, so it is globally
+         * unique and cannot name another catalog's row; and the inner
+         * `FOR UPDATE` holds every row it returned, so no re-check can go
+         * stale between the select and the update. A future composite key
+         * would break the first half.
+         *
+         * No interpolated values (invariant 9 intact) — the composition
+         * is two CONSTANTS, not a value.
+         */
+        internal const val CLAIM_BULK_SQL: String =
+            """
+            UPDATE hog_file_removal r
+               SET claimed_at = now(), claimed_by = :worker
+             WHERE r.removal_id IN ($CLAIM_CANDIDATE_SQL)
+            RETURNING removal_id, path, reason
+            """
+
+        /** The staging arm's UPDATE — see [CLAIM_BULK_SQL] for the shape. */
+        internal const val CLAIM_STAGING_SQL: String =
+            """
+            UPDATE hog_file_removal r
+               SET claimed_at = now(), claimed_by = :worker
+             WHERE r.removal_id IN ($CLAIM_STAGING_CANDIDATE_SQL)
+            RETURNING removal_id, path, reason
+            """
+
+        /**
+         * The rows a settle did not match, read back inside the settle's
+         * own transaction so the miss can be CLASSIFIED rather than
+         * counted.
          *
          * Binds `:catalogId` and the `:ids` array.
          */
-        internal const val STILL_UNDRAINED_SQL: String =
+        internal const val MISSED_SETTLE_SQL: String =
             """
-            SELECT removal_id FROM hog_file_removal
-            WHERE catalog_id = :catalogId AND removal_id = ANY(:ids) AND drained_at IS NULL
+            SELECT removal_id, path, drained_outcome, claimed_by
+              FROM hog_file_removal
+             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+            """
+
+        /**
+         * Give a claimed row back, unchanged: the run already handled it
+         * and claimed it again (a still-referenced skip releases its
+         * claim, which makes the row claimable inside the same run).
+         *
+         * Fenced like every other write here — `drained_at IS NULL AND
+         * claimed_by = :worker` — so releasing can never disturb a row
+         * that has since become someone else's.
+         *
+         * Binds `:catalogId`, `:worker` and the `:ids` array.
+         */
+        internal const val RELEASE_CLAIM_SQL: String =
+            """
+            UPDATE hog_file_removal
+               SET claimed_at = NULL, claimed_by = NULL
+             WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
+               AND drained_at IS NULL AND claimed_by = :worker
             """
 
         /**
          * Record a touch that did NOT drain the row — a still-referenced
-         * skip, or a delete that failed. Fenced on `drained_at IS NULL`
-         * for the same reason [SETTLE_SQL] is: a settled row's
-         * `attempts`/`last_attempt_at` describe what cleanup did to it
-         * before it settled, and bumping them afterwards is a false
-         * statement in the forensics ledger.
+         * skip, or a delete that failed — and RELEASE the claim, so the
+         * row is visible to the next run and to an operator reading the
+         * queue instead of waiting out a lease it will not use.
          *
-         * Binds `:catalogId` and the `:ids` array.
+         * FENCED ON `drained_at IS NULL AND claimed_by = :worker`, and
+         * `RETURNING` is what the caller counts: `attempts` and
+         * `last_attempt_at` on a row this worker no longer holds are a
+         * false statement about what cleanup did to it, and — the reason
+         * the return value is read rather than discarded — so is calling
+         * that row an invariant violation. A compaction group that
+         * commits between the claim and the reference check makes the
+         * path live and settles the ticket in one transaction; the check
+         * sees a live file, and only the fence can tell that from the
+         * real thing.
+         *
+         * Binds `:catalogId`, `:worker` and the `:ids` array.
          */
         internal const val BUMP_ATTEMPTS_SQL: String =
             """
             UPDATE hog_file_removal
-               SET attempts = attempts + 1, last_attempt_at = now()
+               SET attempts = attempts + 1, last_attempt_at = now(),
+                   claimed_at = NULL, claimed_by = NULL
              WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
-               AND drained_at IS NULL
+               AND drained_at IS NULL AND claimed_by = :worker
+            RETURNING removal_id
             """
 
         /**
-         * Settle a drained row, FENCED on `drained_at IS NULL`.
+         * Settle a drained row, FENCED on `drained_at IS NULL AND
+         * claimed_by = :worker`.
          *
-         * THE BACKSTOP, not the catcher. What actually catches the
-         * realistic race — a compaction group settling its staging
-         * ticket `'registered'` between this run's batch select and its
-         * sub-batch — is [STILL_UNDRAINED_SQL], asked as the first
-         * statement under the lock, which drops the row from the
-         * sub-batch before anything touches it. This predicate covers
-         * the remainder: a settle that lands after that re-check, inside
-         * this sub-batch's own lock hold. Without it the statement can
-         * stamp its outcome over one another writer already recorded,
-         * erasing the only record that the path became a live catalog
-         * file and leaving a ledger saying cleanup deleted an object the
-         * catalog is serving.
+         * BOTH HALVES ARE LOAD-BEARING. `drained_at IS NULL` keeps this
+         * statement off a row another writer already settled — without
+         * it, cleanup would stamp `'deleted'` over a compaction group's
+         * `'registered'`, erasing the only record that the path became a
+         * live catalog file and leaving a ledger that says cleanup
+         * deleted an object the catalog is serving. `claimed_by =
+         * :worker` is the LEASE's half: a worker whose claim lapsed while
+         * it was talking to S3 no longer owns the row, and the worker
+         * that reclaimed it is the one entitled to say what happened.
+         *
+         * The claim is cleared with the settle, so a settled row carries
+         * no stale claimant.
          *
          * `RETURNING` is therefore the count that may be trusted: the
-         * caller reports the difference against the ids it asked for and
-         * counts only what it actually settled.
+         * caller reports the difference against the ids it asked for as
+         * `settled_elsewhere` and counts only what it actually settled.
          *
-         * Binds `:outcome`, `:catalogId` and the `:ids` array.
+         * Binds `:outcome`, `:catalogId`, `:worker` and the `:ids` array.
          */
         internal const val SETTLE_SQL: String =
             """
             UPDATE hog_file_removal
                SET drained_at = now(), drained_outcome = :outcome,
-                   last_attempt_at = now()
+                   last_attempt_at = now(), claimed_at = NULL, claimed_by = NULL
              WHERE catalog_id = :catalogId AND removal_id = ANY(:ids)
-               AND drained_at IS NULL
+               AND drained_at IS NULL AND claimed_by = :worker
             RETURNING removal_id
+            """
+
+        /**
+         * One page of the drained-ledger purge: the ids it reads through
+         * the primary key, and therefore the rows one DELETE may remove.
+         *
+         * 1,000 is the same order as a sub-batch, which is the only
+         * reference point that matters — the purge's cost per page is a
+         * key descent plus a heap page per row, so a page is a handful of
+         * milliseconds and a cancelled one costs a page.
+         */
+        const val LEDGER_PURGE_PAGE = 1000
+
+        /**
+         * Wall clock the drained-ledger purge may spend, per run. A pacing
+         * bound, not a correctness one: whatever it does not reach is the
+         * next run's, because the walk always restarts from the bottom of
+         * the key.
+         *
+         * THE NUMBER IT BUYS, honestly: a 1,000-row page is a
+         * `DELETE ... RETURNING` plus its WAL, order 5-15 ms warm, so one
+         * second is **roughly 70-200 pages, i.e. 70-200k rows** per run —
+         * not the "~1,000 pages" an earlier draft of this KDoc claimed. At
+         * a 30-minute interval that is 140-400k rows/h against ~190k/h of
+         * arrivals on prod-us: it keeps up, with little margin. The lever
+         * if it does not is the interval (which the drain-down shortens
+         * anyway) or `HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS`, which is
+         * what actually decides how large the drained ledger gets — at 30
+         * days and 190k/h it heads for ~137M rows, and bounding the
+         * STATEMENT did not bound the TABLE.
+         */
+        const val LEDGER_PURGE_BUDGET_MS = 1000L
+
+        /**
+         * Consecutive pages with nothing to purge before the walk gives up
+         * for this run.
+         *
+         * THE CAP IS ABOUT DAY ONE, not about wedges. The cursor restarts
+         * at the bottom of the primary key every run, and on a queue that
+         * is behind, the bottom is the UNDRAINED backlog — 2.6M rows on
+         * gigahog-prod-us, ~2,600 pages of nothing to purge. Uncapped, the
+         * walk spends the whole [LEDGER_PURGE_BUDGET_MS] on them every
+         * run and never reaches a purgeable row, at debug, for as long as
+         * the backlog stands.
+         *
+         * WHAT TEN CLEARS, AND WHAT IT DOES NOT, because the queue's rows
+         * arrive in ONE-STATEMENT BLOCKS and those blocks are the wedges
+         * that actually occur: a retirement batch queues
+         * `HOGLAKE_RETIREMENT_BATCH` paths (8,000 by default, ~8 pages) and
+         * an expiry sweep queues a whole floor advance's worth (tens of
+         * thousands — ~50 pages at 50,000). So ten pages walks past a
+         * retirement batch's block of undrained rows and does NOT walk past
+         * an expiry sweep's; the rows above a block that wide wait for the
+         * runs after it drains.
+         *
+         * That is a pacing choice, not a correctness one in either
+         * direction — the rows above any wedge are purged once it settles,
+         * and until then they sit inside a retention window that is 30 days
+         * wide — and a walk parked behind a block is VISIBLE rather than
+         * silent: the purge logs its stop reason at INFO whenever it
+         * examined pages and purged nothing. Raising the cap trades a
+         * longer walk per run for reaching past wider blocks; the wall
+         * budget bounds both.
+         */
+        const val LEDGER_PURGE_EMPTY_PAGES = 10
+
+        /**
+         * ONE PAGE of the drained-ledger purge: read up to `:page` ids
+         * above `:after` THROUGH THE PRIMARY KEY, delete those past the
+         * retention cutoff, and report what the page EXAMINED, how far it
+         * got, and what went.
+         *
+         * THREE NUMBERS BECAUSE THE CURSOR MOVES OVER WORK, NOT OVER
+         * DELETIONS. `examined` is what bounds the statement — the window
+         * is ordered and limited, so its row count is the page size
+         * whatever the ledger holds — `cursor_id` is the window's max id,
+         * so the next page is strictly new work even when this one deleted
+         * nothing, and `purged` is what actually went. The old single
+         * `DELETE ... WHERE drained_at < cutoff` could bound none of the
+         * three: every index on this table is partial on `drained_at IS
+         * NULL`, the complement of the rows it deletes, so the predicate
+         * had no access path at all and read the whole table.
+         *
+         * NO `catalog_id`, in the window or in the DELETE. In the window
+         * because there is no non-partial `(catalog_id, removal_id)` index,
+         * so filtering by catalog would make one page scan N pages' worth
+         * of tuples for a catalog holding 1/N of the table — the page would
+         * bound deletions and not work, which is the defect this shape
+         * fixes. In the DELETE for `CLAIM_BULK_SQL`'s reason: `removal_id`
+         * is the table's own `GENERATED ALWAYS AS IDENTITY PRIMARY KEY`, so
+         * it is globally unique and cannot name another catalog's row. A
+         * future composite key breaks both.
+         *
+         * `internal` so the plan test can EXPLAIN the statement production
+         * issues (`V21CleanupClaimMigrationIntegrationTest`): the property
+         * is an index scan on the key with the page as its bound, never a
+         * sequential scan, and nothing removed by a filter.
+         *
+         * Binds `:after`, `:page` and `:retention`.
+         */
+        internal const val PURGE_PAGE_SQL: String =
+            """
+            WITH page AS (
+                SELECT removal_id FROM hog_file_removal
+                 WHERE removal_id > :after
+                 ORDER BY removal_id
+                 LIMIT :page
+            ), gone AS (
+                DELETE FROM hog_file_removal
+                 WHERE removal_id IN (SELECT removal_id FROM page)
+                   AND drained_at < now() - make_interval(secs => :retention)
+                RETURNING removal_id
+            )
+            SELECT (SELECT count(*) FROM page)::int AS examined,
+                   coalesce((SELECT max(removal_id) FROM page), :after) AS cursor_id,
+                   (SELECT count(*) FROM gone)::int AS purged
             """
 
         /** Default drained-ledger retention: 30 days (HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS). */
