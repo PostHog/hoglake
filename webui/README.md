@@ -83,6 +83,40 @@ Notable surfaces beyond the catalog browser:
   name from `GET /v1/info` (`HOGLAKE_INSTANCE_NAME`), so you always
   know which deployment you're looking at; the health dot's tooltip
   explains the readiness semantics.
+- **Snapshot ids date themselves** (`src/components/SnapshotId.tsx`):
+  every snapshot id the console renders — head, the expiry floor, a
+  namespace listing's EARLIEST_SNAPSHOT, a file's `begin_snapshot`, a
+  partition's last writer, a consumer's committed offset, the timeline's
+  own ids — shows the commit time in UTC plus a relative age ("3 min
+  ago") on hover. The id keeps its digits: an identifier is never
+  humanized. There is no get-one-snapshot endpoint, so the lookup is
+  `GET /snapshots?after=<id-1>&limit=1`, and what comes back separates
+  three different answers: the id itself (dated), a LATER id (expired —
+  the floor has passed it), or nothing (not found, above head). Id `0` is
+  the never-committed sentinel — a fresh catalog's head, an un-expired
+  catalog's floor — so it is never probed and reads "no snapshot yet".
+  The tooltip opens, and the lookup fires, only after a short dwell — a
+  page can hold hundreds of ids, and sweeping a column must neither fire
+  one request per row nor leave a trail of boxes. Results are cached per
+  catalog+id, since snapshot times are immutable; callers that already
+  hold the instant (the timeline) pass it in, which both skips their own
+  request and seeds the cache for the same id elsewhere on the page.
+  Escape dismisses an open tooltip and the tooltip itself is hoverable
+  (WCAG 1.4.13).
+
+  **The tooltip is pointer-only: its commit time has no keyboard path.**
+  The trigger is not focusable and carries no `title`, so a keyboard or
+  screen-reader user cannot reach the time from an id at all. The only
+  non-pointer route to an exact commit instant in the console is the
+  catalog page's snapshot list, which prints `snapshot_time` as a column —
+  and that covers only catalog-level snapshots, only those within the page
+  of the list currently loaded; for a file's `begin_snapshot` or a table's
+  EARLIEST_SNAPSHOT there is no substitute. The trade is deliberate: a
+  listing of 200 tables would otherwise gain 200 tab stops that do
+  nothing but open a tooltip, interleaved with the page's real controls,
+  which is worse for the keyboard user it would be for. Making the time
+  reachable without a pointer needs its own affordance, not a focusable
+  value.
 
 Int64 wire fields (snapshot ids, row counts, sizes, row-id starts) are
 parsed **losslessly**: a raw-text reviver carries every

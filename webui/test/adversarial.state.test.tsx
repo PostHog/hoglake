@@ -39,7 +39,11 @@ describe("time-travel snapshot selector", () => {
     await user.type(screen.getByLabelText("snapshot id"), "9007199254740993");
     await user.click(screen.getByRole("button", { name: "Go" }));
 
-    await screen.findByText(/@ snapshot 9007199254740993/);
+    // The badge's id is a SnapshotId element, not a text node of the
+    // badge, so the >2^53 id is asserted on the badge's text content.
+    expect(await screen.findByText(/@ snapshot/)).toHaveTextContent(
+      /^@ snapshot 9007199254740993$/,
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       `${tBase}?snapshot=9007199254740993`,
       expect.anything(),

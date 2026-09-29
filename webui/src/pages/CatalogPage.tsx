@@ -18,6 +18,7 @@ import { ClampedText } from "../components/ClampedText";
 import { ErrorBox } from "../components/ErrorBox";
 import { formatSeconds } from "../components/maintenance";
 import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
+import { SnapshotId } from "../components/SnapshotId";
 import { ChangeBadge } from "../components/badges";
 import { formatTime } from "../lib/format";
 import { identifierError } from "../lib/names";
@@ -71,7 +72,9 @@ function CatalogHeader({ catalog }: { catalog: string }) {
       </div>
       <div>
         <dt>head_snapshot_id</dt>
-        <dd className="mono">{data.head_snapshot_id}</dd>
+        <dd className="mono">
+          <SnapshotId catalog={catalog} id={data.head_snapshot_id} />
+        </dd>
       </div>
       <div>
         <dt>schema_version</dt>
@@ -96,7 +99,13 @@ function CatalogHeader({ catalog }: { catalog: string }) {
       </div>
       <div>
         <dt>earliest_snapshot_id</dt>
-        <dd className="mono">{opts?.earliest_snapshot_id ?? "…"}</dd>
+        <dd className="mono">
+          {opts === undefined ? (
+            "…"
+          ) : (
+            <SnapshotId catalog={catalog} id={opts.earliest_snapshot_id} />
+          )}
+        </dd>
       </div>
     </dl>
   );
@@ -252,7 +261,16 @@ function SnapshotsPanel({ catalog }: { catalog: string }) {
             )}
             {snapshots.map((s) => (
               <tr key={s.snapshot_id}>
-                <td className="num mono">{s.snapshot_id}</td>
+                {/* The row already holds the commit time in the next
+                    column, so the tooltip is handed it rather than
+                    spending a request rediscovering it. */}
+                <td className="num mono">
+                  <SnapshotId
+                    catalog={catalog}
+                    id={s.snapshot_id}
+                    time={s.snapshot_time}
+                  />
+                </td>
                 <td className="mono">{formatTime(s.snapshot_time)}</td>
                 <td>{s.author ?? "—"}</td>
                 <td>

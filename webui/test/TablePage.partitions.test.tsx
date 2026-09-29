@@ -326,3 +326,64 @@ describe("TablePage partitions tab", () => {
     expect(decodeURIComponent(filesUrl)).toContain("partition=1:7");
   });
 });
+
+// The partitions tab carries two snapshot ids: the partition's last
+// writer, and the sample's own snapshot in the footer.
+describe("TablePage partitions snapshot id tooltips", () => {
+  const snapshotsPath = "/v1/catalogs/analytics/snapshots";
+
+  function tooltipHarness() {
+    const urls: string[] = [];
+    mockFetch((url) => {
+      urls.push(url);
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(tableFixture);
+      if (path === `${base}/partitions`)
+        return jsonResponse(partitionListingFixture);
+      if (path === `${base}/partitions/values`)
+        return jsonResponse(partitionValuesFixture);
+      if (path === snapshotsPath)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: url.includes("after=409") ? "410" : "412",
+              snapshot_time: url.includes("after=409")
+                ? "2026-09-12T03:00:00Z"
+                : "2026-09-12T04:00:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return undefined;
+    });
+    return urls;
+  }
+
+  it("dates last_written_snapshot and the footer's sample snapshot", async () => {
+    const urls = tooltipHarness();
+    const user = userEvent.setup();
+    renderApp(route);
+    await user.click(await screen.findByRole("tab", { name: "partitions" }));
+
+    const lastWritten = await screen.findByText("410");
+    expect(lastWritten).toHaveAttribute("data-snapshot-id", "410");
+    // Nothing dated until asked: a partitions page holds one id per row
+    // plus the footer's, and none of them is probed.
+    expect(urls.some((u) => u.split("?")[0] === snapshotsPath)).toBe(false);
+
+    await user.hover(lastWritten);
+    const rowInstant = await screen.findByText("2026-09-12 03:00:00Z");
+    expect(rowInstant.closest('[role="tooltip"]')).not.toBeNull();
+    await user.unhover(lastWritten);
+
+    // The footer's "at snapshot N" is the same component, inside prose.
+    const footer = screen.getByText(/partitions · sampled/);
+    expect(footer).toHaveTextContent("at snapshot 412");
+    const sampled = within(footer).getByText("412");
+    expect(sampled).toHaveAttribute("data-snapshot-id", "412");
+    await user.hover(sampled);
+    const footerInstant = await screen.findByText("2026-09-12 04:00:00Z");
+    expect(footerInstant.closest('[role="tooltip"]')).not.toBeNull();
+  });
+});

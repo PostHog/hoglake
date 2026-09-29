@@ -93,6 +93,36 @@ export const SCALAR_COLUMN_TYPES = [
 ] as const;
 
 /**
+ * The types whose values are WHOLE NUMBERS, and the only ones whose
+ * bounds may be digit-grouped for display.
+ *
+ * A decoded bound arrives as its exact raw token, so "626623" from a long
+ * and "626623" from a string column are the same characters — nothing in
+ * the VALUE can tell them apart, and grouping a string's bound would
+ * corrupt it. The column's declared type is the only sound test, which is
+ * why this list exists rather than a regexp at the call site. Floats and
+ * decimals stay out: their tokens carry fraction digits and a grouped
+ * "1,234.5" is a format nobody stores.
+ */
+export const INTEGER_COLUMN_TYPES = [
+  "int8",
+  "int16",
+  "int",
+  "long",
+  "uint8",
+  "uint16",
+  "uint32",
+  "uint64",
+] as const;
+
+export type IntegerColumnType = (typeof INTEGER_COLUMN_TYPES)[number];
+
+/** Whether `type` is one of the whole-number types. */
+export function isIntegerColumnType(type: string): type is IntegerColumnType {
+  return (INTEGER_COLUMN_TYPES as readonly string[]).includes(type);
+}
+
+/**
  * The container types. Readable everywhere (a table can have them), but
  * not creatable from the console — see SCALAR_COLUMN_TYPES.
  */

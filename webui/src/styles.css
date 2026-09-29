@@ -818,6 +818,78 @@ button.ghost:hover:not(:disabled) {
   word-break: break-word;
 }
 
+/* -- snapshot id + its tooltip -------------------------------------------- */
+
+/* The wrapper is only a positioning context for the tooltip, so it must
+   not change the cell's layout: inline, no padding, and the id inside it
+   keeps whatever mono/num class the cell already carried. */
+.snapshot-id {
+  position: relative;
+  display: inline-block;
+  white-space: nowrap;
+}
+/* A dotted underline is the web's oldest "this has more to say" mark, and
+   the only hint that fits in a column of digits without spending width.
+   --text-dim, not --border: a 1px dotted line in the border token is
+   ~1.4:1 on the dark ground and simply is not there, which for the mark
+   that exists to be FOUND is the wrong trade (the same mistake the files
+   table's expander was just fixed for). The colour never goes accent —
+   the id is data, not a link. Not focusable, so there is no focus state
+   to style; see the component comment. */
+.snapshot-id-value {
+  border-bottom: 1px dotted var(--text-dim);
+  cursor: help;
+}
+.snapshot-id-value:hover {
+  border-bottom-color: var(--text);
+}
+/* Above the id, not below: these sit in table rows and a tooltip that
+   opens downward covers the next row's value — the one thing a reader
+   scanning a column is comparing against. Free to be wider than the
+   column (it is two lines), and hoverable: the pointer may cross into it
+   to read or select the instant (WCAG 1.4.13), which the component's
+   close delay is what makes survivable.
+
+   A raised surface here is a border in the border token, like every other
+   raised surface in this file — not a box-shadow, which would be the only
+   one in the stylesheet and could not be written without hardcoding a
+   colour this file's header forbids. */
+.snapshot-tooltip {
+  position: absolute;
+  bottom: 100%;
+  left: 0;
+  z-index: 20;
+  margin-bottom: 4px;
+  padding: 5px 8px;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  font-weight: normal;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--text);
+}
+/* Anchored to the id's RIGHT edge when the id sits in the right half of
+   the viewport — the files table's begin_snapshot is its last column, and
+   a left-anchored nowrap box there pushes the document wider and raises a
+   horizontal scrollbar on hover. */
+.snapshot-tooltip-right {
+  left: auto;
+  right: 0;
+}
+/* Two lines: the exact instant, then the age. The instant leads because
+   it is the fact; the age is the reading of it. */
+.snapshot-tooltip-time {
+  display: block;
+}
+.snapshot-tooltip-age {
+  display: block;
+  color: var(--text-dim);
+}
+
 /* -- partition filter bar (files tab) -------------------------------------- */
 
 .partition-filter {
@@ -1018,27 +1090,64 @@ button.ghost:hover:not(:disabled) {
 /* -- per-file stats expansion (Files tab) --------------------------------- */
 
 /* Neutral expander, like theme-toggle: must not pick up the accent
-   button look inside a table cell. */
+   button look inside a table cell. It was a 13px glyph with no box and
+   people missed it, so it is now a real 24x24 target — the smallest
+   square anyone recommends for a pointer — with a hover/focus background
+   that says so. Neutral still: it appears on every row of the files
+   table, and an accent chip per row would read as the page's main
+   action. */
 button.expand-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   background: transparent;
   border: none;
+  border-radius: 4px;
   color: var(--text-dim);
   font: inherit;
-  padding: 0 4px;
+  padding: 0;
   cursor: pointer;
 }
 button.expand-toggle:hover {
   color: var(--text);
+  background: var(--bg-hover);
+}
+/* Keyboard users get the same visible box as the pointer does. */
+button.expand-toggle:focus-visible {
+  color: var(--text);
+  background: var(--bg-hover);
+  outline: 1px solid var(--accent);
+}
+/* The mark is rotated, never swapped: one glyph through both states, so
+   the transition is a movement and the metrics cannot change under it. */
+.expand-chevron {
+  display: block;
+  font-size: 16px;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+button.expand-toggle[aria-expanded="true"] .expand-chevron {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .expand-chevron {
+    transition: none;
+  }
 }
 /* The stats marker that replaces the state pill in the files table: a
-   filled circle where there is nothing to expand. Sized to sit on the
-   same baseline as the ▸ triangle it stands in for, so the column does
-   not jump between rows. Cursor stays default — it is not a control. */
+   filled circle where there is nothing to expand. Sized to the SAME
+   24x24 box as the expander it stands in for, so the column does not
+   jump between rows. Cursor stays default — it is not a control. */
 .stats-marker {
-  display: inline-block;
-  padding: 0 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
   font-size: 11px;
-  line-height: inherit;
+  line-height: 1;
 }
 
 .detail-row > td {
