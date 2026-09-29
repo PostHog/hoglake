@@ -17,6 +17,7 @@ import type {
   MaintenanceStatus,
   MaintenanceTask,
   Namespace,
+  PartitionListing,
   PartitionStatsResponse,
   PartitionValues,
   ScanFile,
@@ -215,6 +216,54 @@ export function getPartitionValues(
       { snapshot },
     ),
   );
+}
+
+/**
+ * The table's partitions as the maintenance sampler last measured them.
+ *
+ * No `snapshot`: the sample is at one snapshot and the response names
+ * it. `filter` is repeatable (`key_index:text`) and matches the DECODED
+ * value by prefix, which is why it is appended by hand rather than
+ * through buildUrl's single-valued params — the same reason listFiles
+ * appends `partition`.
+ */
+export function listTablePartitions(
+  catalog: string,
+  namespace: string,
+  table: string,
+  opts?: {
+    sort?: string;
+    order?: "asc" | "desc";
+    limit?: number;
+    offset?: number;
+    /**
+     * key_index -> a case-insensitive PREFIX of the decoded value.
+     *
+     * An empty string is NOT "unfiltered": the server reads it as the
+     * deliberate null-value selector, so a caller must drop cleared
+     * entries before passing this map (PartitionsTab's debounce does,
+     * and its separate "is null" toggle is the only thing that sends
+     * one). Passing a cleared box straight through selected the null
+     * partitions and emptied the table.
+     */
+    filter?: Record<number, string>;
+  },
+): Promise<PartitionListing> {
+  const base = buildUrl(
+    `/catalogs/${seg(catalog)}/namespaces/${seg(namespace)}/tables/${seg(table)}/partitions`,
+    {
+      sort: opts?.sort,
+      order: opts?.order,
+      limit: opts?.limit,
+      offset: opts?.offset,
+    },
+  );
+  const extra = new URLSearchParams();
+  for (const [keyIndex, text] of Object.entries(opts?.filter ?? {})) {
+    extra.append("filter", `${keyIndex}:${text}`);
+  }
+  const qs = extra.toString();
+  return request(qs ? `${base}${base.includes("?") ? "&" : "?"}${qs}` : base);
 }
 
 export function getFileStats(
