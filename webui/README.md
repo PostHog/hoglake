@@ -1,7 +1,7 @@
 # hoglake webui
 
 Management console for the hoglake control plane: catalogs, namespaces,
-tables (schema / files / scan with time travel), the snapshot timeline
+tables (schema / files / scan / partitions, with time travel), the snapshot timeline
 (newest-first, paged down from head via the `before` cursor), consumer
 offsets, a per-catalog compaction-debt view, maintenance views (a
 central catalog × task matrix + per-catalog task pages), and a server
@@ -29,6 +29,24 @@ Notable surfaces beyond the catalog browser:
 - **Metrics** (`/metrics` route): one snapshot of the server's
   Prometheus endpoint rendered visually — stat tiles, per-label bars,
   histogram bucket strips. Manual refresh only, no polling.
+- **Partitions** (the table page's `partitions` tab): one row per
+  partition of one table — files, small files, actionable debt, total
+  and average size, deletion vectors, rows, and the snapshot that last
+  wrote to it — with a filter box per partition key (matching the
+  DECODED value by prefix, so `2026-09` finds every day of that month)
+  and a link from each row into the files tab filtered to it. Each key
+  also carries an explicit "is null" toggle, because the null partition
+  value has no text to prefix-match and an empty box means unfiltered.
+  THE NUMBERS ARE A SAMPLE, not a live read: they come from the
+  maintenance sampler's last published generation, at the snapshot the
+  footer names, which is why the tab costs no manifest walk and no lock
+  and why it ignores the page's snapshot selector. The footer's age is
+  the scan's START, not its publish — a generation runs for tens of
+  minutes and the numbers are as old as its first page. A partition written
+  since that sample shows its old numbers, or none at all; a catalog
+  the sampler has not published for yet says so instead of showing
+  zeroes. Rows and last-written are blank rather than 0 on a sample
+  taken before the server measured them.
 - **Compaction debt** (`/catalogs/:catalog/partitions`): leaf
   partitions ranked by `debt_score` (files the planner would bin-pack
   into a group; excludes groups under their minimum), with small-file

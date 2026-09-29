@@ -63,6 +63,10 @@ const INT64_FIELDS = new Set([
   "avg_file_bytes",
   "dv_count",
   "debt_score",
+  // per-table partitions listing (GET .../tables/{t}/partitions). The
+  // rest of its int64 fields reuse names already above (file_count,
+  // record_count, total_bytes, ...); this one is its own.
+  "last_written_snapshot",
   // maintenance status + run ledger (GET /maintenance/status, /runs). The
   // result payloads inherit the POST result schemas' int64 fields.
   "run_id",

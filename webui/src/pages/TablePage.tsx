@@ -1,7 +1,14 @@
-import { Fragment, useState } from "react";
-import { useParams, useSearchParams } from "react-router-dom";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
-import { getFileStats, getPartitionValues, getTable, listFiles, planScan } from "../api/client";
+import {
+  getFileStats,
+  getPartitionValues,
+  getTable,
+  listFiles,
+  listTablePartitions,
+  planScan,
+} from "../api/client";
 import { isInt64String } from "../api/int64";
 import { formatColumnType } from "../api/types";
 import type {
@@ -9,7 +16,10 @@ import type {
   DataFile,
   DecodedBound,
   Int64,
+  PartitionGroup,
+  PartitionListing,
   PartitionSpec,
+  PartitionSpecSummary,
   PartitionValues,
   ScanFile,
   SortField,
@@ -25,6 +35,7 @@ import { CopyButton } from "../components/CopyButton";
 import { decodePartition, decodeValue, type PartitionDecode } from "../lib/partitions";
 import {
   columnPath,
+  formatAge,
   formatBytes,
   formatCount,
   formatPartitionField,
@@ -33,7 +44,7 @@ import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
 import { SortableTh } from "../components/SortableTh";
 
-const TABS = ["schema", "files", "scan"] as const;
+const TABS = ["schema", "files", "scan", "partitions"] as const;
 type Tab = (typeof TABS)[number];
 
 /**
@@ -785,6 +796,8 @@ function FilesTab({
   spec,
   sortSpec,
   columns,
+  initialFilter,
+  onInitialFilterConsumed,
 }: {
   catalog: string;
   namespace: string;
@@ -793,6 +806,25 @@ function FilesTab({
   spec?: PartitionSpec;
   sortSpec?: SortSpec;
   columns?: Column[];
+  /**
+   * `partition=key_index:value` params the URL arrived with — how the
+   * partitions tab hands a row over. Seeds this tab's own state once,
+   * after which the dropdowns own the filter. The PAGE decides whether
+   * to hand them over (it passes undefined once they have been spent),
+   * so a remount cannot re-seed from params the user has since
+   * filtered away from; the params themselves stay on the URL, which
+   * is what keeps the filtered view shareable.
+   */
+  initialFilter?: Record<number, string>;
+  /**
+   * Called once, on mount, when [initialFilter] was non-empty: the URL
+   * params have been taken into this tab's own state, and the page
+   * must not hand them over again on a later remount — otherwise any
+   * tab switch resurrects the partition the user has since changed
+   * away from. The params stay on the URL so the view is shareable;
+   * the PAGE remembers that they have been spent.
+   */
+  onInitialFilterConsumed?: () => void;
 }) {
   const [expanded, setExpanded] = useState<Int64 | null>(null);
   // null = the server's default order (manifest: begin_snapshot,
@@ -804,7 +836,17 @@ function FilesTab({
   // The active partition filter: key_index → the stored value to match.
   // One value per key; a key set to "" is unfiltered. Changing it refetches
   // from offset 0 via the query key.
-  const [partitionFilter, setPartitionFilter] = useState<Record<number, string>>({});
+  const [partitionFilter, setPartitionFilter] = useState<Record<number, string>>(
+    initialFilter ?? {},
+  );
+  // READ ONCE. The empty dependency list is the whole point: the URL
+  // seeds the dropdowns on arrival and the page then marks the params
+  // SPENT (they stay on the URL, so the view is still addressable), so
+  // this tab's own state is the only filter that moves afterwards.
+  useEffect(() => {
+    if (Object.keys(initialFilter ?? {}).length > 0) onInitialFilterConsumed?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // The dropdown options, from the server. Only fetched for a partitioned
   // table; the values are stored strings, echoed back verbatim on apply.
   const valuesQuery = useQuery({
@@ -1078,6 +1120,384 @@ function ScanTab({
   );
 }
 
+/**
+ * The columns the partitions listing can be sorted by, and the
+ * direction each one starts in. `partition` reads ascending, every
+ * measure descending: a measure column is clicked to find the biggest.
+ * The wire names ARE these keys (the server's SortColumn), so there is
+ * no mapping table to drift.
+ */
+type PartitionSortKey =
+  | "partition"
+  | "files"
+  | "small_files"
+  | "debt"
+  | "total_size"
+  | "avg_size"
+  | "dvs"
+  | "rows"
+  | "last_written";
+
+const PARTITION_SORT_DESC_DEFAULT: Record<PartitionSortKey, boolean> = {
+  partition: false,
+  files: true,
+  small_files: true,
+  debt: true,
+  total_size: true,
+  avg_size: true,
+  dvs: true,
+  rows: true,
+  last_written: true,
+};
+
+/** Partitions shown per page; "Load more" walks offsets in the current sort. */
+const PARTITION_PAGE_SIZE = 100;
+
+/**
+ * How long typing settles before the filter is sent. Long enough that a
+ * typed month is one request rather than seven, short enough that the
+ * table does not feel detached from the box.
+ */
+const FILTER_DEBOUNCE_MS = 250;
+
+/**
+ * The partitions tab.
+ *
+ * WHAT IT SHOWS AND WHAT IT DOES NOT: every number here is the
+ * maintenance sampler's, at the snapshot the footer names, not at head.
+ * That is what makes the tab free — the server reads the sampler's
+ * output instead of walking the manifest — and it is also why the tab
+ * ignores the page's snapshot selector: there is exactly one snapshot
+ * the sample can answer at, so honouring `?snapshot=` would be a
+ * time-travel control that silently did nothing.
+ *
+ * Sorting, filtering and paging are all the SERVER's. The listing is
+ * paged, so a client-side sort would order the loaded page only, which
+ * is the misleading case `lib/sort` warns about; and the filter matches
+ * the DECODED value (the server decodes for exactly this reason), so
+ * `2026-09` finds every day of that month.
+ */
+function PartitionsTab({
+  catalog,
+  namespace,
+  table,
+  onOpenFiles,
+}: {
+  catalog: string;
+  namespace: string;
+  table: string;
+  /** Switch to the files tab with this partition's stored values applied. */
+  onOpenFiles: (group: PartitionGroup) => string;
+}) {
+  const [sort, setSort] = useState<SortState<PartitionSortKey>>({
+    key: "partition",
+    desc: false,
+  });
+  // What the inputs hold, and what the last debounce committed. Two
+  // states on purpose: typing must not fire a request per keystroke,
+  // and the committed map is what the query key is built from, so a
+  // re-render while typing does not refetch.
+  const [draft, setDraft] = useState<Record<number, string>>({});
+  // Keys whose "is null" toggle is on. SEPARATE from `draft`, because
+  // the wire form of "the null value" is an EMPTY filter text — and an
+  // empty text box means "unfiltered" to every user who has ever used
+  // one. Overloading the two made clearing a box silently select the
+  // null partitions and empty the table, with no way back.
+  const [nullOnly, setNullOnly] = useState<Record<number, boolean>>({});
+  const [filter, setFilter] = useState<Record<number, string>>({});
+  useEffect(() => {
+    const id = setTimeout(
+      () =>
+        setFilter({
+          // Empty entries are dropped, exactly as FilesTab does with
+          // its dropdowns: a cleared box is no filter at all. The only
+          // way to send `key:` is the toggle, which is explicit.
+          ...Object.fromEntries(Object.entries(draft).filter(([, v]) => v !== "")),
+          ...Object.fromEntries(
+            Object.entries(nullOnly)
+              .filter(([, on]) => on)
+              .map(([k]) => [k, ""]),
+          ),
+        }),
+      FILTER_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(id);
+  }, [draft, nullOnly]);
+
+  const query = useInfiniteQuery({
+    queryKey: ["partitions", catalog, namespace, table, sort, filter],
+    queryFn: ({ pageParam }) =>
+      listTablePartitions(catalog, namespace, table, {
+        sort: sort.key,
+        order: sort.desc ? "desc" : "asc",
+        limit: PARTITION_PAGE_SIZE,
+        offset: pageParam,
+        filter,
+      }),
+    initialPageParam: 0,
+    // KEEP THE LAST PAGE WHILE A NEW FILTER OR SORT LOADS. Without it
+    // `query.data` goes undefined on every key change, which blanks the
+    // spec this component builds its filter boxes from — so typing into
+    // a box unmounted the box mid-keystroke. It also stops the table
+    // flashing to a skeleton on each debounce.
+    placeholderData: (previous) => previous,
+    // `total` is the server's count of the whole match, so has-more is
+    // exact — no empty last page, unlike the files tab's length probe.
+    getNextPageParam: (lastPage, allPages) => {
+      const loaded = allPages.reduce((n, p) => n + p.partitions.length, 0);
+      return loaded < lastPage.total ? loaded : undefined;
+    },
+  });
+  const first = query.data?.pages[0];
+  const spec = first?.spec;
+  // `placeholderData` keeps the previous pages while a new key loads,
+  // so `spec` survives a filter change; on an ERROR react-query drops
+  // to `data: undefined`, which would take the filter bar with it.
+  const lastSpec = useRef<PartitionSpecSummary | undefined>(undefined);
+  if (spec !== undefined) lastSpec.current = spec;
+  const filterFields = (spec ?? lastSpec.current)?.fields ?? [];
+  const rows = (query.data?.pages ?? []).flatMap((p) => p.partitions);
+  const keyCount = filterFields.length;
+  // partition, files, small, debt, total, avg, dvs, rows, last written.
+  const cols = 9;
+  const onSort = (key: PartitionSortKey) =>
+    setSort((prev) =>
+      prev.key === key
+        ? { key, desc: !prev.desc }
+        : { key, desc: PARTITION_SORT_DESC_DEFAULT[key] },
+    );
+
+  // The spec, and therefore the filter bar, survives an error: a 422
+  // from an out-of-range key_index must leave the inputs that produced
+  // it on screen, or the only recoverable error on this tab is
+  // unrecoverable. `filterFields` falls back to the last spec seen.
+  return (
+    <>
+      {keyCount > 0 && (
+        <div className="partition-filter">
+          {filterFields.map((field, keyIndex) => (
+            <label key={keyIndex} className="partition-filter-field">
+              {field.field}
+              <input
+                value={draft[keyIndex] ?? ""}
+                placeholder="prefix"
+                disabled={nullOnly[keyIndex] === true}
+                aria-label={`filter by ${field.field}`}
+                onChange={(e) =>
+                  setDraft((prev) => ({ ...prev, [keyIndex]: e.target.value }))
+                }
+              />
+              {/* The null partition value has no text to prefix-match,
+                  so it needs its own control. It replaces the prefix
+                  rather than combining with it, which is why the box
+                  goes disabled. */}
+              <span className="partition-filter-null">
+                <input
+                  type="checkbox"
+                  checked={nullOnly[keyIndex] === true}
+                  aria-label={`${field.field} is null`}
+                  onChange={(e) =>
+                    setNullOnly((prev) => ({ ...prev, [keyIndex]: e.target.checked }))
+                  }
+                />
+                is null
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+      {query.isError && <ErrorBox error={query.error} />}
+      <table className="data-table">
+        <thead>
+          <tr>
+            <SortableTh
+              label="partition"
+              sortKey="partition"
+              sort={sort}
+              onSort={onSort}
+              tooltip="Decoded partition values, in key order. Sorted server-side by the decoded tuple, nulls first."
+            />
+            <SortableTh label="files" sortKey="files" sort={sort} onSort={onSort} numeric />
+            <SortableTh
+              label="small files"
+              sortKey="small_files"
+              sort={sort}
+              onSort={onSort}
+              numeric
+              tooltip="Files strictly under the compaction target size."
+            />
+            <SortableTh
+              label="debt"
+              sortKey="debt"
+              sort={sort}
+              onSort={onSort}
+              numeric
+              tooltip="Files the compaction planner would actually group — actionable debt, not just small files."
+            />
+            <SortableTh
+              label="total size"
+              sortKey="total_size"
+              sort={sort}
+              onSort={onSort}
+              numeric
+            />
+            <SortableTh label="avg size" sortKey="avg_size" sort={sort} onSort={onSort} numeric />
+            <SortableTh label="DVs" sortKey="dvs" sort={sort} onSort={onSort} numeric />
+            <SortableTh
+              label="rows"
+              sortKey="rows"
+              sort={sort}
+              onSort={onSort}
+              numeric
+              tooltip="Rows in the partition. Blank when the published sample predates the server measuring them — not zero."
+            />
+            <SortableTh
+              label="last written"
+              sortKey="last_written"
+              sort={sort}
+              onSort={onSort}
+              numeric
+              tooltip="The newest snapshot that wrote a file into this partition."
+            />
+          </tr>
+        </thead>
+        {query.isPending ? (
+          <SkeletonRows rows={5} cols={cols} />
+        ) : (
+          <tbody>
+            {rows.length === 0 && (
+              <tr>
+                <td colSpan={cols} className="empty">
+                  {query.isError
+                    ? "The request above failed."
+                    : first?.sampled_at === null
+                      ? "No sample yet."
+                      : "No partitions match this filter."}
+                </td>
+              </tr>
+            )}
+            {rows.map((p, i) => (
+              <tr key={i}>
+                <td className="partition-cell">
+                  {/* The link carries the STORED values, which is what
+                      the files listing matches on — the decoded form is
+                      for the reader, never for the wire. */}
+                  <Link to={onOpenFiles(p)}>
+                    {p.values.length === 0 ? (
+                      <span className="subtle">unpartitioned</span>
+                    ) : (
+                      p.values.map((v, j) => (
+                        <span key={j} className="partition-part">
+                          {j > 0 && <span className="partition-sep"> / </span>}
+                          <span className="partition-field">{v.field}</span>
+                          <span className="partition-eq">=</span>
+                          <span className="mono partition-value">
+                            {v.decoded ?? "null"}
+                          </span>
+                        </span>
+                      ))
+                    )}
+                  </Link>{" "}
+                  {spec !== undefined && String(p.spec_id) !== String(spec.spec_id) && (
+                    <span
+                      className="badge badge-warn"
+                      title="Written under an older partition spec than the table's current one."
+                    >
+                      spec {p.spec_id === undefined ? "none" : String(p.spec_id)}
+                    </span>
+                  )}
+                </td>
+                <td className="num mono">{formatCount(p.file_count)}</td>
+                <td className="num mono">{formatCount(p.small_file_count)}</td>
+                <td className="num mono">{formatCount(p.debt_score)}</td>
+                <td className="num mono" title={`${p.total_bytes}`}>
+                  {formatBytes(p.total_bytes)}
+                </td>
+                <td className="num mono" title={`${p.avg_file_bytes}`}>
+                  {formatBytes(p.avg_file_bytes)}
+                </td>
+                <td className="num mono">{formatCount(p.dv_count)}</td>
+                {/* An em dash, not 0: the sample never measured this. */}
+                <td className="num mono">
+                  {p.record_count === null ? (
+                    <span className="subtle" title="Not measured by this sample">
+                      —
+                    </span>
+                  ) : (
+                    formatCount(p.record_count)
+                  )}
+                </td>
+                <td className="num mono">
+                  {p.last_written_snapshot === null ? (
+                    <span className="subtle" title="Not measured by this sample">
+                      —
+                    </span>
+                  ) : (
+                    p.last_written_snapshot
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        )}
+      </table>
+      {query.hasNextPage && (
+        <button
+          type="button"
+          disabled={query.isFetchingNextPage}
+          onClick={() => void query.fetchNextPage()}
+        >
+          {query.isFetchingNextPage ? "Loading…" : "Load more"}
+        </button>
+      )}
+      {first !== undefined && (
+        // WHILE A REFETCH IS IN FLIGHT the rows on screen are the
+        // previous filter's (placeholderData), so the counts beside
+        // them are the previous filter's too. Say "loading" rather
+        // than a number that belongs to a page the user has moved off.
+        <PartitionsFooter listing={first} stale={query.isFetching} />
+      )}
+    </>
+  );
+}
+
+/**
+ * What the numbers above are, in one line: how many, how old, and how
+ * many belong to a spec the table has since replaced. The freshness is
+ * not decoration — every measure on the page is as old as this says.
+ */
+function PartitionsFooter({
+  listing,
+  stale,
+}: {
+  listing: PartitionListing;
+  stale?: boolean;
+}) {
+  if (stale) return <p className="subtle">Loading partitions…</p>;
+  if (listing.sampled_at === null) {
+    return (
+      <p className="subtle">
+        No sample yet; the maintenance sampler has not published for this catalog.
+      </p>
+    );
+  }
+  return (
+    <p
+      className="subtle"
+      // Both timestamps, because the gap between them IS the sample: a
+      // generation runs for tens of minutes and the numbers are as old
+      // as its START, not as its publish.
+      title={`scan started ${listing.sample_started ?? "?"}, published ${listing.sampled_at}`}
+    >
+      {formatCount(listing.total)} partitions · sampled{" "}
+      {formatAge(listing.sample_started ?? listing.sampled_at)} ago at snapshot{" "}
+      {listing.sampled_snapshot_id}
+      {listing.stale_spec_groups > 0 &&
+        ` · ${listing.stale_spec_groups} under an older spec`}
+    </p>
+  );
+}
+
 export function TablePage() {
   const { catalog, namespace, table } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -1100,6 +1520,49 @@ export function TablePage() {
     enabled,
   });
   if (!catalog || !namespace || !table) return null;
+
+  /**
+   * `?partition=key_index:value` on the URL, as a filter map. This is
+   * how the partitions tab hands a row to the files tab: the link
+   * carries the STORED values, which is what the files listing matches
+   * on, and the files tab seeds its dropdowns from them.
+   */
+  const urlPartitionFilter: Record<number, string> = Object.fromEntries(
+    searchParams
+      .getAll("partition")
+      .map((p) => p.split(":"))
+      .filter((parts) => parts.length >= 2 && /^\d+$/.test(parts[0]))
+      .map((parts) => [Number(parts[0]), parts.slice(1).join(":")]),
+  );
+
+  /**
+   * The files tab, filtered to one partition. The snapshot rides along
+   * so a time-travelled page stays where it was; the partition values
+   * are the stored ones, never the decoded display form.
+   */
+  const filesHref = (group: PartitionGroup): string => {
+    const next = new URLSearchParams();
+    next.set("tab", "files");
+    if (snapshot !== undefined) next.set("snapshot", snapshot);
+    group.values.forEach((v, keyIndex) => {
+      if (v.raw !== null) next.append("partition", `${keyIndex}:${v.raw}`);
+    });
+    return `?${next.toString()}`;
+  };
+
+  /**
+   * Whether the URL's `partition=` params have already seeded the files
+   * tab in this page's lifetime.
+   *
+   * A REF, and it lives HERE rather than in FilesTab, because FilesTab
+   * unmounts on every tab switch while this component does not — so a
+   * flag inside it would reset and re-seed from a URL the user has
+   * since filtered away from (the round-2 finding). The params
+   * THEMSELVES stay on the URL: erasing them made the filtered files
+   * view unaddressable, and `tab`/`snapshot` set the convention that
+   * the URL is the state.
+   */
+  const partitionFilterSeeded = useRef(false);
 
   const setParam = (key: string, value: string | undefined) => {
     setSearchParams(
@@ -1155,6 +1618,12 @@ export function TablePage() {
           namespace={namespace}
           table={table}
           snapshot={snapshot}
+          initialFilter={
+            partitionFilterSeeded.current ? undefined : urlPartitionFilter
+          }
+          onInitialFilterConsumed={() => {
+            partitionFilterSeeded.current = true;
+          }}
           /* The spec the tuples decode against. Already fetched for the
              schema tab, so this is a prop rather than a second request;
              undefined while it loads, which reads as "not yet decodable"
@@ -1173,6 +1642,14 @@ export function TablePage() {
           namespace={namespace}
           table={table}
           snapshot={snapshot}
+        />
+      )}
+      {tab === "partitions" && (
+        <PartitionsTab
+          catalog={catalog}
+          namespace={namespace}
+          table={table}
+          onOpenFiles={filesHref}
         />
       )}
     </section>

@@ -659,7 +659,7 @@ internal fun ApplicationCall.catalog() = pathParam("catalog")
 
 internal fun ApplicationCall.namespace() = pathParam("namespace")
 
-private fun ApplicationCall.table() = pathParam("table")
+internal fun ApplicationCall.table() = pathParam("table")
 
 private fun ApplicationCall.consumer() = pathParam("consumer")
 
@@ -689,7 +689,7 @@ internal fun parseLongQuery(
     raw: String,
 ): Long = raw.toLongOrNull() ?: throw BadRequestException("query parameter '$name' must be an integer")
 
-private fun ApplicationCall.intQuery(name: String): Int? =
+internal fun ApplicationCall.intQuery(name: String): Int? =
     request.queryParameters[name]?.let {
         it.toIntOrNull()
             ?: throw BadRequestException("query parameter '$name' must be an integer, got '$it'")

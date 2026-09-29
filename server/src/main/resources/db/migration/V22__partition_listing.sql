@@ -1,0 +1,176 @@
+-- THE PARTITIONS TAB's data source: two measures the sampler already
+-- reads but threw away, and the access path the per-table listing needs.
+--
+-- `GET .../tables/{table}/partitions` answers "what partitions does this
+-- table have, how big are they, how stale are they" from the maintenance
+-- SAMPLE rather than from the manifest. No per-request scan, no lock, no
+-- per-commit work — the sampler has already walked every file once per
+-- generation, so the listing is a read of `hog_maintenance_summary_tier`
+-- restricted to one table.
+--
+-- ============================================================
+-- 1. hog_maintenance_summary_tier.record_count
+-- 2. hog_maintenance_summary_tier.newest_begin_snapshot
+-- ============================================================
+--
+-- The sampler's per-bucket accumulator already sums bytes and counts
+-- files; it reads `hog_data_file` rows that carry `record_count` and
+-- `begin_snapshot` in the same page. Summing the first and taking the
+-- max of the second costs nothing extra on the scan and gives the tab
+-- its "rows" and "last written" columns.
+--
+-- Both are metadata-only (a NOT NULL with a constant DEFAULT is
+-- catalog-only since PG 11; the nullable one never was a rewrite) and
+-- both are still ACCESS EXCLUSIVE, so they sit inside the window like
+-- every other ALTER TABLE — `MigrationLockWindowTest` reads this file
+-- off disk and enforces it.
+--
+-- `record_count` defaults to 0 and `newest_begin_snapshot` to NULL, and
+-- THE DIFFERENCE IS THE CONTRACT. A bucket with files always has a begin
+-- snapshot, so a null `newest_begin_snapshot` beside a positive
+-- `file_count` is a row no V22 sampler wrote: the API reports its
+-- `record_count` as NULL rather than as the column default 0, because
+-- "not sampled" and "no rows" are different answers.
+--
+-- THAT PER-ROW TEST IS NOT ENOUGH ON ITS OWN, which is what
+-- `hog_maintenance_summary.measures_generation` below is for. A
+-- generation that STRADDLES the deploy — begun by a pre-V22 replica,
+-- finished by a V22 one — leaves buckets whose accumulation restarted
+-- from the column defaults partway through the scan: a non-null
+-- `newest_begin_snapshot` beside an UNDERCOUNTED `record_count`, which
+-- the per-row test would bless as fact. So the two measures are
+-- generation-scoped: they are reported only when the sampler that BEGAN
+-- the published generation was V22-aware.
+--
+-- ============================================================
+-- 3. hog_maintenance_summary.measures_generation
+-- ============================================================
+--
+-- The last generation PUBLISHED by a V22-aware sampler. Stamped by the
+-- PUBLISH statement, from a flag the scan carries in `scan_state`
+-- (`Scan.measures`, false by default so a checkpoint written by an
+-- older build resumes as unmeasured). `measures_generation =
+-- published_generation` is exactly "every bucket of the published
+-- generation was accumulated by code that knew about these two
+-- columns"; the listing reports `record_count` and
+-- `last_written_snapshot` as null for the whole generation when it is
+-- not.
+--
+-- STAMPED AT PUBLISH, NOT AT `begin()`, and the difference is the
+-- endpoint working at all. A marker naming the generation being
+-- SCANNED disagrees with `published_generation` from the moment the
+-- next scan starts — 60 s after a publish — until that scan finishes,
+-- which on a production catalog is a ~30-minute generation and so ~97%
+-- of wall-clock time with both measures blanked. Stamped at publish it
+-- names something a reader can actually see.
+--
+-- Default -1 rather than 0, because 0 is a real generation: a catalog
+-- discovered but never sampled sits at `generation = 0`, and a 0 default
+-- would claim its (nonexistent) sample was V22-measured.
+--
+-- THE OTHER DIRECTION IS NOT COVERED, and it is worth saying so. A
+-- generation a V22 replica BEGINS and a pre-V22 replica then continues
+-- and publishes carries `Scan.measures = true` in its checkpoint, so
+-- the old code's publish... does not stamp anything, because the old
+-- code has no such statement — the marker stays behind
+-- `published_generation` and the generation reads unmeasured. That is
+-- the safe direction. What is genuinely uncovered is the reverse
+-- mixture WITHIN a V22-published generation: an old replica's
+-- `INSERT ... ON CONFLICT DO UPDATE` names neither new column, so a
+-- bucket it touched keeps a stale `record_count` while `file_count`
+-- grows, and the V22 replica that finishes and publishes the
+-- generation stamps the marker over it. With one maintenance replica
+-- and `FOR UPDATE SKIP LOCKED` the window is the overlap of the
+-- terminating pod's last batch with the new pod's first, for one
+-- generation, and it self-heals on the next publish. Closing it would
+-- need the OLD code to clear the flag, which by definition it cannot.
+--
+-- A ROLLBACK is safe for the same reason, by a different route: a
+-- pre-V22 build reading a checkpoint this one wrote hits the unknown
+-- `measures` property, its strict mapper throws, and the sampler's
+-- `runCatching` around `scan_state` DISCARDS the checkpoint and starts
+-- a fresh generation (the documented behaviour for a shape it cannot
+-- parse). One generation of scan work is lost; nothing is corrupted,
+-- and the two new columns simply stop advancing until the next V22
+-- deploy re-earns them.
+--
+-- DEPLOY NOTE FOR THIS ALTER, which is the one statement in this file
+-- that touches a table written every second. `hog_maintenance_summary`
+-- holds ONE ROW PER CATALOG — the sampler's checkpoint — and the
+-- sampler `UPDATE`s it on every tick (`HOGLAKE_MAINTENANCE_SUMMARY_*`
+-- interval, 1 s by default), taking ROW EXCLUSIVE; `/maintenance/status`
+-- and `/stats/partitions` read it on the request path under ACCESS
+-- SHARE. The ADD COLUMN needs ACCESS EXCLUSIVE and so waits on the
+-- sampler's in-flight BATCH transaction, not on a 1 s tick — a tick
+-- that is paging 10,000 manifest rows with a per-row DV probe. That
+-- wait is bounded by this file's `SET LOCAL lock_timeout = '5s'`, which
+-- rolls the migration back cleanly and crash-loops the pod until a
+-- batch fits inside the window. A deploy that appears to hang here
+-- means a long sampler batch, not a broken migration; lower
+-- `HOGLAKE_MAINTENANCE_SUMMARY_BATCH` or pause the loop to land it.
+--
+-- ============================================================
+-- 4. hog_maintenance_summary_tier_table
+-- ============================================================
+--
+-- The listing's one statement is
+--
+--   WHERE catalog_id = ? AND generation = ? AND table_id = ?
+--
+-- and the primary key is `(catalog_id, generation, bucket_key)`. The
+-- bucket key is a SHA-256 of (table, spec, values, quota), so it carries
+-- no table locality at all: without this index the statement is a range
+-- scan of the whole catalog's published generation — every table's
+-- buckets read to return one table's.
+--
+-- MEASURED on a 5,000-group fixture for one table inside a generation of
+-- 25,000 groups (five tables), PG 18, warm, scan node only, EXPLAIN
+-- (ANALYZE, BUFFERS) of the service's own `internal` statement:
+-- see `V22PartitionListingMigrationIntegrationTest`, which runs this
+-- file against rows seeded BEFORE it and asserts the index name
+-- appears, `Seq Scan` does not, and nothing is `Rows Removed by Filter`.
+--
+-- NOT built CONCURRENTLY, and that is a measurement rather than a
+-- preference (AGENT.md: the CIC trade is per migration). This table is
+-- not `hog_data_file`. PRODUCTION SIZE, gigahog-prod-us: ~3.5k LIVE rows
+-- for the whole catalog, ~5.6k tuples counting dead ones (~38% bloat
+-- from the per-batch ON CONFLICT churn) — two orders of magnitude under
+-- the 25,000-row fixture the 41 ms build was measured on, so the fixture
+-- is the conservative end and the production build is single-digit
+-- milliseconds. Its ONLY writer is the maintenance sampler's background
+-- tick, which checkpoints every batch and simply retries the one it
+-- loses. A plain build takes SHARE, which blocks that tick and nothing
+-- else: no commit, no read path, no request. Against that, CIC costs the
+-- non-transactional `.conf` shape, two heap passes, an INVALID index on
+-- every cancellation, and a partial failure that leaves a
+-- `success = false` history row failing Flyway's validate on every
+-- replica until someone runs `flyway repair`. Paying that to avoid a
+-- sub-10 ms SHARE lock on a 5.6k-tuple table is a net loss.
+--
+-- TRANSACTIONAL (V20's shape, V16's before it): nothing here builds
+-- concurrently, so `SET LOCAL` expires with the transaction and needs no
+-- restore, and a failure rolls the whole file back and writes no history
+-- row. The statements are still idempotent because being re-runnable
+-- costs nothing.
+SET LOCAL lock_timeout = '5s';
+
+-- Rows in the bucket. 0 on a pre-V22 row means "not sampled" — the API
+-- reads that off the null newest_begin_snapshot beside it, never off
+-- this column alone.
+ALTER TABLE hog_maintenance_summary_tier
+    ADD COLUMN IF NOT EXISTS record_count bigint NOT NULL DEFAULT 0;
+
+-- max(begin_snapshot) over the bucket's live files: when the partition
+-- was last written. NULL when the bucket holds no files, and NULL on
+-- every row a pre-V22 sampler wrote.
+ALTER TABLE hog_maintenance_summary_tier
+    ADD COLUMN IF NOT EXISTS newest_begin_snapshot bigint;
+
+-- The generation a V22-aware sampler began; -1 = none. See section 3.
+ALTER TABLE hog_maintenance_summary
+    ADD COLUMN IF NOT EXISTS measures_generation bigint NOT NULL DEFAULT -1;
+
+-- The per-table listing's access path; the PK's bucket_key is a hash and
+-- carries no table locality.
+CREATE INDEX IF NOT EXISTS hog_maintenance_summary_tier_table
+    ON hog_maintenance_summary_tier (catalog_id, generation, table_id);

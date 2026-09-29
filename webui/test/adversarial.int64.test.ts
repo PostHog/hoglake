@@ -11,7 +11,12 @@
 // Number. These are the pinned regressions.
 
 import { describe, expect, it, vi } from "vitest";
-import { createTable, listFiles, listSnapshots } from "../src/api/client";
+import {
+  createTable,
+  listFiles,
+  listSnapshots,
+  listTablePartitions,
+} from "../src/api/client";
 import { addInt64, compareInt64, parseInt64Json } from "../src/api/int64";
 import { formatCount } from "../src/lib/format";
 import {
@@ -57,6 +62,77 @@ describe("int64 wire values above 2^53", () => {
       columns: [{ name: "id", type: "long" }],
     });
     expect(table.snapshot_id).toBe("9007199254740993");
+  });
+
+  // The partitions listing's own int64s. `last_written_snapshot` is a
+  // snapshot id the console displays verbatim, and `record_count` and
+  // `total_bytes` are per-partition sums that exceed 2^53 at fleet
+  // scale. Removing any of them from INT64_FIELDS reds this.
+  it("the partitions listing's int64 fields survive JSON parsing losslessly", async () => {
+    // A RAW body, hand-written: JSON.stringify would round these
+    // through Number before the client ever saw them, which is the
+    // very loss this test exists to catch.
+    stubFetchRaw(`{
+      "sampled_at": "2026-09-29T12:00:00Z",
+      "sample_started": "2026-09-29T11:32:00Z",
+      "sampled_snapshot_id": 9007199254740993,
+      "total": 1,
+      "stale_spec_groups": 0,
+      "partitions": [
+        {
+          "spec_id": 1,
+          "values": [{ "field": "ts_day", "raw": "20713", "decoded": "2026-09-17" }],
+          "file_count": 3,
+          "small_file_count": 2,
+          "total_bytes": 4611686018427387905,
+          "small_file_bytes": 100,
+          "avg_file_bytes": 1537228672809129301,
+          "dv_count": 0,
+          "debt_score": 2,
+          "record_count": 9007199254740995,
+          "last_written_snapshot": 9007199254740993
+        }
+      ]
+    }`);
+    const listing = await listTablePartitions("c", "ns", "t");
+    expect(listing.sampled_snapshot_id).toBe("9007199254740993");
+    const p = listing.partitions[0];
+    expect(p.last_written_snapshot).toBe("9007199254740993");
+    expect(p.record_count).toBe("9007199254740995");
+    expect(p.total_bytes).toBe("4611686018427387905");
+    expect(p.avg_file_bytes).toBe("1537228672809129301");
+  });
+
+  // A null on those two is "the sample never measured this" and must
+  // survive as null rather than becoming the string "null".
+  it("a null record_count and last_written_snapshot stay null", async () => {
+    stubFetchRaw(
+      JSON.stringify({
+        sampled_at: null,
+        sample_started: null,
+        sampled_snapshot_id: null,
+        total: 0,
+        stale_spec_groups: 0,
+        partitions: [
+          {
+            values: [],
+            file_count: 1,
+            small_file_count: 1,
+            total_bytes: 1,
+            small_file_bytes: 1,
+            avg_file_bytes: 1,
+            dv_count: 0,
+            debt_score: 0,
+            record_count: null,
+            last_written_snapshot: null,
+          },
+        ],
+      }),
+    );
+    const listing = await listTablePartitions("c", "ns", "t");
+    expect(listing.sampled_snapshot_id).toBeNull();
+    expect(listing.partitions[0].record_count).toBeNull();
+    expect(listing.partitions[0].last_written_snapshot).toBeNull();
   });
 
   // row_id_start is the lineage anchor; 2^53+3 must not round to 2^53+4.

@@ -7,6 +7,7 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
+import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
@@ -32,6 +33,7 @@ import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.PartitionListingService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
@@ -102,6 +104,19 @@ class App private constructor(
     /** Same threshold CompactionService plans with: debt == sweepable files. */
     private val partitionStatsService =
         PartitionStatsService(
+            jdbi,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
+        )
+
+    /**
+     * The per-table partitions tab, over the same published sample and
+     * the same policy the debt ranking uses — a sample computed under a
+     * different compaction policy is unusable for both.
+     */
+    private val partitionListingService =
+        PartitionListingService(
             jdbi,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
@@ -318,6 +333,7 @@ class App private constructor(
             DatabaseHealthService(jdbi),
         )
         app.installPartitionStatsRoutes(partitionStatsService)
+        app.installPartitionListingRoutes(partitionListingService)
         app.installPublicationRoutes()
         app.installDebugRoutes()
     }

@@ -14,6 +14,7 @@ import com.posthog.hoglake.api.PublishTableCreationDto
 import com.posthog.hoglake.api.UploadOwnerDto
 import com.posthog.hoglake.api.parseExpectedTableUuid
 import com.posthog.hoglake.api.parseLongQuery
+import com.posthog.hoglake.api.parsePartitionFilter
 import com.posthog.hoglake.api.parseScanRequest
 import com.posthog.hoglake.api.parseScanStatsRequest
 import com.posthog.hoglake.commit.commitFingerprint
@@ -72,6 +73,25 @@ class WireDtoParseFuzzTest {
             } catch (e: Exception) {
                 checkAllowed(name, e)
             }
+        }
+
+        // GET .../partitions' `filter=key_index:text`. The oracle is the
+        // grammar itself: a parse succeeds iff the text has a colon and
+        // a non-negative int before it, and what comes back is exactly
+        // that int with everything after the FIRST colon as the text
+        // (so a value containing colons survives). The text is never
+        // interpolated into SQL — the match is in Kotlin — so the only
+        // failure this can have is an unmapped throw.
+        try {
+            val raw = data.toString(Charsets.UTF_8)
+            val filter = parsePartitionFilter(raw)
+            val head = raw.substringBefore(':')
+            check(raw.contains(':'))
+            check(filter.keyIndex == head.toInt() && filter.keyIndex >= 0)
+            check(filter.text == raw.substringAfter(':'))
+            check(parsePartitionFilter("${filter.keyIndex}:${filter.text}") == filter)
+        } catch (e: Exception) {
+            checkAllowed("partitions filter", e)
         }
 
         // GET .../scan's optional parts: the fuzz input split at its first

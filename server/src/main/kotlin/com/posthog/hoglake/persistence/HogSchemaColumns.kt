@@ -24,7 +24,7 @@ object HogSchemaColumns {
             "hog_maintenance_summary" to
                 setOf(
                     "catalog_id", "generation", "published_generation", "sampled_at",
-                    "sample", "scan_state", "next_batch_at",
+                    "sample", "scan_state", "next_batch_at", "measures_generation",
                 ),
             "hog_maintenance_summary_tier" to
                 setOf(
@@ -32,6 +32,7 @@ object HogSchemaColumns {
                     "quota", "remaining", "pending", "selected", "pending_max_bytes",
                     "file_count", "small_count",
                     "total_bytes", "small_bytes", "dv_count",
+                    "record_count", "newest_begin_snapshot",
                 ),
             // CatalogRepo.catalogMapper (the one hog_catalog row mapping;
             // options/expiry/cleanup read through it). Allocator columns are
