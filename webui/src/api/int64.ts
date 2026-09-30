@@ -110,6 +110,21 @@ const INT64_FIELDS = new Set([
   "unconvertible_schema",
   "invalid_data",
   "heap_budget_exceeded",
+  // Retirement results (RetirementResult): the spec types them int64 and
+  // the console compares skipped_queue_full to decide the cell's tone, so
+  // they must arrive as strings like every other int64 or "0" !== 0 paints
+  // a healthy idle loop red.
+  "tables",
+  "batches",
+  "timeouts",
+  "skipped_tables",
+  "skipped_queue_full",
+  "skipped_locked",
+  "convoyed",
+  "dvs_retired",
+  "paths_queued",
+  "rows_retired",
+  "tables_remaining",
   "failed_groups",
   "claimed_elsewhere",
   "violations",

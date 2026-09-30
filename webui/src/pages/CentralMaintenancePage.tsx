@@ -104,10 +104,10 @@ function taskCell(t: MaintenanceTaskStatus): {
       // has outrun the drain and neither is making progress.
       const last = t.last_run;
       const result = last && last.task === "retirement" ? last.result : null;
-      const held =
-        result !== null &&
-        result.skipped_queue_full !== "0" &&
-        result.skipped_queue_full !== undefined;
+      // Numeric, not a string compare: the field is an int64 on the wire
+      // and the reviver only strings it when registered, so `!== "0"`
+      // once painted every idle "0 rows retired" red.
+      const held = result !== null && Number(result.skipped_queue_full ?? 0) > 0;
       return {
         number: result ? `${formatCount(result.rows_retired)} rows retired` : "",
         warn: held,
