@@ -3,6 +3,9 @@
   "manifest": {
     "schema-version": "1.15.0",
     "install": {
+      "atlas": {
+        "pkg-path": "atlas"
+      },
       "jdk25": {
         "pkg-path": "jdk25"
       }
@@ -13,19 +16,106 @@
   },
   "packages": [
     {
+      "attr_path": "atlas",
+      "broken": false,
+      "derivation": "/nix/store/ms38ffv3sh2nxv73srcbxprwl87av290-atlas-1.3.0.drv",
+      "description": "Manage your database schema as code",
+      "install_id": "atlas",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "name": "atlas-1.3.0",
+      "pname": "atlas",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T04:58:27.481384Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.3.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/xzfhicvlahpq8wk3cwqmls9y6r96byln-atlas-1.3.0"
+      },
+      "system": "aarch64-darwin",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "atlas",
+      "broken": false,
+      "derivation": "/nix/store/z2k9mv4gs0cyql62i1shfiwvam9g81gc-atlas-1.3.0.drv",
+      "description": "Manage your database schema as code",
+      "install_id": "atlas",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "name": "atlas-1.3.0",
+      "pname": "atlas",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T05:29:59.808710Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.3.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/7ydzr39ndamiqphha6sgqdnkqspiymly-atlas-1.3.0"
+      },
+      "system": "aarch64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
+      "attr_path": "atlas",
+      "broken": false,
+      "derivation": "/nix/store/bjjp6js39dsvq1n47h634vibv5kqlxks-atlas-1.3.0.drv",
+      "description": "Manage your database schema as code",
+      "install_id": "atlas",
+      "license": "Apache-2.0",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "name": "atlas-1.3.0",
+      "pname": "atlas",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T06:06:00.403048Z",
+      "stabilities": [
+        "unstable"
+      ],
+      "unfree": false,
+      "version": "1.3.0",
+      "outputs_to_install": [
+        "out"
+      ],
+      "outputs": {
+        "out": "/nix/store/m6jqbqd8h7qvp72rxlk547mnyhb8ik27-atlas-1.3.0"
+      },
+      "system": "x86_64-linux",
+      "group": "toplevel",
+      "priority": 5
+    },
+    {
       "attr_path": "jdk25",
       "broken": false,
       "derivation": "/nix/store/dyh1msql1igysmxa0gr8blj71dwcfv6k-zulu-ca-jdk-25.0.3.drv",
       "description": "Certified builds of OpenJDK",
       "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
       "name": "zulu-ca-jdk-25.0.3",
       "pname": "jdk25",
-      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
-      "rev_count": 1077996,
-      "rev_date": "2026-09-22T03:11:10Z",
-      "scrape_date": "2026-09-23T04:58:22.146658Z",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T04:58:44.812478Z",
       "stabilities": [
         "unstable"
       ],
@@ -48,13 +138,13 @@
       "description": "Open-source Java Development Kit",
       "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
       "name": "openjdk-25.0.4.1+1",
       "pname": "jdk25",
-      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
-      "rev_count": 1077996,
-      "rev_date": "2026-09-22T03:11:10Z",
-      "scrape_date": "2026-09-23T05:30:01.217119Z",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T05:30:22.988116Z",
       "stabilities": [
         "unstable"
       ],
@@ -78,13 +168,13 @@
       "description": "Open-source Java Development Kit",
       "install_id": "jdk25",
       "license": "GPL-2.0-only",
-      "locked_url": "https://github.com/flox/nixpkgs?rev=6774f7bc253789b113a4f39285dc0fa100abeacc",
+      "locked_url": "https://github.com/flox/nixpkgs?rev=7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
       "name": "openjdk-25.0.4.1+1",
       "pname": "jdk25",
-      "rev": "6774f7bc253789b113a4f39285dc0fa100abeacc",
-      "rev_count": 1077996,
-      "rev_date": "2026-09-22T03:11:10Z",
-      "scrape_date": "2026-09-23T06:06:40.825566Z",
+      "rev": "7a0f122f5090cf4c2ade2a13a0e229d4e19ba71f",
+      "rev_count": 1080855,
+      "rev_date": "2026-09-28T06:58:16Z",
+      "scrape_date": "2026-09-29T06:06:24.202915Z",
       "stabilities": [
         "unstable"
       ],

@@ -35,6 +35,41 @@ one pattern:
 schema-check:
     {{_gradle}} test --tests 'com.posthog.hoglake.SchemaEquivalenceIntegrationTest' --rerun --console=plain
 
+# Mermaid ERD of the fold of the Flyway chain -> docs/erd/schema.mmd,
+# also spliced into the root README between the erd:begin/erd:end
+# markers. Atlas replays the migrations on a throwaway postgres:18
+# container (Docker required). Atlas needs an atlas.sum beside the
+# migrations, so it runs against a scratch copy rather than writing
+# into the chain.
+erd:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    scratch=$(mktemp -d)
+    trap 'rm -rf "$scratch"' EXIT
+    cp {{source_directory()}}/src/main/resources/db/migration/*.sql "$scratch/"
+    out={{source_directory()}}/../docs/erd/schema.mmd
+    mkdir -p "$(dirname "$out")"
+    flox activate -d {{source_directory()}} -- atlas migrate hash --dir "file://$scratch?format=flyway"
+    flox activate -d {{source_directory()}} -- atlas schema inspect \
+        --url "file://$scratch?format=flyway" \
+        --dev-url "docker://postgres/18/dev?search_path=public" \
+        --format '{{"{{"}} mermaid . {{"}}"}}' > "$scratch/schema.mmd"
+    mv "$scratch/schema.mmd" "$out"
+    echo "wrote $out"
+    readme={{source_directory()}}/../README.md
+    awk -v mmd="$out" '
+        /<!-- erd:end -->/ { skip = 0 }
+        !skip { print }
+        /<!-- erd:begin -->/ {
+            print "```mermaid"
+            while ((getline line < mmd) > 0) print line
+            print "```"
+            skip = 1
+        }
+    ' "$readme" > "$scratch/README.md"
+    mv "$scratch/README.md" "$readme"
+    echo "updated $readme"
+
 # Local dev stack (Postgres 18 + MinIO). Ports overridable:
 # HOGLAKE_PG_PORT / HOGLAKE_MINIO_PORT / HOGLAKE_MINIO_CONSOLE_PORT
 compose-up:

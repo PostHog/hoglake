@@ -51,7 +51,10 @@ with the S3 env wired by the compose file.)
 The server suite includes the **schema equivalence gate**
 (`just server schema-check`): fold(migrations) must equal `schema.sql`.
 If you touch a migration, update `schema.sql` in the same change or
-this fails. It also includes the **mapper-coverage gate**
+this fails. The same change must also run `just server erd` (Docker
+required) and commit the regenerated `docs/erd/schema.mmd` and README
+§Schema diagram; no gate checks this, so a stale ERD goes unnoticed.
+It also includes the **mapper-coverage gate**
 (`MapperCoverageGateIntegrationTest`): every hog_* table's live columns
 must equal the set declared in `persistence/HogSchemaColumns.kt` — a
 new column means updating the row mapper(s) named there AND the
@@ -260,7 +263,9 @@ there would break that gate on every build.
   **The chain is append-only as of v1.0.0** (2026-09-11, the Gigahog
   deploy): `V1__init.sql` is FROZEN — never edit it; schema changes are
   new `V<n>__` migrations, and `schema.sql` must equal the fold of the
-  whole chain (the equivalence test enforces it). FKs with CASCADE,
+  whole chain (the equivalence test enforces it). A new migration also
+  regenerates the ERD (`just server erd`: `docs/erd/schema.mmd` and
+  README §Schema). FKs with CASCADE,
   partial indexes for hot predicates, CHECK-constrained vocabularies
   (deliberate choice over PG enums while the vocabulary churns). No
   migration ledger hacks — Flyway owns it.
