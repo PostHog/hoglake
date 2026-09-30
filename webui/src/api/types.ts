@@ -796,6 +796,28 @@ export interface CompactionResult {
    * older server, and the server omits it when it is zero.
    */
   claimed_elsewhere?: Int64;
+  /**
+   * PLAN measures, not group outcomes: what the sweep's planners read
+   * and how long reading it took, summed over every table planned.
+   *
+   * candidates_fetched is the number the planner's own defect had no
+   * series for — it used to select every live file of a table under the
+   * target into one list, with the bin packing that followed running
+   * inside the planning transaction until Postgres killed the
+   * connection. buckets_considered/buckets_available say how much of a
+   * table's partition debt one plan could reach; candidates_truncated
+   * counts the plans that hit their cap (never an error — the fetch is
+   * ordered by size, so the next sweep sees the next-smallest files).
+   *
+   * OPTIONAL for the same reason claimed_elsewhere is: they postdate
+   * ledger rows a rolling deploy can still serve from an older server,
+   * and the server omits each when it is zero.
+   */
+  candidates_fetched?: Int64;
+  buckets_considered?: Int64;
+  buckets_available?: Int64;
+  candidates_truncated?: Int64;
+  plan_ms?: Int64;
 }
 
 export interface VerifyCheck {

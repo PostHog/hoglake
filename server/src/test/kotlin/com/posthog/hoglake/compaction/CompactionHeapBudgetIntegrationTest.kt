@@ -135,17 +135,26 @@ class CompactionHeapBudgetIntegrationTest {
         // four times over, which on the dev pod is ninety seconds of IO
         // ending in `java.lang.OutOfMemoryError: Java heap space`.
         //
-        // Selecting on rows, the dense table's whole TARGET scales down
-        // by its density, and the two tables' groups come out holding the
-        // SAME NUMBER OF ROWS out of different numbers of bytes. That
-        // equality is the assertion: it is true only if the budget is
-        // denominated in the unit the heap actually holds.
+        // Packing WITH the row ceiling as a second capacity, the two
+        // tables' groups come out holding the SAME NUMBER OF ROWS out of
+        // different numbers of bytes: the sparse one closes on bytes at
+        // 8,192 rows, the dense one closes on ROWS at two files. That
+        // equality is the assertion, and it is true only if the bound is
+        // enforced in the unit the heap actually holds.
+        //
+        // It used to be true by a different route — `effectiveTargetBytes`
+        // measured the table's average density and scaled the byte
+        // target by it — and that arm is gone: an average was an
+        // estimate of a number `hog_data_file.record_count` holds
+        // exactly, and measuring it cost an unbounded aggregate over
+        // every candidate of the table inside the planning transaction.
         val cfg =
             CompactionConfig(
                 targetBytes = 1024 * 1024,
-                // Two files is a group here: the derated dense target is
-                // reached by two, and what this test measures is where
-                // the target lands, not the file minimum.
+                // Two files is a group here: the row capacity closes the
+                // dense table's group at two, and what this test
+                // measures is where the group closes, not the file
+                // minimum.
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapBytesFor(8192),
@@ -159,8 +168,8 @@ class CompactionHeapBudgetIntegrationTest {
         val densePlan = svc.planTable(dense, "ns", "t", cfg)
         assertThat(densePlan.groups)
             .describedAs(
-                "planned on bytes, the dense table's only group is 32,768 rows and the row ceiling " +
-                    "then has to refuse it, leaving nothing to compact (refused=%d)",
+                "packed on bytes alone the dense table's only group would be 32,768 rows and the " +
+                    "ceiling would refuse it, leaving nothing to compact (refused=%d)",
                 densePlan.heapRefusedGroups,
             )
             .isNotEmpty()
@@ -208,13 +217,23 @@ class CompactionHeapBudgetIntegrationTest {
     // ---- a group that cannot fit -------------------------------------------
 
     @Test
-    fun `a group above the row ceiling is refused in metadata and spends no IO`() {
-        // The density derate scales the target by the table's AVERAGE
-        // bytes-per-row, which is an estimate; record_count is not. A
-        // group whose registered survivors land above the ceiling anyway
-        // — the file that closes a group can overshoot it, and a
-        // table mixing client snappy with compaction zstd has no single
-        // density — is refused on the true number.
+    fun `files too dense to pair under the ceiling are refused in metadata and spend no IO`() {
+        // What the row ceiling can still refuse, now that groups are
+        // PACKED to it rather than packed on bytes and then tested.
+        //
+        // Four files of 900 surviving rows each against a 1,024-row
+        // ceiling: no TWO of them fit, so the packer closes a group
+        // before every second file and each closure is a one-file group
+        // the file minimum drops. That is not the ordinary "short
+        // remainder waiting for more appends" case — more files never
+        // help, because the ceiling comes from the table's schema and
+        // this process's heap — so the packer hands those closures back
+        // (`CompactionGrouping.Packing.rowBoundRefusals`) and they are
+        // counted and warned about instead of vanishing.
+        //
+        // THREE, not four: the loop closes before files 2, 3 and 4, and
+        // the fourth file is then the trailing remainder, which closes
+        // on neither bound and is the ordinary silent case.
         //
         // "Spends no IO" is asserted by construction: these paths were
         // never uploaded, so an attempted fetch would be NoSuchKey and
@@ -233,16 +252,20 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
 
         val plan = svc.planTable(cat, "ns", "t", cfg)
-        assertThat(plan.groups).describedAs("nothing survives the ceiling").isEmpty()
-        assertThat(plan.heapRefusedGroups).isEqualTo(2)
+        assertThat(plan.groups).describedAs("no two of these files fit the ceiling").isEmpty()
+        assertThat(plan.heapRefusedGroups).isEqualTo(3)
+        // The bound the refusal defends, stated on the groups that WERE
+        // formed: none, here, which is why the assertion above is the
+        // one that matters.
+        assertThat(plan.groups.map { it.survivingRecords }).allSatisfy { assertThat(it).isLessThanOrEqualTo(ceiling) }
 
         val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
         assertThat(result.heapBudgetExceeded)
             .describedAs(
-                "both refusals counted even though maxGroupsPerRun is 1: a refusal costs no IO, so " +
+                "every refusal counted even though maxGroupsPerRun is 1: a refusal costs no IO, so " +
                     "charging it to the run budget would let one un-compactable table starve the sweep",
             )
-            .isEqualTo(2)
+            .isEqualTo(3)
         assertThat(result.groupsCompacted).isZero()
         assertThat(result.failedGroups).describedAs("no fetch was attempted").isZero()
         assertThat(result.invalidData).isZero()
@@ -255,8 +278,170 @@ class CompactionHeapBudgetIntegrationTest {
         // Deterministic, and just as cheap the second time. The behaviour
         // being replaced was ninety seconds of IO per sweep, forever.
         val again = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(again.heapBudgetExceeded).isEqualTo(2)
+        assertThat(again.heapBudgetExceeded).isEqualTo(3)
         assertThat(again.failedGroups).isZero()
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `a single file above the ceiling is never fetched, and the rest of the bucket compacts`() {
+        // The one thing packing to the ceiling cannot rescue: a file
+        // whose OWN surviving rows exceed it. It can share a group with
+        // nothing.
+        //
+        // IT IS NOT FETCHED, and that is a deliberate change from the
+        // first version of this work, which fetched it, packed it into a
+        // one-file group, refused the group, counted it in
+        // `heap_budget_exceeded` and named it in a WARN — every sweep,
+        // forever, spending a slot of the candidate budget to rediscover
+        // something `hog_data_file.record_count` already said. The
+        // candidate filter now carries `record_count < ceiling`, which
+        // is exact and free.
+        //
+        // WHERE THE OPERATOR SIGNAL WENT, because this does cost one:
+        // the named WARN is gone with the refusal. What remains is the
+        // compaction-debt page, which counts the file (the sampler does
+        // not know the table's row ceiling, so its debt includes it) —
+        // that is one of the three over-reporting cases
+        // `PartitionStatsService`'s KDoc already lists, and it is now
+        // also the signal for this one. `heap_budget_exceeded` still
+        // covers the refusal that RECURS: files dense enough that no
+        // two of them fit.
+        //
+        // The other half is the point of the whole change: the rest of
+        // the bucket still compacts. Under the old shape a bucket was
+        // packed on bytes and every group that came out too dense was
+        // refused, so ONE pathological file's bucket contributed nothing
+        // at all — which is what `ingest.events_raw` looked like for
+        // days.
+        val ceiling = 1024L
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxInputFiles = 2,
+                // Pinned: this test shapes its groups by the file count.
+                maxFanIn = 2,
+                maxGroupsPerRun = 4,
+                sortedHeapBytes = heapBytesFor(ceiling),
+            )
+        val svc = CompactionService(db.jdbi, store, cfg)
+        // Four 400-row files that pair happily under the ceiling, plus
+        // one 2,000-row file that cannot pair with anything. Sizes are
+        // deliberately equal so BYTES decide nothing here.
+        val cat =
+            sortedTableOfFiles(
+                "one-over",
+                listOf(400L, 400L, 400L, 400L, 2_000L).map { 1024L to it },
+            )
+        assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
+
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        assertThat(plan.heapRefusedGroups)
+            .describedAs("the over-ceiling file costs no refusal, because it is never fetched")
+            .isZero()
+        assertThat(plan.groups)
+            .describedAs("the pairable files are NOT held hostage by the one that is not")
+            .isNotEmpty()
+        assertThat(plan.groups.flatMap { it.files }.map { it.recordCount })
+            .describedAs("the oversized file is in no group")
+            .doesNotContain(2_000L)
+        assertThat(plan.groups.flatMap { it.files })
+            .describedAs("and all four that fit are planned")
+            .hasSize(4)
+        for (group in plan.groups) {
+            assertThat(group.survivingRecords)
+                .describedAs("every group the planner emits fits the ceiling")
+                .isLessThanOrEqualTo(ceiling)
+        }
+    }
+
+    // ---- packing TO the ceiling, end to end ---------------------------------
+
+    @Test
+    fun `a dense sorted table that byte-packing could not compact at all now compacts end to end`() {
+        // THE PRODUCTION CASE, at fixture scale. On gigahog-prod-us's
+        // `ingest.events_raw` the stray-day files hold ~50 bytes per row,
+        // so a group packed to the BYTE target was ~2.9M rows against a
+        // row ceiling of 552,336 — and every single group was then
+        // refused. `heap_budget_exceeded` sat around 2,000 per run for
+        // days and the table did not compact at all.
+        //
+        // The fixture reproduces the RELATIONSHIP rather than the
+        // magnitudes: nine real parquet objects whose registered bytes
+        // are low enough per row that one byte-sized group holds far
+        // more rows than the ceiling admits.
+        val filesCount = 9
+        val rowsPerFile = 200L
+        val ceiling = 600L
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxInputFiles = 64,
+                // Enough to execute every group the plan forms, so the
+                // "it compacts" half is not hidden by the run budget.
+                maxGroupsPerRun = 5,
+                sortedHeapBytes = heapBytesFor(ceiling),
+            )
+        assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val cat = realSortedTable("dense-e2e", files = filesCount, rowsPerFile = rowsPerFile)
+
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+
+        // WHAT THE OLD RULE WOULD HAVE DONE, computed with the real
+        // grouping function rather than asserted in prose: pack the same
+        // candidates on BYTES alone, and every group that comes out is
+        // over the ceiling — which is what "the table keeps its debt"
+        // meant.
+        val candidates = plan.groups.flatMap { it.files } + plan.groups.flatMap { it.files }
+        val byteOnly =
+            CompactionGrouping.of(cfg.targetBytes)
+                .groups(
+                    candidates.distinctBy { it.dataFileId },
+                    cfg.minInputFiles,
+                    cfg.maxInputFiles,
+                ) { it.fileSizeBytes }
+        assertThat(byteOnly.groups).describedAs("byte packing forms groups").isNotEmpty()
+        for (group in byteOnly.groups) {
+            assertThat(group.sumOf { it.recordCount })
+                .describedAs("packed on bytes, every group is over the ceiling and would be refused")
+                .isGreaterThan(ceiling)
+        }
+
+        // WHAT THE NEW RULE DOES: groups that FIT, on both bounds.
+        assertThat(plan.groups).describedAs("packing to the ceiling produces work").isNotEmpty()
+        assertThat(plan.heapRefusedGroups).describedAs("and refuses none of it").isZero()
+        for (group in plan.groups) {
+            assertThat(group.survivingRecords)
+                .describedAs("every group fits the row ceiling")
+                .isLessThanOrEqualTo(ceiling)
+            assertThat(group.totalBytes)
+                .describedAs("and still respects the byte budget")
+                .isLessThanOrEqualTo(cfg.effectiveTargetBytes(fixtureLiveColumns, sorted = true))
+        }
+
+        // AND THEY REWRITE. The objects are real, the store is MinIO, and
+        // the rows have to survive: a plan that forms groups nothing can
+        // execute is the same non-event as a plan that forms none.
+        val plannedGroups = plan.groups.size
+        val rowsBefore = liveRecordCount(cat)
+        assertThat(rowsBefore).isEqualTo(filesCount * rowsPerFile)
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted)
+            .describedAs("every planned group committed: %s", result)
+            .isEqualTo(plannedGroups.toLong())
+        assertThat(result.heapBudgetExceeded).isZero()
+        assertThat(result.failedGroups).isZero()
+        assertThat(result.skippedConflicts).isZero()
+        assertThat(liveRecordCount(cat))
+            .describedAs("no row is lost or duplicated by a rewrite")
+            .isEqualTo(rowsBefore)
+        assertThat(liveFileCount(cat))
+            .describedAs("and the file count actually fell")
+            .isLessThan(filesCount.toLong())
         assertVerifyPasses(cat)
     }
 
@@ -458,7 +643,7 @@ class CompactionHeapBudgetIntegrationTest {
         logger.addAppender(appender)
         try {
             repeat(3) {
-                assertThat(svc.planTable(refusing, "ns", "t", cfg).heapRefusedGroups).isEqualTo(2)
+                assertThat(svc.planTable(refusing, "ns", "t", cfg).heapRefusedGroups).isEqualTo(3)
                 assertThat(svc.planTable(innocent, "ns", "t", cfg).heapRefusedGroups).isZero()
             }
         } finally {
@@ -501,6 +686,87 @@ class CompactionHeapBudgetIntegrationTest {
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
         return cat
     }
+
+    /**
+     * A sorted fixture table whose files differ PER FILE, as
+     * (bytes, records) pairs.
+     *
+     * [sortedTable] makes every file identical, which cannot express the
+     * case where one file alone is over the row ceiling and the others
+     * are not.
+     */
+    private fun sortedTableOfFiles(
+        label: String,
+        files: List<Pair<Long, Long>>,
+    ): String {
+        val cat = "heap-$label-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+        )
+        val regs =
+            files.mapIndexed { i, (bytes, records) ->
+                FileRegistration(
+                    path = "s3://$BUCKET/$cat/data/ns/t/v$i.parquet",
+                    recordCount = records,
+                    fileSizeBytes = bytes,
+                )
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        return cat
+    }
+
+    /**
+     * A SORTED table of [files] real parquet objects of [rowsPerFile]
+     * rows each, registered at their true sizes.
+     *
+     * [sortedTable] registers metadata only, which is right for the
+     * tests that assert a refused group spends no IO and wrong for one
+     * that has to run a group to completion. [realTable] writes real
+     * objects but is fixed at three four-row files.
+     */
+    private fun realSortedTable(
+        label: String,
+        files: Int,
+        rowsPerFile: Long,
+    ): String {
+        val cat = "heap-$label-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+        )
+        val regs =
+            (0 until files).map { i ->
+                val ids = (0 until rowsPerFile).map { it + i * rowsPerFile }
+                val bytes = parquetBytes(ids)
+                val path = "s3://$BUCKET/$cat/data/ns/t/d$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, rowsPerFile, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        return cat
+    }
+
+    private fun liveRecordCount(cat: String): Long =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT coalesce(sum(f.record_count), 0) FROM hog_data_file f
+                JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                WHERE c.name = :cat AND f.end_snapshot IS NULL
+                """,
+            ).bind("cat", cat).mapTo(Long::class.java).one()
+        }
 
     /**
      * The UNSORTED twin of [realTable], which matters more than it
@@ -572,6 +838,10 @@ class CompactionHeapBudgetIntegrationTest {
             // policy, so they pin a grouping that yields one group.
             minInputFiles = 2,
             maxInputFiles = 3,
+            // Pinned: these fixtures are three small files and pin a
+            // grouping that yields one group, so the fan-in must not
+            // scale past them.
+            maxFanIn = 3,
             maxGroupsPerRun = 1,
             sortedHeapBytes = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES,
         )

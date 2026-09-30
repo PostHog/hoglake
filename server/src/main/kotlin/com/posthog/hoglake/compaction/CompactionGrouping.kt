@@ -120,13 +120,54 @@ class CompactionGrouping private constructor(
      * the rule is expressed so that a streaming scan CAN mirror it —
      * size-ascending order comes from its SQL, and "the group's largest
      * file" is its last one, known exactly when the group closes.
+     *
+     * The mirror covers the BYTE rule only. [rowCapacity] is a
+     * per-table quantity (it comes from the live sort order and the
+     * column forest, via `CompactionConfig.sortedRowCeiling`), and the
+     * sampler's scan walks every table of a catalog in one pass with no
+     * schema in hand — so a sorted table's reported debt is an UPPER
+     * BOUND on what the planner will take, which is what
+     * `PartitionStatsService`'s KDoc already says about sorted tables
+     * for the other two reasons it lists.
+     *
+     * ## Two capacities, and why the row one closes EARLY
+     *
+     * [rowCapacity] is the second bound: how many surviving rows a group
+     * may hold, because the sorted rewrite materializes all of them at
+     * once (`CompactionConfig.sortedHeapBytes`). `NO_ROW_CAPACITY` — the
+     * default, and what the streaming path passes — means bytes are the
+     * only bound, exactly as before.
+     *
+     * The two bounds close a group differently, deliberately. The BYTE
+     * bound closes INCLUSIVELY: the file that reaches the target joins
+     * the group, so a group's bytes can overshoot the target by up to
+     * one file, which is fine because the target is an output-size AIM.
+     * The ROW bound closes EXCLUSIVELY, before the file that would
+     * breach it, because it is a HEAP LIMIT and an overshoot is an
+     * `OutOfMemoryError` in a background loop. That is the whole reason
+     * this bound lives here rather than being applied to finished
+     * groups: a group packed on bytes and then tested against the
+     * ceiling is REFUSED (which is what compaction did, ~2,000 groups a
+     * run on gigahog-prod-us's `ingest.events_raw`, where ~50 bytes per
+     * row made every byte-sized group ~2.9M rows against a ceiling of
+     * 552,336), while a group packed WITH the bound simply closes
+     * earlier and gets rewritten.
+     *
+     * A file whose own rows exceed [rowCapacity] cannot be grouped with
+     * anything, and is emitted as a one-file group so the `need` rule
+     * below drops it — reported in [Packing.rowBoundRefusals] rather
+     * than disappearing, because a table that cannot compact at all
+     * must not do so silently.
      */
     fun <T> groups(
         files: List<T>,
         minInputFiles: Int = DEFAULT_MIN_INPUT_FILES,
         maxInputFiles: Int = DEFAULT_MAX_INPUT_FILES,
+        rowCapacity: Long = NO_ROW_CAPACITY,
+        rows: (T) -> Long = { 0L },
         size: (T) -> Long,
-    ): List<List<T>> {
+    ): Packing<T> {
+        require(rowCapacity >= 1) { "row capacity must be at least 1, got $rowCapacity" }
         require(minInputFiles >= 2) { "a group of one file is a copy, not a compaction" }
         require(maxInputFiles >= minInputFiles) {
             "maxInputFiles $maxInputFiles is below minInputFiles $minInputFiles: no group could form"
@@ -144,9 +185,13 @@ class CompactionGrouping private constructor(
         // each group can be handed back in the caller's own order.
         val packed = candidates.withIndex().sortedWith(compareBy({ size(it.value) }, { it.index }))
         val result = mutableListOf<List<T>>()
+        val rowRefused = mutableListOf<List<T>>()
         var start = 0
 
-        fun close(endExclusive: Int) {
+        fun close(
+            endExclusive: Int,
+            closedByRows: Boolean,
+        ) {
             val group = packed.subList(start, endExclusive)
             // The group's largest file is its last, because the pack is
             // size-ascending — so this is decidable here, with no
@@ -155,13 +200,27 @@ class CompactionGrouping private constructor(
             val largest = size(group.last().value)
             val fit = if (largest <= 0) minInputFiles.toLong() else targetBytes / largest
             val need = max(2L, min(minInputFiles.toLong(), fit)).toInt()
+            val ordered = group.sortedBy { it.index }.map { it.value }
             if (group.size >= need) {
-                result += group.sortedBy { it.index }.map { it.value }
+                result += ordered
+            } else if (closedByRows) {
+                // A group the ROW capacity closed short of the minimum.
+                // The bytes rule's own short remainders are the ordinary
+                // "wait for more appends" case and are dropped silently,
+                // because more files will arrive and fill them. This one
+                // will NOT fill: the ceiling is a property of the table's
+                // schema and the process's heap, so the same files close
+                // the same short group on every sweep, forever, until an
+                // operator moves one of the two. Handed back so the
+                // planner can count and name it (the old code's
+                // `heap_budget_exceeded`).
+                rowRefused += ordered
             }
             start = endExclusive
         }
 
         var remaining = targetBytes
+        var rowsLeft = rowCapacity
         for (index in packed.indices) {
             val bytes = size(packed[index].value)
             val held = index - start + 1
@@ -204,21 +263,99 @@ class CompactionGrouping private constructor(
             // Streamable by construction — it reads only the bytes held
             // and the arriving file, both of which the sampler has.
             if (held > 1 && (targetBytes - remaining) * DOMINANCE_FACTOR < bytes) {
-                close(index)
+                close(index, closedByRows = false)
                 remaining = targetBytes
+                rowsLeft = rowCapacity
+            }
+            val fileRows = rows(packed[index].value)
+            // THE ROW CAPACITY, and it closes BEFORE this file rather
+            // than with it. See the KDoc: the byte target is an aim a
+            // group may overshoot by one file, and the row ceiling is a
+            // heap limit an overshoot turns into an OutOfMemoryError. So
+            // whatever is held closes now and this file starts the next
+            // group.
+            //
+            // `index > start` rather than `held > 1`: `held` was computed
+            // before the dominance split above, which may have moved
+            // `start` to this very index and left the group empty. With
+            // the group empty there is nothing to close before, and the
+            // single-file case below is what covers it.
+            if (index > start && fileRows > rowsLeft) {
+                // `closedByRows` only when the ARRIVING file could have
+                // fitted a fresh group. If it could not — its own rows
+                // exceed the whole capacity — then what closes here is
+                // an ordinary remainder that an unfittable NEIGHBOUR
+                // happened to interrupt, and the arriving file is
+                // reported as its own refusal one line below. Counting
+                // both would inflate `heap_budget_exceeded` with an
+                // innocent short group, and let the WARN name it as the
+                // ceiling's victim.
+                close(index, closedByRows = fileRows <= rowCapacity)
+                remaining = targetBytes
+                rowsLeft = rowCapacity
+            }
+            if (fileRows > rowCapacity) {
+                // One file that cannot fit the capacity even alone, so it
+                // can never share a group with anything. Emitted as a
+                // one-file group, which `close` drops (a group of one is
+                // a copy, not a compaction) and reports as a row-bound
+                // refusal — the only refusal left once groups are packed
+                // to fit, and the one the planner's WARN names the file
+                // of.
+                close(index + 1, closedByRows = true)
+                remaining = targetBytes
+                rowsLeft = rowCapacity
+                continue
             }
             if (bytes >= remaining || (index - start + 1) >= maxInputFiles) {
-                close(index + 1)
+                close(index + 1, closedByRows = false)
                 remaining = targetBytes
+                rowsLeft = rowCapacity
             } else {
                 remaining -= bytes
+                rowsLeft -= fileRows
             }
         }
-        if (start < packed.size) close(packed.size)
-        return result
+        // The trailing remainder closes on NEITHER bound, so a short one
+        // is the ordinary "waiting for more appends" case even on a
+        // row-capped table: more files arriving is exactly what fills it.
+        if (start < packed.size) close(packed.size, closedByRows = false)
+        return Packing(result, rowRefused)
     }
 
+    /**
+     * What one bucket's pack produced: the groups worth rewriting, and
+     * the ones only the ROW capacity stopped.
+     *
+     * [rowBoundRefusals] exists because the two reasons a group can be
+     * dropped are not the same news. A short group the BYTE rule left
+     * behind fills up as more files arrive, so it is dropped silently
+     * and always was. A short group the row capacity closed will never
+     * fill: the capacity comes from the table's schema and the process's
+     * heap, neither of which more files change, so the identical short
+     * group is formed and dropped on every sweep until an operator
+     * raises the heap or drops the sort order. Handing those back is
+     * what keeps that condition from being invisible, which is the
+     * failure mode `CompactionGrouping`'s own KDoc names for the scaling
+     * file minimum ("Silently: no group forms, so nothing is refused and
+     * nothing is logged").
+     */
+    data class Packing<T>(
+        val groups: List<List<T>>,
+        val rowBoundRefusals: List<List<T>>,
+    )
+
     companion object {
+        /**
+         * [groups]' default row capacity: unbounded, i.e. bytes and the
+         * fan-in cap are the only bounds. What the STREAMING rewrite
+         * path passes, because it writes each survivor as it reads it
+         * and its heap is flat in group size — a row bound there would
+         * be a throughput tax on every unsorted table for a cost it does
+         * not pay.
+         */
+        const val NO_ROW_CAPACITY = Long.MAX_VALUE
+
         /**
          * The most files a group is asked to hold before it is worth
          * rewriting. 5, matching Iceberg's `min-input-files`.

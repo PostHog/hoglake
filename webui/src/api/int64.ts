@@ -112,6 +112,11 @@ const INT64_FIELDS = new Set([
   "heap_budget_exceeded",
   "failed_groups",
   "claimed_elsewhere",
+  "candidates_fetched",
+  "buckets_considered",
+  "buckets_available",
+  "candidates_truncated",
+  "plan_ms",
   "violations",
 ]);
 

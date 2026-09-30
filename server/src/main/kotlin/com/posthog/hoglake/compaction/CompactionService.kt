@@ -24,6 +24,7 @@ import com.posthog.hoglake.persistence.Pg
 import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
@@ -32,6 +33,7 @@ import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
+import java.sql.ResultSet
 import java.util.UUID
 import java.util.concurrent.TimeUnit
 
@@ -44,10 +46,104 @@ data class CompactionConfig(
      * makes compaction TERMINATE. See CompactionGrouping.groups.
      */
     val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
-    /** Fan-in cap — see CompactionGrouping.groups. */
+    /**
+     * The FLOOR of the fan-in cap — see [effectiveMaxInputFiles] and
+     * CompactionGrouping.groups.
+     *
+     * It used to be the cap itself, and at 12 KiB per file that made a
+     * 64-file group rewrite 768 KiB against a 512 MiB target: 0.15% of
+     * the target, and 63 files retired per group when the bucket holds
+     * thousands. See [effectiveMaxInputFiles] for what replaced it and
+     * why this stays a floor rather than becoming irrelevant.
+     */
     val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+    /**
+     * The CEILING of the fan-in cap
+     * (`HOGLAKE_COMPACTION_MAX_FAN_IN`), whatever the file sizes say.
+     *
+     * [effectiveMaxInputFiles] scales the fan-in up for a bucket of tiny
+     * files, and this is where it stops. What it bounds is not bytes —
+     * the byte target does that — but the per-GROUP resources that scale
+     * with the INPUT COUNT rather than with the data: one open reader
+     * and its parsed footer per input while
+     * [inputOpenParallelism] of them are in flight, one `hog_data_file`
+     * row locked per input in the commit tail, and one entry per input
+     * in the claim key.
+     *
+     * # 2,048, and where that comes from
+     *
+     * A group's inputs are also ROWS UNDER THE PER-CATALOG COMMIT LOCK:
+     * `commitGroup`'s plan-to-commit re-verification and its
+     * `end_snapshot` retirement are both `IN`-list statements over
+     * every input, once per group, up to [maxGroupsPerRun] times a
+     * sweep, and every foreground commit waits behind each hold. That
+     * is the bound, and `CompactionFanInMeasurement` measures it
+     * (PG 18, warm, a 200,000-row manifest, ids scattered through it):
+     *
+     *   fan-in 64 = 2.2 ms hold / 34.3 us per row;
+     *   512 = 9.4 ms / 18.5 us; **2,048 = 33.6 ms / 16.4 us**.
+     *
+     * Against a stated budget of 50 ms per group, 2,048 fits with
+     * margin, and the per-row cost FALLS with the list length rather
+     * than growing — so the sweep's lock duty cycle is 33.6 ms x 64
+     * groups x 15 sweeps an hour = **0.90%**, against the retirement
+     * loop's designed 18-25%.
+     *
+     * What it buys: ~1.97M files retired an hour against ~216k
+     * arriving, clearing a 9.9M-file backlog in about five hours. At
+     * the old fixed 64 it is ~60k an hour — permanently under water.
+     *
+     * THE EXTRAPOLATION IS THE RISK, not the arithmetic. That manifest
+     * fits in shared_buffers and gigahog-prod-us's ~14M rows / ~1.5 GB
+     * does not, so a scattered keyed probe there pays reads rather than
+     * hits and the per-row cost can be several times as much; at
+     * 100 us/row a 2,048-input commit is 205 ms and the budget is gone.
+     * LOWER THIS KNOB if it does. The failure mode meanwhile is bounded
+     * rather than open-ended: [commitLockTimeoutMs] already bounds the
+     * commit, so a hold that outgrows it is a counted
+     * `skipped_conflicts` and not a stall.
+     *
+     * `HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` is the other half of
+     * the per-group footprint — it, not this, is what bounds how many
+     * inputs are OPEN at once, so this knob's memory cost is one
+     * `CompactionCandidate` per input rather than one reader.
+     */
+    val maxFanIn: Int = DEFAULT_MAX_FAN_IN,
     /** Groups rewritten per run per catalog — tiny bites, never a storm. */
     val maxGroupsPerRun: Int,
+    /**
+     * How many times a run's own capacity in FILES the planner may fetch
+     * candidate rows for (`HOGLAKE_COMPACTION_CANDIDATE_HEADROOM`).
+     *
+     * A run rewrites at most [maxGroupsPerRun] groups of at most
+     * [maxFanIn] files. The planner fetches that times this, and the
+     * multiplier exists because the two numbers are not the same thing:
+     * candidates are not all groupable. A bucket's trailing remainder is
+     * under the file minimum, a group another maintainer claims is
+     * dropped, and the row ceiling closes some groups short — so a fetch
+     * of exactly the run's capacity would plan fewer groups than the run
+     * can execute.
+     *
+     * 2 is a headroom, not a model. It doubles the read to absorb those
+     * losses. [maxCandidates] is what actually caps the product at the
+     * production settings, which is deliberate — see [candidateBudget].
+     */
+    val candidateHeadroom: Int = DEFAULT_CANDIDATE_HEADROOM,
+    /**
+     * The HARD CAP on any one table plan's candidate read
+     * (`HOGLAKE_COMPACTION_MAX_CANDIDATES`).
+     *
+     * Two things sit under it: the bucket loop's budget
+     * ([candidateBudget] is the minimum of the two), and the
+     * no-published-generation fallback, which has no bucket list to
+     * scope by and reads a size-ordered prefix of the table.
+     *
+     * The number that matters about it is that it EXISTS. The statement
+     * it caps used to read every live file of the table under the target,
+     * which is what made a 9.9M-row table's sweep die inside its own
+     * planning transaction.
+     */
+    val maxCandidates: Int = DEFAULT_MAX_CANDIDATES,
     /**
      * How many of a sweep's planned groups are REWRITTEN AND COMMITTED
      * at once (`HOGLAKE_COMPACTION_PARALLEL_GROUPS`).
@@ -370,7 +466,112 @@ data class CompactionConfig(
             "HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS must be at least 1, got " +
                 "$committedClaimTtlSeconds"
         }
+        // Validated at CONSTRUCTION, which is boot, like every knob
+        // above: a zero here would make the planner fetch no candidates
+        // at all and report clean, empty sweeps forever.
+        // UPPER BOUNDS, not only lower ones: a fat-fingered
+        // HOGLAKE_COMPACTION_MAX_CANDIDATES is the 2026-09-30 incident
+        // again, and `candidateBudget`'s coercion prevents the overflow
+        // but not the absurdity. The ceilings are an order of magnitude
+        // above any value that has been reasoned about, so they refuse
+        // a typo and nothing else.
+        require(candidateHeadroom in 1..MAX_CANDIDATE_HEADROOM) {
+            "HOGLAKE_COMPACTION_CANDIDATE_HEADROOM must be in 1..$MAX_CANDIDATE_HEADROOM, got " +
+                "$candidateHeadroom: 0 would fetch no candidates and report a clean sweep that " +
+                "compacted nothing, and a large multiplier reintroduces the unbounded planning " +
+                "read this bound exists to stop"
+        }
+        require(maxCandidates in maxInputFiles..MAX_MAX_CANDIDATES) {
+            "HOGLAKE_COMPACTION_MAX_CANDIDATES must be in " +
+                "$maxInputFiles..$MAX_MAX_CANDIDATES, got $maxCandidates: below " +
+                "HOGLAKE_COMPACTION_MAX_INPUT_FILES no plan could fill one group, and above the " +
+                "ceiling one plan reads more rows than a run can possibly use — which is the " +
+                "2026-09-30 planning read by another name"
+        }
+        require(maxFanIn >= maxInputFiles) {
+            "HOGLAKE_COMPACTION_MAX_FAN_IN $maxFanIn is below " +
+                "HOGLAKE_COMPACTION_MAX_INPUT_FILES $maxInputFiles: the fan-in ceiling cannot be " +
+                "under its floor"
+        }
     }
+
+    /**
+     * The fan-in cap for a group of files of THESE sizes —
+     * `targetBytes / p50(sizes)`, held inside
+     * `[maxInputFiles, maxFanIn]`.
+     *
+     * # Why the cap has to scale
+     *
+     * A fixed 64 is a FILE COUNT being asked to cap a BYTE target, which
+     * is the same mistake the group MINIMUM already scales to avoid
+     * (`CompactionGrouping.groups`' `need`). On gigahog-prod-us's
+     * stray-day buckets the files are ~12 KiB, so a 64-file group
+     * rewrites 768 KiB — 0.15% of the 512 MiB target — and retires 63
+     * files. At `maxGroupsPerRun` 64 that is 4,032 files a run and
+     * ~60k an hour, against ~216k files/hour arriving: compaction
+     * 3.6x under water on arrivals alone, before touching a 9.9M-file
+     * backlog. At 2,000 inputs the same bucket's group is ~24 MB, still
+     * a twentieth of the target, and retires 1,999 files — ~1.9M an
+     * hour, which outruns arrivals ~9x and drains the backlog in hours
+     * rather than never.
+     *
+     * The other direction matters just as much: a bucket of 200 MB
+     * files must still get a handful, or one group would try to rewrite
+     * hundreds of gigabytes. `targetBytes / p50` gives 2 there and
+     * thousands for the stray buckets, from one expression, so an
+     * operator is not asked to choose a single number for both.
+     *
+     * # p50, and why the median rather than the mean
+     *
+     * The candidates of one bucket are already fetched when this is
+     * called, so the median is free and exact over them. It is the
+     * median rather than the mean because a bucket mixing one
+     * near-target file with thousands of tiny ones is exactly the shape
+     * a mean mis-sizes — and the packer's own dominance split is what
+     * then keeps the big file out of the small files' group.
+     *
+     * It is a CEILING, not a promise: the byte target still closes a
+     * group first if the bytes get there, the row ceiling still closes
+     * it if the rows do, and `need` still refuses one too short.
+     */
+    fun effectiveMaxInputFiles(sizes: List<Long>): Int {
+        if (sizes.isEmpty()) return maxInputFiles
+        val p50 = sizes.sorted()[sizes.size / 2]
+        if (p50 <= 0) return maxFanIn
+        return (targetBytes / p50).coerceIn(maxInputFiles.toLong(), maxFanIn.toLong()).toInt()
+    }
+
+    /**
+     * How many candidate rows one table's plan may fetch —
+     * `min(candidateHeadroom x maxGroupsPerRun x maxFanIn,
+     * maxCandidates)`.
+     *
+     * At the production settings the first term is 2 x 64 x 2,048 =
+     * 262,144 and the second is 50,000, so [maxCandidates] is the
+     * binding one — deliberately. The first term is what a run could
+     * consume if every bucket held 12 KiB files; the second is what one
+     * plan may READ, and reading a quarter of a million rows to plan a
+     * sweep is the shape this change exists to remove. The consequence
+     * is stated rather than hidden: on a table of tiny files a run can
+     * execute more groups than one plan's candidates fill, so the
+     * sweep is candidate-bound rather than budget-bound and the ledger
+     * says so (`candidates_truncated`).
+     *
+     * Counted on ROWS ACTUALLY RETURNED rather than on what the sampler
+     * predicted, so a stale sample cannot make the read unbounded.
+     *
+     * `Long` arithmetic, then floored into `Int`: every factor is
+     * operator-settable and their product overflows a 32-bit
+     * multiplication long before it means anything.
+     */
+    val candidateBudget: Int
+        get() =
+            minOf(
+                candidateHeadroom.toLong() * maxGroupsPerRun.toLong() * maxFanIn.toLong(),
+                maxCandidates.toLong(),
+            )
+                .coerceIn(maxInputFiles.toLong(), Int.MAX_VALUE.toLong())
+                .toInt()
 
     /**
      * The sorted path's heap budget for ONE group, after the division
@@ -460,51 +661,58 @@ data class CompactionConfig(
     /**
      * The group byte budget to plan a table under.
      *
-     * [targetBytes] for the UNSORTED path, which streams one `Group` at
-     * a time and whose heap is therefore flat in group size. For the
-     * SORTED path it is the byte size of [sortedRowCeiling] rows AT THIS
-     * TABLE'S OBSERVED DENSITY, capped at [targetBytes] — rows are what
-     * the heap holds, bytes are what the target is expressed in, and
-     * [density] is the only thing that converts between them.
+     * [targetBytes], except for a SORTED table with NESTED columns,
+     * whose object graph runs far ahead of its bytes
+     * ([nestedSortExpansion]).
      *
-     * Density is why this changed (#118). Group selection reads input
-     * file BYTES, and since #115 an input may be compaction's own zstd
-     * output rather than a client's snappy: measured 1.70x
-     * denser on event data, so the same byte budget started admitting
-     * 1.70x the rows, and rows are what become `Group` objects. Deriving
-     * the budget FROM the row ceiling makes that self-correcting — denser
-     * inputs buy fewer bytes per group, automatically, per table, with no
-     * guessed ratio anywhere.
+     * # It used to carry a DENSITY arm, and the row capacity replaced it
      *
-     * It stays a BYTE budget rather than becoming a row budget because
-     * grouping is byte-anchored: the candidate filter and the group
-     * quota are both sizes. Deriving the budget from the row ceiling
-     * keeps the two in one currency instead of bolting a row cap onto a
-     * byte quota, which would form groups and then refuse them.
+     * The sorted path's real bound is ROWS — a group is materialized as
+     * parquet-java `Group` objects, so what has to fit is
+     * [sortedRowCeiling] of them. Bin packing could only bound BYTES, so
+     * this function converted: it measured the table's average
+     * bytes-per-row over its candidate population and scaled the target
+     * by it, which fixed #118's blindness to a codec change (compaction's
+     * own zstd output is 1.70x denser than a client's snappy, so the same
+     * byte budget started admitting 1.70x the rows).
      *
-     * Never below 2 — CompactionGrouping refuses a smaller target, and a
-     * table whose target derated to nothing would stop compacting.
-     * Note this derate is exactly why the group minimum has to scale
-     * with file size: it can land the effective target at tens of
-     * megabytes, where no five candidate files fit under it.
-     * [InputDensity.UNKNOWN] (a table with no candidate rows to measure)
-     * falls back to the pre-#118 shape, which is never looser.
+     * That conversion is GONE, for two reasons, and both are
+     * improvements rather than trades:
+     *
+     *  - **`CompactionGrouping.groups` now takes the row ceiling as a
+     *    second capacity**, so the bound is enforced in the unit it is
+     *    stated in, on `hog_data_file.record_count`, which is
+     *    REGISTERED AND EXACT per file. An average density is an
+     *    estimate, and it was an estimate whose only job was to
+     *    approximate a number the catalog already had exactly.
+     *  - **Measuring it cost an unbounded aggregate.** `density` summed
+     *    `file_size_bytes` and `record_count` over every live candidate
+     *    of the table on every sweep — ~10M rows on gigahog-prod-us's
+     *    `ingest.events_raw`, inside the planning transaction, which is
+     *    the same defect as the candidate read it sat beside.
+     *
+     * What the derate did to the CANDIDATE FILTER went with it: a sorted
+     * table's candidates are now files under the raw target again,
+     * rather than under a derated budget, and the row capacity is what
+     * keeps the groups those files form small enough. That is strictly
+     * more compactable — a file the derate excluded could never join any
+     * group, and now it can join a short one.
+     *
+     * Never below 2: CompactionGrouping refuses a smaller target, and a
+     * table whose budget derated to nothing would stop compacting.
      */
     fun effectiveTargetBytes(
         columns: List<Column>,
         sorted: Boolean,
-        density: InputDensity = InputDensity.UNKNOWN,
     ): Long {
         if (!sorted) return targetBytes
-        // Two bounds, both enforced, tightest wins — they are estimates
-        // of the same heap by different routes and neither subsumes the
-        // other. The NESTED one is a statement about BYTES (a nested
-        // group's graph measured 30-70x its compressed size) and is the
-        // only thing that sees list lengths at all. The DENSITY one is a
-        // statement about ROWS and is exact for a flat schema. Take the
-        // nested bound away and a nested table with few, fat rows plans
-        // at the raw target again; take the density bound away and #118
-        // comes back.
+        // The NESTED bound is a statement about BYTES, and it is the only
+        // thing in the system that sees list lengths at all — a nested
+        // group's materialized graph measured 30-70x its compressed size,
+        // and no row count can predict that, because list lengths are
+        // data. It therefore survives the density arm's removal: the row
+        // capacity bounds ROWS exactly, and this bounds the bytes those
+        // rows may carry when each row's node count is unknowable.
         val nestedBound =
             if (nestedSortExpansion == 1 || columns.allNodes().none { it.def.type.isNested }) {
                 targetBytes
@@ -513,22 +721,13 @@ data class CompactionConfig(
                 // [sortedHeapBytesPerGroup] gives: this arm is a
                 // statement about how much HEAP a group's nested object
                 // graph takes, so N concurrent groups multiply it just
-                // as they multiply the density arm. Leaving it undivided
+                // as they multiply the row ceiling. Leaving it undivided
                 // made the tightest-bound-wins rule choose an undivided
                 // bound for exactly the tables whose graphs are the
                 // least predictable — the nested ones.
                 maxOf(1L, targetBytes / nestedSortExpansion / parallelGroups)
             }
-        val densityBound =
-            density.bytesPerRow?.let { bytesPerRow ->
-                // Through Double deliberately: ceiling * bytesPerRow is a
-                // row count times a per-row size and overflows Long for a
-                // sparse table long before it means anything.
-                (sortedRowCeiling(columns).toDouble() * bytesPerRow)
-                    .coerceIn(0.0, targetBytes.toDouble())
-                    .toLong()
-            } ?: targetBytes
-        return maxOf(2L, minOf(targetBytes, nestedBound, densityBound))
+        return maxOf(2L, minOf(targetBytes, nestedBound))
     }
 
     companion object {
@@ -581,33 +780,42 @@ data class CompactionConfig(
          * is one sweep — not one sweep interval.
          */
         const val DEFAULT_COMMITTED_CLAIM_TTL_SECONDS = 600L
-    }
-}
 
-/**
- * The two catalog-known quantities the sorted path's heap depends on,
- * summed over a table's compaction candidates: registered file bytes and
- * registered rows.
- *
- * Both are already columns of `hog_data_file` (`file_size_bytes`,
- * `record_count`), so measuring a table's density costs one metadata
- * aggregate and NO object-store IO — which is the reason this rather
- * than the parquet footer's `total_uncompressed_size`. The footer
- * carries the exact ratio per file, but reading it means opening every
- * candidate over S3 on every sweep, and compaction planning is
- * metadata-only by design.
- */
-data class InputDensity(val totalBytes: Long, val totalRecords: Long) {
-    /**
-     * Registered bytes per registered row, or null when the candidates
-     * hold no rows (nothing to materialize, so nothing to bound).
-     */
-    val bytesPerRow: Double?
-        get() = if (totalRecords > 0 && totalBytes > 0) totalBytes.toDouble() / totalRecords else null
+        /**
+         * See [candidateHeadroom]: fetch twice the files a run can
+         * possibly consume, because not every candidate is groupable.
+         */
+        const val DEFAULT_CANDIDATE_HEADROOM = 2
 
-    companion object {
-        /** No candidates measured — callers fall back to the un-derated budget. */
-        val UNKNOWN = InputDensity(0, 0)
+        /**
+         * See [maxCandidates]: the hard cap on one table plan's
+         * candidate read, and the binding term of [candidateBudget] at
+         * the production settings.
+         */
+        const val DEFAULT_MAX_CANDIDATES = 50_000
+
+        /**
+         * See [maxFanIn]: 2,048 inputs per group, chosen from
+         * `CompactionFanInMeasurement`'s measured commit-lock hold
+         * (33.6 ms against a 50 ms per-group budget) rather than
+         * guessed.
+         */
+        const val DEFAULT_MAX_FAN_IN = 2_048
+
+        /**
+         * The ceiling on [candidateHeadroom] — an order of magnitude
+         * above the default, so it refuses a typo and nothing a person
+         * has reasoned about.
+         */
+        const val MAX_CANDIDATE_HEADROOM = 32
+
+        /**
+         * The ceiling on [maxCandidates], for the same reason. 200,000
+         * is four times the shipped default and still an order of
+         * magnitude under the read this change removed, so it refuses a
+         * typo without blessing a value nobody has reasoned about.
+         */
+        const val MAX_MAX_CANDIDATES = 200_000
     }
 }
 
@@ -672,11 +880,21 @@ data class CompactionPlan(
     val table: String,
     val groups: List<CompactionGroup>,
     /**
-     * Groups this plan formed and then REFUSED because their registered
-     * survivor count is above the table's sorted-path row ceiling
-     * (CompactionConfig.sortedRowCeiling) — they would not fit the heap.
+     * Groups the table's sorted-path row ceiling
+     * (CompactionConfig.sortedRowCeiling) left unrewritable.
      *
-     * Refused HERE, in metadata, rather than discovered by an
+     * Groups are PACKED to the ceiling now, so this is no longer "groups
+     * formed on bytes and then refused" — that was the production
+     * pathology (~2,000 a run on gigahog-prod-us's `ingest.events_raw`,
+     * where ~50 bytes per row made every byte-sized group ~2.9M rows
+     * against a ceiling of 552,336, and the table never compacted).
+     * What it counts now is work the ceiling cannot make a group OF: a
+     * single file whose own surviving rows exceed it, or files dense
+     * enough that no two of them fit, both of which the packer closes
+     * short of the file minimum
+     * (`CompactionGrouping.Packing.rowBoundRefusals`).
+     *
+     * Decided in metadata rather than discovered by an
      * OutOfMemoryError ninety seconds into a rewrite: record_count is
      * already in the catalog, so the check is exact and free, and a
      * group that cannot fit never spends the IO to find out. The count
@@ -700,6 +918,49 @@ data class CompactionPlan(
      * spends no IO, so it does NOT consume the run's group budget.
      */
     val claimedGroups: Long = 0,
+    /**
+     * Candidate file rows this plan actually read.
+     *
+     * The measure the planner's own defect had no series for. It is
+     * bounded by CompactionConfig.candidateBudget on the bucket-scoped
+     * path and by CompactionConfig.maxCandidates on the whole-table
+     * fallback, and a value AT either bound means the table has debt
+     * this plan could not see — which is what [candidatesTruncated]
+     * says without the reader having to know the configuration.
+     */
+    val candidatesFetched: Long = 0,
+    /**
+     * Buckets this plan fetched candidates for, of the
+     * [bucketsAvailable] the sample offered.
+     *
+     * Read the pair together: `considered` well under `available` on
+     * every sweep means the candidate budget is the binding constraint
+     * and the table's other buckets wait their turn (which is correct,
+     * and is why the sample is ordered by debt), while `considered` ==
+     * `available` means the plan saw the whole table.
+     */
+    val bucketsConsidered: Long = 0,
+    /**
+     * Buckets the sampler's published generation credits this table with
+     * enough small files to form a group.
+     *
+     * Zero on the whole-table fallback's unpartitioned case — there are
+     * no partition buckets — and zero for a catalog whose sampler has
+     * published nothing yet, which is the same answer as "no debt" and
+     * is why the fallback exists rather than a refusal.
+     */
+    val bucketsAvailable: Long = 0,
+    /** 1 when the fetch hit its own cap; see [candidatesFetched]. */
+    val candidatesTruncated: Long = 0,
+    /**
+     * Wall-clock milliseconds this plan took, all three phases.
+     *
+     * Recorded because the planner's failure mode was a TIME one: the
+     * in-JVM packing grew past `idle_in_transaction_session_timeout`
+     * while a transaction was open, and nothing in the ledger said the
+     * plan had become slow before every sweep started dying.
+     */
+    val planMs: Long = 0,
 )
 
 /**
@@ -886,6 +1147,45 @@ class CompactionService(
 
     // ---- planning --------------------------------------------------------
 
+    /**
+     * A hook the packing phase calls before it starts, so a test can
+     * make that phase SLOW.
+     *
+     * The reason it exists is the bug this planner was rebuilt for: the
+     * candidate read, the in-JVM bin packing and the claim read all ran
+     * inside ONE transaction, and a connection sitting idle inside a
+     * transaction is killed by `Database.SESSION_INIT_SQL`'s
+     * `idle_in_transaction_session_timeout` (30 s in production). On
+     * gigahog-prod-us's `ingest.events_raw` — ~9.9M candidate rows over
+     * ~2,800 buckets — the packing took minutes and every sweep died on
+     * the statement AFTER it with `FATAL: terminating connection due to
+     * idle-in-transaction timeout`.
+     *
+     * The property that prevents it is structural: NO CONNECTION IS HELD
+     * ACROSS THE PACKING. A structural property needs a test that fails
+     * without it, and the only way to write one is to make the packing
+     * take longer than the session's idle bound — hence a seam rather
+     * than a sleep in production code. Default is a no-op, called
+     * exactly once per table plan, and nothing but a test ever sets it.
+     */
+    internal var beforePacking: () -> Unit = {}
+
+    /**
+     * A hook phase (a) calls on its OWN handle, before the candidate
+     * fetch — so a test can learn which backend the planner is using.
+     *
+     * The companion to [beforePacking], and it exists because the
+     * property they test together is about a specific CONNECTION:
+     * "nothing is held across the packing" is only checkable by asking
+     * `pg_stat_activity` about the planner's backend from a DIFFERENT
+     * one, and its pid is knowable only from inside the transaction.
+     * A test that probed on the planner's own pooled connection would
+     * be served that connection and see `active` whatever the code did
+     * — which is exactly how the first version of that test passed
+     * under the mutation it existed to catch.
+     */
+    internal var beforeFetch: (Handle) -> Unit = {}
+
     /** Public metadata-only planning for one table (also the test surface). */
     fun planTable(
         catalog: String,
@@ -894,25 +1194,142 @@ class CompactionService(
         cfg: CompactionConfig = defaults,
     ): CompactionPlan = planSnapshot(catalog, namespace, table, cfg).plan
 
-    /** Schema, head and input files must come from the SAME MVCC view. */
+    /**
+     * Plan one table in THREE phases, of which only the first and third
+     * hold a database connection.
+     *
+     * # Why it is split, and what each phase may do
+     *
+     * This used to be one `inTransactionUnchecked` around the whole
+     * thing. The in-JVM bin packing therefore ran with a connection
+     * parked inside an open transaction, which
+     * `idle_in_transaction_session_timeout` (30 s per
+     * `Database.SESSION_INIT_SQL`) kills — and did, on every sweep of a
+     * table whose candidate set had grown to ~9.9M rows. The rule that
+     * replaces it: **a transaction may hold nothing but statements.**
+     *
+     *  - **(a) READ**, one short `REPEATABLE READ READ ONLY`
+     *    transaction: resolve the catalog/namespace/table, the live
+     *    columns and the live sort order at the catalog head, pick the
+     *    buckets to work on, and fetch their candidate rows. Everything
+     *    that must agree with everything else is in here, on ONE MVCC
+     *    snapshot — the schema the rewrite will be shaped by, the sort
+     *    spec that decides whether there is a row ceiling at all, and
+     *    the files. That invariant is why this phase is a transaction
+     *    and not three autocommit reads.
+     *  - **(b) PACK**, with no connection at all: bin packing, the row
+     *    ceiling, the WARN. Pure CPU over the rows phase (a) returned.
+     *  - **(c) CLAIM READ**, one short autocommit read: which of this
+     *    table's files another maintainer is already rewriting.
+     *
+     * # Why (c) is safe outside (a)'s snapshot
+     *
+     * Because a claim is an OPTIMIZATION, never authorization
+     * (`CompactionClaimRepo`), and because the direction of the error is
+     * the safe one. Read later than the candidates, this sees MORE
+     * claims, never fewer: a claim taken during (b) is visible here and
+     * its group is dropped as `claimed_elsewhere`, where the old shape
+     * would have planned it and lost the rewrite at commit. It can
+     * never miss a claim that (a)'s snapshot would have shown, because
+     * claims are only deleted by a release or an expiry purge, and both
+     * of those mean the group is no longer being rewritten — planning it
+     * is then correct.
+     *
+     * # Why a file that died between (a) and (c) is still safe
+     *
+     * Nothing here is authorization either. A plan is a proposal; the
+     * commit is what checks. `commitGroup` re-verifies, under the
+     * per-catalog commit lock, that the staging ticket is untouched,
+     * that the TABLE is not dropped (`hog_table.dropped_snapshot`),
+     * that every input is still live (`end_snapshot IS NULL`) and that
+     * every input still carries EXACTLY its planned deletion vector by
+     * `delete_file_id`. A stale plan therefore costs one group —
+     * `skipped_conflicts` or `dv_superseded` — and never a wrong commit.
+     * That was already true of a plan the old shape held across minutes
+     * of rewriting other groups; widening the window by the packing time
+     * changes nothing about which check catches it.
+     */
     private fun planSnapshot(
         catalog: String,
         namespace: String,
         table: String,
         cfg: CompactionConfig,
-    ): PlanWithContext =
-        jdbi.inTransactionUnchecked { h ->
-            h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-            planWithContext(h, catalog, namespace, table, cfg)
-        }
+    ): PlanWithContext {
+        val startedAt = System.nanoTime()
+        // (a) One short read transaction: the table's identity, its
+        // shape, and its candidate rows, all on one MVCC snapshot.
+        val fetched =
+            jdbi.inTransactionUnchecked { h ->
+                h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                // A BOUND TIGHTER THAN THE SESSION'S, because the
+                // doctrine asks every statement inside a transaction for
+                // one and the session's is 60 s
+                // (`Database.SESSION_INIT_SQL`).
+                //
+                // 15 s, and the number is derived rather than picked: a
+                // sweep plans one table at a time and executes its
+                // groups before planning the next
+                // (`doRunOnce`, for freshness), and a group costs a
+                // measured ~8.5 s of object-store latency. So a plan
+                // that spends more than about two groups' worth of wall
+                // clock on metadata has stopped being the cheap half of
+                // the sweep, and the honest outcome is to fail THIS
+                // TABLE fast and let the sweep move on rather than to
+                // sit on a statement whose bound is four minutes of
+                // groups.
+                //
+                // It is a fail-fast, not a correctness bound: the throw
+                // leaves the read-only transaction rolled back with
+                // nothing staged, and `runOnceAllCatalogs` treats it as
+                // a per-catalog failure the ledger counts. `SET LOCAL`,
+                // so it expires with the transaction and the pooled
+                // connection goes back carrying the session's 60 s.
+                h.execute("SET LOCAL statement_timeout = '${PLAN_STATEMENT_TIMEOUT_MS}ms'")
+                beforeFetch(h)
+                fetchCandidates(h, catalog, namespace, table, cfg)
+            }
+        // (b) Packing, holding nothing. The hook is the test seam that
+        // makes this phase slower than the session's idle bound; see
+        // [beforePacking].
+        beforePacking()
+        val packed = pack(fetched, cfg)
+        // (c) One short read for the sibling maintainer's claims.
+        val free = withoutClaimedGroups(fetched.ctx, cfg, packed.groups)
+        val planMs = (System.nanoTime() - startedAt) / 1_000_000
+        return PlanWithContext(
+            fetched.ctx,
+            CompactionPlan(
+                tableId = fetched.ctx.tableId,
+                namespace = fetched.ctx.namespace,
+                table = fetched.ctx.table,
+                groups = free.groups,
+                heapRefusedGroups = packed.heapRefused,
+                claimedGroups = free.claimed,
+                candidatesFetched = fetched.candidatesFetched,
+                bucketsConsidered = fetched.bucketsConsidered,
+                bucketsAvailable = fetched.bucketsAvailable,
+                candidatesTruncated = if (fetched.truncated) 1 else 0,
+                planMs = planMs,
+            ),
+        )
+    }
 
-    private fun planWithContext(
+    /**
+     * The table's identity and shape at the catalog head — everything
+     * execution needs that is not a file row.
+     *
+     * Separate from the candidate fetch because [compactPlannedGroup]
+     * wants exactly this and no plan: re-running a bounded fetch and a
+     * whole pack to throw both away was what asking `planSnapshot` for
+     * its context alone used to cost.
+     */
+    private fun tableContext(
         h: Handle,
         catalog: String,
         namespace: String,
         table: String,
         cfg: CompactionConfig,
-    ): PlanWithContext {
+    ): TableContext {
         val cat =
             CatalogRepo.findByName(h, catalog)
                 ?: throw HoglakeException.NotFound("catalog '$catalog'")
@@ -922,170 +1339,884 @@ class CompactionService(
         val t =
             TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                 ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
-        val ctx =
-            TableContext(
-                catalogId = cat.catalogId,
-                dataPath = cat.dataPath,
-                namespace = ns.name,
-                table = t.name,
-                tableId = t.tableId,
-                columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
-                sortFields =
-                    SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
-                        ?.fields ?: emptyList(),
-                maxNodesPerRow = cfg.maxNodesPerRow,
-                codec = cfg.codec,
-                inputOpenParallelism = cfg.inputOpenParallelism,
-                commitLockTimeoutMs = cfg.commitLockTimeoutMs,
-            )
-        val planned = groups(h, ctx, cfg)
-        return PlanWithContext(
-            ctx,
-            CompactionPlan(
-                t.tableId,
-                ns.name,
-                t.name,
-                planned.groups,
-                planned.heapRefused,
-                planned.claimed,
-            ),
+        return TableContext(
+            catalogId = cat.catalogId,
+            dataPath = cat.dataPath,
+            namespace = ns.name,
+            table = t.name,
+            tableId = t.tableId,
+            columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
+            sortFields =
+                SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
+                    ?.fields ?: emptyList(),
+            maxNodesPerRow = cfg.maxNodesPerRow,
+            codec = cfg.codec,
+            inputOpenParallelism = cfg.inputOpenParallelism,
+            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
         )
     }
 
-    /**
-     * What [groups] produced: what will be attempted, what the heap
-     * ceiling refused, and what another maintainer's claim covered.
-     */
-    private data class PlannedGroups(
-        val groups: List<CompactionGroup>,
-        val heapRefused: Long,
-        val claimed: Long = 0,
+    /** A candidate bucket: one (spec, partition values) pair. */
+    private data class Bucket(val specId: Long?, val values: List<String?>?)
+
+    /** Phase (a)'s output: what to pack, and what it cost to find. */
+    private data class CandidateFetch(
+        val ctx: TableContext,
+        /** The group byte budget this fetch filtered on. */
+        val budget: Long,
+        /**
+         * The row ceiling this fetch filtered on, and the capacity
+         * packing will use. `NO_ROW_CAPACITY` for an unsorted table.
+         */
+        val rowCapacity: Long,
+        val byBucket: Map<Bucket, List<CompactionCandidate>>,
+        val candidatesFetched: Long,
+        val bucketsConsidered: Long,
+        val bucketsAvailable: Long,
+        /** The fetch hit its own cap, so the table has debt this plan cannot see. */
+        val truncated: Boolean,
     )
 
-    private fun groups(
+    /**
+     * THE BOUNDED CANDIDATE READ, and the reason this class was
+     * rewritten.
+     *
+     * # The shape it replaces
+     *
+     * One statement selected EVERY live file of the table under the
+     * target, with a correlated `array_agg` over
+     * `hog_file_partition_value` per row, into a Kotlin list. A run
+     * rewrites at most `maxGroupsPerRun` groups of at most
+     * `effectiveMaxInputFiles` files; on gigahog-prod-us the statement
+     * fetched **9.9 million** rows and ran 9.9M correlated subqueries
+     * doing it. The packing that followed took minutes with the
+     * transaction still open, which is what the idle-in-transaction kill
+     * was measuring.
+     *
+     * # ONE STATEMENT, and the LIMIT is on the ORDERED SCAN
+     *
+     * Every fetch here is [CANDIDATE_SQL]: an ordered index scan of
+     * `hog_data_file_maintenance_size_scan (catalog_id, table_id,
+     * file_size_bytes, data_file_id)` (V10), smallest first,
+     * table-scoped, with the bucket's partition tuple applied as one
+     * `EXISTS` arm per key against V23's index and the `LIMIT` on that
+     * scan — so the read STOPS at the cap instead of materialising a
+     * bucket and sorting it.
+     *
+     * The first version of this change drove the other way: an
+     * `INTERSECT` of V23 index arms into a `hog_data_file` primary-key
+     * probe per id, with `ORDER BY file_size_bytes` and the `LIMIT` on
+     * top. That bounds the ROWS RETURNED and not the WORK: the sort key
+     * is not obtainable from the intersect's order, so Postgres had to
+     * materialise every id the bucket holds, probe the manifest for each
+     * one and sort the survivors before the `LIMIT` applied. On a
+     * ~100k-file bucket that is ~100k primary-key probes and a ~50 MB
+     * sort — past `work_mem` — to return 8,192 rows. Worse, the arms
+     * are CATALOG-scoped: `hog_file_partition_value` carries no
+     * `table_id` (`schema.sql`), so an arm on `value = 'day-…'` returns
+     * that day's files in *every* table of the catalog, and every
+     * day-partitioned table writes the same day string.
+     *
+     * Leading on the manifest fixes both: the scan is table-scoped by
+     * the index's own second column, it is already in the sort order, and
+     * nothing is materialised. WHICH PLAN POSTGRES PICKS IS NOT FIXED,
+     * and both are bounded — see [CANDIDATE_SQL].
+     *
+     * # Buckets first, from the published sample
+     *
+     * Groups never span a `(spec_id, partition_values)` bucket, so the
+     * question "which files might this run rewrite" is really "which
+     * BUCKETS are worth rewriting" — and the maintenance sampler has
+     * already answered that per bucket in
+     * `hog_maintenance_summary_tier`. See [sampledBuckets] for the order
+     * and [bucketCursor] for why a strict order is not enough.
+     *
+     * The sample is allowed to be stale, and nothing here depends on it
+     * being right. It decides WHERE TO LOOK; the files come from live
+     * rows on phase (a)'s snapshot. A bucket that emptied since the
+     * generation was published yields no candidates and no group.
+     *
+     * # Ordered by SIZE, and the reason is VALUE rather than access path
+     *
+     * The old statement ordered by `row_id_start`, and this one orders
+     * by `file_size_bytes`. The reason is NOT that the old order lacked
+     * an index — it has one, V10's `hog_data_file_maintenance_scan
+     * (catalog_id, table_id, row_id_start, data_file_id)`, and a
+     * measurement on a 250k-row fixture shows both orders served as
+     * ordered index scans with no `Sort` node and near-identical cost
+     * (106 ms against 107 ms). An earlier version of this KDoc claimed
+     * otherwise and it was wrong.
+     *
+     * The reason is what a TRUNCATED prefix should contain. Both orders
+     * let the `LIMIT` stop the scan; only one of them makes the rows it
+     * stops on the right rows. Size-ascending is the order
+     * `CompactionGrouping` consumes candidates in, and the smallest
+     * files are where compaction buys the most — a group of 12 KiB
+     * files retires 63 files for 768 KiB rewritten, a group of 200 MB
+     * files retires the same 63 for up to 12.8 GB. So a prefix of the
+     * table's smallest candidates is the most compactable part of it,
+     * and a prefix in row-id order is an arbitrary slice of arrival
+     * history.
+     *
+     * The consequence is handled rather than ignored: the rewriter's
+     * input order must stay row-id order, and [rowIdOrder] restores it
+     * after packing.
+     *
+     * # Three states, not two
+     *
+     *  - **no published generation** (a fresh install, the sampler's
+     *    warm-up): there is no bucket list, so the fetch is the same
+     *    statement with no `EXISTS` arms and the aggregated tuple
+     *    projected per returned row, capped at
+     *    [CompactionConfig.maxCandidates];
+     *  - **a published generation with no qualifying bucket**: THERE IS
+     *    NO WORK. Return an empty fetch. The first version of this
+     *    change conflated this with the state above and ran the
+     *    50,000-row whole-table statement, every sweep, forever, for a
+     *    table whose debt is real but spread thinner than the file
+     *    minimum — which is the one statement in this change that still
+     *    carries the per-row `array_agg` the incident was about;
+     *  - **a published generation with buckets**: the bucket loop.
+     */
+    private fun fetchCandidates(
         h: Handle,
-        ctx: TableContext,
+        catalog: String,
+        namespace: String,
+        table: String,
         cfg: CompactionConfig,
-    ): PlannedGroups {
+    ): CandidateFetch {
+        val ctx = tableContext(h, catalog, namespace, table, cfg)
+        val sorted = ctx.sortFields.isNotEmpty()
+        val budget = cfg.effectiveTargetBytes(ctx.columns, sorted)
+        // THE ROW CEILING IS PART OF THE CANDIDATE FILTER, not only of
+        // the packing. A sorted file whose own surviving rows exceed the
+        // ceiling can never join any group, so fetching it costs a slot
+        // of the candidate budget to produce a one-file group, a
+        // refusal and a WARN. `record_count` is registered and exact, so
+        // the filter is free — which is what the removed density derate
+        // was approximating when it narrowed the filter by an average.
+        //
+        // `record_count`, not survivors: the DV's delete count is on
+        // another table and this predicate has to stay on the index's
+        // own row. It is therefore conservative in the right direction —
+        // a file the ceiling would admit only after its DV is applied is
+        // excluded, which costs one group and never an OOM.
+        val rowCapacity = if (sorted) cfg.sortedRowCeiling(ctx.columns) else CompactionGrouping.NO_ROW_CAPACITY
+
+        fun empty(
+            available: Long = 0,
+            truncated: Boolean = false,
+        ) = CandidateFetch(ctx, budget, rowCapacity, emptyMap(), 0, 0, available, truncated)
         // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
         // work that could drop payloads or repeatedly fail the maintenance loop.
         // allNodes, not the top level: a variant nested inside a struct
         // is still a variant the rewriter cannot write, and `struct{v:
         // variant}` has no top-level one. #77's check predates
         // containers, where the two were the same question.
-        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) {
-            return PlannedGroups(emptyList(), 0)
+        //
+        // Checked BEFORE the fetch, not after: a variant table's
+        // candidate rows were read and thrown away on every sweep.
+        if (ctx.columns.allNodes().any { it.def.type == ColType.VARIANT }) return empty()
+
+        // Does a published generation exist AT ALL? That is a different
+        // question from "does it credit this table with a compactable
+        // bucket", and the two have opposite answers.
+        if (TierTotalsRepo.publishedGeneration(h, ctx.catalogId) == null) {
+            return fetchWholeTable(h, ctx, budget, rowCapacity, cfg)
         }
+        val sampled = sampledBuckets(h, ctx, cfg)
+        if (sampled.isEmpty()) return empty()
 
-        data class Bucket(val specId: Long?, val values: List<String?>?)
+        val candidateBudget = cfg.candidateBudget
+        // THE NUMBER OF STATEMENTS IS BOUNDED TOO, not only the rows.
+        // A sample that credits 2,800 buckets a large compaction has
+        // since emptied would otherwise make one plan issue 2,800 round
+        // trips and never reach the row cap — the doctrine bounds the
+        // WORK per run, not only what it returns. A bucket cannot yield
+        // a group with fewer than `minInputFiles` files, so a budget of
+        // N rows cannot be spent by more than N/minInputFiles useful
+        // buckets.
+        val bucketLimit = maxOf(1, candidateBudget / cfg.minInputFiles)
+        val byBucket = LinkedHashMap<Bucket, List<CompactionCandidate>>()
+        var fetched = 0L
+        var considered = 0L
+        var truncated = false
+        for (bucket in rotated(ctx, sampled)) {
+            if (fetched >= candidateBudget || considered >= bucketLimit) {
+                truncated = true
+                break
+            }
+            // `room + 1` so the truncation flag is EXACT: a bucket that
+            // holds exactly its remaining room was truncated by nothing,
+            // and a bucket that holds one more was. Trimmed below.
+            val room = (candidateBudget - fetched).toInt()
+            val rows = bucketCandidates(h, ctx, budget, rowCapacity, cfg, bucket.bucket, room + 1)
+            considered++
+            if (rows.size > room) truncated = true
+            val taken = if (rows.size > room) rows.subList(0, room) else rows
+            fetched += taken.size
+            if (taken.isNotEmpty()) byBucket[bucket.bucket] = taken
+            rememberCursor(ctx, bucket.bucket)
+        }
+        return CandidateFetch(
+            ctx = ctx,
+            budget = budget,
+            rowCapacity = rowCapacity,
+            byBucket = byBucket,
+            candidatesFetched = fetched,
+            bucketsConsidered = considered,
+            bucketsAvailable = sampled.size.toLong(),
+            truncated = truncated,
+        )
+    }
 
-        data class Row(val candidate: CompactionCandidate, val bucket: Bucket)
+    /** One sampled bucket and the debt the sample credits it with. */
+    private data class SampledBucket(
+        val bucket: Bucket,
+        /** Files the sampler's mirror of the packer would put in a group. */
+        val selected: Long,
+        val smallCount: Long,
+        val smallBytes: Long,
+    )
 
-        val sorted = ctx.sortFields.isNotEmpty()
-        // The DERATED budget, not the raw one: a sorted table's group has
-        // to stay small enough that materializing it to sort fits in heap
-        // (CompactionConfig.effectiveTargetBytes), which depends on how
-        // many ROWS its bytes carry — so the density is measured first,
-        // from the same MVCC snapshot, in metadata. It narrows the
-        // candidate filter too: a file above the derated target can never
-        // fill a group under it, so fetching it would only be work.
-        val budget = cfg.effectiveTargetBytes(ctx.columns, sorted, density(h, ctx, cfg))
-
-        val rows =
-            h.createQuery(
-                """
-            SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
-                   f.footer_size, f.row_id_start, f.spec_id, f.stats_state,
-                   f.explicit_row_ids,
-                   dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count,
-                   (SELECT array_agg(pv.value ORDER BY pv.key_index)
-                    FROM hog_file_partition_value pv
-                    WHERE pv.catalog_id = f.catalog_id
-                      AND pv.data_file_id = f.data_file_id) AS partition_values
-            FROM hog_data_file f
-            LEFT JOIN hog_delete_file dv
-              ON dv.catalog_id = f.catalog_id
-             AND dv.data_file_id = f.data_file_id
-             AND dv.end_snapshot IS NULL
-            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
-              AND f.end_snapshot IS NULL
-              AND f.file_size_bytes < :targetBytes
-            ORDER BY f.row_id_start, f.data_file_id
+    /**
+     * This table's buckets in the sampler's PUBLISHED generation that
+     * are worth rewriting, BEST VALUE FIRST.
+     *
+     * # The order is compaction VALUE, not file population
+     *
+     * The first version of this change ordered by `small_count DESC`,
+     * which ranks buckets by raw file count — and on
+     * gigahog-prod-us's `ingest.events_raw` that is the FRESH-DAY
+     * buckets (~100k files of up to 200 MB), not the stray-day buckets
+     * (~3.5k files of ~12 KiB each) that hold the 9.9M-file problem.
+     * Files removed per byte rewritten differs by four orders of
+     * magnitude between the two, and `small_count DESC` picks the wrong
+     * end — then keeps picking it, because a day's bucket outranks every
+     * stray bucket for about a day and the next day's grows into the
+     * same position.
+     *
+     * One FLOOR and two SORT KEYS:
+     *
+     *  - **the floor is `selected >= 2`**, and both halves of that are
+     *    deliberate.
+     *    `selected` (`MaintenanceSummarySampler`'s per-bucket
+     *    accumulator) is the number of files that would land in groups
+     *    the planner would ACTUALLY TAKE — the sampler mirrors the byte
+     *    rule, the dominance split and the scaling `need` minimum to
+     *    compute it — so it answers "is there actionable work here"
+     *    rather than "how many files are there", which is what
+     *    `small_count` answered.
+     *    And the threshold is 2, not `minInputFiles`, because
+     *    `CompactionGrouping`'s minimum SCALES: a group needs
+     *    `max(2, min(minInputFiles, targetBytes / its largest file))`
+     *    files, so a bucket of three 300 MB files under a 512 MiB
+     *    target is groupable at `need = 2` while `small_count` and
+     *    `selected` are both 3. A floor of `minInputFiles` would have
+     *    excluded it from the fetch forever while the compaction-debt
+     *    page went on reporting its debt. 2 is the floor the packer
+     *    itself cannot go below — one file is a copy, not a
+     *    compaction — so it is the only threshold that cannot exclude
+     *    groupable work.
+     *  - **the first sort key is BYTES PER FILE, ascending**
+     *    (`small_bytes / small_count`), which is files removed per byte
+     *    rewritten, descending. It is the measure the whole change
+     *    exists to serve: a group of 12 KiB files rewrites 768 KiB to
+     *    retire 63 files (~84 files per MB), a group of 200 MB files
+     *    rewrites up to 12.8 GB to retire the same 63 (~0.005 per MB).
+     *  - **the second is `selected`, descending**: among buckets of
+     *    comparably sized files, take the one with the most actionable
+     *    work.
+     *
+     * `GREATEST(small_count, 1)` because the floor above admits only
+     * buckets with files, and the guard costs nothing.
+     *
+     * # The order is also what keeps the FETCH bounded
+     *
+     * This is not only a throughput argument. [candidateSql] leads on
+     * V10's size index and lets the `LIMIT` stop the scan, which is only
+     * cheap while the bucket's files are among the table's SMALLEST: a
+     * probe for a bucket of near-target files, with smaller files
+     * elsewhere in the table, has to walk past all of them, and
+     * Postgres then picks a whole-table plan instead (measured on
+     * `CompactionCandidateFetchPlanIntegrationTest`'s fixture: a
+     * hash join over a sequential scan of the table). Ordering by
+     * bytes-per-file ascending makes that combination UNREACHABLE while
+     * smaller files exist — the buckets whose files are the table's
+     * smallest are exactly the ones probed first — so the ordering and
+     * the plan's bound are the same decision.
+     *
+     * # It is LIMITED, because the doctrine bounds every fetch
+     *
+     * One row per partition bucket of one table, reached through V22's
+     * `hog_maintenance_summary_tier_table (catalog_id, generation,
+     * table_id)` index, is small for a day-partitioned table — 2,804
+     * rows, 2.2 ms, 87 buffers measured — and NOT small for a
+     * `(team, day)` spec at 1,000 teams x 90 days, which is 90,000 rows
+     * into one `HashAggregate` and sort per table per sweep. Partitions
+     * are operator data; "buckets are few" is not a bound.
+     *
+     * So [MAX_SAMPLED_BUCKETS] caps it, and the order above is what
+     * makes a cap safe: the rows that survive it are the ones the
+     * planner would have probed first anyway. [bucketsAvailable] then
+     * counts what was OFFERED after the cap, which is a number an
+     * operator can still read against [bucketsConsidered] — and the
+     * cap is an order of magnitude above the documented 5,000-bucket
+     * stress shape, so it bites only where the unbounded read would
+     * have hurt.
+     *
+     * The number of buckets the planner PROBES is bounded separately
+     * and much more tightly, in [fetchCandidates].
+     *
+     * TUPLE-LESS BUCKETS ARE INCLUDED. A table partitioned mid-life
+     * keeps one — every file written before the spec existed, with a
+     * null `spec_id` and no `hog_file_partition_value` rows — and an
+     * unpartitioned table is nothing but that bucket. Excluding it would
+     * have left those files uncompactable forever, silently.
+     *
+     * The `GROUP BY` survives from `PartitionStatsService`'s reader for
+     * the same reason it has one — the bucket key also hashes the
+     * sampler's `quota`, so a generation written either side of a target
+     * change can hold two rows for one bucket.
+     */
+    private fun sampledBuckets(
+        h: Handle,
+        ctx: TableContext,
+        cfg: CompactionConfig,
+    ): List<SampledBucket> =
+        h.createQuery(
+            """
+            SELECT p.spec_id,
+                   p.partition_values,
+                   sum(p.selected) AS selected,
+                   sum(p.small_count) AS small_count,
+                   sum(p.small_bytes) AS small_bytes
+              FROM hog_maintenance_summary_tier p
+              ${TierTotalsRepo.PUBLISHED_GENERATION_JOIN}
+             WHERE p.catalog_id = :catalogId
+               AND p.table_id = :tableId
+             GROUP BY p.spec_id, p.partition_values
+            HAVING sum(p.selected) >= :minSelected
+             ORDER BY sum(p.small_bytes)::float8 / GREATEST(sum(p.small_count), 1) ASC,
+                      selected DESC,
+                      small_count DESC
+             LIMIT :bucketScanCap
             """,
+        )
+            .bind("catalogId", ctx.catalogId)
+            .bind("tableId", ctx.tableId)
+            // The packer's own absolute floor, not `minInputFiles`:
+            // see the KDoc.
+            .bind("minSelected", 2L)
+            .bind("bucketScanCap", MAX_SAMPLED_BUCKETS)
+            .map { rs, _ ->
+                SampledBucket(
+                    Bucket(
+                        specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
+                        values = (rs.getArray("partition_values")?.array as? Array<*>)?.map { it as String? },
+                    ),
+                    selected = rs.getLong("selected"),
+                    smallCount = rs.getLong("small_count"),
+                    smallBytes = rs.getLong("small_bytes"),
+                )
+            }
+            .list()
+
+    /**
+     * Where the last sweep's bucket loop stopped, per (catalog, table).
+     *
+     * # Why a strict order is not enough
+     *
+     * Any total order over buckets starves its own tail. `selected DESC`
+     * is a fixed point on gigahog-prod-us: yesterday's day bucket keeps
+     * ~1.5M files and outranks every stray bucket for the ~25 hours it
+     * takes to drain, by which time today's bucket has grown into the
+     * same position — so the 2,790 stray buckets that hold the actual
+     * problem are never reached. Ten sweeps of the first version's
+     * ordering touched ONE bucket, ten times.
+     *
+     * So the order decides PRIORITY and the cursor decides WHERE THIS
+     * SWEEP STARTS: the loop begins after the last bucket the previous
+     * sweep planned and wraps, so every bucket the sample offers is
+     * reached within `ceil(available / considered)` sweeps whatever the
+     * order says.
+     *
+     * # In memory, and that is a deliberate limitation
+     *
+     * Keyed by (catalog, table) — `table_id` is scoped per catalog, so
+     * a table-only key would let one catalog's sweep move another's
+     * cursor (the bug `lastHeapRefusal`'s key already records). It is
+     * lost on restart and NOT shared between replicas, which costs a
+     * repeated bucket after a deploy and nothing else: the cursor is
+     * fairness, never correctness, and two replicas planning the same
+     * bucket is what the group claims already arbitrate. Persisting it
+     * would mean a write per plan on the maintenance path for a
+     * tie-break.
+     */
+    private val bucketCursor = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, Bucket>()
+
+    /**
+     * [sampled] rotated so this sweep starts after the bucket the last
+     * one stopped on — the order is preserved, only the entry point
+     * moves.
+     */
+    private fun rotated(
+        ctx: TableContext,
+        sampled: List<SampledBucket>,
+    ): List<SampledBucket> {
+        val last = bucketCursor[ctx.catalogId to ctx.tableId] ?: return sampled
+        val at = sampled.indexOfFirst { it.bucket == last }
+        // Not found: the bucket is gone from the sample (compacted away,
+        // or the generation moved), so there is nothing to start after
+        // and the natural order is right.
+        if (at < 0) return sampled
+        val from = (at + 1) % sampled.size
+        return sampled.subList(from, sampled.size) + sampled.subList(0, from)
+    }
+
+    private fun rememberCursor(
+        ctx: TableContext,
+        bucket: Bucket,
+    ) {
+        bucketCursor[ctx.catalogId to ctx.tableId] = bucket
+    }
+
+    /**
+     * ONE candidate statement, built for the shape of [arms].
+     *
+     * `internal` so the plan tests can EXPLAIN THIS STRING rather than a
+     * retyped copy of it — a plan test that restates its query asserts
+     * the plan of something no code path runs (AGENT.md: an index proves
+     * itself against the query it serves).
+     *
+     * # The structure, and where each bound sits
+     *
+     * ```
+     * SELECT … FROM (
+     *     SELECT … FROM hog_data_file f0
+     *      WHERE catalog_id = ? AND table_id = ?        -- V10's index, leading
+     *        AND end_snapshot IS NULL
+     *        AND file_size_bytes < ?                    -- V10's index, range
+     *        [AND record_count < ?]                      -- the sorted row ceiling
+     *        [AND EXISTS (one arm per partition key)]    -- V23's index
+     *      [ORDER BY file_size_bytes, data_file_id]      -- ONLY when there are no arms
+     *      LIMIT ?                                       -- THE SCAN CAP
+     * ) f
+     * LEFT JOIN hog_delete_file dv …                    -- the planned DV
+     * [LEFT JOIN LATERAL (array_agg of the tuple) …]     -- no-sample fallback only
+     * [WHERE f.spec_id IS NOT DISTINCT FROM ?]           -- bucket identity
+     * ORDER BY f.file_size_bytes, f.data_file_id         -- over at most the cap
+     * LIMIT ?                                            -- THE RESULT CAP
+     * ```
+     *
+     * The inner `LIMIT` is what makes the read bounded, and **the inner
+     * `ORDER BY` is what would stop it being bounded** — so it is there
+     * only in the case where it is free.
+     *
+     * With NO ARMS the sort key is V10's own index order
+     * (`hog_data_file_maintenance_size_scan (catalog_id, table_id,
+     * file_size_bytes, data_file_id)`), so ordering costs nothing: the
+     * scan is an ordered index scan and the `LIMIT` stops it. Measured:
+     * 239 buffers for 8,192 rows out of a 140,000-row table.
+     *
+     * With ARMS it is the opposite. A bucket's files are not a prefix of
+     * the size order — they are interleaved with every other bucket's —
+     * so `ORDER BY file_size_bytes` cannot be satisfied by any access
+     * path that also applies the arms, and Postgres has to produce
+     * **the whole bucket** before the `LIMIT` sees a row: measured on a
+     * 20,000-file bucket of a 140,000-file table, a hash join over a
+     * SEQUENTIAL SCAN of the manifest feeding an external-merge sort
+     * that spilled 3 MB to disk. The first version of this statement had
+     * that shape and its KDoc claimed the opposite.
+     *
+     * Dropping the inner `ORDER BY` removes the requirement, and the
+     * `LIMIT` then stops whichever plan Postgres picks after the cap's
+     * worth of MATCHING rows. What it costs is that the candidates are
+     * an arbitrary `scanLimit` of the bucket rather than its smallest —
+     * which is no loss in practice and no loss in principle:
+     *
+     *  - a bucket is one partition's ingest, so its files are within a
+     *    factor of each other (they are all about one flush size), and
+     *    "the smallest of them" is not a meaningful preference;
+     *  - `CompactionGrouping` sorts by size ITSELF before packing, so
+     *    group membership is still decided smallest-first over whatever
+     *    arrives;
+     *  - and it only bites at all when a bucket holds more than the cap,
+     *    which for the ~3.5k-file stray-day buckets this change exists
+     *    to drain it never does.
+     *
+     * The outer `ORDER BY` stays, over at most `limit` rows, so the
+     * result is deterministic.
+     *
+     * # WHICH PLAN POSTGRES PICKS IS NOT FIXED, and both are bounded
+     *
+     * With a SELECTIVE bucket it rewrites the arms into a semi-join and
+     * drives from V23's index, reading the bucket's entries index-only
+     * and probing the manifest per id: bounded by the BUCKET, and the
+     * right choice at that selectivity. With a bucket that is a large
+     * fraction of the table it drives the manifest and applies the arms
+     * as filters: bounded by the `LIMIT`, because there is no ordering
+     * left to force materialization. The plan test measures both shapes
+     * on one fixture and asserts the bound in each, rather than pinning
+     * whichever plan the planner picks — which is the mistake the first
+     * version's test made (it asserted "one primary-key probe per bucket
+     * member", i.e. the unbounded shape, as the desired property).
+     *
+     * `value = ?` or `value IS NULL` per key, chosen by the sampled
+     * tuple's own shape. A null partition value is legal (`schema.sql`:
+     * "NULL = null partition value") and `IS NOT DISTINCT FROM` drives
+     * no btree, while `IS NULL` is an ordinary range over the index's
+     * null entries. Only the PREDICATE SHAPE is built from the tuple;
+     * every value is bound.
+     *
+     * # PER-ROW COST on production's access pattern
+     *
+     * Measured on `CompactionCandidateFetchPlanIntegrationTest`'s
+     * production-shaped fixture (3 tables in one catalog sharing day
+     * values, 2,000 tiny buckets of 40 files at 200 rows/12 KiB plus 3
+     * fresh buckets of 20,000 large files, 210,000 file rows), PG 18,
+     * warm, serial, scan nodes only — the figures the test asserts
+     * against are in its own KDoc. The bound to design against is the
+     * CAP, not the bucket: the read is `min(candidateBudget,
+     * maxCandidates)` rows however big the bucket is, which is what the
+     * first version got wrong.
+     */
+    internal fun candidateSql(
+        arms: List<Int>,
+        nullArms: Set<Int>,
+        scopeToSpec: Boolean,
+        withPartitionValues: Boolean,
+        boundRows: Boolean,
+    ): String {
+        val armSql =
+            arms.joinToString("\n") { keyIndex ->
+                val valuePredicate =
+                    if (keyIndex in nullArms) "pv$keyIndex.value IS NULL" else "pv$keyIndex.value = :v$keyIndex"
+                """
+                       AND EXISTS (SELECT 1 FROM hog_file_partition_value pv$keyIndex
+                                    WHERE pv$keyIndex.catalog_id = f0.catalog_id
+                                      AND pv$keyIndex.data_file_id = f0.data_file_id
+                                      AND pv$keyIndex.key_index = :k$keyIndex
+                                      AND $valuePredicate)
+                """.trimEnd()
+            }
+        val rowBound = if (boundRows) "\n                       AND f0.record_count < :rowCeiling" else ""
+        // THE INNER ORDER BY EXISTS ONLY WHEN THERE ARE NO ARMS, and
+        // that asymmetry is the whole bound. See the KDoc.
+        val innerOrder =
+            if (arms.isEmpty()) "\n                     ORDER BY f0.file_size_bytes, f0.data_file_id" else ""
+        val specFilter = if (scopeToSpec) "\n             WHERE f.spec_id IS NOT DISTINCT FROM :specId" else ""
+        val valuesProjection = if (withPartitionValues) ",\n                   pvs.partition_values" else ""
+        val valuesJoin =
+            if (withPartitionValues) {
+                """
+              LEFT JOIN LATERAL (
+                    SELECT array_agg(pv.value ORDER BY pv.key_index) AS partition_values
+                      FROM hog_file_partition_value pv
+                     WHERE pv.catalog_id = f.catalog_id AND pv.data_file_id = f.data_file_id
+                   ) pvs ON true
+                """.trimEnd()
+            } else {
+                ""
+            }
+        return """
+            SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
+                   f.footer_size, f.row_id_start, f.stats_state, f.explicit_row_ids,
+                   f.spec_id,
+                   dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count$valuesProjection
+              FROM (
+                    SELECT f0.catalog_id, f0.data_file_id, f0.path, f0.record_count,
+                           f0.file_size_bytes, f0.footer_size, f0.row_id_start,
+                           f0.stats_state, f0.explicit_row_ids, f0.spec_id
+                      FROM hog_data_file f0
+                     WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
+                       AND f0.end_snapshot IS NULL
+                       AND f0.file_size_bytes < :targetBytes$rowBound$armSql$innerOrder
+                     LIMIT :scanLimit
+                   ) f
+              LEFT JOIN hog_delete_file dv
+                ON dv.catalog_id = f.catalog_id
+               AND dv.data_file_id = f.data_file_id
+               AND dv.end_snapshot IS NULL$valuesJoin$specFilter
+             ORDER BY f.file_size_bytes, f.data_file_id
+             LIMIT :limit
+            """
+    }
+
+    /**
+     * One bucket's smallest [limit] live candidate files.
+     *
+     * A bucket WITH a tuple gets one `EXISTS` arm per key; the
+     * TUPLE-LESS bucket — an unpartitioned table, or the vintage a
+     * mid-life-partitioned table wrote before its spec — gets none, and
+     * is separated from the partitioned buckets by the `spec_id` filter
+     * alone.
+     *
+     * That is why the tuple-less case reads a SCAN CAP of
+     * [CompactionConfig.maxCandidates] rather than its share of the
+     * budget: `spec_id` has no index, so its filter sits outside the
+     * inner `LIMIT`, and a cap of "this bucket's remaining room" would
+     * read only that many of the table's smallest candidates and
+     * probably find none of the vintage's. The cost is stated rather
+     * than hidden: a table whose tuple-less files are all LARGER than
+     * its 50,000 smallest candidates keeps that vintage's debt until the
+     * smaller files drain. Size order is compaction's own order, and the
+     * alternative is a partial index on a table the hottest write in
+     * the system already pays two indexes for.
+     */
+    private fun bucketCandidates(
+        h: Handle,
+        ctx: TableContext,
+        budget: Long,
+        rowCapacity: Long,
+        cfg: CompactionConfig,
+        bucket: Bucket,
+        limit: Int,
+    ): List<CompactionCandidate> {
+        val values = bucket.values ?: emptyList()
+        val arms = values.indices.toList()
+        val nullArms = values.indices.filter { values[it] == null }.toSet()
+        val boundRows = rowCapacity != CompactionGrouping.NO_ROW_CAPACITY
+        val scanLimit = if (arms.isEmpty()) maxOf(limit, cfg.maxCandidates) else limit
+        val query =
+            h.createQuery(
+                candidateSql(
+                    arms = arms,
+                    nullArms = nullArms,
+                    scopeToSpec = true,
+                    withPartitionValues = false,
+                    boundRows = boundRows,
+                ),
             )
                 .bind("catalogId", ctx.catalogId)
                 .bind("tableId", ctx.tableId)
                 .bind("targetBytes", budget)
+                .bind("specId", bucket.specId)
+                .bind("scanLimit", scanLimit)
+                .bind("limit", limit)
+        if (boundRows) query.bind("rowCeiling", rowCapacity)
+        values.forEachIndexed { keyIndex, value ->
+            query.bind("k$keyIndex", keyIndex)
+            if (value != null) query.bind("v$keyIndex", value)
+        }
+        return query.map { rs, _ -> candidate(rs) }.list()
+    }
+
+    /**
+     * The NO-SAMPLE fallback: the smallest
+     * [CompactionConfig.maxCandidates] live candidates of the table,
+     * with their partition tuples, bucketed in the JVM.
+     *
+     * Reached only when the catalog has no published generation at all —
+     * a fresh install, or the sampler's warm-up. There is no bucket list
+     * to scope by, so this is the one shape that must derive the buckets
+     * itself, which is what the `array_agg` lateral is for. It runs at
+     * most `maxCandidates` times, OUTSIDE the inner `LIMIT`, rather than
+     * once per live file of the table: on gigahog-prod-us the statement
+     * this replaces ran it 9.9 million times per table per sweep.
+     */
+    private fun fetchWholeTable(
+        h: Handle,
+        ctx: TableContext,
+        budget: Long,
+        rowCapacity: Long,
+        cfg: CompactionConfig,
+    ): CandidateFetch {
+        val boundRows = rowCapacity != CompactionGrouping.NO_ROW_CAPACITY
+        val query =
+            h.createQuery(
+                candidateSql(
+                    arms = emptyList(),
+                    nullArms = emptySet(),
+                    scopeToSpec = false,
+                    withPartitionValues = true,
+                    boundRows = boundRows,
+                ),
+            )
+                .bind("catalogId", ctx.catalogId)
+                .bind("tableId", ctx.tableId)
+                .bind("targetBytes", budget)
+                .bind("scanLimit", cfg.maxCandidates)
+                .bind("limit", cfg.maxCandidates)
+        if (boundRows) query.bind("rowCeiling", rowCapacity)
+        val rows =
+            query
                 .map { rs, _ ->
-                    Row(
-                        CompactionCandidate(
-                            dataFileId = rs.getLong("data_file_id"),
-                            path = rs.getString("path"),
-                            recordCount = rs.getLong("record_count"),
-                            fileSizeBytes = rs.getLong("file_size_bytes"),
-                            footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
-                            rowIdStart = rs.getLong("row_id_start"),
-                            statsProvided = rs.getString("stats_state") == "provided",
-                            explicitRowIds = rs.getBoolean("explicit_row_ids"),
-                            dv =
-                                rs.getObject("dv_id")?.let {
-                                    LiveDv(
-                                        deleteFileId = (it as Number).toLong(),
-                                        path = rs.getString("dv_path"),
-                                        deleteCount = rs.getLong("dv_count"),
-                                    )
-                                },
-                        ),
+                    candidate(rs) to
                         Bucket(
                             specId = rs.getObject("spec_id")?.let { (it as Number).toLong() },
                             values =
                                 (rs.getArray("partition_values")?.array as? Array<*>)
                                     ?.map { it as String? },
-                        ),
-                    )
+                        )
                 }
                 .list()
+        val byBucket = rows.groupBy({ it.second }, { it.first })
+        if (rows.size >= cfg.maxCandidates) {
+            log.debug {
+                "compaction candidate fetch for ${ctx.namespace}.${ctx.table} hit its cap of " +
+                    "${cfg.maxCandidates} rows (HOGLAKE_COMPACTION_MAX_CANDIDATES); the table has " +
+                    "debt this plan cannot see, and the next sweep sees the next-smallest files"
+            }
+        }
+        return CandidateFetch(
+            ctx = ctx,
+            budget = budget,
+            rowCapacity = rowCapacity,
+            byBucket = byBucket,
+            candidatesFetched = rows.size.toLong(),
+            // BOTH ZERO, and that is the honest report: this path did
+            // not pick buckets at all, so "considered" and "available"
+            // have no value to state. The candidate count and the
+            // truncation flag are what describe it, and a reader
+            // separates the two paths by the zeros.
+            bucketsConsidered = 0,
+            bucketsAvailable = 0,
+            truncated = rows.size >= cfg.maxCandidates,
+        )
+    }
 
-        val grouping = CompactionGrouping.of(budget)
+    /** One candidate row. */
+    private fun candidate(rs: ResultSet): CompactionCandidate =
+        CompactionCandidate(
+            dataFileId = rs.getLong("data_file_id"),
+            path = rs.getString("path"),
+            recordCount = rs.getLong("record_count"),
+            fileSizeBytes = rs.getLong("file_size_bytes"),
+            footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
+            rowIdStart = rs.getLong("row_id_start"),
+            statsProvided = rs.getString("stats_state") == "provided",
+            explicitRowIds = rs.getBoolean("explicit_row_ids"),
+            dv =
+                rs.getObject("dv_id")?.let {
+                    LiveDv(
+                        deleteFileId = (it as Number).toLong(),
+                        path = rs.getString("dv_path"),
+                        deleteCount = rs.getLong("dv_count"),
+                    )
+                },
+        )
+
+    /**
+     * What [pack] produced: what will be attempted, and what the row
+     * ceiling refused.
+     */
+    private data class PackedGroups(
+        val groups: List<CompactionGroup>,
+        val heapRefused: Long,
+    )
+
+    /**
+     * A group's files in ROW-ID order, which is not cosmetic.
+     *
+     * `CompactionGrouping` decides MEMBERSHIP on size and hands each
+     * group back in the CALLER's order — which used to be row-id order,
+     * because the candidate read was `ORDER BY row_id_start`. The
+     * bounded read is ordered by SIZE now (for the reason
+     * [fetchCandidates] gives: a truncated prefix should hold the
+     * table's most compactable files, not an arbitrary slice of its
+     * arrival history), so the order has to be restored here.
+     *
+     * What depends on it: the rewriter consumes inputs in the order it
+     * is given, and for an UNSORTED table the output's row order IS
+     * that order. Leaving the files in size order would silently
+     * reorder every unsorted compaction output — legal, since ids are
+     * explicit (invariant 2), and a gratuitous change to what readers
+     * see.
+     */
+    private fun rowIdOrder(files: List<CompactionCandidate>): List<CompactionCandidate> =
+        files.sortedWith(compareBy({ it.rowIdStart }, { it.dataFileId }))
+
+    /**
+     * PHASE (b): bin-pack the fetched candidates, holding no connection.
+     *
+     * Pure CPU by construction — every argument is already in memory —
+     * which is the property [beforePacking] exists to test and the one
+     * the idle-in-transaction kill was the absence of.
+     */
+    private fun pack(
+        fetched: CandidateFetch,
+        cfg: CompactionConfig,
+    ): PackedGroups {
+        val ctx = fetched.ctx
+        // THE ROW CEILING IS A PACKING BOUND NOW, not a post-hoc filter.
+        //
+        // It used to be applied to finished groups: pack on bytes, then
+        // refuse any group whose registered survivors exceeded
+        // `sortedRowCeiling`. On gigahog-prod-us's `ingest.events_raw`
+        // that refused EVERY group — the stray-day files hold ~50 bytes
+        // per row, so a byte-sized group was ~2.9M rows against a
+        // ceiling of 552,336 — and the table did not compact at all for
+        // days, ~2,000 `heap_budget_exceeded` per run. Handed to the
+        // packer the same ceiling produces groups that FIT: smaller, but
+        // rewritten.
+        //
+        // Taken from the FETCH, which filtered on it too
+        // (`fetchCandidates`), so the two cannot disagree. Only the
+        // sorted path materializes a group, so only it has a ceiling;
+        // the streaming path writes each survivor as it reads it and its
+        // heap is flat in group size.
+        val rowCapacity = fetched.rowCapacity
+        val grouping = CompactionGrouping.of(fetched.budget)
         val out = mutableListOf<CompactionGroup>()
-        for ((bucket, bucketRows) in rows.groupBy { it.bucket }) {
-            val candidates = bucketRows.map { it.candidate }
-            val takes =
+        val refused = mutableListOf<CompactionGroup>()
+        for ((bucket, candidates) in fetched.byBucket) {
+            val packing =
                 grouping.groups(
                     candidates,
                     cfg.minInputFiles,
-                    cfg.maxInputFiles,
+                    // THE FAN-IN SCALES WITH THE FILES IT IS CAPPING.
+                    // Computed per bucket from the rows just fetched, so
+                    // a bucket of 12 KiB files gets thousands of inputs
+                    // and a bucket of 200 MB files still gets a handful.
+                    cfg.effectiveMaxInputFiles(candidates.map { it.fileSizeBytes }),
+                    rowCapacity,
+                    // SURVIVORS, not `record_count`: the rewrite
+                    // materializes what the deletion vectors leave, and
+                    // a file whose DV deletes most of it costs the heap
+                    // only what survives. Same expression as
+                    // CompactionGroup.survivingRecords, per file.
+                    { it.recordCount - (it.dv?.deleteCount ?: 0) },
                 ) { it.fileSizeBytes }
-            for (take in takes) {
-                out += CompactionGroup(take, bucket.specId, bucket.values)
+            for (take in packing.groups) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+            for (short in packing.rowBoundRefusals) {
+                refused += CompactionGroup(rowIdOrder(short), bucket.specId, bucket.values)
             }
         }
-        // The EXACT check, after the estimate. The budget above scales the
-        // target by the table's AVERAGE density, which is an estimate;
-        // hog_data_file.record_count is not, so a group whose registered
-        // survivors are above the ceiling is refused here on the true
-        // number rather than attempted and discovered by an OOM. Only the
-        // sorted path materializes, so only it has a ceiling.
-        val ceiling = if (sorted) cfg.sortedRowCeiling(ctx.columns) else Long.MAX_VALUE
-        val (fits, refused) = out.partition { it.survivingRecords <= ceiling }
+        // THE BACKSTOP, and it should never fire. The packer closes a
+        // group BEFORE the file that would breach the ceiling, so every
+        // group it emits fits by construction — this is what catches a
+        // regression in that rule instead of an OutOfMemoryError ninety
+        // seconds into a rewrite. record_count is registered and exact,
+        // so the check is free.
+        val (fits, overCeiling) = out.partition { it.survivingRecords <= rowCapacity }
+        val allRefused = refused + overCeiling
         // A table at the row ceiling is a STATE, not an event: the same
-        // groups are re-planned and re-refused on every sweep, forever,
+        // files are re-packed and re-refused on every sweep, forever,
         // until an operator raises the heap or drops the sort order.
         // Logging it per sweep buried a burn-in in 289 identical
         // warnings -- 235 KB -- in three minutes for a single table. Log
         // when the picture CHANGES; the metric below carries the rest.
-        if (refused.isEmpty()) {
+        if (allRefused.isEmpty()) {
             lastHeapRefusal.remove(ctx.catalogId to ctx.tableId)
         }
-        val signature = "${refused.size}/${refused.maxOfOrNull { it.survivingRecords } ?: 0}/$ceiling"
-        if (refused.isNotEmpty() && lastHeapRefusal.put(ctx.catalogId to ctx.tableId, signature) != signature) {
+        val worst = allRefused.maxByOrNull { it.survivingRecords }
+        val signature = "${allRefused.size}/${worst?.survivingRecords ?: 0}/$rowCapacity"
+        if (worst != null && lastHeapRefusal.put(ctx.catalogId to ctx.tableId, signature) != signature) {
+            val worstFile = worst.files.maxByOrNull { it.recordCount - (it.dv?.deleteCount ?: 0) }
             log.warn {
-                "compaction refused ${refused.size} planned group(s) of " +
-                    "${ctx.namespace}.${ctx.table}: the sorted path would materialize up to " +
-                    "${refused.maxOf { it.survivingRecords }} rows against a ceiling of " +
-                    "$ceiling (heap budget ${cfg.sortedHeapBytesPerGroup} B per group = " +
+                "compaction refused ${allRefused.size} group(s) of " +
+                    "${ctx.namespace}.${ctx.table} that the sorted-path row ceiling closed too " +
+                    "short to rewrite: ${worst.files.size} file(s) holding " +
+                    "${worst.survivingRecords} surviving row(s) against a ceiling of " +
+                    "$rowCapacity, the largest being ${worstFile?.path} with " +
+                    "${worstFile?.let { it.recordCount - (it.dv?.deleteCount ?: 0) }} row(s) " +
+                    "(heap budget ${cfg.sortedHeapBytesPerGroup} B per group = " +
                     "${cfg.sortedHeapBytes} B / ${cfg.parallelGroups} concurrent group(s)). " +
-                    "The table keeps its debt. " +
+                    "Groups are now PACKED to the ceiling, so what is left here is work the " +
+                    "ceiling cannot make a group of at all — a single file above it, or files " +
+                    "dense enough that no two of them fit — and that part of the table keeps its " +
+                    "debt while the rest compacts. " +
                     "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
                     "pod's memory (the default is sized for a 4 GiB pod), lower " +
                     "HOGLAKE_COMPACTION_PARALLEL_GROUPS (which divides that budget), or drop " +
@@ -1098,108 +2229,83 @@ class CompactionService(
                     "CompactionConfig.sortedHeapBytes"
             }
         }
-        // THE PLANNER SKIPS CLAIMED GROUPS — the other half of the
-        // two-replica fix, and the half that costs nothing when it is
-        // wrong.
-        //
-        // By OVERLAP, not by claim-key equality. Two replicas planning
-        // the same catalog metadata form identical groups and would
-        // match exactly; a replica planning a moment later, after one
-        // more ingest file landed, packs the same files into groups with
-        // different keys, and an exact match would wave every one of
-        // them through. Overlap covers both, and a group sharing even one
-        // input with an in-flight rewrite is a group whose commit would
-        // lose the re-verification anyway.
-        //
-        // Read from THIS transaction's REPEATABLE READ snapshot, so a
-        // claim taken after it began is invisible and the group is
-        // planned regardless — which is the pre-existing race, resolved
-        // where it always was, at the commit. A claim is an optimization,
-        // never authorization.
-        //
-        // A FAILING claim read plans the table as if nothing were
-        // claimed, rather than throwing. `groups` runs inside
-        // planSnapshot, which is outside the per-group catch, so an
-        // error here would kill the sweep for every catalog on every
-        // interval — and it would do so on behalf of an optimization.
-        // Losing the read costs duplicated work between replicas and
-        // costs nothing else; `acquireClaim` takes the same position on
-        // the write.
-        // Under a SAVEPOINT, because this transaction has work left to
-        // do. A failed statement poisons a Postgres transaction — every
-        // later statement answers `current transaction is aborted` and
-        // the commit rolls back — so catching the exception without
-        // rewinding would turn a broken optimization into a broken
-        // plan, which is the failure this arm exists to prevent.
-        val claimed =
-            if (!cfg.claimsEnabled) {
-                emptySet()
-            } else {
-                h.savepoint(CLAIM_READ_SAVEPOINT)
-                try {
-                    CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
-                        .also { h.releaseSavepoint(CLAIM_READ_SAVEPOINT) }
-                } catch (e: Exception) {
-                    h.rollbackToSavepoint(CLAIM_READ_SAVEPOINT)
-                    log.warn(e) {
-                        "compaction claim read failed for ${ctx.namespace}.${ctx.table}; " +
-                            "planning as if unclaimed (a claim is an optimization, and the " +
-                            "plan-to-commit re-verification is the correctness backstop)"
-                    }
-                    emptySet()
-                }
-            }
-        val (free, claimedOut) =
-            if (claimed.isEmpty()) {
-                fits to emptyList()
-            } else {
-                fits.partition { g -> g.files.none { it.dataFileId in claimed } }
-            }
         // Most files first: every group now targets the same size, so the
         // one holding the most files buys the largest drop in file count
         // for the same bytes rewritten. Row-id order breaks ties, which
         // keeps a group's inputs adjacent in arrival order.
-        return PlannedGroups(
-            free
-                .sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
-            refused.size.toLong(),
-            claimedOut.size.toLong(),
+        return PackedGroups(
+            fits.sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
+            allRefused.size.toLong(),
         )
     }
 
+    /** Phase (c)'s output: the groups to attempt, and how many a sibling holds. */
+    private data class FreeGroups(val groups: List<CompactionGroup>, val claimed: Long)
+
     /**
-     * Registered bytes and rows over the table's candidate population —
-     * one metadata aggregate on the same REPEATABLE READ snapshot as the
-     * candidate read, no object-store IO.
+     * PHASE (c): drop the groups another maintainer is already
+     * rewriting.
      *
-     * Filtered by the RAW [CompactionConfig.targetBytes], not the derated
-     * budget, because the derate is what this is being measured to
-     * compute. It is a superset of the eventual candidate set, which
-     * makes the density a whole-table average: a table holding both
-     * client snappy and compaction zstd measures between the two, and
-     * the exact per-group row check in
-     * [groups] is what covers the residual.
+     * THE PLANNER SKIPS CLAIMED GROUPS — the other half of the
+     * two-replica fix, and the half that costs nothing when it is
+     * wrong.
+     *
+     * By OVERLAP, not by claim-key equality. Two replicas planning
+     * the same catalog metadata form identical groups and would
+     * match exactly; a replica planning a moment later, after one
+     * more ingest file landed, packs the same files into groups with
+     * different keys, and an exact match would wave every one of
+     * them through. Overlap covers both, and a group sharing even one
+     * input with an in-flight rewrite is a group whose commit would
+     * lose the re-verification anyway.
+     *
+     * READ IN ITS OWN SHORT TRANSACTION, after the packing, and both
+     * halves of that are deliberate. It is outside the candidate read's
+     * snapshot because nothing may be held across the packing; and that
+     * is harmless because this read can only see MORE claims than the
+     * candidate snapshot would have — a claim taken during the packing
+     * is honoured here, where the old shape planned the group and lost
+     * its rewrite at commit. A claim is an optimization, never
+     * authorization (`CompactionClaimRepo`), and the plan-to-commit
+     * re-verification is the correctness backstop either way.
+     *
+     * A FAILING claim read plans the table as if nothing were claimed,
+     * rather than throwing: this runs inside `planSnapshot`, which is
+     * outside the per-group catch, so an error here would kill the
+     * sweep for every catalog on every interval — and it would do so on
+     * behalf of an optimization. `acquireClaim` takes the same position
+     * on the write.
+     *
+     * NO SAVEPOINT, unlike the version of this read that lived inside
+     * the planning transaction. A failed statement poisons a Postgres
+     * transaction, so catching the exception there without rewinding
+     * would have turned a broken optimization into a broken plan. This
+     * transaction has nothing else in it, so rolling it back IS the
+     * rewind.
      */
-    private fun density(
-        h: Handle,
+    private fun withoutClaimedGroups(
         ctx: TableContext,
         cfg: CompactionConfig,
-    ): InputDensity =
-        h.createQuery(
-            """
-            SELECT COALESCE(SUM(f.file_size_bytes), 0) AS total_bytes,
-                   COALESCE(SUM(f.record_count), 0) AS total_records
-            FROM hog_data_file f
-            WHERE f.catalog_id = :catalogId AND f.table_id = :tableId
-              AND f.end_snapshot IS NULL
-              AND f.file_size_bytes < :targetBytes
-            """,
-        )
-            .bind("catalogId", ctx.catalogId)
-            .bind("tableId", ctx.tableId)
-            .bind("targetBytes", cfg.targetBytes)
-            .map { rs, _ -> InputDensity(rs.getLong("total_bytes"), rs.getLong("total_records")) }
-            .one()
+        groups: List<CompactionGroup>,
+    ): FreeGroups {
+        if (!cfg.claimsEnabled || groups.isEmpty()) return FreeGroups(groups, 0)
+        val claimed =
+            try {
+                jdbi.withHandleUnchecked { h ->
+                    CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
+                }
+            } catch (e: Exception) {
+                log.warn(e) {
+                    "compaction claim read failed for ${ctx.namespace}.${ctx.table}; " +
+                        "planning as if unclaimed (a claim is an optimization, and the " +
+                        "plan-to-commit re-verification is the correctness backstop)"
+                }
+                emptySet()
+            }
+        if (claimed.isEmpty()) return FreeGroups(groups, 0)
+        val (free, held) = groups.partition { g -> g.files.none { it.dataFileId in claimed } }
+        return FreeGroups(free, held.size.toLong())
+    }
 
     // ---- one run ---------------------------------------------------------
 
@@ -1241,7 +2347,10 @@ class CompactionService(
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
                     "invalid_data=${r.invalidData} heap_budget_exceeded=${r.heapBudgetExceeded} " +
-                    "failed_groups=${r.failedGroups} claimed_elsewhere=${r.claimedElsewhere}"
+                    "failed_groups=${r.failedGroups} claimed_elsewhere=${r.claimedElsewhere} " +
+                    "candidates_fetched=${r.candidatesFetched} " +
+                    "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
+                    "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs}"
             },
         ) {
             if (cfg.maxGroupsPerRun <= 0) {
@@ -1287,6 +2396,21 @@ class CompactionService(
         val heapBudgetExceeded: Long = 0,
         val failedGroups: Long = 0,
         val claimedElsewhere: Long = 0,
+        /**
+         * The PLAN measures, which are not group outcomes at all: they
+         * describe what the planner READ, not what a rewrite did.
+         *
+         * They ride this accumulator because it is the one thing the
+         * sweep already sums per table and per wave, and because they
+         * must reach the run ledger by the same route the counters do.
+         * None of them is in [attempts] — a candidate row is not a
+         * group's IO.
+         */
+        val candidatesFetched: Long = 0,
+        val bucketsConsidered: Long = 0,
+        val bucketsAvailable: Long = 0,
+        val candidatesTruncated: Long = 0,
+        val planMs: Long = 0,
     ) {
         /**
          * What this tally has spent of `maxGroupsPerRun`.
@@ -1334,6 +2458,11 @@ class CompactionService(
                 heapBudgetExceeded + other.heapBudgetExceeded,
                 failedGroups + other.failedGroups,
                 claimedElsewhere + other.claimedElsewhere,
+                candidatesFetched + other.candidatesFetched,
+                bucketsConsidered + other.bucketsConsidered,
+                bucketsAvailable + other.bucketsAvailable,
+                candidatesTruncated + other.candidatesTruncated,
+                planMs + other.planMs,
             )
 
         companion object {
@@ -1413,6 +2542,16 @@ class CompactionService(
                     GroupTally(
                         heapBudgetExceeded = plan.heapRefusedGroups,
                         claimedElsewhere = plan.claimedGroups,
+                        // The plan measures, summed over every table the
+                        // sweep plans — so the ledger row says how much
+                        // metadata the whole sweep read and how long
+                        // reading it took, which is the quantity that grew
+                        // until every sweep died.
+                        candidatesFetched = plan.candidatesFetched,
+                        bucketsConsidered = plan.bucketsConsidered,
+                        bucketsAvailable = plan.bucketsAvailable,
+                        candidatesTruncated = plan.candidatesTruncated,
+                        planMs = plan.planMs,
                     )
                 val queue = ArrayDeque(plan.groups)
                 while (queue.isNotEmpty() && !heapExhausted.get()) {
@@ -1492,6 +2631,11 @@ class CompactionService(
             heapBudgetExceeded = heapBudgetExceeded,
             failedGroups = failedGroups,
             claimedElsewhere = claimedElsewhere,
+            candidatesFetched = candidatesFetched,
+            bucketsConsidered = bucketsConsidered,
+            bucketsAvailable = bucketsAvailable,
+            candidatesTruncated = candidatesTruncated,
+            planMs = planMs,
         )
 
     /**
@@ -1985,7 +3129,14 @@ class CompactionService(
         table: String,
         group: CompactionGroup,
     ): GroupOutcome {
-        val ctx = planSnapshot(catalog, namespace, table, defaults).ctx
+        // The CONTEXT only, on its own short read: this surface is handed
+        // a group, so planning one (a bounded candidate fetch and a whole
+        // pack) would be work thrown away.
+        val ctx =
+            jdbi.inTransactionUnchecked { h ->
+                h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+                tableContext(h, catalog, namespace, table, defaults)
+            }
         return compactGroup(ctx, group)
     }
 
@@ -2788,7 +3939,25 @@ class CompactionService(
         override val partial: Any get() = result
     }
 
-    private companion object {
+    internal companion object {
+        /**
+         * The cap on how many of a table's sampled buckets one plan may
+         * READ — see `CompactionService.sampledBuckets`. 50,000 is an
+         * order of magnitude above `PartitionListingService`'s
+         * documented 5,000-bucket stress shape, so it bounds a
+         * `(team, day)` spec's partition explosion and bites nothing
+         * else.
+         */
+        const val MAX_SAMPLED_BUCKETS = 50_000
+
+        /**
+         * The `SET LOCAL statement_timeout` phase (a) of a plan runs
+         * under — see `planSnapshot`. Two groups' measured wall time,
+         * which is the point at which the cheap half of a sweep has
+         * stopped being cheap.
+         */
+        const val PLAN_STATEMENT_TIMEOUT_MS = 15_000L
+
         /**
          * Does this throwable's cause chain hold an interrupt?
          *
@@ -2816,13 +3985,6 @@ class CompactionService(
 
         /** How far [wasInterrupt] walks a cause chain. */
         const val CAUSE_CHAIN_LIMIT = 16
-
-        /**
-         * Savepoint the planner's claim read runs under, so a claim
-         * table that is missing or broken cannot poison the planning
-         * transaction — see [groups].
-         */
-        const val CLAIM_READ_SAVEPOINT = "hog_compaction_claim_read"
 
         /**
          * How long [shutdown] waits for a worker to notice that the

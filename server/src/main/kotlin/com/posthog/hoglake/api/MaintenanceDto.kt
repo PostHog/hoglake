@@ -122,6 +122,21 @@ data class CompactionResultDto(
      * COMPACTION_COUNTERS_ADDED_LATER.
      */
     val claimedElsewhere: Long,
+    /**
+     * The PLAN measures — what the sweep's planners read, and how long
+     * it took — rather than what any rewrite did. See
+     * CompactionResult.candidatesFetched for the unbounded read they
+     * replaced.
+     *
+     * Serialized unconditionally, like every counter on this DTO and
+     * for the same reason: a response that omits a field it declares
+     * makes the client's zero a guess.
+     */
+    val candidatesFetched: Long,
+    val bucketsConsidered: Long,
+    val bucketsAvailable: Long,
+    val candidatesTruncated: Long,
+    val planMs: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -138,6 +153,11 @@ fun CompactionResult.toDto() =
         heapBudgetExceeded = heapBudgetExceeded,
         failedGroups = failedGroups,
         claimedElsewhere = claimedElsewhere,
+        candidatesFetched = candidatesFetched,
+        bucketsConsidered = bucketsConsidered,
+        bucketsAvailable = bucketsAvailable,
+        candidatesTruncated = candidatesTruncated,
+        planMs = planMs,
     )
 
 data class RehydrateResultDto(
@@ -270,7 +290,16 @@ private fun normalizeLedgerResult(
  * it to CompactionResult, and never leaves.
  */
 private val COMPACTION_COUNTERS_ADDED_LATER =
-    listOf("invalid_data", "heap_budget_exceeded", "claimed_elsewhere")
+    listOf(
+        "invalid_data",
+        "heap_budget_exceeded",
+        "claimed_elsewhere",
+        "candidates_fetched",
+        "buckets_considered",
+        "buckets_available",
+        "candidates_truncated",
+        "plan_ms",
+    )
 
 /** The same, for ExpiryResult. Append-only for the same reason. */
 private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")

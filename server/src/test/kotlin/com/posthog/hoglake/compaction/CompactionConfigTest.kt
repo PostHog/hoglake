@@ -293,99 +293,69 @@ class CompactionConfigTest {
     private fun heapForTenThousandFlatRows() = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * 2 * 10_000
 
     @Test
-    fun `a denser table is planned under a smaller byte budget`() {
-        // The #118 regression in one assertion. Group selection reads
-        // BYTES; the sorted path holds ROWS. #115 made every compaction
-        // input compaction's own zstd rather than a client's snappy —
-        // 1.70x denser on event data — so the same byte budget started
-        // admitting 1.70x the rows with nothing anywhere noticing.
+    fun `the row ceiling, not a byte budget, is what a denser table is planned under`() {
+        // #118's regression, and the assertion has MOVED rather than
+        // gone. Group selection reads BYTES; the sorted path holds ROWS,
+        // and #115 made every compaction input compaction's own zstd
+        // rather than a client's snappy — 1.70x denser on event data —
+        // so the same byte budget admitted 1.70x the rows with nothing
+        // noticing.
         //
-        // Deriving the budget from a row ceiling makes that
-        // self-correcting: double the rows per byte and the budget
-        // halves, exactly.
+        // `effectiveTargetBytes` used to convert between the two by
+        // measuring the table's AVERAGE density, which cost an
+        // unbounded aggregate over every candidate of the table on
+        // every sweep and was an estimate of a number the catalog holds
+        // exactly. `CompactionGrouping.groups` now takes the ceiling as
+        // a second capacity and closes a group on
+        // `hog_data_file.record_count`, per file. So the density-derived
+        // budget is gone and the byte budget is the plain target; what
+        // bounds a dense sorted table is the row capacity, tested in
+        // `CompactionGroupingTest` and end to end in
+        // `CompactionHeapBudgetIntegrationTest`.
         val cfg =
             CompactionConfig(
                 targetBytes = target,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapForTenThousandFlatRows(),
             )
-        val sparse = cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity(1_000_000, 10_000))
-        val dense = cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity(1_000_000, 20_000))
-
-        assertThat(sparse).describedAs("100 B/row x a 10,000-row ceiling").isEqualTo(1_000_000)
-        assertThat(dense)
-            .describedAs("twice the rows per byte, half the bytes — the budget follows the density")
-            .isEqualTo(sparse / 2)
-    }
-
-    @Test
-    fun `whatever the density, the budget encodes the same row ceiling`() {
-        // The invariant underneath the test above, stated directly: the
-        // byte budget is a ROW budget in the target's own currency, so
-        // budget / bytesPerRow is the ceiling at every density.
-        val cfg =
-            CompactionConfig(
-                targetBytes = target,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapForTenThousandFlatRows(),
-            )
-        val ceiling = cfg.sortedRowCeiling(flatColumns)
-        assertThat(ceiling).isEqualTo(10_000)
-        for (bytesPerRow in listOf(7L, 64L, 119L, 512L)) {
-            val density = InputDensity(bytesPerRow * 1_000_000, 1_000_000)
-            val budget = cfg.effectiveTargetBytes(flatColumns, sorted = true, density)
-            assertThat(budget / bytesPerRow)
-                .describedAs("budget at %d B/row must still be %d rows", bytesPerRow, ceiling)
-                .isEqualTo(ceiling)
-        }
-    }
-
-    @Test
-    fun `the density bound and the nested derate compose`() {
-        // Two different blindnesses, and neither replaces the other. The
-        // per-node accounting is exact for a flat row and a FLOOR for a
-        // nested one (list lengths are data, not schema), so a nested
-        // table's ceiling is divided again — and the density conversion
-        // then applies to that smaller ceiling, not around it.
-        val cfg =
-            CompactionConfig(
-                targetBytes = target,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapForTenThousandFlatRows(),
-            )
-        val density = InputDensity(1_000_000, 10_000) // 100 B/row
-        val flat = cfg.effectiveTargetBytes(flatColumns, sorted = true, density)
-        val nested = cfg.effectiveTargetBytes(nestedColumns, sorted = true, density)
-
-        assertThat(cfg.sortedRowCeiling(nestedColumns))
-            .describedAs("nested: fewer nodes-per-row known, so the expansion divides the ceiling")
-            .isLessThan(cfg.sortedRowCeiling(flatColumns) / cfg.nestedSortExpansion + 1)
-        assertThat(nested)
-            .describedAs("a nested sorted table is planned far under the flat bound, not beside it")
-            .isLessThan(flat)
-    }
-
-    @Test
-    fun `an unmeasurable density falls back to the pre-118 budget`() {
-        // A table with candidates but no rows in them has nothing to
-        // materialize and nothing to measure. Falling back must never be
-        // LOOSER than what shipped before: flat keeps the target, nested
-        // keeps the nested derate.
-        val cfg = defaulted()
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = true, InputDensity.UNKNOWN))
+        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = true))
+            .describedAs("a flat sorted table plans at the raw target; rows are bounded by the packer")
             .isEqualTo(target)
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = true, InputDensity.UNKNOWN))
-            .isEqualTo(target / cfg.nestedSortExpansion)
+        assertThat(cfg.sortedRowCeiling(flatColumns))
+            .describedAs("and THIS is the bound that replaced the derate, in the unit the heap holds")
+            .isEqualTo(10_000)
     }
 
     @Test
-    fun `the unsorted path is never derated, at any density`() {
+    fun `the nested derate survives the density arm's removal`() {
+        // The two bounds were never interchangeable and only one of them
+        // could be replaced by an exact row count. The per-node
+        // accounting the ROW ceiling is built on is exact for a flat row
+        // and a FLOOR for a nested one, because list lengths are data
+        // and not schema — so a nested sorted table still needs a bound
+        // stated in BYTES, which is what this arm is.
+        val cfg =
+            CompactionConfig(
+                targetBytes = target,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapForTenThousandFlatRows(),
+            )
+        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = true))
+            .describedAs("nested and sorted: still derated by the expansion")
+            .isEqualTo(target / cfg.nestedSortExpansion)
+        assertThat(cfg.sortedRowCeiling(nestedColumns))
+            .describedAs("and the ceiling is divided as well — both, tightest wins")
+            .isLessThan(cfg.sortedRowCeiling(flatColumns) / cfg.nestedSortExpansion + 1)
+    }
+
+    @Test
+    fun `the unsorted path is never derated`() {
         // It streams one record at a time. Shrinking its groups would be
-        // a permanent throughput tax for a heap cost it does not pay.
+        // a permanent throughput tax for a heap cost it does not pay —
+        // which is also why it passes CompactionGrouping.NO_ROW_CAPACITY.
         val cfg = defaulted()
-        val absurd = InputDensity(1_000_000, 1_000_000_000)
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false, absurd)).isEqualTo(target)
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = false, absurd)).isEqualTo(target)
+        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false)).isEqualTo(target)
+        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = false)).isEqualTo(target)
     }
 
     @Test
@@ -617,29 +587,29 @@ class CompactionConfigTest {
     }
 
     @Test
-    fun `the divided heap budget flows into the group BYTE budget, not just the row ceiling`() {
+    fun `the divided heap budget reaches the bound grouping runs under`() {
         // Both bounds derive from the same heap, and only one of them is
-        // the one grouping actually runs under. A division that reached
-        // sortedRowCeiling but not effectiveTargetBytes would form
-        // full-size groups and then refuse them one by one at the exact
-        // check — a sweep that does nothing but plan.
-        // 100 B/row, deliberately: at the default heap a flat two-node
-        // row ceiling times anything denser lands ABOVE targetBytes, and
-        // the target cap would then hide the division entirely.
-        val density = InputDensity(totalBytes = 100_000, totalRecords = 1_000)
+        // the one grouping actually runs under. When the group budget
+        // was a DENSITY-derived byte number, a division that reached
+        // `sortedRowCeiling` but not `effectiveTargetBytes` would form
+        // full-size groups and then refuse them one by one — a sweep
+        // that does nothing but plan. The byte conversion is gone and
+        // the ceiling IS what grouping runs under (it is passed as the
+        // row capacity), so the property to pin is that the division
+        // reaches the ceiling and that N groups at it add up to one
+        // undivided group.
         val one = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1)
         val eight = one.copy(parallelGroups = 8)
-        val budgetOne = one.effectiveTargetBytes(flatColumns, sorted = true, density = density)
-        val budgetEight = eight.effectiveTargetBytes(flatColumns, sorted = true, density = density)
-        assertThat(budgetEight)
-            .describedAs("eight-way concurrency must buy one eighth of the group bytes")
-            .isLessThan(budgetOne)
-        assertThat(budgetEight)
-            .describedAs("the cap must not be what is being measured")
-            .isLessThan(target)
-        assertThat(budgetEight * 8)
-            .describedAs("eight groups' bytes must add up to one group's")
-            .isLessThanOrEqualTo(budgetOne + 8)
+        assertThat(eight.sortedRowCeiling(flatColumns))
+            .describedAs("eight-way concurrency must buy one eighth of the rows")
+            .isLessThan(one.sortedRowCeiling(flatColumns))
+        assertThat(eight.sortedRowCeiling(flatColumns) * 8)
+            .describedAs("eight groups' rows must add up to one group's")
+            .isLessThanOrEqualTo(one.sortedRowCeiling(flatColumns) + 8)
+        // And the byte budget is NOT divided for a flat table, because
+        // it is no longer a statement about the heap at all — the
+        // nested arm is the only one left, and it has its own test.
+        assertThat(eight.effectiveTargetBytes(flatColumns, sorted = true)).isEqualTo(target)
     }
 
     @Test
@@ -675,6 +645,100 @@ class CompactionConfigTest {
                 .isInstanceOf(IllegalArgumentException::class.java)
                 .hasMessageContaining("HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS")
         }
+    }
+
+    @Test
+    fun `the candidate-read bounds are rejected at CONSTRUCTION, not at plan time`() {
+        // Same argument as every knob above: a bad value caught inside
+        // the sweep throws out of planSnapshot, which is outside the
+        // per-group catch, so it kills every catalog's sweep on every
+        // interval while the process still looks healthy.
+        //
+        // BOTH DIRECTIONS, and the upper one is the point: a
+        // fat-fingered HOGLAKE_COMPACTION_MAX_CANDIDATES is the
+        // 2026-09-30 planning read again, and `candidateBudget`'s
+        // coercion prevents the overflow but not the absurdity.
+        for (bad in listOf(0, -1, CompactionConfig.MAX_CANDIDATE_HEADROOM + 1)) {
+            assertThatThrownBy {
+                CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, candidateHeadroom = bad)
+            }.describedAs("candidateHeadroom=%d", bad)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_CANDIDATE_HEADROOM")
+        }
+        for (bad in listOf(0, 1, CompactionConfig.MAX_MAX_CANDIDATES + 1)) {
+            assertThatThrownBy {
+                CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, maxCandidates = bad)
+            }.describedAs("maxCandidates=%d", bad)
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_MAX_CANDIDATES")
+        }
+        // The fan-in CEILING cannot be under its own floor.
+        assertThatThrownBy {
+            CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, maxInputFiles = 64, maxFanIn = 8)
+        }.isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_MAX_FAN_IN")
+    }
+
+    @Test
+    fun `the fan-in scales with the files it caps, between its floor and its ceiling`() {
+        // The knob that replaced a fixed 64, and the arithmetic is the
+        // whole of it: `targetBytes / p50`, held inside
+        // [maxInputFiles, maxFanIn].
+        val cfg = CompactionConfig(targetBytes = 512L * 1024 * 1024, maxGroupsPerRun = 1)
+
+        assertThat(cfg.effectiveMaxInputFiles(List(9) { 12L * 1024 }))
+            .describedAs("12 KiB files: 512 MiB / 12 KiB is ~43,690, so the CEILING binds")
+            .isEqualTo(cfg.maxFanIn)
+        assertThat(cfg.effectiveMaxInputFiles(List(9) { 200L * 1024 * 1024 }))
+            .describedAs("200 MB files: two fill the target, so the FLOOR binds")
+            .isEqualTo(cfg.maxInputFiles)
+        assertThat(cfg.effectiveMaxInputFiles(List(9) { 1L * 1024 * 1024 }))
+            .describedAs("1 MiB files: 512 of them fill the target, and that is between the two")
+            .isEqualTo(512)
+
+        // THE MEDIAN, not the mean, and this is the fixture that
+        // separates them: one near-target file among eight tiny ones.
+        // The mean would be ~57 MiB and cap the fan-in at 9; the median
+        // is 12 KiB and caps it at the ceiling, which is right, because
+        // the packer's dominance split keeps the big file out of the
+        // small files' group anyway.
+        val skewed = List(8) { 12L * 1024 } + listOf(500L * 1024 * 1024)
+        assertThat(cfg.effectiveMaxInputFiles(skewed))
+            .describedAs("one near-target file must not shrink the whole bucket's fan-in")
+            .isEqualTo(cfg.maxFanIn)
+
+        // No candidates: nothing to measure, so the floor.
+        assertThat(cfg.effectiveMaxInputFiles(emptyList())).isEqualTo(cfg.maxInputFiles)
+        // A registered zero-byte file is legal, and dividing by it is not.
+        assertThat(cfg.effectiveMaxInputFiles(List(3) { 0L })).isEqualTo(cfg.maxFanIn)
+    }
+
+    @Test
+    fun `the candidate budget is the smaller of the run's capacity and the hard cap`() {
+        // `min(headroom x maxGroupsPerRun x maxFanIn, maxCandidates)`.
+        // At the shipped defaults the first term is 2 x 64 x 2,048 =
+        // 262,144 and the second is 50,000, so the CAP is the binding
+        // term — which is deliberate, and is the number an operator
+        // reads `candidates_fetched` against.
+        val shipped = CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 64)
+        assertThat(shipped.candidateBudget).isEqualTo(CompactionConfig.DEFAULT_MAX_CANDIDATES)
+        // And the other term binds when it is the smaller one.
+        val small = CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, maxFanIn = 64)
+        assertThat(small.candidateBudget)
+            .describedAs("1 group x 64 files x headroom 2")
+            .isEqualTo(128)
+    }
+
+    @Test
+    fun `the env surface production boots from carries the candidate-read knobs through`() {
+        // The wiring, for the same reason the concurrency test below
+        // checks its own: a dropped `maxFanIn =` line in App would
+        // leave a values file's setting inert with the whole suite
+        // green.
+        assertThat(Config().compactionCandidateHeadroom)
+            .isEqualTo(CompactionConfig.DEFAULT_CANDIDATE_HEADROOM)
+        assertThat(Config().compactionMaxCandidates).isEqualTo(CompactionConfig.DEFAULT_MAX_CANDIDATES)
+        assertThat(Config().compactionMaxFanIn).isEqualTo(CompactionConfig.DEFAULT_MAX_FAN_IN)
     }
 
     @Test

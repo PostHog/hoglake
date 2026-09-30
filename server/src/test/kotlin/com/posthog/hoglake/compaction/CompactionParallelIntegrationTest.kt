@@ -190,7 +190,13 @@ class CompactionParallelIntegrationTest {
     ) = CompactionConfig(
         targetBytes = 1L shl 30,
         minInputFiles = fixture.filesPerGroup,
+        // Fan-in PINNED to the file count this fixture shapes its
+        // groups by: `maxInputFiles` is the scaling cap's FLOOR now, so
+        // leaving `maxFanIn` at its default would let a group take
+        // every candidate. The scaling has its own tests
+        // (CompactionConfigTest, CompactionFanInMeasurement).
         maxInputFiles = fixture.filesPerGroup,
+        maxFanIn = fixture.filesPerGroup,
         maxGroupsPerRun = maxGroups,
         parallelGroups = parallelGroups,
         claimsEnabled = claims,
@@ -872,6 +878,8 @@ class CompactionParallelIntegrationTest {
                 targetBytes = 1L shl 30,
                 minInputFiles = 2,
                 maxInputFiles = 2,
+                // Pinned; see the fixture config above.
+                maxFanIn = 2,
                 maxGroupsPerRun = 8,
             )
         val result = CompactionService(instrumented, store, cfg).runOnce(fx, cfg)
@@ -882,7 +890,12 @@ class CompactionParallelIntegrationTest {
         // and neither is issued by anything else in a compaction sweep.
         val candidateReads =
             issued.withIndex()
-                .filter { "FROM hog_data_file f" in it.value && "ORDER BY f.row_id_start" in it.value }
+                // Ordered by SIZE since the planner's read became
+                // bounded: the LIMIT only bounds anything if the order
+                // is one V10's index serves (see
+                // CompactionService.fetchCandidates), and size order is
+                // also the order packing consumes candidates in.
+                .filter { "FROM hog_data_file f" in it.value && "ORDER BY f.file_size_bytes" in it.value }
                 .map { it.index }
         val retirements =
             issued.withIndex()
@@ -1654,6 +1667,8 @@ class CompactionParallelIntegrationTest {
                     targetBytes = 1L shl 30,
                     minInputFiles = 2,
                     maxInputFiles = 2,
+                    // Pinned; see the fixture config above.
+                    maxFanIn = 2,
                     maxGroupsPerRun = 4,
                     claimsEnabled = true,
                 )
