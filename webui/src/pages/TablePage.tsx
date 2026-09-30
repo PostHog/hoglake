@@ -10,9 +10,10 @@ import {
   planScan,
 } from "../api/client";
 import { isInt64String } from "../api/int64";
-import { formatColumnType } from "../api/types";
+import { formatColumnType, isIntegerColumnType } from "../api/types";
 import type {
   Column,
+  ColumnType,
   DataFile,
   DecodedBound,
   Int64,
@@ -32,9 +33,11 @@ import { SkeletonBlock, SkeletonRows } from "../components/Skeleton";
 import { StatsStateBadge } from "../components/badges";
 import { ClampedText } from "../components/ClampedText";
 import { CopyButton } from "../components/CopyButton";
+import { SnapshotId } from "../components/SnapshotId";
 import { decodePartition, decodeValue, type PartitionDecode } from "../lib/partitions";
 import {
   columnPath,
+  columnType,
   formatAge,
   formatBytes,
   formatCount,
@@ -354,13 +357,21 @@ const NO_BOUND_TITLE = "no bound stored — do not prune";
  * always mean the same thing: on a column's stats it is "nothing was
  * stored, so do not prune", while on the upper end of a compaction
  * output's row-id span it is "unknown" — see [OrderingBoundCell].
+ *
+ * [type] is the column's DECLARED type, and it is what decides whether a
+ * bound of digits is digit-grouped: the decoded token for a long 626623
+ * and for a string column holding "626623" are the same characters, so
+ * only the type can say which one grouping would corrupt.
  */
 function BoundCell({
   bound,
   nullTitle = NO_BOUND_TITLE,
+  type,
 }: {
   bound: DecodedBound;
   nullTitle?: string;
+  /** "row_id" for the implicit ordering key, which has no catalog column. */
+  type?: ColumnType | "row_id";
 }) {
   if (bound === null) {
     return (
@@ -376,18 +387,39 @@ function BoundCell({
   // unconstrained one cell pushes both bound columns off the viewport and
   // squeezes every column before them. Past this width the cell truncates
   // and keeps its full value in the tooltip.
-  if (text.length <= BOUND_INLINE_MAX_CHARS) {
-    return <td className="num mono">{text}</td>;
+  //
+  // This guard comes FIRST, before the grouping below: a conforming int64
+  // cannot exceed 20 digits, but the width guard is the table's and must
+  // hold for whatever a payload actually contains, not for what a type
+  // promises.
+  if (text.length > BOUND_INLINE_MAX_CHARS) {
+    return (
+      <td className="mono bound-cell">
+        {/* Truncated from the RIGHT, unlike a path: an object path is
+            distinguished by its end, a bound by its beginning. */}
+        <span className="bound-text" title={text}>
+          {text}
+        </span>
+      </td>
+    );
   }
-  return (
-    <td className="mono bound-cell">
-      {/* Truncated from the RIGHT, unlike a path: an object path is
-          distinguished by its end, a bound by its beginning. */}
-      <span className="bound-text" title={text}>
-        {text}
-      </span>
-    </td>
-  );
+  // Grouped like every other count in the console (626623 -> "626,623"),
+  // on the exact decimal string — formatCount never round-trips through a
+  // Number, so a uint64 bound past 2^53 groups without losing a digit.
+  // The raw token stays in the title, for copying and for pasting into a
+  // query.
+  if (
+    typeof bound === "string" &&
+    (type === "row_id" || (type !== undefined && isIntegerColumnType(type))) &&
+    /^-?\d+$/.test(bound)
+  ) {
+    return (
+      <td className="num mono" title={bound}>
+        {formatCount(bound)}
+      </td>
+    );
+  }
+  return <td className="num mono">{text}</td>;
 }
 
 /** The expanded stats panel for one file: its per-column decoded stats. */
@@ -446,8 +478,10 @@ function FileStatsPanel({
             <td className="num mono">
               {c.size_bytes !== undefined ? formatBytes(c.size_bytes) : "—"}
             </td>
-            <BoundCell bound={c.lower_bound} />
-            <BoundCell bound={c.upper_bound} />
+            {/* The stats row states its own column's type, so the bound
+                needs no schema lookup here. */}
+            <BoundCell bound={c.lower_bound} type={c.type} />
+            <BoundCell bound={c.upper_bound} type={c.type} />
           </tr>
         ))}
       </tbody>
@@ -530,7 +564,15 @@ function StatsCell({
           onClick={onToggle}
           title={STATS_TOOLTIP.provided}
         >
-          {expanded ? "▾" : "▸"}
+          {/* ONE glyph, rotated — not ▸ swapped for ▾. The rotation is
+              animatable (so open/close reads as a movement rather than a
+              substitution) and it keeps the box identical in both states,
+              which is what stops the column jumping. aria-expanded on the
+              button already says which state it is in, so the mark itself
+              is decoration. */}
+          <span className="expand-chevron" aria-hidden="true">
+            ▶
+          </span>
         </button>
       </td>
     );
@@ -654,9 +696,12 @@ function orderingKeyName(sortSpec?: SortSpec, columns?: Column[]): string {
 function OrderingBoundCell({
   file,
   end,
+  columns,
 }: {
   file: DataFile;
   end: "lower" | "upper";
+  /** The table's schema, to resolve the key's field_id to a type. */
+  columns?: Column[];
 }) {
   const bounds = file.ordering_bounds;
   if (!bounds) return <td className="num mono subtle">—</td>;
@@ -666,6 +711,10 @@ function OrderingBoundCell({
   return (
     <BoundCell
       bound={end === "lower" ? bounds.lower_bound : bounds.upper_bound}
+      // A row id is a long by construction. Otherwise the key's own type,
+      // which an unresolvable field_id leaves undefined — and an unknown
+      // type means the bound renders verbatim rather than guessed at.
+      type={rowIdSpan ? "row_id" : columnType(columns, bounds.field_id!)}
       nullTitle={
         rowIdSpan && end === "upper" ? UNKNOWN_ROW_ID_TITLE : NO_BOUND_TITLE
       }
@@ -961,8 +1010,8 @@ function FilesTab({
                   <td className="num mono" title={`${f.file_size_bytes}`}>
                     {formatBytes(f.file_size_bytes)}
                   </td>
-                  <OrderingBoundCell file={f} end="lower" />
-                  <OrderingBoundCell file={f} end="upper" />
+                  <OrderingBoundCell file={f} end="lower" columns={columns} />
+                  <OrderingBoundCell file={f} end="upper" columns={columns} />
                   <StatsCell
                     state={f.stats_state}
                     expanded={expanded === f.data_file_id}
@@ -973,7 +1022,9 @@ function FilesTab({
                     }
                     fileId={f.data_file_id}
                   />
-                  <td className="num mono">{f.begin_snapshot}</td>
+                  <td className="num mono">
+                    <SnapshotId catalog={catalog} id={f.begin_snapshot} />
+                  </td>
                 </tr>
                 {expanded === f.data_file_id && (
                   <tr className="detail-row">
@@ -1433,7 +1484,7 @@ function PartitionsTab({
                       —
                     </span>
                   ) : (
-                    p.last_written_snapshot
+                    <SnapshotId catalog={catalog} id={p.last_written_snapshot} />
                   )}
                 </td>
               </tr>
@@ -1455,7 +1506,11 @@ function PartitionsTab({
         // previous filter's (placeholderData), so the counts beside
         // them are the previous filter's too. Say "loading" rather
         // than a number that belongs to a page the user has moved off.
-        <PartitionsFooter listing={first} stale={query.isFetching} />
+        <PartitionsFooter
+          catalog={catalog}
+          listing={first}
+          stale={query.isFetching}
+        />
       )}
     </>
   );
@@ -1467,9 +1522,11 @@ function PartitionsTab({
  * not decoration — every measure on the page is as old as this says.
  */
 function PartitionsFooter({
+  catalog,
   listing,
   stale,
 }: {
+  catalog: string;
   listing: PartitionListing;
   stale?: boolean;
 }) {
@@ -1491,7 +1548,11 @@ function PartitionsFooter({
     >
       {formatCount(listing.total)} partitions · sampled{" "}
       {formatAge(listing.sample_started ?? listing.sampled_at)} ago at snapshot{" "}
-      {listing.sampled_snapshot_id}
+      {listing.sampled_snapshot_id === null ? (
+        "—"
+      ) : (
+        <SnapshotId catalog={catalog} id={listing.sampled_snapshot_id} />
+      )}
       {listing.stale_spec_groups > 0 &&
         ` · ${listing.stale_spec_groups} under an older spec`}
     </p>
@@ -1581,7 +1642,9 @@ export function TablePage() {
       <h2>
         {table} <span className="subtle">table</span>
         {snapshot !== undefined && (
-          <span className="badge time-travel">@ snapshot {snapshot}</span>
+          <span className="badge time-travel">
+            @ snapshot <SnapshotId catalog={catalog!} id={snapshot} />
+          </span>
         )}
       </h2>
       {tableQuery.isError ? (

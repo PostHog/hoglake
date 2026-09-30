@@ -410,3 +410,43 @@ describe("MaintenancePage", () => {
     ).toBeInTheDocument();
   });
 });
+
+// The expiry panel is two snapshot ids and nothing else: the floor and
+// head. Both are only meaningful as instants.
+describe("MaintenancePage snapshot id tooltips", () => {
+  it("dates the expiry floor on hover, and asks for nothing until then", async () => {
+    const probe = "/v1/catalogs/analytics/snapshots?after=4098&limit=1";
+    const fetchMock = mockFetch((url) => {
+      if (url === statusUrl) return jsonResponse(maintenanceStatusFixture);
+      if (url === runsUrl) return jsonResponse(maintenanceRunPageFixture);
+      if (url === probe)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: "4099",
+              snapshot_time: "2026-09-04T09:00:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return undefined;
+    });
+    renderApp("/catalogs/analytics/maintenance");
+    const user = userEvent.setup();
+
+    const expiry = await screen.findByText("earliest snapshot");
+    const floor = within(
+      expiry.nextElementSibling as HTMLElement,
+    ).getByText("4099");
+    expect(floor).toHaveAttribute("data-snapshot-id", "4099");
+    // Neither the floor nor head is probed before the hover.
+    const asked = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked().some((u) => u.includes("after="))).toBe(false);
+
+    await user.hover(floor);
+    const instant = await screen.findByText("2026-09-04 09:00:00Z");
+    expect(instant.closest('[role="tooltip"]')).not.toBeNull();
+    expect(asked().filter((u) => u.includes("after="))).toEqual([probe]);
+  });
+});

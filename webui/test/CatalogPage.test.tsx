@@ -267,3 +267,60 @@ describe("CatalogPage snapshot messages", () => {
     expect(screen.queryByText(/p0:41200-83999/)).toBeNull();
   });
 });
+
+// The catalog page shows four ids: head and the expiry floor in the
+// header, and one per timeline row. The timeline's rows already print the
+// commit time in the next column, so those must cost no request.
+describe("CatalogPage snapshot id tooltips", () => {
+  it("wires the header ids to the lookup and the timeline ids to their own time", async () => {
+    const fetchMock = mockFetch(happyHandler);
+    renderApp("/catalogs/analytics");
+    const user = userEvent.setup();
+
+    // Header: head_snapshot_id and earliest_snapshot_id both went through
+    // the component.
+    const floorDt = await screen.findByText("earliest_snapshot_id", {
+      selector: "dt",
+    });
+    const floor = within(floorDt.nextElementSibling as HTMLElement).getByText(
+      "4099",
+    );
+    expect(floor).toHaveAttribute("data-snapshot-id", "4099");
+    const headDt = screen.getByText("head_snapshot_id", { selector: "dt" });
+    expect(
+      within(headDt.nextElementSibling as HTMLElement).getByText("4211"),
+    ).toHaveAttribute("data-snapshot-id", "4211");
+
+    // A timeline row's id: hovering it shows the time the row already
+    // holds, with no snapshot lookup behind it. Gated on a message rather
+    // than an id — the header prints "4211" too.
+    await screen.findByText("append 1 file");
+    const row = screen
+      .getAllByRole("row")
+      .find((r) => r.firstElementChild?.textContent === "4210")!;
+    const id = within(row).getByText("4210");
+    expect(id).toHaveAttribute("data-snapshot-id", "4210");
+    await user.hover(id);
+    const tip = await screen.findByRole("tooltip");
+    expect(tip).toHaveTextContent("2026-09-04 10:16:00Z");
+    // And the header's head id, which IS the timeline's top row, is
+    // answered out of the cache the timeline seeded — hovering it must not
+    // ask the server for an instant already rendered on this page.
+    await user.unhover(id);
+    const headId = within(headDt.nextElementSibling as HTMLElement).getByText(
+      "4211",
+    );
+    const headWrapper = headId.closest(".snapshot-id") as HTMLElement;
+    await user.hover(headWrapper);
+    // Scoped to the header's own wrapper — the tooltip is a child of it —
+    // because head's commit time is ALSO printed in the timeline's time
+    // column, which is the whole point: the instant is already on screen.
+    // Seeded, so it is in the box the moment the box opens.
+    const seeded = await within(headWrapper).findByRole("tooltip");
+    expect(seeded).toHaveTextContent("2026-09-04 10:17:00Z");
+
+    // Only the timeline's own paging requests were made — no ?after= probe.
+    const asked = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked.some((u) => u.includes("after="))).toBe(false);
+  });
+});

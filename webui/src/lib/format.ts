@@ -1,4 +1,4 @@
-import type { Column, Int64, PartitionField } from "../api/types";
+import type { Column, ColumnType, Int64, PartitionField } from "../api/types";
 
 const DECIMAL_INT_RE = /^-?\d+$/;
 
@@ -71,28 +71,81 @@ export function formatTime(iso: string): string {
 }
 
 /**
- * Elapsed time since `iso`, to a SINGLE rounded unit: "8s", "12min",
- * "19h", "3d". An age here places a snapshot in time — the difference
- * between 19h and 19h 11min never matters, and the second unit is just
- * noise. Computed from `Date.now()` at render, so it stays live between
- * refetches. `—` for a missing or unparseable instant.
+ * ONE elapsed-time ladder, shared by every age the console prints.
  *
- * Units and 2x thresholds match the maintenance page's formatSeconds
- * (up to 119min before switching to hours, 47h before days): "min", not
- * a bare "m" that reads as mega. A future instant (client clock skew)
- * clamps to "0s" rather than a negative age.
+ * Returns the single unit an instant is best described in, rounded, with
+ * 2x thresholds (up to 119min before switching to hours, 47h before
+ * days) matching the maintenance page's formatSeconds. The difference
+ * between 19h and 19h 11min never matters for placing a snapshot in
+ * time, and the second unit is just noise.
+ *
+ * It exists as one function because the two RENDERERS below sit side by
+ * side on the same screen: the partitions footer prints
+ * `formatAge(sample)` and the snapshot id beside it prints
+ * `formatRelativeAge(...)`. Two ladders meant "sampled 4d ago at
+ * snapshot 412" could sit next to a tooltip saying "3 days ago" for the
+ * same instant. Thresholds and rounding live here so that cannot happen;
+ * only the wording differs.
+ *
+ * `null` for a missing or unparseable instant. A future instant (client
+ * clock skew) clamps to zero rather than going negative. Computed from
+ * `Date.now()` at call time, so ages stay live between refetches.
+ */
+export function ageParts(
+  iso: string | null | undefined,
+): { value: number; unit: "s" | "min" | "h" | "d" } | null {
+  if (iso === null || iso === undefined) return null;
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return null;
+  const secs = Math.max(0, (Date.now() - t) / 1000);
+  if (secs < 120) return { value: Math.round(secs), unit: "s" };
+  const mins = secs / 60;
+  if (mins < 120) return { value: Math.round(mins), unit: "min" };
+  const hours = mins / 60;
+  if (hours < 48) return { value: Math.round(hours), unit: "h" };
+  return { value: Math.round(hours / 24), unit: "d" };
+}
+
+/**
+ * Elapsed time since `iso` as a COMPACT age: "8s", "12min", "19h", "3d".
+ * The column form — it sits in table cells and headers where width is
+ * the constraint. "min", not a bare "m" that reads as mega. `—` for a
+ * missing or unparseable instant.
  */
 export function formatAge(iso: string | null | undefined): string {
-  if (iso === null || iso === undefined) return "—";
-  const t = new Date(iso).getTime();
-  if (Number.isNaN(t)) return "—";
-  const secs = Math.max(0, (Date.now() - t) / 1000);
-  if (secs < 120) return `${Math.round(secs)}s`;
-  const mins = secs / 60;
-  if (mins < 120) return `${Math.round(mins)}min`;
-  const hours = mins / 60;
-  if (hours < 48) return `${Math.round(hours)}h`;
-  return `${Math.round(hours / 24)}d`;
+  const age = ageParts(iso);
+  if (age === null) return "—";
+  return `${age.value}${age.unit}`;
+}
+
+/**
+ * Elapsed time since `iso` as a PHRASE: "just now", "7 min ago",
+ * "3 hours ago", "3 days ago". The prose form — it reads inside a
+ * sentence (a snapshot tooltip's second line), so it spells the unit and
+ * carries the "ago" that makes it a statement about the past.
+ *
+ * Same ladder as formatAge, so the two can never disagree about which
+ * unit an instant belongs in; only the words are different. The seconds
+ * bucket collapses to "just now" rather than counting them out: a
+ * snapshot committed under two minutes ago has, in the only sense the
+ * reader cares about, just happened — and that is also where a
+ * future-dated instant lands. `—` for a missing or unparseable instant.
+ */
+export function formatRelativeAge(iso: string | null | undefined): string {
+  const age = ageParts(iso);
+  if (age === null) return "—";
+  switch (age.unit) {
+    case "s":
+      return "just now";
+    case "min":
+      return `${age.value} min ago`;
+    case "h":
+      // The singular guards the wording against a threshold change; the
+      // 2x ladder above cannot currently produce 1 here.
+      return `${age.value} hour${age.value === 1 ? "" : "s"} ago`;
+    case "d":
+      return `${age.value} day${age.value === 1 ? "" : "s"} ago`;
+  }
 }
 
 /**
@@ -116,6 +169,39 @@ export function columnPath(
     if (nested) return nested;
   }
   return undefined;
+}
+
+/**
+ * The column NODE carrying `fieldId`, nested children included, or
+ * undefined when the schema does not hold it.
+ *
+ * Kept separate from columnPath rather than folded into it: that one
+ * accumulates a dotted prefix on the way down and returns a string, and
+ * a single walk returning both would make every caller unpack a pair it
+ * does not want.
+ */
+export function findColumn(
+  columns: Column[] | undefined,
+  fieldId: Int64,
+): Column | undefined {
+  for (const c of columns ?? []) {
+    if (c.field_id === fieldId) return c;
+    const nested = findColumn(c.children, fieldId);
+    if (nested) return nested;
+  }
+  return undefined;
+}
+
+/**
+ * The declared TYPE of the column carrying `fieldId`, or undefined when
+ * the schema does not hold it (a key column dropped since the file
+ * landed, a field id from an older spec).
+ */
+export function columnType(
+  columns: Column[] | undefined,
+  fieldId: Int64,
+): ColumnType | undefined {
+  return findColumn(columns, fieldId)?.type;
 }
 
 /** Render a partition field, e.g. "bucket(16, field 3)" or "identity(addr.zip)". */

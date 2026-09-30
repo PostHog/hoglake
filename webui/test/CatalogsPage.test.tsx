@@ -214,3 +214,52 @@ describe("catalog totals", () => {
     expect(names).toEqual(["analytics", "smaller", "scratch"]);
   });
 });
+
+// Every snapshot id in the console dates itself on hover; the listing's
+// head column is the densest place that has to stay a sortable number.
+describe("snapshot id tooltips", () => {
+  const probe = "/v1/catalogs/analytics/snapshots?after=4210&limit=1";
+
+  it("dates head_snapshot_id on hover, and not before", async () => {
+    const fetchMock = mockFetch((url) => {
+      if (url === "/v1/catalogs") return jsonResponse(catalogsFixture);
+      if (url === probe)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: "4211",
+              snapshot_time: "2026-09-04T10:17:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return undefined;
+    });
+    renderApp("/");
+    const user = userEvent.setup();
+
+    const head = await screen.findByText("4211");
+    // The id went through the component, and the cell keeps the classes
+    // the sortable numeric column is built on.
+    expect(head).toHaveAttribute("data-snapshot-id", "4211");
+    expect(head.closest("td")).toHaveClass("num", "mono");
+    // Lazy: a listing of catalogs asks for NO snapshot of any of them —
+    // asserted over every URL, not just this row's, because a probe for
+    // another row's id would otherwise slip through.
+    const asked = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked().some((u) => u.includes("after="))).toBe(false);
+
+    // Nothing opens until the hover settles; the box and the instant then
+    // arrive together.
+    await user.hover(head);
+    const instant = await screen.findByText("2026-09-04 10:17:00Z");
+    expect(instant.closest('[role="tooltip"]')).not.toBeNull();
+    expect(asked().filter((u) => u.includes("after="))).toEqual([probe]);
+    // The row's own link is untouched by the wrapper.
+    expect(screen.getByRole("link", { name: "analytics" })).toHaveAttribute(
+      "href",
+      "/catalogs/analytics",
+    );
+  });
+});
