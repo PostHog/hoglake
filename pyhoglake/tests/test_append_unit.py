@@ -993,6 +993,12 @@ def test_prepare_counts_completed_uploads_on_object_store_failure(
     The failing file is NOT completed in either flavour: an open that
     never succeeded wrote nothing, and a close that failed may have left
     a truncated object the caller cannot tell apart from a whole one.
+
+    ``concurrency=1`` because "the (k+1)-th upload" is only a
+    well-defined thing to fail at in a serial fan-out: this pins the
+    serial path, and test_upload.py pins what a fault does to a wide one
+    (every upload already in flight is waited for and reported, so the
+    completed set is no longer a prefix of the input).
     """
     total = 4
     files = [
@@ -1006,7 +1012,7 @@ def test_prepare_counts_completed_uploads_on_object_store_failure(
     # The object store's own OSError, unwrapped: an existing
     # `except OSError` in a published consumer must keep catching it.
     with pytest.raises(OSError) as excinfo:
-        table.prepare_append_files(files, idempotency_key=key)
+        table.prepare_append_files(files, idempotency_key=key, concurrency=1)
     error = excinfo.value
     assert error.uploaded_files == completed
     assert len(error.uploaded_uris) == completed

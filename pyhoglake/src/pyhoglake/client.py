@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import logging
 import struct
 import uuid as _uuid
 from collections.abc import Iterator, Sequence
@@ -58,8 +59,22 @@ from .parquet_schema import prepared_schema_matches, validate_variant_file
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
+from .upload import (
+    Upload,
+    perform_upload,
+    resolve_concurrency,
+    run_uploads,
+    s3_key,
+    widen_io_threads_for,
+)
 
 DEFAULT_TIMEOUT = 30.0
+
+# The package's logger, named for the package rather than the module: a
+# consumer configures one name to hear from pyhoglake, and the handful of
+# things worth saying are all about the writer path. __init__ attaches a
+# NullHandler, so a library that is never configured stays silent.
+logger = logging.getLogger("pyhoglake")
 
 # Sentinel for Table.append(expected_table_uuid=...): opt out of the
 # incarnation guard entirely — no pre-flight uuid check, and the commit
@@ -184,6 +199,11 @@ class S3Config:
     endpoint_override: str | None = None
     region: str | None = None
     allow_bucket_creation: bool = False
+    # Small objects go up as ONE PutObject (see put_client). Turn it off
+    # to send every object through pyarrow's streaming multipart writer —
+    # an escape hatch for an endpoint that handles one and not the other,
+    # not a performance choice.
+    single_request_uploads: bool = True
 
     def filesystem(self):
         from pyarrow import fs
@@ -200,6 +220,127 @@ class S3Config:
         if self.allow_bucket_creation:
             kwargs["allow_bucket_creation"] = True
         return fs.S3FileSystem(**kwargs)
+
+    def put_client(self, connections: int):
+        """An S3 client for single-request ``PutObject`` uploads, built
+        from this config's own fields, or ``None`` when single-request
+        uploads are unavailable.
+
+        pyarrow cannot do this job: its S3 output stream always opens a
+        multipart upload (pyarrow 25.0.1, measured against a recording
+        endpoint — CreateMultipartUpload + UploadPart +
+        CompleteMultipartUpload for a 12 KiB buffer written and closed in
+        one go), and Arrow exposes no whole-buffer write. boto3 is an
+        optional extra (``pip install 'pyhoglake[fast-upload]'``), so its
+        absence answers ``None`` rather than raising: the objects still
+        go up, by the streaming path, at three requests each.
+
+        **What is guaranteed about parity with :meth:`filesystem`.** The
+        two are given the same explicit fields — access key, secret key,
+        endpoint override (with the same path-style addressing), and the
+        region when this config names one — and ambient endpoint
+        configuration is refused on both sides
+        (``ignore_configured_endpoint_urls``), because botocore honours
+        ``AWS_ENDPOINT_URL`` / ``AWS_ENDPOINT_URL_S3`` and the shared
+        config's ``endpoint_url`` while ``S3FileSystem`` reads none of
+        them: without that, one flush could put its small objects in one
+        store and its large ones in another and register both under the
+        same uris.
+
+        **What is not.** Credentials still come from two implementations
+        of the same chain (botocore's, and the AWS C++ SDK's inside
+        Arrow), and with ``region=None`` Arrow resolves the bucket's
+        region while botocore falls back to its own default and leans on
+        S3's region redirect. Neither has been tested against an
+        instance-role pod or a bucket outside the configured region.
+        ``single_request_uploads=False`` sidesteps both if a deployment
+        needs one code path.
+
+        ``connections`` sizes the connection pool. botocore's default is
+        10, and a 64-wide upload fan-out through 10 connections is a
+        64-wide fan-out that behaves like a 10-wide one.
+        """
+        if not self.single_request_uploads:
+            # An explicit choice, so no complaint: the operator asked for
+            # the streaming path.
+            return None
+        try:
+            import boto3
+            from botocore.config import Config
+            from botocore.exceptions import BotoCoreError
+        except ImportError:
+            logger.warning(
+                "pyhoglake: boto3 is not installed, so parquet uploads will use "
+                "pyarrow's streaming multipart writer — three S3 requests per "
+                "object instead of one. Install pyhoglake[fast-upload] to get "
+                "the single-request path, or set "
+                "S3Config(single_request_uploads=False) to choose it deliberately."
+            )
+            return None
+        kwargs: dict[str, Any] = {}
+        if self.access_key is not None:
+            kwargs["aws_access_key_id"] = self.access_key
+        if self.secret_key is not None:
+            kwargs["aws_secret_access_key"] = self.secret_key
+        if self.region is not None:
+            kwargs["region_name"] = self.region
+        if self.endpoint_override is not None:
+            endpoint = self.endpoint_override
+            if "://" not in endpoint:
+                # The override may omit the scheme; pyarrow defaults a
+                # bare host to https, so mirror that rather than invent
+                # a second rule.
+                endpoint = f"https://{endpoint}"
+            kwargs["endpoint_url"] = endpoint
+        try:
+            return boto3.client(
+                "s3",
+                config=Config(
+                    # Path style whenever the endpoint is overridden,
+                    # which is what the pyarrow filesystem does: MinIO
+                    # and friends have no bucket-as-subdomain DNS.
+                    s3={
+                        "addressing_style": "path" if self.endpoint_override else "auto"
+                    },
+                    # Arrow reads none of botocore's endpoint environment
+                    # (AWS_ENDPOINT_URL, AWS_ENDPOINT_URL_S3, the shared
+                    # config's endpoint_url), so honouring them here would
+                    # split a single flush across two object stores while
+                    # registering every file under one set of uris. Set
+                    # unconditionally: an explicit endpoint_url kwarg
+                    # still wins (verified against botocore 1.43.105).
+                    ignore_configured_endpoint_urls=True,
+                    # Arrow's SDK defaults to roughly 1 s connect / 3 s
+                    # request; botocore defaults to 60/60, and run_uploads
+                    # waits for every in-flight upload before it re-raises,
+                    # so a brownout with those defaults turns a failing
+                    # flush into an ~8 minute stall (4 tries x 120 s).
+                    # max_attempts is botocore's count of RETRIES, so this
+                    # is four tries: worst case ~2.5 minutes for the
+                    # unluckiest object, and the whole fan-out waits out
+                    # only that one, not the sum.
+                    connect_timeout=3,
+                    read_timeout=30,
+                    retries={"mode": "standard", "max_attempts": 3},
+                    max_pool_connections=max(connections, 10),
+                ),
+                **kwargs,
+            )
+        except BotoCoreError as refused:
+            # NOT the missing-region case: botocore falls back to its own
+            # default for S3 and does not raise. This catches a broken
+            # profile or a malformed shared config file — the streaming
+            # path needs neither, so fall back rather than fail a write
+            # over the fast path's own configuration.
+            logger.warning(
+                "pyhoglake: could not build the single-request upload client "
+                "(%s), so parquet uploads will use pyarrow's streaming "
+                "multipart writer — three S3 requests per object instead of "
+                "one. The AWS profile/config this process reads is the thing "
+                "to check.",
+                refused,
+            )
+            return None
 
 
 def _ts_param(value: datetime | str | None) -> str | None:
@@ -242,6 +383,9 @@ class HoglakeClient:
         self.s3 = s3
         self._http = httpx.Client(base_url=self.base_url + "/v1", timeout=timeout)
         self._fs = None
+        self._put: Any = None
+        self._put_pool = 0
+        self._put_declined = False
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -321,6 +465,46 @@ class HoglakeClient:
                 )
             self._fs = self.s3.filesystem()
         return self._fs
+
+    def _put_client(self, connections: int = 1):
+        """The cached single-request upload client
+        (:meth:`S3Config.put_client`), or ``None`` when small objects
+        have to take the streaming path.
+
+        Cached beside the filesystem so both are always built from the
+        same :class:`S3Config`, and rebuilt only when a wider fan-out
+        needs a bigger connection pool than the one the cached client
+        actually got — ``put_client`` floors the pool at botocore's own
+        10, so comparing the request rather than the effective size would
+        rebuild a client that was already wide enough and leak its
+        connection pool.
+
+        A decline is asked for ONCE per client: boto3 being absent or the
+        AWS config being unreadable cannot change under us, and asking
+        again would repeat the warning that goes with it on every flush.
+        """
+        self._filesystem()  # the same "no S3 configuration" refusal, first
+        if self._put_declined:
+            return None
+        if self._put_pool < connections:
+            # Duck-typed on purpose: an S3 stand-in that implements only
+            # filesystem() (every test double here, and any caller that
+            # passes its own) keeps the streaming path.
+            factory = getattr(self.s3, "put_client", None)
+            replaced = self._put
+            self._put = None if factory is None else factory(connections)
+            self._put_declined = self._put is None
+            self._put_pool = max(connections, 10)
+            if replaced is not None:
+                # Its urllib3 pool would otherwise live until GC. Named
+                # exceptions, like _record_uploads' annotation: OSError
+                # because tearing down sockets is the only thing a real
+                # close does, AttributeError because a duck-typed
+                # stand-in need not implement one. Anything else here is
+                # a bug worth seeing, not worth swallowing.
+                with contextlib.suppress(AttributeError, OSError):
+                    replaced.close()
+        return self._put
 
     # -- catalogs ----------------------------------------------------------
 
@@ -952,6 +1136,7 @@ class Table:
         expected_table_uuid: str | None = None,
         expected_table_info: TableInfo | None = None,
         allow_optional_fields: bool = False,
+        concurrency: int | None = None,
     ) -> dict[str, Any]:
         """Upload already partitioned/sorted local Parquet without loading it in RAM.
 
@@ -963,30 +1148,151 @@ class Table:
         With allow_optional_fields, external writers may use optional physical
         fields for required catalog columns only when footer counts prove no nulls.
 
+        Each file is read only when its own upload runs — whole, by the
+        uploading thread, when it is at or under
+        :data:`~pyhoglake.upload.SINGLE_REQUEST_MAX_BYTES` (one
+        ``PutObject`` instead of a three-request multipart upload), and in
+        chunks otherwise. So a wide prepare holds ``concurrency`` files in
+        memory, never all of them. ``concurrency`` (or
+        ``PYHOGLAKE_UPLOAD_CONCURRENCY``) bounds how many are in flight;
+        see :func:`~pyhoglake.upload.run_uploads` for what a mid-fanout
+        failure does and :func:`~pyhoglake.upload.widen_io_threads` for
+        the one process-global setting this touches.
+
         Orphan accounting: every exception out of this call carries what it
         already wrote, on the exception object itself (no new type, so
         existing ``except`` clauses keep working):
 
         ``uploaded_files``
-            How many uploads COMPLETED — the output stream closed without
+            How many uploads COMPLETED — the object was written without
             error. A file whose upload raised partway is NOT counted, in
-            either direction: the open may never have succeeded, or the
-            close may have failed over a TRUNCATED object that exists in
-            the store. So the count is a lower bound on objects present,
-            and the failing file must be treated as possibly-there.
+            either direction: the request may never have been accepted, or
+            a multipart close may have failed over a TRUNCATED object that
+            exists in the store. So the count is a lower bound on objects
+            present, and the failing file must be treated as
+            possibly-there. Uploads that were still in flight when
+            another one failed are waited for and counted if they land.
         ``uploaded_uris``
-            The uris of exactly those completed uploads, in order, always
+            The uris of exactly those completed uploads, in the order the
+            files were given (not the order they finished), always
             ``uploaded_files`` long.
 
-        A refusal raised before the first upload carries ``0`` / ``()``.
+        **Changed in the concurrent upload path** (it was a serial loop):
+        this list is no longer a contiguous PREFIX of ``files``. Uploads
+        run in parallel, so a fault can leave gaps — file 7 uploaded and
+        file 6 not — and nothing can be inferred about a file from the
+        position or the count. Only the uris themselves are meaningful:
+        those objects exist, everything else either does not or (for the
+        one that raised) cannot be known. The default fan-out is 64, so
+        an existing caller gets this shape without asking; pass
+        ``concurrency=1`` for the old serial behaviour.
+
+        Every validation now runs before the first upload, so a refusal —
+        of any file, not just the first — carries ``0`` / ``()``.
         Sweep the uris, not the ``{idempotency_key}/`` prefix: a retry
         under the same key writes new object names beside the old ones,
         so a prefix sweep after a later success deletes live files.
+        """
+        return self._prepare_append(
+            files,
+            from_tables=False,
+            idempotency_key=idempotency_key,
+            expected_table_uuid=expected_table_uuid,
+            expected_table_info=expected_table_info,
+            allow_optional_fields=allow_optional_fields,
+            concurrency=concurrency,
+        )
+
+    def prepare_append_tables(
+        self,
+        groups: Sequence[tuple[pa.Table, tuple[str | None, ...] | None]],
+        *,
+        idempotency_key: str,
+        expected_table_uuid: str | None = None,
+        expected_table_info: TableInfo | None = None,
+        concurrency: int | None = None,
+    ) -> dict[str, Any]:
+        """:meth:`prepare_append_files` without the disk: encode each
+        already-partitioned Arrow table straight to a parquet buffer,
+        upload the buffers, and return the same immutable commit request.
+
+        For a writer that already holds its rows in Arrow — one table per
+        partition tuple — a temp file is pure overhead: write, fsync,
+        re-read for the footer, re-read for the upload, unlink. The
+        registrations this produces are the ones the file path produces
+        for the same rows (same path shape, ``record_count``,
+        ``file_size_bytes``, ``footer_size``, ``column_stats``,
+        ``partition_values``), because it is the same code reading the
+        same footer — out of a buffer instead of off a disk.
+
+        The caller still owns row-to-partition correctness, sort order,
+        and the schema: each table's schema must be the destination's,
+        field ids included (``columns_to_arrow_schema(table.columns)``
+        builds it), and it is checked on the ENCODED footer by the same
+        comparison a prepared file gets. Everything else about the
+        prepared-append contract — persist the request before
+        ``Catalog.commit_prepared``, never regenerate after preparing,
+        the ``uploaded_files`` / ``uploaded_uris`` orphan accounting on
+        every exception — is unchanged, so read
+        :meth:`prepare_append_files` for it.
+
+        **Memory.** Peak is the caller's Arrow input PLUS every encoded
+        buffer, both alive at once. The buffers accumulate because each
+        group is encoded before any upload starts (validating everything
+        first is what keeps a refusal from orphaning objects), and the
+        input tables are the caller's — this method never drops a
+        reference, so nothing is released until the caller releases the
+        sequence it passed in, after the call returns. Budget for both:
+        the prod-us events writer's ~105K rows over ~271 partitions
+        encode to a few MiB against ~1 GiB of Arrow input on 16 GiB
+        pods. Nothing is held twice, though — there is no temp file, and
+        the upload reads the buffer it was handed.
+
+        Destinations with ``variant`` columns are refused: an Arrow
+        rewrite drops the native Parquet VARIANT annotation, so those
+        files have to come from a variant-aware writer through
+        :meth:`prepare_append_files`.
+        """
+        return self._prepare_append(
+            groups,
+            from_tables=True,
+            idempotency_key=idempotency_key,
+            expected_table_uuid=expected_table_uuid,
+            expected_table_info=expected_table_info,
+            allow_optional_fields=False,
+            concurrency=concurrency,
+        )
+
+    def _prepare_append(
+        self,
+        groups: Sequence[tuple[Any, tuple[str | None, ...] | None]],
+        *,
+        from_tables: bool,
+        idempotency_key: str,
+        expected_table_uuid: str | None,
+        expected_table_info: TableInfo | None,
+        allow_optional_fields: bool,
+        concurrency: int | None,
+    ) -> dict[str, Any]:
+        """The prepared-append path both public entry points are: resolve,
+        validate every group, upload them all, build the commit request.
+
+        The two differ only in where a group's parquet comes from — a file
+        the caller wrote, or a buffer this encodes — which is one branch
+        in the loop. Validation, uri shape, registration fields, upload
+        fan-out and orphan accounting are shared BECAUSE they must not
+        drift: a registration that differs between the two paths is a
+        wire-shape bug nothing else would catch.
+
+        Validation of every group precedes the first upload (the serial
+        loop this replaced interleaved them), so a refusal orphans
+        nothing and the fan-out is handed work already known to be good.
         """
         uploaded: list[str] = []
         try:
             _uuid.UUID(idempotency_key)
             catalog = self._namespace._catalog
+            client = catalog._client
             read_snapshot = catalog.refresh().head_snapshot_id
             expected = expected_table_uuid or self.table_uuid
             info = self._check_incarnation(expected)
@@ -1003,6 +1309,14 @@ class Table:
                     "prepared append destination layout changed", status_code=None
                 )
             has_variant = any(c.type == "variant" for c in info.columns)
+            if has_variant and from_tables:
+                raise ValidationError(
+                    "cannot prepare Arrow tables for a destination with variant "
+                    "columns: an Arrow rewrite loses the native Parquet VARIANT "
+                    "annotation — use prepare_append_files with files a "
+                    "variant-aware writer produced",
+                    status_code=None,
+                )
             schema = columns_to_arrow_schema(
                 tuple(c for c in info.columns if c.type != "variant")
             )
@@ -1017,17 +1331,26 @@ class Table:
                 ],
                 metadata=schema.metadata,
             )
+            # Resolved before any encode or footer read so a bad
+            # setting costs nothing. The object-store clients are NOT
+            # built yet: doing that here would answer an empty or
+            # malformed prepare with "no S3 configuration" instead of
+            # naming the caller's actual mistake.
+            fanout = resolve_concurrency(len(groups), concurrency)
             registrations = []
-            for index, (path, partition) in enumerate(files):
-                with pq.ParquetFile(path) as parquet:
-                    if has_variant or allow_optional_fields:
-                        validate_variant_file(path, parquet, info.columns)
-                    elif not prepared_schema_matches(parquet.schema_arrow, schema):
-                        raise ValidationError(
-                            "prepared Parquet schema/field IDs differ from destination",
-                            status_code=None,
-                        )
-                    metadata = parquet.metadata
+            uploads: list[Upload] = []
+            for index, (source, partition) in enumerate(groups):
+                part = (
+                    _encode_group(source, schema)
+                    if from_tables
+                    else _describe_prepared_file(
+                        source,
+                        info,
+                        schema,
+                        has_variant=has_variant,
+                        allow_optional_fields=allow_optional_fields,
+                    )
+                )
                 arity = len(info.partition_spec.fields) if info.partition_spec else 0
                 if (arity and (partition is None or len(partition) != arity)) or (
                     not arity and partition is not None
@@ -1036,35 +1359,22 @@ class Table:
                         "prepared file partition arity differs from destination",
                         status_code=None,
                     )
-                if metadata.num_rows <= 0:
+                if part.metadata.num_rows <= 0:
                     raise ValidationError(
                         "prepared file must contain rows", status_code=None
                     )
                 uri = f"{catalog.data_path.rstrip('/')}/data/{info.namespace}/{info.name}/{idempotency_key}/{_uuid.uuid4()}-{index}.parquet"
-                with open(path, "rb") as source:
-                    source.seek(0, 2)
-                    size = source.tell()
-                    source.seek(-8, 2)
-                    trailer = source.read(8)
-                    footer_size = struct.unpack("<I", trailer[:4])[0]
-                    source.seek(0)
-                    with catalog._client._filesystem().open_output_stream(
-                        uri.removeprefix("s3://")
-                    ) as sink:
-                        while chunk := source.read(8 * 1024 * 1024):
-                            sink.write(chunk)
-                # Only past the stream's close: an object-store write is
-                # not durable until then, so counting any earlier would
-                # claim uploads that never landed.
-                uploaded.append(uri)
+                uploads.append(
+                    Upload(uri=uri, size=part.size, body=part.body, path=part.path)
+                )
                 reg: dict[str, Any] = {
                     "path": uri,
-                    "record_count": metadata.num_rows,
-                    "file_size_bytes": size,
-                    "footer_size": footer_size,
+                    "record_count": part.metadata.num_rows,
+                    "file_size_bytes": part.size,
+                    "footer_size": part.footer_size,
                     "column_stats": [
                         stat.to_wire()
-                        for stat in extract_column_stats(metadata, info.columns)
+                        for stat in extract_column_stats(part.metadata, info.columns)
                     ],
                 }
                 if partition is not None:
@@ -1074,6 +1384,17 @@ class Table:
                 raise ValidationError(
                     "prepared append must contain files", status_code=None
                 )
+            # Everything is validated; now pay for the clients. The pool
+            # is sized to the fan-out that is actually about to run.
+            filesystem = client._filesystem()
+            put_client = client._put_client(fanout)
+            widen_io_threads_for(uploads, put_client, fanout)
+            run_uploads(
+                lambda upload: perform_upload(filesystem, put_client, upload),
+                uploads,
+                concurrency=fanout,
+                completed=uploaded,
+            )
             return {
                 "idempotency_key": idempotency_key,
                 "read_snapshot": read_snapshot,
@@ -1251,6 +1572,93 @@ def _write_one_file(
     return file_reg
 
 
+@dataclass(frozen=True)
+class _PreparedPart:
+    """One prepared group, measured and validated, ready to register.
+
+    ``metadata`` is the parquet footer the registration's ``record_count``
+    and ``column_stats`` come from; ``size`` and ``footer_size`` are the
+    wire fields the server's tail read depends on. Exactly one of ``body``
+    (an in-memory buffer this process encoded) and ``path`` (a file the
+    caller wrote, still unread) says where the bytes are.
+    """
+
+    metadata: Any
+    size: int
+    footer_size: int
+    body: Any | None = None
+    path: str | None = None
+
+
+def _encode_group(data: pa.Table, schema: pa.Schema) -> _PreparedPart:
+    """Encode one group's parquet into a buffer — never to disk — and read
+    back everything the registration needs out of that same buffer.
+
+    The schema check is the prepared-FILE check, run on the ENCODED
+    footer rather than on the caller's Arrow schema: same helper, same
+    error text, so a table that would have been refused as a file is
+    refused here, and conversions the writer performs (timestamp_s stored
+    as milliseconds) are compared as written rather than as intended.
+    """
+    sink = pa.BufferOutputStream()
+    pq.write_table(data, sink)
+    raw = sink.getvalue()
+    with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
+        if not prepared_schema_matches(parquet.schema_arrow, schema):
+            raise ValidationError(
+                "prepared Parquet schema/field IDs differ from destination",
+                status_code=None,
+            )
+        metadata = parquet.metadata
+    # Only the 8-byte trailer is copied out of the buffer, so the one
+    # definition of the footer_size wire convention keeps its bytes
+    # signature and stays shared with the file path.
+    return _PreparedPart(
+        metadata=metadata,
+        size=raw.size,
+        footer_size=_footer_size(bytes(raw[-8:])),
+        body=raw,
+    )
+
+
+def _describe_prepared_file(
+    path: str,
+    info: TableInfo,
+    schema: pa.Schema,
+    *,
+    has_variant: bool,
+    allow_optional_fields: bool,
+) -> _PreparedPart:
+    """Validate and measure one prepared file WITHOUT reading its data:
+    the footer for schema and stats, the 8-byte trailer for
+    ``footer_size``, the file length for ``file_size_bytes``.
+
+    The bytes stay on disk until this file's upload runs, which is what
+    keeps a wide prepare's memory proportional to the fan-out instead of
+    to the flush.
+    """
+    with pq.ParquetFile(path) as parquet:
+        if has_variant or allow_optional_fields:
+            validate_variant_file(path, parquet, info.columns)
+        elif not prepared_schema_matches(parquet.schema_arrow, schema):
+            raise ValidationError(
+                "prepared Parquet schema/field IDs differ from destination",
+                status_code=None,
+            )
+        metadata = parquet.metadata
+    with open(path, "rb") as source:
+        source.seek(0, 2)
+        size = source.tell()
+        source.seek(-8, 2)
+        trailer = source.read(8)
+    return _PreparedPart(
+        metadata=metadata,
+        size=size,
+        footer_size=_footer_size(trailer),
+        path=path,
+    )
+
+
 def _field_id_chains(
     columns: tuple[Column, ...] | list[Column],
     prefix: tuple[Column, ...] = (),
@@ -1351,11 +1759,16 @@ def _footer_size(raw: bytes) -> int:
 
 
 def _upload(fs, uri: str, raw: bytes) -> None:
-    if not uri.startswith("s3://"):
-        raise HoglakeError(
-            f"unsupported data_path scheme for the write path: {uri!r} "
-            "(only s3:// is supported)"
-        )
-    key = uri[len("s3://") :]
-    with fs.open_output_stream(key) as out:
+    """``Table.append``'s upload: pyarrow's streaming multipart write,
+    unchanged.
+
+    Deliberately NOT the prepared path's single-request upload. That
+    would change the transport of the library's most-used method for
+    every install with boto3 importable, and buy only 3 requests -> 1 per
+    file: append writes its per-partition files in a serial loop, so it
+    gains none of the concurrency that makes the prepared path's upload
+    change worth its risk. It belongs in its own change, with its own
+    verification.
+    """
+    with fs.open_output_stream(s3_key(uri)) as out:
         out.write(raw)
