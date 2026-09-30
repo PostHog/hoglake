@@ -115,22 +115,96 @@ object PgTestSupport {
     }
 
     /**
+     * The idle-in-transaction bound every database THIS OBJECT hands
+     * out carries, unless a fixture opts out with [holdsTransactions].
+     *
+     * # Why the suite runs under it
+     *
+     * Production runs at 30 s (`Database.SESSION_INIT_SQL`), and the
+     * compaction planner's 2026-09-30 outage was a connection parked
+     * inside an open transaction while the JVM bin-packed 9.9M candidate
+     * rows: Postgres killed it and every sweep died on the next
+     * statement. Nothing in the suite could see that, because no test
+     * database had the bound at all — so "this code holds a transaction
+     * across slow work" was not a property any test could fail on.
+     *
+     * 2 s rather than 30: it has to fire inside a test's patience, and
+     * the difference between the two numbers is a difference in how slow
+     * the held work is, not in whether it is held. A test that passes
+     * here is a code path that holds nothing across work of any
+     * duration, which is the property worth pinning.
+     *
+     * This is NOT [Database.SESSION_INIT_SQL] and does not carry its
+     * `statement_timeout`. A 60 s statement bound under the suite's
+     * six-figure bulk seeds would be a flake on a slow machine, and it
+     * would be a flake about the MACHINE rather than about the code —
+     * the thing the original opt-in KDoc was right to refuse. This bound
+     * cannot be reached by a slow statement at all: a running statement
+     * is not idle.
+     *
+     * # WHAT IT DOES NOT REACH
+     *
+     * Two things, both measured rather than suspected, so this bound's
+     * green is not read as a proof it does not carry.
+     *
+     * **`CleanupService`/`RemovalStore` still hold a transaction across
+     * object-store calls**, and they say so: `Database`'s
+     * `SESSION_INIT_SQL_IDLE_TIMEOUT` KDoc states that "a connection
+     * awaiting an S3 response IS idle in transaction", and the drain
+     * derives its SDK budget from that 30 s bound —
+     * `CleanupService.callBoundFor()` is
+     * `min(idle timeout, admission) / 3` = 10 s, FIVE TIMES this bound.
+     * `CleanupServiceIntegrationTest` is green at 2 s only because the
+     * Testcontainers MinIO answers in milliseconds, so that fixture is a
+     * latent flake whose failure message would be about the machine
+     * rather than about the code. It is known debt with its own
+     * follow-up; a session timeout is not the instrument that will catch
+     * it, and the `pg_stat_activity` assertion in
+     * `CompactionPlannerBoundedIntegrationTest` is the shape that would.
+     *
+     * **Five fixtures are outside this guard entirely**, and
+     * legitimately: `ApiIntegrationTest`, `HealthProbeIntegrationTest`,
+     * `RequestDispatchIntegrationTest`, `DbPoolGaugesIntegrationTest`
+     * and `DropAtScaleIntegrationTest` build their own pool from
+     * [TestDb.jdbcUrl] through `Config`/`Database.dataSource`, so they
+     * carry production's `SESSION_INIT_SQL` (30 s) instead. That is
+     * production-faithful and is the point of those fixtures — but it
+     * is why this reads "every database this object hands out" rather
+     * than "every test database".
+     */
+    const val IDLE_IN_TRANSACTION_GUARD: String =
+        "SET idle_in_transaction_session_timeout = '2s'"
+
+    /**
      * Create a new empty database, run migrations, return a pooled Jdbi.
      *
      * [productionSession] wires the pool with [Database.SESSION_INIT_SQL]
      * — the `statement_timeout` / `idle_in_transaction_session_timeout`
      * a real pod's sessions carry. OPT-IN, and default OFF on purpose:
      * turning it on for the whole suite would put a 60 s statement bound
-     * and a 30 s idle-in-transaction bound under every fixture in the
-     * tree, including the six-figure bulk seeds and the drain tests that
-     * hold a transaction open across MinIO round trips, and a suite that
-     * starts failing on a slow machine teaches nothing about the code.
-     * A test that needs session behaviour to be REACHABLE (a migration
-     * whose build can block, say) asks for it.
+     * under every fixture in the tree, including the six-figure bulk
+     * seeds, and a suite that starts failing on a slow machine teaches
+     * nothing about the code. A test that needs session behaviour to be
+     * REACHABLE (a migration whose build can block, say) asks for it.
+     *
+     * [holdsTransactions] is the OPT-OUT from
+     * [IDLE_IN_TRANSACTION_GUARD], and the ONLY legitimate reason for it
+     * is that the parked transaction is the TEST'S OWN INSTRUMENT: a
+     * concurrency test that holds one transaction to prove another
+     * blocks on it. Every caller says so at its call site.
+     *
+     * It is NOT an opt-out for production code that holds a transaction
+     * across non-database work. The doctrine forbids that outright, so a
+     * fixture that opts out to make such a path pass is hiding the thing
+     * this guard exists to surface, and the right fix is to split the
+     * transaction.
+     *
      */
     @Synchronized
-    fun freshDatabase(productionSession: Boolean = false): TestDb =
-        freshEmpty(productionSession).also { Database.migrate(it.dataSource) }
+    fun freshDatabase(
+        productionSession: Boolean = false,
+        holdsTransactions: Boolean = false,
+    ): TestDb = freshEmpty(productionSession, holdsTransactions).also { Database.migrate(it.dataSource) }
 
     /**
      * A database migrated only as far as [version], so a migration test
@@ -145,8 +219,9 @@ object PgTestSupport {
     fun freshDatabaseAt(
         version: String,
         productionSession: Boolean = false,
+        holdsTransactions: Boolean = false,
     ): TestDb =
-        freshEmpty(productionSession).also {
+        freshEmpty(productionSession, holdsTransactions).also {
             Database.flywayConfig(it.dataSource)
                 .target(MigrationVersion.fromVersion(version))
                 .load()
@@ -192,7 +267,10 @@ object PgTestSupport {
     }
 
     @Synchronized
-    private fun freshEmpty(productionSession: Boolean = false): TestDb {
+    private fun freshEmpty(
+        productionSession: Boolean = false,
+        holdsTransactions: Boolean = false,
+    ): TestDb {
         val name = "hoglake_test_${dbCounter++}"
         container.createConnection("").use { conn ->
             conn.createStatement().use { it.execute("CREATE DATABASE $name") }
@@ -207,7 +285,16 @@ object PgTestSupport {
                     maximumPoolSize = 8
                     poolName = name
                     // Database's own constant, never a copy of its text.
-                    if (productionSession) connectionInitSql = Database.SESSION_INIT_SQL
+                    // The guard is APPENDED to it rather than replacing
+                    // it: production's 30 s and the suite's 2 s are the
+                    // same setting, and the last SET in the init script
+                    // is the one that stands, so the tighter bound wins
+                    // for a fixture that asked for both.
+                    connectionInitSql =
+                        listOfNotNull(
+                            Database.SESSION_INIT_SQL.takeIf { productionSession },
+                            IDLE_IN_TRANSACTION_GUARD.takeUnless { holdsTransactions },
+                        ).joinToString("; ").ifEmpty { null }
                 },
             )
         return TestDb(ds, Database.jdbi(ds), url)

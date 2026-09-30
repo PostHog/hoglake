@@ -176,6 +176,19 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(result["claimed_elsewhere"].asLong())
             .describedAs("claimed_elsewhere joined COMPACTION_COUNTERS_ADDED_LATER with the claims")
             .isZero()
+        val planMeasures =
+            listOf(
+                "candidates_fetched",
+                "buckets_considered",
+                "buckets_available",
+                "candidates_truncated",
+                "plan_ms",
+            )
+        for (planMeasure in planMeasures) {
+            assertThat(result[planMeasure].asLong())
+                .describedAs("the planner's plan measures joined the list when the planner was bounded")
+                .isZero()
+        }
         // Every other field survives untouched, and the row is complete
         // against the schema's required list.
         assertThat(result["groups_compacted"].asLong()).isEqualTo(2)
@@ -185,6 +198,7 @@ class MaintenanceLedgerIntegrationTest {
                 "skipped_conflicts", "dv_superseded", "unconvertible_schema",
                 "invalid_data", "heap_budget_exceeded", "failed_groups",
                 "claimed_elsewhere",
+                *planMeasures.toTypedArray(),
             )
     }
 

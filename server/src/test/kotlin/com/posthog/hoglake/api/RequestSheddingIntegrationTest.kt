@@ -56,7 +56,12 @@ import kotlin.concurrent.thread
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class RequestSheddingIntegrationTest {
-    private val db = PgTestSupport.freshDatabase()
+    // holdsTransactions: the admission tests HOLD the per-catalog
+    // commit lock from a parked transaction while a request queues
+    // behind it — that is how a lock wait is produced at all. The
+    // suite's idle-in-transaction guard would kill the holder, so this
+    // fixture opts out of it.
+    private val db = PgTestSupport.freshDatabase(holdsTransactions = true)
 
     /**
      * ONE handler thread, so a single blocked request puts everything

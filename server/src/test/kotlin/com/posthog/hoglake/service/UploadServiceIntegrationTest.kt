@@ -22,7 +22,14 @@ import java.util.UUID
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class UploadServiceIntegrationTest {
-    private val db = PgTestSupport.freshDatabase()
+    // holdsTransactions: three tests here PARK a transaction — one
+    // handle takes the `hog_upload` row lock and holds it across a
+    // latch while another thread proves it blocks, which is the whole
+    // subject (invariant 4: that row lock is the serializer the removed
+    // commit lock was standing in for). The suite's
+    // idle-in-transaction guard would kill the parked connection, so
+    // this fixture opts out of it.
+    private val db = PgTestSupport.freshDatabase(holdsTransactions = true)
     private val catalogs = CatalogService(db.jdbi)
     private val uploads = UploadService(db.jdbi)
     private val commits = CommitService(db.jdbi)

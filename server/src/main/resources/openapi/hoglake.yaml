@@ -4542,13 +4542,23 @@ components:
           type: integer
           format: int64
           description: >
-            Groups the SORTED rewrite path declined because
-            materializing them to sort would not fit the compaction heap
-            budget: a group formed on input bytes with too many rows for
-            the heap. Refused in metadata at planning time from the
-            registered record counts, before any object-store IO, so a
-            group that cannot fit never spends ninety seconds finding
-            out.
+            Work the SORTED rewrite path's row ceiling cannot make a
+            group OF.
+
+            Not "groups formed on input bytes and then refused" — groups
+            are PACKED to the ceiling (it is a capacity the bin packer
+            closes a group on, beside the byte target), so a dense
+            sorted table produces smaller groups rather than refused
+            ones. What is left to count is the residue: files dense
+            enough that no TWO of them fit under the ceiling, which the
+            packer closes one short of the file minimum. A file whose
+            OWN rows exceed the ceiling is never fetched — the candidate
+            filter carries record_count < ceiling — so it costs nothing
+            and is not counted.
+
+            Decided in metadata at planning time from the registered
+            record counts, before any object-store IO, so work that
+            cannot fit never spends ninety seconds finding out.
 
             Durable, like invalid_data, but the fault is neither the
             writer's nor the schema's: it is a table whose sort order and
@@ -4556,7 +4566,8 @@ components:
             by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD
             sized for it) or by dropping the table's sort order, which
             moves it to the streaming path where group size costs no
-            heap.
+            heap. A nonzero count no longer means the table is not
+            compacting: the rest of it is.
 
             TEMPORARY. The ceiling exists only because the sorted rewrite
             sorts a whole group in memory. An external merge sort removes
@@ -4607,6 +4618,94 @@ components:
             response this server serves carries it explicitly and only
             a replayed historical row can lack it.
 
+        candidates_fetched:
+          type: integer
+          format: int64
+          description: >
+            Candidate file rows the sweep's PLANNERS read, summed over
+            every table planned. A plan measure, not a group outcome.
+
+            Compaction planning used to select every live file of a
+            table under the target into one in-memory list — ~9.9M rows
+            per table per sweep on a production events table, against
+            the 4,096 files a run can consume — and the in-JVM bin
+            packing that followed ran with the planning transaction
+            still open, long enough for Postgres to kill the connection
+            on idle_in_transaction_session_timeout. The fetch is bounded
+            now, per table plan, by
+            min(HOGLAKE_COMPACTION_CANDIDATE_HEADROOM x
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN x
+            HOGLAKE_COMPACTION_MAX_FAN_IN,
+            HOGLAKE_COMPACTION_MAX_CANDIDATES) — the second term is the
+            binding one at the shipped defaults — and the number of
+            statements one plan may issue is bounded as well.
+        buckets_considered:
+          type: integer
+          format: int64
+          description: >
+            Partition buckets the planners fetched candidates for, of
+            the buckets_available their samples offered.
+
+            A compaction group never spans a (spec_id, partition_values)
+            bucket, so the planner picks BUCKETS before files — from the
+            maintenance sampler's published generation, best compaction
+            VALUE first (the files a group would actually take, then
+            files removed per byte rewritten) — and fetches candidate
+            rows only for those.
+
+            Summed across the sweep's tables, so the pair is a ratio and
+            not an equality: considered well below available means the
+            candidate budget is the binding constraint and the remaining
+            buckets wait for a later sweep, which is correct and is why
+            the planner rotates the bucket it starts at rather than
+            re-visiting the top of a fixed order.
+        buckets_available:
+          type: integer
+          format: int64
+          description: >
+            Partition buckets the published sample credits the sweep's
+            tables with enough ACTIONABLE debt to form a group — files
+            the packer would take, not files that merely exist.
+
+            Zero for a catalog whose sampler has published nothing yet,
+            which takes the bounded whole-table fallback fetch rather
+            than refusing to plan. An unpartitioned table has exactly
+            ONE bucket once a generation is published — the tuple-less
+            one — and it is planned like any other. A published
+            generation that credits a table with NO qualifying bucket
+            means there is no work, and the planner reads nothing at
+            all.
+        candidates_truncated:
+          type: integer
+          format: int64
+          description: >
+            Table plans whose candidate fetch hit its own cap, so the
+            table has compactable debt that plan could not see.
+
+            Never an error. The fetch is ordered by file size and
+            compaction consumes candidates in that order, so a truncated
+            prefix is the most compactable part of the table and the
+            next sweep sees the next-smallest files. A STANDING nonzero
+            on a table that never drains says the run should rewrite
+            more groups (HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN), not
+            that the caps should move.
+        plan_ms:
+          type: integer
+          format: int64
+          description: >
+            Wall-clock milliseconds the sweep spent PLANNING, summed
+            over every table it planned (all three phases: the bounded
+            candidate read, the bin packing, the claim read).
+
+            Recorded because the planner's failure mode was a time one —
+            the packing grew past the session's idle-in-transaction
+            bound while a transaction was open, and nothing in the
+            ledger said planning had become slow until every sweep
+            started dying on the statement after it.
+
+            OPTIONAL, with the four above and with claimed_elsewhere,
+            for the reason that one states: the ledger holds rows
+            written before these fields existed.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,

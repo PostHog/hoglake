@@ -97,7 +97,7 @@ class CompactionDebtIntegrationTest {
             assertThat(summary.sample.smallFiles)
                 .isEqualTo(
                     policy.groups(sizes.filter { it < policy.targetBytes }, minInputFiles, maxInputFiles) { it }
-                        .sumOf { it.size.toLong() },
+                        .groups.sumOf { it.size.toLong() },
                 )
         }
     }

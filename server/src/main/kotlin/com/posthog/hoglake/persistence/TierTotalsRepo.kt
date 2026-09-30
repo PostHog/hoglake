@@ -105,6 +105,38 @@ object TierTotalsRepo {
             "AND s.published_generation = p.generation"
 
     /**
+     * The generation the sampler has PUBLISHED for [catalogId], or null
+     * when it has published none.
+     *
+     * "No published generation" and "a published generation that credits
+     * this table with no compactable bucket" are opposite states, and
+     * `CompactionService.fetchCandidates` has to tell them apart: the
+     * first means fall back to reading the table, the second means
+     * THERE IS NO WORK. Conflating them ran the whole-table statement
+     * every sweep, forever, for a table whose debt was real but spread
+     * thinner than the group minimum.
+     *
+     * One row per catalog, by primary key. `published_generation` is
+     * NOT NULL, so this returns null in TWO cases and they are the same
+     * answer: the row does not exist (the sampler has not discovered the
+     * catalog), or it is still at the column's default of 0 (discovered,
+     * never published — the sampler increments before it publishes, so
+     * every published generation is >= 1).
+     */
+    fun publishedGeneration(
+        handle: Handle,
+        catalogId: Long,
+    ): Long? =
+        handle.createQuery(
+            "SELECT published_generation FROM hog_maintenance_summary WHERE catalog_id = :catalogId",
+        )
+            .bind("catalogId", catalogId)
+            .mapTo(Long::class.javaObjectType)
+            .findOne()
+            .orElse(null)
+            ?.takeIf { it > 0 }
+
+    /**
      * One table's totals over the catalog's PUBLISHED generation, with
      * that generation's own identity and freshness alongside.
      *

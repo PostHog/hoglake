@@ -423,6 +423,22 @@ CREATE TABLE hog_file_partition_value (
     FOREIGN KEY (catalog_id, data_file_id)
         REFERENCES hog_data_file ON DELETE CASCADE
 );
+-- V23: the INVERSE of the primary key. The PK answers "what are this
+-- file's partition values"; the compaction planner needs "which files
+-- are in this bucket", because a group never spans a (spec_id,
+-- partition_values) bucket and the planner picks buckets before files.
+-- One EXISTS arm per partition key on the candidate fetch, each an
+-- index-only range on (catalog_id, key_index, value) returning
+-- data_file_id — hence that column in the key. Without it the planner
+-- read every live file of the table with a correlated array_agg per row
+-- (~9.9M on gigahog-prod-us's ingest.events_raw) to find the at most
+-- 50,000 candidates a table plan may fetch. NOT partial: every live
+-- file of a partitioned table is a bucket member, so there is nothing
+-- to exclude, and the index is paid
+-- on every registered partition value (V23's header has the write cost
+-- and the out-of-band build steps).
+CREATE INDEX hog_file_partition_value_lookup
+    ON hog_file_partition_value (catalog_id, key_index, value, data_file_id);
 
 -- ---- Sort orders ----
 -- Versioned sort spec, mirroring the partition-spec pair: header +

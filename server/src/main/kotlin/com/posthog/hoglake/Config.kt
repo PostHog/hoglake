@@ -627,6 +627,62 @@ data class Config(
     /** Groups rewritten per run per catalog — the commit-storm guard. */
     val compactionMaxGroupsPerRun: Int = env("HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN", "1").toInt(),
     /**
+     * How many times a run's own capacity in FILES the planner fetches
+     * candidate rows for.
+     *
+     * A run rewrites at most `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`
+     * groups of at most `HOGLAKE_COMPACTION_MAX_INPUT_FILES` files, and
+     * the planner's candidate read is bounded by that product times
+     * this. The multiplier absorbs the candidates that turn out not to
+     * be groupable — a bucket's short remainder, a group a sibling
+     * replica claims, a group the sorted row ceiling closes short — so
+     * a sweep plans as many groups as it can execute. See
+     * CompactionConfig.candidateHeadroom.
+     */
+    val compactionCandidateHeadroom: Int =
+        env(
+            "HOGLAKE_COMPACTION_CANDIDATE_HEADROOM",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_CANDIDATE_HEADROOM}",
+        ).toInt(),
+    /**
+     * Hard cap on any one table plan's candidate read — the binding
+     * term of the planner's budget at these defaults, and the bound on
+     * the no-published-generation fallback that has no bucket list to
+     * scope by.
+     *
+     * What matters about it is that it exists: the statement it caps
+     * used to read every live file of the table under the target. See
+     * CompactionConfig.maxCandidates.
+     */
+    val compactionMaxCandidates: Int =
+        env(
+            "HOGLAKE_COMPACTION_MAX_CANDIDATES",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_MAX_CANDIDATES}",
+        ).toInt(),
+    /**
+     * The CEILING of a group's fan-in, whatever the file sizes say;
+     * `HOGLAKE_COMPACTION_MAX_INPUT_FILES` is its floor.
+     *
+     * The fan-in cap scales with the size of the files it is capping
+     * (`CompactionConfig.effectiveMaxInputFiles`), because a fixed 64 is
+     * a file count asked to cap a byte target: at 12 KiB per file a
+     * 64-file group rewrites 768 KiB against a 512 MiB target and
+     * retires 63 files, which cannot outrun a fleet adding ~3,600 files
+     * a minute. This is where the scaling stops, and what it bounds is
+     * the per-group resources that scale with the INPUT COUNT rather
+     * than with the data — one open reader and parsed footer per input,
+     * one row lock per input in the commit tail.
+     *
+     * 2,048, from `CompactionFanInMeasurement`'s measured commit-lock
+     * hold: 33.6 ms per group against a stated 50 ms budget, a 0.90%
+     * duty cycle on the lock at 64 groups and 15 sweeps an hour.
+     */
+    val compactionMaxFanIn: Int =
+        env(
+            "HOGLAKE_COMPACTION_MAX_FAN_IN",
+            "${com.posthog.hoglake.compaction.CompactionConfig.DEFAULT_MAX_FAN_IN}",
+        ).toInt(),
+    /**
      * How many of a sweep's planned groups are rewritten and committed
      * AT ONCE. **1 (the default) is the sequential sweep this server has
      * always run** — an existing deployment that sets nothing changes in

@@ -1349,6 +1349,83 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val claimedElsewhere: Long = 0,
+    /**
+     * Candidate file rows the sweep's planners READ, summed over every
+     * table planned.
+     *
+     * Not a group outcome — a plan measure, and the one the planner's
+     * own defect had no series for. Compaction planning used to select
+     * every live file of a table under the target into a Kotlin list:
+     * ~9.9M rows per table per sweep on gigahog-prod-us's
+     * `ingest.events_raw`, with the packing that followed running long
+     * enough inside the planning transaction that Postgres killed the
+     * connection on `idle_in_transaction_session_timeout`. The fetch is
+     * bounded now, per table plan, by
+     * CompactionConfig.candidateBudget — and the number of STATEMENTS
+     * one plan may issue is bounded as well, which rows alone would not
+     * have covered. This is the number that says so.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val candidatesFetched: Long = 0,
+    /**
+     * Partition buckets the sweep's planners fetched candidates for,
+     * of the [bucketsAvailable] their samples offered.
+     *
+     * Groups never span a (spec_id, partition_values) bucket, so the
+     * planner picks BUCKETS before files, from the maintenance
+     * sampler's published generation, best compaction value first.
+     *
+     * SUMMED ACROSS THE SWEEP'S TABLES, so the pair is a ratio and not
+     * an equality: `considered` well below `available` means the
+     * candidate budget is the binding constraint and the remaining
+     * buckets wait for a later sweep, which is correct and is why the
+     * planner rotates the bucket it starts at
+     * (`CompactionService.bucketCursor`) rather than re-visiting the
+     * top of a fixed order. Equality would only mean "every table saw
+     * every bucket", which is a per-table statement this sum cannot
+     * make.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val bucketsConsidered: Long = 0,
+    /**
+     * Partition buckets the published sample credits the sweep's tables
+     * with enough ACTIONABLE debt to form a group — files the packer
+     * would take (the sampler's `selected` accumulator), not files that
+     * merely exist.
+     *
+     * Zero for a catalog whose sampler has published nothing yet, which
+     * takes the bounded whole-table fallback. A published generation
+     * that credits a table with no qualifying bucket means there is no
+     * work, and the planner reads nothing at all — a different state
+     * from the fallback, and one the first version of this change
+     * conflated with it.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val bucketsAvailable: Long = 0,
+    /**
+     * Table plans whose candidate fetch hit its own cap, so the table
+     * has compactable debt the plan could not see.
+     *
+     * Never an error: the next sweep sees the next-smallest files,
+     * because the fetch is ordered by size and compaction consumes
+     * candidates in that order. A STANDING nonzero on a table that
+     * never drains is the signal to raise
+     * HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN (so the run can use more of
+     * what it reads) rather than the caps themselves.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val candidatesTruncated: Long = 0,
+    /**
+     * Wall-clock milliseconds the sweep spent PLANNING, summed over
+     * every table it planned.
+     *
+     * Here because the planner's failure was a time failure: the in-JVM
+     * packing grew past the session's 30 s idle-in-transaction bound and
+     * nothing in the ledger said planning had become slow until every
+     * sweep started dying on the statement after it.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val planMs: Long = 0,
 )
 
 /**

@@ -21,12 +21,25 @@ class CompactionGroupingTest {
 
     private fun grouping(targetBytes: Long = 512 * mib) = CompactionGrouping.of(targetBytes)
 
+    /**
+     * Pack with BOTH capacities. Files are (bytes, rows) pairs here
+     * rather than bare sizes, because the whole point of the row bound
+     * is that the two quantities do not track each other.
+     */
+    private fun packRows(
+        files: List<Pair<Long, Long>>,
+        rowCapacity: Long,
+        min: Int = 2,
+        max: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
+        targetBytes: Long = 512 * mib,
+    ) = grouping(targetBytes).groups(files, min, max, rowCapacity, { it.second }) { it.first }
+
     private fun group(
         sizes: List<Long>,
         min: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
         max: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
         targetBytes: Long = 512 * mib,
-    ) = grouping(targetBytes).groups(sizes, min, max) { it }
+    ) = grouping(targetBytes).groups(sizes, min, max) { it }.groups
 
     @Test
     fun `files pack to the target rather than to an intermediate rung`() {
@@ -317,7 +330,7 @@ class CompactionGroupingTest {
             val sizes = List(rng.nextInt(0, 80)) { rng.nextLong(0, 200 * mib) }
             val min = rng.nextInt(2, 6)
             val max = rng.nextInt(min, min + 40)
-            val groups = grouping().groups(sizes, min, max) { it }
+            val groups = grouping().groups(sizes, min, max) { it }.groups
 
             // Groups are disjoint, ordered prefixes of the input.
             val flat = groups.flatten()
@@ -346,6 +359,145 @@ class CompactionGroupingTest {
                 assertThat(largest)
                     .describedAs("largest %d vs %d x rest %d", largest, CompactionGrouping.DOMINANCE_FACTOR, rest)
                     .isLessThanOrEqualTo(CompactionGrouping.DOMINANCE_FACTOR * rest)
+            }
+        }
+    }
+
+    // ---- the ROW capacity ----------------------------------------------------
+
+    @Test
+    fun `a group closes on rows before the file that would breach the ceiling`() {
+        // The asymmetry between the two bounds, which is the whole
+        // design. The BYTE target is an aim: the file that reaches it
+        // JOINS the group, so a group may overshoot the target by up to
+        // one file. The ROW capacity is a heap limit, and an overshoot
+        // is an OutOfMemoryError in a background loop — so it closes
+        // BEFORE the file that would breach it.
+        //
+        // Six files of 400 rows against a 1,000-row capacity: two per
+        // group (800 rows), never three (1,200).
+        val packed = packRows(List(6) { 1 * mib to 400L }, rowCapacity = 1_000)
+        assertThat(packed.groups.map { it.size }).containsExactly(2, 2, 2)
+        for (g in packed.groups) {
+            assertThat(g.sumOf { it.second })
+                .describedAs("no group may exceed the row capacity, ever")
+                .isLessThanOrEqualTo(1_000)
+        }
+        assertThat(packed.rowBoundRefusals).describedAs("every closure made a usable group").isEmpty()
+    }
+
+    @Test
+    fun `bytes still close a group when the rows are nowhere near their ceiling`() {
+        // The row bound must not become the only bound. Eight 64 MiB
+        // files against a 512 MiB target and a capacity of a billion
+        // rows is the pre-existing byte behaviour, untouched.
+        val packed = packRows(List(16) { 64 * mib to 1L }, rowCapacity = 1_000_000_000)
+        assertThat(packed.groups.map { it.size }).containsExactly(8, 8)
+        assertThat(packed.rowBoundRefusals).isEmpty()
+    }
+
+    @Test
+    fun `NO_ROW_CAPACITY is the streaming path's bound and changes nothing`() {
+        // The unsorted rewrite writes each survivor as it reads it, so
+        // its heap is flat in group size and a row bound there would be
+        // a pure throughput tax. The default must therefore be exactly
+        // the old behaviour, whatever the rows say.
+        val absurd = List(20) { 32 * mib to 100_000_000L }
+        val capped = packRows(absurd, rowCapacity = CompactionGrouping.NO_ROW_CAPACITY)
+        assertThat(capped.groups.map { it.size }).containsExactly(16, 4)
+        assertThat(capped.rowBoundRefusals).isEmpty()
+    }
+
+    @Test
+    fun `a group the row capacity closes under the file minimum is refused, not dropped silently`() {
+        // The two reasons a short group is dropped are not the same
+        // news, and this is the distinction `rowBoundRefusals` exists
+        // for.
+        //
+        // Four files of 900 rows against a 1,000-row capacity: no two
+        // fit, so every closure is a one-file group. A short group the
+        // BYTE rule left behind fills as more files arrive; this one
+        // never will, because the capacity comes from the table's
+        // schema and the process's heap. So it is handed back to be
+        // counted (heap_budget_exceeded) and warned about.
+        //
+        // THREE refusals for four files: the loop closes before files
+        // 2, 3 and 4, and the fourth is then the trailing remainder,
+        // which closes on neither bound and is the ordinary silent case.
+        val packed = packRows(List(4) { 1 * mib to 900L }, rowCapacity = 1_000, min = 2)
+        assertThat(packed.groups).isEmpty()
+        assertThat(packed.rowBoundRefusals.map { it.size }).containsExactly(1, 1, 1)
+    }
+
+    @Test
+    fun `a short remainder the BYTES left behind is still dropped silently`() {
+        // The control for the test above: the row capacity is generous,
+        // the remainder is short because the bucket has run out of
+        // files, and more appends are exactly what fills it. Refusing it
+        // would put a permanent warning on every low-traffic partition
+        // in the fleet.
+        val packed = packRows(listOf(1 * mib to 1L), rowCapacity = 1_000_000, min = 2)
+        assertThat(packed.groups).isEmpty()
+        assertThat(packed.rowBoundRefusals).isEmpty()
+    }
+
+    @Test
+    fun `a file whose own rows exceed the capacity is refused and does not strand the others`() {
+        // A file that can share a group with nothing. It is emitted as a
+        // one-file group so the minimum drops it, and reported — because
+        // the alternative is a table that silently never compacts.
+        //
+        // The other half is what the old shape got wrong: the files
+        // around it still group. Packed on bytes and then tested against
+        // the ceiling, one such file's bucket produced nothing at all.
+        val packed =
+            packRows(
+                List(4) { 1 * mib to 400L } + listOf(1 * mib to 5_000L),
+                rowCapacity = 1_000,
+                min = 2,
+            )
+        assertThat(packed.groups.map { it.size }).containsExactly(2, 2)
+        assertThat(packed.rowBoundRefusals.single().map { it.second }).containsExactly(5_000L)
+        for (g in packed.groups) {
+            assertThat(g.map { it.second }).doesNotContain(5_000L)
+        }
+    }
+
+    @Test
+    fun `randomized inputs never produce a group above the row capacity`() {
+        // The invariant, over both bounds at once, because the two close
+        // a group by different rules and the interaction is where an
+        // off-by-one would live. The byte assertions from the
+        // size-only property still hold; the row one is absolute.
+        val rng = Random(20260930)
+        val target = 512 * mib
+        repeat(300) {
+            val files = List(rng.nextInt(0, 80)) { rng.nextLong(0, 200 * mib) to rng.nextLong(0, 4_000) }
+            val min = rng.nextInt(2, 6)
+            val max = rng.nextInt(min, min + 40)
+            val capacity = rng.nextLong(1, 10_000)
+            val packed =
+                CompactionGrouping.of(target)
+                    .groups(files, min, max, capacity, { it.second }) { it.first }
+
+            for (g in packed.groups) {
+                assertThat(g.sumOf { it.second })
+                    .describedAs("group rows against capacity %d", capacity)
+                    .isLessThanOrEqualTo(capacity)
+                assertThat(g.size).describedAs("fan-in").isLessThanOrEqualTo(max)
+            }
+            // Refusals are disjoint from groups and from each other: a
+            // file is in at most one of the two lists, so a count of
+            // refusals can never double-count work that also got done.
+            val taken = packed.groups.flatten()
+            val refused = packed.rowBoundRefusals.flatten()
+            assertThat(taken.size + refused.size).isLessThanOrEqualTo(files.size)
+            // And every refusal is genuinely short of what it needed,
+            // never a group that could have been rewritten.
+            for (g in packed.rowBoundRefusals) {
+                val largest = g.maxOf { it.first }
+                val need = maxOf(2L, minOf(min.toLong(), if (largest <= 0) min.toLong() else target / largest))
+                assertThat(g.size.toLong()).describedAs("a refusal is short by definition").isLessThan(need)
             }
         }
     }

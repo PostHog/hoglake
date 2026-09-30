@@ -44,13 +44,20 @@ import java.util.UUID
  *    EXACT for ordinary unsorted scalar tables, and OVER-REPORTING for
  *    three cases the sampler cannot see, all of which predate the
  *    one-pass change:
- *      - SORTED (and nested) tables, where the planner runs against
- *        CompactionConfig.effectiveTargetBytes — derated to fit the sort
- *        buffer in heap — while the sampler uses the raw target. Files
- *        between the derated budget and the raw target are debt here and
- *        invisible to the planner.
+ *      - SORTED (and nested) tables, where the planner packs to a ROW
+ *        CEILING as well as to the byte target
+ *        (CompactionConfig.sortedRowCeiling, passed to
+ *        CompactionGrouping as a second capacity) while the sampler
+ *        knows only the bytes. The ceiling is a per-table quantity —
+ *        the live sort order and the column forest decide it — and the
+ *        sampler's scan walks every table of a catalog in one pass with
+ *        no schema in hand, so it cannot mirror it. A dense sorted
+ *        table's groups therefore close EARLIER than the debt reported
+ *        here, and a nested one's byte budget is derated on top
+ *        (CompactionConfig.effectiveTargetBytes).
  *      - VARIANT tables, which CompactionService refuses to plan at all.
- *      - Groups the row ceiling refuses (heap_budget_exceeded).
+ *      - Work the row ceiling cannot group at all: a file above it, or
+ *        files dense enough that no two fit (heap_budget_exceeded).
  *    Closing these means teaching a bounded streaming scan the schema,
  *    sort spec and per-table density; until then, read a sorted or
  *    variant table's debt as an upper bound.

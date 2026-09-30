@@ -1,0 +1,320 @@
+-- THE INDEX THAT RESOLVES A PARTITION TUPLE TO ITS FILES, which
+-- nothing in this schema has ever had.
+--
+-- `hog_file_partition_value` stores ONE ROW PER PARTITION KEY of a file
+-- (`PRIMARY KEY (catalog_id, data_file_id, key_index)`, V1), so its only
+-- access path answers "what are THIS FILE's partition values". The
+-- compaction planner needs the inverse — "which files are in THIS
+-- BUCKET" — because a compaction group never spans a
+-- `(spec_id, partition_values)` bucket, so the planner's whole job is to
+-- pick buckets and then read their files.
+--
+-- Without this index it could not, and what it did instead is the defect
+-- this migration is half of: `CompactionService` selected EVERY live
+-- file of the table under the target, with a correlated `array_agg` over
+-- this table per row, and bucketed them in the JVM. On
+-- gigahog-prod-us's `ingest.events_raw` that is ~9.9M rows and ~9.9M
+-- correlated subqueries per table per sweep, to find the at most 4,096
+-- files a run can rewrite — and the in-memory bin packing that followed
+-- ran with the planning transaction still open, until
+-- `idle_in_transaction_session_timeout` (30 s,
+-- `Database.SESSION_INIT_SQL`) killed the connection and every sweep
+-- failed on the statement after it.
+--
+-- ============================================================
+-- THE STATEMENT IT SERVES, AND THE PLAN IT REPLACES
+-- ============================================================
+--
+-- `CompactionService.candidateSql` — the planner's ONE candidate
+-- statement. It leads on `hog_data_file_maintenance_size_scan
+-- (catalog_id, table_id, file_size_bytes, data_file_id)` (V10),
+-- smallest first, table-scoped, and applies the bucket's partition
+-- tuple as one `EXISTS` arm per key against THIS index, with the
+-- `LIMIT` on that ordered scan so the read stops at the cap.
+--
+-- Each arm is `catalog_id = ? AND key_index = ? AND value = ?` (or
+-- `value IS NULL`; a null partition value is legal and `IS NULL` drives
+-- a btree while `IS NOT DISTINCT FROM` does not).
+--
+-- WHICH PLAN POSTGRES PICKS IS NOT FIXED, AND BOTH ARE BOUNDED. That is
+-- the point of this shape rather than a defect in it:
+--
+--   * with a SELECTIVE bucket (a day of one table) Postgres rewrites
+--     the `EXISTS` into a semi-join and drives from THIS index, reading
+--     the bucket's entries index-only and probing the manifest per id —
+--     bounded by the bucket, and the right choice at that selectivity;
+--   * with a bucket that is a large fraction of the table's small files
+--     it drives the ordered scan and applies the arms as filters —
+--     bounded by the `LIMIT`.
+--
+-- An earlier draft drove the other way: an `INTERSECT` of arms into a
+-- primary-key probe per id, with `ORDER BY file_size_bytes` and the
+-- `LIMIT` on top. That bounds the rows RETURNED and not the work — the
+-- sort key is not obtainable from the intersect's order, so every id the
+-- bucket holds is materialised, probed and sorted before the `LIMIT`
+-- applies — and the arms are CATALOG-scoped, because this table has no
+-- `table_id` and every day-partitioned table of a catalog writes the
+-- same day string. It is gone.
+--
+-- `V23PartitionValueLookupMigrationIntegrationTest` runs this file
+-- against rows seeded BEFORE it and EXPLAINs the planner's own
+-- statement, exposed `internal` for the purpose. Fixture: PG 18,
+-- 200,000 `hog_data_file` rows over 2,000 single-key partition buckets
+-- (100 files each) in one table, plus a neighbour catalog taking every
+-- tenth row so `catalog_id` leading the index means something;
+-- partition values assigned round-robin over one `generate_series` so a
+-- bucket's rows are SCATTERED through both heaps rather than contiguous
+-- — AGENT.md records what a clustered fixture does to a measurement of
+-- this kind (V19's first draft read 91x and the honest number was
+-- 2.2x). `EXPLAIN (ANALYZE, BUFFERS)`, serial plan, warm, the PROBE's
+-- scan node rather than the plan's maximum:
+--
+--   before   1,471 buffers
+--            (Seq Scan on hog_file_partition_value with
+--            `Rows Removed by Filter: 199,900` — only `catalog_id` leads
+--            the primary key, so `key_index` and `value` are Filters and
+--            the catalog's whole partition-value population is read to
+--            find one bucket's 100 rows)
+--   after        5 buffers
+--            (Index Only Scan using hog_file_partition_value_lookup,
+--            `Index Cond` carrying all three columns,
+--            `Index Searches: 1`, `Heap Fetches: 0`, nothing filtered)
+--
+-- 294x on the probe, and unlike V19's the ratio does not decay with a
+-- row fraction: the before plan grows with the CATALOG's partition-value
+-- count and the after plan with the BUCKET's file count, which the
+-- partition bounds.
+--
+-- `CompactionCandidateFetchPlanIntegrationTest` is the other half, and
+-- it is the one that answers the doctrine's "prove the plan on a
+-- production-shaped fixture": three tables in ONE catalog sharing day
+-- values, 2,000 tiny buckets beside 3 fresh buckets three orders of
+-- magnitude larger, 210,000 file rows. Its KDoc carries the measured
+-- rows, buffers and wall time for both plan shapes, and it asserts the
+-- bound in each rather than pinning whichever plan the planner picks.
+--
+-- ============================================================
+-- THE ALTERNATIVE, MEASURED AND REJECTED
+-- ============================================================
+--
+-- One shape needs no new index: lead on `hog_data_file` through V10's
+-- size index and compare the `array_agg` of the file's values to the
+-- bucket's tuple. This is the statement being replaced, narrowed to one
+-- bucket, and with no index present it measures
+--
+--     726,837 buffers, `Rows Removed by Filter: 179,900`, the correlated
+--     subquery running 180,000 times (`Index Searches: 180000` on the
+--     partition-value primary key)
+--
+-- — 494x the shipped statement's whole cost, to return the same 100
+-- rows. That is the production defect reproduced: it is what
+-- `ingest.events_raw` pays 9.9M times per sweep. The shipped statement
+-- keeps that aggregate for exactly one case — a catalog with no
+-- published sampler generation, where there is no bucket list to scope
+-- by — and runs it at most `HOGLAKE_COMPACTION_MAX_CANDIDATES` times,
+-- outside the `LIMIT`, instead of once per live file.
+--
+-- The key order is `(catalog_id, key_index, value, data_file_id)`:
+-- `key_index` before `value` because each arm probes one key of the
+-- tuple with an equality on both, and `data_file_id` last so the arm is
+-- an INDEX ONLY SCAN — the ids are all the arm returns, and without the
+-- column every matching row would cost a heap fetch on the largest
+-- child table in the schema.
+--
+-- ============================================================
+-- WHAT IT COSTS, ON THE HOTTEST WRITE IN THE SYSTEM
+-- ============================================================
+--
+-- Not partial, and it cannot be: every live file of a partitioned table
+-- is a bucket member, so there is no predicate to exclude anything by
+-- (the test asserts `pg_index.indpred` is null, because a future partial
+-- predicate would silently hide files from the planner). This index is
+-- therefore paid on EVERY registered partition value, which is
+-- `keys x files` — the biggest insert volume in the catalog after
+-- `hog_file_column_stats`.
+--
+-- BOTH SIDES ARE MEASURED. Size, on the fixture above (200,000 value
+-- rows, one key each, 12-byte `day-NNNNNN` values):
+--
+--   index size    9,969,664 bytes = 50 bytes per value row
+--   relation size 12,050,432 bytes
+--
+-- So the index is ~83% of the relation it indexes, which is what a
+-- four-column key over a five-column table comes to. Confirmed
+-- independently on a clean index (`VACUUM FULL` + `REINDEX`) over
+-- 262,000 value rows: 12,984,320 B, **49.6 bytes per row**.
+--
+-- And the PER-INSERT cost, measured rather than estimated: three runs
+-- each of 20,000 `hog_data_file` rows plus 20,000
+-- `hog_file_partition_value` rows, one key, 11-char values, warm, WAL
+-- taken from a `pg_current_wal_insert_lsn()` delta:
+--
+--   with the index      294 / 295 / 324 ms     22.5 / 22.9 / 25.7 MB WAL
+--   without it          246 / 254 / 257 ms     20.2 / 20.7 / 20.7 MB WAL
+--
+-- **+2.0 us and +100 bytes of WAL per registered partition value**, a
+-- +10% WAL increase on the pair — consistent with V17's anchor on
+-- `hog_data_file` (+31 us and +7,343 B for a 243-byte key; this key is
+-- ~1/8 that width). Extrapolated to gigahog-prod-us's ~270 files per
+-- commit on a one-key spec: **+0.5 ms and +27 KB per commit**, and at
+-- ~50 commits/min **~2.3 GB/day of extra WAL** (~7 GB/day on a
+-- three-key spec), against `hog_commit_receipt`'s ~40 GB/day (#240).
+-- The standing index size at 30M value rows is ~1.4 GB.
+--
+-- CAVEAT on those figures, because it matters which way they are wrong:
+-- they are bulk single-statement inserts, so the per-row amortization
+-- is OPTIMISTIC against a 270-row prepared batch. The order of
+-- magnitude is right; the latency per commit could be a small multiple.
+--
+-- THE DELETE SIDE, which is the hot path from the week this index was
+-- written in and which the insert arithmetic above does not cover.
+-- `hog_file_partition_value` is one of `hog_data_file`'s three
+-- cascading children, and V19's header names those RI triggers as the
+-- DOMINANT cost of expiry's data-file DELETE — "~4 s per 300k rows even
+-- against an EMPTY child table" — with the 2026-09-28 outage being that
+-- statement at 700-870 us per file. A second index on the child adds
+-- index maintenance to every cascaded delete and vacuum debt behind it.
+--
+-- The arithmetic, with the measurement it rests on named: a btree entry
+-- deletion is a mark-dead plus the eventual vacuum of the leaf page, and
+-- this index holds ONE ENTRY PER VALUE ROW at a measured 50 bytes. So a
+-- sweep that expires F files of a k-key spec dirties F x k entries here
+-- on top of the F x k heap tuples the cascade already dirties — a
+-- constant factor on a term that already exists, not a new term. At
+-- prod-us's `HOGLAKE_EXPIRY_BATCH` and its ~30-90k ended rows per sweep
+-- that is ~90-270k entries at three keys.
+--
+-- WHAT IS NOT MEASURED, and is labelled rather than estimated: the
+-- wall-clock and WAL those entry deletions add to a sweep. Nothing here
+-- has a production-sized volume, and V19's own figure was measured on
+-- an EMPTY child table, so it is the wrong anchor for a child that now
+-- carries two indexes. The operator lever if it bites is the one V19's
+-- header already names — lower `HOGLAKE_EXPIRY_BATCH` — and the
+-- follow-up is the same one the insert side has: a partition-tuple hash
+-- column on `hog_data_file`, which removes this index and the child's
+-- second access path together.
+--
+-- It is a real cost and it buys the difference between a planner that
+-- runs and one that does not. The cheaper alternative — a
+-- partition-tuple HASH column on `hog_data_file`, folded into the
+-- existing size index — needs a new column, a backfill of every existing
+-- row and a writer-path change, and is the follow-up if this index's
+-- write cost ever bites.
+--
+-- ============================================================
+-- CONCURRENTLY, IN V17'S AND V19'S SHAPE
+-- ============================================================
+--
+-- `hog_file_partition_value` is `hog_data_file`'s size times the
+-- partition key count, and a PLAIN build takes SHARE on it for the whole
+-- duration — which blocks the partition-value INSERT inside every commit
+-- of every partitioned table in the fleet, past the 30 s admission bound
+-- (`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`). V16's trade (a plain build is
+-- cheaper at a small table's size) reverses here for the same reason it
+-- reverses for V17 and V19: what matters is what the build BLOCKS, not
+-- what it costs.
+--
+-- MEASURED on the fixture, both builds back to back on the same rows in
+-- the same session, warm — so these are the BEST case and not the deploy
+-- case:
+--
+--   CREATE INDEX CONCURRENTLY   217 ms
+--   plain CREATE INDEX          165 ms
+--   whole V23 migration         187 ms
+--
+-- The concurrent build is the SLOWER of the two, as it is at every size
+-- (two heap passes instead of one), and the test asserts that ordering
+-- rather than either millisecond figure. V16 measured the same
+-- relationship at its table's size and chose the plain build anyway
+-- because 1.4 s of blocked INSERTs on a 164k-row queue is survivable;
+-- here the blocked statement is inside every commit in the fleet.
+--
+-- THE COLD ESTIMATE AT PRODUCTION SIZE IS A FLOOR, and it is labelled an
+-- estimate because nothing here has a production-sized volume to measure
+-- on. The build is a full heap scan whatever the index holds, twice over
+-- when CONCURRENTLY, plus ~1.4 GB of index to write. At three keys per
+-- file on a 5M-file manifest that is two passes over a relation on the
+-- order of a gigabyte: **~20-30 s at an idle volume's 125 MB/s, and well
+-- past a 60 s session `statement_timeout` on a busy one**, which is the
+-- whole argument for the out-of-band pre-build below rather than a
+-- number to trust.
+--
+-- SO ON A LARGE CATALOG, PRE-BUILD IT OUT OF BAND and let the migration
+-- be the no-op it then is. `Main.kt` migrates before Netty binds and the
+-- chart's startup probe SIGKILLs at 30 x 5 s, and a CIC waits out every
+-- transaction older than itself — including FOREIGN ones this repo does
+-- not bound (an operator's psql in a transaction, pg_dump, an RDS
+-- export, a logical-decoding reader). The steps:
+--
+--   -- 1. nothing older than the build may be running:
+--   SELECT pid, state, now() - xact_start AS xact_age, left(query, 80)
+--   FROM pg_stat_activity
+--   WHERE datname = current_database() AND xact_start IS NOT NULL
+--     AND now() - xact_start > interval '1 minute'
+--   ORDER BY xact_start;
+--
+--   -- 2. the build (re-runnable; an interrupted one leaves an INVALID
+--   --    index that the DO block below clears):
+--   SET statement_timeout = 0;
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS hog_file_partition_value_lookup
+--       ON hog_file_partition_value (catalog_id, key_index, value, data_file_id);
+--
+--   -- 3. valid before promoting:
+--   SELECT c.relname, i.indisvalid FROM pg_class c
+--   JOIN pg_index i ON i.indexrelid = c.oid
+--   WHERE c.relname = 'hog_file_partition_value_lookup';
+--
+-- UNTIL IT EXISTS, THE PLANNER STILL WORKS AND IS STILL BOUNDED. The
+-- bucket-scoped fetch is what gets slow without the index, not wrong,
+-- and the whole-table fallback it shares a cap with
+-- (`HOGLAKE_COMPACTION_MAX_CANDIDATES`) is bounded either way. A deploy
+-- that lands the code before the index compacts less, not worse.
+--
+-- NOT TRANSACTIONAL, because the index builds CONCURRENTLY, which forces
+-- V17's and V19's shape: the `lock_timeout` window is a SAVE-and-RESTORE
+-- pair rather than `SET LOCAL`, every statement is idempotent, and a
+-- partial failure leaves a `success = false` history row that fails
+-- Flyway's validate on every replica until an operator runs `flyway
+-- repair`. NEITHER RESTORE RUNS ON THE FAILURE PATH, which is survivable
+-- for one reason only and it is a property of the CALLER: `Main.kt`
+-- migrates before it binds, so a throw here is a dead pod and the pooled
+-- connection carrying the settings dies with the JVM.
+SELECT set_config('hoglake.migration_lock_timeout', current_setting('lock_timeout'), false);
+SET lock_timeout = '5s';
+
+-- An INVALID remnant is cleared before the build. `CREATE INDEX
+-- CONCURRENTLY IF NOT EXISTS` matches on NAME alone: it would find a
+-- half-built index from a cancelled build, skip, and leave one that
+-- every partition-value INSERT maintains and no query may use. A
+-- cancelled build is what a killed pod, an operator's Ctrl-C or a
+-- statement timeout leaves behind. Plain `DROP INDEX` takes ACCESS
+-- EXCLUSIVE on the TABLE and cannot be CONCURRENTLY inside a DO block,
+-- so it runs under the 5 s bound: fail fast and retryably rather than
+-- convoy the catalog.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM pg_class c
+        JOIN pg_index i ON i.indexrelid = c.oid
+        WHERE c.relname = 'hog_file_partition_value_lookup' AND NOT i.indisvalid
+    ) THEN
+        EXECUTE 'DROP INDEX hog_file_partition_value_lookup';
+    END IF;
+END $$;
+
+-- Restore BEFORE the concurrent build: it waits out every transaction
+-- older than itself, which is exactly the wait a 5 s lock_timeout would
+-- abort.
+SELECT set_config('lock_timeout', current_setting('hoglake.migration_lock_timeout'), false);
+
+-- `statement_timeout = 0` for the build and nothing else. A pod's
+-- session carries 60 s (Database.SESSION_INIT_SQL); a build the bound
+-- kills leaves an INVALID index and a failed history row, and the DO
+-- block above is the other half of that story.
+SELECT set_config('hoglake.migration_statement_timeout', current_setting('statement_timeout'), false);
+SET statement_timeout = 0;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS hog_file_partition_value_lookup
+    ON hog_file_partition_value (catalog_id, key_index, value, data_file_id);
+
+SELECT set_config('statement_timeout', current_setting('hoglake.migration_statement_timeout'), false);

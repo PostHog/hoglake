@@ -2307,6 +2307,9 @@ class CompactionServiceIntegrationTest {
             cfg.copy(
                 targetBytes = inputs.sumOf { it.fileSizeBytes } * 4,
                 maxInputFiles = 2,
+                // Pinned: `maxInputFiles` is the scaling fan-in's floor
+                // now, and this test closes groups on the fan-in cap.
+                maxFanIn = 2,
                 maxGroupsPerRun = 20,
             )
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", inputs))))

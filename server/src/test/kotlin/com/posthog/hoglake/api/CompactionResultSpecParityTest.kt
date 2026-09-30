@@ -94,6 +94,11 @@ class CompactionResultSpecParityTest {
                 heapBudgetExceeded = 10,
                 failedGroups = 11,
                 claimedElsewhere = 12,
+                candidatesFetched = 13,
+                bucketsConsidered = 14,
+                bucketsAvailable = 15,
+                candidatesTruncated = 16,
+                planMs = 17,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -110,6 +115,15 @@ class CompactionResultSpecParityTest {
         assertThat(dto.claimedElsewhere)
             .describedAs("the counter whose absence made the endpoint unable to report it")
             .isEqualTo(12)
+        // The five PLAN measures. Distinct values for the same reason
+        // the counters have them: the name-equality tests above cannot
+        // see `candidatesFetched = bucketsConsidered`, and this is the
+        // test that exists to.
+        assertThat(dto.candidatesFetched).isEqualTo(13)
+        assertThat(dto.bucketsConsidered).isEqualTo(14)
+        assertThat(dto.bucketsAvailable).isEqualTo(15)
+        assertThat(dto.candidatesTruncated).isEqualTo(16)
+        assertThat(dto.planMs).isEqualTo(17)
     }
 
     @Test

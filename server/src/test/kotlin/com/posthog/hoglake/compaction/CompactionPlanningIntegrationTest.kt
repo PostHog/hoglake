@@ -177,7 +177,11 @@ class CompactionPlanningIntegrationTest {
         // And the fan-in cap closes a group the bytes never would. The
         // trailing 2 is a group in its own right: it clears this
         // config's minimum of two files.
-        val capped = svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024, maxInputFiles = 3))
+        // `maxFanIn` pinned with it: `maxInputFiles` is the scaling
+        // cap's FLOOR now, so the fan-in has to be capped explicitly
+        // for this assertion to be about the fan-in.
+        val capped =
+            svc.planTable(cat, "ns", "t", cfg.copy(targetBytes = 1024, maxInputFiles = 3, maxFanIn = 3))
         assertThat(capped.groups.map { it.files.size }).containsExactly(3, 3, 2)
     }
 
