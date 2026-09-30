@@ -98,10 +98,41 @@ SELECT (SELECT id FROM hoglake_current_snapshot('lake')) = (SELECT max(snapshot_
 ----
 true
 
-query III
-SELECT namespace, table_name, record_count FROM hoglake_table_info('lake') WHERE table_name = 'tt'
+# hoglake_table_info's identity columns are exact; its THREE TOTALS are
+# not, and cannot be asserted as a number here (hoglake #232). The server
+# serves a head read's totals from the maintenance sampler's published
+# generation, and `tt` is created BY this file: whether the generation
+# that covers it has published yet depends on where the sampler's cycle
+# happens to be (HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS in
+# server/docker-compose.yml, lowered to 1 so the dev stack samples
+# promptly). So the row is asserted exact on identity, and the totals
+# are asserted to be either the right number or HONESTLY NULL — never
+# the confident 0 the extension used to report for an absent field,
+# which is the regression this pair of assertions exists to catch.
+#
+# THE TRADEOFF, stated because the NULL branch is a hole as well as a
+# contract: `IS NULL OR = 3` catches the confident 0, and it would also
+# pass against a server that regressed to never sampling at all. The
+# `count(*)` below is what covers that — it reads the table's own data
+# path, which no sample touches — so between them the pair pins the
+# extension's NULL handling and the data. Restoring the bare `3` needs
+# the harness to wait for a published sample, which sqllogictest has no
+# directive for here.
+query II
+SELECT namespace, table_name FROM hoglake_table_info('lake') WHERE table_name = 'tt'
 ----
-ns1	tt	3
+ns1	tt
+
+query I
+SELECT record_count IS NULL OR record_count = 3 FROM hoglake_table_info('lake') WHERE table_name = 'tt'
+----
+true
+
+# And the exact count comes from the table itself, which is not sampled.
+query I
+SELECT count(*) FROM lake.ns1.tt
+----
+3
 
 # ---- maintenance passthroughs (server-side; results are JSON).
 # NOTE: these assert the wire round trip and result SHAPE; this dev

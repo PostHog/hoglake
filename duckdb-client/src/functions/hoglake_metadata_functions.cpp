@@ -140,6 +140,11 @@ struct HoglakeTableInfoRow {
 	string namespace_name;
 	string table_name;
 	string table_uuid;
+	//! Whether the server sent the three totals at all — see
+	//! HoglakeTableInfo::has_totals. False emits SQL NULLs rather than
+	//! zeros, because this function's output is read by a person and a
+	//! zero for a table with rows is a wrong answer, not a stale one.
+	bool has_totals;
 	int64_t record_count;
 	int64_t file_count;
 	int64_t file_size_bytes;
@@ -191,6 +196,7 @@ static unique_ptr<GlobalTableFunctionState> TableInfoInit(ClientContext &context
 			row.namespace_name = ns;
 			row.table_name = table->name;
 			row.table_uuid = table->table_uuid;
+			row.has_totals = table->has_totals;
 			row.record_count = table->record_count;
 			row.file_count = table->file_count;
 			row.file_size_bytes = table->file_size_bytes;
@@ -213,9 +219,22 @@ static void TableInfoExecute(ClientContext &context, TableFunctionInput &data, D
 		Value raw_uuid(row.table_uuid);
 		raw_uuid.DefaultTryCastAs(LogicalType::UUID, uuid_value, nullptr);
 		output.SetValue(2, count, uuid_value);
-		output.SetValue(3, count, Value::BIGINT(row.record_count));
-		output.SetValue(4, count, Value::BIGINT(row.file_count));
-		output.SetValue(5, count, Value::BIGINT(row.file_size_bytes));
+		// NULL, not 0, when the server sent no totals: this row goes
+		// straight to a human, and `hoglake_table_info()` reporting 0
+		// rows for a table that has rows is a wrong answer. The server
+		// omits them on a head read whose maintenance sample does not
+		// cover the table (hoglake #232) — a table created since the
+		// last published generation, or a catalog the sampler has not
+		// finished a scan of.
+		if (row.has_totals) {
+			output.SetValue(3, count, Value::BIGINT(row.record_count));
+			output.SetValue(4, count, Value::BIGINT(row.file_count));
+			output.SetValue(5, count, Value::BIGINT(row.file_size_bytes));
+		} else {
+			output.SetValue(3, count, Value(LogicalType::BIGINT));
+			output.SetValue(4, count, Value(LogicalType::BIGINT));
+			output.SetValue(5, count, Value(LogicalType::BIGINT));
+		}
 		count++;
 	}
 	output.SetCardinality(count);

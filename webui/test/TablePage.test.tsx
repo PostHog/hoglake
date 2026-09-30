@@ -64,6 +64,112 @@ describe("TablePage", () => {
     expect(screen.getByText("sort_order").nextElementSibling).toHaveTextContent("—");
   });
 
+  // ---- the totals and their freshness (#232) --------------------------
+  //
+  // The three totals used to be a live aggregate over every live file of
+  // the table on EVERY call; they now come from the maintenance
+  // sampler's published generation, which means the header has to say
+  // four different things and must never say the wrong one. Each state
+  // gets its own test because each is a different claim about the
+  // numbers.
+
+  it("dates the header's totals when they come from the sample", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+
+    // tableFixture's totals_as_of is 12 minutes back, so the header
+    // reads the age rather than implying the numbers are live, and the
+    // snapshot they are exact at sits beside it.
+    expect(await screen.findByText(/as of 12 min ago/)).toBeInTheDocument();
+    expect(screen.getByText(/as of 12 min ago/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("sampled 20"),
+    );
+    // The snapshot goes through SnapshotId, so it is hoverable and keeps
+    // its digits — the same treatment every other snapshot id gets.
+    expect(screen.getByText("39")).toHaveAttribute("data-snapshot-id", "39");
+  });
+
+  it("shows em dashes and 'not yet sampled' when the sample does not cover the table", async () => {
+    // What the server sends for a table the published generation never
+    // saw: the totals and both freshness fields ABSENT. Never zeros — an
+    // unsampled table and an empty one are different facts, and showing
+    // 0 would assert the wrong one.
+    const unsampled = { ...tableFixture };
+    delete unsampled.record_count;
+    delete unsampled.file_count;
+    delete unsampled.file_size_bytes;
+    delete unsampled.totals_snapshot_id;
+    delete unsampled.totals_as_of;
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(unsampled);
+      return happyHandler(url);
+    });
+    renderApp(route);
+
+    await screen.findByText("record_count");
+    // The three value cells plus the freshness cell, each explaining
+    // itself. sort_order's own em dash is not one of these, so the
+    // tooltip is what the assertion keys on rather than the character.
+    expect(screen.getAllByTitle("not yet sampled")).toHaveLength(4);
+    for (const cell of screen.getAllByTitle("not yet sampled")) {
+      expect(cell).toHaveTextContent("—");
+    }
+    // Nothing anywhere claims a number.
+    expect(screen.queryByText("1,234,567")).not.toBeInTheDocument();
+    expect(screen.queryByText("5.0 GiB")).not.toBeInTheDocument();
+  });
+
+  it("calls a time-travel read's totals exact, keyed on the request", async () => {
+    // With ?snapshot= the server aggregates the manifest and sends no
+    // freshness fields: the numbers are EXACT at that snapshot. An em
+    // dash here would make the most trustworthy numbers on the page
+    // look like the least.
+    const exact = { ...tableFixture };
+    delete exact.totals_snapshot_id;
+    delete exact.totals_as_of;
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(exact);
+      return happyHandler(url);
+    });
+    renderApp(`${route}?snapshot=41`);
+
+    expect(await screen.findByText("exact at this snapshot")).toBeInTheDocument();
+    expect(screen.getByText("1,234,567")).toBeInTheDocument();
+    expect(screen.queryByTitle("not yet sampled")).not.toBeInTheDocument();
+  });
+
+  it("claims nothing about an older server's head totals", async () => {
+    // THE STATE THE PREVIOUS DRAFT GOT WRONG. A pre-#232 server returns
+    // live-aggregated totals and NO freshness field on a HEAD read, and
+    // during a rollout the console deploys ahead of the server — so
+    // keying "exact at this snapshot" on the absence of
+    // totals_snapshot_id would have labelled a head read as exact at a
+    // snapshot nobody asked for. Keyed on the REQUEST instead, this
+    // renders the numbers with no freshness claim at all.
+    const older = { ...tableFixture };
+    delete older.totals_snapshot_id;
+    delete older.totals_as_of;
+    mockFetch((url) => {
+      const [path] = url.split("?");
+      if (path === base) return jsonResponse(older);
+      return happyHandler(url);
+    });
+    renderApp(route);
+
+    // The numbers are shown, because they are real.
+    expect(await screen.findByText("1,234,567")).toBeInTheDocument();
+    // But nothing is claimed about them.
+    expect(screen.queryByText("exact at this snapshot")).not.toBeInTheDocument();
+    expect(screen.queryByText(/as of/)).not.toBeInTheDocument();
+    expect(screen.queryByTitle("not yet sampled")).not.toBeInTheDocument();
+    expect(
+      screen.getByTitle("this server does not report the totals' freshness"),
+    ).toHaveTextContent("—");
+  });
+
   it("shows the sort order in the stats header for a sorted table", async () => {
     mockFetch((url) => {
       const [path] = url.split("?");

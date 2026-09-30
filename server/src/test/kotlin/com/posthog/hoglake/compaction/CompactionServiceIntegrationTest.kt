@@ -32,6 +32,7 @@ import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import com.posthog.hoglake.testing.ThriftRowGroupStarts
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
@@ -605,7 +606,7 @@ class CompactionServiceIntegrationTest {
         // -- aggregates: gross 15 before, 13 after (the deleted rows are
         //    physically gone from the visible file set).
         assertThat(catalogs.getTable(fx.cat, "ns", "t", snapshot = compactionSnap - 1).recordCount).isEqualTo(15)
-        val aggAfter = catalogs.getTable(fx.cat, "ns", "t")
+        val aggAfter = catalogs.tableWithExactTotals(fx.cat, "ns", "t")
         assertThat(aggAfter.recordCount).isEqualTo(13)
         assertThat(aggAfter.fileCount).isEqualTo(1)
 
@@ -1751,7 +1752,7 @@ class CompactionServiceIntegrationTest {
         val txnFile = scanned.single { it.dataFile.path == path }
         assertThat(txnFile.dataFile.recordCount).isEqualTo(rows.size.toLong())
         assertThat(txnFile.deleteFile).isNull()
-        assertThat(catalogs.getTable(fx.cat, "ns", "t").recordCount).isEqualTo(23)
+        assertThat(catalogs.tableWithExactTotals(fx.cat, "ns", "t").recordCount).isEqualTo(23)
         assertVerifyPasses(fx.cat)
     }
 
@@ -1782,7 +1783,7 @@ class CompactionServiceIntegrationTest {
         val receipt = creations.publish(fx.cat, prepared.operationId, emptyList())
         assertThat(receipt.state).isEqualTo("committed")
         assertThat(receipt.reason).isNull()
-        val replaced = catalogs.getTable(fx.cat, "ns", "t")
+        val replaced = catalogs.tableWithExactTotals(fx.cat, "ns", "t")
         assertThat(replaced.tableUuid).isEqualTo(prepared.tableUuid).isNotEqualTo(target.tableUuid)
         assertThat(replaced.recordCount).isZero()
         assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()

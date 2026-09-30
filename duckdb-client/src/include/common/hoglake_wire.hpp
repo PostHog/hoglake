@@ -67,6 +67,16 @@ struct HoglakeTableInfo {
 	string namespace_name;
 	string table_uuid;
 	vector<HoglakeColumn> columns;
+	//! The three file totals, and whether the server SENT them
+	//! (hoglake #232). A head read serves them from the server's
+	//! maintenance sample and OMITS all three when that sample does not
+	//! cover the table; `?totals=false` omits them too. Absence means
+	//! UNKNOWN, and it used to be indistinguishable from a real 0
+	//! because the parser defaulted them — which reported a table with
+	//! rows as empty, to the optimizer and to hoglake_table_info() both.
+	//! So the flag is the only thing that may be read to decide whether
+	//! the three below mean anything.
+	bool has_totals = false;
 	int64_t record_count = 0;
 	int64_t file_count = 0;
 	int64_t file_size_bytes = 0;

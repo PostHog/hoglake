@@ -804,9 +804,104 @@ data class TableInfo(
     val namespace: String,
     val name: String,
     val columns: List<Column>,
-    val recordCount: Long,
-    val fileCount: Long,
-    val fileSizeBytes: Long,
+    /**
+     * The snapshot this whole response was RESOLVED AT: head when the
+     * caller named no snapshot, the resolved one otherwise. Always set,
+     * on every path including `totals=false`, because it describes the
+     * read rather than the totals.
+     *
+     * WHAT IT IS FOR: a writer can cache a `TableInfo` and send this
+     * back as a commit's `read_snapshot`, and the server's existing OCC
+     * then validates the cache — a table GET per flush becomes zero
+     * table GETs per flush. It is the identity read's other half.
+     *
+     * NOT [snapshotId], and the distinction is load-bearing rather than
+     * cosmetic. That field is set ONLY by createTable/alterTable, and
+     * its ABSENCE on a read is a contract PYHOGLAKE depends on:
+     * `Table.__init__` stores a non-null `snapshot_id` as a DDL pin and
+     * `_travel_for` makes it the default snapshot for every later
+     * `files()` / `scan_plan()` (`client.py` `_ddl_snapshot_id`), so a
+     * server that started sending it on reads would freeze a long-lived
+     * `Table` at the snapshot of its first `info()` — appends land and
+     * the client stops seeing them. Silent, in a shipped PyPI release.
+     *
+     * duckdb-client is NOT a second witness, and the earlier draft of
+     * this comment was wrong to name it: it does branch on
+     * `has_snapshot_id`, but only in `PostDDLTravel`, which is reached
+     * solely from its create-table and alter paths — never from a read.
+     * pyhoglake alone carries the argument, and it is enough.
+     *
+     * So this is its own field, and [snapshotId] keeps meaning exactly
+     * what it meant.
+     */
+    val readSnapshotId: Long,
+    /*
+     * The three totals, and they are NULLABLE for three reasons (#232).
+     *
+     * A head read serves them from the MAINTENANCE SAMPLER's published
+     * generation (`hog_maintenance_summary_tier`, summed per table), not
+     * from the manifest — AGENT.md's rule that a dashboard read never
+     * scans the manifest. Null then means "the published generation does
+     * not cover this table": the sampler has never published for the
+     * catalog, or the table was created after the published generation's
+     * snapshot. Never 0, because an unsampled table and an empty one are
+     * different facts and only one of them is worth a number.
+     *
+     * `GET ...?totals=false` asks for the table's identity without them
+     * at all: name, UUID, columns, partition and sort specs, and no file
+     * read of any kind.
+     *
+     * A time-travel read (`snapshot` / `at_timestamp`) is the one path
+     * that still aggregates the manifest, so its numbers are EXACT at
+     * that snapshot and never null. See [totalsSnapshotId].
+     */
+    val recordCount: Long?,
+    val fileCount: Long?,
+    val fileSizeBytes: Long?,
+    /**
+     * The snapshot the totals above are exact AS OF — the snapshot the
+     * sampler captured when the published generation's scan began.
+     *
+     * THE PRIMARY FRESHNESS FIELD, because this repo dates a sample by
+     * snapshot rather than by clock: `PartitionListingService`'s KDoc
+     * says so outright ("the sample is at the sampler's snapshot, which
+     * the response states"), and a snapshot is the only form a caller
+     * can reconcile against a time-travel read of the same table.
+     *
+     * It is THE SAME VALUE `PartitionListing.sampledSnapshotId` carries,
+     * from the same `hog_maintenance_summary` row. The `totals` prefix
+     * scopes it to these three fields, which is necessary here and not
+     * there: a `TableInfo` mixes measures from two sources — these from
+     * the sample, everything else resolved at [readSnapshotId] — while a
+     * `PartitionListing` is all sample.
+     *
+     * Null on every path where the numbers are not a sample: a
+     * time-travel read (exact at the snapshot the caller named), a
+     * create/alter receipt (exact at the snapshot the DDL just made),
+     * `totals=false` (no numbers), an uncovered table (nothing to date).
+     */
+    val totalsSnapshotId: Long? = null,
+    /**
+     * When [totalsSnapshotId] was captured — the instant the published
+     * generation's scan STARTED, not the instant it published.
+     *
+     * The distinction is load-bearing and `PartitionListing`'s own
+     * comment is where it is written down: a generation runs for tens of
+     * minutes, so `hog_maintenance_summary.sampled_at` (the publish) is
+     * up to that far AFTER the numbers were true. `sample.startedAt` is
+     * the instant the scan's snapshot was taken, so it is the instant
+     * these totals describe — pairing it with [totalsSnapshotId] makes
+     * one claim rather than two.
+     *
+     * It is THE SAME INSTANT `PartitionListing.sampleStarted` carries
+     * (both read `sample.startedAt`), and deliberately NOT its
+     * `sampledAt` twin: a `TableInfo` reports the age of its numbers and
+     * nothing else, so it omits the publish instant rather than offering
+     * a reader two timestamps and letting them pick the wrong one.
+     *
+     * Null exactly when [totalsSnapshotId] is.
+     */
+    val totalsAsOf: Instant? = null,
     /** Live partition spec; null = unpartitioned. */
     val partitionSpec: PartitionSpec? = null,
     /** Live sort order; null = unsorted. */

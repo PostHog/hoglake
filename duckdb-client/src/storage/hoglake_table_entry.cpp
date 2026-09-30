@@ -104,7 +104,17 @@ void HoglakeTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, L
 
 TableStorageInfo HoglakeTableEntry::GetStorageInfo(ClientContext &context) {
 	TableStorageInfo info;
-	info.cardinality = NumericCast<idx_t>(table_info.record_count);
+	// LEFT UNSET when the server sent no totals (hoglake #232): a head
+	// read omits them when the maintenance sample does not cover the
+	// table, and writing 0 there is the worst value available to the
+	// optimizer — it picks the build side and the join order off it, so
+	// a table with rows would be planned as empty. TableStorageInfo's
+	// own default is DConstants::INVALID_INDEX, i.e. "no estimate", which
+	// is exactly the honest answer, and it is what every non-hoglake
+	// catalog without statistics reports.
+	if (table_info.has_totals) {
+		info.cardinality = NumericCast<idx_t>(table_info.record_count);
+	}
 	return info;
 }
 

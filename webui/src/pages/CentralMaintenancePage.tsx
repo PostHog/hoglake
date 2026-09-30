@@ -136,7 +136,24 @@ function MatrixRow({ catalog }: { catalog: MaintenanceStatus }) {
         </div>
       </td>
       {TASKS.map((task) => {
-        const t = byTask.get(task)!;
+        const t = byTask.get(task);
+        // A task the response does not carry, which during a rollout is
+        // the normal case: the console deploys separately from the
+        // server, so a column added here exists before the server that
+        // fills it. It used to be a `!` assertion, and the missing key
+        // then threw inside render and blanked the WHOLE PAGE — every
+        // catalog, every other task — over one absent cell.
+        if (t === undefined) {
+          return (
+            <td
+              key={task}
+              className="task-cell"
+              title="This server does not report the task"
+            >
+              <span className="badge">—</span>
+            </td>
+          );
+        }
         const cell = taskCell(t);
         return (
           <td key={task} className="task-cell" title={cell.title}>

@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -74,7 +75,7 @@ class UploadServiceIntegrationTest {
         val claim = claim(catalog, owner)
         commits.commit(catalog, request(catalog, owner, claim))
         commits.commit(catalog, request(catalog, UUID.randomUUID(), claim))
-        assertThat(catalogs.getTable(catalog, "test", "target").recordCount).isEqualTo(2)
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "target").recordCount).isEqualTo(2)
         db.jdbi.useHandleUnchecked { h ->
             h.createUpdate("DELETE FROM hog_data_file WHERE path = :path").bind("path", claim.path).execute()
         }

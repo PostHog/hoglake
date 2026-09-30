@@ -26,7 +26,7 @@ import uuid
 
 import pyarrow as pa
 import pytest
-from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
+from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY, info_at_head
 from pyhoglake import HoglakeClient, S3Config
 
 from hedgerow import (
@@ -133,6 +133,6 @@ def test_dest_recreate_mid_window_live(live_server_url, client):
         assert [o for o in offs if o.committed_snapshot > start] == []
         # nothing was ever committed into the NEW incarnation: the guard
         # refused before the commit landed
-        assert dst_ns.table("t").info().record_count == 0
+        assert info_at_head(dst_cat, dst_ns.table("t")).record_count == 0
     finally:
         daemon.close()

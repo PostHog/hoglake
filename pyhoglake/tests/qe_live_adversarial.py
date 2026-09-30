@@ -112,6 +112,30 @@ def _sanity(client, catalog):
 # ---------------------------------------------------------------------------
 
 
+def _info_at_head(catalog, table):
+    """``table.info()`` at the catalog's CURRENT HEAD, i.e. with EXACT totals.
+
+    A plain ``info()`` serves ``record_count`` / ``file_count`` /
+    ``file_size_bytes`` from the server's maintenance sample and returns
+    ``None`` for all three until a published generation covers the table
+    (hoglake #232). That is right for the endpoint -- the aggregate it
+    replaced was ~10M manifest rows per call on a busy table -- and
+    useless to a test asserting what an append just did, where the
+    question is "what does the manifest hold RIGHT NOW".
+
+    Naming head puts the read on the time-travel path, which still
+    aggregates the manifest, so the numbers are a fact and no sampler has
+    to be waited for. It mirrors the server suite's own
+    ``tableWithExactTotals``, which exists for the identical reason.
+
+    Do NOT replace this with a POST to the maintenance trigger: the
+    sample would have to be refreshed after every append, and a hand
+    trigger that loses the sampler's own turn refreshes nothing -- a test
+    flaky by construction.
+    """
+    return table.info(snapshot=catalog.refresh().head_snapshot_id)
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -181,7 +205,7 @@ def test_identifier_boundary_names_accepted(client, catalog, ns):
         t = ns.create_table(name, _schema())
         assert ns.table(name).table_uuid == t.table_uuid
         t.append(_rows(1))
-        assert ns.table(name).info().record_count == 1
+        assert _info_at_head(catalog, ns.table(name)).record_count == 1
         t.drop()
     _sanity(client, catalog)
 
@@ -234,7 +258,7 @@ def test_zero_row_append_zero_width_rowid_range(catalog, ns):
     assert [f.record_count for f in files] == [0, 5]
     # adjacent zero-width: the 5-row file starts where the empty one did
     assert files[1].row_id_start == files[0].row_id_start == 0
-    assert t.info().record_count == 5
+    assert _info_at_head(catalog, t).record_count == 5
 
 
 def test_zero_size_fabricated_file_accepted_negatives_rejected(catalog, ns):
@@ -503,7 +527,7 @@ def test_1000_file_commit(catalog, ns):
     # row-id lineage: 1000 contiguous width-1 ranges starting at 0
     starts = sorted(f.row_id_start for f in listed)
     assert starts == list(range(1000))
-    assert ns.table("many_files").info().record_count == 1000
+    assert _info_at_head(catalog, ns.table("many_files")).record_count == 1000
 
 
 def test_500_column_table(catalog, ns):
@@ -527,7 +551,7 @@ def test_500_column_table(catalog, ns):
     (f,) = t.files()
     assert f.record_count == 2
     assert f.stats_state == "provided"
-    assert ns.table("wide").info().record_count == 2
+    assert _info_at_head(catalog, ns.table("wide")).record_count == 2
 
 
 def test_view_with_100kb_sql(catalog, ns):
@@ -641,4 +665,4 @@ def test_read_snapshot_zero_after_heavy_ddl_conflicts(catalog, ns):
     # the retry contract works: refresh and go again
     res = t.append(_rows(2), read_snapshot=catalog.refresh().head_snapshot_id)
     assert res.snapshot_id > 0
-    assert t.info().record_count == 2
+    assert _info_at_head(catalog, t).record_count == 2

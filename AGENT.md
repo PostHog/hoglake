@@ -339,9 +339,35 @@ there would break that gate on every build.
 6. **Versioned-row visibility**: a row is visible at S iff
    `begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot)`.
    Every read path uses exactly this predicate.
-7. **TableInfo aggregates come from files visible at the requested
-   snapshot**, never from `hog_table_stats` (that row is the gross
-   append counter / row-id allocator anchor — head-scoped by nature).
+7. **TableInfo aggregates never come from `hog_table_stats`** (that row
+   is the gross append counter / row-id allocator anchor — head-scoped by
+   nature). Where they DO come from is now the request's own shape
+   (#232), and the response says which:
+   - `snapshot` / `at_timestamp` given: the files visible AT THAT
+     SNAPSHOT, aggregated from the manifest (`FileRepo.aggregateAt`).
+     Exact, and the only correct answer for a past snapshot. Same for a
+     createTable/alterTable receipt, whose snapshot its own transaction
+     just made.
+   - neither: the MAINTENANCE SAMPLER's published generation, summed per
+     table (`TierTotalsRepo`), because the maintenance section's rule
+     below — persisted summaries, never the manifest — applies to this
+     endpoint too: the writer fleet calls it three times per flush and
+     the aggregate it replaced was ~10M manifest rows per call. The
+     response carries `totals_snapshot_id` (the snapshot the numbers are
+     exact at) and `totals_as_of`; all three totals are ABSENT, never 0,
+     when the published generation does not cover the table.
+   - `totals=false`: absent, and no file read of any kind. The identity
+     read. `read_snapshot_id` is present on every one of these paths —
+     it describes the read, not the totals, and a writer sends it back
+     as a commit's `read_snapshot`.
+
+   THE NAMESPACE LISTING (`TableSummary`) IS NOT ON THIS RULE YET: it
+   still aggregates the manifest per table through `LIVE_SUMMARIES_SQL`'s
+   LATERAL, and its three totals stay required and exact at head. So the
+   table GET and the listing can disagree by the sample's age for the
+   same table; the OpenAPI `Table` schema states the asymmetry, and
+   moving the listing onto `TierTotalsRepo.PER_TABLE_SQL` is its own
+   change.
 8. **Audit/observability never rides a transaction** and never writes
    to any database. Audit emits after commit/rollback; metrics are
    passive. Maintenance run history and asynchronous summaries are
@@ -868,7 +894,13 @@ there would break that gate on every build.
   instance-wide `GET /v1/maintenance/status` + `/runs` twins
   (MaintenanceStatusService; batched reads independent of catalog count).
   Dashboard and partition-debt requests read persisted asynchronous
-  summaries, NEVER the manifest. `MaintenanceSummarySampler` checkpoints
+  summaries, NEVER the manifest — and since #232 that includes the TABLE
+  GET's three totals, which sum the published generation's tier rows
+  (`TierTotalsRepo.PER_TABLE_SQL`, the one per-table sum; the two
+  per-partition-group readers share only its published-generation
+  predicate, `TierTotalsRepo.PUBLISHED_GENERATION_JOIN`). Invariant 7 has
+  the full contract, including what the response says about freshness and
+  which endpoint is still exempt. `MaintenanceSummarySampler` checkpoints
   keyset pages in `(catalog, table, file_size_bytes, file_id)` order —
   the order compaction bin-packs in (V10 indexes it) — carrying each
   bucket's partial group across pages in `pending_max_bytes`. Default row budget 10,000/tick, interval 1s,
