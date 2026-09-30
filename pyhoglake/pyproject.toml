@@ -25,6 +25,28 @@ dependencies = [
     "thrift>=0.22.0,<1",
 ]
 
+[project.optional-dependencies]
+# The single-request upload path. pyarrow's S3 output stream always opens
+# a multipart upload — 3 requests for a 12 KiB parquet file — and Arrow
+# exposes no whole-buffer PutObject, so the fast path for small objects
+# needs an S3 client of its own. Optional so a plain `pip install
+# pyhoglake` stays the three-dependency install it is today (httpx,
+# pyarrow, thrift): without it, small objects take the same streaming
+# path they always did.
+#
+# The floor is the FRAMING boundary, not a guess. botocore 1.36.0
+# (2025-01-15) is the release whose changelog reads "S3 client behavior
+# is updated to always calculate a CRC32 checksum by default for
+# operations that support it" and "Botocore will no longer automatically
+# compute and populate the Content-MD5 header" — so PutObject bodies
+# below that version are framed differently from every request this path
+# was verified with (botocore 1.43.105: CRC32 trailer, exact
+# Content-Length, no aws-chunked). That change has broken S3-compatible
+# endpoints before, so an install must not silently get the other
+# framing. boto3 1.36.0 (PyPI, 2025-01-15) is the matching release: it
+# requires botocore >=1.36.0,<1.37.0.
+fast-upload = ["boto3>=1.36.0"]
+
 [project.urls]
 Repository = "https://github.com/PostHog/hoglake"
 Documentation = "https://github.com/PostHog/hoglake/tree/main/pyhoglake"
@@ -39,6 +61,10 @@ dev = [
     # (and silently ignored the per-file-ignores below).
     "ruff==0.16.7",
     "mypy==2.3.1",
+    # Not optional for the suite: the single-request upload path is only
+    # covered if boto3 is importable here. Same floor as the extra, so
+    # the suite cannot pass against framing the extra would not install.
+    "boto3>=1.36.0",
 ]
 
 [build-system]
@@ -67,7 +93,7 @@ python_version = "3.11"
 
 [[tool.mypy.overrides]]
 # pyarrow ships no type information.
-module = ["pyarrow", "pyarrow.*", "thrift", "thrift.*"]
+module = ["pyarrow", "pyarrow.*", "thrift", "thrift.*", "boto3", "botocore", "botocore.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

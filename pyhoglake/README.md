@@ -9,11 +9,17 @@ control plane via footer-shipping commits.
 ## Install
 
 ```sh
-pip install pyhoglake       # or: uv add pyhoglake
+pip install pyhoglake                  # or: uv add pyhoglake
+pip install 'pyhoglake[fast-upload]'   # + boto3, for single-request uploads
 ```
 
-Dependencies: `httpx`, `pyarrow`. Development uses the flox env in this
-directory:
+Dependencies: `httpx`, `pyarrow`, `thrift`. The `fast-upload` extra
+adds `boto3`, which the writer path uses to put a small parquet object
+in ONE request (see [Prepared
+appends](#prepared-appends--buffered-encode-one-request-uploads-one-commit));
+without it every object takes pyarrow's three-request multipart write,
+and pyhoglake logs one warning saying so. Development uses the flox env
+in this directory:
 
 ```sh
 flox activate -- uv sync
@@ -108,7 +114,8 @@ for s in catalog.snapshots(before=head + 1):
 | What | How |
 |---|---|
 | Server | `HoglakeClient(base_url, timeout=30.0)` — `/v1` is appended |
-| Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override) |
+| Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation, single_request_uploads)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override), and `boto3` built from the same settings for single-request uploads (`single_request_uploads=False` sends everything through the streaming writer) |
+| Upload fan-out | `concurrency=` on the prepared-append calls, else `PYHOGLAKE_UPLOAD_CONCURRENCY`, else 64 — capped at the number of objects. Arrow's process-global IO thread pool is raised to match only when the flush actually routes an object through Arrow |
 | Errors | Typed: `NotFoundError`, `AlreadyExistsError`, `CommitConflictError` (`retryable=True` — refresh read snapshot and retry), `ValidationError`, `OffsetRegressionError`, `ExpiredError` (410 — reconcile from a full scan), `IncarnationChangedError` (the append incarnation guard, enforced server-side at commit, see below), `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field), all under `HoglakeError` |
 
 ## Type mapping
@@ -231,6 +238,50 @@ a different spec. Grouping runs arrow-native where possible and per
 `(spec_id, partition_values)` server-side, so partition-local file
 layout is preserved end to end.
 
+## Prepared appends — buffered encode, one-request uploads, one commit
+
+A writer that owns its own partitioning and sort order (the events
+writer flushes ~105K rows fanned out over ~271 partition tuples) prepares
+its files itself and publishes them in a separate, idempotent step:
+
+```python
+key = str(uuid.uuid4())  # this prepare's idempotency key
+# ... or prepare_append_files([(path, partition_tuple), ...])
+request = table.prepare_append_tables(
+    [(arrow_table, partition_tuple), ...],
+    idempotency_key=key,
+    expected_table_uuid=table.table_uuid,
+)
+persist(request)  # durably, BEFORE publishing
+catalog.commit_prepared(request)  # idempotent: safe to retry
+```
+
+`prepare_append_tables` encodes each group to a parquet buffer in memory
+— nothing to write, fsync, re-read for the footer and unlink — and
+produces the same registrations `prepare_append_files` produces for the
+same rows. Use `prepare_append_files` for files another writer produced
+(native VARIANT, `allow_optional_fields`); Arrow tables are refused for
+a VARIANT destination, because an Arrow rewrite loses the annotation.
+
+| | |
+|---|---|
+| Objects ≤ 8 MiB | ONE `PutObject`. pyarrow's S3 output stream always opens a multipart upload — three round trips for a 12 KiB file, ~320 ms — so this path uses `boto3` (the `fast-upload` extra), built from the same `S3Config`. Without the extra, small objects take the streaming path and pay the three requests. |
+| Larger objects | pyarrow's streaming multipart write, 8 MiB at a time. |
+| Fan-out | every object of the flush at once, `min(len(groups), 64)` in flight; `concurrency=` per call, `PYHOGLAKE_UPLOAD_CONCURRENCY` per process. Arrow's IO thread pool is **process-global** and every Arrow S3 request runs on it, so it is raised to match the fan-out — but only when this flush has an object that Arrow will carry (one above the threshold, or no single-request client at all). A flush where every object goes up as one `PutObject` leaves the pool alone. Never lowered either way. |
+| A fault mid-flush | the first error is re-raised as the object store's own `OSError` (botocore's fault classes are translated to it, so both upload paths fail alike); uploads that have not started are cancelled, in-flight ones are waited for, and the exception carries `uploaded_files` / `uploaded_uris` — exactly the objects that landed, in input order. That list is **sparse**, not a prefix: uploads run in parallel, so file 7 can be in it while file 6 is not, and neither the count nor a position tells you anything about a particular file. Sweep the uris themselves, never the `{idempotency_key}/` prefix: a retry under the same key writes new names beside the old. |
+| Memory | `prepare_append_tables` holds the caller's Arrow input AND every encoded buffer until it returns; `prepare_append_files` reads each file inside its own upload, so it holds at most `concurrency` of them. |
+
+**Deploy prerequisite.** The single-request path is only active if
+`boto3` is importable, so a writer that wants it must install
+`pyhoglake[fast-upload]` — a plain `pyhoglake` install keeps the
+three-request streaming path and pays ~3x the S3 requests per flush.
+When the extra is missing, or when botocore refuses the ambient AWS
+configuration, pyhoglake logs one warning per client on the `pyhoglake`
+logger naming the condition — so a process that configures logging hears
+about it, while the library itself only attaches a `NullHandler` and
+never writes to stderr uninvited. `single_request_uploads=False` is how
+to choose the streaming path deliberately, and it logs nothing.
+
 ## The append incarnation guard — atomic at commit
 
 Commit payloads are addressed by **(namespace, table) name**, so an
@@ -298,7 +349,7 @@ stats), and everything transactional happens server-side.
 | **Concurrency** | Server-side OCC; typed 409s with `retryable=True`; appends never conflict with appends | Optimistic, client-side, no retry |
 | **Metrics/observability** | Server `/metrics` + audit log; client stays thin | N/A |
 | **Zero-infrastructure quickstart** | No — requires the service (docker compose up) | Yes with SQL/memory catalogs |
-| **Package size** | 2 deps (httpx, pyarrow) | ~200MB with PyArrow + optional deps |
+| **Package size** | 3 deps (httpx, pyarrow, thrift), +boto3 with the `fast-upload` extra | ~200MB with PyArrow + optional deps |
 
 ### Native VARIANT files
 
