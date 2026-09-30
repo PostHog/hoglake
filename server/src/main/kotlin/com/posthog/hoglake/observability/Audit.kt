@@ -118,13 +118,24 @@ object Audit {
     /** Failure outcome vocabulary for audit lines (ErrorMapping's cousin). */
     fun failureOutcome(e: Throwable): String =
         when (e) {
-            is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.AlreadyExists -> "conflict"
             // A commit into a dropped table is a 409 like the other
             // two, and it used to arrive here as Validation. Without
             // this branch the typed refusal would fall to "error" and
             // a writer racing a drop would read as a server fault.
             is HoglakeException.TableDropped -> "conflict"
+            // Was a CommitConflict, so it was already "conflict" here;
+            // without this branch the typed refusal falls to "error" and
+            // a writer racing an alter reads as a server fault.
+            // The two RE-PREPARE refusals, before CommitConflict because
+            // DdlSinceReadSnapshot is a subclass of it. Distinct outcomes
+            // on purpose: an audit line reading `conflict` says "retry",
+            // these two say "re-prepare", and that is the difference
+            // whoever reads the trail after a stuck writer needs. Echoing
+            // "conflict" would be the same as having no arm.
+            is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
+            is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.OffsetRegression -> "regression"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             is HoglakeException.Validation -> "validation"

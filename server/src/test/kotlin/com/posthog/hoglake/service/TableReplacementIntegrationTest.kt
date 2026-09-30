@@ -89,7 +89,7 @@ class TableReplacementIntegrationTest {
         assertThat(catalogs.listFiles(cat, "ns", "t", before)).hasSize(1)
         assertThat(creations.publish(cat, prepared.operationId, files)).isEqualTo(receipt)
         assertThat(commits.commit(cat, request)).isEqualTo(oldReceipt)
-        assertThatThrownBy { commits.commit(cat, stale) }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy { commits.commit(cat, stale) }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         for (from in listOf(0L, before)) {
             assertThatThrownBy { catalogs.changes(cat, "ns", "t", from) }
                 .isInstanceOf(HoglakeException.ReconciliationRequired::class.java)

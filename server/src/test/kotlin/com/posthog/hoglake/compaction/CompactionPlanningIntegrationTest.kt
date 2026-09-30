@@ -89,7 +89,12 @@ class CompactionPlanningIntegrationTest {
     private fun append(
         cat: String,
         vararg files: FileRegistration,
-    ) = commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", files.toList()))))
+        // readSnapshot = head: an append carrying partition_values
+        // requires one (invariant 12), and the fixture's DDL is done.
+    ) = commits.commit(
+        cat,
+        CommitRequest(readSnapshot = db.head(cat), appends = listOf(TableAppend("ns", "t", files.toList()))),
+    )
 
     private fun file(
         name: String,

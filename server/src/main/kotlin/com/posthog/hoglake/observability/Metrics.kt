@@ -135,6 +135,40 @@ object Metrics {
      */
     fun statsRepaired(source: String) = increment("hoglake_stats_repaired_total", 1.0, "source", source)
 
+    /**
+     * hoglake_blind_partitioned_appends_total{catalog,namespace,table} —
+     * prepared appends that carried partition values with NO
+     * read_snapshot, counted per occurrence.
+     *
+     * The flip signal for HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS, and
+     * the reason it is a counter and not only the WARN beside it: that
+     * line fires once per (catalog, table) per pod and then goes quiet
+     * forever, so a pod that logged it at startup and a pod whose client
+     * was fixed an hour later read identically, and a second offending
+     * client on an already-warned table is never named at all. "Has the
+     * fleet stopped doing this?" is answerable from a rate, not from a
+     * once-per-lifetime log line — so the flag flips on this going to
+     * zero and staying there, not on someone grepping logs.
+     *
+     * Per (namespace, table) because the remediation is per writer and
+     * the writers are per table; the series only exists for tables doing
+     * it, which is a set the rollout is driving to empty.
+     */
+    fun blindPartitionedAppend(
+        catalog: String,
+        namespace: String,
+        table: String,
+    ) = increment(
+        "hoglake_blind_partitioned_appends_total",
+        1.0,
+        "catalog",
+        catalog,
+        "namespace",
+        namespace,
+        "table",
+        table,
+    )
+
     /** hoglake_stats_hydrated_total{result=provided|failed} */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 
@@ -376,11 +410,26 @@ object Metrics {
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
-            is HoglakeException.CommitConflict -> "conflict"
             // Counted, and counted as a conflict: it is a 409, and
             // before it was typed it was counted as "validation".
             // Left in the `else` it would stop being counted at all.
             is HoglakeException.TableDropped -> "conflict"
+            // Same argument as TableDropped above: a 409 that used to be
+            // counted as a conflict (it WAS a CommitConflict) and would
+            // silently stop being counted at all if left to the `else`.
+            // The two RE-PREPARE refusals, before CommitConflict because
+            // DdlSinceReadSnapshot is a subclass of it and a `when` would
+            // otherwise answer the base arm.
+            //
+            // Their values are DISTINCT, and that is the point: these are
+            // the refusals a writer cannot retry its way out of, so "how
+            // often is the fleet re-preparing" has to be a series an
+            // operator can graph rather than a slice of `conflict` only
+            // the logs can separate. An arm that answered "conflict" here
+            // would be indistinguishable from having no arm at all.
+            is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
+            is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null

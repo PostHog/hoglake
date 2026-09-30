@@ -50,7 +50,26 @@ import java.util.UUID
 
 // ---- errors --------------------------------------------------------------
 
-data class ApiErrorDto(val error: String, val detail: String? = null)
+/**
+ * Every error body. `{error, detail}` for all but one of them, and
+ * NON_NULL omission keeps it exactly that shape — a client that parses
+ * only those two is unaffected by the three fields below.
+ *
+ * `ddl_since_read_snapshot` carries more, because it is the one refusal
+ * whose recovery is not "retry": a caller has to know WHICH tables
+ * moved and that replaying is futile, and making it regex [detail] for
+ * that would be a contract in prose.
+ */
+data class ApiErrorDto(
+    val error: String,
+    val detail: String? = null,
+    /** `ddl_since_read_snapshot` only: the qualified tables DDL landed on. */
+    val tables: List<String>? = null,
+    /** `ddl_since_read_snapshot` only: the request's own read_snapshot. */
+    val readSnapshot: Long? = null,
+    /** The recovery, when there is exactly one: `re-prepare`. */
+    val retry: String? = null,
+)
 
 // ---- catalogs ------------------------------------------------------------
 

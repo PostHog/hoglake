@@ -424,7 +424,13 @@ class CatalogService(private val jdbi: Jdbi) {
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                         ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
                 if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
-                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                    throw HoglakeException.TableRecreated(
+                        "table '$namespace.$table' no longer has the expected UUID: it was " +
+                            "recreated; re-read it before retrying",
+                        table = "$namespace.$table",
+                        expectedTableUuid = expectedTableUuid,
+                        currentTableUuid = t.tableUuid,
+                    )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)
@@ -475,7 +481,13 @@ class CatalogService(private val jdbi: Jdbi) {
                     TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                         ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
                 if (t.tableUuid != expectedTableUuid) {
-                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                    throw HoglakeException.TableRecreated(
+                        "table '$namespace.$table' no longer has the expected UUID: it was " +
+                            "recreated; re-read it before retrying",
+                        table = "$namespace.$table",
+                        expectedTableUuid = expectedTableUuid,
+                        currentTableUuid = t.tableUuid,
+                    )
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)

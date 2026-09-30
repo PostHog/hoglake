@@ -1128,10 +1128,16 @@ data class TableAppend(
     val files: List<FileRegistration>,
     /**
      * Optional incarnation guard: when present, the commit fails with
-     * CommitConflict if the live table resolved by name does not carry
-     * this table_uuid — the atomic answer to the name-rebind race where
-     * a table is dropped and recreated between a replicator's read and
-     * its commit.
+     * [HoglakeException.TableRecreated] (409 `table_recreated`) if the
+     * live table resolved by name does not carry this table_uuid — the
+     * atomic answer to the name-rebind race where a table is dropped and
+     * recreated between a replicator's read and its commit.
+     *
+     * It is also the ONLY thing that closes that race:
+     * CommitService.checkConflicts keys on the RESOLVED table id and
+     * treats 'table_created' as a conflict only for a guarded request's
+     * delete targets, so a drop+recreate is outside an append's conflict
+     * window however fresh its read_snapshot is.
      */
     val expectedTableUuid: UUID? = null,
 )
@@ -1812,7 +1818,33 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
     /** A changefeed window crosses a deletion it cannot represent; never blindly retry or skip it. */
     class ReconciliationRequired(detail: String) : HoglakeException(detail)
 
-    class CommitConflict(detail: String) : HoglakeException(detail)
+    /**
+     * OPEN, for [DdlSinceReadSnapshot] alone. Subclassing is what keeps
+     * the re-typing backwards compatible: every client that discriminates
+     * with an `isinstance` ladder (millpond's `is_retryable` does, and it
+     * is wired into its retry budget) keeps classifying the DDL refusal as
+     * it does today, while the WIRE code changes so a client that wants
+     * the finer answer can have it. The same trade as
+     * `ReadSnapshotExpiredError(ExpiredError)` on the pyhoglake side.
+     *
+     * Every `when` over this hierarchy must therefore put the SUBCLASS
+     * arm first — `ErrorMapping`, `Metrics.commitFailureResult` and
+     * `Audit.failureOutcome` all do, and each says so.
+     *
+     * THE RULE for a future refusal, because the asymmetry here is
+     * principled and not arbitrary: **what decides whether a new refusal
+     * subclasses this is the CLIENT-side mapping, not the server's.**
+     * Nothing in `server/src/main` catches `CommitConflict` at all, so
+     * the server cannot tell. [DdlSinceReadSnapshot] subclasses because
+     * pyhoglake maps it into `CommitConflictError`, which sits in
+     * millpond's `isinstance` ladder ahead of its "any other 4xx"
+     * re-raise — un-subclassing would have bypassed a working recovery
+     * arm. [TableRecreated] does NOT subclass because pyhoglake maps it
+     * to `IncarnationChangedError`, which was never a
+     * `CommitConflictError` and already has its own ladder arm. Split a
+     * refusal out only after checking which client arm it lands in.
+     */
+    open class CommitConflict(detail: String) : HoglakeException(detail)
 
     class Validation(detail: String) : HoglakeException(detail)
 
@@ -1862,4 +1894,67 @@ sealed class HoglakeException(message: String) : RuntimeException(message) {
      * failing).
      */
     class TableDropped(detail: String) : HoglakeException(detail)
+
+    /**
+     * A request's `expected_table_uuid` is not the live table's ->
+     * HTTP 409 `table_recreated`: the name resolved, but to a different
+     * INCARNATION, so the table was dropped and recreated since the
+     * caller read it.
+     *
+     * The same family as [DdlSinceReadSnapshot] and for the same reason:
+     * the expected incarnation is gone and its history does not carry
+     * over, so replaying a payload that names it can only be refused
+     * again. It was a [CommitConflict] — which the clients that matter
+     * map to a RETRYABLE error — and pyhoglake could only tell the two
+     * apart by looking for the phrase "the table was recreated" in the
+     * detail string. A code is the contract; prose is not.
+     */
+    class TableRecreated(
+        detail: String,
+        /** Qualified `namespace.table`, so a client knows what to re-read. */
+        val table: String,
+        val expectedTableUuid: UUID,
+        val currentTableUuid: UUID,
+    ) : HoglakeException(detail)
+
+    /**
+     * DDL landed on a touched table after the commit's `read_snapshot`
+     * -> HTTP 409 `ddl_since_read_snapshot`, naming the tables and the
+     * snapshot.
+     *
+     * This is the DDL arm of [CommitService.checkConflicts], split out
+     * of [CommitConflict] — as a SUBCLASS of it, see there — because the
+     * two answers need opposite client behaviour and used to arrive as
+     * the same code. A CommitConflict is
+     * REPLAYABLE: the read set moved, so refresh the read snapshot and
+     * send the same files. This one is not, and cannot be — a prepared
+     * request's `read_snapshot` is part of a durable payload that must
+     * be replayed byte-identically, so the condition that refused it is
+     * permanent and a retry loop on it is a livelock. The recovery is to
+     * re-prepare: read the table again and build a new request.
+     *
+     * THAT is what makes a prepared append a check-and-set on the
+     * table's shape. A partition-spec change between the writer's read
+     * and its commit arrives here, atomically and with zero writes —
+     * which is why #233 needs no new wire field: `read_snapshot` was
+     * always the token, it was only ever answered with the wrong code.
+     *
+     * Named for the wire code rather than for appends, because a DELETE
+     * commit takes the same refusal for the same reason: its
+     * `read_snapshot` is fixed too.
+     *
+     * Not all of [CommitService.checkConflicts]' refusals are this:
+     * ROW-CONTENT conflicts ('table_created' / 'table_inserted_into' /
+     * 'table_deleted_from' on a guarded request's delete targets) stay
+     * [CommitConflict], because re-reading and replanning IS the
+     * recovery there and the same payload can succeed on the next try.
+     * A refusal that mixes both is the conservative answer, i.e. also
+     * [CommitConflict].
+     */
+    class DdlSinceReadSnapshot(
+        detail: String,
+        /** The qualified `namespace.table` names the DDL landed on. */
+        val tables: List<String>,
+        val readSnapshot: Long,
+    ) : CommitConflict(detail)
 }

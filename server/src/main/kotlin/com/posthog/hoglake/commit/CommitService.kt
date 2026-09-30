@@ -63,9 +63,18 @@ import java.util.UUID
  * Conflict rule (append fast path): appends only conflict with DDL on
  * the tables they touch. With a non-null readSnapshot we look for
  * 'table_dropped' / 'table_altered' changes on the touched tables since
- * that snapshot — one indexed lookup. A null readSnapshot is a blind
- * append with no conflict window (only legal when the commit has no
- * deletes).
+ * that snapshot — one indexed lookup — and a pure-DDL refusal is typed
+ * apart as `ddl_since_read_snapshot` (re-prepare; replaying the same
+ * payload can never succeed) from the retryable `commit_conflict` a
+ * row-content conflict gets. THAT is what makes a prepared append a
+ * full check-and-set on the table's shape: a spec or schema change
+ * between the writer's read and its commit is this refusal, atomically
+ * and with zero writes.
+ *
+ * A null readSnapshot is a blind append with no conflict window, legal
+ * only when the commit has no deletes AND no file carries
+ * partition_values — partition values are writer-computed against one
+ * spec and a blind append could register them under another (#233).
  *
  * requireUnchangedTables adds the read-set rule ON TOP of that, and only
  * for the tables the request DELETES from: those additionally conflict
@@ -83,6 +92,17 @@ class CommitService(
      * unbounded. Expiry surfaces as CommitQueueTimeout -> 503.
      */
     private val commitLockTimeoutMs: Long = DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+    /**
+     * Whether a blind append carrying partition_values is REFUSED (422)
+     * or merely warned about
+     * (HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS, default false).
+     *
+     * The rule itself is invariant 12 and is not optional; the flag only
+     * says when it starts biting, because `duckdb-client` sends exactly
+     * that shape today. Flip it once the extension takes a snapshot for
+     * partitioned appends.
+     */
+    private val refuseBlindPartitionedAppends: Boolean = false,
 ) {
     companion object {
         /** Default commit admission bound: 30s (Config's default mirrors it). */
@@ -94,6 +114,30 @@ class CommitService(
          * registration from racing the row-id allocator toward overflow.
          */
         private const val MAX_FILE_RECORD_COUNT: Long = 1L shl 48
+
+        /**
+         * Cap on the blind-partitioned WARN's dedupe set — see
+         * `warnedBlindPartitioned`. Sized well past any real catalog's
+         * table count; it is defence in depth, not the primary bound,
+         * which is that the key holds nothing a client chooses.
+         */
+        private const val MAX_WARNED_BLIND_PARTITIONED: Int = 512
+
+        /** Which table(s) the blind-partitioned refusal is about. */
+        internal fun blindPartitionedRefusal(qualified: List<String>): String =
+            "append to table(s) ${qualified.joinToString(", ")}"
+
+        /**
+         * The 422 a blind partitioned append gets once
+         * HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS is on — and the text
+         * the WARN quotes until then, so the message a client will
+         * eventually be refused with is the one it is warned about.
+         * Prefixed by [blindPartitionedRefusal] so it names the tables.
+         */
+        internal const val BLIND_PARTITIONED_REFUSAL: String =
+            "read_snapshot is required when an append carries partition_values: partition " +
+                "values are only valid under the spec they were computed with, and a blind " +
+                "append has no conflict window in which a spec change could be detected"
 
         /**
          * THE PATH-REUSE GUARD, issued once per commit under the
@@ -164,6 +208,18 @@ class CommitService(
     fun commit(
         catalog: String,
         request: CommitRequest,
+        /**
+         * The caller's User-Agent, for the blind-partitioned WARN — the
+         * line has to name WHICH client so the fleet can be moved before
+         * the refusal is switched on.
+         *
+         * A parameter and NOT a CommitRequest field, deliberately: the
+         * request is the fingerprinted, durably stored receipt payload
+         * (commitFingerprint serializes all of it), so a user agent in
+         * there would make a replay from a different client version fail
+         * the "same key, same request" check.
+         */
+        userAgent: String? = null,
     ): CommitResult {
         val files = request.appends.sumOf { it.files.size }
         val deletes = request.deletes.sumOf { it.files.size }
@@ -188,7 +244,7 @@ class CommitService(
                 // the catalog lock. Receipt comparison and publication stay locked.
                 val requestJson = request.idempotencyKey?.let { commitFingerprint(request) }
                 jdbi.inTransaction<CommitResult, RuntimeException> { handle ->
-                    doCommit(handle, catalog, request, requestJson)
+                    doCommit(handle, catalog, request, requestJson, userAgent)
                 }
             } catch (e: HoglakeException) {
                 Metrics.commitFailureResult(e)?.let { Metrics.commitRecorded(catalog, it) }
@@ -282,6 +338,46 @@ class CommitService(
         writeAppends(h, catalogId, snapshotId, firstId, listOf(append))
     }
 
+    /**
+     * (catalogId, tableId) already warned about a blind partitioned
+     * append, so the line fires ONCE per table per pod instead of once
+     * per flush.
+     *
+     * Both halves are SERVER-ASSIGNED, and that is the property that
+     * makes the set safe: nothing a client supplies can grow it. Two
+     * earlier keys were wrong in exactly that way — the User-Agent (a
+     * client minting one per request fills the cap and silences the
+     * signal for everyone) and then the request's own (namespace, table)
+     * STRINGS, which a client can invent 512 of without a single table
+     * existing. The caller resolves first now, so an unresolvable name
+     * gets the "unknown table" refusal instead of a slot here.
+     *
+     * The cost of keying on the table alone is that a second client on an
+     * already-warned table is named only in whatever logs it writes
+     * itself — acceptable, because the first line already says the table
+     * needs attention, and the agent is still in the message.
+     *
+     * Still CAPPED at [MAX_WARNED_BLIND_PARTITIONED] as defence in depth
+     * against a pathological table count; past it the line says so once
+     * and stops. Never shrinks, which is fine: it stops growing the
+     * moment the writers are fixed.
+     *
+     * Concurrent-safe without a lock because it is only ever `add`ed to
+     * and `add` is what decides whether to log; `size` is a racy read,
+     * used only to decide when to stop, so an over- or under-shoot of a
+     * few around the cap is immaterial.
+     */
+    private val warnedBlindPartitioned =
+        java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Long, Long>>()
+
+    /**
+     * Whether the cap's own line has been logged. A flag rather than a
+     * sentinel IN the set, which is what it was: a sentinel added after
+     * the `size >= cap` check let the set reach cap + 1, so the cap did
+     * not mean what it said.
+     */
+    private val warnedBlindPartitionedCapped = java.util.concurrent.atomic.AtomicBoolean(false)
+
     /** hog_catalog head-of-line state, read once under the commit lock. */
     private data class CatalogHead(
         val head: Long,
@@ -329,6 +425,7 @@ class CommitService(
         catalogName: String,
         req: CommitRequest,
         requestJson: String?,
+        userAgent: String? = null,
     ): CommitResult {
         // Resolve only the catalog before checking receipts. Replays must not
         // depend on current table, snapshot, or data-path validation.
@@ -446,12 +543,17 @@ class CommitService(
             for (expected in expectedUuids[key].orEmpty()) {
                 // The atomic incarnation guard: the name resolved, but to a
                 // different incarnation than the writer planned against —
-                // a drop+recreate happened. Retryable conflict, never a
-                // silent write into the wrong table.
+                // a drop+recreate happened. NOT retryable (the expected
+                // incarnation is gone and its history does not carry
+                // over), never a silent write into the wrong table.
                 if (expected != live.tableUuid) {
-                    throw HoglakeException.CommitConflict(
+                    throw HoglakeException.TableRecreated(
                         "table '$namespace.$table' is uuid ${live.tableUuid}, " +
-                            "expected $expected: the table was recreated",
+                            "expected $expected: the table was recreated; re-prepare against the " +
+                            "current incarnation, replaying this request cannot succeed",
+                        table = "$namespace.$table",
+                        expectedTableUuid = expected,
+                        currentTableUuid = live.tableUuid,
                     )
                 }
             }
@@ -472,39 +574,102 @@ class CommitService(
                 ResolvedDeletes(namespace, table, tableId, files)
             }
 
-        // 3. Structural validation. Nothing is written unless all of it
-        // passes. The RESULT is what gets written: validateFiles also
-        // sanitizes each file's stats (StatsSanity).
-        val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
-        validateDeleteRegistrations(resolvedDeletes)
+        // The second thing read_snapshot is REQUIRED for, and the reason
+        // is the trust boundary on partition values (invariant 12): they
+        // are computed by the WRITER under one partition spec, the server
+        // never opens the parquet and so can neither verify nor recompute
+        // them, and validateFiles' arity check cannot tell two same-arity
+        // specs apart. With a read_snapshot, a spec change between the
+        // writer's read and its commit is caught by [checkConflicts]' DDL
+        // arm and answered with re-prepare. WITHOUT one there is no
+        // conflict window at all, so the same change silently registers
+        // values computed under the old transform against the new
+        // spec_id — files that mis-prune every read of them, with nothing
+        // anywhere able to detect it afterwards.
+        //
+        // A blind append to an UNPARTITIONED table stays legal and
+        // unchanged: it carries no partition values, so it has nothing
+        // bound to a spec and nothing a concurrent alter can invalidate
+        // that the arity/field-id content checks do not already catch.
+        //
+        // OFF BY DEFAULT, and the reason is the fleet, not timidity:
+        // EVERY production flush is this shape today — millpond strips the
+        // read_snapshot `prepare_append_files` puts on, and duckdb-client
+        // never sends one. See Config.refuseBlindPartitionedAppends for
+        // both writers and the two-part flip precondition. Until then the
+        // refusal is a WARN naming the client.
+        //
+        // AFTER RESOLUTION, and that is what makes the dedupe key sound:
+        // the key is the server-assigned tableId, so nothing a client
+        // supplies can grow the set. Keyed on the request's (namespace,
+        // table) strings — which is where this check used to sit — 512
+        // bogus names would have silenced the line for the pod's life,
+        // and a name that does not resolve now gets the "unknown table"
+        // refusal it deserves instead of this one.
+        //
+        // The OFFENDING TABLES, not a request-level boolean: a commit may
+        // append to several tables (`/commit` and `/commit/transaction`
+        // both take many groups, and both millpond and the duckdb
+        // extension write multi-table requests), and only the ones
+        // carrying partition values are at fault. A boolean made the
+        // refusal name no table at all and made the WARN name EVERY table
+        // in the request — a false statement about each unpartitioned one,
+        // and each of those keys then poisoned the dedupe set so the line
+        // could never be corrected.
+        val blindPartitioned =
+            if (readSnapshot != null) {
+                emptyList()
+            } else {
+                resolvedAppends.filter { a -> a.files.any { it.partitionValues != null } }
+            }
+        if (blindPartitioned.isNotEmpty()) {
+            val qualified = blindPartitioned.map { "${it.namespace}.${it.table}" }.sorted()
+            // Counted per OCCURRENCE, above the flag and outside the WARN's
+            // dedupe, because this counter is what the flag flip is decided
+            // on: a rate that reaches zero and stays there. Counting only
+            // the accepted ones would make the line fall to zero the moment
+            // enforcement is switched on, which is exactly the observation
+            // the operator needs to keep after the flip.
+            blindPartitioned.forEach {
+                Metrics.blindPartitionedAppend(catalogName, it.namespace, it.table)
+            }
+            if (refuseBlindPartitionedAppends) {
+                throw HoglakeException.Validation(
+                    "${blindPartitionedRefusal(qualified)}: $BLIND_PARTITIONED_REFUSAL",
+                )
+            }
+            warnBlindPartitioned(catalogName, catalogId, blindPartitioned, userAgent)
+        }
 
-        // 3b. Removal-queue collision check, and IT IS THE SERIALIZER
-        // NOW RATHER THAN THE COMMIT LOCK: cleanup's drain takes no lock
-        // at all (V21 — it claims rows instead), so what keeps it off a
-        // path this commit is registering is this refusal plus the fact
-        // that the drain reads only UNDRAINED rows. A registered path with
-        // an undrained hog_file_removal row is scheduled for physical
-        // deletion — accepting it would let the drain delete the object
-        // out from under the new live row (path reuse under a
-        // deterministic path scheme / writer retry). A CLAIMED row is
-        // still an undrained row, so the refusal stands for the whole
-        // time the path is somebody's work.
-        // Duplicate paths against live/historical file rows stay legal —
-        // this rejects only paths the cleanup queue currently owns; once
-        // the entry drains (drained_at set) the path is registrable again.
-        com.posthog.hoglake.service.UploadService.register(
-            h,
-            catalogId,
-            req.idempotencyKey,
-            resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
-                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
-        )
-        checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
-
-        // 4. Conflict check ('table_dropped'/'table_altered' since
+        // 3. Conflict check ('table_dropped'/'table_altered' since
         // readSnapshot on every touched table — appends and deletes share
         // the one-query pattern). readSnapshot is non-null whenever deletes
         // exist; a null readSnapshot is an appends-only blind commit.
+        //
+        // BEFORE the structural validation below, and the order is a
+        // contract decision, not a micro-optimization. A DDL change and
+        // the file-level symptom it produces arrive together — DROP COLUMN
+        // leaves stats naming a dead field_id, a new spec leaves the
+        // arity wrong, a dropped spec leaves partition values on an
+        // unpartitioned table — and whichever check runs first decides
+        // what the client is told. validateFiles answers 422 Validation,
+        // which is "your request is malformed": not retryable, not
+        // re-preparable, and it tells a caching writer nothing about its
+        // stale basis, so it rebuilds the same doomed payload until its
+        // cache ages out. checkConflicts answers the typed 409 that says
+        // re-prepare. The conflict is the CAUSE and the malformed file is
+        // the SYMPTOM, so the cause answers first.
+        // `UploadService.register`'s claimed-path refusal moved below this
+        // too, so a request that is both conflicted and path-colliding now
+        // gets the 409 rather than that refusal — same trade, same better
+        // answer, and worth naming since this list enumerates the cases.
+        //
+        // Safe to hoist because this block reads only what step 2
+        // produced — the resolved table ids and names — and nothing below
+        // it depends on having run: validateFiles' sanitized return is
+        // consumed at write time, and the removal-queue/upload serializers
+        // key on paths. Both still run inside this transaction under the
+        // same catalog lock.
         if (readSnapshot != null) {
             if (readSnapshot > head) {
                 throw HoglakeException.Validation(
@@ -544,6 +709,35 @@ class CommitService(
                 if (req.requireUnchangedTables) resolvedDeletes.mapTo(HashSet()) { it.tableId } else emptySet()
             checkConflicts(h, catalogId, readSnapshot, names, unchangedTableIds)
         }
+
+        // 4. Structural validation. Nothing is written unless all of it
+        // passes. The RESULT is what gets written: validateFiles also
+        // sanitizes each file's stats (StatsSanity).
+        val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
+        validateDeleteRegistrations(resolvedDeletes)
+
+        // 4b. Removal-queue collision check, and IT IS THE SERIALIZER
+        // NOW RATHER THAN THE COMMIT LOCK: cleanup's drain takes no lock
+        // at all (V21 — it claims rows instead), so what keeps it off a
+        // path this commit is registering is this refusal plus the fact
+        // that the drain reads only UNDRAINED rows. A registered path with
+        // an undrained hog_file_removal row is scheduled for physical
+        // deletion — accepting it would let the drain delete the object
+        // out from under the new live row (path reuse under a
+        // deterministic path scheme / writer retry). A CLAIMED row is
+        // still an undrained row, so the refusal stands for the whole
+        // time the path is somebody's work.
+        // Duplicate paths against live/historical file rows stay legal —
+        // this rejects only paths the cleanup queue currently owns; once
+        // the entry drains (drained_at set) the path is registrable again.
+        com.posthog.hoglake.service.UploadService.register(
+            h,
+            catalogId,
+            req.idempotencyKey,
+            resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
+                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
+        )
+        checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
 
         // 5. Allocations, all under the lock via UPDATE..RETURNING. Data
         // files and DV files share the next_file_id allocator. Neither
@@ -1397,11 +1591,51 @@ class CommitService(
     }
 
     /**
+     * The transition WARN for a blind append carrying partition_values:
+     * once per RESOLVED table per pod, naming the client in the message
+     * so the line is actionable by whoever owns it rather than being
+     * noise on every flush. Takes the resolved appends, so the dedupe key
+     * is the server's own (catalogId, tableId) — see
+     * `warnedBlindPartitioned` for why that matters.
+     */
+    private fun warnBlindPartitioned(
+        catalogName: String,
+        catalogId: Long,
+        appends: List<ResolvedAppend>,
+        userAgent: String?,
+    ) {
+        val agent = userAgent ?: "unknown"
+        for (append in appends) {
+            if (warnedBlindPartitioned.size >= MAX_WARNED_BLIND_PARTITIONED) {
+                // Said once, at the cap, and then never again.
+                if (warnedBlindPartitionedCapped.compareAndSet(false, true)) {
+                    log.warn {
+                        "blind-partitioned append warnings suppressed past " +
+                            "$MAX_WARNED_BLIND_PARTITIONED distinct tables"
+                    }
+                }
+                return
+            }
+            if (!warnedBlindPartitioned.add(catalogId to append.tableId)) continue
+            log.warn {
+                "blind append with partition_values on " +
+                    "'$catalogName'/'${append.namespace}.${append.table}' from " +
+                    "user_agent=$agent; accepted for now, and it will be refused once " +
+                    "HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS is on: $BLIND_PARTITIONED_REFUSAL"
+            }
+        }
+    }
+
+    /**
      * One indexed lookup over the typed change table covers appends and
      * deletes alike.
      *
      * Every touched table gets the DDL check ('table_dropped' /
-     * 'table_altered' since readSnapshot). The tables in
+     * 'table_altered' since readSnapshot), and a refusal where EVERY
+     * conflicted row is DDL is the typed, non-retryable
+     * [HoglakeException.DdlSinceReadSnapshot] rather than a
+     * [HoglakeException.CommitConflict] — see that class for why the two
+     * need opposite client behaviour. The tables in
      * [unchangedTableIds] — the DELETE targets of a guarded request, see
      * CommitRequest.requireUnchangedTables — additionally require that
      * nothing changed their ROW CONTENT, because the delete was planned
@@ -1449,9 +1683,36 @@ class CommitService(
                 .list()
         if (conflicted.isNotEmpty()) {
             val names = conflicted.mapNotNull { nameByTableId[it.first] }.distinct().sorted()
-            val change = if (conflicted.all { it.second }) "DDL" else "table change"
+            // TYPED, because the two answers need opposite client
+            // behaviour and used to be the same code. Pure DDL is
+            // permanent for this payload: a prepared request's
+            // read_snapshot is durable and must be replayed
+            // byte-identically, so nothing about a retry can make the
+            // alter un-happen, and a client that treats the refusal as
+            // retryable (which `commit_conflict` tells it to —
+            // pyhoglake's CommitConflictError is retryable=True) loops on
+            // a request that can only be refused again. The recovery is
+            // to re-prepare against a fresh table read.
+            //
+            // A ROW-CONTENT conflict is the opposite: re-reading and
+            // replanning is the recovery, and the same payload can
+            // succeed next time. It keeps `commit_conflict`, and so does
+            // a MIXED refusal — `all { ddl }` rather than `any`, because
+            // telling a caller "re-prepare, replaying cannot work" when
+            // half the reason was a concurrent insert would send it down
+            // the more expensive path for a conflict a plain retry
+            // clears.
+            if (conflicted.all { it.second }) {
+                throw HoglakeException.DdlSinceReadSnapshot(
+                    "concurrent DDL since snapshot $readSnapshot on table(s): " +
+                        names.joinToString(", ") +
+                        "; re-prepare against current table info, replaying this request cannot succeed",
+                    tables = names,
+                    readSnapshot = readSnapshot,
+                )
+            }
             throw HoglakeException.CommitConflict(
-                "concurrent $change since snapshot $readSnapshot on table(s): " +
+                "concurrent table change since snapshot $readSnapshot on table(s): " +
                     names.joinToString(", "),
             )
         }

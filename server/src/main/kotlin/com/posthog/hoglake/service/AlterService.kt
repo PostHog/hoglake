@@ -81,7 +81,13 @@ class AlterService(private val jdbi: Jdbi) {
                         ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
 
                 if (expectedTableUuid != null && t.tableUuid != expectedTableUuid) {
-                    throw HoglakeException.CommitConflict("table '$namespace.$table' no longer has the expected UUID")
+                    throw HoglakeException.TableRecreated(
+                        "table '$namespace.$table' no longer has the expected UUID: it was " +
+                            "recreated; re-read it before retrying",
+                        table = "$namespace.$table",
+                        expectedTableUuid = expectedTableUuid,
+                        currentTableUuid = t.tableUuid,
+                    )
                 }
                 if (readSnapshot != null) {
                     val head = CatalogRepo.findByName(h, catalog)!!
@@ -101,7 +107,18 @@ class AlterService(private val jdbi: Jdbi) {
                         ).bind("catalog", cat.catalogId).bind("table", t.tableId)
                             .bind("snapshot", readSnapshot).mapTo(Boolean::class.java).one()
                     if (changed) {
-                        throw HoglakeException.CommitConflict("concurrent DDL since snapshot $readSnapshot")
+                        // The same typed refusal the commit path gives, and
+                        // for the same reason: this request's read_snapshot
+                        // is fixed, so replaying it can only be refused
+                        // again. (A subclass of CommitConflict, so a client
+                        // that only knows the old class is unaffected.)
+                        throw HoglakeException.DdlSinceReadSnapshot(
+                            "concurrent DDL since snapshot $readSnapshot on table(s): " +
+                                "$namespace.$table; re-read the table and re-issue the alter, " +
+                                "replaying this request cannot succeed",
+                            tables = listOf("$namespace.$table"),
+                            readSnapshot = readSnapshot,
+                        )
                     }
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)

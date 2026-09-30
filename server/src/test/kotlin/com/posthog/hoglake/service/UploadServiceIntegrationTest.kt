@@ -584,7 +584,12 @@ class UploadServiceIntegrationTest {
             "target",
             listOf(com.posthog.hoglake.model.AlterOp.SetTableComment("new")),
         )
-        assertThatThrownBy { commits.commit(catalog, stale) }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            commits.commit(
+                catalog,
+                stale,
+            )
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
         assertThat(uploads.claim(catalog, data.uploadId, owner, data.prefix, "data").state).isEqualTo("active")
         commits.commit(catalog, request(catalog, owner, data))
     }

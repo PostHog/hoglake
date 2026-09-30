@@ -15,6 +15,7 @@ from pyhoglake import (
     HoglakeError,
     NotFoundError,
     OffsetRegressionError,
+    ReadSnapshotExpiredError,
     ValidationError,
 )
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
@@ -172,6 +173,18 @@ class BufferedService:
                 self.coordinator._guard()
                 self.coordinator.scheduler.tick(time.time())
                 self.coordinator._offset()
+        except ReadSnapshotExpiredError as error:
+            # A 410 on the DESTINATION commit, not on the source changefeed.
+            # Both are ExpiredError, and only this arm's position keeps them
+            # apart: the source diagnosis (FeedExpiredError) tells the operator
+            # to reconcile from a full scan, which is the wrong remedy and an
+            # expensive one. What actually expired is the prepared payload's
+            # read_snapshot, and PendingStore still holds everything needed to
+            # re-prepare it, so this is the ordinary retained-request halt.
+            raise PersistentFailureError(
+                "prepared commit read_snapshot expired; request retained, "
+                "re-prepare: " + self.describe_error(error)
+            ) from error
         except ExpiredError as error:
             raise FeedExpiredError(str(error)) from error
         except OffsetRegressionError as error:

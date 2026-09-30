@@ -93,7 +93,16 @@ class PartitionStatsServiceIntegrationTest {
         cat: String,
         table: String,
         vararg files: FileRegistration,
-    ) = commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", table, files.toList()))))
+        // readSnapshot = head: an append carrying partition_values
+        // requires one (invariant 12), and the fixture has just finished
+        // whatever DDL it meant to do, so head is its honest answer.
+    ) = commits.commit(
+        cat,
+        CommitRequest(
+            readSnapshot = db.head(cat),
+            appends = listOf(TableAppend("ns", table, files.toList())),
+        ),
+    )
 
     private fun file(
         name: String,

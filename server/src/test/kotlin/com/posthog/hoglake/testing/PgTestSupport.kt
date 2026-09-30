@@ -71,6 +71,35 @@ object PgTestSupport {
     class TestDb(val dataSource: HikariDataSource, val jdbi: Jdbi, val jdbcUrl: String) :
         AutoCloseable {
         override fun close() = dataSource.close()
+
+        /**
+         * A catalog's current head snapshot, for fixtures that seed
+         * files through CommitService.
+         *
+         * An append carrying `partition_values` REQUIRES a read_snapshot
+         * (invariant 12: a blind commit has no conflict window in which
+         * a spec change could be detected), so a fixture that writes
+         * partitioned files has to name one, and "head right now" is the
+         * fixture's honest answer — it has just done whatever DDL it
+         * meant to do. Reading `hog_catalog` directly rather than through
+         * CatalogService because most of these fixtures never build one.
+         */
+        fun head(catalog: String): Long =
+            jdbi.withHandle<Long, RuntimeException> { h ->
+                h.createQuery("SELECT last_snapshot_id FROM hog_catalog WHERE name = ?")
+                    .bind(0, catalog)
+                    .mapTo(Long::class.java)
+                    .one()
+            }
+
+        /** [head] by catalog id, for fixtures that only ever hold the id. */
+        fun headOf(catalogId: Long): Long =
+            jdbi.withHandle<Long, RuntimeException> { h ->
+                h.createQuery("SELECT last_snapshot_id FROM hog_catalog WHERE catalog_id = ?")
+                    .bind(0, catalogId)
+                    .mapTo(Long::class.java)
+                    .one()
+            }
     }
 
     /**

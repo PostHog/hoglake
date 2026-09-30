@@ -68,7 +68,11 @@ class PartitionFilterApiTest {
                 val res =
                     client.postJson(
                         "/v1/catalogs/$catalog/commit",
-                        """{"appends": [{"namespace": "ns", "table": "t", "files": [
+                        // read_snapshot, because the files carry
+                        // partition_values (invariant 12): a blind
+                        // partitioned append is a 422.
+                        """{"read_snapshot": ${db.head(catalog)},
+                           "appends": [{"namespace": "ns", "table": "t", "files": [
                            {"path": "s3://b/$catalog/$path.parquet", "record_count": 10,
                             "file_size_bytes": ${1000 + i},
                             "partition_values": ["$day", "$uid"]}]}]}""",

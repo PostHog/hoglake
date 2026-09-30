@@ -294,7 +294,13 @@ paths:
         - { $ref: "#/components/parameters/table" }
         - in: query
           name: expected_table_uuid
-          description: Optional incarnation guard, checked under the commit lock; mismatch returns 409.
+          description: >
+            Optional incarnation guard, checked under the commit lock. A
+            mismatch is 409 `table_recreated` — the table was dropped and
+            recreated under this name, so the incarnation named here is
+            gone and its history does not carry over. The body names
+            `tables` and `retry: re-prepare`: re-read the table and
+            decide, never replay.
           schema: { type: string, format: uuid }
       responses:
         "200":
@@ -303,7 +309,14 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409":
+          description: >
+            Conflict. `table_recreated` when expected_table_uuid names an
+            incarnation that is no longer live — not retryable, and the
+            body carries `tables` and `retry: re-prepare`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/truncate:
     post:
@@ -325,6 +338,13 @@ paths:
         - in: query
           name: expected_table_uuid
           required: true
+          description: >
+            Optional incarnation guard, checked under the commit lock. A
+            mismatch is 409 `table_recreated` — the table was dropped and
+            recreated under this name, so the incarnation named here is
+            gone and its history does not carry over. The body names
+            `tables` and `retry: re-prepare`: re-read the table and
+            decide, never replay.
           schema: { type: string, format: uuid }
       responses:
         "200":
@@ -335,7 +355,14 @@ paths:
         "400":
           description: Missing or invalid expected_table_uuid
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { $ref: "#/components/responses/Conflict" }
+        "409":
+          description: >
+            Conflict. `table_recreated` when expected_table_uuid names an
+            incarnation that is no longer live — not retryable, and the
+            body carries `tables` and `retry: re-prepare`.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
 
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/alter:
     post:
@@ -351,7 +378,13 @@ paths:
         - { $ref: "#/components/parameters/table" }
         - in: query
           name: expected_table_uuid
-          description: Optional incarnation guard, checked under the commit lock; mismatch returns 409.
+          description: >
+            Optional incarnation guard, checked under the commit lock. A
+            mismatch is 409 `table_recreated` — the table was dropped and
+            recreated under this name, so the incarnation named here is
+            gone and its history does not carry over. The body names
+            `tables` and `retry: re-prepare`: re-read the table and
+            decide, never replay.
           schema: { type: string, format: uuid }
         - in: query
           name: read_snapshot
@@ -387,6 +420,13 @@ paths:
             operations until successfully hydrated. Rewrite
             (compact) or retire the id-less files first. rename_table is
             unaffected.
+
+
+            `table_recreated` when expected_table_uuid names an
+            incarnation that is no longer live, and
+            `ddl_since_read_snapshot` when read_snapshot predates DDL on
+            the table. Neither is retryable: the body carries `tables`
+            and `retry: re-prepare`.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -1919,7 +1959,53 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Commit conflict
+          description: >
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
+
+
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2080,7 +2166,53 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Commit conflict
+          description: >
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
+
+
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2131,14 +2263,62 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
-            Commit conflict: a delete-target table changed since
-            read_snapshot, a DDL change on any touched table, a table
-            incarnation mismatch, or a targeted data file that was live at
+            Conflict: a delete-target table changed since read_snapshot,
+            a DDL change on any touched table, a table incarnation
+            mismatch, or a targeted data file that was live at
             read_snapshot and has since been retired (by compaction or
-            another commit). All are retryable after re-reading. Expiry is
-            NOT among them: for expiry to have removed a file live at
-            read_snapshot, read_snapshot must be below the floor, and the
-            floor guard returns 410 before any per-file check runs.
+            another commit). Expiry is NOT among them: for expiry to have
+            removed a file live at read_snapshot, read_snapshot must be
+            below the floor, and the floor guard returns 410 before any
+            per-file check runs.
+
+
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
+
+
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2175,7 +2355,53 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Commit conflict
+          description: >
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
+
+
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2219,14 +2445,62 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
           description: >
-            Commit conflict: a guarded delete target changed since
+            Conflict: a guarded delete target changed since
             read_snapshot, a DDL change on a touched table, a table
             incarnation mismatch, or a targeted data file that was live at
             read_snapshot and has since been retired (by compaction or
-            another commit). All are retryable after re-reading. Expiry is
-            NOT among them: for expiry to have removed a file live at
-            read_snapshot, read_snapshot must be below the floor, and the
-            floor guard returns 410 before any per-file check runs.
+            another commit). Expiry is NOT among them: for expiry to have
+            removed a file live at read_snapshot, read_snapshot must be
+            below the floor, and the floor guard returns 410 before any
+            per-file check runs.
+
+
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
+
+
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "422":
           description: Invalid request, missing key, or key reused with another payload
         "503":
@@ -2254,18 +2528,56 @@ paths:
               schema: { $ref: "#/components/schemas/CommitResult" }
         "409":
           description: >
-            Commit conflict (concurrent DDL on a touched table). The
-            client refreshes its read snapshot and retries.
+            Two error codes share this status and they need OPPOSITE
+            client behaviour.
 
 
-            Error code `table_dropped` is the one 409 a retry cannot
-            fix: a table the commit named EXISTS but has been dropped,
-            and the detail carries the snapshot it was dropped in. It is
-            typed apart from the 422 below because "you named a table
-            that does not exist" and "the table you were writing to was
-            dropped out from under you" are different facts with
-            different remedies, and both used to arrive as the same
-            `unknown table` validation failure.
+            `commit_conflict` is RETRYABLE: the read set moved (a
+            concurrent insert, delete or DV on a guarded delete target,
+            or a targeted data file retired since read_snapshot).
+            Refresh read_snapshot, replan and send again.
+
+
+            `ddl_since_read_snapshot` is NOT: DDL landed on a touched
+            table after this request's read_snapshot. Re-prepare against
+            current table info — replaying this payload cannot succeed,
+            because its read_snapshot is part of the payload and the
+            alter will not un-happen. The body names `tables`,
+            `read_snapshot` and `retry: re-prepare` so a client need not
+            parse the detail. This is also what makes a prepared append
+            a check-and-set on the table's shape: a partition-spec or
+            schema change between the writer's read and its commit
+            arrives here, atomically and with zero writes.
+
+
+            `table_recreated` is the third, same family: an
+            expected_table_uuid that is not the live table's, i.e. the
+            table was dropped and recreated under the same name. The
+            expected incarnation's history does not carry over, so
+            replaying cannot succeed; the body names `tables` and
+            `retry: re-prepare`.
+
+
+            `table_dropped` likewise cannot be retried: the table the
+            commit named exists but has been dropped, and the detail
+            carries the drop snapshot.
+
+
+            `table_dropped` is typed apart from the 422 below because
+            "you named a table that does not exist" and "the table you
+            were writing to was dropped out from under you" are different
+            facts with different remedies, and both used to arrive as the
+            same `unknown table` validation failure.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+        "410":
+          description: >
+            read_snapshot is below the catalog's expiry floor: the
+            snapshot this request was planned against is no longer
+            retained, so its conflict window cannot be evaluated. Same
+            recovery as the 409s above — re-read the table and prepare a
+            new request. Never a replay: the floor only moves forward.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -2273,7 +2585,8 @@ paths:
           description: Validation failure (unknown table, bad stats shape,
             unknown field ids, duplicate delete target — a commit carries
             at most one superseding deletion vector per data file; merge
-            deleted positions client-side and register the union)
+            deleted positions client-side and register the union; an
+            append carrying partition_values with no read_snapshot)
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ApiError" }
@@ -2659,6 +2972,30 @@ components:
       properties:
         error: { type: string }
         detail: { type: string }
+        tables:
+          type: array
+          items: { type: string }
+          description: >
+            Present on 409 ddl_since_read_snapshot and 409
+            table_recreated: the qualified `namespace.table` names the
+            refusal is about, so a caller knows which table info to
+            re-read without parsing `detail`.
+        read_snapshot:
+          type: integer
+          format: int64
+          description: >
+            Present only on 409 ddl_since_read_snapshot: the
+            read_snapshot the refused request carried. (Not on
+            table_recreated: a recreate is outside the conflict window
+            altogether, so no snapshot is at fault.)
+        retry:
+          type: string
+          enum: [re-prepare]
+          description: >
+            The recovery, when there is exactly one. `re-prepare` means
+            replaying this payload can only be refused again — re-read
+            the table and build a new request. Absent on every retryable
+            conflict.
 
     Catalog:
       type: object
@@ -3148,7 +3485,15 @@ components:
           description: >
             Transformed partition values by key_index of the table's live
             spec. Required with matching arity when the table is
-            partitioned; forbidden when not.
+            partitioned; forbidden when not. A file carrying them also
+            requires CommitRequest.read_snapshot — the values are only
+            valid under the spec they were computed with, and a blind
+            append has no conflict window in which a spec change could be
+            detected. ENFORCEMENT IS STAGED: the server answers 422 only
+            where it is configured to, and otherwise accepts the request
+            and logs a warning naming the client, so the existing writer
+            fleet can be moved first. Send the field regardless; a later
+            release refuses without it.
           items: { type: string, nullable: true }
         split_offsets:
           type: array
@@ -3188,10 +3533,18 @@ components:
           format: uuid
           description: >
             Optional incarnation guard. When present, the commit fails
-            with 409 commit_conflict if the live table resolved by name
+            with 409 `table_recreated` (carrying `tables` and
+            `retry: re-prepare`) if the live table resolved by name
             carries a different table_uuid — i.e. the table was dropped
             and recreated since the writer read it. Absent = today's
             name-only resolution.
+
+
+            It is also the ONLY guard against that race: the conflict
+            check keys on the resolved table id, so a drop+recreate is
+            outside an append's conflict window however fresh its
+            read_snapshot is. A writer that wants the guarantee must send
+            this field.
         files:
           type: array
           minItems: 1
@@ -3219,8 +3572,34 @@ components:
           description: >
             The snapshot the writer planned against. Conflicts are
             evaluated against changes after this point. Defaults to head
-            (no conflict window) for blind appends. REQUIRED when
-            deletes are present (deletes always conflict-check).
+            (no conflict window) for blind appends.
+
+
+            REQUIRED when deletes are present — deletes always
+            conflict-check, and that one is a 422 today.
+
+
+            REQUIRED, and STAGED, when any registered file carries
+            partition_values: partition values are computed by the writer
+            under one partition spec and the server never opens the
+            parquet, so a blind append could register values computed
+            under the old transform against a spec that changed underneath
+            it, with nothing afterwards able to detect it. The server
+            answers 422 only where it is configured to enforce this, and
+            otherwise accepts the request and logs a warning naming the
+            client — the existing writer fleet sends this shape and has to
+            be moved first. Send the field regardless. A blind append to an
+            unpartitioned table is unaffected.
+
+
+            It is also worth sending for its own sake rather than to
+            satisfy a rule: a prepared append whose read_snapshot is the
+            snapshot its table info was read at (Table.read_snapshot_id)
+            is validated by the server's OCC for free, which is what lets
+            a writer cache that info instead of re-reading the table
+            every flush. A DDL change is then 409
+            ddl_since_read_snapshot with retry: re-prepare, rather than
+            an undetected mis-registration.
         appends:
           type: array
           items: { $ref: "#/components/schemas/TableAppend" }

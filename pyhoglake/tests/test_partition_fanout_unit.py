@@ -75,6 +75,10 @@ PART_TABLE_WIRE = {
 
 _TABLES_URL = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
 _COMMIT_URL = f"{BASE}/v1/catalogs/cat/commit"
+# Writer-path table reads ask the server to skip its live-totals scan
+# (#232), so the mocks they match carry the query parameter. A read a
+# TEST makes as a user (the fixture's own resolve) does not.
+_WRITER_TABLES_URL = f"{_TABLES_URL}?totals=false"
 
 # months since 1970 for 2026-01/02/03
 M_JAN, M_FEB, M_MAR = "672", "673", "674"
@@ -99,6 +103,19 @@ def _make_table(httpx_mock, fake_s3, wire=None):
     )
     cat = client.catalog("cat")
     httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire or PART_TABLE_WIRE)
+    # Every table here is PARTITIONED, so `Table.append` reads the catalog
+    # for a read_snapshot BEFORE it re-resolves the table: the server
+    # refuses a blind partitioned append, and a basis taken after the
+    # resolve would leave a spec change between the two reads outside the
+    # conflict window. Optional and reusable because a caller that passes
+    # its own read_snapshot needs no head read, and several tests do.
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat",
+        json=CATALOG_WIRE,
+        is_optional=True,
+        is_reusable=True,
+    )
     return client, Namespace(cat, "ns1").table("events")
 
 
@@ -110,7 +127,9 @@ def table(httpx_mock, fake_s3):
 
 
 def _mock_refresh_and_commit(httpx_mock, wire=None):
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire or PART_TABLE_WIRE)
+    httpx_mock.add_response(
+        method="GET", url=_WRITER_TABLES_URL, json=wire or PART_TABLE_WIRE
+    )
     httpx_mock.add_response(
         method="POST",
         url=_COMMIT_URL,
@@ -216,7 +235,7 @@ def test_fanout_result_exposes_partition_tuples(table, httpx_mock, fake_s3):
 def test_unpartitioned_result_exposes_single_file(httpx_mock, fake_s3):
     wire = {k: v for k, v in PART_TABLE_WIRE.items() if k != "partition_spec"}
     client, t = _make_table(httpx_mock, fake_s3, wire=wire)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
     httpx_mock.add_response(method="POST", url=_COMMIT_URL, json={"snapshot_id": 6})
     res = t.append(_batch())
     (f,) = res.files
@@ -261,7 +280,7 @@ def test_fanout_deferred_stats_still_ships_partition_values(table, httpx_mock, f
 
 
 def test_fanout_empty_batch_rejected(table, httpx_mock, fake_s3):
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=PART_TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=PART_TABLE_WIRE)
     empty = _batch().slice(0, 0)
     with pytest.raises(ValidationError, match="0 rows to partitioned table"):
         table.append(empty)
@@ -273,11 +292,17 @@ def test_fanout_stale_spec_conflict_surfaces_taxonomy(table, httpx_mock, fake_s3
     # moves before the commit lands, the server refuses and the EXISTING
     # taxonomy surfaces it (retryable CommitConflictError) — the client
     # never silently recomputes under a new spec
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=PART_TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=PART_TABLE_WIRE)
     httpx_mock.add_response(
         method="POST",
         url=_COMMIT_URL,
-        json={"error": "commit_conflict", "detail": "concurrent DDL: alter_table"},
+        # A `commit_conflict` body on purpose: the RETRYABLE half of the
+        # taxonomy. Pure DDL is `ddl_since_read_snapshot` now, the
+        # non-retryable re-prepare refusal — see test_prepare_cache.py.
+        json={
+            "error": "commit_conflict",
+            "detail": "a concurrent insert moved the read set",
+        },
         status_code=409,
     )
     with pytest.raises(CommitConflictError) as ei:
@@ -293,7 +318,7 @@ def test_fanout_unknown_transform_fails_before_upload(httpx_mock, fake_s3):
         "fields": [{"source_field_id": 1, "transform": "squiggle"}],
     }
     client, t = _make_table(httpx_mock, fake_s3, wire=wire)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
     with pytest.raises(ValidationError, match="unknown partition transform"):
         t.append(_batch())
     assert fake_s3.files == {}
@@ -307,7 +332,7 @@ def test_fanout_bucket_without_param_fails_before_upload(httpx_mock, fake_s3):
         "fields": [{"source_field_id": 1, "transform": "bucket"}],
     }
     client, t = _make_table(httpx_mock, fake_s3, wire=wire)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
     with pytest.raises(ValidationError, match="requires transform_param"):
         t.append(_batch())
     assert fake_s3.files == {}
@@ -321,7 +346,7 @@ def test_fanout_spec_referencing_dead_column_fails(httpx_mock, fake_s3):
         "fields": [{"source_field_id": 99, "transform": "identity"}],
     }
     client, t = _make_table(httpx_mock, fake_s3, wire=wire)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
     with pytest.raises(ValidationError, match="field_id 99"):
         t.append(_batch())
     assert fake_s3.files == {}
@@ -342,7 +367,7 @@ def test_fanout_bucket_spec(httpx_mock, fake_s3):
         ],
     }
     client, t = _make_table(httpx_mock, fake_s3, wire=wire)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=wire)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=wire)
     httpx_mock.add_response(method="POST", url=_COMMIT_URL, json={"snapshot_id": 6})
     res = t.append(_batch())
     expected: dict[tuple[str, str], int] = {}

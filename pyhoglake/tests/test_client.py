@@ -997,17 +997,32 @@ def test_commit_conflict_is_retryable(client, httpx_mock):
 
 
 @pytest.mark.parametrize(
-    "body",
+    "body,expected,table",
     [
-        {"error": "commit_conflict: the table was recreated"},
-        {"error": "commit_conflict", "detail": "The Table Was Recreated (uuid x != y)"},
+        (
+            {
+                "error": "table_recreated",
+                "detail": "uuid x != y",
+                "tables": ["ns1.events"],
+                "retry": "re-prepare",
+            },
+            "IncarnationChangedError",
+            "ns1.events",
+        ),
+        # A body carrying only the code: the TYPE must still be right,
+        # because the type is what stops a retry loop.
+        ({"error": "table_recreated"}, "IncarnationChangedError", None),
     ],
-    ids=["marker-in-error", "marker-in-detail-case-insensitive"],
+    ids=["full-body", "code-only"],
 )
-def test_commit_409_recreation_maps_to_incarnation_changed(client, httpx_mock, body):
-    # the 409 discriminator: "the table was recreated" in message or
-    # detail (case-insensitive) -> IncarnationChangedError (never
-    # retryable); any other 409 stays CommitConflictError (see above)
+def test_commit_409_recreation_maps_to_incarnation_changed(
+    client, httpx_mock, body, expected, table
+):
+    # The discriminator is the CODE. It used to be the phrase "the table
+    # was recreated" found in the message or detail — prose the server
+    # never promised, which is why the server now sends
+    # `table_recreated` with `retry: re-prepare`. Any other 409 stays
+    # CommitConflictError (see above).
     from pyhoglake import IncarnationChangedError
 
     cat = _catalog(client, httpx_mock)
@@ -1019,8 +1034,92 @@ def test_commit_409_recreation_maps_to_incarnation_changed(client, httpx_mock, b
     )
     with pytest.raises(IncarnationChangedError) as ei:
         cat._commit({"appends": []})
+    assert type(ei.value).__name__ == expected
     assert ei.value.status_code == 409
     assert ei.value.retryable is False
+    assert ei.value.re_prepare is True
+    assert ei.value.table == table
+
+
+def test_commit_409_ddl_since_read_snapshot_is_typed_and_not_retryable(
+    client, httpx_mock
+):
+    # The other half of the split: pure DDL since read_snapshot. Not
+    # retryable and not a replay — the payload's own read_snapshot can
+    # never satisfy the check again — so the recovery is to re-prepare.
+    from pyhoglake import DdlSinceReadSnapshotError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={
+            "error": "ddl_since_read_snapshot",
+            "detail": "concurrent DDL since snapshot 7 on table(s): ns1.events",
+            "tables": ["ns1.events"],
+            "read_snapshot": 7,
+            "retry": "re-prepare",
+        },
+        status_code=409,
+    )
+    with pytest.raises(DdlSinceReadSnapshotError) as ei:
+        cat._commit({"appends": []})
+    assert ei.value.status_code == 409
+    assert ei.value.retryable is False
+    assert ei.value.re_prepare is True
+    assert ei.value.tables == ("ns1.events",)
+    assert ei.value.read_snapshot == 7
+    # A SUBCLASS of CommitConflictError, deliberately: callers
+    # discriminate with isinstance ladders (millpond's retry budget does,
+    # and its CommitConflictError arm already recovers by resetting its
+    # cached table and re-preparing). A sibling class would have dropped
+    # through to its "any other 4xx" arm and turned that into a hard
+    # re-raise. The wire code is what changed.
+    from pyhoglake import CommitConflictError
+
+    assert isinstance(ei.value, CommitConflictError)
+
+
+def test_commit_410_below_the_floor_is_re_prepare_not_a_reconcile(client, httpx_mock):
+    # A COMMIT's 410 is its own read_snapshot below the expiry floor,
+    # which is a different fact from a changefeed 410 ("reconcile from a
+    # full scan"): the floor only moves forward, so replaying is futile
+    # and re-preparing is the answer. Still an ExpiredError, so existing
+    # handlers keep working.
+    from pyhoglake import ExpiredError, ReadSnapshotExpiredError
+
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{BASE}/v1/catalogs/cat/commit",
+        json={"error": "expired", "detail": "read_snapshot 3 is below the floor 10"},
+        status_code=410,
+    )
+    with pytest.raises(ReadSnapshotExpiredError) as ei:
+        cat._commit({"appends": []})
+    assert isinstance(ei.value, ExpiredError)
+    assert ei.value.retryable is False
+    assert ei.value.re_prepare is True
+
+
+def test_every_request_identifies_the_client(client, httpx_mock):
+    """`User-Agent: pyhoglake/<version>` on every request.
+
+    The SERVER reads it: its transition warnings name the client that has
+    to change, and without this they said `python-httpx/<version>` —
+    true, useless, and identical for every other httpx caller in the
+    fleet. Version from the installed metadata, the same source as
+    `pyhoglake.__version__`.
+    """
+    import pyhoglake
+
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    client.catalog("cat")
+    agent = httpx_mock.get_requests()[-1].headers["user-agent"]
+    assert agent == f"pyhoglake/{pyhoglake.__version__}"
+    assert "httpx" not in agent
 
 
 def test_non_json_error_body(client, httpx_mock):

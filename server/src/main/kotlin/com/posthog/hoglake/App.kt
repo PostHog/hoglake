@@ -84,7 +84,12 @@ class App private constructor(
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
 
     private val catalogService = CatalogService(jdbi)
-    private val commitService = CommitService(jdbi, commitLockTimeoutMs = cfg.commitLockTimeoutMs)
+    private val commitService =
+        CommitService(
+            jdbi,
+            commitLockTimeoutMs = cfg.commitLockTimeoutMs,
+            refuseBlindPartitionedAppends = cfg.refuseBlindPartitionedAppends,
+        )
     private val alterService = AlterService(jdbi)
     private val scanService = ScanService(jdbi)
     private val viewService = ViewService(jdbi)

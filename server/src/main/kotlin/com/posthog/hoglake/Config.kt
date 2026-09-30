@@ -534,6 +534,54 @@ data class Config(
             com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS.toString(),
         ).toLong(),
     /**
+     * Whether a blind append (no `read_snapshot`) carrying
+     * `partition_values` is REFUSED with 422 or merely logged at WARN.
+     *
+     * OFF by default because EVERY PRODUCTION FLUSH IS THIS SHAPE TODAY.
+     * Two writers send it:
+     *
+     *  - **millpond**, the primary one. `prepare_append_files` puts a
+     *    read_snapshot on the payload and millpond deletes it again
+     *    (`millpond/hoglake.py`, `payload.pop("read_snapshot", None)`),
+     *    deliberately: a prepared payload's read_snapshot is frozen, so
+     *    the 409 it used to earn when another pod added a column was
+     *    permanent, and the only way out was re-uploading. Its tables are
+     *    partitioned, so every flush on prod-us is a blind partitioned
+     *    append.
+     *  - **duckdb-client**, whose append-only commits carry no
+     *    read_snapshot (storage/hoglake_transaction.cpp) and which sets
+     *    partition values whenever the target has a live spec
+     *    (storage/hoglake_insert.cpp). Turning this on today breaks
+     *    `INSERT INTO <partitioned table>` through the extension.
+     *
+     * THE FLIP PRECONDITION, both halves:
+     *
+     *  1. millpond stops popping the field. That is safe now and was not
+     *     before: the refusal is `ddl_since_read_snapshot`, a SUBCLASS of
+     *     CommitConflictError, which millpond's `is_retryable` ladder
+     *     already treats as retryable — so `reset_caches` re-resolves,
+     *     `_commit_prepared` drops the refused payload, and the next
+     *     attempt re-prepares and succeeds. The re-upload it was avoiding
+     *     is now one flush's worth, not a wedge.
+     *  2. duckdb-client sends one for a partitioned append.
+     *
+     * WHEN TO FLIP IT: on
+     * `hoglake_blind_partitioned_appends_total{catalog,namespace,table}`
+     * reaching zero and staying there. The WARN beside it fires once per
+     * (catalog, table) per pod and then goes quiet forever, so it cannot
+     * tell a fixed client from a pod that already logged the line; the
+     * counter can, and it keeps counting after the flip.
+     *
+     * The rule itself is invariant 12 and is not optional — partition
+     * values are only valid under the spec they were computed with, and a
+     * blind commit has no window in which a spec change could be
+     * detected — so this knob is a rollout order, not a policy: the WARN
+     * names the offending client and the refusal text, and the flag flips
+     * once both writers are fixed.
+     */
+    val refuseBlindPartitionedAppends: Boolean =
+        boolEnv("HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS", false),
+    /**
      * Compaction sweep interval; default 0 = OFF for now (the manual
      * /maintenance/compact trigger still works). Rate-awareness is by
      * construction: tiny bites (see the batch knobs), never a storm.
