@@ -508,12 +508,12 @@ class CompactionGroupingTest {
             val taken = packed.groups.flatten()
             val refused = packed.rowBoundRefusals.flatten()
             assertThat(taken.size + refused.size).isLessThanOrEqualTo(files.size)
-            // And every refusal is genuinely short of what it needed,
-            // never a group that could have been rewritten.
+            // And every refusal is a single file: a row-closed group
+            // needs only two, so anything the capacity closed with two
+            // or more is rewritten, never refused. The byte minimum has
+            // no say here, which is the rule this branch introduced.
             for (g in packed.rowBoundRefusals) {
-                val largest = g.maxOf { it.first }
-                val need = maxOf(2L, minOf(min.toLong(), if (largest <= 0) min.toLong() else target / largest))
-                assertThat(g.size.toLong()).describedAs("a refusal is short by definition").isLessThan(need)
+                assertThat(g.size).describedAs("a row refusal is one file the capacity closed alone").isEqualTo(1)
             }
         }
     }
