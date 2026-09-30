@@ -339,19 +339,23 @@ class CommitService(
     }
 
     /**
-     * (catalog, namespace.table) already warned about a blind partitioned
+     * (catalogId, tableId) already warned about a blind partitioned
      * append, so the line fires ONCE per table per pod instead of once
      * per flush.
      *
-     * The USER AGENT is deliberately NOT part of the key, only of the
-     * message. It was, and that was wrong in the one direction that
-     * matters: the agent is client-supplied, so a client minting one per
-     * request could fill the cap below and silence the signal for every
-     * other writer for the pod's life. Keyed on the table alone the
-     * cardinality is the catalog's own, and the cost is that a second
-     * client on an already-warned table is named only in the logs of
-     * whoever looks — acceptable, because the first line already says the
-     * table needs attention.
+     * Both halves are SERVER-ASSIGNED, and that is the property that
+     * makes the set safe: nothing a client supplies can grow it. Two
+     * earlier keys were wrong in exactly that way — the User-Agent (a
+     * client minting one per request fills the cap and silences the
+     * signal for everyone) and then the request's own (namespace, table)
+     * STRINGS, which a client can invent 512 of without a single table
+     * existing. The caller resolves first now, so an unresolvable name
+     * gets the "unknown table" refusal instead of a slot here.
+     *
+     * The cost of keying on the table alone is that a second client on an
+     * already-warned table is named only in whatever logs it writes
+     * itself — acceptable, because the first line already says the table
+     * needs attention, and the agent is still in the message.
      *
      * Still CAPPED at [MAX_WARNED_BLIND_PARTITIONED] as defence in depth
      * against a pathological table count; past it the line says so once
@@ -364,7 +368,7 @@ class CommitService(
      * few around the cap is immaterial.
      */
     private val warnedBlindPartitioned =
-        java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<String, String>>()
+        java.util.concurrent.ConcurrentHashMap.newKeySet<Pair<Long, Long>>()
 
     /**
      * Whether the cap's own line has been logged. A flag rather than a
@@ -519,61 +523,6 @@ class CommitService(
                 "read_snapshot is required when the commit contains deletes",
             )
         }
-        // The second thing read_snapshot is REQUIRED for, and the
-        // reason is the trust boundary on partition values (invariant
-        // 12): they are computed by the WRITER under one partition spec,
-        // the server never opens the parquet and so can neither verify
-        // nor recompute them, and validateFiles' arity check cannot tell
-        // two same-arity specs apart. With a read_snapshot, a spec change
-        // between the writer's read and its commit is caught by
-        // [checkConflicts]' DDL arm and answered with re-prepare. WITHOUT
-        // one there is no conflict window at all, so the same change
-        // silently registers values computed under the old transform
-        // against the new spec_id — files that mis-prune every read of
-        // them, with nothing anywhere able to detect it afterwards.
-        //
-        // A blind append to an UNPARTITIONED table stays legal and
-        // unchanged: it carries no partition values, so it has nothing
-        // bound to a spec and nothing a concurrent alter can invalidate
-        // that the arity/field-id content checks do not already catch.
-        //
-        // OFF BY DEFAULT, and that is not timidity: `duckdb-client` sends
-        // no read_snapshot on an append-only commit
-        // (storage/hoglake_transaction.cpp) and sets partition values
-        // whenever the target has a live spec (storage/hoglake_insert.cpp),
-        // so enforcing this today breaks `INSERT INTO <partitioned table>`
-        // from the extension — an in-repo client that cannot be changed in
-        // the same commit as the server. Until it ships a snapshot the
-        // refusal is a WARN naming the client, and
-        // HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS flips it to the 422 the
-        // contract describes.
-        //
-        // The OFFENDING TABLES, not a request-level boolean: a commit may
-        // append to several tables (`/commit` and `/commit/transaction`
-        // both take many groups, and the duckdb extension writes
-        // multi-table transactions), and only the ones carrying partition
-        // values are at fault. A boolean made the refusal name no table at
-        // all and made the WARN name EVERY table in the request — a false
-        // statement about each unpartitioned one, and each of those keys
-        // then poisoned the once-per-table dedupe set so the line could
-        // never be corrected.
-        val blindPartitioned =
-            if (readSnapshot != null) {
-                emptySet()
-            } else {
-                mergedAppends
-                    .filterValues { files -> files.any { it.partitionValues != null } }
-                    .keys
-            }
-        if (blindPartitioned.isNotEmpty()) {
-            val qualified = blindPartitioned.map { (ns, t) -> "$ns.$t" }.sorted()
-            if (refuseBlindPartitionedAppends) {
-                throw HoglakeException.Validation(
-                    "${blindPartitionedRefusal(qualified)}: $BLIND_PARTITIONED_REFUSAL",
-                )
-            }
-            warnBlindPartitioned(catalogName, blindPartitioned, userAgent)
-        }
 
         fun resolveGuarded(key: Pair<String, String>): LiveTable {
             val (namespace, table) = key
@@ -624,6 +573,73 @@ class CommitService(
                 val tableId = appendTableIdByName[key] ?: resolveGuarded(key).tableId
                 ResolvedDeletes(namespace, table, tableId, files)
             }
+
+        // The second thing read_snapshot is REQUIRED for, and the reason
+        // is the trust boundary on partition values (invariant 12): they
+        // are computed by the WRITER under one partition spec, the server
+        // never opens the parquet and so can neither verify nor recompute
+        // them, and validateFiles' arity check cannot tell two same-arity
+        // specs apart. With a read_snapshot, a spec change between the
+        // writer's read and its commit is caught by [checkConflicts]' DDL
+        // arm and answered with re-prepare. WITHOUT one there is no
+        // conflict window at all, so the same change silently registers
+        // values computed under the old transform against the new
+        // spec_id — files that mis-prune every read of them, with nothing
+        // anywhere able to detect it afterwards.
+        //
+        // A blind append to an UNPARTITIONED table stays legal and
+        // unchanged: it carries no partition values, so it has nothing
+        // bound to a spec and nothing a concurrent alter can invalidate
+        // that the arity/field-id content checks do not already catch.
+        //
+        // OFF BY DEFAULT, and the reason is the fleet, not timidity:
+        // EVERY production flush is this shape today — millpond strips the
+        // read_snapshot `prepare_append_files` puts on, and duckdb-client
+        // never sends one. See Config.refuseBlindPartitionedAppends for
+        // both writers and the two-part flip precondition. Until then the
+        // refusal is a WARN naming the client.
+        //
+        // AFTER RESOLUTION, and that is what makes the dedupe key sound:
+        // the key is the server-assigned tableId, so nothing a client
+        // supplies can grow the set. Keyed on the request's (namespace,
+        // table) strings — which is where this check used to sit — 512
+        // bogus names would have silenced the line for the pod's life,
+        // and a name that does not resolve now gets the "unknown table"
+        // refusal it deserves instead of this one.
+        //
+        // The OFFENDING TABLES, not a request-level boolean: a commit may
+        // append to several tables (`/commit` and `/commit/transaction`
+        // both take many groups, and both millpond and the duckdb
+        // extension write multi-table requests), and only the ones
+        // carrying partition values are at fault. A boolean made the
+        // refusal name no table at all and made the WARN name EVERY table
+        // in the request — a false statement about each unpartitioned one,
+        // and each of those keys then poisoned the dedupe set so the line
+        // could never be corrected.
+        val blindPartitioned =
+            if (readSnapshot != null) {
+                emptyList()
+            } else {
+                resolvedAppends.filter { a -> a.files.any { it.partitionValues != null } }
+            }
+        if (blindPartitioned.isNotEmpty()) {
+            val qualified = blindPartitioned.map { "${it.namespace}.${it.table}" }.sorted()
+            // Counted per OCCURRENCE, above the flag and outside the WARN's
+            // dedupe, because this counter is what the flag flip is decided
+            // on: a rate that reaches zero and stays there. Counting only
+            // the accepted ones would make the line fall to zero the moment
+            // enforcement is switched on, which is exactly the observation
+            // the operator needs to keep after the flip.
+            blindPartitioned.forEach {
+                Metrics.blindPartitionedAppend(catalogName, it.namespace, it.table)
+            }
+            if (refuseBlindPartitionedAppends) {
+                throw HoglakeException.Validation(
+                    "${blindPartitionedRefusal(qualified)}: $BLIND_PARTITIONED_REFUSAL",
+                )
+            }
+            warnBlindPartitioned(catalogName, catalogId, blindPartitioned, userAgent)
+        }
 
         // 3. Conflict check ('table_dropped'/'table_altered' since
         // readSnapshot on every touched table — appends and deletes share
@@ -1576,17 +1592,20 @@ class CommitService(
 
     /**
      * The transition WARN for a blind append carrying partition_values:
-     * once per (catalog, table) per pod, naming the client in the message
+     * once per RESOLVED table per pod, naming the client in the message
      * so the line is actionable by whoever owns it rather than being
-     * noise on every flush.
+     * noise on every flush. Takes the resolved appends, so the dedupe key
+     * is the server's own (catalogId, tableId) — see
+     * `warnedBlindPartitioned` for why that matters.
      */
     private fun warnBlindPartitioned(
-        catalog: String,
-        tables: Set<Pair<String, String>>,
+        catalogName: String,
+        catalogId: Long,
+        appends: List<ResolvedAppend>,
         userAgent: String?,
     ) {
         val agent = userAgent ?: "unknown"
-        for ((namespace, table) in tables) {
+        for (append in appends) {
             if (warnedBlindPartitioned.size >= MAX_WARNED_BLIND_PARTITIONED) {
                 // Said once, at the cap, and then never again.
                 if (warnedBlindPartitionedCapped.compareAndSet(false, true)) {
@@ -1597,9 +1616,10 @@ class CommitService(
                 }
                 return
             }
-            if (!warnedBlindPartitioned.add(catalog to "$namespace.$table")) continue
+            if (!warnedBlindPartitioned.add(catalogId to append.tableId)) continue
             log.warn {
-                "blind append with partition_values on '$catalog'/'$namespace.$table' from " +
+                "blind append with partition_values on " +
+                    "'$catalogName'/'${append.namespace}.${append.table}' from " +
                     "user_agent=$agent; accepted for now, and it will be refused once " +
                     "HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS is on: $BLIND_PARTITIONED_REFUSAL"
             }

@@ -427,15 +427,36 @@ there would break that gate on every build.
     The REFUSAL is staged, not immediate:
     `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` (default **false**) makes
     it the 422 the contract describes, and until then the shape is
-    accepted and logged at WARN once per (catalog, table, user agent) per
-    pod, naming the client and quoting the refusal it will get. The flag
-    exists because `duckdb-client` sends exactly that shape today —
-    append-only commits carry no `read_snapshot`
-    (`storage/hoglake_transaction.cpp`) and partition values ride
-    whenever the table has a live spec (`storage/hoglake_insert.cpp`) —
-    so enforcing it in the same change as the server would break `INSERT
-    INTO <partitioned table>` through the extension. The rule is not
-    optional; the rollout order is.
+    accepted and logged at WARN once per RESOLVED table per pod, naming
+    the client and quoting the refusal it will get. (Once per resolved
+    table, not per requested name: the dedupe key is the server's
+    `tableId`, because a key holding anything a client supplies — a
+    User-Agent, a `namespace.table` string — lets one client fill the cap
+    and silence the signal for the whole fleet.)
+    The flag exists because **every production flush is that shape
+    today**. millpond is the primary blind writer: `prepare_append_files`
+    puts a `read_snapshot` on the payload and millpond deletes it
+    (`millpond/hoglake.py`, `payload.pop("read_snapshot", None)`), because
+    a prepared payload's basis is frozen and the 409 it earned when
+    another pod added a column was permanent. `duckdb-client` is the
+    second — append-only commits carry no `read_snapshot`
+    (`storage/hoglake_transaction.cpp`) and partition values ride whenever
+    the table has a live spec (`storage/hoglake_insert.cpp`) — so
+    enforcing this in the same change as the server would break both
+    millpond's flush and `INSERT INTO <partitioned table>` through the
+    extension.
+    THE FLIP PRECONDITION is therefore two-part: millpond keeps the field
+    (safe now, and not before — `ddl_since_read_snapshot` subclasses
+    `CommitConflictError`, which millpond's `is_retryable` ladder already
+    recovers from by `reset_caches` + dropping the refused payload, so the
+    re-upload it was avoiding costs one flush rather than wedging), and
+    duckdb-client starts sending one. The rule is not optional; the
+    rollout order is. WHEN to flip is read off
+    `hoglake_blind_partitioned_appends_total{catalog,namespace,table}`,
+    which counts every occurrence and is deliberately outside the WARN's
+    dedupe: a line that fires once per pod cannot distinguish a fixed
+    client from a pod that already logged it, and the counter keeps
+    counting after the flip.
     `checkConflicts` also runs BEFORE `validateFiles`, deliberately: a
     DDL change and the file-level symptom it produces (stats naming a
     dropped field, the wrong arity, values on a now-unpartitioned table)

@@ -1102,6 +1102,26 @@ def test_commit_410_below_the_floor_is_re_prepare_not_a_reconcile(client, httpx_
     assert ei.value.re_prepare is True
 
 
+def test_every_request_identifies_the_client(client, httpx_mock):
+    """`User-Agent: pyhoglake/<version>` on every request.
+
+    The SERVER reads it: its transition warnings name the client that has
+    to change, and without this they said `python-httpx/<version>` —
+    true, useless, and identical for every other httpx caller in the
+    fleet. Version from the installed metadata, the same source as
+    `pyhoglake.__version__`.
+    """
+    import pyhoglake
+
+    httpx_mock.add_response(
+        method="GET", url=f"{BASE}/v1/catalogs/cat", json=CATALOG_WIRE
+    )
+    client.catalog("cat")
+    agent = httpx_mock.get_requests()[-1].headers["user-agent"]
+    assert agent == f"pyhoglake/{pyhoglake.__version__}"
+    assert "httpx" not in agent
+
+
 def test_non_json_error_body(client, httpx_mock):
     httpx_mock.add_response(
         method="GET",

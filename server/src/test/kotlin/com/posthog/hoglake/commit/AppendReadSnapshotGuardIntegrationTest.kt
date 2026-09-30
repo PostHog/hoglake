@@ -694,6 +694,53 @@ class AppendReadSnapshotGuardIntegrationTest {
     }
 
     @Test
+    fun `a name that does not resolve gets the unknown-table refusal, not a dedupe slot`() {
+        // The dedupe key is the server's tableId, so it can only be taken
+        // by a table that EXISTS. Keyed on the request's own
+        // (namespace, table) strings — which is where this check used to
+        // sit, before resolution — a client could have minted 512 names
+        // and silenced the line for the pod's life without creating
+        // anything.
+        val cat = fixture()
+        alter.alterTable(cat, "ns", "t", listOf(partitionBy(Transform.DAY)))
+        val service = CommitService(db.jdbi)
+        val lines = mutableListOf<String>()
+        withWarnCapture(lines) {
+            repeat(600) { i ->
+                assertThatThrownBy {
+                    service.commit(
+                        cat,
+                        CommitRequest(
+                            appends =
+                                listOf(
+                                    TableAppend(
+                                        "ns",
+                                        "nope$i",
+                                        listOf(file(cat, "ghost-$i", listOf("2026-09-29"))),
+                                    ),
+                                ),
+                        ),
+                        userAgent = "liar/1.0",
+                    )
+                }.isInstanceOf(HoglakeException.Validation::class.java)
+            }
+            // The real table's line still gets through afterwards, which
+            // is the property: 600 bogus names consumed nothing.
+            service.commit(
+                cat,
+                CommitRequest(
+                    appends = listOf(TableAppend("ns", "t", listOf(file(cat, "real", listOf("2026-09-29"))))),
+                ),
+                userAgent = "duckdb-client/1.0",
+            )
+        }
+        val warnings = lines.filter { it.contains("blind append with partition_values") }
+        assertThat(warnings).hasSize(1)
+        assertThat(warnings.single()).contains("ns.t").contains("duckdb-client/1.0")
+        assertThat(lines.filter { it.contains("warnings suppressed past") }).isEmpty()
+    }
+
+    @Test
     fun `the warning stops at its cap, and the cap means what it says`() {
         // Defence in depth against a pathological table count. The cap's
         // own line used to be a sentinel added to the set AFTER the size

@@ -542,24 +542,52 @@ def test_two_table_handles_each_keep_their_own_cache(httpx_mock, fake_s3, tmp_pa
     client.close()
 
 
-def test_an_alter_clears_the_cache_so_the_next_prepare_re_reads(
+def test_an_alter_re_seeds_the_cache_at_the_post_alter_snapshot(
     table, httpx_mock, fake_s3, tmp_path
 ):
     """`Table.alter` is a second cache setter and has to go through the
     same one function every read does.
 
-    Assigning `_info` directly left the PRE-alter snapshot in the cache
-    while the shape became post-alter, so the next flush was a guaranteed
-    409 with its parquet already uploaded — a doomed flush per in-process
-    alter. An alter receipt carries no `read_snapshot_id`, so adopting it
-    correctly clears the cache instead.
+    This is the branch production runs: `read_snapshot_id` is required on
+    `Table` and AlterService sets it to the alter's own snapshot, so
+    adopting the receipt re-seeds the cache — the next prepare sends a
+    basis the alter is not newer than, and reads nothing.
+
+    Assigning `_info` directly instead left the PRE-alter snapshot in the
+    cache while the shape became post-alter, so the next flush was a
+    guaranteed 409 with its parquet already uploaded: one doomed flush per
+    in-process alter.
     """
     from pyhoglake import ops
 
     httpx_mock.add_response(
         method="POST",
         url=f"{TABLE_URL}/alter",
-        json={**REREAD_WIRE, "snapshot_id": 95, "read_snapshot_id": None},
+        json={**REREAD_WIRE, "snapshot_id": 97, "read_snapshot_id": 97},
+    )
+    table.alter([ops.add_column("extra", "string")])
+    assert table._cache is not None and table._cache[0] == 97
+
+    # No GET is registered, so httpx_mock fails the test if one is issued.
+    assert _prepare(table, tmp_path, "f.parquet")["read_snapshot"] == 97
+
+
+def test_an_alter_against_a_legacy_server_clears_the_cache(
+    table, httpx_mock, fake_s3, tmp_path
+):
+    # The other half of _adopt: a server too old to report the field leaves
+    # nothing to pair the new shape with, so the cache has to go and the
+    # next prepare re-reads. Both outcomes are correct; only assigning
+    # _info directly is not.
+    from pyhoglake import ops
+
+    httpx_mock.add_response(
+        method="POST",
+        url=f"{TABLE_URL}/alter",
+        json={
+            **{k: v for k, v in REREAD_WIRE.items() if k != "read_snapshot_id"},
+            "snapshot_id": 95,
+        },
     )
     table.alter([ops.add_column("extra", "string")])
     assert table._cache is None
@@ -687,17 +715,74 @@ def test_set_retention_drops_the_cached_threshold(table, httpx_mock):
     assert catalog._retention_seconds() == 600.0
 
 
-def test_a_failed_options_read_is_not_cached_permanently(httpx_mock, fake_s3):
+def test_a_failed_options_read_is_not_cached_permanently(
+    httpx_mock, fake_s3, monkeypatch
+):
     # One transient blip must not pin the process to 30-minute refreshes
-    # for its life.
-    from pyhoglake.client import _ASSUMED_RETENTION_SECONDS
+    # for its life: the VALUE is never cached, only the failure, and only
+    # for _RETENTION_RETRY_SECONDS.
+    import pyhoglake.client as client_module
+    from pyhoglake.client import (
+        _ASSUMED_RETENTION_SECONDS,
+        _RETENTION_RETRY_SECONDS,
+    )
 
     client, cat = _client(httpx_mock, fake_s3)
+    now = client_module.time.monotonic()
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: now)
     httpx_mock.add_response(method="GET", url=OPTIONS_URL, status_code=503, json={})
     assert cat._retention_seconds() == _ASSUMED_RETENTION_SECONDS
     assert cat._retention_cache is None
+
+    later = now + _RETENTION_RETRY_SECONDS + 1.0
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: later)
     httpx_mock.add_response(method="GET", url=OPTIONS_URL, json=OPTIONS_WIRE)
     assert cat._retention_seconds() == 3600.0
+    client.close()
+
+
+def test_a_persistent_options_failure_costs_one_read_a_minute_not_one_a_flush(
+    httpx_mock, fake_s3, monkeypatch
+):
+    """The negative cache, and the reason it exists.
+
+    `_cache_is_usable` calls `_retention_seconds` on every prepare, so an
+    options endpoint that keeps failing would issue one GET per flush for
+    the life of the process — reintroducing the per-flush round trip this
+    path exists to remove, in the one situation nobody is watching. The
+    assumed value is still returned every time; only the READ is bounded.
+    """
+    import pyhoglake.client as client_module
+    from pyhoglake.client import (
+        _ASSUMED_RETENTION_SECONDS,
+        _RETENTION_RETRY_SECONDS,
+    )
+
+    client, cat = _client(httpx_mock, fake_s3)
+    clock = {"t": client_module.time.monotonic()}
+    monkeypatch.setattr(client_module.time, "monotonic", lambda: clock["t"])
+    httpx_mock.add_response(
+        method="GET",
+        url=OPTIONS_URL,
+        status_code=503,
+        json={},
+        is_reusable=True,
+    )
+
+    def options_reads():
+        return sum(1 for r in httpx_mock.get_requests() if "options" in r.url.path)
+
+    # 100 flushes inside one retry window: one read, and the fallback
+    # every time.
+    for _ in range(100):
+        clock["t"] += 0.1
+        assert cat._retention_seconds() == _ASSUMED_RETENTION_SECONDS
+    assert options_reads() == 1
+
+    # Cross the window: exactly one more.
+    clock["t"] += _RETENTION_RETRY_SECONDS
+    assert cat._retention_seconds() == _ASSUMED_RETENTION_SECONDS
+    assert options_reads() == 2
     client.close()
 
 
@@ -750,15 +835,25 @@ def test_the_commit_body_is_what_the_prepare_recorded(
 def test_a_partitioned_blind_append_takes_a_read_snapshot(table, httpx_mock, fake_s3):
     """`Table.append` (the non-prepared path) defaults to a blind commit,
     which the server now refuses for a partitioned table. The client
-    supplies the basis itself so the caller never sees that 422."""
-    httpx_mock.add_response(method="GET", url=CATALOG_URL, json=CATALOG_WIRE)
+    supplies the basis itself so the caller never sees that 422 — and
+    against a current server it pays NO extra read to do it: no catalog
+    response is registered here, so httpx_mock fails the test if the
+    pre-resolve head read runs. One GET (the resolve), one POST.
+    """
     httpx_mock.add_response(method="GET", url=WRITER_TABLE_URL, json=TABLE_WIRE)
     httpx_mock.add_response(
         method="POST",
         url=f"{BASE}/v1/catalogs/cat/commit",
         json={"snapshot_id": 91, "schema_version": 2},
     )
+    before = len(httpx_mock.get_requests())
     table.append(pa.table({"id": pa.array([1], pa.int64()), "team": [7]}))
+    seen = [
+        (r.method, r.url.path.rsplit("/", 1)[-1])
+        for r in httpx_mock.get_requests()[before:]
+        if "options" not in r.url.path
+    ]
+    assert seen == [("GET", "events"), ("POST", "commit")]
     body = json.loads(httpx_mock.get_requests()[-1].content)
     # The resolve's own snapshot, so the spec the values were computed
     # under and the conflict window are the same instant.
@@ -766,7 +861,7 @@ def test_a_partitioned_blind_append_takes_a_read_snapshot(table, httpx_mock, fak
     assert body["appends"][0]["files"][0]["partition_values"] == ["7"]
 
 
-def test_a_partitioned_append_reads_head_BEFORE_the_resolve(table, httpx_mock, fake_s3):
+def test_a_partitioned_append_reads_head_BEFORE_the_resolve(httpx_mock, fake_s3):
     """The ordering, on the branch that actually runs against a server
     with no `read_snapshot_id`.
 
@@ -776,7 +871,21 @@ def test_a_partitioned_append_reads_head_BEFORE_the_resolve(table, httpx_mock, f
     whole duration of the parquet write and the S3 upload. Asserted on the
     recorded request ORDER, because that is the property: catalog first,
     table second, commit last.
+
+    The CACHED info is the legacy shape, because that is the capability
+    hint the pre-resolve read is gated on: a cache that reports a
+    read_snapshot_id means the resolve will too, and this read would be a
+    second GET whose answer is discarded.
     """
+    client, cat = _client(httpx_mock, fake_s3)
+    table = Table(Namespace(cat, "ns1"), TableInfo.from_wire(LEGACY_PARTITIONED_WIRE))
+    httpx_mock.add_response(
+        method="GET",
+        url=OPTIONS_URL,
+        json=OPTIONS_WIRE,
+        is_optional=True,
+        is_reusable=True,
+    )
     httpx_mock.add_response(method="GET", url=CATALOG_URL, json=CATALOG_WIRE)
     httpx_mock.add_response(
         method="GET", url=WRITER_TABLE_URL, json=LEGACY_PARTITIONED_WIRE
@@ -797,6 +906,7 @@ def test_a_partitioned_append_reads_head_BEFORE_the_resolve(table, httpx_mock, f
     body = json.loads(httpx_mock.get_requests()[-1].content)
     # Head, read first, so the window covers the resolve and the upload.
     assert body["read_snapshot"] == CATALOG_WIRE["head_snapshot_id"]
+    client.close()
 
 
 def test_a_spec_installed_since_the_cache_fill_still_settles_the_basis_pre_upload(

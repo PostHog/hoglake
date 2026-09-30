@@ -135,6 +135,40 @@ object Metrics {
      */
     fun statsRepaired(source: String) = increment("hoglake_stats_repaired_total", 1.0, "source", source)
 
+    /**
+     * hoglake_blind_partitioned_appends_total{catalog,namespace,table} —
+     * prepared appends that carried partition values with NO
+     * read_snapshot, counted per occurrence.
+     *
+     * The flip signal for HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS, and
+     * the reason it is a counter and not only the WARN beside it: that
+     * line fires once per (catalog, table) per pod and then goes quiet
+     * forever, so a pod that logged it at startup and a pod whose client
+     * was fixed an hour later read identically, and a second offending
+     * client on an already-warned table is never named at all. "Has the
+     * fleet stopped doing this?" is answerable from a rate, not from a
+     * once-per-lifetime log line — so the flag flips on this going to
+     * zero and staying there, not on someone grepping logs.
+     *
+     * Per (namespace, table) because the remediation is per writer and
+     * the writers are per table; the series only exists for tables doing
+     * it, which is a set the rollout is driving to empty.
+     */
+    fun blindPartitionedAppend(
+        catalog: String,
+        namespace: String,
+        table: String,
+    ) = increment(
+        "hoglake_blind_partitioned_appends_total",
+        1.0,
+        "catalog",
+        catalog,
+        "namespace",
+        namespace,
+        "table",
+        table,
+    )
+
     /** hoglake_stats_hydrated_total{result=provided|failed} */
     fun statsHydrated(result: String) = increment("hoglake_stats_hydrated_total", 1.0, "result", result)
 

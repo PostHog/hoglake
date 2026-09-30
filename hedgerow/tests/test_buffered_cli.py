@@ -9,6 +9,7 @@ from pyhoglake import (
     CommitConflictError,
     ExpiredError,
     OffsetRegressionError,
+    ReadSnapshotExpiredError,
     ValidationError,
 )
 from test_config import VALID
@@ -193,6 +194,11 @@ def test_poll_failures_have_their_own_bounded_budget(tmp_path, monkeypatch):
     [
         (ExpiredError("expired"), FeedExpiredError),
         (OffsetRegressionError("offset"), SplitBrainError),
+        # A destination commit whose read_snapshot sank below the expiry
+        # floor is an ExpiredError too, so arm ORDER is the whole guard: the
+        # remedy is to re-prepare the retained request, not to reconcile the
+        # source feed from a full scan.
+        (ReadSnapshotExpiredError("below floor"), PersistentFailureError),
     ],
 )
 def test_client_halts_are_translated(tmp_path, error, expected):
@@ -206,6 +212,24 @@ def test_client_halts_are_translated(tmp_path, error, expected):
     )
     with pytest.raises(expected):
         service._cycle()
+
+
+def test_an_expired_read_snapshot_names_the_prepared_commit_not_the_feed(tmp_path):
+    # The two 410s reach _cycle through the same base class, and the operator
+    # acts on the diagnosis: "reconcile the changefeed" is a full re-scan,
+    # while this one is a re-prepare of a request PendingStore still holds.
+    service = BufferedService(HedgerowConfig.parse(raw_config(tmp_path)))
+
+    def cycle():
+        raise ReadSnapshotExpiredError("read_snapshot 100 is below the floor 101")
+
+    service.coordinator = SimpleNamespace(
+        run_once=cycle, scheduler=SimpleNamespace(failed_work=None)
+    )
+    with pytest.raises(PersistentFailureError, match="re-prepare") as ei:
+        service._cycle()
+    assert "reconcile" not in str(ei.value)
+    assert "retained" in str(ei.value)
 
 
 def test_once_harvests_workers_without_another_discovery_window(tmp_path):

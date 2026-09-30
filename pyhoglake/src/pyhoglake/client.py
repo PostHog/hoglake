@@ -8,6 +8,7 @@ footer-derived stats via the commit endpoint (footer-shipping commits).
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
 import io
 import logging
 import struct
@@ -73,6 +74,26 @@ from .upload import (
 
 DEFAULT_TIMEOUT = 30.0
 
+
+def _user_agent() -> str:
+    """`pyhoglake/<version>`, from the installed metadata.
+
+    Set on every request because the SERVER reads it: its transition
+    warnings name the client that has to change
+    (`HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS`), and without this the
+    line said `python-httpx/0.28` — true, useless, and identical for
+    every other httpx caller in the fleet. Same source as
+    `pyhoglake.__version__`, and unknown rather than a guess if the
+    package is not installed (a source checkout on sys.path).
+    """
+    try:
+        return f"pyhoglake/{importlib.metadata.version('pyhoglake')}"
+    except importlib.metadata.PackageNotFoundError:  # pragma: no cover
+        return "pyhoglake/unknown"
+
+
+USER_AGENT = _user_agent()
+
 # The package's logger, named for the package rather than the module: a
 # consumer configures one name to hear from pyhoglake, and the handful of
 # things worth saying are all about the writer path. __init__ attaches a
@@ -98,6 +119,11 @@ _RE_PREPARE_ERRORS: dict[str, type[HoglakeError]] = {
 # configuring, so an unknown answer costs an extra read rather than an
 # expired commit.
 _ASSUMED_RETENTION_SECONDS = 1800.0
+# How long a FAILED options read is remembered before it is retried. Long
+# enough that a persistently broken options endpoint cannot reintroduce a
+# per-flush GET, short enough that a real retention change is picked up
+# within a minute of the endpoint recovering.
+_RETENTION_RETRY_SECONDS = 60.0
 
 # COLUMN names starting with this prefix are reserved for hoglake internals
 # (``_hog_row_id`` is compaction's row-id carrier). The SERVER enforces
@@ -452,7 +478,11 @@ class HoglakeClient:
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.s3 = s3
-        self._http = httpx.Client(base_url=self.base_url + "/v1", timeout=timeout)
+        self._http = httpx.Client(
+            base_url=self.base_url + "/v1",
+            timeout=timeout,
+            headers={"User-Agent": USER_AGENT},
+        )
         self._fs = None
         self._put: Any = None
         self._put_pool = 0
@@ -609,6 +639,8 @@ class Catalog:
         self._info = info
         # See _retention_seconds: one options GET per Catalog object.
         self._retention_cache: float | None = None
+        # ...and, when the read FAILS, one per _RETENTION_RETRY_SECONDS.
+        self._retention_failed_at: float | None = None
 
     # -- identity ----------------------------------------------------------
 
@@ -894,17 +926,34 @@ class Catalog:
 
         Cleared by :meth:`set_retention` and by a
         :class:`ReadSnapshotExpiredError`, which are the two events that
-        can falsify it. A failed options read is NOT cached at all — it
-        answers [_ASSUMED_RETENTION_SECONDS] for this call and asks again
-        next time, so one transient blip does not pin the process to
-        30-minute refreshes for its life. An unknown retention must cost
-        a read, never an expired commit.
+        can falsify it.
+
+        A failed options read does not become the cached VALUE — it
+        answers [_ASSUMED_RETENTION_SECONDS] for this call, so one
+        transient blip cannot pin the process to 30-minute refreshes for
+        its life; an unknown retention must cost a read, never an expired
+        commit. But the failure itself is remembered for
+        [_RETENTION_RETRY_SECONDS], because _cache_is_usable calls this on
+        every prepare: a PERSISTENT failure (the endpoint 5xx-ing, a
+        permission problem, a server without it) would otherwise issue one
+        options GET per flush forever — silently restoring the per-flush
+        round trip this whole path exists to remove, in the one situation
+        where nobody is watching. Bounded at one read a minute, the
+        assumption costs nothing and still heals within a minute.
         """
         if self._retention_cache is None:
+            now = time.monotonic()
+            if (
+                self._retention_failed_at is not None
+                and now - self._retention_failed_at < _RETENTION_RETRY_SECONDS
+            ):
+                return _ASSUMED_RETENTION_SECONDS
             try:
                 seconds = self.options().snapshot_retention_seconds
             except HoglakeError:
+                self._retention_failed_at = now
                 return _ASSUMED_RETENTION_SECONDS
+            self._retention_failed_at = None
             self._retention_cache = float("inf") if seconds is None else float(seconds)
         return self._retention_cache
 
@@ -1213,11 +1262,15 @@ class Table:
             conflict=CommitConflictError,
         )
         # _adopt, not a bare assignment: the cache's (snapshot, read time)
-        # has to move with the shape, and an alter receipt carries no
-        # read_snapshot_id, so this correctly CLEARS the cache and the
-        # next prepare re-reads. Assigning _info directly left the
-        # pre-alter snapshot in place, making the next flush a guaranteed
-        # 409 with its uploads orphaned.
+        # has to move with the shape. An alter receipt carries its OWN
+        # read_snapshot_id (AlterService sets it to the alter's snapshot,
+        # and the field is required on Table), so this re-seeds the cache
+        # at the post-alter snapshot: the next prepare sends a basis the
+        # alter is not newer than, with no GET. Assigning _info directly
+        # left the PRE-alter snapshot paired with the new shape, making the
+        # next flush a guaranteed 409 with its uploads orphaned. Against a
+        # server too old to report the field, _adopt clears instead, and
+        # the next prepare re-reads; both outcomes are correct.
         self._adopt(TableInfo.from_wire(body))
         # A newer DDL snapshot supersedes the old pin.
         if self._info.snapshot_id is not None:
@@ -1324,12 +1377,25 @@ class Table:
         #
         # `read_snapshot_id` supersedes it when the server reports one:
         # that pairs the spec the values were computed under with the
-        # window at the same instant, which is strictly tighter. The head
-        # read only happens when it will be needed — a partitioned table
-        # with no caller-supplied snapshot — so an unpartitioned append
-        # stays at one GET.
+        # window at the same instant, which is strictly tighter. So this
+        # read is ONLY for a server too old to report it — hence the third
+        # condition. Against any current server the field is required, the
+        # selection below always takes it, and doing this read anyway
+        # would be a second GET per partitioned append whose result is
+        # discarded. The cached info carries the capability hint itself:
+        # if the last read got no `read_snapshot_id`, the next will not
+        # either.
+        #
+        # Reading the hint from a cache that may be stale is safe in both
+        # directions: if the server has since gained the field, the
+        # selection below falls through to its own fresh pre-upload head
+        # read; if it has lost it, this read is merely wasted.
         head_before_resolve: int | None = None
-        if read_snapshot is None and self._info.partition_spec is not None:
+        if (
+            read_snapshot is None
+            and self._info.partition_spec is not None
+            and self._info.read_snapshot_id is None
+        ):
             head_before_resolve = self._namespace._catalog.refresh().head_snapshot_id
 
         if expected is not None:
@@ -1795,14 +1861,32 @@ class Table:
           refresh per 30 minutes per table, against a flush rate of many
           per minute.
 
-        The age is the age of the READ, not of the snapshot, and on an
-        IDLE catalog those differ: head itself can be hours old, so a
-        five-second-old cache can hold a very old snapshot. Safe rather
-        than lucky — expiry never advances the floor past head (AGENT.md
-        invariant 5, and the server's floor guard explicitly allows
-        `read_snapshot == earliest`), so a stale head can never be below
-        its own floor. The age only has to bound how far the floor moves
-        AFTER the read, which is exactly what retention measures.
+        The age is the age of the READ, not of the snapshot, and what it
+        bounds is how far the floor can move AFTER the read — NOT how far
+        the read is from head. On a BUSY catalog those coincide, because
+        retention is measured in snapshot time and snapshot time advances
+        with wall clock: half the retention of slack is half a retention
+        period of headroom, which is the design.
+
+        On an IDLE catalog they diverge without limit, and this threshold
+        does not protect the flush. `ExpiryService` sets the floor to
+        `min(firstFresh, head, earliest + batchSize)`, where `firstFresh`
+        is the oldest snapshot still inside the retention window. Let
+        retention be an hour and the catalog be idle for three: every
+        snapshot 1..100 is outside the window, a writer reads and caches
+        head = 100 with age zero, one unrelated commit lands as 101, and
+        the next sweep computes `firstFresh = 101` — so the floor jumps to
+        101 and expires a snapshot read seconds ago. No cache age avoids
+        this; only a read after that commit does.
+
+        It stays a non-issue because the cost is bounded, not because it
+        cannot happen: the commit is refused 410, the refusal invalidates
+        the cache, the re-prepare reads fresh, and the price is ONE
+        orphaned parquet for ONE flush, on a catalog that by construction
+        flushes rarely. Which is also the reason not to read this
+        threshold as a safety margin against the floor and raise it: it
+        buys headroom on the busy catalogs, where the arithmetic holds,
+        and nothing at all on the idle ones.
         """
         if self._cache is None:
             return False

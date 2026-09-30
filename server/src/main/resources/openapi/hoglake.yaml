@@ -3486,10 +3486,14 @@ components:
             Transformed partition values by key_index of the table's live
             spec. Required with matching arity when the table is
             partitioned; forbidden when not. A file carrying them also
-            requires CommitRequest.read_snapshot (422 otherwise) — the
-            values are only valid under the spec they were computed
-            with, and a blind append has no conflict window in which a
-            spec change could be detected.
+            requires CommitRequest.read_snapshot — the values are only
+            valid under the spec they were computed with, and a blind
+            append has no conflict window in which a spec change could be
+            detected. ENFORCEMENT IS STAGED: the server answers 422 only
+            where it is configured to, and otherwise accepts the request
+            and logs a warning naming the client, so the existing writer
+            fleet can be moved first. Send the field regardless; a later
+            release refuses without it.
           items: { type: string, nullable: true }
         split_offsets:
           type: array
@@ -3568,15 +3572,34 @@ components:
           description: >
             The snapshot the writer planned against. Conflicts are
             evaluated against changes after this point. Defaults to head
-            (no conflict window) for blind appends. REQUIRED when
-            deletes are present (deletes always conflict-check) and when
-            any registered file carries partition_values (422 otherwise):
-            partition values are computed by the writer under one
-            partition spec and the server never opens the parquet, so a
-            blind append could register values computed under the old
-            transform against a spec that changed underneath it, with
-            nothing afterwards able to detect it. A blind append to an
+            (no conflict window) for blind appends.
+
+
+            REQUIRED when deletes are present — deletes always
+            conflict-check, and that one is a 422 today.
+
+
+            REQUIRED, and STAGED, when any registered file carries
+            partition_values: partition values are computed by the writer
+            under one partition spec and the server never opens the
+            parquet, so a blind append could register values computed
+            under the old transform against a spec that changed underneath
+            it, with nothing afterwards able to detect it. The server
+            answers 422 only where it is configured to enforce this, and
+            otherwise accepts the request and logs a warning naming the
+            client — the existing writer fleet sends this shape and has to
+            be moved first. Send the field regardless. A blind append to an
             unpartitioned table is unaffected.
+
+
+            It is also worth sending for its own sake rather than to
+            satisfy a rule: a prepared append whose read_snapshot is the
+            snapshot its table info was read at (Table.read_snapshot_id)
+            is validated by the server's OCC for free, which is what lets
+            a writer cache that info instead of re-reading the table
+            every flush. A DDL change is then 409
+            ddl_since_read_snapshot with retry: re-prepare, rather than
+            an undetected mis-registration.
         appends:
           type: array
           items: { $ref: "#/components/schemas/TableAppend" }

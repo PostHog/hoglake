@@ -253,6 +253,85 @@ class ObservabilityIntegrationTest {
         }
 
     @Test
+    fun `blind partitioned appends are counted per occurrence, not once per pod`() =
+        api { client ->
+            // The flag flips on this series reaching zero, so the WARN's
+            // once-per-(catalog, table)-per-pod dedupe must NOT apply here:
+            // three flushes are three, and a fixed client is a line that
+            // stops rising rather than a line that already went quiet.
+            val catalog = "blindcount"
+            seed(client, catalog)
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs/$catalog/namespaces/ns/tables/events/alter",
+                    """{"ops": [{"op": "set_partition_spec",
+                       "fields": [{"source_field_id": 2, "transform": "day"}]}]}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.OK)
+            repeat(3) { i ->
+                val blind =
+                    client.postJson(
+                        "/v1/catalogs/$catalog/commit",
+                        """
+                    {"appends": [{"namespace": "ns", "table": "events",
+                       "files": [{"path": "s3://hog/$catalog/p$i.parquet",
+                                  "record_count": 1, "file_size_bytes": 10,
+                                  "partition_values": ["2026-09-30"]}]}]}
+                    """,
+                    )
+                assertThat(blind.status).isEqualTo(HttpStatusCode.OK)
+            }
+
+            // ...and per offending TABLE inside one request, because both
+            // /commit forms take many groups and a request-level count
+            // would name only whichever group came first.
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs/$catalog/namespaces/ns/tables",
+                    """{"name": "events2", "columns": [
+                        {"name": "id", "type": "long", "nullable": false},
+                        {"name": "ts", "type": "timestamp"}]}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs/$catalog/namespaces/ns/tables/events2/alter",
+                    """{"ops": [{"op": "set_partition_spec",
+                       "fields": [{"source_field_id": 2, "transform": "day"}]}]}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.OK)
+            val both =
+                client.postJson(
+                    "/v1/catalogs/$catalog/commit",
+                    """
+                {"appends": [
+                  {"namespace": "ns", "table": "events",
+                   "files": [{"path": "s3://hog/$catalog/both-1.parquet",
+                              "record_count": 1, "file_size_bytes": 10,
+                              "partition_values": ["2026-09-30"]}]},
+                  {"namespace": "ns", "table": "events2",
+                   "files": [{"path": "s3://hog/$catalog/both-2.parquet",
+                              "record_count": 1, "file_size_bytes": 10,
+                              "partition_values": ["2026-09-30"]}]}]}
+                """,
+                )
+            assertThat(both.status).isEqualTo(HttpStatusCode.OK)
+
+            val scrape = client.get("/metrics").bodyAsText()
+
+            fun counted(table: String) =
+                seriesValue(
+                    scrape,
+                    "hoglake_blind_partitioned_appends_total",
+                    "catalog" to catalog,
+                    "namespace" to "ns",
+                    "table" to table,
+                )
+            assertThat(counted("events")).isEqualTo(4.0)
+            assertThat(counted("events2")).isEqualTo(1.0)
+        }
+
+    @Test
     fun `an unexpected mid-commit failure ticks result=error and returns 500`() =
         api { client ->
             val catalog = "errcount"
