@@ -285,6 +285,10 @@ class CommitDeletesAndPartitionsTest {
         service.commit(
             "cat",
             CommitRequest(
+                // Required once a file carries partition_values
+                // (invariant 12). The SQL fixture writes no snapshot
+                // changes, so head is a clean conflict basis.
+                readSnapshot = db.head("cat"),
                 appends =
                     listOf(
                         append(
@@ -312,6 +316,10 @@ class CommitDeletesAndPartitionsTest {
             service.commit(
                 "cat",
                 CommitRequest(
+                    // The read_snapshot rule runs BEFORE validateFiles,
+                    // so without one this test would assert on that
+                    // refusal instead of on the arity check it is for.
+                    readSnapshot = db.head("cat"),
                     appends = listOf(append("events", file("s3://b/f.parquet", 1, listOf("only-one")))),
                 ),
             )
@@ -341,6 +349,9 @@ class CommitDeletesAndPartitionsTest {
             service.commit(
                 "cat",
                 CommitRequest(
+                    // As above: the read_snapshot rule would shadow the
+                    // "not partitioned" refusal this test is for.
+                    readSnapshot = db.head("cat"),
                     appends = listOf(append("events", file("s3://b/f.parquet", 1, listOf("v")))),
                 ),
             )
@@ -661,7 +672,7 @@ class CommitDeletesAndPartitionsTest {
                 "cat",
                 CommitRequest(readSnapshot = 1, deletes = listOf(deletes("events", del(1, 1)))),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
             .hasMessageContaining("ns.events")
         assertThat(dvRows(fx.catalogId)).isEmpty()
     }

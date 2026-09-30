@@ -220,6 +220,13 @@ MODEL_CASES = [
     (
         TableInfo,
         st.fixed_dictionaries(
+            # The required half is the IDENTITY: what a getTable answer
+            # always carries. The three totals moved out of it when the
+            # writer path started asking for identity only
+            # (`totals=false`), and `snapshot_id` / `read_snapshot_id`
+            # are optional in the other direction — a server new enough
+            # to send them does, an older one does not, and the client
+            # must parse both.
             {
                 "name": st.text(max_size=16),
                 "namespace": st.text(max_size=16),
@@ -244,6 +251,7 @@ MODEL_CASES = [
                 "file_size_bytes": st.one_of(st.none(), I64),
                 "totals_snapshot_id": st.one_of(st.none(), I64),
                 "read_snapshot_id": st.one_of(st.none(), I64),
+                "snapshot_id": st.one_of(st.none(), I64),
                 "totals_as_of": st.one_of(st.none(), st.just("2026-09-30T00:54:00Z")),
                 "columns": st.lists(
                     st.fixed_dictionaries(
@@ -286,6 +294,32 @@ MODEL_CASES = [
         ),
     ),
 ]
+
+# A dataclass field with no default is wire-REQUIRED: the `_pick`-based
+# `from_wire`s fail to construct without it, and the hand-written ones
+# index it. Derived rather than restated, so a new model needs no entry
+# here — with one override, for the hand-written `from_wire` that reads
+# a no-default field with `.get` instead.
+WIRE_OPTIONAL_DESPITE_NO_DEFAULT: dict[str, frozenset[str]] = {
+    # The writer path asks for identity only (`totals=false`), so a
+    # getTable answer legitimately omits the three totals and they come
+    # back None; `columns` has always been tolerated absent.
+    "TableInfo": frozenset(
+        {"columns", "record_count", "file_count", "file_size_bytes"}
+    ),
+}
+
+
+def wire_required(cls: type) -> frozenset[str]:
+    no_default = {
+        f.name
+        for f in dataclasses.fields(cls)
+        if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
+    }
+    return frozenset(
+        no_default - WIRE_OPTIONAL_DESPITE_NO_DEFAULT.get(cls.__name__, frozenset())
+    )
+
 
 model_case = st.sampled_from(range(len(MODEL_CASES))).flatmap(
     lambda i: st.tuples(st.just(MODEL_CASES[i][0]), MODEL_CASES[i][1], extra_fields)
@@ -341,19 +375,56 @@ def test_models_required_values_survive_verbatim(case):
 # Regression (bugs.md #24, formerly an xfail BUG pin): a response
 # missing a required field must raise MalformedResponseError — never a
 # leaked KeyError (direct-index parsers) or TypeError (_pick parsers).
-# Removing an OPTIONAL field must still parse cleanly.
-@given(model_case, st.data())
-def test_missing_required_field_raises_malformed_response(case, data):
-    cls, wire, _ = case
-    victim = data.draw(st.sampled_from(sorted(wire)))
+#
+# PARAMETRIZED over (model, required field), not sampled. Two earlier
+# shapes of this test were not gates: the original accepted EITHER
+# outcome for every field, so a field that stopped being wire-required
+# went unnoticed (which is what happened when the writer path made
+# TableInfo's three totals optional); and splitting the two halves off
+# `wire_required` while still drawing ONE victim per example left the
+# defect showing on only about a quarter of seeds — a mutation making
+# `TableInfo.namespace` optional reddened 5 of 20 runs, so 75% of CI
+# passed with it in place. Dropping every required field of every model
+# on every run is the only version that cannot flake.
+@pytest.mark.parametrize(
+    "case_index,victim",
+    [
+        (i, f)
+        for i, (cls, _) in enumerate(MODEL_CASES)
+        for f in sorted(wire_required(cls))
+    ],
+    ids=lambda v: str(v),
+)
+@given(st.data())
+def test_missing_required_field_raises_malformed_response(case_index, victim, data):
+    cls, strategy = MODEL_CASES[case_index]
+    wire = data.draw(strategy)
+    if victim not in wire:
+        # The strategy declared it optional while the model requires it:
+        # the two disagree, and that disagreement is itself the bug this
+        # test exists to catch.
+        raise AssertionError(
+            f"{cls.__name__}.{victim} is wire-required but the strategy "
+            "does not always generate it"
+        )
     broken = {k: v for k, v in wire.items() if k != victim}
-    try:
-        cls.from_wire(broken)  # a removed OPTIONAL field parses fine
-    except MalformedResponseError as e:
-        # the one sanctioned parse error, naming the model
-        assert cls.__name__ in str(e)
-    # anything else (KeyError, TypeError, AttributeError...) propagates
-    # out of the test and fails it
+    with pytest.raises(MalformedResponseError) as excinfo:
+        cls.from_wire(broken)
+    # the one sanctioned parse error, naming the model
+    assert cls.__name__ in str(excinfo.value)
+
+
+@given(model_case, st.data())
+def test_missing_optional_field_still_parses(case, data):
+    """The other half: removing an OPTIONAL field parses cleanly, and
+    anything but a clean parse (KeyError, TypeError, AttributeError...)
+    propagates and fails."""
+    cls, wire, _ = case
+    optional = sorted(set(wire) - wire_required(cls))
+    if not optional:
+        return
+    victim = data.draw(st.sampled_from(optional))
+    cls.from_wire({k: v for k, v in wire.items() if k != victim})
 
 
 # Regression (bugs.md #24, formerly an xfail BUG pin): non-dict entries

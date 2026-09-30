@@ -302,6 +302,20 @@ object FuzzSeedGenerator {
                     """{"appends":[{"namespace":"ns","table":"t","files":[
                        {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
                         "split_offsets":[700,300,1024]}]}]}""",
+                // A BLIND append carrying partition_values: the shape
+                // CommitService now refuses with a 422 (invariant 12 —
+                // partition values are only valid under the spec they
+                // were computed with, and a blind commit has no conflict
+                // window). It PARSES, which is all this target checks;
+                // the refusal itself is service-layer and its regression
+                // cover is AppendReadSnapshotGuardIntegrationTest. Kept
+                // as a corpus member so the shape the contract now
+                // rejects is represented next to the one it accepts
+                // (commit_full, the same files WITH a read_snapshot).
+                "commit_blind_partitioned" to
+                    """{"appends":[{"namespace":"ns","table":"t","files":[
+                       {"path":"s3://b/f.parquet","record_count":10,"file_size_bytes":1024,
+                        "footer_size":256,"partition_values":["2026-01-01",null]}]}]}""",
                 "alter_all_ops" to
                     """{"ops":[
                        {"op":"add_column","column":{"name":"c1","type":"long"}},

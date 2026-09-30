@@ -582,8 +582,14 @@ class ApiIntegrationTest {
                     "/v1/catalogs/cfl/commit",
                     append.replace("%READ%", """"read_snapshot": 2, """),
                 )
-            val error = assertApiError(conflicted, HttpStatusCode.Conflict, "commit_conflict")
+            // Pure DDL is the TYPED 409: not `commit_conflict`, because
+            // this payload's own read_snapshot can never satisfy the
+            // check again. The body carries what a client acts on.
+            val error = assertApiError(conflicted, HttpStatusCode.Conflict, "ddl_since_read_snapshot")
             assertThat(error["detail"].asText()).contains("ns.events")
+            assertThat(error["tables"].map { it.asText() }).containsExactly("ns.events")
+            assertThat(error["read_snapshot"].asLong()).isEqualTo(2)
+            assertThat(error["retry"].asText()).isEqualTo("re-prepare")
 
             // The same append as a blind commit (no read_snapshot) sails through.
             val blind = client.postJson("/v1/catalogs/cfl/commit", append.replace("%READ%", ""))

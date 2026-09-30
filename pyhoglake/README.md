@@ -116,7 +116,7 @@ for s in catalog.snapshots(before=head + 1):
 | Server | `HoglakeClient(base_url, timeout=30.0)` — `/v1` is appended |
 | Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation, single_request_uploads)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override), and `boto3` built from the same settings for single-request uploads (`single_request_uploads=False` sends everything through the streaming writer) |
 | Upload fan-out | `concurrency=` on the prepared-append calls, else `PYHOGLAKE_UPLOAD_CONCURRENCY`, else 64 — capped at the number of objects. Arrow's process-global IO thread pool is raised to match only when the flush actually routes an object through Arrow |
-| Errors | Typed: `NotFoundError`, `AlreadyExistsError`, `CommitConflictError` (`retryable=True` — refresh read snapshot and retry), `ValidationError`, `OffsetRegressionError`, `ExpiredError` (410 — reconcile from a full scan), `IncarnationChangedError` (the append incarnation guard, enforced server-side at commit, see below), `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field), all under `HoglakeError` |
+| Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
 
 ## Type mapping
 
@@ -230,10 +230,15 @@ are pinned against its published test vectors:
 
 A null source value yields a null partition value forming its own
 partition group (Iceberg semantics). The tuple is computed under the
-table's **current** spec (re-resolved pre-flight); if the spec changes
-before the commit lands, the server refuses the commit (409 concurrent
-DDL / 422 arity mismatch) — the client never silently recomputes under
-a different spec. Grouping runs arrow-native where possible and per
+spec the client resolved (`Table.append` re-resolves pre-flight;
+`prepare_append_files` uses its cached read). If the spec changes before
+the commit lands, the server refuses the commit — 409
+`ddl_since_read_snapshot`, atomically and with zero writes — and the
+client never silently recomputes under a different spec. That refusal is
+also why an append whose files carry `partition_values` must send a
+`read_snapshot`: without one the commit has no conflict window, so the
+spec change could not be detected at all, and the server answers 422.
+pyhoglake supplies the basis itself, so a caller never has to. Grouping runs arrow-native where possible and per
 *unique* value (never per row) otherwise. Compaction groups only within
 `(spec_id, partition_values)` server-side, so partition-local file
 layout is preserved end to end.
@@ -294,24 +299,88 @@ history without noticing.
 **atomically, at commit time**. Every commit carries an
 `expected_table_uuid` field (default: the `table_uuid` the `Table`
 object was resolved as; pass one explicitly to pin a specific
-incarnation), and the server rejects the whole commit with 409 — zero
-writes — when the live table's uuid differs. The client maps that 409
-(its message says "the table was recreated") to
-`IncarnationChangedError`; ordinary commit conflicts remain
+incarnation), and the server rejects the whole commit with 409
+`table_recreated` — zero writes — when the live table's uuid differs.
+The client maps that CODE to `IncarnationChangedError`
+(`re_prepare=True`); ordinary commit conflicts remain
 `CommitConflictError` (retryable). There is no window in which a
 recreated table can accept rows from a guarded append.
 
-The client also keeps **one** cheap pre-flight re-resolve before the
+`Table.append` also keeps **one** cheap pre-flight re-resolve before the
 parquet upload. That is purely an optimization — it fast-fails an
 already-dead incarnation before paying for the S3 write — not the
-safety mechanism. A commit-time refusal orphans the uploaded parquet
-(cleanup's problem, never the catalog's). A refused append never
-rebases the `Table` object's pinned identity, so a blind retry trips
-the guard again rather than silently adopting the new incarnation.
+safety mechanism. `prepare_append_files` makes no such read when its
+cache is warm (see "The writer path's reads" below); the server-side
+guard is the same either way. A commit-time refusal orphans the
+uploaded parquet (cleanup's problem, never the catalog's). A refused
+append never rebases the `Table` object's pinned identity, so a blind
+retry trips the guard again rather than silently adopting the new
+incarnation.
 
 To opt out entirely (name-only resolution), pass
 `expected_table_uuid=pyhoglake.UNGUARDED`; the commit then carries no
 `expected_table_uuid` field and no pre-flight check runs.
+
+## The writer path's reads
+
+A flush used to cost two GETs before its commit: one on the catalog for
+a `read_snapshot`, and one on the table for its uuid, columns and spec.
+The second is the expensive one — the server's table response computes
+the table's live totals, a `count(*)` and two sums over every live file
+row of the table (hoglake#232) — and the writer never reads a total.
+
+Both are gone from the steady state, and no new wire field was needed
+for it. `Table` caches the last `TableInfo` it read together with the
+snapshot that read resolved at (`TableInfo.read_snapshot_id`), and
+`prepare_append_files` prepares against the cache and sends that same
+snapshot as `read_snapshot`. The server's existing OCC then does exactly
+the validation the re-read was for: the commit is accepted iff nothing
+has altered, dropped or recreated the table since. Anything that has is
+one of the three `re_prepare=True` refusals, which drops the cache so
+the next `prepare_*` re-reads once.
+
+The zero-GET steady state needs a server that returns
+`TableInfo.read_snapshot_id`, and a **current server always does** — it is
+required and non-null in the spec. An OLDER one sends nothing to use as a
+`read_snapshot`, so the cache is never used and the writer path makes the
+same two reads it always did (one of them cheaper, since it asks for
+identity only). Every row below is measured in tests on both sides of
+that, and `test_metadata_parity.py` pins the three cross-tree facts the
+fast path rests on: the server declares the field, declares it required,
+and documents the `totals` parameter.
+
+| Per flush | Requests |
+|---|---|
+| steady state (server returns `read_snapshot_id`) | 1 POST commit, 0 GET |
+| every half of `snapshot_retention_seconds` | + 1 identity GET (`totals=false`) + 1 catalog GET |
+| after DDL / a recreate / a below-floor snapshot | 1 refused POST, then one re-prepare's 2 GETs; that flush's uploads are orphaned |
+| server too old for `TableInfo.read_snapshot_id` | 1 catalog GET + 1 identity GET, as before (minus the totals scan) |
+
+The age refresh is the one thing the cache needs beyond invalidation: a
+`read_snapshot` older than the catalog's retention is below the expiry
+floor, and the resulting 410 arrives *after* the flush's parquet is
+uploaded — a re-encode and a set of orphaned objects each time. The
+cache therefore refreshes at half the retention (read once per `Catalog`
+from `snapshot_retention_seconds`; 30 minutes assumed when the catalog
+will not say, and never when retention is disabled). An old
+`read_snapshot` costs the server nothing otherwise: the conflict scan is
+an index range over one table's change rows.
+
+`Catalog.commit_prepared(payload, table=...)` is what drops the cache on
+a `re_prepare` refusal, and **`Table.commit_prepared(payload)` is the
+form to prefer** — it passes the Table for you, so the invalidation
+cannot be forgotten. The Catalog form stays for the cross-process case
+the contract is built around (persist the payload, publish from anywhere,
+possibly after a restart); **a caller on that form without `table=` owns
+invalidation itself**, via `Table.invalidate()` or by dropping the
+`Table`. Not doing so turns a one-flush refusal into a loop until the
+cache ages out.
+
+Reads a *caller* makes are untouched — `table.info()` still returns the
+totals. Only the writer path asks for identity alone, and
+`expected_table_info=` opts out of the cache entirely, because its
+contract is to compare the caller's layout against a fresh *server*
+read.
 
 ## Not in 0.1
 

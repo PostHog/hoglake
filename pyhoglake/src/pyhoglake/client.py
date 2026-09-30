@@ -11,8 +11,9 @@ import contextlib
 import io
 import logging
 import struct
+import time
 import uuid as _uuid
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Self
@@ -26,11 +27,13 @@ import pyarrow.parquet as pq
 from .errors import (
     AlreadyExistsError,
     CommitConflictError,
+    DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeError,
     IncarnationChangedError,
     NotFoundError,
     OffsetRegressionError,
+    ReadSnapshotExpiredError,
     ReconciliationRequiredError,
     ValidationError,
 )
@@ -81,11 +84,20 @@ logger = logging.getLogger("pyhoglake")
 # carries no expected_table_uuid field (name-only resolution).
 UNGUARDED = object()
 
-# The server's commit 409 for a mismatched expected_table_uuid carries
-# this phrase in its ApiError message/detail; it is how the client tells
-# a recreation refusal (IncarnationChangedError, never retryable) from an
-# ordinary commit conflict (CommitConflictError, retryable).
-_RECREATED_MARKER = "the table was recreated"
+# The 409/410 codes whose recovery is "re-read the table and prepare a
+# new request", never "replay this payload". The server says the same
+# thing in the body as `retry: re-prepare`.
+_RE_PREPARE_ERRORS: dict[str, type[HoglakeError]] = {
+    "ddl_since_read_snapshot": DdlSinceReadSnapshotError,
+    "table_recreated": IncarnationChangedError,
+}
+
+# Assumed snapshot retention when the catalog will not say: half of this
+# is how stale a cached read_snapshot may get before the writer path
+# refreshes it. 30 min is deliberately shorter than any retention worth
+# configuring, so an unknown answer costs an extra read rather than an
+# expired commit.
+_ASSUMED_RETENTION_SECONDS = 1800.0
 
 # COLUMN names starting with this prefix are reserved for hoglake internals
 # (``_hog_row_id`` is compaction's row-id carrier). The SERVER enforces
@@ -97,6 +109,65 @@ _RECREATED_MARKER = "the table was recreated"
 # instead of the first one the server trips on.
 # Namespace/table/view names are NOT affected.
 _RESERVED_COLUMN_PREFIX = "_hog"
+
+
+def _basis_was_cached(table: Table, payload: Mapping[str, Any]) -> bool:
+    """Whether this payload's `read_snapshot` is the one the Table cached.
+
+    The question a 4xx has to answer before it invalidates: a payload
+    built from a FRESH read already has the best basis there is, so
+    dropping the cache for it would buy a read per malformed request and
+    fix nothing.
+    """
+    if table._cache is None:
+        return False
+    return payload.get("read_snapshot") == table._cache[0]
+
+
+def _cache_entry(info: TableInfo) -> tuple[int, float] | None:
+    """The writer cache for ``info``, or None when there is none to keep.
+
+    None exactly when the response did not say which snapshot it was
+    resolved at (`read_snapshot_id`, NOT `snapshot_id` — that one is a
+    DDL receipt): without it there is nothing to send as a
+    ``read_snapshot``, so the writer path falls back to the two reads it
+    always made. This is the ONE place that rule lives.
+
+    A CURRENT server always sends it (required and non-null in the spec),
+    so this branch — and the `else head` fallbacks it forces in
+    `_prepared_read` and `Table.append` — is reachable only against an
+    older one. Kept rather than deleted for exactly that reason, and
+    tested on both sides.
+    """
+    if info.read_snapshot_id is None:
+        return None
+    return info.read_snapshot_id, time.monotonic()
+
+
+def _re_prepare_error(code: str, body: Any, detail: str | None) -> HoglakeError:
+    """Build one of the re-prepare refusals from the server's body.
+
+    Every field is read with ``.get``: a partial or older body must still
+    produce the right TYPE, because the type is what tells a retry loop
+    to re-prepare instead of replaying. The values are for the operator
+    and for cache invalidation.
+    """
+    fields = body if isinstance(body, dict) else {}
+    tables = tuple(fields.get("tables") or ())
+    if code == "table_recreated":
+        return IncarnationChangedError(
+            code,
+            status_code=409,
+            detail=detail,
+            table=tables[0] if tables else None,
+        )
+    return DdlSinceReadSnapshotError(
+        code,
+        status_code=409,
+        detail=detail,
+        tables=tables,
+        read_snapshot=fields.get("read_snapshot"),
+    )
 
 
 def _reserved_field_paths(fields: object, prefix: str = "") -> list[str]:
@@ -434,6 +505,7 @@ class HoglakeClient:
     def _raise(resp: httpx.Response, conflict: type[HoglakeError]) -> None:
         message = f"HTTP {resp.status_code}"
         detail = None
+        body: Any = None
         try:
             body = resp.json()
             if isinstance(body, dict):
@@ -441,6 +513,14 @@ class HoglakeClient:
                 detail = body.get("detail")
         except Exception:  # noqa: BLE001  # any body-parse failure falls back to raw text
             detail = resp.text[:500] or None
+        # The re-prepare family is built here rather than by the
+        # generic constructor below: `ddl_since_read_snapshot` carries
+        # the tables and the snapshot that were refused, and a caller
+        # acts on those rather than on the detail prose. The CODE is the
+        # contract — this used to be a search for the phrase "the table
+        # was recreated" inside `detail`.
+        if resp.status_code == 409 and message in _RE_PREPARE_ERRORS:
+            raise _re_prepare_error(message, body, detail)
         cls: type[HoglakeError]
         if resp.status_code == 409 and message == "reconciliation_required":
             cls = ReconciliationRequiredError
@@ -527,6 +607,8 @@ class Catalog:
     def __init__(self, client: HoglakeClient, info: CatalogInfo) -> None:
         self._client = client
         self._info = info
+        # See _retention_seconds: one options GET per Catalog object.
+        self._retention_cache: float | None = None
 
     # -- identity ----------------------------------------------------------
 
@@ -627,6 +709,11 @@ class Catalog:
         if consumer_floor is not None:
             payload["consumer_floor"] = consumer_floor
         body = self._client._request("PATCH", self._path("/options"), json=payload)
+        # The writer cache's staleness threshold is derived from
+        # retention, so changing it here has to invalidate it. Shortening
+        # retention is a live operational lever, and a long-lived writer
+        # keeping the old threshold would hold a basis past the new floor.
+        self._retention_cache = None
         return CatalogOptions.from_wire(body)
 
     # -- maintenance -------------------------------------------------------
@@ -697,19 +784,45 @@ class Catalog:
 
     # -- commit (internal; Table.append is the public writer path) ---------
 
-    def commit_prepared(self, payload: dict[str, Any]) -> CommitResult:
+    def commit_prepared(
+        self, payload: dict[str, Any], *, table: Table | None = None
+    ) -> CommitResult:
         """Publish a durably saved request; retry the EXACT payload on uncertainty.
 
         Requires a server supporting CommitRequest.idempotency_key (V7 migration).
         This API does not apply event-level deduplication.
+
+        SHELF LIFE, and it shortened: the payload carries its own
+        ``read_snapshot``, and that basis is refused once it sinks below
+        the catalog's expiry floor. A payload prepared from a warm cache
+        may already be up to half the retention old when it is written, so
+        a persisted request is good for **at least half** the retention
+        rather than the full window it used to get (30 minutes at
+        prod-us's 3600 s). A committer that backlogs or restarts past that
+        gets :class:`ReadSnapshotExpiredError` — after the parquet is
+        uploaded — and must re-prepare. Persist and publish promptly.
+
+        ``table`` is the ``Table`` the request was prepared from, when
+        the caller has it. A ``re_prepare`` refusal then invalidates that
+        Table's cached info, so its next ``prepare_*`` re-reads instead
+        of rebuilding the same doomed payload. It is optional because
+        this call is explicitly cross-process — the committer need not
+        be, and after a restart cannot be, the process that prepared —
+        and such a caller re-prepares from a fresh
+        ``Namespace.table()``, which reads anyway. Pass it whenever you
+        can; see ``Table.invalidate``.
         """
         if not payload.get("idempotency_key"):
             raise ValueError("prepared commits require an idempotency_key")
         _uuid.UUID(payload["idempotency_key"])
-        return self._commit(payload, prepared=True)
+        return self._commit(payload, prepared=True, table=table)
 
     def _commit(
-        self, payload: dict[str, Any], *, prepared: bool = False
+        self,
+        payload: dict[str, Any],
+        *,
+        prepared: bool = False,
+        table: Table | None = None,
     ) -> CommitResult:
         try:
             body = self._client._request(
@@ -718,19 +831,82 @@ class Catalog:
                 json=payload,
                 conflict=CommitConflictError,
             )
-        except CommitConflictError as e:
-            # Discriminate the expected_table_uuid guard's 409 from an
-            # ordinary (retryable) commit conflict: the server's
-            # recreation refusal says "the table was recreated" in its
-            # message/detail. That refusal is atomic (zero writes) and
-            # never retryable — surface it as IncarnationChangedError.
-            text = f"{e.message} {e.detail or ''}".lower()
-            if _RECREATED_MARKER in text:
-                raise IncarnationChangedError(
-                    e.message, status_code=e.status_code, detail=e.detail
-                ) from e
+        except ExpiredError as e:
+            # A commit's 410 is its own read_snapshot below the expiry
+            # floor, which is a DIFFERENT fact from a changefeed 410
+            # ("reconcile from a full scan"): the floor only moves
+            # forward, so this payload can never be accepted, and the
+            # recovery is to re-read and prepare again. Subclass, so an
+            # existing `except ExpiredError` still catches it.
+            #
+            # It is also the one observation that proves the retention
+            # this Catalog cached is wrong — retention can be SHORTENED
+            # live, and a writer holding the old, longer threshold would
+            # otherwise take this 410 once per new-retention period
+            # forever. Dropping it makes the degradation self-healing.
+            self._retention_cache = None
+            if table is not None:
+                table.invalidate()
+            raise ReadSnapshotExpiredError(
+                e.message, status_code=e.status_code, detail=e.detail
+            ) from e
+        except HoglakeError as e:
+            # Two reasons to drop the cache, and the second is the safety
+            # net for the first.
+            #
+            # `re_prepare` is the designed path: the server named the
+            # drift, so the cached info is stale by definition.
+            #
+            # Any other NON-RETRYABLE refusal of a payload whose basis
+            # came from the cache is the undesigned one. A DDL change and
+            # the file-level symptom it produces arrive together — DROP
+            # COLUMN leaves stats naming a dead field_id, a new spec leaves
+            # the arity wrong — and if the symptom is answered first the
+            # client gets a 422 that says nothing about its basis. The
+            # server now runs the conflict check first so that should not
+            # happen, but "should not" is not a mechanism: without this the
+            # cost of being wrong is a writer rebuilding an identical
+            # doomed payload, re-encoding and orphaning its parquet every
+            # flush, until the cache ages out. The cost of being wrong the
+            # other way is one extra table read per genuinely-malformed
+            # request.
+            #
+            # RETRYABLE is excluded, and that exclusion is why the flag is
+            # consulted rather than the status: `commit_conflict` is
+            # replayed with the SAME payload, so the basis it was built
+            # from must survive, or every OCC retry buys a table read —
+            # the cost #232 removes.
+            if table is not None and (
+                e.re_prepare or (not e.retryable and _basis_was_cached(table, payload))
+            ):
+                table.invalidate()
             raise
         return CommitResult.from_wire(body)
+
+    def _retention_seconds(self) -> float:
+        """Cached `snapshot_retention_seconds`, as a float number of seconds.
+
+        ONE GET per Catalog object, not per flush: it decides how stale a
+        cached read_snapshot may get, and retention does not change on a
+        flush timescale. `inf` when retention is disabled (the expiry
+        floor never advances on its own, so a cached snapshot cannot age
+        out).
+
+        Cleared by :meth:`set_retention` and by a
+        :class:`ReadSnapshotExpiredError`, which are the two events that
+        can falsify it. A failed options read is NOT cached at all — it
+        answers [_ASSUMED_RETENTION_SECONDS] for this call and asks again
+        next time, so one transient blip does not pin the process to
+        30-minute refreshes for its life. An unknown retention must cost
+        a read, never an expired commit.
+        """
+        if self._retention_cache is None:
+            try:
+                seconds = self.options().snapshot_retention_seconds
+            except HoglakeError:
+                return _ASSUMED_RETENTION_SECONDS
+            self._retention_cache = float("inf") if seconds is None else float(seconds)
+        return self._retention_cache
 
 
 class Namespace:
@@ -825,6 +1001,13 @@ class Table:
         # from a read response that carries no snapshot_id, and must not
         # erase a pin that is still valid. See snapshot_id.
         self._ddl_snapshot_id: int | None = info.snapshot_id
+        # (snapshot the info was resolved at, when it was read) — ONE
+        # field, so "is there a usable cache" has one answer and the two
+        # halves cannot drift apart. None = no usable cache, which is
+        # also what a server that does not report the resolved snapshot
+        # leaves behind. The clock is MONOTONIC: elapsed time is the
+        # question and a wall-clock step must not answer it.
+        self._cache: tuple[int, float] | None = _cache_entry(info)
 
     # -- identity ----------------------------------------------------------
 
@@ -902,14 +1085,79 @@ class Table:
         self,
         snapshot: int | None = None,
         at_timestamp: datetime | str | None = None,
+        *,
+        totals: bool = True,
     ) -> TableInfo:
+        """This table's shape, and by default its live totals.
+
+        ``totals=False`` asks the server to omit record_count /
+        file_count / file_size_bytes and skip the scan that produces
+        them — a count and two sums over every live file row of the
+        table, which on a large table is the whole cost of the call. The
+        three fields come back as ``None``, never 0. The WRITER path
+        always asks this way: it needs the uuid, the columns and the
+        specs, and has never read a total.
+
+        Sending the parameter is safe against a server that predates it:
+        unknown query parameters are ignored and the totals come back as
+        before.
+        """
+        params = _travel_params(snapshot, at_timestamp)
+        if not totals:
+            params["totals"] = "false"
         body = self._namespace._catalog._client._request(
-            "GET", self._path(), params=_travel_params(snapshot, at_timestamp)
+            "GET", self._path(), params=params
         )
         info = TableInfo.from_wire(body)
         if snapshot is None and at_timestamp is None:
-            self._info = info
+            self._adopt(info)
         return info
+
+    def _adopt(self, info: TableInfo) -> None:
+        """Take a head read as this table's cached shape.
+
+        One function, so the read timestamp can never be forgotten: the
+        cache is only usable while it is younger than half the catalog's
+        retention, and a cache with a stale (or absent) timestamp is not
+        used at all.
+        """
+        self._info = info
+        self._cache = _cache_entry(info)
+
+    def commit_prepared(self, payload: dict[str, Any]) -> CommitResult:
+        """Publish a request this Table prepared, invalidating on refusal.
+
+        The same call as :meth:`Catalog.commit_prepared` with
+        ``table=self``, and the form to prefer whenever the publishing
+        code still holds the ``Table``: the cache invalidation a
+        ``re_prepare`` refusal needs cannot be forgotten, because there is
+        no parameter to forget.
+
+        The Catalog form stays for the cross-process case the contract is
+        built around — a committer that persisted the payload and may be a
+        different process entirely. **A caller using that form without
+        ``table=`` owns invalidation itself** (millpond does, by dropping
+        its whole cached ``Table`` in `reset_caches`); not doing so turns
+        a one-flush refusal into a loop until the cache ages out.
+        """
+        return self._namespace._catalog.commit_prepared(payload, table=self)
+
+    def invalidate(self) -> None:
+        """Drop this Table's cached info so the next ``prepare_*`` re-reads.
+
+        Call it after any ``re_prepare`` refusal from a commit this
+        Table's info was prepared for —
+        :class:`DdlSinceReadSnapshotError`,
+        :class:`IncarnationChangedError`,
+        :class:`ReadSnapshotExpiredError`. ``Table.append`` and
+        ``Catalog.commit_prepared(..., table=self)`` already do it; this
+        is the lever for a caller that publishes some other way.
+
+        Not calling it is a livelock, not a slowdown: the next prepare
+        would rebuild a payload carrying the same stale ``read_snapshot``
+        and take the same refusal.
+        """
+        self._cache = None
 
     def files(
         self,
@@ -964,7 +1212,13 @@ class Table:
             json={"ops": [op.to_wire() for op in ops]},
             conflict=CommitConflictError,
         )
-        self._info = TableInfo.from_wire(body)
+        # _adopt, not a bare assignment: the cache's (snapshot, read time)
+        # has to move with the shape, and an alter receipt carries no
+        # read_snapshot_id, so this correctly CLEARS the cache and the
+        # next prepare re-reads. Assigning _info directly left the
+        # pre-alter snapshot in place, making the next flush a guaranteed
+        # 409 with its uploads orphaned.
+        self._adopt(TableInfo.from_wire(body))
         # A newer DDL snapshot supersedes the old pin.
         if self._info.snapshot_id is not None:
             self._ddl_snapshot_id = self._info.snapshot_id
@@ -976,8 +1230,10 @@ class Table:
         # The table is gone; a pin to one of its snapshots resolves a dead
         # incarnation, not this table. Drop it rather than hand back a
         # snapshot_id that points at nothing (or, after a same-name
-        # recreate, at the wrong table).
+        # recreate, at the wrong table). Same for the writer cache: a
+        # prepare against it would be refused by the incarnation guard.
         self._ddl_snapshot_id = None
+        self._cache = None
         return result
 
     # -- THE writer path ---------------------------------------------------
@@ -1054,12 +1310,62 @@ class Table:
         else:
             expected = str(expected_table_uuid)
 
+        # The conflict basis, read BEFORE the resolve and long before the
+        # upload, and the order is the whole point. A partitioned append
+        # must carry a read_snapshot (the server refuses a blind one:
+        # partition values are only valid under the spec they were
+        # computed with), and the server's window is
+        # `snapshot_id > read_snapshot` — so a basis taken AFTER the
+        # resolve sits above any DDL that landed in between, putting the
+        # respec this guard exists to catch OUTSIDE the window. Taken
+        # first, the window covers the resolve, the parquet write and the
+        # whole upload. `_prepared_read` reads the catalog first for
+        # exactly this reason.
+        #
+        # `read_snapshot_id` supersedes it when the server reports one:
+        # that pairs the spec the values were computed under with the
+        # window at the same instant, which is strictly tighter. The head
+        # read only happens when it will be needed — a partitioned table
+        # with no caller-supplied snapshot — so an unpartitioned append
+        # stays at one GET.
+        head_before_resolve: int | None = None
+        if read_snapshot is None and self._info.partition_spec is not None:
+            head_before_resolve = self._namespace._catalog.refresh().head_snapshot_id
+
         if expected is not None:
             # Pre-flight fast-fail (optimization, not the guarantee):
             # re-resolve by name before paying for the parquet upload.
             info = self._check_incarnation(expected)  # current columns + spec
         else:
-            info = self.info()  # UNGUARDED: name-only resolution
+            # UNGUARDED: name-only resolution, and still a WRITER read —
+            # it wants the columns and the spec, never the totals.
+            info = self.info(totals=False)
+
+        # The basis is SETTLED HERE, before a single byte is written, and
+        # that is the whole point: everything below this line is the
+        # parquet fanout and the upload, and a basis read after them would
+        # exclude their entire duration from the conflict window.
+        #
+        # Three sources, in order of tightness. `read_snapshot_id` pairs
+        # the spec the values are about to be computed under with the
+        # window at the same instant. `head_before_resolve` is the head
+        # taken before the resolve, so the window covers the resolve too.
+        # The third reads head now — still pre-upload — and is reached
+        # only when the cached shape looked unpartitioned and the fresh
+        # one is partitioned, i.e. a spec was installed between the last
+        # cache fill and this resolve. That install is at a snapshot <=
+        # head so it is NOT inside the window, and it does not need to be:
+        # the values below are computed under the spec the resolve just
+        # returned, not under the stale one. What the window is for is a
+        # FURTHER change after this point, which is exactly what it covers.
+        if read_snapshot is None and info.partition_spec is not None:
+            read_snapshot = (
+                info.read_snapshot_id
+                if info.read_snapshot_id is not None
+                else head_before_resolve
+                if head_before_resolve is not None
+                else self._namespace._catalog.refresh().head_snapshot_id
+            )
 
         target_schema = columns_to_arrow_schema(info.columns)
         data = _align_table(data, target_schema)
@@ -1121,7 +1427,11 @@ class Table:
         # atomically at commit time (409, zero writes), superseding the
         # old post-upload check. A refusal orphans the uploaded parquet
         # (cleanup's problem, never the catalog's).
-        result = catalog._commit(payload)
+        # `table=self`: a re_prepare refusal (DDL, recreation, or a
+        # read_snapshot below the floor) drops this Table's cached info,
+        # so the caller's next append or prepare re-reads instead of
+        # rebuilding the same doomed request.
+        result = catalog._commit(payload, table=self)
         return AppendResult(
             snapshot_id=result.snapshot_id,
             schema_version=result.schema_version,
@@ -1293,9 +1603,21 @@ class Table:
             _uuid.UUID(idempotency_key)
             catalog = self._namespace._catalog
             client = catalog._client
-            read_snapshot = catalog.refresh().head_snapshot_id
             expected = expected_table_uuid or self.table_uuid
-            info = self._check_incarnation(expected)
+            if expected_table_info is None:
+                # The cached-read path: info and conflict basis from the
+                # same read, so the steady state is zero GETs per flush.
+                info, read_snapshot = self._prepared_read(expected)
+            else:
+                # expected_table_info OPTS OUT of the cache, on purpose:
+                # its contract is "refuse if the DESTINATION's layout is
+                # not the one I planned against", and comparing the
+                # caller's copy with this client's own cache would be a
+                # comparison of two client-side values. Same two reads
+                # as before, same order (head first — see
+                # _prepared_read).
+                read_snapshot = catalog.refresh().head_snapshot_id
+                info = self._check_incarnation(expected)
             if expected_table_info is not None and (
                 info.columns,
                 info.partition_spec,
@@ -1420,21 +1742,132 @@ class Table:
         table_uuid. Purely an optimization — it saves the parquet upload
         when the incarnation is already dead; the server-side
         ``expected_table_uuid`` commit guard is the atomic safety
-        mechanism. ``self._info`` is only adopted when the incarnation
+        mechanism.
+
+        NOT on every writer path: ``prepare_append_files`` skips this read
+        entirely while its cache is warm, so the only check before the
+        upload there is the cached uuid against the caller's expectation
+        (two client-side values). The server's guard still catches a
+        recreation, and it costs that one flush's uploads. ``self._info`` is only adopted when the incarnation
         matches, so the pinned identity (and the default
         ``expected_table_uuid`` of later appends) is never silently
-        rebased onto a recreated table."""
-        body = self._namespace._catalog._client._request("GET", self._path())
+        rebased onto a recreated table.
+
+        ``totals=false``: this is a WRITER read and it wants the uuid,
+        the columns and the specs — never the live totals, whose scan is
+        the whole cost of the call (#232)."""
+        body = self._namespace._catalog._client._request(
+            "GET", self._path(), params={"totals": "false"}
+        )
         info = TableInfo.from_wire(body)
         if info.table_uuid != expected_uuid:
             raise IncarnationChangedError(
                 f"table {self._namespace._catalog.name}/{self.namespace}."
                 f"{self.name} was recreated: expected table_uuid "
                 f"{expected_uuid}, name now resolves to {info.table_uuid}. "
-                "Refusing to append across incarnations."
+                "Refusing to append across incarnations.",
+                table=f"{self.namespace}.{self.name}",
             )
-        self._info = info
+        self._adopt(info)
         return info
+
+    def _cache_is_usable(self) -> bool:
+        """Whether the cached info can be prepared against without a read.
+
+        Two conditions, and both are about `read_snapshot`:
+
+        * the cache must KNOW the snapshot it was read at. A server that
+          predates ``Table.read_snapshot_id`` sends none, so there is
+          nothing to send as a read_snapshot and the writer path falls
+          back to what it always did;
+        * the cache must be younger than half the catalog's snapshot
+          retention. An old read_snapshot is not a correctness problem —
+          the server evaluates the conflict window over
+          `hog_snapshot_change_conflict (catalog_id, object_id, kind,
+          snapshot_id)`, a range over ONE table's change rows, so it
+          costs the same whether it reaches back ten snapshots or ten
+          thousand — but once it sinks BELOW the expiry floor the commit
+          is a 410, and by then the flush's parquet is already uploaded.
+          One refusal per writer per retention period would be a
+          re-encode and a set of orphaned objects each time, so the cache
+          refreshes at half the retention instead. On
+          `snapshot_retention_seconds = 3600` (prod-us) that is one
+          refresh per 30 minutes per table, against a flush rate of many
+          per minute.
+
+        The age is the age of the READ, not of the snapshot, and on an
+        IDLE catalog those differ: head itself can be hours old, so a
+        five-second-old cache can hold a very old snapshot. Safe rather
+        than lucky — expiry never advances the floor past head (AGENT.md
+        invariant 5, and the server's floor guard explicitly allows
+        `read_snapshot == earliest`), so a stale head can never be below
+        its own floor. The age only has to bound how far the floor moves
+        AFTER the read, which is exactly what retention measures.
+        """
+        if self._cache is None:
+            return False
+        _, read_at = self._cache
+        return (
+            time.monotonic() - read_at
+            < self._namespace._catalog._retention_seconds() / 2
+        )
+
+    def _prepared_read(self, expected_uuid: str) -> tuple[TableInfo, int]:
+        """The (info, read_snapshot) a prepare binds its files to.
+
+        THE POINT (#232/#233): the info and the conflict basis come from
+        the SAME read, so a prepared append needs no per-flush table GET
+        and no new wire field. The server already validates the pairing —
+        an append committed with `read_snapshot = S` is accepted exactly
+        when nothing has altered, dropped or recreated the table since S
+        (CommitService.checkConflicts), which is the entire question the
+        writer was re-reading the table to answer. Anything that has is
+        one of the typed `re_prepare` refusals, which invalidates this
+        cache.
+
+        The old shape was two GETs per flush: a catalog GET for head and
+        a table GET whose live-totals scan (a count and two sums over
+        every live file row, ~10M rows on prod-us) was the reason #232
+        exists. Now it is zero, plus one identity read per half-retention.
+
+        ONE DRIFT `read_snapshot` DOES NOT COVER, and it matters: a
+        DROP + RECREATE under the same name. The server's conflict check
+        keys on the RESOLVED (new) table id, and `table_created` is only a
+        conflict for a guarded request's delete targets, so a recreate is
+        outside its window for an append. It is closed solely by
+        ``expected_table_uuid`` -> 409 `table_recreated`, which holds
+        because this function always binds a real uuid: `prepare_*` takes
+        `expected_table_uuid or self.table_uuid` and its signature does
+        not accept ``UNGUARDED``. A future prepare that allowed UNGUARDED
+        would silently reopen it, so it must not use this path.
+        """
+        if self._cache is not None and self._cache_is_usable():
+            if self._info.table_uuid != expected_uuid:
+                raise IncarnationChangedError(
+                    f"table {self._namespace._catalog.name}/{self.namespace}."
+                    f"{self.name} was recreated: expected table_uuid "
+                    f"{expected_uuid}, cached identity is {self._info.table_uuid}. "
+                    "Refusing to append across incarnations.",
+                    table=f"{self.namespace}.{self.name}",
+                )
+            return self._info, self._cache[0]
+        # No usable cache. The catalog GET comes FIRST and the order is
+        # load-bearing: a read_snapshot taken AFTER the identity read
+        # would sit above any DDL that landed between the two, putting it
+        # outside the conflict window and silently defeating the guard.
+        # (This is the order main has always used, for the same reason.)
+        # It is wasted work against a server that reports the resolved
+        # snapshot on a read — one GET, on the refresh path only, never
+        # per flush — and paying it is cheaper than learning the server's
+        # capability by guessing.
+        head = self._namespace._catalog.refresh().head_snapshot_id
+        info = self._check_incarnation(expected_uuid)
+        # Prefer the snapshot the info was actually RESOLVED at: it pairs
+        # the shape and the conflict basis exactly, and it is >= head.
+        return (
+            info,
+            info.read_snapshot_id if info.read_snapshot_id is not None else head,
+        )
 
 
 def _nested_field_mismatch(

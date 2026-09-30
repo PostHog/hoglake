@@ -534,6 +534,25 @@ data class Config(
             com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS.toString(),
         ).toLong(),
     /**
+     * Whether a blind append (no `read_snapshot`) carrying
+     * `partition_values` is REFUSED with 422 or merely logged at WARN.
+     *
+     * OFF by default because `duckdb-client` sends exactly that shape:
+     * its append-only commits carry no read_snapshot
+     * (storage/hoglake_transaction.cpp) and it sets partition values
+     * whenever the target table has a live spec
+     * (storage/hoglake_insert.cpp), so turning this on today breaks
+     * `INSERT INTO <partitioned table>` through the extension. The rule
+     * itself is invariant 12 and is not optional — partition values are
+     * only valid under the spec they were computed with, and a blind
+     * commit has no window in which a spec change could be detected — so
+     * this knob is a rollout order, not a policy: the WARN names the
+     * offending client and the refusal text, and the flag flips once the
+     * fleet sends a snapshot.
+     */
+    val refuseBlindPartitionedAppends: Boolean =
+        boolEnv("HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS", false),
+    /**
      * Compaction sweep interval; default 0 = OFF for now (the manual
      * /maintenance/compact trigger still works). Rate-awareness is by
      * construction: tiny bites (see the batch knobs), never a storm.

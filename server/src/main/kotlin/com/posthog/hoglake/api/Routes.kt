@@ -15,6 +15,7 @@ import io.ktor.server.application.Application
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.plugins.BadRequestException
 import io.ktor.server.request.receive
+import io.ktor.server.request.userAgent
 import io.ktor.server.response.respond
 import io.ktor.server.routing.delete
 import io.ktor.server.routing.get
@@ -307,7 +308,9 @@ fun Application.installApiRoutes(
                     if (req.idempotencyKey == null) {
                         throw com.posthog.hoglake.model.HoglakeException.Validation("idempotency_key is required")
                     }
-                    call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
+                    call.respond(
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                    )
                 }
 
                 // Distinct endpoint fences replicas that predate the DELETE contract.
@@ -320,7 +323,13 @@ fun Application.installApiRoutes(
                             "prepared DELETE requires idempotency_key, read_snapshot, guarded deletes and no appends",
                         )
                     }
-                    call.respond(commits.commit(call.catalog(), req.toModel(allowEmptyDeletes = true)).toDto())
+                    call.respond(
+                        commits.commit(
+                            call.catalog(),
+                            req.toModel(allowEmptyDeletes = true),
+                            call.request.userAgent(),
+                        ).toDto(),
+                    )
                 }
 
                 // A separate endpoint fences old replicas and includes the stronger
@@ -339,6 +348,7 @@ fun Application.installApiRoutes(
                         commits.commit(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true).copy(requireUnchangedTables = true),
+                            call.request.userAgent(),
                         ).toDto(),
                     )
                 }
@@ -358,6 +368,7 @@ fun Application.installApiRoutes(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true)
                                 .copy(requireUnchangedTables = req.deletes.isNotEmpty()),
+                            call.request.userAgent(),
                         ).toDto(),
                     )
                 }
@@ -382,6 +393,7 @@ fun Application.installApiRoutes(
                             call.catalog(),
                             req.toModel(allowEmptyDeletes = true)
                                 .copy(requireUnchangedTables = true, allowPendingDeletes = true),
+                            call.request.userAgent(),
                         ).toDto(),
                     )
                 }
@@ -399,7 +411,9 @@ fun Application.installApiRoutes(
 
                 post("/commit") {
                     val req = call.receive<CommitRequestDto>()
-                    call.respond(commits.commit(call.catalog(), req.toModel()).toDto())
+                    call.respond(
+                        commits.commit(call.catalog(), req.toModel(), call.request.userAgent()).toDto(),
+                    )
                 }
 
                 get("/consumers") {

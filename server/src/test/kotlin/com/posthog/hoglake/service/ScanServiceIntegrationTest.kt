@@ -104,6 +104,9 @@ class ScanServiceIntegrationTest {
         commits.commit(
             "cat",
             CommitRequest(
+                // An append carrying partition_values needs a
+                // read_snapshot (invariant 12); the fixture's DDL is done.
+                readSnapshot = db.head("cat"),
                 appends =
                     listOf(
                         TableAppend(

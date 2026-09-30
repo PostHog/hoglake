@@ -126,7 +126,7 @@ def _mock_refresh_and_commit(httpx_mock):
     # Non-reusable on purpose: a second GET would fail the mock.
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=TABLE_WIRE,
     )
     httpx_mock.add_response(
@@ -193,7 +193,7 @@ def test_append_full(table, httpx_mock, fake_s3):
     table_gets = [
         r
         for r in httpx_mock.get_requests()
-        if r.method == "GET" and str(r.url).endswith("/tables/events")
+        if r.method == "GET" and r.url.path.endswith("/tables/events")
     ]
     assert len(table_gets) == 2
 
@@ -270,21 +270,13 @@ def test_append_reorders_and_casts(table, httpx_mock, fake_s3):
 
 
 def test_append_missing_column_rejected(table, httpx_mock):
-    httpx_mock.add_response(
-        method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
-        json=TABLE_WIRE,
-    )
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     with pytest.raises(ValidationError, match="missing table columns"):
         table.append(pa.table({"id": [1]}))
 
 
 def test_append_extra_column_rejected(table, httpx_mock):
-    httpx_mock.add_response(
-        method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
-        json=TABLE_WIRE,
-    )
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     with pytest.raises(ValidationError, match="not in the table schema"):
         table.append(pa.table({"id": [1], "name": ["a"], "ghost": [1]}))
 
@@ -297,19 +289,30 @@ def test_append_extra_column_rejected(table, httpx_mock):
 REBOUND_WIRE = dict(TABLE_WIRE, table_uuid="9d1c2f34-0000-4000-8000-000000000bad")
 _TABLES_URL = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
 _COMMIT_URL = f"{BASE}/v1/catalogs/cat/commit"
+# Writer-path table reads ask the server to skip its live-totals scan
+# (#232), so the mocks they match carry the query parameter. A read a
+# TEST makes as a user (the fixture's own resolve) does not.
+_WRITER_TABLES_URL = f"{_TABLES_URL}?totals=false"
 
+# The server's TYPED recreation refusal. It used to be a
+# `commit_conflict` that the client told apart by looking for the phrase
+# "the table was recreated" inside `detail`; the code is the contract
+# now, and `retry: re-prepare` says the recovery in machine-readable
+# form.
 RECREATED_409 = {
-    "error": "commit_conflict",
+    "error": "table_recreated",
     "detail": (
-        "expected_table_uuid mismatch: the table was recreated "
+        "table 'ns1.events' no longer has the expected UUID: the table was recreated "
         f"(expected {TABLE_WIRE['table_uuid']})"
     ),
+    "tables": ["ns1.events"],
+    "retry": "re-prepare",
 }
 
 
 def test_append_rebind_detected_before_upload(table, httpx_mock, fake_s3):
     # the pre-flight fast-fail sees the new incarnation: no S3 write
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=REBOUND_WIRE)
     with pytest.raises(IncarnationChangedError, match="recreated"):
         table.append(pa.table({"id": [1], "name": ["a"]}))
     assert fake_s3.files == {}  # nothing uploaded
@@ -324,15 +327,19 @@ def test_append_rebind_after_preflight_is_409d_by_the_server(
     # expected_table_uuid guard 409s the commit ("the table was
     # recreated") with zero writes. The client maps it to
     # IncarnationChangedError.
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     httpx_mock.add_response(
         method="POST", url=_COMMIT_URL, json=RECREATED_409, status_code=409
     )
-    with pytest.raises(IncarnationChangedError, match="commit_conflict") as ei:
+    with pytest.raises(IncarnationChangedError, match="table_recreated") as ei:
         table.append(pa.table({"id": [1], "name": ["a"]}))
     assert ei.value.status_code == 409
     assert "the table was recreated" in (ei.value.detail or "")
     assert not ei.value.retryable
+    # ... and it says what to do instead, off the wire code rather than
+    # off the prose, plus which table to re-read.
+    assert ei.value.re_prepare
+    assert ei.value.table == "ns1.events"
     assert len(fake_s3.files) == 1  # parquet orphaned in the bucket
 
 
@@ -341,7 +348,7 @@ def test_append_ordinary_commit_conflict_stays_retryable(table, httpx_mock, fake
     # taxonomy: CommitConflictError, retryable
     from pyhoglake import CommitConflictError
 
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     httpx_mock.add_response(
         method="POST",
         url=_COMMIT_URL,
@@ -359,7 +366,7 @@ def test_append_server_refusal_does_not_rebase_pinned_identity(
     # a server-side guard refusal must leave the Table pinned to the
     # ORIGINAL uuid (the pre-flight saw the old incarnation and adopted
     # nothing new)
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     httpx_mock.add_response(
         method="POST", url=_COMMIT_URL, json=RECREATED_409, status_code=409
     )
@@ -372,18 +379,18 @@ def test_append_rebind_does_not_rebase_pinned_identity(table, httpx_mock, fake_s
     # after a refused append, the Table object still pins the ORIGINAL
     # uuid — a naive retry must trip the guard again, not silently adopt
     # the new incarnation.
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=REBOUND_WIRE)
     with pytest.raises(IncarnationChangedError):
         table.append(pa.table({"id": [1], "name": ["a"]}))
     assert table.table_uuid == TABLE_WIRE["table_uuid"]
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=REBOUND_WIRE)
     with pytest.raises(IncarnationChangedError):
         table.append(pa.table({"id": [1], "name": ["a"]}))
 
 
 def test_append_explicit_expected_table_uuid(table, httpx_mock, fake_s3):
     # an explicit pin (uuid.UUID accepted) overrides the object's own
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=TABLE_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     with pytest.raises(IncarnationChangedError, match="recreated"):
         table.append(
             pa.table({"id": [1], "name": ["a"]}),
@@ -414,7 +421,7 @@ def test_append_unguarded_sends_no_field_and_skips_the_guard(
     # rides the commit body.
     from pyhoglake import UNGUARDED
 
-    httpx_mock.add_response(method="GET", url=_TABLES_URL, json=REBOUND_WIRE)
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=REBOUND_WIRE)
     httpx_mock.add_response(method="POST", url=_COMMIT_URL, json={"snapshot_id": 6})
     res = table.append(
         pa.table({"id": [1], "name": ["a"]}), expected_table_uuid=UNGUARDED
@@ -437,11 +444,7 @@ def test_append_without_s3_config(httpx_mock):
         json=TABLE_WIRE,
     )
     t = Namespace(cat, "ns1").table("events")
-    httpx_mock.add_response(
-        method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
-        json=TABLE_WIRE,
-    )
+    httpx_mock.add_response(method="GET", url=_WRITER_TABLES_URL, json=TABLE_WIRE)
     with pytest.raises(HoglakeError, match="S3 configuration"):
         t.append(pa.table({"id": [1], "name": ["a"]}))
     client.close()
@@ -506,7 +509,7 @@ def test_prepared_files_upload_then_commit_exact_request(
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=TABLE_WIRE,
     )
     key = str(uuid.uuid4())
@@ -574,7 +577,7 @@ def test_prepared_seconds_timestamp_preserves_schema_guards(
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=wire,
     )
     if defect:
@@ -670,7 +673,7 @@ def test_prepared_uuid_column_accepts_both_wire_forms(
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=UUID_TABLE_WIRE,
     )
     if accepted:
@@ -737,7 +740,7 @@ def test_prepared_json_column_still_requires_the_json_extension(
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=wire,
     )
     with pytest.raises(ValidationError, match="schema/field IDs"):
@@ -756,7 +759,7 @@ def test_appended_uuid_file_carries_the_parquet_uuid_annotation(
     binary an Iceberg reader takes for opaque bytes."""
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=UUID_TABLE_WIRE,
     )
     httpx_mock.add_response(
@@ -811,7 +814,7 @@ def test_prepared_native_variant_uploads_original_bytes(table, httpx_mock, fake_
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=wire,
     )
     request = table.prepare_append_files(
@@ -842,7 +845,7 @@ def test_prepared_external_optional_fields_require_zero_nulls(
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=TABLE_WIRE,
     )
     if null_id:
@@ -879,7 +882,7 @@ def _prepare_mocks(httpx_mock, table_wire=TABLE_WIRE):
     )
     httpx_mock.add_response(
         method="GET",
-        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
+        url=_WRITER_TABLES_URL,
         json=table_wire,
     )
 

@@ -226,9 +226,14 @@ class AuditIntegrationTest {
             """,
                 )
             assertThat(conflicted.status).isEqualTo(HttpStatusCode.Conflict)
+            // The outcome names the CODE, not a generic `conflict`: an
+            // audit line saying `conflict` means "retry", and this one
+            // means "re-prepare". Whoever reads the trail after a stuck
+            // writer needs to see which.
             val conflictLine =
                 eventsFor("commit").single {
-                    it["catalog"].asText() == catalog && it["outcome"].asText() == "conflict"
+                    it["catalog"].asText() == catalog &&
+                        it["outcome"].asText() == "ddl_since_read_snapshot"
                 }
             assertThat(conflictLine["detail"].asText()).contains("concurrent DDL")
 

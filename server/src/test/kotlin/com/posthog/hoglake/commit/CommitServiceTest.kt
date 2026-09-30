@@ -616,7 +616,7 @@ class CommitServiceTest {
                         ),
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
             .hasMessageContaining("ns.events")
 
         // Atomicity: nothing written, no allocator advanced.
@@ -648,7 +648,7 @@ class CommitServiceTest {
                         ),
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
             .hasMessageContaining("ns.events")
         assertThat(dataFiles(fx.catalogId)).isEmpty()
     }
@@ -710,7 +710,18 @@ class CommitServiceTest {
                 requireUnchangedTables = true,
             )
         assertThatThrownBy { service.commit("cat", request) }
-            .isInstanceOf(HoglakeException.CommitConflict::class.java)
+            // The kind decides WHICH refusal, and that split is the
+            // point: a row-content change is retryable (re-read,
+            // replan, send again), pure DDL is not (the payload's own
+            // read_snapshot can never satisfy the check again), so they
+            // are different error codes on the wire.
+            .isInstanceOf(
+                if (kind == "table_altered" || kind == "table_dropped") {
+                    HoglakeException.DdlSinceReadSnapshot::class.java
+                } else {
+                    HoglakeException.CommitConflict::class.java
+                },
+            )
         assertThat(dataFiles(fx.catalogId).map { it.path }).containsExactly("s3://b/target")
         assertThatThrownBy { service.receipt("cat", request.idempotencyKey!!) }
             .isInstanceOf(HoglakeException.NotFound::class.java)
@@ -817,7 +828,7 @@ class CommitServiceTest {
                     requireUnchangedTables = true,
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
     }
 
     @Test
@@ -1175,8 +1186,11 @@ class CommitServiceTest {
                         ),
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
-            .hasMessage("table 'ns.events' is uuid $actual, expected $stale: the table was recreated")
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
+            .hasMessage(
+                "table 'ns.events' is uuid $actual, expected $stale: the table was recreated; " +
+                    "re-prepare against the current incarnation, replaying this request cannot succeed",
+            )
 
         // Zero writes: no snapshot, no files, no allocator movement.
         assertThat(snapshotIds(fx.catalogId)).isEmpty()
@@ -1219,7 +1233,7 @@ class CommitServiceTest {
                         ),
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
             .hasMessageContaining("the table was recreated")
         // Only the append snapshot exists; no DV row was written.
         assertThat(snapshotIds(fx.catalogId)).containsExactly(1L)
@@ -1293,7 +1307,7 @@ class CommitServiceTest {
                         ),
                 ),
             )
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
             .hasMessageContaining("was recreated")
         assertThat(dataFiles(fx.catalogId)).isEmpty()
 

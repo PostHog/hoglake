@@ -413,6 +413,65 @@ there would break that gate on every build.
     keeps the O(rows) pass under the commit lock; `POST .../truncate` on
     a multi-million-row table has today's hazard, and redesigning it is
     its own change.
+12. **A file's partition values are valid only under the spec they were
+    computed with**, and the server cannot check them: it never opens
+    the parquet (footer-shipping), so it can neither verify nor
+    recompute a transform, and `CommitService.validateFiles`' arity
+    check cannot tell two same-arity specs apart. `read_snapshot` is
+    therefore the whole guard, and an append whose files carry
+    `partition_values` NEEDS one — a blind append has no conflict window
+    at all, so a spec change between the writer's read and its commit
+    would register the old transform's values under the new `spec_id`
+    with nothing afterwards able to detect it. With one, the change is
+    `checkConflicts`' DDL arm.
+    The REFUSAL is staged, not immediate:
+    `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` (default **false**) makes
+    it the 422 the contract describes, and until then the shape is
+    accepted and logged at WARN once per (catalog, table, user agent) per
+    pod, naming the client and quoting the refusal it will get. The flag
+    exists because `duckdb-client` sends exactly that shape today —
+    append-only commits carry no `read_snapshot`
+    (`storage/hoglake_transaction.cpp`) and partition values ride
+    whenever the table has a live spec (`storage/hoglake_insert.cpp`) —
+    so enforcing it in the same change as the server would break `INSERT
+    INTO <partitioned table>` through the extension. The rule is not
+    optional; the rollout order is.
+    `checkConflicts` also runs BEFORE `validateFiles`, deliberately: a
+    DDL change and the file-level symptom it produces (stats naming a
+    dropped field, the wrong arity, values on a now-unpartitioned table)
+    arrive together, and the CAUSE has to answer before the SYMPTOM — a
+    422 tells a caching writer nothing about its stale basis, so it
+    rebuilds the same doomed payload until the cache ages out.
+    That arm is TYPED: when every conflicted row is DDL it is
+    `HoglakeException.DdlSinceReadSnapshot` -> 409
+    `ddl_since_read_snapshot` carrying `tables`, `read_snapshot` and
+    `retry: re-prepare`, never the retryable `commit_conflict`. The
+    distinction is the point: a prepared request's `read_snapshot` is
+    part of a durable payload that must be replayed byte-identically,
+    so the refusal is permanent for that payload and a retry loop on it
+    is a livelock. Row-content conflicts keep `commit_conflict`, and so
+    does a mixed refusal (`all { ddl }`, not `any`) — a plain retry
+    clears those. The `expected_table_uuid` guard joins the same family:
+    `HoglakeException.TableRecreated` -> 409 `table_recreated`, because
+    the incarnation the caller named is gone and its history does not
+    carry over (it was a `CommitConflict`, and pyhoglake could only tell
+    it apart by grepping the detail string for "the table was
+    recreated"). So does the below-floor `Expired` 410. Three codes, one
+    recovery: re-read the table and prepare a new request. And
+    `table_recreated` is the ONLY guard against a drop+recreate —
+    `checkConflicts` keys on the RESOLVED table id and counts
+    `table_created` only for a guarded request's delete targets, so a
+    recreate is outside an append's window however fresh its
+    `read_snapshot` is.
+    `DdlSinceReadSnapshot` is a SUBCLASS of `CommitConflict`, and that is
+    load-bearing rather than tidy: clients discriminate with `isinstance`
+    ladders (millpond's retry budget does, and it already recovers
+    correctly by resetting its caches on a `CommitConflict`), so
+    un-subclassing would turn a working recovery into a hard re-raise.
+    The wire CODE is what changed. Every `when` over the hierarchy must
+    therefore put the subclass arm FIRST — `ErrorMapping`,
+    `Metrics.commitFailureResult` and `Audit.failureOutcome` all do, and
+    each says so.
 
 ## Working conventions
 

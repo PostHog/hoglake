@@ -237,8 +237,17 @@ class ObservabilityIntegrationTest {
             val cat = "catalog" to catalog
             assertThat(seriesValue(scrape, "hoglake_commits_total", cat, "result" to "committed"))
                 .isEqualTo(1.0)
+            // The DDL conflict has its OWN result value, not a slice of
+            // `conflict`: it is the refusal a writer cannot retry its way
+            // out of, so an operator has to be able to graph it alone.
+            assertThat(
+                seriesValue(scrape, "hoglake_commits_total", cat, "result" to "ddl_since_read_snapshot"),
+            ).isEqualTo(1.0)
+            // ...and NOT as `conflict`: a counter that never ticked has no
+            // series at all, which is what distinguishes "typed apart"
+            // from "relabelled".
             assertThat(seriesValue(scrape, "hoglake_commits_total", cat, "result" to "conflict"))
-                .isEqualTo(1.0)
+                .isNull()
             assertThat(seriesValue(scrape, "hoglake_commits_total", cat, "result" to "validation"))
                 .isEqualTo(1.0)
         }

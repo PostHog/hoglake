@@ -126,9 +126,19 @@ class _Sink:
 
 
 def _mocks(httpx_mock, table_wire=TABLE_WIRE):
-    """The two GETs every prepare does — the catalog refresh for
+    """The GETs a prepare does on THIS wire — the catalog refresh for
     ``read_snapshot`` and the incarnation pre-flight — reusable, so a test
-    may prepare more than once."""
+    may prepare more than once.
+
+    Two URLs for the table, both reusable and both optional, because how
+    many of these a prepare makes depends on the wire. `TABLE_WIRE` here
+    carries no ``read_snapshot_id``, so the writer cache is unusable and
+    every prepare pays the pair (the catalog first, then the identity read
+    with ``totals=false`` — that order is load-bearing, see
+    ``Table._prepared_read``). The query-less one is the initial
+    ``Namespace.table()`` resolve, which is a CALLER's read and keeps the
+    totals.
+    """
     httpx_mock.add_response(
         method="GET",
         url=f"{BASE}/v1/catalogs/cat",
@@ -140,6 +150,13 @@ def _mocks(httpx_mock, table_wire=TABLE_WIRE):
         url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events",
         json=table_wire,
         is_reusable=True,
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events?totals=false",
+        json=table_wire,
+        is_reusable=True,
+        is_optional=True,
     )
 
 

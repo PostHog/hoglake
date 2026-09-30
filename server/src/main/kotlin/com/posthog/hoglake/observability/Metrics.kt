@@ -376,11 +376,26 @@ object Metrics {
     /** The commit counter's result tag for a failed commit. */
     fun commitFailureResult(e: HoglakeException): String? =
         when (e) {
-            is HoglakeException.CommitConflict -> "conflict"
             // Counted, and counted as a conflict: it is a 409, and
             // before it was typed it was counted as "validation".
             // Left in the `else` it would stop being counted at all.
             is HoglakeException.TableDropped -> "conflict"
+            // Same argument as TableDropped above: a 409 that used to be
+            // counted as a conflict (it WAS a CommitConflict) and would
+            // silently stop being counted at all if left to the `else`.
+            // The two RE-PREPARE refusals, before CommitConflict because
+            // DdlSinceReadSnapshot is a subclass of it and a `when` would
+            // otherwise answer the base arm.
+            //
+            // Their values are DISTINCT, and that is the point: these are
+            // the refusals a writer cannot retry its way out of, so "how
+            // often is the fleet re-preparing" has to be a series an
+            // operator can graph rather than a slice of `conflict` only
+            // the logs can separate. An arm that answered "conflict" here
+            // would be indistinguishable from having no arm at all.
+            is HoglakeException.DdlSinceReadSnapshot -> "ddl_since_read_snapshot"
+            is HoglakeException.TableRecreated -> "table_recreated"
+            is HoglakeException.CommitConflict -> "conflict"
             is HoglakeException.Validation -> "validation"
             is HoglakeException.CommitQueueTimeout -> "timeout"
             else -> null

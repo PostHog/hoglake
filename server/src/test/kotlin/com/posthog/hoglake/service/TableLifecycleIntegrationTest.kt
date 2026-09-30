@@ -19,6 +19,7 @@ import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.assertj.core.api.Assertions.catchThrowable
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -159,13 +160,13 @@ class TableLifecycleIntegrationTest {
         val replacement = catalogs.tableWithExactTotals(cat, "ns", "t")
         assertThatThrownBy {
             catalogs.dropTable(cat, "ns", "t", original.tableUuid)
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThatThrownBy {
             catalogs.truncateTable(cat, "ns", "t", original.tableUuid)
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThatThrownBy {
             alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("wrong")), original.tableUuid)
-        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        }.isInstanceOf(HoglakeException.TableRecreated::class.java)
         assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(replacement)
         catalogs.dropTable(cat, "ns", "renamed", original.tableUuid)
         assertThat(commits.commit(cat, request)).isEqualTo(receipt)
@@ -193,6 +194,12 @@ class TableLifecycleIntegrationTest {
                         try {
                             commits.commit(cat, request)
                             true
+                            // TRUNCATE emits DDL, so the loser's refusal
+                            // is the typed one; CommitConflict is kept
+                            // alongside it because the race can also be
+                            // lost on the read-set arm.
+                        } catch (_: HoglakeException.DdlSinceReadSnapshot) {
+                            false
                         } catch (_: HoglakeException.CommitConflict) {
                             false
                         }
@@ -221,7 +228,24 @@ class TableLifecycleIntegrationTest {
         val old = append(cat, snapshot = catalogs.getCatalog(cat).headSnapshotId)
         val uuid = catalogs.getTable(cat, "ns", "t").tableUuid
         catalogs.truncateTable(cat, "ns", "t", uuid)
-        assertThatThrownBy { commits.commit(cat, old) }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        val refused = catchThrowable { commits.commit(cat, old) }
+        assertThat(refused).isInstanceOf(HoglakeException.DdlSinceReadSnapshot::class.java)
+        // The EXACT class, separately, because `isInstanceOf` alone
+        // cannot tell these two apart any more: DdlSinceReadSnapshot is a
+        // subclass of CommitConflict (so an isinstance-ladder client keeps
+        // working). This catches the assertion above being WEAKENED to the
+        // base class — but not this whole block being replaced by one, and
+        // no assertion can.
+        //
+        // What guards the contract across a bad merge is in other files,
+        // and it is the THROW SITE that they cover (measured by
+        // downgrading it to CommitConflict): ApiIntegrationTest, which
+        // asserts the wire code over HTTP, plus AuditIntegrationTest and
+        // ObservabilityIntegrationTest, which assert the audit outcome and
+        // the metric's `result` label. CommitConflictSpecParityTest is NOT
+        // among them: it guards the mapping from exception to code, not
+        // which exception `checkConflicts` throws, so it stays green.
+        assertThat(refused!!::class.java).isEqualTo(HoglakeException.DdlSinceReadSnapshot::class.java)
         commits.commit(cat, append(cat, "blind.parquet"))
         assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isEqualTo(10)
     }
