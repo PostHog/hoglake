@@ -116,24 +116,34 @@ for s in catalog.snapshots(before=head + 1):
 | Server | `HoglakeClient(base_url, timeout=30.0)` — `/v1` is appended |
 | Object store | `S3Config(access_key, secret_key, endpoint_override, region, allow_bucket_creation, single_request_uploads)`; the write path uses `pyarrow.fs.S3FileSystem` (path-style with an endpoint override), and `boto3` built from the same settings for single-request uploads (`single_request_uploads=False` sends everything through the streaming writer) |
 | Upload fan-out | `concurrency=` on the prepared-append calls, else `PYHOGLAKE_UPLOAD_CONCURRENCY`, else 64 — capped at the number of objects. Arrow's process-global IO thread pool is raised to match only when the flush actually routes an object through Arrow |
+| `User-Agent` | `pyhoglake/<version>` on every request, from the installed package metadata (`pyhoglake/unknown` from a source checkout). The server names the client in its transition warnings by this header — notably the blind-partitioned-append WARN — so it identifies which writer has to change |
 | Errors | Typed, all under `HoglakeError`, and every one of them answers two questions — `retryable` (replay the SAME request) and `re_prepare` (replay cannot work; re-read the table and build a NEW one). `CommitConflictError` (`retryable=True` — refresh the read snapshot and retry) · `DdlSinceReadSnapshotError` (`re_prepare=True` — DDL landed on a touched table after the request's `read_snapshot`, so replaying is a livelock) · `IncarnationChangedError` (`re_prepare=True` — the table was dropped and recreated; the append incarnation guard, enforced server-side at commit, see below) · `ReadSnapshotExpiredError` (`re_prepare=True`, a subclass of `ExpiredError` — a commit whose `read_snapshot` sank below the expiry floor) · `NotFoundError` · `AlreadyExistsError` · `ValidationError` · `OffsetRegressionError` · `ExpiredError` (410 on a changefeed window — reconcile from a full scan) · `MalformedResponseError` (every wire-parse failure — a structurally defective response body, an unexpected redirect (3xx is never success), a field of the wrong shape — one exception type naming the model and field) |
 
 ## Type mapping
 
+The Arrow writer path maps 26 of the catalog's 27 wire names, both
+directions. `variant` is the exception: Arrow cannot construct it, so a
+`variant` column arrives only through `Table.prepare_append_files` (see
+"Native VARIANT files" below). An Arrow type outside the table is
+rejected with an error listing the supported set.
+
 | pyarrow | hoglake |
 |---|---|
 | `bool_` | `boolean` |
-| `int32` / `int64` | `int` / `long` |
+| `int8` / `int16` / `int32` / `int64` | `int8` / `int16` / `int` / `long` |
+| `uint8` / `uint16` / `uint64` | `uint8` / `uint16` / `uint64` |
+| `uint32` | `uint32` — asymmetric: the writer contract is parquet INT64, so `coltype_to_arrow("uint32")` returns `int64` |
 | `float32` / `float64` | `float` / `double` |
 | `string` / `large_string` | `string` |
+| `pa.json_()` (pyarrow >= 19) | `json` — the extension type only; a bare string stays `string` |
 | `binary` / `large_binary` | `binary` |
 | `date32` | `date` |
 | `time64("us")` | `time` |
-| `timestamp("us")` / `timestamp("us", tz)` | `timestamp` / `timestamptz` |
+| `timestamp("s")` / `("ms")` / `("us")` / `("ns")` | `timestamp_s` / `timestamp_ms` / `timestamp` / `timestamp_ns` |
+| `timestamp("us", tz)` | `timestamptz` — micros only; the other units exist tz-naive |
 | `decimal128(p, s)` | `decimal` (`type_params: {precision, scale}`) |
 | `pa.uuid()` or `binary(16)` (fixed) | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
-
-Anything else is rejected with an error listing the supported set.
+| `list` family / `struct` / `map` | `list` / `struct` / `map` — children validated recursively; an empty struct is refused |
 
 ### uuid columns: the wire form, and the two spellings
 
@@ -237,7 +247,10 @@ the commit lands, the server refuses the commit — 409
 client never silently recomputes under a different spec. That refusal is
 also why an append whose files carry `partition_values` must send a
 `read_snapshot`: without one the commit has no conflict window, so the
-spec change could not be detected at all, and the server answers 422.
+spec change could not be detected at all. The server will answer 422
+once `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` is flipped; today it
+accepts the shape, WARNs once per resolved table and counts
+`hoglake_blind_partitioned_appends_total`.
 pyhoglake supplies the basis itself, so a caller never has to. Grouping runs arrow-native where possible and per
 *unique* value (never per row) otherwise. Compaction groups only within
 `(spec_id, partition_values)` server-side, so partition-local file

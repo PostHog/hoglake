@@ -1,14 +1,13 @@
 # Iceberg federation — design obligations for v1
 
 What the initial hoglake design must get right so the read-only Iceberg
-REST facade ([README.md](../README.md), Decisions) works — and keeps
-working — as a federation participant. The theme: *mappability is a
+REST facade works — and keeps working — as a federation participant. The theme: *mappability is a
 property of the data model and the files, not of the facade code*, and
 several pieces are unretrofittable once a lake exists.
 
-Companions: [README.md](../README.md) (architecture + decisions),
+Companions: [README.md](../README.md) (architecture),
 [trino-integration.md](trino-integration.md) (the first consumer of
-this facade), [metadata-schema.md](metadata-schema.md) (what today's
+this facade), [server/schema.sql](../server/schema.sql) (what today's
 model looks like).
 
 ## 1. Field IDs in the parquet files (unretrofittable)
@@ -498,8 +497,7 @@ storage. Two v1 obligations:
 ## 7. Identity and snapshot mapping (mostly free, keep it that way)
 
 - `table_uuid` ↔ Iceberg `table-uuid`: already in the model; the
-  changefeed carries it (README key moves) — the facade uses the same
-  one.
+  changefeed carries it — the facade uses the same one.
 - hoglake snapshot ↔ Iceberg snapshot is 1:1; the snapshot's
   change-summary must be mappable to Iceberg's snapshot `operation`
   (`append` / `overwrite` / `delete` / `replace`) — a constraint on
@@ -510,12 +508,12 @@ storage. Two v1 obligations:
 
 ## 8. What stays out of scope (and why that's safe)
 
-Write-path Iceberg compatibility remains out (Decisions) — but see
+Write-path Iceberg compatibility remains out — but see
 [trino-integration.md](trino-integration.md) for the commit-shape
 choice that keeps an append-only write adapter a *translation* rather
-than a redesign. Facade freshness bounds (relevant only if
-Arrow-inline data files ever land) are covered in the README's
-inlining decision.
+than a redesign. Facade freshness bounds would be relevant only if
+Arrow-inline data files ever landed, and inlining is dropped entirely
+([ducklake-defect-ledger.md](ducklake-defect-ledger.md) §1).
 
 ## Checklist form (for the phase-2 spec)
 

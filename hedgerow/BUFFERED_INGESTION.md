@@ -68,7 +68,7 @@ and the destination client's upload filesystem. It must be thread-safe and must
 not override writer resource limits. Credentials are not stored in pending state.
 
 A complete uploaded-file commit request is persisted before publication. The
-new `POST /catalogs/{catalog}/commit/prepared` endpoint requires a UUID
+`POST /catalogs/{catalog}/commit/prepared` endpoint requires a UUID
 `idempotency_key` and atomically stores a receipt with the commit under the
 catalog lock. Exact retries return the original result. Different payloads with
 the same key fail. Receipts survive snapshot expiry. This deduplicates a work
@@ -100,8 +100,8 @@ endpoint rather than silently ignoring an unfamiliar request field.
   commit. A persistent DDL conflict requires operator reconciliation.
 - Receipts currently retain the complete request indefinitely. A receipt GC
   protocol needs an explicit replay horizon before any deletion is safe.
-- Native VARIANT is not JSON. The DuckDB writer pins stable 1.5.5 and
-  keeps payloads inside DuckDB. Catalog types and prepared-file physical validation are implemented; VARIANT
+- Native VARIANT is not JSON. The DuckDB writer keeps payloads inside DuckDB,
+  at the version [DUCKDB_WRITER.md](DUCKDB_WRITER.md) pins. Catalog types and prepared-file physical validation are implemented; VARIANT
   statistics are omitted. VARIANT compaction, reader interoperability still need implementation. No Arrow payload rewrite may be inserted: ordinary
   PyArrow read/write drops the native VARIANT annotation. Source-to-destination
   JSON column mappings are explicit at the library boundary; the CLI defaults

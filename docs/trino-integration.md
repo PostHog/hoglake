@@ -346,10 +346,10 @@ removes the value; an empty string is a distinct comment. Comments allow at most
 refused. `hoglake.`/`trino.` prefixes and `partitioning`, `sorted_by`, `location`,
 `format`, `comment` keys are reserved to avoid implied configuration behavior.
 
-Deploy the additive V11 migration and upgrade **all server replicas** before
-enabling metadata writes. Old server DDL can rewrite a version without preserving
-new metadata fields; a mixed-version fleet or downgrade after metadata use is not
-supported. The connector
+The additive V11 migration landed in 1.x and is applied in every environment;
+a mixed-version fleet below it, or a downgrade after metadata use, is not
+supported — old server DDL can rewrite a version without preserving new metadata
+fields. The connector
 requires `versioned-table-metadata-v1`; atomic creation uses `/metadata` and
 receipt version 6 only when metadata is present. Old replicas reject that endpoint
 or receipt. Metadata ALTER operation names (including `add_column_with_metadata`)
@@ -374,8 +374,8 @@ another commit; registered paths without retained references cannot be revived.
 An explicit `POST /v1/catalogs/{catalog}/uploads/schedule-expired?limit=1000` fences
 expired leases and queues abandoned paths, and returns how many it fenced. It does
 not run in a new background job and does not enable production cleanup. The
-existing cleanup drain still checks retained references under the commit lock
-before physical deletion.
+existing cleanup drain still checks retained references off any catalog lock, as
+a claimed work queue (V21), before physical deletion.
 
 Claim transitions do NOT take that lock. A writer claims one upload per output
 file, so taking the catalog's write-throughput bottleneck once per file bought
@@ -403,7 +403,8 @@ renewals, and permanent fencing metadata. A paused writer exceeding its lease ma
 fail if an operator reclaims it; it must retry with fresh paths. Unfinished worker
 aborts fence only their own paths; workers never directly delete claimed files.
 Uploads handed to the coordinator remain protected until publication or lease
-expiry. Claim support requires V12 and all server replicas upgraded before use.
+expiry. Claim support landed with V12 in 1.x and is applied in every
+environment; mixed-version fleets below it are unsupported.
 Claimed publication uses dedicated endpoints so old replicas refuse it. Older
 servers retain legacy writes without this reclamation guarantee. Python, DuckDB,
 hedgerow and the console can continue their existing paths; they do not claim or

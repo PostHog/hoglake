@@ -5,7 +5,8 @@ client. **DONE** = implemented and tested against the live dev stack;
 **PARTIAL** = implemented with named limits; **WIRE GAP** = blocked on
 the hoglake REST contract (see DESIGN.md server findings); **N/A** =
 deliberately not carried over (the fleet-liability list); **TODO** =
-client work not yet done.
+client work not yet done. Last checked against `openapi/hoglake.yaml`
+1.3.6-dev; re-sweep the WIRE GAP rows on each server release.
 
 ## Attach / catalog
 
@@ -25,7 +26,7 @@ client work not yet done.
 | Capability | Status | Notes |
 |---|---|---|
 | `CREATE SCHEMA` | DONE | eager DDL (own server snapshot; not rolled back) |
-| `DROP SCHEMA` | WIRE GAP | no namespace-drop endpoint |
+| `DROP SCHEMA` | TODO | DELETE `/catalogs/{c}/namespaces/{ns}` (`dropNamespace`) exists: emptiness precondition, no CASCADE, optional `expected_namespace_id` guard |
 | `CREATE TABLE` (+ IF NOT EXISTS) | DONE | flat hoglake type set only; `_hog` column prefix fast-fail |
 | `CREATE TABLE AS` | DONE | eager create at plan time (prepared-statement re-exec caveat) |
 | `DROP TABLE` | DONE | no CASCADE (as ducklake) |
@@ -36,7 +37,7 @@ client work not yet done.
 | `SET SORTED BY` | PARTIAL | DDL committed; sort-on-insert NOT applied by the writer yet |
 | `SET/DROP NOT NULL`, `SET DEFAULT` | WIRE GAP | not in AlterOp |
 | Nested-field ALTERs (`ADD/DROP/RENAME FIELD`) | N/A | flat wire schema |
-| `COMMENT ON` | WIRE GAP | no comment/tag storage |
+| `COMMENT ON` | TODO | AlterOps `set_table_comment` / `set_column_comment` / `set_properties` exist (`versioned-table-metadata-v1`) |
 | `CREATE VIEW` / views | TODO/WIRE-SHAPED | wire has views (dialect-tagged); binding duckdb-dialect views is client work not done |
 | `CREATE MACRO` / sequences / indexes / constraints beyond NOT NULL | N/A | as ducklake (unsupported there too) except macros |
 
@@ -76,7 +77,7 @@ client work not yet done.
 | Capability | Status | Notes |
 |---|---|---|
 | `AT (VERSION => n)` / `AT (TIMESTAMP => t)` | DONE | per-lookup entries at the historical schema; genuinely-historical reads tested (fixture-exported snapshot ids: V1 shows 3 of head's 5 rows; a pre-ADD-COLUMN read shows the 1-column schema) |
-| Attach-level pins | DONE | SNAPSHOT_VERSION and SNAPSHOT_TIME both tested, including the pin FORCING read-only without an explicit flag (INSERT refused; READ_WRITE+pin refused at attach) and explicit-UTC-offset timestamps parsed with instant semantics on both the AT() and SNAPSHOT_TIME paths; `hoglake_current_snapshot` under a SNAPSHOT_TIME pin errors (no client-resolvable snapshot id — server finding 9) |
+| Attach-level pins | DONE | SNAPSHOT_VERSION and SNAPSHOT_TIME both tested, including the pin FORCING read-only without an explicit flag (INSERT refused; READ_WRITE+pin refused at attach) and explicit-UTC-offset timestamps parsed with instant semantics on both the AT() and SNAPSHOT_TIME paths; `hoglake_current_snapshot` under a SNAPSHOT_TIME pin errors (closed on the wire: `TableInfo.read_snapshot_id` resolves it; answering from it is client work) |
 | `ducklake_snapshots` | DONE | `hoglake_snapshots(cat)` — paginated (fixes ducklake's full-list OOM; `page_size` param, page-boundary crossing tested); typed change rows (content asserted) |
 | `ducklake_table_info` | DONE | `hoglake_table_info(cat)` |
 | `ducklake_current_snapshot` | DONE | `hoglake_current_snapshot(cat)` |

@@ -137,17 +137,6 @@ green deploys on the rerun — the procedure in
 millpond's AGENT.md applies verbatim with `app=gigahog-server` /
 `app=gigahog-webui`.
 
-Bootstrap state (until all are done, CD dispatches fail or no-op):
-
-- [ ] repo secrets `GH_APP_CHARTS_DEPLOYER_APP_ID` /
-      `GH_APP_CHARTS_DEPLOYER_PRIVATE_KEY` exposed to this repo
-- [ ] charts side: golden-chart apps + `state/gigahog-*.yaml` seeded
-      AFTER the first image push (the seed digest must postdate the
-      code — docs/claude/new-app-image-releases.md in charts)
-- [ ] first images published (needs the repo visible to GHCR consumers)
-- [ ] Dependency Graph (+ GHAS for internal repos) enabled — the
-      dependency-review workflow errors on every PR without it
-
 ### Versioning
 
 Images deploy per-commit by SHA+digest (above); semver is release-only.
@@ -224,114 +213,22 @@ there would break that gate on every build.
    with an undrained row (path-reuse guard) and compaction
    pre-registers its output path as a `compaction_staging` claim
    settled `'registered'` on group commit — and only if cleanup has not
-   TOUCHED that ticket (below).
+   TOUCHED that ticket.
    **THE DRAIN IS A CLAIMED WORK QUEUE AND TAKES NO CATALOG LOCK
-   ANYWHERE** (V21). It used to hold the per-catalog commit lock across
-   its reference check, its deletes and its settle; the lock protected
-   nothing, because a commit passes `REMOVAL_QUEUE_COLLISION_SQL` only
-   when no UNDRAINED row names the path, the drain reads only undrained
-   rows, and every queue insert (expiry, retirement, compaction
-   staging) happens inside a transaction that already holds the commit
-   lock from its collision check to its commit — EXCEPT that two of the
-   four inserters take NO commit lock, and the proof has to name them:
-   `CompactionService.stageOutputPath`'s initial stage is an autocommit
-   INSERT, safe because the path is a UUID that sweep just minted and
-   nobody else knows; and `UploadService.fenceAndQueue` takes none
-   deliberately, serialized instead by the `hog_upload` ROW LOCK that
-   `UploadService.register` takes inside the commit transaction plus its
-   `CommitConflict` on a claim that is no longer active — THAT is the arm
-   the removed commit lock was standing in for. The standing constraint
-   that follows: a commit registering a path with no `hog_upload` claim
-   has no serializer against a concurrent queue insert for that path,
-   unreachable today only because paths are never reused.
-   What the lock cost was measured on gigahog-prod-us 2026-09-24: **~19 s
-   of held lock per 1,000-row sub-batch**, during which every commit on
-   the catalog waits — which is why cleanup is OFF in production; as of
-   2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h,
-   ~9.4k of them orphaned `compaction_staging` tickets past grace. Three steps now, and the
-   transaction boundaries are the design: **CLAIM** (`UPDATE ... WHERE
-   removal_id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`,
-   stamping `claimed_at`/`claimed_by`, committed BEFORE any
-   object-store call — so nothing is open across S3 and
-   `idle_in_transaction_session_timeout` bounds nothing here);
-   **WORK** (the reference check, then the deletes, no transaction and
-   no lock); **SETTLE** (one short transaction, fenced on `drained_at
-   IS NULL AND claimed_by = :worker`, `RETURNING` the rows it really
-   took — the rest are `settled_elsewhere`). `SKIP LOCKED` is why
-   `HOGLAKE_CLEANUP_WORKERS` (default 1) workers and any number of
-   replicas partition the queue with no coordination and no
-   single-flight lock. `HOGLAKE_CLEANUP_BATCH` is a budget PER WORKER, so
-   a run asks for `workers x batch` rows and the standing rate is
-   `workers x batch x 3600000 / HOGLAKE_CLEANUP_INTERVAL_MS` — **4,000
-   rows/h at the compiled defaults**, a floor nowhere near ~190k/h of
-   arrivals. THE DEFAULTS DO NOT CLEAR A BACKLOG; the values that do are a
-   chart change (a batch that keeps the workers busy, an interval near a
-   run's own duration, which the 19 s cold reference check sets). The boot
-   refusal is AGGREGATE with compaction —
-   `compactionParallelGroups + cleanupWorkers <= dbPoolSize -
-   FOREGROUND_CONNECTION_RESERVE` — because a worker holds a pooled
-   connection across that 19 s check, so at the production shape (pool 10,
-   reserve 4, groups 6) the pool must be raised before ANY worker count is
-   legal. A claim is a **LEASE**
-   (`HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS`, 900): a worker killed
-   between claim and settle leaves rows claimed until it lapses, and
-   the `claimed_by` fence is what stops the lapsed worker writing the
-   ledger afterwards. The RETURNING of the attempts bump is also what
-   `still_referenced` is COUNTED from: a compaction group that commits
-   between a claim and its reference check makes the path live, and
-   only the fence can tell that from a real violation. THE LEASE IS CLEANUP'S
-   ALONE: `commitGroup` re-reads its staging ticket `FOR UPDATE` and takes
-   it only if NOBODY HAS TOUCHED IT — `drained_at IS NULL AND claimed_at
-   IS NULL AND attempts = 0`, the same three terms in its `'registered'`
-   settle — because an expired claim does not mean the object survived, it
-   means nobody knows, and a row lock cannot stand between a DELETE no
-   transaction holds and a registration. A worker past its lease, a worker
-   killed after its DELETE, and a lost `DeleteObjects` response (which
-   bumps `attempts` and releases the claim) are the three routes; each
-   costs ONE GROUP (re-stage + `SkippedConflict`, fresh UUID next sweep)
-   rather than a live file row pointing at a deleted object. The drain
-   also reads back the rows its settle did not match and counts a
-   `'registered'` over a path it had already deleted as an invariant
-   violation with a `cleanup_violation` audit event — unreachable by the
-   above, and the only signature that state would ever have.
-   A bulk sub-batch is
-   `HOGLAKE_CLEANUP_SUB_BATCH` rows (1,000, and also the size of one
-   claim) and one `DeleteObjects` call PER BUCKET CHUNK (1,000 keys is
-   S3's own request ceiling) — not the 25 x (HeadObject +
-   DeleteObject) it was, where one hold ran ~3.2 s and a 2,000-row run
-   spent ~255 s holding the lock across 80 slices, took commit latency
-   from 200-400 ms to 12-22 s against the 30 s admission bound, and got
-   both API pods liveness-killed. `'absent'` is
-   PRODUCED only by `compaction_staging` rows — it also remains on
-   every row settled before batching landed, which the 30-day ledger keeps
-   visible — and those rows keep HeadObject + DeleteObject because
-   `/verify`'s `staging_tickets` arm reads that outcome. Because they
-   cost two round trips each they settle in their OWN sub-batches of 25,
-   which is now a unit of PROGRESS (each sub-batch settles in its own
-   transaction) rather than of lock hold. The worst case a claim can
-   hold is 1,000 tickets, ~128 s of round trips at the measured 64 ms,
-   which is why the CLAIM is reason-aware — a bulk claim is
-   `HOGLAKE_CLEANUP_SUB_BATCH` rows and one `DeleteObjects` per bucket
-   chunk, a staging claim is 25 tickets and 50 calls (500 s at the call
-   bound, inside the 900 s lease), where one mixed claim of 1,000 tickets
-   would have been 20,000 s of calls under a single lease. The old
-   `deadline_skipped` / `HOLD_BUDGET` machinery bounded a lock hold that
-   no longer exists and is GONE — the counter stays on the wire, always 0, because the
-   maintenance ledger holds rows that carry it. And the drain
-   leaves a staging row
-   alone until it is past `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h,
-   which must stay well under `/verify`'s 6 h staging-ticket age) so a
-   ticket whose group is still uploading is not settled out from under
-   it. `hoglake_files_removed_total` counts DISTINCT paths
-   (`objects_removed`), not the settled rows, which a duplicate path
-   makes two of. And the ledger purge is a LOOP OF BOUNDED DELETES paging
-   the primary key from the bottom (`LEDGER_PURGE_PAGE` ids per page, a
-   wall budget, stopping at the first page with nothing to purge): the old
-   single `DELETE ... WHERE drained_at < cutoff` had no access path at all
-   — every index on the table is partial on `drained_at IS NULL` — so it
-   was a sequential scan with an unbounded row count against a ledger
-   heading for ~137M rows, which is the shape of the 2026-09-28
-   expiry-lock outage.
+   ANYWHERE** (V21): CLAIM in its own transaction committed before any
+   object-store call, WORK with nothing open, SETTLE fenced on
+   `claimed_by`. A claim is a **LEASE**
+   (`HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS`, 900), not a lock, and the
+   `claimed_by` fence is what stops a lapsed worker writing the ledger
+   over the worker that took its row. THE LEASE IS CLEANUP'S ALONE:
+   `commitGroup` re-reads its staging ticket `FOR UPDATE` and takes it
+   only if NOBODY HAS TOUCHED IT, because an expired claim does not mean
+   the object survived — it means nobody knows.
+   The proof — the four-inserters-three-serializers argument, the
+   `hog_upload` row-lock arm, the staging carve-out, the `DeleteObjects`
+   ceiling, the ledger-purge shape and the production measurements — is
+   in server/README.md §Retention, expiry, and safe file removal, which
+   is the single home for it.
 5. **Expiry never passes head or (when `consumer_floor`) the min
    consumer offset**, and names the pinning consumer. Ranges below
    `earliest_snapshot_id` are 410 Gone — consumers reconcile, never
@@ -515,10 +412,14 @@ against ten million:
 - **2026-09-29, cleanup.** The drain re-checked every path's liveness
   under the commit lock: ~19 s per 1,000 paths on a table whose hot
   set does not fit the cache, every commit queued behind it. The lock
-  protected nothing (V21).
-- **2026-09-30, compaction.** The planner loaded every small file of a
+  protected nothing (V21). Cleanup was off in production until it came
+  out, and is ON in prod-us since 2026-09-29 at 60 s / batch 10,000 /
+  1 worker.
+- **2026-09-30, compaction. OPEN — the fix is on branch
+  `jakob/compaction-plan-bounded`, unmerged, where the other two shipped
+  (#220, #225).** The planner loads every small file of a
   table (9.9M rows, a correlated `array_agg` per row, an `ORDER BY`)
-  into a Kotlin list inside one transaction, then bin-packed in memory
+  into a Kotlin list inside one transaction, then bin-packs in memory
   for minutes. `idle_in_transaction_session_timeout` killed the
   connection at 30 s; every sweep failed for eleven hours. The groups
   it planned were then refused anyway: packed by bytes, checked by
@@ -530,18 +431,26 @@ gigahog-prod-us on 2026-09-30: one catalog, ~500k snapshots, retention
 across ~2,800 partitions, 96% of them under 60 KiB; ~50 commits/min of
 ~270 files × 25 columns each, rising 4-5× with pyhoglake's concurrent
 uploads; ~3,600 files added per minute; compaction retiring 64 files
-per 4-minute run. Any code path that is O(files of a table),
-O(snapshots) or O(commits) is O(ten million) here, and the growth rates
-are as important as the counts.
+per 4-minute run. The pod it all runs on: one maintenance replica with
+`dbPoolSize` raised to 16, which is what makes 6 compaction groups plus
+a cleanup worker legal against the reserve of 4. Any code path that is
+O(files of a table), O(snapshots) or O(commits) is O(ten million) here,
+and the growth rates are as important as the counts. Note also that
+these are PROD-US numbers and prod-us settings: dev and prod-eu carry no
+`maintenance:` block at all, so they run the chart defaults, and every
+tuning figure in this section and in server/README §Retention is
+prod-us-only.
 
 The rules. Every one of them was violated by the code above.
 
 - **Bound every fetch.** No statement on a maintenance or request path
-  reads an unbounded row set into memory. Every candidate, victim or
-  work-queue read has a `LIMIT` sized from the work the run can
+  may read an unbounded row set into memory. Every candidate, victim or
+  work-queue read must carry a `LIMIT` sized from the work the run can
   actually do (compaction: `maxGroupsPerRun × maxInputFiles`; cleanup:
-  the sub-batch; expiry: a file-count batch), and the ledger records
-  when the limit truncated. Selecting from a per-partition summary
+  the sub-batch; expiry: a file-count batch), and the ledger must record
+  when the limit truncated. Compaction's candidate read does not yet —
+  it is the 2026-09-30 shape above, and the branch named there is where
+  it gets one. Selecting from a per-partition summary
   (the sampler tier) and then fetching rows for the chosen buckets is
   the shape; "select everything and filter in Kotlin" is not.
 - **Bound every unit of work under a lock or inside a transaction.**
@@ -555,12 +464,20 @@ The rules. Every one of them was violated by the code above.
   of it happens between transactions, never inside one. Read what you
   need, commit, compute, open a new transaction for the write, and
   re-check under it what could have changed (liveness, claims). The
-  test suite is the guard: `PgTestSupport` runs test connections with
-  `idle_in_transaction_session_timeout = '2s'` (landing with the
-  compaction planner fix, branch `jakob/compaction-plan-bounded`), so a
-  transaction left open across slow work fails the test the way
-  production fails the pod. Do not raise that value to make a test
-  pass; split the transaction.
+  test suite is where the rule gets enforced, and today it is opt-in:
+  `PgTestSupport.freshDatabase(productionSession = true)` wires the pool
+  with `Database.SESSION_INIT_SQL`, so the test connection carries
+  production's own bounds — a 60 s `statement_timeout` and a 30 s
+  `idle_in_transaction_session_timeout` — and it is default OFF on
+  purpose, because a suite-wide bound would sit under the six-figure bulk
+  seeds and the drain tests that hold a transaction open across MinIO
+  round trips. A suite-wide guard at
+  `idle_in_transaction_session_timeout = '2s'`, so that a transaction
+  left open across slow work fails the test the way production fails the
+  pod, lands with the compaction planner fix on branch
+  `jakob/compaction-plan-bounded` (PR pending). Either way the rule is
+  the rule: do not raise the value to make a test pass; split the
+  transaction.
 - **Measure per-row cost, not per-statement cost.** A statement's
   plan says which index it uses; the per-row cost on production's
   access pattern (random heap reads on a 10M-row table versus PK-order
@@ -626,7 +543,9 @@ fixture size is, and what grows per commit and how it is purged.
   **The chain is append-only as of v1.0.0** (2026-09-11, the Gigahog
   deploy): `V1__init.sql` is FROZEN — never edit it; schema changes are
   new `V<n>__` migrations, and `schema.sql` must equal the fold of the
-  whole chain (the equivalence test enforces it). FKs with CASCADE,
+  whole chain (the equivalence test enforces it). There is no `V5__` —
+  the number is skipped, which Flyway allows and which nothing in the
+  repo explains; it is not a missing file. FKs with CASCADE,
   partial indexes for hot predicates, CHECK-constrained vocabularies
   (deliberate choice over PG enums while the vocabulary churns). No
   migration ledger hacks — Flyway owns it.
@@ -654,13 +573,12 @@ fixture size is, and what grows per commit and how it is purged.
     trade, and it is measured PER MIGRATION.** The exemption above says
     CIC MAY sit outside the window, not that it should be preferred.
     Both halves are table-size questions and neither answer transfers:
-    at `hog_file_removal`'s production size (164k undrained rows, PG
-    18.6) a plain build blocks INSERTs for 1.37 s and CIC takes 1.48 s
-    — no faster, two passes instead of one, so V16 blocks — while at
-    `hog_data_file`'s (5M rows, 175-byte keys) a plain build blocks
-    every commit in the fleet for 27-31 s against a 30 s admission
-    bound, so V17 does not. State the measurement in the file, from a
-    run rather than from the neighbouring migration.
+    on a small table a plain build can be no slower than CIC and one
+    pass instead of two (V16 blocks), while on the manifest a plain
+    build blocks every commit in the fleet past the admission bound
+    (V17 does not). State the measurement in the file, from a run
+    rather than from the neighbouring migration; each migration carries
+    its own figures.
     A blocking build's cost is seconds of blocked writes inside the 5 s
     window (V13's/V16's transactional shape, where a failure rolls back
     and writes no history row). A CIC's cost is that its phases WAIT
@@ -671,9 +589,8 @@ fixture size is, and what grows per commit and how it is purged.
     `pg_try_advisory_lock` instead of blocking inside it, because a
     blocked lock wait is an open statement with a live xmin and CIC
     parked behind a replica waiting on the very migration CIC belongs
-    to (a CHAIN, not a cycle, so the deadlock detector never fires;
-    measured 26 s / 58 s / 26 s for no waiter, a blocking waiter, a
-    polling one). What remains are FOREIGN snapshots — an operator's
+    to (a CHAIN, not a cycle, so the deadlock detector never fires).
+    What remains are FOREIGN snapshots — an operator's
     psql in a transaction, `pg_dump`, an RDS export, a logical-decoding
     reader — none of which carry hoglake's idle bound. So a CIC on a
     big table is announced in its file as an OUT-OF-BAND step
@@ -724,17 +641,15 @@ fixture size is, and what grows per commit and how it is purged.
     advances the retention floor. The OTHER half of that statement pair
     is `hog_data_file_path` / `hog_delete_file_path` (catalog_id, path)
     (V17): the drain's liveness check asks those two tables the same
-    question once per sub-batch, under the commit lock, and until V17
-    both legs were a full scan of the manifest — 190,884 buffers and
-    692 ms at 5M rows against 8,728 and 33 ms. NOT partial, because the
-    check covers "any file row, live or not". `hog_upload`'s leg needs
-    nothing: `UNIQUE (catalog_id, path)` (V12) is already that key, and its
-    fallback is bounded by the catalog's ACTIVE claims rather than by an
-    append-only history. The index is paid on the hottest write in the
-    system (+31 us and +7,343 bytes of WAL per file row, 1.47 GB/hour at
-    production churn; the index is 1,157 MiB / 243 bytes per row at 5M
-    rows), and it is built `CONCURRENTLY` — at that size a plain build
-    blocks every commit for 27-31 s, which reverses V16's trade on
+    question once per sub-batch, and until V17 both legs were a full
+    scan of the manifest (the V17 file carries the buffer counts). NOT
+    partial, because the check covers "any file row, live or not".
+    `hog_upload`'s leg needs nothing: `UNIQUE (catalog_id, path)` (V12)
+    is already that key, and its fallback is bounded by the catalog's
+    ACTIVE claims rather than by an append-only history. The index is
+    paid on the hottest write in the system, and it is built
+    `CONCURRENTLY` because at that size a plain build blocks every
+    commit past the admission bound — which reverses V16's trade on
     measurement rather than on analogy. What makes a concurrent build
     safe to deploy, and what still cannot make it safe on its own, is
     the CIC rule above.
@@ -792,38 +707,20 @@ fixture size is, and what grows per commit and how it is purged.
     an index there would be paid on every write and used by nothing;
     splitting that statement into two arms is the fix, and it is
     ticketed.
-    V19 IS ITS OWN MIGRATION, ahead of the rest of #193, and the split
-    is a DEPLOY decision rather than a tidiness one. **It takes no
-    ACCESS EXCLUSIVE lock**, so it needs no quiet window: pre-build it
-    out of band (`CREATE INDEX CONCURRENTLY IF NOT EXISTS`, after
-    checking `pg_stat_activity` for transactions older than a minute),
-    and the migration is the no-op it then is. **V20 carries the two
-    `ALTER TABLE`s and MUST be timed**, because both need ACCESS
-    EXCLUSIVE and an EXPIRY SWEEP HOLDS ACCESS SHARE ON `hog_table` for
-    its whole transaction (step 5 deletes from `hog_table_version`,
-    whose FK references it). A sweep that runs long makes V20's `SET
-    LOCAL lock_timeout = '5s'` fire, which rolls the migration back
-    cleanly and crash-loops the pod until the sweep finishes — the
-    designed behaviour, and a deploy that looks hung. Confirm no sweep
-    is in flight before promoting:
-
-    ```sql
-    SELECT pid, state, now() - xact_start AS xact_age, left(query, 120)
-    FROM pg_stat_activity
-    WHERE datname = current_database()
-      AND query ILIKE '%hog_snapshot%' AND state <> 'idle'
-    ORDER BY xact_start;
-    ```
-
-    and keep sweeps short while a lagging floor catches up with
-    `HOGLAKE_EXPIRY_BATCH` (snapshots per sweep, default 10,000; 1,000
-    with a five-minute interval on the maintenance workload, or
-    `POST .../maintenance/expire?batch=500` by hand). Do NOT raise
-    retention to make the sweep easier — that makes it zero-work and
-    the floor stops moving at all. V20 is TRANSACTIONAL, so a failure
-    rolls back and writes no history row and the next pod retries; V19
-    is not, so a half-applied V19 needs `flyway repair` before any
-    replica can validate again.
+    V19 and V20 are both applied in all three environments; the general
+    rule their split recorded stands. An `ALTER TABLE` migration against
+    `hog_table` MUST be timed, because an EXPIRY SWEEP HOLDS ACCESS
+    SHARE ON `hog_table` for its whole transaction (step 5 deletes from
+    `hog_table_version`, whose FK references it), so a long sweep makes
+    the `SET LOCAL lock_timeout = '5s'` fire, which rolls the migration
+    back cleanly and crash-loops the pod until the sweep finishes — the
+    designed behaviour, and a deploy that looks hung. Check
+    `pg_stat_activity` for an in-flight sweep before promoting one, and
+    do NOT raise retention to make the sweep easier: that makes it
+    zero-work and the floor stops moving at all. A TRANSACTIONAL
+    migration that fails rolls back and writes no history row and the
+    next pod retries; a non-transactional one half-applied needs
+    `flyway repair` before any replica can validate again.
 - **Change kinds** (`hog_snapshot_change.kind`) are the typed OCC
   vocabulary; adding one = migration + schema.sql + `ChangeKind` enum +
   conflict-rule review in `CommitService`. `object_id` is ONE column
@@ -860,8 +757,8 @@ fixture size is, and what grows per commit and how it is purged.
   ahead of its reclamation), not against a state the server produces.
 - **`GET .../tables` is the one unpaged listing that scales with data.**
   One row per live table, one statement, per-table work index-driven —
-  linear in the namespace. Measured on a Portola-shaped namespace (54k
-  tables / 270k files / 270k change rows, PG18, warm, serial):
+  linear in the namespace. Measured on a 54k-table namespace (270k
+  files / 270k change rows, PG18, warm, serial):
   **389-402 ms, 595,488 shared buffers, 9.16 MiB of JSON**, with the
   final `ORDER BY` spilling 595 temp blocks. The FILE rollup is 73% of
   the buffer traffic and the change-log lateral 27% — so the tempting
@@ -943,127 +840,51 @@ fixture size is, and what grows per commit and how it is purged.
   code sprinkled in a route.
 - **The request path never blocks the event loop, and the probe never
   borrows a request connection** (#218). `App.module` installs ONE
-  interceptor (`api/BlockingDispatch.kt`, `ApplicationCallPipeline`'s
-  `Plugins` phase) that runs the rest of the pipeline — routing, the
-  handler, serialization — under a bounded dispatcher of
-  `HOGLAKE_REQUEST_THREADS` threads, default `HOGLAKE_DB_POOL_SIZE`.
-  One seam, not ~90 `withContext` calls, because the failure mode of
-  the per-handler form is a new route that looks like its neighbours
-  and reintroduces the incident with nothing redding. Handlers ran on
-  `eventLoopGroupProxy-4-1` — Ktor sizes Netty's call group from
-  `availableProcessors` and the pod has one CPU — so a `commit/prepared`
-  waiting the 30 s admission bound owned the only thread, three 5 s
-  `/healthz` probes went unserved, liveness killed the pod, and the
-  restart discarded every queued commit. `Main.kt` also FLOORS NETTY'S
-  CALL GROUP, and only that (`HOGLAKE_NETTY_CALL_GROUP_SIZE`,
-  `max(4, availableProcessors)`), which is defence in depth, not the
-  fix. Ktor sizes the call group at `availableProcessors` exactly and
-  the worker group at `parallelism / 2 + 1`, so the same floor on the
-  worker group would RAISE it on every pod with more than two CPUs;
-  there is no `HOGLAKE_NETTY_WORKER_GROUP_SIZE` and there should not
-  be —
-  those threads do socket IO, not blocking work, and #218 produced no
-  evidence about them.
-  Excess requests QUEUE, and THE QUEUE IS BOUNDED BY AGE, NOT DEPTH.
-  The interceptor stamps `System.nanoTime()` before the hand-off and
-  FREEZES the wait at admission (`RequestAdmission.admit`), records
-  `hoglake_request_queue_wait_seconds`, sheds
-  a request whose wait already passed the admission bound with the
-  typed 503 + Retry-After BEFORE it borrows a connection
-  (`RequestAdmission.refuseIfQueueExhausted`, counted as
-  `hoglake_requests_shed_total`), and charges the rest of
-  the wait against the advisory-lock bound inside
-  `Locks.acquireCatalogCommitLock`
-  (`RequestAdmission.remainingLockTimeoutMs`, an ambient
-  `ThreadLocal.asContextElement` established at the same seam, floored
-  so a request never arrives with a useless remainder and never raised
-  above a bound an operator set lower). One budget, charged once: 25 s
-  queued plus a fresh 30 s lock wait was 55 s of server time for a
-  caller that had gone. FROZEN, not read live, and the difference is
-  not cosmetic: elapsed-since-dispatch grows with THE HANDLER'S OWN
-  EXECUTION, so `POST .../maintenance/compact` — a synchronous sweep on
-  the handler thread — would take the lock with the 1 s floor for every
-  group after the first 30 s of the run and 503 blaming a queue wait
-  that never happened. The seam lives in its OWN PHASE between
-  `Plugins` and `Call`, not in `Plugins`: same-phase interceptors run
-  in registration order, so at `Plugins` it shed AHEAD of `RequestId`
-  and the 503 went out with no `X-Request-Id` — the response class most
-  likely to be investigated being the one that could not be. A DEPTH cap was rejected — the number that
-  matters to a caller is how long it waited, and a cap turns a brief
-  burst into refusals while a slow wedge under it stays invisible.
-  The shed is judged at ADMISSION (when a call reaches a thread), so a
-  pool that never frees one queues rather than refuses, and
-  readiness-on-sustained-saturation is still the follow-up: today a
-  wedged pod answers `/healthz` 200 and stays in the Service.
-  Sizing at the pool rather than above it is the same argument
-  `HOGLAKE_COMPACTION_PARALLEL_GROUPS`' boot check makes, and it is a
-  BOOT REFUSAL for the same reason: handler threads above the pool
-  queue inside `getConnection` and 500 after Hikari's 5 s bound instead
-  of queueing in the dispatcher. `HOGLAKE_REQUEST_THREADS >
-  HOGLAKE_DB_POOL_SIZE` is refused naming both knobs, as are a
+  interceptor (`api/BlockingDispatch.kt`) that runs the rest of the
+  pipeline — routing, the handler, serialization — under a bounded
+  dispatcher of `HOGLAKE_REQUEST_THREADS` threads, default
+  `HOGLAKE_DB_POOL_SIZE`. One seam, not ~90 `withContext` calls, because
+  the failure mode of the per-handler form is a new route that looks
+  like its neighbours and reintroduces the incident with nothing
+  redding. The seam lives in its OWN PHASE inserted after `Plugins`, not
+  in `Plugins`: same-phase interceptors run in registration order, so at
+  `Plugins` it shed AHEAD of `RequestId` and the 503 went out with no
+  `X-Request-Id` — the response class most likely to be investigated
+  being the one that could not be. `/healthz`, `/livez` and `/metrics`
+  BYPASS the dispatcher (`PROBE_PATHS`, matched on a path normalised for
+  trailing slashes): they are the surfaces an operator reaches for
+  exactly when the queue is longest.
+  Excess requests QUEUE, and THE QUEUE IS BOUNDED BY AGE, NOT DEPTH. The
+  wait is FROZEN at admission (`RequestAdmission.admit`), not read live,
+  and the difference is not cosmetic: elapsed-since-dispatch grows with
+  THE HANDLER'S OWN EXECUTION, so `POST .../maintenance/compact` — a
+  synchronous sweep on the handler thread — would take the lock with the
+  1 s floor for every group after the first 30 s of the run and 503
+  blaming a queue wait that never happened. One budget, charged once:
+  the shed happens before a connection is borrowed, and the remainder is
+  charged against the advisory-lock bound
+  (`RequestAdmission.remainingLockTimeoutMs`, floored so a request never
+  arrives with a useless remainder and never raised above a bound an
+  operator set lower).
+  TWO BOOT REFUSALS. `HOGLAKE_REQUEST_THREADS > HOGLAKE_DB_POOL_SIZE` is
+  refused naming both knobs — handler threads above the pool queue
+  inside `getConnection` and 500 after Hikari's 5 s bound instead of
+  queueing in the dispatcher, which is the same argument
+  `HOGLAKE_COMPACTION_PARALLEL_GROUPS`' boot check makes — as are a
   dispatcher of zero threads, a probe timeout under Hikari's own 250 ms
   floor, and a call group of zero. The default reserves NOTHING for the
   background loops: on the API workload the chart turns them all off,
   but a pod that runs loops and serves traffic should set
   `HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
   runs. SHUTDOWN ORDER IS PART OF THE FIX: `Main.kt` stops the ENGINE
-  first and only then closes the loops and the pools, and both new
-  pools close with `shutdown()` + a bounded wait rather than
-  `shutdownNow()` — interrupting an in-flight commit to save a second
-  of shutdown is the behaviour #218 complains about.
-  `/healthz`, `/livez` and `/metrics` BYPASS the dispatcher
-  (`PROBE_PATHS`, matched on a path normalised for trailing slashes —
-  MEASURED: `/healthz/` is a 404 today, because this server does not
-  install Ktor 3's `IgnoreTrailingSlash`, and normalising makes it a
-  FAST 404 rather than a queued timeout and removes the trap where
-  installing that one-line plugin later would route a real probe
-  through the saturated pool with nothing redding) — they are the
-  surfaces an operator reaches for exactly when the queue is longest — and `/healthz` runs on its own threads over
-  its own ONE-CONNECTION pool (`HealthProbe`),
-  bounded four ways by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` (Hikari
-  `connectionTimeout`, pgjdbc `connectTimeout`/`socketTimeout`, session
-  `statement_timeout`) with a wall-clock deadline of twice it. The
-  zombie-server property is unchanged — a database that does not answer
-  is still a 503 — but "the pool is busy serving commits" is no longer
-  indistinguishable from it. The deadline ABANDONS its task rather than
-  cancelling it (`withTimeoutOrNull` cannot interrupt a blocking JDBC
-  call), and probes single-flight WITH AN AGE BOUND: an in-flight
-  attempt is joined only while it is younger than its own deadline,
-  because joining on "still running" alone lets one hung task pin
-  `/healthz` at 503 for the rest of the pod's life — a permanently
-  unready pod, the same outage in a different costume. Past that it is
-  abandoned and a fresh attempt runs on the SECOND thread (which is why
-  there are two, and why two is also the cap: with both hung the probe
-  refuses to launch a third and answers 503, so a permanent hang costs
-  a fixed number of parked threads).
-  Metrics: `hoglake_db_pool_active`/`_idle`/`_pending`/`_max` (Hikari's
-  request pool; `pending > 0` is the alert — a caller queued inside
-  `getConnection` with 5 s before it is a 500),
-  `hoglake_request_pool_active`/`_queued`/`_max` (the dispatcher) and
-  the `hoglake_request_queue_wait_seconds` histogram (what the
-  saturation cost), `hoglake_request_queue_abandoned_total` (calls that
-  left the queue without ever reaching a thread — the histogram is
-  CONDITIONED ON SURVIVAL, so under a convoy bad enough that callers
-  give up first the surviving waits are the SHORT ones and its p99 can
-  FALL while the instance gets worse; read the two together),
-  `hoglake_requests_shed_total` (refusals at handler entry — NOT in
-  `hoglake_commits_total{result="timeout"}`, because a shed request is
-  refused before Routing has parsed a catalog to tag, and for the same
-  reason it carries no `route` tag) and
-  `hoglake_health_probe_attempts_hung` (the probe's outstanding
-  attempts; 2 is the cap and an ABSORBING STATE — two hangs park both
-  threads forever and `/healthz` then answers 503 indistinguishably
-  from a dead database, so 2 against a live Postgres means restart the
-  pod). Handlers queued in the dispatcher hold no catalog
-  connection; handlers pending on Hikari do, so the two families are
-  read together. The pool gauges are read straight off the pools at
-  scrape time — no sampler — and the Hikari MXBean is resolved INSIDE
-  each lambda, because a reference captured at registration can be null
-  (the pool is lazy) or stale across a reopen, and a gauge frozen on a
-  dead pool reports calm while the live one saturates. `active` counts
-  THREADS and is an approximation; `queued` counts calls waiting for
-  their FIRST thread and is NOT `executor.queue.size`, which also holds
-  the re-dispatch of every already-admitted coroutine that resumed.
+  first and only then closes the loops and the pools, and both new pools
+  close with `shutdown()` + a bounded wait rather than `shutdownNow()` —
+  interrupting an in-flight commit to save a second of shutdown is the
+  behaviour #218 complains about.
+  The incident narrative, the Netty call-group floor, the probe's own
+  pool and threads, and the full pool/dispatcher metric roster are in
+  server/README.md §Background assembly and §Observability, which is the
+  single home for them.
   The Ktor TEST ENGINE cannot see any of this: it has no call group and
   no event loop, so a blocked handler starves nothing and `/healthz`
   answers whether or not the fix exists. The property is pinned against
@@ -1306,199 +1127,17 @@ fixture size is, and what grows per commit and how it is purged.
 
 ## Known deferrals / open items
 
-- **Compaction (M4) — 100% implemented**: `server/compaction/` —
-  planning is metadata-only (live, same spec + partition values;
-  adjacency NOT required) and ONE-PASS BIN PACKING. Sort a bucket's
-  candidates by SIZE, pack until their bytes reach
-  `HOGLAKE_COMPACTION_TARGET_BYTES` or the group holds
-  `HOGLAKE_COMPACTION_MAX_INPUT_FILES` (64), close, carry on; the
-  trailing remainder is a group too. A group is dropped unless it holds
-  `min(HOGLAKE_COMPACTION_MIN_INPUT_FILES, target / its largest file)`
-  files, floored at 2 — the minimum SCALES, because a fixed file count
-  cannot judge a byte target and a fixed 5 silently means "never
-  compact" for any bucket whose files exceed a fifth of the target
-  (every sorted table, whose target is derated for heap). Size order is
-  load-bearing: outputs inherit `min` row id, so in row-id order a big
-  output blocked the small files behind it forever. Output compression is
-  `HOGLAKE_COMPACTION_CODEC` (default **zstd** at
-  `HOGLAKE_COMPACTION_ZSTD_LEVEL` 3; snappy/gzip/lz4_raw/uncompressed
-  also legal, an unknown name refused at boot). Not a per-file detail:
-  compaction rewrites a table's rows into target-sized files and then
-  leaves them alone, so it is the codec a compacted table is stored and
-  scanned under from then on. It was UNCOMPRESSED — inherited from
-  `ExampleParquetWriter`'s default, never chosen — which made every
-  merge a permanent decompression of clients that write snappy (pyarrow
-  and DuckDB defaults) or zstd (hedgerow), measured at 1.4-1.8x the
-  input bytes. An input's codec is never an instruction; the rewrite
-  decodes and re-encodes.
-  A table's plan is fixed before execution:
-  outputs are never re-compacted within that run, and the file minimum
-  keeps them from being re-compacted in later runs either. Input bytes
-  estimate the output size; encoding and DV removal change it. The
-  existing max-groups-per-run budget still caps executed attempts. Rewrite via **parquet-java**
-  (the project's one parquet library — decision 2026-09-05: Hardwood is
-  out of main code entirely (the trino test fixtures still use
-  hardwood-core to produce id-less parquet — deliberately); parquet-java handles footer reads in the hydrator AND
-  the compaction writer), commit under the catalog lock with input
-  re-verification. **DV-bearing files compact — LANDED**: the rewrite
-  APPLIES each input's live DV (puffin `deletion-vector-v1`, read via
-  `PuffinDeletionVector`) — survivors keep their ids in `_hog_row_id`,
-  deleted ids are gone forever, the DV rows end-snapshot with their
-  files, and the commit re-verifies the exact planned DV identity (a
-  vector that grew/appeared since planning skips the group:
-  `dv_superseded` — a post-plan delete is never dropped).
-  **Heterogeneous-schema groups — LANDED**: inputs map to the LIVE
-  schema by field id (missing columns null-fill, int→long/float→double
-  up-cast, unsigned int32→long ZERO-extension, dropped field ids drop
-  their data); only a live column unproducible from an input's physical
-  type skips the group (`unconvertible_schema`). The rewriter applies
-  the same unsigned-annotation domain rule as the hydrator's footer
-  decode (`ColType.maxUnsignedParquetWidth`) so compaction cannot
-  launder an annotation the hydrator refuses. **Aborted-upload orphans — LANDED**: the
-  output path pre-registers as an undrained `hog_file_removal` row
-  (reason `compaction_staging`) before upload; a successful group
-  commit settles it (`drained_outcome='registered'`) in the same
-  transaction, an aborted group leaves it for the normal cleanup drain
-  to reclaim, and the commit re-claims the ticket first so a drain that
-  won the race just aborts the group. Still deliberate: the background
-  loop defaults OFF (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) — flipping it
-  on is an ops decision, not a code gap.
-  **A GROUP COSTS A FIXED AMOUNT OF WALL TIME, and that is the shape
-  every throughput knob here answers.** Measured on gigahog-prod-us
-  (2026-09-24, catalog millpond-prod-us, `main.events_raw`): ~8.5 s per
-  group whatever the group holds, because the cost is object-store
-  LATENCY — the serialized opens, the plan, the commit — and not bytes.
-  Three knobs overlap it, and only the middle one is on by default.
-  `HOGLAKE_COMPACTION_PARALLEL_GROUPS` (**default 1**, which is the
-  sequential sweep exactly: no executor, groups on the calling thread,
-  tables planned and executed one at a time as before) runs that many of
-  a sweep's planned groups at once. The sweep plans and executes PER
-  TABLE, deliberately — planning every table up front would make the
-  last table's plan as old as every rewrite before it, which at 64
-  groups and ~8.5 s each is minutes of staleness arriving at a commit.
-  A wave is joined whole (the slowest group bounds it) and drawn from
-  ONE table's queue, so a table with fewer groups than the knob runs at
-  its own group count: the knob is a ceiling, not a promise. Groups
-  share no input file by construction, so the only serialization between
-  them is the per-catalog commit lock, which the commit transaction
-  takes ALONE — never across the rewrite or the upload, and there is a
-  test that blocks a rewrite mid-read and takes the real lock to prove
-  it. Compaction's commit now passes `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`
-  like every other acquirer (a timeout anywhere in the commit
-  transaction — the advisory lock or a row lock in the tail, since the
-  setting is transaction-local — is a counted race, not a failure),
-  because N workers queued on an untimed lock hold N pooled connections
-  and turn foreground commit backpressure from a typed 503 into a
-  connection-pool 500. That is also why boot REFUSES
-  `parallelGroups > HOGLAKE_DB_POOL_SIZE - 4` (default pool 10, so the
-  ceiling is 6); the four are a floor, not a model — the other
-  background loops draw on the same pool. Raising the knob wants the
-  pool and the pod's CPU raised with it, and it DIVIDES
-  `HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (see below).
-  **Cancellation stops the sweep on BOTH paths.** The table loop and the
-  wave loop check this thread's interrupt flag, `executeGroup` restores
-  it when a caught `Throwable`'s cause chain holds an interrupt (the
-  object-store client translates it and sometimes clears the flag), and
-  `runOnceAllCatalogs` rethrows rather than treating cancellation as a
-  per-catalog failure and sweeping the rest of the fleet. The sweep
-  throws `SweepInterrupted` — an `InterruptedException` carrying the
-  PARTIAL tally — so the ledger row for a cancelled sweep still counts
-  the groups that committed; those commits are durable, and a row saying
-  otherwise is the same lie an uncounted swallow tells.
-  `HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` (**default 8**) opens that
-  many of one group's inputs at a time; merge order and the streaming
-  memory bound are both preserved — only the `open` round trips overlap,
-  an open-but-unread input holds its parsed footer rather than a
-  readahead buffer, and the rewrite still consumes inputs in order on
-  one thread. Measured on a synthetic 64-file group against a MinIO
-  container: 435 ms sequential, 74 ms at 8 (and the double open per
-  input — once for the schema, once for the rows — is gone). It is the
-  one of the three that is ON by default, so its footprint is worth
-  stating: the worst case is `parallelGroups x inputOpenParallelism`
-  readers holding a parsed footer each, capped at
-  `S3InputFile.DEFAULT_MAX_PREFETCH_BYTES` (64 MiB) — 6 x 8 x 64 MiB at
-  the highest `parallelGroups` a default pool allows, against kilobytes
-  per footer for every real file. The window is per GROUP and is not
-  divided by `parallelGroups`.
-  **The sorted-path heap budget is DIVIDED by the group concurrency,
-  not gated.** `sortedHeapBytes / parallelGroups` is what
-  `CompactionConfig.sortedRowCeiling` converts to a row ceiling, so N
-  concurrent sorted groups cannot exceed what one group was allowed, and
-  the bound is arithmetic evaluated at planning time rather than a
-  runtime invariant holding a permit across object-store IO. The price
-  is proportionally smaller sorted groups whether or not a sweep ever
-  runs two at once; at the default of 1 the arithmetic is bit-identical
-  to what it was. BOTH arms are divided — the density arm (a statement
-  about rows) and the nested arm (a statement about bytes) — because
-  they estimate the same heap by different routes and the tightest wins,
-  so leaving either undivided lets N groups take N heaps. At a high N
-  the divided ceiling plus the SCALING file minimum can stop a sorted
-  table forming groups at all; that is the cost, and it is why the
-  default is 1. A gate would preserve sorted group SIZE and is the
-  alternative if that ever bites — but the real fix is the external
-  merge sort `CompactionConfig.sortedHeapBytes` already describes,
-  which removes the ceiling and the division together.
-  **Two maintainers do not rewrite the same group: they CLAIM it**
-  (`hog_compaction_claim`, V15, `HOGLAKE_COMPACTION_CLAIMS_ENABLED`
-  default on). **A claim is an optimization, never authorization** —
-  correctness against a concurrent rewrite is, and stays, the
-  plan-to-commit re-verification under the commit lock, and a change
-  that makes the commit path trust a claim turns an advisory lease into
-  a correctness dependency on two clocks. What it removes is waste: two
-  replicas planning the same candidate set both rewrote and uploaded
-  every group and one of the two was discarded at commit (a 547 s
-  production sweep committed 34 groups and lost 30 that way, counted
-  `skipped_conflicts`). The key is a hash of the group's spec, partition
-  values and sorted input file ids — the identity of the WORK, so two
-  replicas compute it with no coordination — while the planner's skip is
-  by input-file OVERLAP, because a replica planning a moment later packs
-  the same files under a different key. A claim is released when its
-  group does NOT commit and deliberately KEPT when it does: the inputs
-  are dead, and the other maintainer's stale plan still names them, so
-  the row is what turns its arrival into a counted `claimed_elsewhere`
-  instead of a wasted rewrite. A kept claim gets its own lease
-  (`HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS`, 600 s), sized for
-  what it has to cover: the age of a sibling's PLAN, which is one whole
-  sweep — ~544 s for 64 groups at the measured 8.5 s each, not one sweep
-  INTERVAL. The cost is `committed groups per sweep x lease / sweep
-  duration` rows per table, about 70 at production settings, whose
-  `input_file_ids` the planner reads on every pass.
-  `expires_at` is the only liveness
-  protocol (`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS`, 900 s) — there is no
-  heartbeat, so a killed maintainer costs one lease and nothing else —
-  and the bulk purge at the head of each sweep clears the rest. That
-  purge is not gated on `HOGLAKE_COMPACTION_CLAIMS_ENABLED`, so turning
-  the CLAIMS off still clears what they left; it does live at the head
-  of a SWEEP, so turning compaction off stops it like everything else.
-  `/verify`'s `compaction_claims` check is what reds when that purge
-  stops running or an expired claim outlives its table; both arms
-  require the claim to be well PAST its expiry, because a live claim on
-  a dropped table is the normal state of a group that just committed,
-  and the gap between expiry and the next sweep's purge is a correct
-  system. **Nested schemas rewrite** —
-  list/struct/map are copied through recursively (the plan is a tree of
-  steps; parquet-java's Group API already is one), so a nested table is
-  compactable like any other; an input whose nested SHAPE disagrees with
-  the live column is `unconvertible_schema`, never a guess. A fault that is DURABLE and
-  the WRITER's is the OTHER typed skip, `invalid_data`: a value that
-  cannot exist under the type its own file declares (an empty blob under
-  a decimal, an unscaled value past the destination precision, a row
-  past `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW`), a file whose schema
-  contradicts its own `explicit_row_ids` registration (invariant 2's
-  reserved field id present or absent), or a registered `.dv` object
-  whose bytes do not decode — the decoder's refusals, including the
-  containment around the roaring library, about bytes it already holds;
-  the object-store FETCH stays retryable. Durability and fault are the
-  axis, not values-versus-schema — a schema skip clears when the schema
-  or the file set moves, and this one never does, so it is re-planned
-  and re-refused every sweep and a nonzero count is a writer bug rather
-  than a backlog. Remaining
-  rewrite deferrals (all surface as `unconvertible_schema` skips, never
-  wrong bytes): INT96, decimal-scale changes, and non-native
-  time(stamp) units — each timestamp type accepts only the unit its own
-  files carry (millis for `timestamp_s`/`timestamp_ms`, micros for
-  `timestamp`/`timestamptz`, nanos for `timestamp_ns`), and `time`
-  stays micros-only. No unit CONVERSION exists, because no legal
+- **Compaction (M4) — 100% implemented**, so what belongs here is only
+  what is still deferred. The design — one-pass bin packing, the scaling
+  minimum, the two knobs, the claim, the sorted-heap bound, the typed
+  skips and their measurements — is in server/README.md §Sort orders and
+  compaction, the single home for it.
+  Remaining rewrite deferrals (all surface as `unconvertible_schema`
+  skips, never wrong bytes): INT96, decimal-scale changes, and
+  non-native time(stamp) units — each timestamp type accepts only the
+  unit its own files carry (millis for `timestamp_s`/`timestamp_ms`,
+  micros for `timestamp`/`timestamptz`, nanos for `timestamp_ns`), and
+  `time` stays micros-only. No unit CONVERSION exists, because no legal
   promotion produces a unit mismatch: `PROMOTIONS` follows DuckLake's
   documented table, which has no timestamp rungs.
 - **Field ids are a contract**: the hydrator's footer read flags files
@@ -1515,7 +1154,7 @@ fixture size is, and what grows per commit and how it is purged.
   endpoint is metadata-only by design and can't do the S3 footer reads
   this check needs.
 - **Maintenance verify — LANDED**: `POST
-  /v1/catalogs/{c}/maintenance/verify` (schema-gaps review item B3, absorbing B4) — the
+  /v1/catalogs/{c}/maintenance/verify` — the
   QE suite's global-invariant SQL as a metadata-only, read-only
   endpoint (REPEATABLE READ MVCC snapshot, no catalog lock), and the
   same code a background sweep runs. **Twelve** checks: row-id tiling
@@ -1561,27 +1200,27 @@ fixture size is, and what grows per commit and how it is purged.
   INNER side.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
-  NOT yet in CI and not yet released — no path-scoped workflow, and its
+  NOT yet in CI and not yet released as of 2026-09-30 (four server
+  releases into that state) — no path-scoped workflow, and its
   `duckdb` / `extension-ci-tools` trees are gitignored pinned clones
   rather than submodules (the repo root was out of the branch's write
   scope; they become submodules on extraction to a standalone
-  community-extension repo). Its DESIGN.md ends with 11 numbered
-  **findings for the server** — wire gaps (no namespace drop, no
-  `explicit_row_ids` on `FileRegistration`, no snapshot id on
-  create/alter responses, head-only listings, no timestamp→snapshot
-  resolution) that each cap a parity item. No server changes were made
-  for them.
+  community-extension repo). Its DESIGN.md ends with numbered
+  **findings for the server**; the two still open are no
+  `explicit_row_ids` on `FileRegistration` (#30) and head-only listings
+  (#28), each capping a parity item.
 - **CDC publications to Kafka (the WAL tap)**: fully specified in the
   OpenAPI (501s) + README; not implemented.
 - **DR/export**: `GET /v1/catalogs/{c}/export` specified in the OpenAPI
   (snapshot range + live-file manifest + consumer offsets, consistent
-  at head); 501 stub until built (schema-gaps review item B5).
+  at head); 501 stub until built.
 - **Iceberg REST facade + Trino**: design obligations in
   [docs/iceberg-federation.md](docs/iceberg-federation.md) /
   [docs/trino-integration.md](docs/trino-integration.md); v1 schema already
   conforms (typed bounds, Iceberg transforms, DV-only deletes).
 - **Auth**: out of scope for v1; audit actor is `anonymous` until it
-  lands. Decision space in README §AuthN/Z.
+  lands. README §Status says the same and there is no decision record
+  beyond it.
 - pyhoglake implements `truncate[W]` partition transforms; the server's
   Transform vocabulary doesn't include truncate yet (client-ready,
   server gap).
@@ -1601,8 +1240,8 @@ review and the language retrospective) was retired in the 2026-09-17
 docs pass: each had done its job informing the as-built system, and git
 history holds them.
 
-**Design** — [docs/metadata-schema.md](docs/metadata-schema.md) (the
-schema, table by table) ·
+**Design** — [server/schema.sql](server/schema.sql) (the schema, table
+by table, with each index's rationale beside it) ·
 [docs/iceberg-federation.md](docs/iceberg-federation.md) /
 [docs/trino-integration.md](docs/trino-integration.md) (engine
 surfaces).

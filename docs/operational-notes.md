@@ -1,5 +1,11 @@
 # Operational Notes — hoglake at 2PB / 1T rows (2026-09-05)
 
+This file is the PRE-DEPLOY PROJECTION, written from bench figures before
+hoglake ran in production. Where production has since measured a number this
+file predicts, the measured one is in [AGENT.md](../AGENT.md) §Scale doctrine
+and [server/README.md](../server/README.md); read those first, and this for
+the shape of the problem.
+
 Scale context: the DuckLake deployment hoglake replaces stands at 2PB
 and ~1T rows. The straight answer to "how does hoglake improve on
 this": at this scale hoglake changes almost nothing about the *data
@@ -19,18 +25,25 @@ the liability, and the incident generator.
 
 ## What changes, quantified against DuckLake's observed numbers
 
-| DuckLake at scale (observed) | Hoglake | How |
-|---|---|---|
-| Commit loads stats for the entire catalog: 5–7s/attempt at 59K tables / 3.7M stats rows; 190–264s commits under OCC retry | p50 2.0–3.6ms commits, flat vs. preseeded history (bench) | Write-set-scoped commit; O(catalog) loads structurally impossible. ~5 orders of magnitude on the pathological end |
-| OCC conflict = snapshot-PK collision; retry re-pays the whole commit | Typed change rows, one indexed anti-join; appends never conflict with appends | `hog_snapshot_change` + `(catalog, object, kind, snapshot)` index; bench: k=8 writers, 368 commits/s, 0 conflicts |
-| Expiry ~14ms/snapshot → ~50h to drain a 15.3M-snapshot backlog; DDL churn grows it forever | 5.6–14.5K snapshots/s (bench), continuous incremental sweeps | Range deletes + cascade; ~100–200× drain rate, continuous instead of cron-batched |
-| 99.4% of stats rows for dropped tables; purging them bought 30–50× | Unrepresentable | FK `ON DELETE CASCADE`; drop/expiry removes stats rows with the file rows |
-| 50M orphaned partition-value rows; 9.99M-row phantom deletion queue | Unrepresentable | FKs + drain-time liveness check; the queue is a suggestion, never an authorization |
-| Compaction recovery emitting 60–180s commits → convoy, 13 restarts | `max_groups_per_run` (default 1) per sweep; commit is small metadata under the lock; execution entirely outside any transaction | The 2026-09-04 incident shape designed out: foreground writers wait ms, never on S3 IO |
-| Two engines, one catalog (millpond upstream + viaduck fork); drift; fork fixes never reaching maintenance | Exactly one catalog implementation, deployed once | Fork-drift / extension-distribution / OOM-loop class dies |
-| CDC: `table_changes()` read-barrier crawl; every consumer hand-builds cursors; expiry silently destroys unread ranges | Changefeed API + catalog-resident consumer offsets + retention floor + 410 | hedgerow rows-then-offset, halt-on-incarnation; expiry *pages* when a consumer pins instead of silently losing its data |
-| Rowid reuse on upsert-recreate; sorted compaction silently remaps rowids | Server-assigned, never-reused, `explicit_row_ids` through compaction | Every CDC consumer's defensive machinery at 1T rows — retired |
-| Recovery artisanal (split-brain reconstructed from S3 delete markers) | Liveness-checked soft deletion + forensics ledger + audit trail keyed to principals | The drain ledger keeps what was deleted, when, why, after how many attempts |
+The row-by-row record of what the predecessor did, and where hoglake answers
+each, is [docs/ducklake-defect-ledger.md](ducklake-defect-ledger.md); the
+design comparison and the bench figures are the two tables in the
+[repository README](../README.md) (§Compared to DuckLake and Iceberg,
+§Performance), which are the single citation for both. Three differences have
+no entry in either:
+
+- **One catalog implementation, deployed once.** The predecessor ran two
+  engines against one catalog (an upstream extension and a fork), so fork
+  fixes never reached maintenance. Fork drift, extension distribution and the
+  per-connection OOM loop are all that arrangement, not the data.
+- **CDC is a catalog concern, not a consumer's.** `table_changes()` was a
+  read-barrier crawl with every consumer hand-building cursors, and expiry
+  silently destroyed unread ranges. Here the changefeed, the consumer offsets
+  and the retention floor are catalog state, and expiry *pages* when a
+  consumer pins instead of losing its data.
+- **Recovery is a ledger read, not archaeology.** A split brain on the
+  predecessor was reconstructed from S3 delete markers. The drain ledger keeps
+  what was deleted, when, why and after how many attempts.
 
 ## The catalog's own size at 2PB / 1T rows (the sizing question)
 
@@ -63,13 +76,14 @@ the liability, and the incident generator.
 2. **Read scaling.** Facade/Trino planning reads hit the service →
    one PG. Snapshot-pinned reads are replica-able (lag-tolerant by
    construction), but that's not built yet.
-3. **Compaction IO cost at 2PB.** The never-convoy design (one group
-   per sweep, full download+rewrite locally, heap-materialized
-   survivors) deliberately throttles compaction *throughput*. At 2PB
-   with continuous small-file ingestion, whether
-   `max_groups_per_run=1` keeps up with the small-file accumulation
-   rate is a real capacity-planning question — the knob exists; the
-   tradeoff is intentional.
+3. **Compaction IO cost at 2PB.** The never-convoy design streams both
+   ends (`S3InputFile` / `S3OutputFile`) and touches no local disk;
+   only the sorted path materializes survivors in a heap. A sweep
+   rewrites `max_groups_per_run` × `parallel_groups` groups — 1 × 1 at
+   the compiled defaults, 64 × 6 on gigahog-prod-us. At 2PB with
+   continuous small-file ingestion, whether those knobs keep up with
+   the small-file accumulation rate is a real capacity-planning
+   question — the knobs exist; the tradeoff is intentional.
 4. **Consumer-floor pinning at 2PB.** A stuck consumer pins expiry →
    end-snapshotted files accumulate as storage. DuckLake's answer was
    silent loss; hoglake's is bounded staleness + a page. Correct
