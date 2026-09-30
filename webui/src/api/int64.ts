@@ -100,6 +100,21 @@ const INT64_FIELDS = new Set([
   "objects_removed",
   "settled_elsewhere",
   "deadline_skipped",
+  "receipts_purged",
+  "receipts_purge_failures",
+  // The database-health tables list: every int64 column it SORTS on has
+  // to be here or `int64Column` marks every row absent and the header
+  // sorts nothing while showing an arrow. `total_bytes` was already
+  // present (partition stats use the name); these six were not, so six
+  // of the list's seven numeric columns were inert — found in review of
+  // #240, which added the `toast` column and inherited the bug.
+  "toast_bytes",
+  "table_bytes",
+  "index_bytes",
+  "live_tuples",
+  "dead_tuples",
+  "seq_scans",
+  "index_scans",
   "groups_compacted",
   "files_in",
   "files_out",

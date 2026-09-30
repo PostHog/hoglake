@@ -118,6 +118,52 @@ object Metrics {
     }
 
     /**
+     * hoglake_commit_receipt_unknown_digest_version_total{catalog} — a
+     * replay whose stored receipt digest carries a version byte this
+     * build does not know (#240, V24).
+     *
+     * ZERO FOREVER IS THE EXPECTED VALUE. It can only become nonzero
+     * after [com.posthog.hoglake.commit.COMMIT_FINGERPRINT_VERSION] is
+     * bumped — which is required whenever the canonical fingerprint
+     * string changes shape — and then only for replays of receipts
+     * written before that deploy, i.e. for at most one
+     * HOGLAKE_RECEIPT_RETENTION_SECONDS window. Each one was answered
+     * with the stored snapshot rather than a refusal, which is the right
+     * answer and an invisible one: this counter is the only way an
+     * operator learns that the bump is in force and how many replays it
+     * is covering.
+     *
+     * A nonzero rate with no recent deploy means something is writing
+     * receipts this build cannot read — a rolled-back binary, or two
+     * versions of the format live at once.
+     */
+    fun commitReceiptUnknownDigestVersion(catalog: String) {
+        increment("hoglake_commit_receipt_unknown_digest_version_total", 1.0, "catalog", catalog)
+    }
+
+    /**
+     * hoglake_commit_receipt_purge_failures_total{catalog} — pages of
+     * the commit-receipt retention purge that threw (#240, V24).
+     *
+     * The purge is fenced so it can never fail the drain it rides, so
+     * without this a page that times out is indistinguishable on every
+     * surface from "nothing was eligible": `receipts_purged` reads 0
+     * either way. That matters most for the one-time legacy backlog,
+     * where the rows carry ~82 TOAST chunks each and a page is the only
+     * statement in this change whose cost is not bounded by its row
+     * count. A standing nonzero rate means the backlog is NOT draining
+     * and the page size or the statement bound needs looking at.
+     */
+    fun commitReceiptPurgeFailures(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_commit_receipt_purge_failures_total", count.toDouble(), "catalog", catalog)
+        }
+    }
+
+    /**
      * hoglake_stats_repaired_total{source=commit|hydrator|compaction} —
      * stats rows stored only after StatsSanity had to repair them (an
      * undecodable or inverted bound dropped, an impossible count

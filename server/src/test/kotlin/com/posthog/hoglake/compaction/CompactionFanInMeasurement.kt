@@ -1,6 +1,7 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.testing.Measuring
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -121,19 +122,8 @@ class CompactionFanInMeasurement {
         /** Sweeps per hour at a four-minute interval. */
         const val SWEEPS_PER_HOUR = 15
 
-        /**
-         * The wall-clock assertions (the 50 ms budget and the duty
-         * cycle) are statements about a quiet, production-shaped host,
-         * and the first CI run of this class failed both on a shared
-         * runner while the relative assertions held. So the absolute
-         * ones run only when an engineer is measuring deliberately
-         * (`HOGLAKE_FAN_IN_MEASURE=1`), which is also when a changed
-         * default gets its new figures for the KDoc. CI still runs the
-         * measurement and pins the properties that make it extrapolate:
-         * per-row cost does not degrade with the list length, and the
-         * hold grows with the fan-in.
-         */
-        val MEASURING: Boolean = System.getenv("HOGLAKE_FAN_IN_MEASURE") == "1"
+        /** Wall-clock assertions run on a measuring host only; see [Measuring]. */
+        val MEASURING: Boolean = Measuring.enabled
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -314,7 +304,7 @@ class CompactionFanInMeasurement {
         val shipped = CompactionConfig.DEFAULT_MAX_FAN_IN
         assertThat(shipped).describedAs("a power of two, so the ladder is unambiguous").isEqualTo(2_048)
         // Wall-clock: measuring hosts only (see MEASURING).
-        Assumptions.assumeTrue(MEASURING, "set HOGLAKE_FAN_IN_MEASURE=1 to apply the budget rule on this host")
+        Assumptions.assumeTrue(MEASURING, "set HOGLAKE_MEASURE=1 to apply the budget rule on this host")
         assertThat(holdMicros(shipped) / 1000)
             .describedAs("the shipped default fits the budget")
             .isLessThanOrEqualTo(HOLD_BUDGET_MS)

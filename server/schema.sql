@@ -733,14 +733,30 @@ CREATE TABLE hog_table_creation (
 
 -- Publication receipts outlive snapshot expiry: retrying an old request must
 -- never publish it again. Keys are scoped to a catalog and immutable payload.
+-- They do NOT outlive HOGLAKE_RECEIPT_RETENTION_SECONDS (V24, #240) — the
+-- cleanup sweep purges past it, keyed on created_at through the index below.
 CREATE TABLE hog_commit_receipt (
     catalog_id BIGINT NOT NULL REFERENCES hog_catalog(catalog_id) ON DELETE CASCADE,
     idempotency_key UUID NOT NULL,
-    request JSONB NOT NULL,
+    -- V24: the whole payload, kept only for receipts written before V24.
+    -- The writer leaves it NULL and a follow-up migration drops the column
+    -- once no fingerprint IS NULL row is left.
+    request JSONB,
+    -- V24: SHA-256 of the canonical fingerprint string. NULL = a pre-V24
+    -- row, whose `request` is still the comparison.
+    fingerprint BYTEA,
     snapshot_id BIGINT NOT NULL,
     schema_version BIGINT NOT NULL,
+    -- V24: the retention key. Fast default, so every pre-V24 row carries
+    -- the migration's timestamp rather than its own (unknowable) age.
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (catalog_id, idempotency_key)
 );
+-- The purge's ordered walk (V24). The primary key leads on a random UUID
+-- and carries no time locality, so without this the purge is a scan of
+-- the catalog's whole receipt history per page.
+CREATE INDEX hog_commit_receipt_created
+    ON hog_commit_receipt (catalog_id, created_at);
 
 CREATE TABLE hog_upload (
     catalog_id bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,

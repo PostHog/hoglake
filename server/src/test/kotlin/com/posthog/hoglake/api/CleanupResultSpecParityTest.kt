@@ -85,6 +85,8 @@ class CleanupResultSpecParityTest {
                 objectsRemoved = 4,
                 settledElsewhere = 5,
                 deadlineSkipped = 6,
+                receiptsPurged = 7,
+                receiptsPurgeFailures = 8,
             ).toDto()
         assertThat(dto.removed).isEqualTo(1)
         assertThat(dto.missing).isEqualTo(2)
@@ -94,6 +96,12 @@ class CleanupResultSpecParityTest {
             .isEqualTo(4)
         assertThat(dto.settledElsewhere).isEqualTo(5)
         assertThat(dto.deadlineSkipped).isEqualTo(6)
+        assertThat(dto.receiptsPurged)
+            .describedAs("commit receipts past HOGLAKE_RECEIPT_RETENTION_SECONDS (#240)")
+            .isEqualTo(7)
+        assertThat(dto.receiptsPurgeFailures)
+            .describedAs("purge pages that threw — what makes a zero above readable")
+            .isEqualTo(8)
     }
 
     @Test
@@ -107,7 +115,15 @@ class CleanupResultSpecParityTest {
         // CompactionResultSpecParityTest pins for claimed_elsewhere.
         val block = schemaBlock("    CleanupResult:")
         val required = requiredOf(block)
-        for (counter in listOf("objects_removed", "settled_elsewhere", "deadline_skipped")) {
+        val addedLater =
+            listOf(
+                "objects_removed",
+                "settled_elsewhere",
+                "deadline_skipped",
+                "receipts_purged",
+                "receipts_purge_failures",
+            )
+        for (counter in addedLater) {
             assertThat(properties(block)).contains(counter)
             assertThat(required)
                 .describedAs("a required counter cannot be one the ledger has rows without")

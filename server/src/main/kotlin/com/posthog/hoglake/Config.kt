@@ -347,6 +347,65 @@ data class Config(
     val maintenanceLedgerRetentionSeconds: Long =
         env("HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS", "${7L * 24 * 60 * 60}").toLong(),
     /**
+     * How long a commit receipt (`hog_commit_receipt`) is kept before the
+     * cleanup sweep purges it. Default **7 days**; `<= 0` disables the
+     * purge, which is V7's behaviour of keeping every receipt forever.
+     *
+     * AN INSTANCE SETTING, NOT A CATALOG OPTION, unlike snapshot
+     * retention. A receipt's cost is a property of the WRITER's commit
+     * rate, the operator tunes it against the database's size, and no
+     * tenant-visible behaviour depends on the number as long as it
+     * exceeds the replay window below. Making it a catalog option would
+     * put a correctness-relevant floor in a tenant-editable field.
+     *
+     * WHY 7 DAYS. Retention has to exceed any plausible REPLAY, because a
+     * replay arriving after its receipt is gone is not an error — it is a
+     * commit, and it publishes the same files again as a NEW snapshot, so
+     * the table silently doubles those rows
+     * (`PurgedReceiptReplayIntegrationTest` pins exactly that outcome). The longest a request can
+     * legitimately sit before being retried: pyhoglake holds a prepared
+     * payload for at least `snapshot_retention_seconds / 2`, and
+     * hedgerow's `PendingStore` keeps one across process restarts with no
+     * bound of its own. Seven days is comfortably past both, is a number
+     * an operator can reason about ("a week of replays are answered"),
+     * and at ~100 bytes per receipt costs ~250 MB at 250 commits/min —
+     * against the 58 GiB the same table held when it stored bodies
+     * (#240).
+     *
+     * WHAT 7 DAYS DOES NOT COVER, because it is a judgement and not a
+     * derivation: hedgerow's `PendingStore` holds a request in its `work`
+     * table until `published()` removes it, with NO TTL, and `recover()`
+     * replays whatever is left after any outage. That window is not a
+     * function of snapshot retention in either direction, so no floor
+     * derived from the catalog can bound it — a payload hedgerow replays
+     * more than this many seconds after preparing it will re-publish its
+     * files as a new snapshot. THAT IS AN ACCEPTED RISK, taken because
+     * the alternative is keeping every receipt forever, which is the
+     * 58 GiB this change exists to remove.
+     *
+     * THE PER-CATALOG FLOOR IS APPLIED AT PURGE TIME, NOT HERE.
+     * `CleanupService.purgeCommitReceipts` raises the cutoff to
+     * `2 x snapshot_retention_seconds` (capped at
+     * `CleanupService.RECEIPT_FLOOR_CEILING_SECONDS`) for any catalog
+     * whose retention makes this value too short, because that is the
+     * term pyhoglake's shelf life is derived from. It cannot be checked
+     * at boot: snapshot retention is a per-catalog option an operator
+     * PATCHes at runtime, so a boot-time comparison would pass and then
+     * become wrong without anything running again. The floor never
+     * shortens this value, only lengthens it for the catalog that needs
+     * it — and on a catalog with retention DISABLED, where pyhoglake's
+     * shelf life is unbounded, there is no derivable floor at all and
+     * this value stands with the same accepted risk as hedgerow's.
+     *
+     * THE FLOOR ON THE KNOB ITSELF is [MIN_RECEIPT_RETENTION_SECONDS]: a
+     * positive value under an hour is refused at boot, because it is
+     * indistinguishable from a typo (`3600` meant as days) and its effect
+     * — duplicate publications from ordinary client retries — is silent
+     * and unrecoverable.
+     */
+    val receiptRetentionSeconds: Long =
+        env("HOGLAKE_RECEIPT_RETENTION_SECONDS", "${7L * 24 * 60 * 60}").toLong(),
+    /**
      * Verify sweep interval; <= 0 disables. Default **0 — OFF**, the
      * same position compaction takes: the loop belongs to ONE workload,
      * and which one is an ops decision the chart makes, not a default
@@ -961,6 +1020,22 @@ data class Config(
                 "drain, and 0 would turn the loop into a no-op with nothing saying so — set " +
                 "HOGLAKE_CLEANUP_INTERVAL_MS=0 to turn cleanup off on purpose)"
         }
+        // A receipt purged while a client can still replay its request
+        // turns that replay into a SECOND publication of the same files,
+        // and nothing reports it: the commit succeeds, the snapshot is
+        // valid, the rows are duplicated. An hour is not a retention an
+        // operator would choose on purpose against a client that holds a
+        // prepared payload for half the snapshot window, so a positive
+        // value under it is read as a unit mistake and refused. 0 and
+        // below are left alone: "never purge" is V7's behaviour and a
+        // legitimate choice.
+        require(receiptRetentionSeconds <= 0 || receiptRetentionSeconds >= MIN_RECEIPT_RETENTION_SECONDS) {
+            "HOGLAKE_RECEIPT_RETENTION_SECONDS=$receiptRetentionSeconds is below the " +
+                "$MIN_RECEIPT_RETENTION_SECONDS s floor: a receipt purged inside a client's " +
+                "replay window makes the replay publish the same files again as a new snapshot, " +
+                "silently. Use at least $MIN_RECEIPT_RETENTION_SECONDS (the default is " +
+                "${7L * 24 * 60 * 60}), or 0 to keep every receipt forever."
+        }
         // ONE CHECK, BOTH DRAWS, EACH PRICED ONLY WHERE ITS LOOP RUNS.
         //
         // One check, because the two knobs spend the same pool and two
@@ -1069,6 +1144,12 @@ data class Config(
          * health-probe bound is checked against at boot.
          */
         const val MIN_HEALTH_PROBE_TIMEOUT_MS = 250L
+
+        /**
+         * Floor on a POSITIVE [receiptRetentionSeconds]; see the boot
+         * check for why the failure it prevents is silent.
+         */
+        const val MIN_RECEIPT_RETENTION_SECONDS = 3_600L
 
         /**
          * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so

@@ -19,7 +19,10 @@ object HogSchemaColumns {
         mapOf(
             // CommitService: immutable publication receipts, independent of snapshot retention.
             "hog_commit_receipt" to
-                setOf("catalog_id", "idempotency_key", "request", "snapshot_id", "schema_version"),
+                setOf(
+                    "catalog_id", "idempotency_key", "request", "fingerprint",
+                    "snapshot_id", "schema_version", "created_at",
+                ),
             // MaintenanceSummarySampler: published samples + durable scan checkpoints.
             "hog_maintenance_summary" to
                 setOf(

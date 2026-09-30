@@ -87,6 +87,20 @@ data class CleanupResultDto(
     val settledElsewhere: Long,
     /** Always 0: the hold budget it counted bounded a lock the drain no longer takes. */
     val deadlineSkipped: Long,
+    /**
+     * Commit receipts past their retention that this run deleted (#240).
+     *
+     * Serialized unconditionally here, unlike on the stored model, for
+     * objectsRemoved's reason: a response that omits a counter it
+     * declares makes every client's zero a guess.
+     */
+    val receiptsPurged: Long,
+    /**
+     * Purge pages that threw. Separate from receipts_purged because 0
+     * purged is otherwise the same number for an idle run and a failing
+     * one — see CleanupResult.receiptsPurgeFailures.
+     */
+    val receiptsPurgeFailures: Long,
 )
 
 fun CleanupResult.toDto() =
@@ -97,6 +111,8 @@ fun CleanupResult.toDto() =
         objectsRemoved = objectsRemoved,
         settledElsewhere = settledElsewhere,
         deadlineSkipped = deadlineSkipped,
+        receiptsPurged = receiptsPurged,
+        receiptsPurgeFailures = receiptsPurgeFailures,
     )
 
 data class CompactionResultDto(
@@ -306,7 +322,13 @@ private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")
 
 /** The same, for CleanupResult. Append-only for the same reason. */
 private val CLEANUP_COUNTERS_ADDED_LATER =
-    listOf("objects_removed", "settled_elsewhere", "deadline_skipped")
+    listOf(
+        "objects_removed",
+        "settled_elsewhere",
+        "deadline_skipped",
+        "receipts_purged",
+        "receipts_purge_failures",
+    )
 
 /**
  * What the run ledger observed about a task's loop — fleet-wide, unlike

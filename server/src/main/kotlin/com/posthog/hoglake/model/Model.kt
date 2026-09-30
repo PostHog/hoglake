@@ -1563,6 +1563,48 @@ data class CleanupResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val deadlineSkipped: Long = 0,
+    /**
+     * Commit receipts this run purged for the catalog — rows past
+     * `HOGLAKE_RECEIPT_RETENTION_SECONDS` (#240, V24).
+     *
+     * ZERO IS NOT "NOTHING TO DO" ON ITS OWN, which is what
+     * [receiptsPurgeFailures] beside it is for: the purge is fenced so it
+     * can never fail the drain, so a failed page also reports 0 purged.
+     * A run whose budget expired before its first page reports 0 too, and
+     * THAT one is distinguished only by the app log — deliberately, since
+     * it is the benign case and a third counter on a hygiene task earns
+     * nothing.
+     *
+     * Defaulted and NON_DEFAULT for [objectsRemoved]'s reason — the
+     * ledger holds rows written before this counter existed, and a
+     * counter that postdates a row must be absent from it rather than
+     * asserted as zero.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val receiptsPurged: Long = 0,
+    /**
+     * Pages of the commit-receipt purge that THREW — a statement bound
+     * fired, the pool failed, anything.
+     *
+     * IT EXISTS BECAUSE [receiptsPurged] ALONE IS AMBIGUOUS. The purge is
+     * fenced so it can never fail the drain it rides, so a failing page
+     * and an idle one both report 0 purged, and the failing one is the
+     * state that matters: for the first retention window after V24 the
+     * only eligible rows are the legacy ones, each carrying ~82 TOAST
+     * chunk rows that `heap_delete` removes synchronously, and a page
+     * that cannot finish inside its bound would otherwise retry forever
+     * while every surface read exactly like a healthy instance and the
+     * 58 GiB never went.
+     *
+     * Standing nonzero = the page size or the bound needs looking at,
+     * not that anything is corrupt; the rows are still there and the
+     * next run starts again from the oldest eligible one.
+     * `hoglake_commit_receipt_purge_failures_total` is the same number.
+     *
+     * Defaulted and NON_DEFAULT for [objectsRemoved]'s reason.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val receiptsPurgeFailures: Long = 0,
 )
 
 /**
