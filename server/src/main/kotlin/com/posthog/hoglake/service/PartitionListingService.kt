@@ -12,6 +12,7 @@ import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TierTotalsRepo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -572,8 +573,7 @@ class PartitionListingService(
                    sum(p.record_count) AS record_count,
                    max(p.newest_begin_snapshot) AS newest_begin_snapshot
             FROM hog_maintenance_summary_tier p
-            JOIN hog_maintenance_summary s ON s.catalog_id = p.catalog_id
-              AND s.published_generation = p.generation
+            ${TierTotalsRepo.PUBLISHED_GENERATION_JOIN}
             WHERE p.catalog_id = :catalogId AND p.table_id = :tableId
             GROUP BY p.spec_id, p.partition_values
             LIMIT $MAX_GROUPS_PLUS_ONE

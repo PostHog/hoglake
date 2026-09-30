@@ -219,11 +219,45 @@ class QeContractPedantryTest {
 
             val table = body(client.get("/v1/catalogs/pedantry/namespaces/ns/tables/t"))
             assertSnakeCase(table)
+            // The three totals LEFT the required list (#232): a head read
+            // serves them from the maintenance sampler's published
+            // generation, so a table that generation does not cover has
+            // none and the spec says so. `read_snapshot_id` JOINED it,
+            // because it describes the read and is therefore always
+            // present. TableSummary above keeps its totals required —
+            // the namespace listing still aggregates in its own single
+            // statement and is unaffected.
             assertRequired(
-                table, "Table",
-                "name", "namespace", "table_uuid", "columns", "record_count",
-                "file_count", "file_size_bytes",
+                table,
+                "Table",
+                "name",
+                "namespace",
+                "table_uuid",
+                "columns",
+                "read_snapshot_id",
             )
+            // And no test fixture runs the sampler loop, so this is the
+            // uncovered case: absent, never zero. A zero here would be
+            // the server asserting a table is empty when it has two
+            // files.
+            for (
+            total in
+            listOf(
+                "record_count",
+                "file_count",
+                "file_size_bytes",
+                "totals_snapshot_id",
+                "totals_as_of",
+            )
+            ) {
+                assertThat(table.has(total))
+                    .describedAs(
+                        "'%s' must be absent until the maintenance sampler publishes a " +
+                            "generation covering the table",
+                        total,
+                    )
+                    .isFalse()
+            }
             assertRequired(table["columns"][0], "Column", "name", "type", "field_id", "ordinal")
 
             val files = body(client.get("/v1/catalogs/pedantry/namespaces/ns/tables/t/files"))

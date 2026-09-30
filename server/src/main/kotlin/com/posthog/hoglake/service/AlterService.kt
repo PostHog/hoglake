@@ -128,6 +128,16 @@ class AlterService(private val jdbi: Jdbi) {
                     applyOp(h, cat.catalogId, t.tableId, ns.namespaceId, namespace, alloc.snapshotId, state, op)
                 }
 
+                // STAYS EXACT, deliberately (#232). This is the only
+                // other server caller of `aggregateAt`, and it cannot
+                // use the maintenance sampler's totals: the snapshot it
+                // must answer for was allocated in THIS transaction, so
+                // no published generation can have seen it. It is also
+                // the right trade on cost — a DDL receipt is rare (a
+                // schema change, not a flush) and already pays for the
+                // per-catalog commit lock, beside which one aggregate is
+                // noise. The freshness fields stay null: an exact
+                // number has no age.
                 val agg = FileRepo.aggregateAt(h, cat.catalogId, t.tableId, alloc.snapshotId)
                 TableInfo(
                     tableId = t.tableId,
@@ -137,6 +147,9 @@ class AlterService(private val jdbi: Jdbi) {
                     comment = state.comment,
                     properties = state.properties,
                     columns = state.cols.sortedBy { it.ordinal },
+                    // The alter's own snapshot, which is what this
+                    // TableInfo is resolved at.
+                    readSnapshotId = alloc.snapshotId,
                     recordCount = agg.recordCount,
                     fileCount = agg.fileCount,
                     fileSizeBytes = agg.fileSizeBytes,

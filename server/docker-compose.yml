@@ -84,7 +84,12 @@ services:
       HOGLAKE_COMPACTION_ZSTD_LEVEL: ${HOGLAKE_COMPACTION_ZSTD_LEVEL:-3}
       HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS: ${HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS:-1000}
       HOGLAKE_MAINTENANCE_SUMMARY_BATCH: ${HOGLAKE_MAINTENANCE_SUMMARY_BATCH:-10000}
-      HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS: ${HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS:-60}
+      # 1 s, not production's 60: the dev stack's catalog is tiny, so a
+      # generation finishes in one tick, and the table page's totals now
+      # come from the published generation (#232). At 60 s a table you
+      # just created reads "not yet sampled" for a minute, which on a dev
+      # stack reads as a bug rather than as a cadence.
+      HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS: ${HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS:-1}
     ports:
       - "${HOGLAKE_SERVER_PORT:-8080}:8080"
     depends_on:

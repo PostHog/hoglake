@@ -33,6 +33,7 @@ import com.posthog.hoglake.persistence.SnapshotRepo
 import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.SpecRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.TimeTravelRepo
 import com.posthog.hoglake.persistence.ViewRepo
 import org.jdbi.v3.core.Handle
@@ -361,11 +362,20 @@ class CatalogService(private val jdbi: Jdbi) {
             namespace = ns.name,
             name = name,
             columns = cols,
+            // The create's own snapshot: what this TableInfo is resolved
+            // at and what snapshotId names too, which is only a
+            // coincidence of the DDL paths (see TableInfo.readSnapshotId).
+            readSnapshotId = alloc.snapshotId,
             partitionSpec = partitionSpec,
             sortSpec =
                 AlterService(
                     jdbi,
                 ).installSortSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, sortFields),
+            // EXACT, not sampled, and not null: a table created in this
+            // transaction has no files, so zero is a fact rather than a
+            // default. The freshness fields therefore stay null — the
+            // receipt's numbers have no age because they cannot be
+            // stale (#232).
             recordCount = 0,
             fileCount = 0,
             fileSizeBytes = 0,
@@ -479,12 +489,83 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
+    /**
+     * One table's identity, schema, specs and — depending on [totals]
+     * and on whether a snapshot was asked for — its file totals.
+     *
+     * THREE TOTALS PATHS, and the choice between them is the whole of
+     * #232. This endpoint used to run `FileRepo.aggregateAt` on every
+     * call: `count(*)`, `sum(record_count)`, `sum(file_size_bytes)` over
+     * every live `hog_data_file` row of the table. On gigahog-prod-us's
+     * `ingest.events_raw` that is ~10M rows, 0.7 s quiet and 9 s under
+     * load, charged against the 10-thread request pool — and the main
+     * caller is the WRITER fleet, three calls per flush, which reads the
+     * UUID and the schema and none of the numbers.
+     *
+     *  - [totals] false: no totals at all, and NO FILE ROW READ of any
+     *    kind — not the manifest and not the sampler's summary of it.
+     *    The identity read: name, UUID, columns, partition and sort
+     *    specs. It is what a writer fetching a table's UUID and schema
+     *    per flush should send; pyhoglake sends it from its next
+     *    release, and nothing in this tree sends it yet.
+     *  - [snapshot] or [atTimestamp] given: the exact aggregate at that
+     *    snapshot, with no freshness fields. A time-travel read has no
+     *    sampled answer available — the sampler measures the files LIVE
+     *    at its own snapshot, and a scan is the only correct answer for
+     *    a past one — and this path is a console/debugging one rather
+     *    than a writer's, so it pays for correctness.
+     *  - neither: the MAINTENANCE SAMPLER's published generation
+     *    (`TierTotalsRepo`), with that generation's snapshot and start
+     *    instant as `totalsSnapshotId` / `totalsAsOf`. Null totals when
+     *    the generation does not cover the table, which is "not yet
+     *    sampled" and never 0.
+     *
+     * WHY THE SAMPLER AND NOT A SOURCE OF ITS OWN: AGENT.md's rule for
+     * this path, in the maintenance section — "Dashboard and
+     * partition-debt requests read persisted asynchronous summaries,
+     * NEVER the manifest", which `MaintenanceStatusService`'s KDoc
+     * spells out as "NEVER scan the manifest on this path". The sampler
+     * already walks every live file once per generation and stores these
+     * three measures per bucket, so a per-table sum over the published
+     * generation is the answer already computed. See `TierTotalsRepo`'s
+     * KDoc.
+     *
+     * THREE WAYS THE SAMPLE CAN FAIL TO BE AN ANSWER, all reported the
+     * same way (totals absent) because a caller can do nothing different
+     * about them:
+     *
+     *  1. no published sample — the sampler has never finished a scan
+     *     of this catalog (warm-up, or a catalog created since), or the
+     *     one it published is in a shape this build cannot parse;
+     *  2. the table was created ABOVE the published generation's
+     *     snapshot, so that scan never saw it. This is the check that
+     *     needs `created_snapshot`: the sampler writes a tier row only
+     *     for a bucket that HAS files, so "no tier rows" is otherwise
+     *     indistinguishable from "covered and empty" — and a covered
+     *     empty table must read 0, not "unknown";
+     *  3. the published generation is not `measured` (V22's
+     *     `measures_generation`), so its `record_count` may be
+     *     undercounted. All three totals are withheld rather than two of
+     *     three, because they travel as one fact on the wire and
+     *     `record_count` is the one a reader looks at first; a response
+     *     carrying files and bytes with rows silently missing is worse
+     *     than one that says nothing. Reachable only on a deploy that
+     *     crosses V22, and then for one generation.
+     *
+     * The table's own metadata is resolved at the requested snapshot on
+     * every path. On the head path the totals therefore answer for the
+     * SAMPLER's snapshot while the columns and specs answer for head —
+     * which is why `totalsSnapshotId` is on the wire: the response says
+     * which snapshot its numbers are exact at rather than implying they
+     * are current.
+     */
     fun getTable(
         catalog: String,
         namespace: String,
         table: String,
         snapshot: Long? = null,
         atTimestamp: Instant? = null,
+        totals: Boolean = true,
     ): TableInfo =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
@@ -495,7 +576,25 @@ class CatalogService(private val jdbi: Jdbi) {
                     ?: throw HoglakeException.NotFound(
                         "table '$namespace.$table' in catalog '$catalog' at snapshot $at",
                     )
-            val agg = FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
+            // Asked for by the CALLER, not derived from `at`:
+            // resolveReadSnapshot returns head when neither parameter is
+            // given, so `at` alone cannot tell a head read from a
+            // time-travel read that happens to name head — and the two
+            // must answer differently, one from the sample and one from
+            // the manifest.
+            val timeTravel = snapshot != null || atTimestamp != null
+            val sampled =
+                if (totals && !timeTravel) {
+                    sampledTotals(h, cat.catalogId, t.tableId)
+                } else {
+                    null
+                }
+            val exact =
+                if (totals && timeTravel) {
+                    FileRepo.aggregateAt(h, cat.catalogId, t.tableId, at)
+                } else {
+                    null
+                }
             TableInfo(
                 tableId = t.tableId,
                 tableUuid = t.tableUuid,
@@ -504,15 +603,77 @@ class CatalogService(private val jdbi: Jdbi) {
                 namespace = ns.name,
                 name = t.name,
                 columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, at),
-                recordCount = agg.recordCount,
-                fileCount = agg.fileCount,
-                fileSizeBytes = agg.fileSizeBytes,
+                // The snapshot every field above was resolved at, which
+                // a writer sends back as a commit's read_snapshot.
+                readSnapshotId = at,
+                recordCount = exact?.recordCount ?: sampled?.recordCount,
+                fileCount = exact?.fileCount ?: sampled?.fileCount,
+                fileSizeBytes = exact?.fileSizeBytes ?: sampled?.fileSizeBytes,
+                // Only a SAMPLE is dated. An exact aggregate carries no
+                // freshness, and stamping it would tell a client the
+                // number might be stale when it cannot be.
+                totalsSnapshotId = sampled?.snapshotId,
+                totalsAsOf = sampled?.asOf,
                 // The specs visible at the requested snapshot (null =
                 // unpartitioned/unsorted there); listTables skips both.
                 partitionSpec = SpecRepo.specAt(h, cat.catalogId, t.tableId, at),
                 sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, at),
             )
         }
+
+    /** A usable per-table sample: the three totals plus what dates them. */
+    private data class SampledTotals(
+        val recordCount: Long,
+        val fileCount: Long,
+        val fileSizeBytes: Long,
+        val snapshotId: Long,
+        val asOf: Instant,
+    )
+
+    /**
+     * The published generation's totals for one table, or null when that
+     * generation is not an answer for it — the three cases enumerated in
+     * [getTable]'s KDoc, in the order they are checked here.
+     *
+     * NO COMPACTION-POLICY CHECK, unlike `PartitionListingService` and
+     * `PartitionStatsService`, which both discard a sample computed
+     * under a different `targetBytes` / min / max. Those read
+     * `small_count`, `small_bytes` and `selected`, which ARE the policy's
+     * output. `file_count`, `record_count` and `total_bytes` are counts
+     * of files, rows and bytes: the policy cannot change them, so
+     * discarding a sample over it would throw away a correct answer.
+     * That is also why this service needs no policy knobs in its
+     * constructor.
+     */
+    private fun sampledTotals(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): SampledTotals? {
+        // 1. the sampler has no row for the catalog at all (warm-up),
+        //    or it has one with no published sample, or with a sample
+        //    this build cannot parse — the sampler's own lenient read,
+        //    because a newer replica's shape must degrade the numbers
+        //    rather than 500 a request path.
+        val tier = TierTotalsRepo.totalsFor(h, catalogId, tableId) ?: return null
+        val sample = tier.sample ?: return null
+        // 2. the scan never saw this table.
+        if (tier.createdSnapshot > sample.snapshotId) return null
+        // 3. rows may be undercounted for the whole generation.
+        if (!tier.measured) return null
+        return SampledTotals(
+            recordCount = tier.recordCount,
+            fileCount = tier.fileCount,
+            fileSizeBytes = tier.fileSizeBytes,
+            snapshotId = sample.snapshotId,
+            // startedAt, NOT the summary row's sampled_at: a generation
+            // runs for tens of minutes, so the publish instant is up to
+            // that far after the numbers were true. `startedAt` is when
+            // `snapshotId` was captured, so the pair makes ONE claim —
+            // the distinction PartitionListing's own comment records.
+            asOf = sample.startedAt,
+        )
+    }
 
     /**
      * Live tables at head, each with its comment, its file rollup and

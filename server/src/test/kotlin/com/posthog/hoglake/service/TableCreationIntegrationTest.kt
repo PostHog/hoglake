@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.SortDirection
 import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.awaitility.Awaitility.await
@@ -60,7 +61,7 @@ class TableCreationIntegrationTest {
         assertThatThrownBy { creations.prepare(catalog, operation, request.copy(comment = "changed")) }
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
         val published = creations.publish(catalog, operation, emptyList())
-        val original = catalogs.getTable(catalog, "test", "target")
+        val original = catalogs.tableWithExactTotals(catalog, "test", "target")
         assertThat(original.comment).isEqualTo("original table")
         assertThat(original.properties).isEqualTo(request.properties)
         val altered =
@@ -120,7 +121,7 @@ class TableCreationIntegrationTest {
                 ),
             )
         creations.publish(catalog, replacement.operationId, emptyList())
-        val replaced = catalogs.getTable(catalog, "test", "renamed")
+        val replaced = catalogs.tableWithExactTotals(catalog, "test", "renamed")
         assertThat(replaced.comment).isEqualTo("replacement")
         assertThat(replaced.properties).isEmpty()
         assertThat(replaced.columns.single().def.comment).isNull()
@@ -377,7 +378,7 @@ class TableCreationIntegrationTest {
                     ),
             ),
         )
-        assertThat(catalogs.getTable(catalog, "test", "target").fileCount).isEqualTo(1)
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "target").fileCount).isEqualTo(1)
     }
 
     @Test
@@ -487,7 +488,7 @@ class TableCreationIntegrationTest {
         assertThat(committed.state).isEqualTo("committed")
         assertThat(committed.snapshotId).isEqualTo(head.headSnapshotId + 1)
         assertThat(committed.schemaVersion).isEqualTo(head.schemaVersion + 1)
-        val table = catalogs.getTable(catalog, "test", "target")
+        val table = catalogs.tableWithExactTotals(catalog, "test", "target")
         assertThat(table.tableUuid).isEqualTo(prepared.tableUuid)
         assertThat(table.recordCount).isEqualTo(7)
         assertThat(table.fileCount).isEqualTo(1)
@@ -525,7 +526,7 @@ class TableCreationIntegrationTest {
         assertThat(catalogs.getCatalog(catalog)).isEqualTo(head)
         assertThat(creations.status(catalog, operation.operationId).state).isEqualTo("prepared")
         assertThat(creations.publish(catalog, operation.operationId, emptyList()).state).isEqualTo("committed")
-        assertThat(catalogs.getTable(catalog, "test", "target").fileCount).isZero()
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "target").fileCount).isZero()
     }
 
     @Test
@@ -647,7 +648,7 @@ class TableCreationIntegrationTest {
             assertThat(results.map { it.get(10, TimeUnit.SECONDS) }.distinct()).hasSize(1)
         }
         assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head + 1)
-        assertThat(catalogs.getTable(catalog, "test", "target").recordCount).isEqualTo(7)
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "target").recordCount).isEqualTo(7)
     }
 
     @Test
@@ -745,6 +746,6 @@ class TableCreationIntegrationTest {
             }
             h.execute("DROP TRIGGER block_receipt ON hog_table_creation; DROP FUNCTION block_creation_receipt()")
         }
-        assertThat(catalogs.getTable(catalog, "test", "target").recordCount).isEqualTo(7)
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "target").recordCount).isEqualTo(7)
     }
 }

@@ -188,10 +188,23 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 	info.namespace_name = GetString(obj, "namespace");
 	info.table_uuid = GetString(obj, "table_uuid");
 	// Table-schema numerics were the one struct the R3 sweep missed:
-	// record_count feeds NumericCast in GetStorageInfo
-	info.record_count = GetBoundedInt(obj, "record_count", 0, 9223372036854775807LL);
-	info.file_count = GetBoundedInt(obj, "file_count", 0, 9223372036854775807LL);
-	info.file_size_bytes = GetBoundedInt(obj, "file_size_bytes", 0, 9223372036854775807LL);
+	// record_count feeds NumericCast in GetStorageInfo.
+	//
+	// OPTIONAL SINCE hoglake #232, and the default is the bug this
+	// guard exists for: the server omits all three when a head read's
+	// maintenance sample does not cover the table, and
+	// GetBoundedInt's default_value turned that absence into a
+	// confident 0 — a table with rows reported as empty, both to the
+	// optimizer (GetStorageInfo's cardinality) and to a user reading
+	// hoglake_table_info(). The three travel together on the wire, so
+	// record_count's presence decides for all of them.
+	auto rows = yyjson_obj_get(obj, "record_count");
+	if (rows && !yyjson_is_null(rows)) {
+		info.has_totals = true;
+		info.record_count = GetBoundedInt(obj, "record_count", 0, 9223372036854775807LL);
+		info.file_count = GetBoundedInt(obj, "file_count", 0, 9223372036854775807LL);
+		info.file_size_bytes = GetBoundedInt(obj, "file_size_bytes", 0, 9223372036854775807LL);
+	}
 	auto columns = yyjson_obj_get(obj, "columns");
 	size_t idx, max;
 	yyjson_val *col;

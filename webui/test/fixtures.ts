@@ -106,6 +106,13 @@ export const tableFixture: Table = {
   record_count: "1234567",
   file_count: "42",
   file_size_bytes: "5368709120",
+  // A head read's totals are a SAMPLE of the maintenance sampler's
+  // published generation, so the fixture carries the pair that dates
+  // them: the snapshot they are exact at and when it was captured.
+  // `Date.now()` rather than a literal, because the header prints a LIVE
+  // age and a fixed timestamp would read as years old (#232).
+  totals_snapshot_id: "39",
+  totals_as_of: new Date(Date.now() - 12 * 60 * 1000).toISOString(),
   partition_spec: {
     spec_id: "1",
     fields: [

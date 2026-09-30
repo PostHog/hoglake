@@ -224,11 +224,27 @@ MODEL_CASES = [
                 "name": st.text(max_size=16),
                 "namespace": st.text(max_size=16),
                 "table_uuid": st.uuids().map(str),
-                "record_count": I64,
-                "file_count": I64,
-                "file_size_bytes": I64,
             },
+            # The three totals are OPTIONAL on the wire (hoglake #232):
+            # absent under totals=false and on a table the server's
+            # maintenance sample does not cover, so a model that required
+            # them would reject a correct response. `read_snapshot_id` is
+            # optional here for the OTHER reason -- the spec makes it
+            # required, but an older server does not send it and the
+            # model must still parse.
+            #
+            # st.none() is DEFENSIVE, not a wire possibility: the spec
+            # declares all of these absent-only (the server serializes
+            # under NON_NULL, so a null never reaches the wire), and the
+            # model landing absent and null on the same None costs
+            # nothing.
             optional={
+                "record_count": st.one_of(st.none(), I64),
+                "file_count": st.one_of(st.none(), I64),
+                "file_size_bytes": st.one_of(st.none(), I64),
+                "totals_snapshot_id": st.one_of(st.none(), I64),
+                "read_snapshot_id": st.one_of(st.none(), I64),
+                "totals_as_of": st.one_of(st.none(), st.just("2026-09-30T00:54:00Z")),
                 "columns": st.lists(
                     st.fixed_dictionaries(
                         {

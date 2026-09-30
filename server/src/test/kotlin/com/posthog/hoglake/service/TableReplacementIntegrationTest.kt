@@ -14,6 +14,7 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.persistence.OffsetRepo
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterAll
@@ -77,11 +78,11 @@ class TableReplacementIntegrationTest {
         val before = catalogs.getCatalog(cat).headSnapshotId
         val prepared = prepare(cat, old.tableUuid)
         assertThat(catalogs.getTable(cat, "ns", "t").tableUuid).isEqualTo(old.tableUuid)
-        assertThat(catalogs.getTable(cat, "ns", "t").recordCount).isEqualTo(5)
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isEqualTo(5)
         val files = listOf(FileRegistration(prepared.writePath + "new.parquet", 2, 100, 20))
         val receipt = creations.publish(cat, prepared.operationId, files)
         assertThat(receipt.snapshotId).isEqualTo(before + 1)
-        val current = catalogs.getTable(cat, "ns", "t")
+        val current = catalogs.tableWithExactTotals(cat, "ns", "t")
         assertThat(current.tableUuid).isEqualTo(prepared.tableUuid).isNotEqualTo(old.tableUuid)
         assertThat(current.recordCount).isEqualTo(2)
         assertThat(catalogs.getTable(cat, "ns", "t", before).tableUuid).isEqualTo(old.tableUuid)
@@ -94,7 +95,7 @@ class TableReplacementIntegrationTest {
                 .isInstanceOf(HoglakeException.ReconciliationRequired::class.java)
         }
         assertThat(catalogs.changes(cat, "ns", "t", before + 1).files).isEmpty()
-        assertThat(catalogs.getTable(cat, "ns", "t").recordCount).isEqualTo(2)
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isEqualTo(2)
     }
 
     @Test
@@ -696,7 +697,7 @@ class TableReplacementIntegrationTest {
         assertThat(creations.publish(cat, prepared.operationId, emptyList()).reason).isEqualTo("target_changed")
         // createTable returns the commit's snapshotId; a getTable read
         // carries none, so compare the table shape with that field cleared.
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(winner.copy(snapshotId = null))
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(winner.copy(snapshotId = null))
     }
 
     @Test
@@ -708,7 +709,7 @@ class TableReplacementIntegrationTest {
         val receipt = creations.publish(cat, replacement.operationId, emptyList())
         assertThat(receipt.state).isEqualTo("committed")
         assertThat(catalogs.getTable(cat, "ns", "t").tableUuid).isEqualTo(replacement.tableUuid)
-        assertThat(catalogs.getTable(cat, "ns", "t").recordCount).isZero()
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isZero()
     }
 
     @Test
@@ -725,10 +726,10 @@ class TableReplacementIntegrationTest {
         }.isInstanceOf(HoglakeException.Validation::class.java)
         // createTable returns the commit's snapshotId; a getTable read
         // carries none, so compare the table shape with that field cleared.
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
         assertThat(creations.abort(cat, prepared.operationId).state).isEqualTo("aborted")
         assertThat(creations.publish(cat, prepared.operationId, emptyList()).state).isEqualTo("aborted")
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(original.copy(snapshotId = null))
     }
 
     @Test

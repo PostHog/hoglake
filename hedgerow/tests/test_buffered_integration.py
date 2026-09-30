@@ -10,7 +10,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 import yaml
-from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
+from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY, info_at_head
 from pyhoglake import HoglakeClient, S3Config, ops
 
 from hedgerow.buffered_service import configure_s3
@@ -154,17 +154,17 @@ raise SystemExit(main(sys.argv[1:]))
             assert result.returncode == (9 if lose_reply else 0), result.stderr
 
         run_cli()  # discovery only: young data remains buffered on disk
-        assert destination.info().record_count == 0
+        assert info_at_head(destination_catalog, destination).record_count == 0
         config["buffered"]["policy"]["target_file_bytes"] = 1
         run_cli(
             lose_reply=True
         )  # real server committed; client did not receive success
-        assert destination.info().record_count == 1
+        assert info_at_head(destination_catalog, destination).record_count == 1
         run_cli()  # exact receipt retry, then remaining ready partitions
-        assert destination.info().record_count == 3
+        assert info_at_head(destination_catalog, destination).record_count == 3
         published = destination.scan_plan()
         run_cli()  # another restart cannot duplicate the publication
-        assert destination.info().record_count == 3
+        assert info_at_head(destination_catalog, destination).record_count == 3
         assert (
             source_catalog.offset("buffered-live", source.table_uuid).committed_snapshot
             == source_catalog.refresh().head_snapshot_id

@@ -262,11 +262,26 @@ class ApiIntegrationTest {
                 assertThat(f["begin_snapshot"].asLong()).isEqualTo(4)
             }
 
-            // Rolled-up table stats at head.
-            body(client.get("/v1/catalogs/lake/namespaces/analytics/tables/events")).let { t ->
+            // Rolled-up table stats, AT THE SNAPSHOT the second commit
+            // made. Naming the snapshot is what keeps this an assertion
+            // about the manifest: a read with no snapshot serves its
+            // totals from the maintenance sampler's published generation
+            // and reports none until one covers the table (#232) — no
+            // test fixture runs that loop. The sampled path is covered
+            // by api/TableTotalsApiTest.
+            body(
+                client.get("/v1/catalogs/lake/namespaces/analytics/tables/events?snapshot=4"),
+            ).let { t ->
                 assertThat(t["record_count"].asLong()).isEqualTo(150)
                 assertThat(t["file_count"].asLong()).isEqualTo(2)
                 assertThat(t["file_size_bytes"].asLong()).isEqualTo(4096 + 2048L)
+                assertThat(t.has("totals_snapshot_id"))
+                    .describedAs("an exact aggregate carries no sample freshness")
+                    .isFalse()
+                assertThat(t.has("totals_as_of")).isFalse()
+                assertThat(t["read_snapshot_id"].asLong())
+                    .describedAs("but it does say what snapshot it was resolved at")
+                    .isEqualTo(4)
             }
 
             // Changefeed plan over (from, to].

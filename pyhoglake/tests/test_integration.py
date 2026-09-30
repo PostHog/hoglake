@@ -89,6 +89,30 @@ def _events_data(n: int, start: int = 0) -> pa.Table:
 # ---------------------------------------------------------------------------
 
 
+def _info_at_head(catalog, table):
+    """``table.info()`` at the catalog's CURRENT HEAD, i.e. with EXACT totals.
+
+    A plain ``info()`` serves ``record_count`` / ``file_count`` /
+    ``file_size_bytes`` from the server's maintenance sample and returns
+    ``None`` for all three until a published generation covers the table
+    (hoglake #232). That is right for the endpoint -- the aggregate it
+    replaced was ~10M manifest rows per call on a busy table -- and
+    useless to a test asserting what an append just did, where the
+    question is "what does the manifest hold RIGHT NOW".
+
+    Naming head puts the read on the time-travel path, which still
+    aggregates the manifest, so the numbers are a fact and no sampler has
+    to be waited for. It mirrors the server suite's own
+    ``tableWithExactTotals``, which exists for the identical reason.
+
+    Do NOT replace this with a POST to the maintenance trigger: the
+    sample would have to be refreshed after every append, and a hand
+    trigger that loses the sampler's own turn refreshes nothing -- a test
+    flaky by construction.
+    """
+    return table.info(snapshot=catalog.refresh().head_snapshot_id)
+
+
 def test_catalog_visible_in_listing(client, catalog):
     names = [c.name for c in client.list_catalogs()]
     assert catalog.name in names
@@ -158,8 +182,8 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     assert len(plan) == 1
     assert plan[0].delete_file is None
 
-    # table info aggregates
-    info = table.info()
+    # table info aggregates, at head so they are exact (see _info_at_head)
+    info = _info_at_head(catalog, table)
     assert info.record_count == 1000
     assert info.file_count == 1
 
@@ -248,7 +272,7 @@ def test_uuid_column_roundtrip_carries_the_parquet_annotation(
         [(str(bare), None)], idempotency_key=str(uuid.uuid4())
     )
     catalog.commit_prepared(request)
-    assert table.info().record_count == 5
+    assert _info_at_head(catalog, table).record_count == 5
     prepared_path = request["appends"][0]["files"][0]["path"]
     leaf, parquet = uuid_leaf(prepared_path)
     # Uploaded byte for byte: prepare never rewrites, so this object
@@ -475,7 +499,7 @@ def test_alter_add_column_then_append(catalog, ns):
     table.append(pa.table({"id": pa.array([3, 4], pa.int64()), "score": [1.5, None]}))
     files = table.files()
     assert len(files) == 2
-    assert table.info().record_count == 4
+    assert _info_at_head(catalog, table).record_count == 4
 
 
 def test_time_travel(catalog, ns):
@@ -494,7 +518,9 @@ def test_time_travel(catalog, ns):
 
     assert table.info(snapshot=s1).file_count == 1
     assert table.info(snapshot=s2).file_count == 2
-    assert table.info().record_count == 10
+    # s2 IS head here, named explicitly: a bare info() would answer from
+    # the maintenance sample instead of the manifest (hoglake #232).
+    assert table.info(snapshot=s2).record_count == 10
 
     t1 = next(s.snapshot_time for s in catalog.snapshots() if s.snapshot_id == s1)
     assert table.info(at_timestamp=t1).file_count == 1
@@ -509,6 +535,12 @@ def test_time_travel(catalog, ns):
 # file_size_bytes alongside snapshot-scoped file_count (fixed by
 # aggregateAt: TableInfo aggregates come from files visible at the
 # requested snapshot).
+#
+# That still holds for the SNAPSHOT path, which is what this test reads,
+# and it is now the only path it holds for: a head read with no snapshot
+# serves its totals from the server's maintenance sample instead
+# (hoglake #232), which is why every other assertion in this file names
+# head explicitly through _info_at_head.
 def test_time_travel_aggregates_are_snapshot_scoped(catalog, ns):
     table = ns.create_table("travel_agg", _events_schema())
     s1 = table.append(_events_data(5)).snapshot_id
@@ -703,7 +735,7 @@ def test_partitioned_append_fanout(catalog, ns):
         next_start += f.record_count
     assert next_start == total
 
-    assert table.info().record_count == total
+    assert _info_at_head(catalog, table).record_count == total
 
 
 def test_partitioned_compaction_groups_within_partition(catalog, ns):

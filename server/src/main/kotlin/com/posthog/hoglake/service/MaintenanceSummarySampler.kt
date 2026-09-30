@@ -702,10 +702,7 @@ class MaintenanceSummarySampler(
                 // sampled_at, empty partitions — for the minute or so
                 // until the sampler republishes. Raising instead would
                 // 500 every dashboard read across the deploy window.
-                val sample =
-                    runCatching {
-                        json.readValue(rs.getString("sample"), Sample::class.java)
-                    }.getOrNull()
+                val sample = sampleFrom(rs.getString("sample"))
                 sample?.let {
                     rs.getLong("catalog_id") to
                         Published(
@@ -715,5 +712,21 @@ class MaintenanceSummarySampler(
                 }
             }.list().filterNotNull().toMap()
         }
+
+        /**
+         * Decode a stored `sample` payload, or null when this build
+         * cannot — the ONE parser, so a second reader cannot get the
+         * lenient-vs-strict decision wrong.
+         *
+         * `internal` because `TierTotalsRepo`'s per-table read fetches
+         * the summary row in the SAME statement as the tier sums (one
+         * round trip on the hottest endpoint) and so has the JSON text
+         * in hand rather than a `Published`. The leniency is [read]'s,
+         * for [read]'s reason: a sample a newer replica published in a
+         * shape this build does not know must degrade the numbers to
+         * "not sampled", never 500 a request path.
+         */
+        internal fun sampleFrom(text: String?): Sample? =
+            text?.let { runCatching { json.readValue(it, Sample::class.java) }.getOrNull() }
     }
 }

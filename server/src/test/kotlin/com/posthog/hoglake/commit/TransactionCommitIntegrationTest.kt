@@ -11,6 +11,7 @@ import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -67,7 +68,7 @@ class TransactionCommitIntegrationTest {
         assertThat(commits.commit(catalog, request)).isEqualTo(result)
         assertThat(commits.receipt(catalog, request.idempotencyKey!!)).isEqualTo(result)
         for (table in listOf("a", "b")) {
-            assertThat(catalogs.getTable(catalog, "test", table).recordCount).isEqualTo(10)
+            assertThat(catalogs.tableWithExactTotals(catalog, "test", table).recordCount).isEqualTo(10)
         }
         db.jdbi.withHandleUnchecked { h ->
             assertThat(
@@ -124,7 +125,7 @@ class TransactionCommitIntegrationTest {
             )
         assertThatThrownBy { commits.commit(catalog, broken) }.isInstanceOf(HoglakeException.Validation::class.java)
         assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(request.readSnapshot)
-        assertThat(catalogs.getTable(catalog, "test", "a").recordCount).isZero()
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "a").recordCount).isZero()
         db.jdbi.withHandleUnchecked { h ->
             assertThat(
                 h.createQuery("SELECT count(*) FROM hog_upload WHERE owner = :owner AND state = 'active'")
@@ -170,6 +171,6 @@ class TransactionCommitIntegrationTest {
             )
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
         assertThat(catalogs.getCatalog(catalog).headSnapshotId).isEqualTo(head)
-        assertThat(catalogs.getTable(catalog, "test", "b").recordCount).isZero()
+        assertThat(catalogs.tableWithExactTotals(catalog, "test", "b").recordCount).isZero()
     }
 }

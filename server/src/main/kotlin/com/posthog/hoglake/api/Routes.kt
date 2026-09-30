@@ -131,6 +131,14 @@ fun Application.installApiRoutes(
                                         call.table(),
                                         call.longQuery("snapshot"),
                                         call.instantQuery("at_timestamp"),
+                                        // Defaults TRUE: the field set a
+                                        // client already gets does not
+                                        // shrink because a parameter was
+                                        // added. `totals=false` is the
+                                        // identity read (#232), which no
+                                        // client in this tree sends yet —
+                                        // see CatalogService.getTable.
+                                        totals = call.boolQuery("totals") ?: true,
                                     ).toDto(),
                                 )
                             }
@@ -688,6 +696,24 @@ internal fun parseLongQuery(
     name: String,
     raw: String,
 ): Long = raw.toLongOrNull() ?: throw BadRequestException("query parameter '$name' must be an integer")
+
+/**
+ * Boolean query parameter: exactly `true` or `false`, anything else a
+ * 400. Null when absent, so a caller can tell "not asked" from "asked
+ * for false" and supply its own default.
+ *
+ * STRICT ON PURPOSE. `toBooleanStrictOrNull` rather than
+ * `toBoolean`, which maps every unrecognized string — `"0"`, `"no"`,
+ * `"False "`, a typo — to FALSE. On `?totals=` that would silently
+ * suppress the totals for a caller that asked for something else, and
+ * the caller would read the absent fields as "not yet sampled" and
+ * believe the server.
+ */
+internal fun ApplicationCall.boolQuery(name: String): Boolean? =
+    request.queryParameters[name]?.let {
+        it.toBooleanStrictOrNull()
+            ?: throw BadRequestException("query parameter '$name' must be 'true' or 'false', got '$it'")
+    }
 
 internal fun ApplicationCall.intQuery(name: String): Int? =
     request.queryParameters[name]?.let {

@@ -227,9 +227,68 @@ data class TableDto(
     val namespace: String,
     val tableUuid: UUID,
     val columns: List<ColumnDto>,
-    val recordCount: Long,
-    val fileCount: Long,
-    val fileSizeBytes: Long,
+    /**
+     * The snapshot this response was resolved at — head when the caller
+     * named none. ALWAYS present, on every path including
+     * `totals=false`, because it describes the read and not the totals.
+     *
+     * A writer caches the whole response and sends this as a commit's
+     * `read_snapshot`, so the server's OCC validates the cache and the
+     * writer stops fetching the table per flush.
+     *
+     * Deliberately NOT [snapshotId]: that one is a DDL receipt marker
+     * whose ABSENCE on a read is a contract released clients depend on
+     * (see TableInfo.readSnapshotId).
+     */
+    val readSnapshotId: Long,
+    /*
+     * The three totals, ABSENT under NON_NULL rather than zeroed, and
+     * absence has exactly two causes (#232):
+     *
+     *  - the caller passed `?totals=false`, which is the identity read:
+     *    UUID, columns, specs, and no file read of any kind. The read a
+     *    writer fetching a table's schema per flush should make;
+     *    pyhoglake sends it from its next release.
+     *  - a head read the maintenance sampler's published generation does
+     *    not answer for: it has never published, the table was created
+     *    above its snapshot, or the generation predates V22's row
+     *    measures. "Not yet sampled", never 0 — an unsampled table and
+     *    an empty one are different facts, and the tier read keeps them
+     *    apart (a covered table with no files reports real zeros).
+     *
+     * The two are not distinguished ON THE WIRE, and they do not need to
+     * be: the caller knows which one it asked for. What distinguishes a
+     * SAMPLED number from an EXACT one is [totalsSnapshotId].
+     */
+    val recordCount: Long? = null,
+    val fileCount: Long? = null,
+    val fileSizeBytes: Long? = null,
+    /**
+     * The snapshot the three totals above are exact as of, present
+     * exactly when they are a sample.
+     *
+     * THE FRESHNESS FIELD A CALLER CAN RECONCILE. This repo dates a
+     * sample by snapshot — `PartitionListingService`'s "the sample is at
+     * the sampler's snapshot, which the response states" — because a
+     * snapshot can be compared against a time-travel read of the same
+     * table and a wall clock cannot.
+     *
+     * Absent on a time-travel read (the numbers are exact at the
+     * snapshot the caller named), on a create/alter receipt (exact at
+     * the snapshot the DDL just made), under `totals=false`, and when
+     * the sample does not cover the table.
+     */
+    val totalsSnapshotId: Long? = null,
+    /**
+     * When [totalsSnapshotId] was captured — the instant the published
+     * generation's SCAN BEGAN, not the instant it published.
+     *
+     * A generation runs for tens of minutes, so the publish instant
+     * would date these numbers up to that far after they were true;
+     * `PartitionListing`'s own comment is where that is written down.
+     * Absent exactly when [totalsSnapshotId] is.
+     */
+    val totalsAsOf: Instant? = null,
     /**
      * The spec visible at the requested snapshot (AlterDto's shape);
      * NON_NULL omits it for an unpartitioned table.
@@ -257,9 +316,12 @@ fun TableInfo.toDto() =
         namespace = namespace,
         tableUuid = tableUuid,
         columns = columns.map { it.toDto() },
+        readSnapshotId = readSnapshotId,
         recordCount = recordCount,
         fileCount = fileCount,
         fileSizeBytes = fileSizeBytes,
+        totalsSnapshotId = totalsSnapshotId,
+        totalsAsOf = totalsAsOf,
         partitionSpec = partitionSpec?.toAlterDto(),
         sortSpec = sortSpec?.toAlterDto(),
         comment = comment,

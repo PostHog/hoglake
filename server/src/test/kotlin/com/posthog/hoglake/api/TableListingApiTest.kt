@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.posthog.hoglake.App
 import com.posthog.hoglake.Config
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.publishMaintenanceSample
 import io.ktor.client.HttpClient
 import io.ktor.client.request.delete
 import io.ktor.client.request.get
@@ -178,7 +179,22 @@ class TableListingApiTest {
             // The same numbers the full Table object reports at head —
             // read from the other endpoint rather than restated, because
             // "agrees with GET table" is the actual contract.
+            //
+            // THE SAMPLE IS PART OF THE ASSERTION NOW, and so is the
+            // asymmetry it creates. The listing still aggregates the
+            // manifest in its own single statement; the Table object
+            // serves its totals from the maintenance sampler's published
+            // generation (#232). So the two agree exactly when the
+            // sample is current — which is why the sampler is driven
+            // here — and they can disagree by the sample's age
+            // otherwise. Bringing the listing onto the same source is a
+            // separate change; the OpenAPI Table schema states the
+            // asymmetry so a client is not left to discover it.
+            publishMaintenanceSample(db.jdbi)
             val table = body(client.get("$tables/commented"))
+            assertThat(table["totals_snapshot_id"].asLong())
+                .describedAs("the Table object's totals are a dated sample, the listing's are live")
+                .isGreaterThan(0)
             for (f in listOf("record_count", "file_count", "file_size_bytes")) {
                 assertThat(commented[f].asLong())
                     .describedAs("listing's %s must equal the Table object's", f)

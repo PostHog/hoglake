@@ -17,6 +17,7 @@ import com.posthog.hoglake.model.TableInfo
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.stats.IcebergSingleValue
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.AfterEach
@@ -72,7 +73,7 @@ class VariantCatalogIntegrationTest {
         val result = commits.commit("variant", request)
         assertThat(commits.commit("variant", request)).isEqualTo(result)
         assertThat(ScanService(db.jdbi).planScan("variant", "ns", "events")).hasSize(1)
-        assertThat(catalogs.getTable("variant", "ns", "events").recordCount).isEqualTo(1)
+        assertThat(catalogs.tableWithExactTotals("variant", "ns", "events").recordCount).isEqualTo(1)
     }
 
     @Test

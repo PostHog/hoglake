@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
@@ -58,7 +59,15 @@ class TimeTravelAggregatesIntegrationTest {
         assertThat(atFirst.recordCount).isEqualTo(10)
         assertThat(atFirst.fileSizeBytes).isEqualTo(1000)
 
-        val atHead = catalogs.getTable("tta", "ns", "t")
+        // HEAD NAMED EXPLICITLY, which is now a different contract from
+        // passing nothing: a read with no snapshot serves its totals from
+        // the maintenance sampler's published generation and reports
+        // nulls until one covers the table (#232). The invariant here is the
+        // aggregate one — totals come from the files visible AT THE
+        // REQUESTED SNAPSHOT, never from hog_table_stats — so the read
+        // has to be the one that aggregates. The sampled path has its own
+        // tests (api/TableTotalsApiTest).
+        val atHead = catalogs.tableWithExactTotals("tta", "ns", "t")
         assertThat(atHead.fileCount).isEqualTo(2)
         assertThat(atHead.recordCount).isEqualTo(15)
         assertThat(atHead.fileSizeBytes).isEqualTo(1500)

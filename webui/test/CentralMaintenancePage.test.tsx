@@ -153,6 +153,41 @@ describe("CentralMaintenancePage", () => {
     );
   });
 
+  it("renders a catalog whose response omits a task, instead of blanking the page", async () => {
+    // VERSION SKEW, which is the normal state during a rollout: the
+    // console deploys separately from the server, so a column this build
+    // knows can be missing from the response for a few minutes. This used
+    // to be `byTask.get(task)!` — the missing key threw inside render and
+    // React unmounted the WHOLE PAGE, every catalog and every other task,
+    // over one absent cell.
+    const withoutCompaction = {
+      catalogs: instanceMaintenanceStatusFixture.catalogs.map((c) => ({
+        ...c,
+        tasks: c.tasks.filter((t) => t.task !== "compaction"),
+      })),
+    };
+    mockCentral({ status: withoutCompaction });
+    renderApp("/maintenance");
+
+    // The page renders: both catalogs, and every task the response DID
+    // carry still has its cell.
+    expect(await screen.findByText("analytics")).toBeInTheDocument();
+    expect(screen.getByText("scratch")).toBeInTheDocument();
+    // A task the response DID carry still has its real cell, so the
+    // tolerance branch is narrow rather than swallowing the whole row.
+    expect(
+      screen.getAllByTitle("Metadata-only invariant scan; runs on demand"),
+    ).toHaveLength(withoutCompaction.catalogs.length);
+
+    // And the missing one degrades to a cell that says so, rather than
+    // silently reading as a task that has never run.
+    const skew = screen.getAllByTitle("This server does not report the task");
+    expect(skew).toHaveLength(withoutCompaction.catalogs.length);
+    for (const cell of skew) {
+      expect(cell).toHaveTextContent("—");
+    }
+  });
+
   it("renders the instance-wide run feed with catalog links", async () => {
     mockCentral();
     renderApp("/maintenance");

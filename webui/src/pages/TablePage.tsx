@@ -42,6 +42,8 @@ import {
   formatBytes,
   formatCount,
   formatPartitionField,
+  formatRelativeAge,
+  formatTime,
 } from "../lib/format";
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
@@ -84,22 +86,155 @@ function formatSortField(f: SortField, columns?: Column[]): string {
 /** Chars of a table comment shown before the expand control takes over. */
 const COMMENT_CLAMP = 120;
 
-function StatsHeader({ table }: { table: Table }) {
+/**
+ * Tooltip for a total that is not there. Absence has one cause on this
+ * page — the console never sends `totals=false` — so it can name it
+ * (#232): the maintenance sampler's published generation does not cover
+ * this table. It is NOT "empty": a table the sample covered that has no
+ * files reports real zeros.
+ */
+const NOT_SAMPLED = "not yet sampled";
+
+/**
+ * The freshness of the three totals, beside them, which is the whole
+ * point of serving them from a sample instead of a live scan: a number
+ * whose age is invisible is read as current.
+ *
+ * FOUR STATES, and the discriminator for the first one is THE REQUEST,
+ * not the response. `timeTravel` is whether this page asked for a
+ * snapshot, which it knows for certain; keying "exact" on
+ * `totals_snapshot_id === undefined` instead would label two other
+ * shapes as exact:
+ *
+ *  - a PRE-#232 server's head response, which carries live-aggregated
+ *    totals and no freshness field at all. During a rollout the console
+ *    deploys ahead of the server, so that shape is not hypothetical —
+ *    it is the same version-skew reasoning `CentralMaintenancePage`
+ *    applies to a missing task;
+ *  - a `totals=false` response, if anyone ever adds the parameter to
+ *    `getTable`: the numbers would be absent and the cell would claim
+ *    "not yet sampled", which is a WRONG claim rather than a missing
+ *    one.
+ *
+ * So: time travel ⇒ exact at the snapshot asked for; otherwise a
+ * `totals_snapshot_id` ⇒ a dated sample; otherwise numbers present ⇒
+ * an older server, numbers with no freshness claim at all; otherwise
+ * nothing sampled.
+ */
+function TotalsFreshness({
+  catalog,
+  table,
+  timeTravel,
+}: {
+  catalog: string;
+  table: Table;
+  /**
+   * Whether the page asked for a past snapshot. Just `?snapshot=` today:
+   * the page has no `at_timestamp` control, and the server's other
+   * time-travel parameter cannot be reached from here. It is the
+   * REQUEST's own state, which is the point — see this component's KDoc.
+   */
+  timeTravel: boolean;
+}) {
+  if (timeTravel) {
+    return (
+      <dd
+        className="subtle"
+        title={
+          "aggregated from the manifest at the snapshot this page asked " +
+          "for — a time-travel read has no sampled answer, so these are exact"
+        }
+      >
+        exact at this snapshot
+      </dd>
+    );
+  }
+  if (table.totals_snapshot_id !== undefined) {
+    return (
+      <dd
+        className="subtle"
+        // Exact UTC in the tooltip, humanized age in the cell — the
+        // snapshot-id tooltips' idiom (components/SnapshotId.tsx), and
+        // the snapshot itself is a SnapshotId so hovering it dates the
+        // sample against the table's own history.
+        title={
+          table.totals_as_of !== undefined
+            ? `sampled ${formatTime(table.totals_as_of)}, at the snapshot beside it`
+            : undefined
+        }
+      >
+        as of{" "}
+        {/* The fallback is DEFENSIVE and unreachable against a
+            conforming server: the spec says totals_as_of is "present and
+            absent exactly when totals_snapshot_id is", and the server
+            sets both from one nullable source. The other three states
+            here each answer a shape a real server produces; this one
+            answers a malformed response without rendering "undefined". */}
+        {table.totals_as_of !== undefined
+          ? formatRelativeAge(table.totals_as_of)
+          : "an earlier snapshot"}{" "}
+        · snapshot <SnapshotId catalog={catalog} id={table.totals_snapshot_id} />
+      </dd>
+    );
+  }
+  if (table.record_count !== undefined) {
+    // An older server: live numbers with nothing to date them by. Say
+    // nothing rather than guess — claiming either "exact" or an age
+    // would be inventing a property of a response that has none.
+    return (
+      <dd className="subtle" title="this server does not report the totals' freshness">
+        —
+      </dd>
+    );
+  }
+  return (
+    <dd className="subtle" title={NOT_SAMPLED}>
+      —
+    </dd>
+  );
+}
+
+function StatsHeader({
+  catalog,
+  table,
+  timeTravel,
+}: {
+  catalog: string;
+  table: Table;
+  timeTravel: boolean;
+}) {
+  // One test per cell would ask the same question three times; the server
+  // sends the three totals together or not at all.
+  const sampled = table.record_count !== undefined;
   return (
     <dl className="stats-header">
       <div>
         <dt>record_count</dt>
-        <dd className="mono">{formatCount(table.record_count)}</dd>
+        <dd className="mono" title={sampled ? undefined : NOT_SAMPLED}>
+          {formatCount(table.record_count)}
+        </dd>
       </div>
       <div>
         <dt>file_count</dt>
-        <dd className="mono">{formatCount(table.file_count)}</dd>
+        <dd className="mono" title={sampled ? undefined : NOT_SAMPLED}>
+          {formatCount(table.file_count)}
+        </dd>
       </div>
       <div>
         <dt>file_size_bytes</dt>
-        <dd className="mono" title={`${table.file_size_bytes}`}>
+        <dd
+          className="mono"
+          title={sampled ? `${table.file_size_bytes}` : NOT_SAMPLED}
+        >
           {formatBytes(table.file_size_bytes)}
         </dd>
+      </div>
+      {/* Beside the three it describes, not at the end of the header:
+          these numbers are a SAMPLE and the reader has to see that in
+          the same glance. */}
+      <div>
+        <dt>totals</dt>
+        <TotalsFreshness catalog={catalog} table={table} timeTravel={timeTravel} />
       </div>
       <div>
         <dt>table_uuid</dt>
@@ -1652,7 +1787,13 @@ export function TablePage() {
       ) : tableQuery.isPending ? (
         <SkeletonBlock />
       ) : (
-        <StatsHeader table={tableQuery.data} />
+        <StatsHeader
+          catalog={catalog!}
+          table={tableQuery.data}
+          // The REQUEST's own parameter. The page has it; the response
+          // cannot be asked (see TotalsFreshness).
+          timeTravel={snapshot !== undefined}
+        />
       )}
       <div className="tab-bar">
         <div role="tablist" className="tabs">

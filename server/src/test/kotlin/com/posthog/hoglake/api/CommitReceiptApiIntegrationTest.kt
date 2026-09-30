@@ -214,7 +214,14 @@ class CommitReceiptApiIntegrationTest {
                 assertThat(post("$base/commit/mutations/prepared", request.replace("new2", "changed")).status)
                     .isEqualTo(HttpStatusCode.UnprocessableEntity)
                 val target = "$base/namespaces/ns/tables/target"
-                assertThat(json.readTree(client.get(target).bodyAsText())["record_count"].asLong()).isEqualTo(10)
+                // The snapshot is named on BOTH reads: without one the
+                // totals come from the maintenance sampler's published
+                // generation and are absent until one covers the table
+                // (#232) — no test fixture runs that loop — so a bare
+                // read cannot assert what this commit just did.
+                assertThat(
+                    json.readTree(client.get("$target?snapshot=$committed").bodyAsText())["record_count"].asLong(),
+                ).isEqualTo(10)
                 assertThat(
                     json.readTree(client.get("$target?snapshot=$snapshot").bodyAsText())["record_count"].asLong(),
                 ).isEqualTo(7)
@@ -364,11 +371,17 @@ class CommitReceiptApiIntegrationTest {
 
                 // Both tables moved, in one snapshot, including the delete
                 // against a file this very commit staged.
+                // At the transaction's own snapshot, for the reason
+                // above: a bare read answers from the sample.
                 assertThat(
-                    json.readTree(client.get("$base/namespaces/ns/tables/a").bodyAsText())["record_count"].asLong(),
+                    json.readTree(
+                        client.get("$base/namespaces/ns/tables/a?snapshot=$committed").bodyAsText(),
+                    )["record_count"].asLong(),
                 ).isEqualTo(11)
                 assertThat(
-                    json.readTree(client.get("$base/namespaces/ns/tables/b").bodyAsText())["record_count"].asLong(),
+                    json.readTree(
+                        client.get("$base/namespaces/ns/tables/b?snapshot=$committed").bodyAsText(),
+                    )["record_count"].asLong(),
                 ).isEqualTo(8)
                 db.jdbi.useHandle<Exception> { h ->
                     assertThat(

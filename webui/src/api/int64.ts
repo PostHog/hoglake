@@ -67,6 +67,13 @@ const INT64_FIELDS = new Set([
   // rest of its int64 fields reuse names already above (file_count,
   // record_count, total_bytes, ...); this one is its own.
   "last_written_snapshot",
+  // table GET (#232): the snapshot a head read's sampled totals are
+  // exact at, and the snapshot the whole response was resolved at. Both
+  // are snapshot ids under their own names, so neither is covered by
+  // "snapshot_id" above — and the reviver keys on the NAME, so an
+  // omission here is a silent double.
+  "totals_snapshot_id",
+  "read_snapshot_id",
   // maintenance status + run ledger (GET /maintenance/status, /runs). The
   // result payloads inherit the POST result schemas' int64 fields.
   "run_id",

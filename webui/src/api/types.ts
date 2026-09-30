@@ -319,17 +319,72 @@ export interface Table {
   /** Inert user metadata (≤ 100 keys, string values); absent when none set. */
   properties?: Record<string, string>;
   columns: Column[];
-  record_count: Int64;
-  file_count: Int64;
-  file_size_bytes: Int64;
+  /**
+   * The three totals, OPTIONAL since the table GET stopped aggregating
+   * the manifest per call (#232). Absent means one of two things, and
+   * the caller knows which because it chose:
+   *
+   * - `?totals=false` was asked for (the identity read; the console
+   *   never sends it);
+   * - a head read the maintenance sampler's published generation does
+   *   not answer for — it has never published, the table was created
+   *   above its snapshot, or the generation predates the row measures.
+   *   NOT SAMPLED, never zero: a table the sample covered that has no
+   *   files reports real zeros.
+   *
+   * Present WITH `totals_snapshot_id` = sampled numbers, exact at that
+   * snapshot. Present WITHOUT it = exact at the snapshot the request
+   * named (a time-travel read still aggregates the manifest), or an
+   * OLDER SERVER's head response — which is why the console keys
+   * "exact" on the request's own parameters and never on this absence.
+   */
+  record_count?: Int64;
+  file_count?: Int64;
+  file_size_bytes?: Int64;
+  /**
+   * The snapshot the three totals are exact as of; present exactly when
+   * they are a sample. The repo dates samples by snapshot, because a
+   * snapshot is what a caller can reconcile against a time-travel read
+   * and a wall clock is not.
+   *
+   * THE SAME VALUE `PartitionListing.sampled_snapshot_id` carries, from
+   * the same sampler row. The `totals_` prefix scopes it to these three
+   * fields, which a `Table` needs and a `PartitionListing` does not: a
+   * Table mixes a sampled measure with metadata resolved at
+   * `read_snapshot_id`, while a listing is all sample.
+   */
+  totals_snapshot_id?: Int64;
+  /**
+   * When `totals_snapshot_id` was captured — the published generation's
+   * SCAN START, not its publish instant (a generation runs for tens of
+   * minutes). Present and absent exactly when `totals_snapshot_id` is;
+   * it exists so the header can print an age without resolving a
+   * snapshot id first.
+   *
+   * THE SAME INSTANT `PartitionListing.sample_started` carries — NOT its
+   * `sampled_at`, which is the publish. `formatAge`/`formatRelativeAge`
+   * share one ladder, so the table header's age and the partitions
+   * footer's cannot disagree about the same sample.
+   */
+  totals_as_of?: string;
   partition_spec?: PartitionSpec;
   sort_spec?: SortSpec;
   /**
    * The snapshot a create/alter DDL commit just made; absent on reads
    * (getTable resolves an arbitrary snapshot), so its presence means
-   * "this Table came with a fresh DDL pin".
+   * "this Table came with a fresh DDL pin". NOT `read_snapshot_id`.
    */
   snapshot_id?: Int64;
+  /**
+   * The snapshot this response was RESOLVED at — head when the request
+   * named none. Present on every response of a current server,
+   * `totals=false` included, because it describes the read rather than
+   * the totals; optional here only so an older server still types.
+   *
+   * A writer caches the response and sends this as a commit's
+   * `read_snapshot`, so the server's OCC validates the cache.
+   */
+  read_snapshot_id?: Int64;
 }
 
 export type StatsState = "provided" | "pending" | "failed";

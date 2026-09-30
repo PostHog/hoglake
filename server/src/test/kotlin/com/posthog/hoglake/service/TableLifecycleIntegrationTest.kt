@@ -16,6 +16,7 @@ import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
 import com.posthog.hoglake.model.Transform
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -98,13 +99,25 @@ class TableLifecycleIntegrationTest {
                 AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))),
             ),
         )
-        val before = catalogs.getTable(cat, "ns", "t")
+        val before = catalogs.tableWithExactTotals(cat, "ns", "t")
         val beforeFiles = catalogs.listFiles(cat, "ns", "t")
         val beforeSnapshot = catalogs.getCatalog(cat).headSnapshotId
         val result = catalogs.truncateTable(cat, "ns", "t", before.tableUuid)
+        // `readSnapshotId` is the one field that legitimately differs
+        // between two head reads taken either side of a commit — it is
+        // the snapshot the read resolved at, and the truncate moved head
+        // (#232). Naming the truncate's own snapshot here asserts that
+        // too, rather than excusing the difference.
         assertThat(
-            catalogs.getTable(cat, "ns", "t"),
-        ).isEqualTo(before.copy(recordCount = 0, fileCount = 0, fileSizeBytes = 0))
+            catalogs.tableWithExactTotals(cat, "ns", "t"),
+        ).isEqualTo(
+            before.copy(
+                recordCount = 0,
+                fileCount = 0,
+                fileSizeBytes = 0,
+                readSnapshotId = result.snapshotId,
+            ),
+        )
         assertThat(catalogs.getTable(cat, "ns", "t", beforeSnapshot)).isEqualTo(before)
         assertThat(catalogs.listFiles(cat, "ns", "t")).isEmpty()
         assertThat(catalogs.listFiles(cat, "ns", "t", beforeSnapshot)).containsExactlyElementsOf(beforeFiles)
@@ -134,7 +147,7 @@ class TableLifecycleIntegrationTest {
     @Test
     fun `rename and drop preserve receipts and history and stale UUID cannot affect reused names`() {
         val cat = fixture()
-        val original = catalogs.getTable(cat, "ns", "t")
+        val original = catalogs.tableWithExactTotals(cat, "ns", "t")
         val request = append(cat)
         val receipt = commits.commit(cat, request)
         val renamed = alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("renamed")), original.tableUuid)
@@ -143,7 +156,7 @@ class TableLifecycleIntegrationTest {
         assertThat(catalogs.getTable(cat, "ns", "t", receipt.snapshotId).recordCount).isEqualTo(10)
         assertThat(commits.commit(cat, request)).isEqualTo(receipt)
         catalogs.createTable(cat, "ns", "t", listOf(ColumnDef("id", ColType.LONG)))
-        val replacement = catalogs.getTable(cat, "ns", "t")
+        val replacement = catalogs.tableWithExactTotals(cat, "ns", "t")
         assertThatThrownBy {
             catalogs.dropTable(cat, "ns", "t", original.tableUuid)
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
@@ -153,10 +166,15 @@ class TableLifecycleIntegrationTest {
         assertThatThrownBy {
             alter.alterTable(cat, "ns", "t", listOf(AlterOp.RenameTable("wrong")), original.tableUuid)
         }.isInstanceOf(HoglakeException.CommitConflict::class.java)
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(replacement)
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(replacement)
         catalogs.dropTable(cat, "ns", "renamed", original.tableUuid)
         assertThat(commits.commit(cat, request)).isEqualTo(receipt)
-        assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(replacement)
+        // The drop above moved head, so a head read now resolves one
+        // snapshot later. `readSnapshotId` is the field that says so
+        // (#232); everything else about the replacement is unchanged,
+        // which is what this assertion is for.
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t"))
+            .isEqualTo(replacement.copy(readSnapshotId = catalogs.getCatalog(cat).headSnapshotId))
         assertThat(catalogs.getTable(cat, "ns", "t", receipt.snapshotId).recordCount).isEqualTo(10)
     }
 
@@ -190,7 +208,7 @@ class TableLifecycleIntegrationTest {
                 assertThat(catalogs.listFiles(cat, "ns", "t")).isEmpty()
                 val fresh = append(cat, "fresh.parquet", catalogs.getCatalog(cat).headSnapshotId)
                 commits.commit(cat, fresh)
-                assertThat(catalogs.getTable(cat, "ns", "t").recordCount).isEqualTo(10)
+                assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isEqualTo(10)
             } finally {
                 pool.shutdownNow()
             }
@@ -205,7 +223,7 @@ class TableLifecycleIntegrationTest {
         catalogs.truncateTable(cat, "ns", "t", uuid)
         assertThatThrownBy { commits.commit(cat, old) }.isInstanceOf(HoglakeException.CommitConflict::class.java)
         commits.commit(cat, append(cat, "blind.parquet"))
-        assertThat(catalogs.getTable(cat, "ns", "t").recordCount).isEqualTo(10)
+        assertThat(catalogs.tableWithExactTotals(cat, "ns", "t").recordCount).isEqualTo(10)
     }
 
     @Test
@@ -251,7 +269,7 @@ class TableLifecycleIntegrationTest {
                     ),
             ),
         )
-        val before = catalogs.getTable(cat, "ns", "t")
+        val before = catalogs.tableWithExactTotals(cat, "ns", "t")
         val head = catalogs.getCatalog(cat).headSnapshotId
         db.jdbi.useHandleUnchecked { h ->
             h.execute(
@@ -272,7 +290,7 @@ class TableLifecycleIntegrationTest {
                 catalogs.truncateTable(cat, "ns", "t", before.tableUuid)
             }.hasMessageContaining("publication failure")
             assertThat(catalogs.getCatalog(cat).headSnapshotId).isEqualTo(head)
-            assertThat(catalogs.getTable(cat, "ns", "t")).isEqualTo(before)
+            assertThat(catalogs.tableWithExactTotals(cat, "ns", "t")).isEqualTo(before)
             db.jdbi.withHandleUnchecked { h ->
                 assertThat(
                     h.createQuery("SELECT count(*) FROM hog_delete_file WHERE path = :path AND end_snapshot IS NULL")

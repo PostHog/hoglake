@@ -243,18 +243,46 @@ paths:
     get:
       operationId: getTable
       summary: Table schema, identity, and stats (optionally at a snapshot)
+      description: >
+        Without `snapshot`/`at_timestamp` the three totals come from the
+        maintenance sampler's published generation and carry
+        `totals_snapshot_id` plus `totals_as_of`; with either, they are
+        aggregated from the manifest and exact at the snapshot named.
+        `totals=false` omits them and reads no file row of any kind —
+        the identity read, and the one a writer fetching a table's UUID
+        and schema per flush should send. See the Table schema for the
+        full contract on absence.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
         - { $ref: "#/components/parameters/table" }
         - { $ref: "#/components/parameters/snapshot" }
         - { $ref: "#/components/parameters/atTimestamp" }
+        - in: query
+          name: totals
+          required: false
+          description: >
+            false omits record_count, file_count, file_size_bytes,
+            totals_snapshot_id and totals_as_of, and skips every read
+            behind them — including at a snapshot, so it cannot be used
+            to ask for an exact aggregate cheaply. Default true, so the
+            field set an existing client receives is unchanged.
+            Only `true` and `false` are accepted; any other value is a
+            400 rather than a silent false.
+          schema: { type: boolean, default: true }
       responses:
         "200":
           description: Table
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Table" }
+        "400":
+          description: >
+            `totals` was neither `true` nor `false`, or `at_timestamp`
+            was not an ISO-8601 instant.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
         "404": { $ref: "#/components/responses/NotFound" }
         "410": { $ref: "#/components/responses/Gone" }
     delete:
@@ -2935,8 +2963,61 @@ components:
 
     Table:
       type: object
-      required: [name, namespace, table_uuid, columns, record_count,
-                 file_count, file_size_bytes]
+      required: [name, namespace, table_uuid, columns, read_snapshot_id]
+      description: >
+        THE THREE TOTALS ARE OPTIONAL, and were required until the table
+        GET stopped aggregating the manifest on every call. A client must
+        handle their absence.
+
+
+        On a HEAD read they come from the MAINTENANCE SAMPLER's published
+        generation — the same source /maintenance/status and
+        /stats/partitions read, summed per table — so the request reads
+        one indexed row set and never the manifest.
+        `totals_snapshot_id` names the snapshot they are exact at and
+        `totals_as_of` the instant that snapshot was captured. A
+        generation runs for tens of minutes, so expect these numbers to
+        be minutes to tens of minutes behind head; the two freshness
+        fields are how a client knows by how much.
+
+
+        They are ABSENT on a head read when the published generation is
+        not an answer for the table: the sampler has never published for
+        the catalog, or the table was created above that generation's
+        snapshot and the scan never saw it, or the generation predates
+        the sampler that measures rows. Absent means NOT SAMPLED and
+        never zero — an unsampled table and an empty one are different
+        facts, and the read keeps them apart: a table the generation
+        covered that has no files reports real zeros.
+
+
+        On a TIME-TRAVEL read (`snapshot` or `at_timestamp`) they are
+        aggregated from the manifest, EXACT at that snapshot, and both
+        freshness fields are absent — a scan is the only correct answer
+        for a past snapshot, and an exact number has no age. Same on a
+        createTable/alterTable receipt, where they are exact at the
+        snapshot the DDL just made.
+
+
+        Under `totals=false` all five are absent. That is the identity
+        read: name, UUID, columns, partition and sort specs, with no file
+        read of any kind. A writer needing a table's UUID and schema per
+        flush should send it — that caller is what made this endpoint a
+        ~10M-row aggregate three times per flush on a busy table.
+        pyhoglake sends it from its next release.
+
+
+        The wire does not distinguish "you asked for no totals" from "not
+        yet sampled", because the caller knows which one it asked for.
+        What distinguishes a SAMPLED total from an EXACT one is the
+        presence of `totals_snapshot_id`.
+
+
+        NOTE THE ASYMMETRY WITH TableSummary: the namespace listing still
+        aggregates the manifest per table and its three totals stay
+        required and exact at the catalog head. So this endpoint and that
+        one can disagree by the sample's age for the same table. Bringing
+        the listing onto the same source is a separate change.
       properties:
         comment: { type: [string, "null"], maxLength: 16384 }
         properties: { $ref: "#/components/schemas/CustomProperties" }
@@ -2946,9 +3027,82 @@ components:
         columns:
           type: array
           items: { $ref: "#/components/schemas/Column" }
-        record_count: { type: integer, format: int64 }
-        file_count: { type: integer, format: int64 }
-        file_size_bytes: { type: integer, format: int64 }
+        read_snapshot_id:
+          type: integer
+          format: int64
+          description: >
+            The snapshot this response was RESOLVED AT — the catalog head
+            when the request named no `snapshot`/`at_timestamp`, the
+            resolved snapshot otherwise. Always present, on every path
+            including `totals=false`, because it describes the read
+            rather than the totals.
+
+
+            A writer can therefore cache this response and send this
+            value as a commit's `read_snapshot`: the server's existing
+            OCC validates the cache, so a writer that would otherwise
+            fetch the table before every flush fetches it once.
+
+
+            NOT the same field as `snapshot_id`, which is a DDL receipt
+            marker present only on createTable/alterTable responses and
+            whose ABSENCE on a read is relied on by released clients.
+        record_count:
+          type: integer
+          format: int64
+          description: >
+            Rows in the table's live files. Absent when the sample does
+            not cover the table or when totals=false; see this schema's
+            description.
+        file_count:
+          type: integer
+          format: int64
+          description: Live data files. Absent on the same terms as record_count.
+        file_size_bytes:
+          type: integer
+          format: int64
+          description: Bytes across those files. Absent on the same terms.
+        totals_snapshot_id:
+          type: integer
+          format: int64
+          description: >
+            The snapshot the three totals above are exact AS OF — the
+            snapshot the published generation's scan captured when it
+            began. Present exactly when they are a SAMPLE, so its
+            presence is how a client tells sampled numbers from exact
+            ones, and its value is what a client can reconcile against a
+            time-travel read of the same table. Absent on a time-travel
+            read, on a DDL receipt, under totals=false, and when the
+            sample does not cover the table.
+
+
+            THE SAME VALUE the sibling endpoints call
+            `sampled_snapshot_id` (PartitionListing, MaintenanceStatus) —
+            one generation, one row, one snapshot. The `totals_` prefix
+            says which numbers on THIS schema it dates, because a Table
+            carries measures from two different sources at once (these
+            three from the sample, everything else at
+            `read_snapshot_id`).
+        totals_as_of:
+          type: string
+          format: date-time
+          description: >
+            When `totals_snapshot_id` was captured — the instant the
+            published generation's scan BEGAN, not the instant it
+            published. A generation runs for tens of minutes, so the
+            publish instant would date these numbers up to that far
+            after they were true. Present and absent exactly when
+            `totals_snapshot_id` is; it exists so a UI can print an age
+            without resolving a snapshot id first.
+
+
+            THE SAME INSTANT the sibling endpoints call `sample_started`,
+            from the same row — not their `sampled_at`, which is the
+            PUBLISH instant and which PartitionListing's own description
+            tells you not to use for freshness. This schema deliberately
+            omits the publish instant altogether: carrying both would
+            make two claims about one set of numbers, and only one of
+            them is their age.
         partition_spec: { $ref: "#/components/schemas/PartitionSpec" }
         sort_spec: { $ref: "#/components/schemas/SortSpec" }
         snapshot_id:

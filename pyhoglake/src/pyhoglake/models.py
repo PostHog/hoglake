@@ -385,9 +385,29 @@ class TableInfo:
     namespace: str
     table_uuid: str
     columns: tuple[Column, ...]
-    record_count: int
-    file_count: int
-    file_size_bytes: int
+    #: Rows, files and bytes over the table's live files -- and all three
+    #: are OPTIONAL on the wire since the server stopped aggregating the
+    #: manifest on every table GET (hoglake #232). They are ``None``
+    #: when:
+    #:
+    #: * the read asked for ``totals=false`` (the identity read: name,
+    #:   UUID, columns, specs, no file read at all); or
+    #: * a head read the server's maintenance sample does not cover --
+    #:   it has never published for the catalog, or the table was created
+    #:   after the published sample's snapshot.
+    #:
+    #: ``None`` means NOT SAMPLED and never zero -- an unsampled table
+    #: and an empty one are different facts, and the server keeps them
+    #: apart (a covered table with no files samples as real zeros). A
+    #: time-travel read (``snapshot``/``at_timestamp``) still aggregates
+    #: the manifest, so its numbers are exact and never None.
+    #:
+    #: Accepting None is what lets an OLDER client keep working against a
+    #: newer server: this is tolerance, not a feature, and a caller that
+    #: needs a number must handle the absence rather than assume it.
+    record_count: int | None
+    file_count: int | None
+    file_size_bytes: int | None
     partition_spec: PartitionSpec | None = None
     sort_spec: SortSpec | None = None
     # The snapshot a create/alter commit just made; None on any read
@@ -398,6 +418,36 @@ class TableInfo:
     comment: str | None = None
     #: Inert user metadata; None when no properties are set.
     properties: dict[str, str] | None = None
+    #: The snapshot the three totals above are exact AS OF, when they are
+    #: a SAMPLE; None when they are exact (a time-travel read, a DDL
+    #: receipt), absent, or the server is too old to report it. Its
+    #: presence is how a caller tells a sampled total from an exact one.
+    #:
+    #: The same value ``PartitionListing.sampled_snapshot_id`` carries,
+    #: from the same sampler row; the ``totals_`` prefix scopes it to the
+    #: three fields above, because a TableInfo mixes them with metadata
+    #: resolved at :attr:`read_snapshot_id`.
+    totals_snapshot_id: int | None = None
+    #: When ``totals_snapshot_id`` was captured, as the server's ISO-8601
+    #: instant -- the sampler's scan START, not its publish, so it is the
+    #: instant these numbers describe. Present and absent exactly when
+    #: ``totals_snapshot_id`` is.
+    #:
+    #: The same instant ``PartitionListing.sample_started`` carries, NOT
+    #: its ``sampled_at`` twin (the publish, which a generation's runtime
+    #: puts up to tens of minutes later).
+    totals_as_of: str | None = None
+    #: The snapshot this whole response was RESOLVED at: head when the
+    #: read named none, the named one otherwise. Present on every
+    #: response of a current server, ``totals=false`` included, because
+    #: it describes the read rather than the totals -- a caller can cache
+    #: a TableInfo and send this as a commit's ``read_snapshot``, and the
+    #: server's OCC then validates the cache.
+    #:
+    #: OPTIONAL so an older server still parses, and DISTINCT from
+    #: :attr:`snapshot_id`: that one is set only by create/alter and this
+    #: client treats its presence as a DDL pin.
+    read_snapshot_id: int | None = None
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> TableInfo:
@@ -408,9 +458,13 @@ class TableInfo:
                 namespace=d["namespace"],
                 table_uuid=d["table_uuid"],
                 columns=tuple(Column.from_wire(c) for c in (d.get("columns") or ())),
-                record_count=d["record_count"],
-                file_count=d["file_count"],
-                file_size_bytes=d["file_size_bytes"],
+                # .get, not [...]: optional on the wire now -- see the
+                # field comments. Indexing would turn every unsampled
+                # table and every totals=false read into a
+                # MalformedResponseError.
+                record_count=d.get("record_count"),
+                file_count=d.get("file_count"),
+                file_size_bytes=d.get("file_size_bytes"),
                 partition_spec=PartitionSpec.from_wire(spec) if spec else None,
                 sort_spec=SortSpec.from_wire(d["sort_spec"])
                 if d.get("sort_spec")
@@ -418,6 +472,9 @@ class TableInfo:
                 snapshot_id=d.get("snapshot_id"),
                 comment=d.get("comment"),
                 properties=dict(d["properties"]) if d.get("properties") else None,
+                totals_snapshot_id=d.get("totals_snapshot_id"),
+                totals_as_of=d.get("totals_as_of"),
+                read_snapshot_id=d.get("read_snapshot_id"),
             )
 
         return _wire("TableInfo", d, build)

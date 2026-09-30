@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.PartitionValue
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.NamespaceRepo
 import com.posthog.hoglake.persistence.TableRepo
+import com.posthog.hoglake.persistence.TierTotalsRepo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -197,8 +198,7 @@ class PartitionStatsService(
                            sum(p.total_bytes) AS total_bytes, sum(p.small_bytes) AS small_file_bytes,
                            sum(p.dv_count) AS dv_count, sum(p.selected) AS debt_score
                     FROM hog_maintenance_summary_tier p
-                    JOIN hog_maintenance_summary s ON s.catalog_id = p.catalog_id
-                      AND s.published_generation = p.generation
+                    ${TierTotalsRepo.PUBLISHED_GENERATION_JOIN}
                     WHERE p.catalog_id = :catalogId
                     GROUP BY p.table_id, p.spec_id, p.partition_values
                 ),
