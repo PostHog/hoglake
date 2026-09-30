@@ -242,4 +242,45 @@ describe("CentralMaintenancePage", () => {
     expect(await screen.findByText("No catalogs yet.")).toBeInTheDocument();
     expect(await screen.findByText("No runs recorded yet.")).toBeInTheDocument();
   });
+
+  it("retirement's idle result is quiet, and only a queue-ceiling hold is red", async () => {
+    // Wire-shaped: the ledger's int64 counters arrive as JSON numbers
+    // before the reviver strings them. The tone once compared
+    // `skipped_queue_full !== "0"`, which is true for the number 0, so
+    // every idle "0 rows retired" rendered red.
+    const withRetirement = (result: Record<string, unknown>) => ({
+      catalogs: [
+        {
+          ...instanceMaintenanceStatusFixture.catalogs[0],
+          tasks: instanceMaintenanceStatusFixture.catalogs[0].tasks.map((t) =>
+            t.task === "retirement" && t.last_run
+              ? { ...t, last_run: { ...t.last_run, result } }
+              : t,
+          ),
+        },
+      ],
+      has_more: false,
+    });
+    const idle = {
+      tables: 0, rows_retired: 0, dvs_retired: 0, paths_queued: 0, batches: 0,
+      timeouts: 0, skipped_tables: 0, skipped_queue_full: 0, skipped_locked: 0,
+      convoyed: 0, tables_remaining: 0,
+    };
+
+    mockCentral({ status: withRetirement(idle) });
+    const { unmount } = renderApp("/maintenance");
+    const quiet = await screen.findByText("0 rows retired");
+    expect(quiet).toHaveClass("subtle");
+    expect(quiet).not.toHaveClass("backlog-bad");
+    unmount();
+
+    mockCentral({ status: withRetirement({ ...idle, skipped_queue_full: 1 }) });
+    renderApp("/maintenance");
+    const held = await screen.findByText("0 rows retired");
+    expect(held).toHaveClass("backlog-bad");
+    expect(held.closest("td")).toHaveAttribute(
+      "title",
+      expect.stringContaining("HOGLAKE_RETIREMENT_QUEUE_CEILING"),
+    );
+  });
 });
