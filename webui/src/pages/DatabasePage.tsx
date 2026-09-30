@@ -168,6 +168,8 @@ type TableSortKey =
   | "ratio"
   | "heap"
   | "indexes"
+  | "toast"
+  | "total"
   | "scans"
   | "vacuum";
 
@@ -183,6 +185,8 @@ const TABLE_COMPARATORS: Record<TableSortKey, ColumnSort<DatabaseTable>> = {
   },
   heap: int64Column((t) => t.table_bytes),
   indexes: int64Column((t) => t.index_bytes),
+  toast: int64Column((t) => t.toast_bytes),
+  total: int64Column((t) => t.total_bytes),
   // Sequential scans are the number worth ranking here: the cell shows
   // both, and a table being seq-scanned is what an operator looks for.
   scans: int64Column((t) => t.seq_scans),
@@ -197,7 +201,18 @@ const TABLE_COMPARATORS: Record<TableSortKey, ColumnSort<DatabaseTable>> = {
 };
 
 function Tables({ tables }: { tables: DatabaseTable[] }) {
-  const [sort, setSort] = useState<SortState<TableSortKey> | null>(null);
+  // THE ONLY TABLE HERE THAT OPENS SORTED, and it opens on the column
+  // the server already ordered by (DatabaseHealthRepo.tables:
+  // `ORDER BY pg_total_relation_size(relid) DESC`). So this changes no
+  // row order — it makes the order the page is ALREADY in legible, with
+  // the header arrow saying which column it is on, and clickable back to
+  // that state. The reason it matters is #240: heap + indexes were the
+  // only size columns, so a table that was 58 GiB of TOAST read as
+  // 61.8 MiB and sorted near the bottom of a column nobody was sorting.
+  const [sort, setSort] = useState<SortState<TableSortKey> | null>({
+    key: "total",
+    desc: true,
+  });
   const onSort = (key: TableSortKey) => setSort((prev) => nextSort(prev, key));
   const rows = applySort(tables, sort, TABLE_COMPARATORS);
   if (tables.length === 0) return <p className="empty">No tables.</p>;
@@ -222,6 +237,22 @@ function Tables({ tables }: { tables: DatabaseTable[] }) {
             sort={sort}
             onSort={onSort}
             numeric
+          />
+          <SortableTh
+            label="toast"
+            sortKey="toast"
+            sort={sort}
+            onSort={onSort}
+            numeric
+            tooltip="Out-of-line storage: where jsonb and text values too large for a page live. Counted in total but in neither heap nor indexes."
+          />
+          <SortableTh
+            label="total"
+            sortKey="total"
+            sort={sort}
+            onSort={onSort}
+            numeric
+            tooltip="Heap + indexes + TOAST — what the table actually costs on disk."
           />
           <SortableTh
             label="seq / idx scans"
@@ -254,6 +285,8 @@ function Tables({ tables }: { tables: DatabaseTable[] }) {
             </td>
             <td className="num">{formatBytes(t.table_bytes)}</td>
             <td className="num">{formatBytes(t.index_bytes)}</td>
+            <td className="num">{formatBytes(t.toast_bytes)}</td>
+            <td className="num">{formatBytes(t.total_bytes)}</td>
             <td className="num">
               {formatCount(t.seq_scans)} / {formatCount(t.index_scans)}
             </td>

@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
+import com.posthog.hoglake.testing.Measuring
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
@@ -666,13 +667,18 @@ class V23PartitionValueLookupMigrationIntegrationTest {
             }
         val concurrent = build(concurrently = true)
         val plain = build(concurrently = false)
+        println("V23 build: concurrent $concurrent ms against plain $plain ms on $FILES rows")
         // Not a threshold on either number — a machine-dependent
         // millisecond budget would flake and teach nothing. What is
-        // asserted is the ORDERING the trade rests on, which is a
-        // property of doing two heap passes instead of one.
-        assertThat(concurrent)
-            .describedAs("concurrent %d ms against plain %d ms on %d rows", concurrent, plain, FILES)
-            .isGreaterThan(plain)
+        // asserted is the ORDERING the trade rests on, a property of two
+        // heap passes instead of one — and on a quiet host only: a shared
+        // CI runner measured concurrent 232 ms against plain 617 ms once,
+        // so even the ordering is a measuring-host statement (Measuring).
+        if (Measuring.enabled) {
+            assertThat(concurrent)
+                .describedAs("concurrent %d ms against plain %d ms on %d rows", concurrent, plain, FILES)
+                .isGreaterThan(plain)
+        }
         // And the index is valid afterwards, because this test leaves
         // the fixture behind for the ones that share the class.
         assertThat(indexDef()).isNotNull()

@@ -249,10 +249,16 @@ class CommitServiceTest {
                 appends = listOf(TableAppend("ns", "events", files)),
             )
         val result = service.commit("cat", request)
-        // Simulate an existing pre-capability receipt with its original array ordering.
+        // Simulate an existing PRE-V24 receipt: the body in its original
+        // array ordering and no digest, which is the only state in which
+        // the commit path's re-canonicalize-and-compare arm runs at all.
+        // MUTATION: leave the fingerprint in place and this test stops
+        // exercising that arm (the digest answers, and the body is never
+        // read) — which is why the NULL is here rather than just the body.
         jdbi.useHandle<Exception> { h ->
-            h.createUpdate("UPDATE hog_commit_receipt SET request = CAST(:request AS jsonb)")
-                .bind("request", com.posthog.hoglake.wireObjectMapper().writeValueAsString(request)).execute()
+            h.createUpdate(
+                "UPDATE hog_commit_receipt SET fingerprint = NULL, request = CAST(:request AS jsonb)",
+            ).bind("request", com.posthog.hoglake.wireObjectMapper().writeValueAsString(request)).execute()
         }
         val reordered = request.copy(appends = listOf(request.appends.single().copy(files = files.reversed())))
         assertThat(CommitService(jdbi).commit("cat", reordered)).isEqualTo(result)
@@ -944,15 +950,23 @@ class CommitServiceTest {
             // NESTED: an unknown property inside appends[].files[], which
             // is where a newer replica's per-file field would land and
             // where a strict decode fails just as hard.
+            // The body is written from the canonical payload rather than
+            // read back from the row: after V24 the writer stores no body
+            // at all, so the pre-V24 row this case is about has to be
+            // constructed. The digest goes with it — a row that has one is
+            // judged by it, and this case is about the OTHER arm.
             h.createUpdate(
                 """
                 UPDATE hog_commit_receipt
-                   SET request = jsonb_set(
-                           request || '{"require_unchanged_tables": false, "future_guard": "v2"}'::jsonb,
+                   SET fingerprint = NULL,
+                       request = jsonb_set(
+                           CAST(:request AS jsonb) ||
+                               '{"require_unchanged_tables": false, "future_guard": "v2"}'::jsonb,
                            '{appends,0,files,0,future_file_field}', '"v2"'::jsonb, true)
                  WHERE catalog_id = :catalogId AND idempotency_key = :key
                 """,
-            ).bind("catalogId", seedCatalogId()).bind("key", key).execute()
+            ).bind("request", com.posthog.hoglake.wireObjectMapper().writeValueAsString(request))
+                .bind("catalogId", seedCatalogId()).bind("key", key).execute()
         }
         val stored =
             jdbi.withHandle<String, Exception> { h ->

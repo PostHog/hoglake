@@ -79,13 +79,14 @@ class DatabaseHealthFindingsTest {
         seqScans: Long = 2,
         indexScans: Long = 5_000_000,
         analyzed: Instant? = Instant.parse("2026-09-17T00:00:00Z"),
+        toast: Long = 0,
     ) = DatabaseTable(
         name = name,
         liveTuples = live,
         deadTuples = dead,
         tableBytes = bytes,
         indexBytes = bytes / 4,
-        toastBytes = 0,
+        toastBytes = toast,
         seqScans = seqScans,
         indexScans = indexScans,
         lastVacuum = null,
@@ -424,5 +425,55 @@ class DatabaseHealthFindingsTest {
             assertThat(finding.detail).describedAs("detail of ${finding.code}").isNotBlank()
             assertThat(finding.hoglakeImpact).describedAs("impact of ${finding.code}").isNotBlank()
         }
+    }
+
+    /**
+     * The `toast_dominant` finding, which exists because #240 was
+     * invisible for a year: `hog_commit_receipt` was 58.2 GiB of which
+     * 58.1 GiB was TOAST, and the console's tables list carried
+     * `table_bytes` and `index_bytes` — so the table read as 61.8 MiB and
+     * nothing anywhere said otherwise.
+     */
+    @Test
+    fun `a table that is mostly TOAST is reported, and a normally toasted one is not`() {
+        // #240's actual numbers: 61.8 MiB of heap, 58.1 GiB of TOAST.
+        val receipts =
+            listOf(
+                table(
+                    name = "hog_commit_receipt",
+                    bytes = 64L * 1024 * 1024,
+                    toast = 58L * 1024 * 1024 * 1024,
+                ),
+            )
+        assertThat(codes(tables = receipts)).contains("toast_dominant")
+
+        // A table with genuine text columns runs a few times its heap in
+        // TOAST, which is normal and must stay silent — otherwise the
+        // finding fires on the events manifest and trains an operator to
+        // ignore the page. MUTATION: lower TOAST_DOMINANT_RATIO to 2 and
+        // this reds.
+        val normal =
+            listOf(
+                table(
+                    name = "hog_table_metadata",
+                    bytes = 1L * 1024 * 1024 * 1024,
+                    toast = 4L * 1024 * 1024 * 1024,
+                ),
+            )
+        assertThat(codes(tables = normal)).doesNotContain("toast_dominant")
+
+        // And a SMALL table is silent whatever its ratio: a 1 MiB table
+        // that is all TOAST says nothing about anything. MUTATION: drop
+        // the SIGNIFICANT_TABLE_BYTES filter and this reds.
+        val tiny = listOf(table(name = "hog_options", bytes = 8 * 1024, toast = 1024 * 1024))
+        assertThat(codes(tables = tiny)).doesNotContain("toast_dominant")
+
+        // INFO, not WARN: it is a schema observation, true of a healthy
+        // table that legitimately stores documents.
+        val finding =
+            service.findings(server(), activity(), receipts, listOf(index()))
+                .single { it.code == "toast_dominant" }
+        assertThat(finding.severity).isEqualTo(FindingSeverity.INFO)
+        assertThat(finding.title).contains("hog_commit_receipt")
     }
 }

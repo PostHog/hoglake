@@ -733,6 +733,17 @@ export interface CleanupResult {
    * Optional for the same reason as the two above.
    */
   deadline_skipped?: Int64;
+  /**
+   * Commit receipts past HOGLAKE_RECEIPT_RETENTION_SECONDS that the run
+   * deleted (#240). Optional for the same reason as the three above.
+   */
+  receipts_purged?: Int64;
+  /**
+   * Purge pages that threw. Separate from receipts_purged because 0 is
+   * the same number for an idle run and a failing one. Optional for the
+   * same reason as the three above.
+   */
+  receipts_purge_failures?: Int64;
 }
 
 export interface CompactionResult {

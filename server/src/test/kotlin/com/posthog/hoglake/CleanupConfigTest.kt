@@ -364,4 +364,44 @@ class CleanupConfigTest {
             )
             .isEqualTo(4_000)
     }
+
+    /**
+     * The receipt-retention floor (#240, V24).
+     *
+     * The failure it prevents is the quietest one in the change: a
+     * receipt purged inside a client's replay window turns that replay
+     * into a second publication of the same files, with the commit
+     * reporting success and no counter anywhere disagreeing. An hour is
+     * not a retention anybody chooses against a client that holds a
+     * prepared payload for half the snapshot window, so a positive value
+     * under it is read as a unit mistake.
+     *
+     * 0 and below stay legal, and that is the other half: "keep every
+     * receipt forever" is V7's behaviour and a defensible choice for an
+     * operator who wants the old shape back.
+     */
+    @Test
+    fun `a positive receipt retention under the floor is refused, and zero is not`() {
+        // MUTATION: drop the `receiptRetentionSeconds <= 0 ||` arm and the
+        // second half of this test reds; drop the `>= MIN` arm and the
+        // first half does.
+        assertThatThrownBy { Config(receiptRetentionSeconds = 60) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_RECEIPT_RETENTION_SECONDS=60")
+            .hasMessageContaining("publish the same files again")
+        assertThatThrownBy { Config(receiptRetentionSeconds = Config.MIN_RECEIPT_RETENTION_SECONDS - 1) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+        // The floor itself is legal, and so is turning the purge off.
+        assertThat(Config(receiptRetentionSeconds = Config.MIN_RECEIPT_RETENTION_SECONDS).receiptRetentionSeconds)
+            .isEqualTo(Config.MIN_RECEIPT_RETENTION_SECONDS)
+        assertThat(Config(receiptRetentionSeconds = 0).receiptRetentionSeconds).isZero()
+        assertThat(Config(receiptRetentionSeconds = -1).receiptRetentionSeconds).isEqualTo(-1)
+        // The compiled default is the seven days the KDoc argues for, and
+        // it is what CleanupService's own default has to agree with —
+        // App.kt wires the config value, but a hand-built service uses the
+        // constant, and two different "7 days" would be two behaviours.
+        assertThat(Config().receiptRetentionSeconds)
+            .isEqualTo(7L * 24 * 60 * 60)
+            .isEqualTo(CleanupService.RECEIPT_RETENTION_SECONDS)
+    }
 }

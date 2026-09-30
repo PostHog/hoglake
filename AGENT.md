@@ -497,11 +497,24 @@ The rules. Every one of them was violated by the code above.
 - **Do the growth arithmetic for anything written per commit or per
   file.** Rows per file per commit × files per commit × commits per
   minute × retention, in bytes on disk, before the change ships.
-  `hog_commit_receipt` stores 566 KB per 270-file commit and is never
-  purged: ~40 GB/day at today's rate (#240). Column stats are 25 rows
-  per file. Every such table needs a retention and a bounded,
-  PK-walking purge (the removal-ledger purge shape) from the day it is
-  created.
+  `hog_commit_receipt` stored 566 KB per 270-file commit and nothing
+  purged it — ~40 GB/day, 58.2 GiB standing when #240 found it. It now
+  stores a 33-byte digest instead of the body and expires at
+  `HOGLAKE_RECEIPT_RETENTION_SECONDS` (7 days), purged in bounded pages
+  by the cleanup sweep (V24). Column stats are 25 rows per file and are
+  still unbounded. Every such table needs a retention and a bounded
+  purge from the day it is created — **bounded, not necessarily
+  PK-walking**: the removal-ledger purge walks its primary key because
+  its predicate (`drained_at`) is uncorrelated with that key, so pages
+  can purge nothing and the walk needs a cursor and a skip cap. The
+  receipt purge walks `(catalog_id, created_at)` instead, because the
+  predicate IS the indexed column and the eligible rows are therefore a
+  dense prefix — no cursor, no skip, and `purged < page` means the end.
+  Pick whichever makes the eligible set an index range; what is not
+  negotiable is that a page bounds the rows EXAMINED and that the
+  statement carries its own `statement_timeout`, because a page's cost
+  is not always its row count (a legacy receipt's ~160 KiB body is ~80
+  synchronous TOAST-chunk deletes on top of its heap delete).
 - **Size groups by every dimension a downstream bound checks.** If a
   later stage refuses on rows, pack by rows and bytes; if it refuses
   on heap, pack by the estimate it will apply. A planner that packs by
@@ -907,7 +920,12 @@ fixture size is, and what grows per commit and how it is purged.
   funnel; the hydrator's instance-wide sweep fans out one row per
   claimed catalog). Recording is post-run and best-effort (never fails
   the task); the cleanup sweep purges rows past
-  `HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS` (7d default). Read
+  `HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS` (7d default), and
+  commit receipts past `HOGLAKE_RECEIPT_RETENTION_SECONDS` (7d, #240/V24
+  — floored per catalog at twice its snapshot retention and capped at
+  30 days, because a receipt purged inside a client's replay window
+  turns that replay into a duplicate publication with nothing reporting
+  it). Read
   side: per-catalog `GET .../maintenance/status` + `/runs` and the
   instance-wide `GET /v1/maintenance/status` + `/runs` twins
   (MaintenanceStatusService; batched reads independent of catalog count).

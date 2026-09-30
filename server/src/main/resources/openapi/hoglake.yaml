@@ -4370,6 +4370,34 @@ components:
             of, and that budget bounded a commit-lock hold the drain no longer
             takes. Retained on the wire because the maintenance run ledger
             holds rows that carry it.
+        receipts_purged:
+          type: integer
+          format: int64
+          description: >
+            Commit receipts (hog_commit_receipt) this run deleted because
+            they are past HOGLAKE_RECEIPT_RETENTION_SECONDS — per catalog,
+            in bounded pages, with the cutoff floored at twice the
+            catalog's snapshot retention (capped at 30 days) so a receipt
+            always outlives any payload a client may still replay. 0 also
+            means "the run's page budget expired first" — and, when
+            receipts_purge_failures is nonzero, "every page it attempted
+            threw". Not required: a run recorded before the counter
+            existed has no such field, and the ledger replays rows
+            verbatim (the read path fills 0).
+        receipts_purge_failures:
+          type: integer
+          format: int64
+          description: >
+            Pages of that purge which threw — a statement bound fired, or
+            the run could not reach the database. Reported separately
+            because receipts_purged alone is 0 for an idle run and for a
+            failing one alike, and the failing one is the state that
+            matters while the pre-V24 backlog (rows carrying ~160 KiB of
+            out-of-line body each) is still draining. Standing nonzero
+            means the page size or the statement bound needs looking at;
+            nothing is corrupt and the next run retries from the oldest
+            eligible receipt. Not required, for the same reason as the
+            counters above.
 
     RehydrateResult:
       type: object

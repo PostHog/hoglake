@@ -274,6 +274,44 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
             }
         }
 
+        // BODIES DOMINATE THE TABLE, which is a shape the tables list can
+        // now show (toast_bytes is a column) but that nobody reads a list
+        // to find. #240 is the case: `hog_commit_receipt` was 58.2 GiB of
+        // which 58.1 GiB was TOAST — a thousandfold ratio — and the
+        // console showed it as 61.8 MiB for a year, because the list
+        // carried `table_bytes` and `index_bytes` and TOAST is neither.
+        //
+        // The ratio, not the size, is the signal: a wide events table
+        // with real text columns can hold gigabytes of TOAST
+        // legitimately, at maybe 2-5x its heap. Past
+        // [TOAST_DOMINANT_RATIO] the row itself is a handful of ids and
+        // the payload is the table, which for a hoglake table means a
+        // column holding request/response bodies — and those are exactly
+        // the columns nothing reads back.
+        //
+        // INFO, not WARN: it is a design observation about a schema, not
+        // a state an operator must act on tonight, and it is TRUE of a
+        // healthy table that legitimately stores documents.
+        for (table in tables.filter { it.toastBytes >= SIGNIFICANT_TABLE_BYTES }) {
+            if (table.toastBytes >= table.tableBytes * TOAST_DOMINANT_RATIO) {
+                found +=
+                    DatabaseFinding(
+                        FindingSeverity.INFO,
+                        "toast_dominant",
+                        "${table.name} is mostly out-of-line values: ${bytes(table.toastBytes)} of TOAST",
+                        "${bytes(table.toastBytes)} of TOAST against ${bytes(table.tableBytes)} " +
+                            "of heap and ${bytes(table.indexBytes)} of indexes.",
+                        "TOAST is where jsonb and text values too large for a page live, so a " +
+                            "table this lopsided is storing BODIES, not rows. Two questions " +
+                            "follow: does anything read them back (hog_commit_receipt's " +
+                            "request payload did not — #240 replaced it with a 32-byte " +
+                            "digest), and do they have a retention? A body written per commit " +
+                            "and never deleted is the growth curve this finding exists to " +
+                            "make visible before the volume does.",
+                    )
+            }
+        }
+
         val unused =
             indexes.filter {
                 it.scans == 0L && !it.constraintBacking && it.sizeBytes >= SIGNIFICANT_INDEX_BYTES
@@ -452,6 +490,18 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
 
         /** The commit tail holds its lock for milliseconds. */
         const val LOCK_WAIT_WARN = 10.0
+
+        /**
+         * TOAST-to-heap ratio past which the table is storing bodies
+         * rather than rows (the `toast_dominant` finding).
+         *
+         * 10x, not 2x: a table with genuine text or jsonb columns runs a
+         * few times its heap in TOAST and that is normal. The ratio this
+         * catches is the one #240 found — `hog_commit_receipt` at 58.1 GiB
+         * of TOAST against 61.8 MiB of heap, roughly 960x — where the row
+         * is a handful of ids and the payload is everything.
+         */
+        const val TOAST_DOMINANT_RATIO = 10L
 
         const val SEQ_SCAN_WARN = 0.5
         const val SCAN_FLOOR = 100L

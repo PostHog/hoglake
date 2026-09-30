@@ -55,6 +55,22 @@ class MigrationLockWindowTest {
         const val FIRST_GUARDED_VERSION = 14
 
         /**
+         * Version numbers that may be MISSING from the chain, and why.
+         *
+         * 5: never written. V4 is followed by V6, since before the
+         * append-only freeze.
+         *
+         * This set is also a MERGE-COORDINATION REGISTER: a branch that
+         * deliberately leaves a number to a sibling adds it here with the
+         * owner named, and `no stale entry survives the sibling's merge`
+         * below reds the moment that number exists, which is what forces
+         * the entry to be pruned rather than left to rot into a hole
+         * nobody notices. (23 sat here while #247 and #240 developed
+         * V23 and V24 in parallel; #247 merged first and it was pruned.)
+         */
+        val ALLOWED_GAPS = setOf(5)
+
+        /**
          * Statements that take a lock conflicting with ordinary writes,
          * as a line-level pattern over the migration text.
          *
@@ -328,5 +344,81 @@ class MigrationLockWindowTest {
                     .isTrue()
             }
         }
+    }
+
+    /**
+     * THE CHAIN IS CONTIGUOUS, which is the guard the V23/V24 collision
+     * showed was missing.
+     *
+     * Flyway runs with `outOfOrder = false` and `validateOnMigrate = true`
+     * (`Database.flywayConfig` sets neither, so both are the defaults), so
+     * a migration whose version is BELOW the highest one already applied
+     * is not run — it is a validate failure, on every replica, at boot:
+     * `Detected resolved migration not applied to database: N`. Two
+     * branches developing V23 and V24 in parallel therefore have a merge
+     * order that matters, and until this assertion existed nothing in the
+     * repo said so: the second branch to merge would have taken the whole
+     * fleet into a boot crash-loop, with the mitigation living only in a
+     * reviewer's notes.
+     *
+     * A gap is the detectable form of that mistake, and it fails HERE — in
+     * the unit lane, in under a second, on the PR that opens second —
+     * rather than in production. The rule the failure states is the fix:
+     * whichever branch merges second holds the HIGHER number, so the
+     * branch that finds a gap renumbers its file, its `.conf` and the
+     * `freshDatabaseAt` arrival in its test.
+     *
+     * Deliberately NOT asserting that the chain starts at 1 or reaches any
+     * particular N: V5 never existed (the chain has been 1,2,3,4,6,… since
+     * before the freeze, which is why the expected set is built from the
+     * MINIMUM present rather than from 1), and the head moves with every
+     * change.
+     */
+    @Test
+    fun `the migration chain has no gaps, so a parallel-branch collision fails here`() {
+        val versions =
+            Files.list(Path.of(DIR)).use { stream ->
+                stream.map { it.fileName.toString() }
+                    .filter { it.endsWith(".sql") }
+                    .toList()
+            }.map { version(it) }.sorted()
+        assertThat(versions).doesNotHaveDuplicates()
+        val expected = (versions.first()..versions.last()).filterNot { it in ALLOWED_GAPS }
+        assertThat(versions)
+            .describedAs(
+                "a gap means some version below the chain's head is missing. Flyway runs " +
+                    "outOfOrder=false and validateOnMigrate=true, so a migration that later " +
+                    "arrives to fill it is never applied — it is a boot-time validate failure on " +
+                    "every replica. Either renumber the new migration above the head, or, if a " +
+                    "sibling branch legitimately owns that number, add it to ALLOWED_GAPS with " +
+                    "the branch named",
+            )
+            .isEqualTo(expected)
+    }
+
+    /**
+     * The register above cannot rot.
+     *
+     * An [ALLOWED_GAPS] entry for a version that now EXISTS means the
+     * sibling merged and nobody pruned the exemption — which leaves a
+     * permanent hole in the guard at exactly the number most likely to be
+     * reused next. Failing here is cheap; the alternative is the gate
+     * quietly not covering a version forever.
+     */
+    @Test
+    fun `no stale entry survives the sibling's merge`() {
+        val present =
+            Files.list(Path.of(DIR)).use { stream ->
+                stream.map { it.fileName.toString() }
+                    .filter { it.endsWith(".sql") }
+                    .toList()
+            }.map { version(it) }.toSet()
+        assertThat(ALLOWED_GAPS.filter { it in present })
+            .describedAs(
+                "these versions are in the chain now, so their ALLOWED_GAPS entries are stale " +
+                    "and must be removed — an exemption for a version that exists is a hole in " +
+                    "the contiguity guard",
+            )
+            .isEmpty()
     }
 }

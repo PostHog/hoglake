@@ -214,7 +214,7 @@ class CommitService(
          * the refusal is switched on.
          *
          * A parameter and NOT a CommitRequest field, deliberately: the
-         * request is the fingerprinted, durably stored receipt payload
+         * request is what the receipt's fingerprint is taken over
          * (commitFingerprint serializes all of it), so a user agent in
          * there would make a replay from a different client version fail
          * the "same key, same request" check.
@@ -243,8 +243,15 @@ class CommitService(
                 // Canonicalizing large registrations needs neither a connection nor
                 // the catalog lock. Receipt comparison and publication stay locked.
                 val requestJson = request.idempotencyKey?.let { commitFingerprint(request) }
+                // The digest is taken HERE, outside the transaction and the
+                // catalog lock, for the reason the line above canonicalizes
+                // here: hashing 1.5 MB of canonical JSON is ~1 ms of CPU and
+                // it is nobody else's business. Both halves are kept because
+                // a pre-V24 receipt still has to be compared as a STRING —
+                // see the fallback in [doCommit].
+                val fingerprint = requestJson?.let { commitFingerprintDigest(it) }
                 jdbi.inTransaction<CommitResult, RuntimeException> { handle ->
-                    doCommit(handle, catalog, request, requestJson, userAgent)
+                    doCommit(handle, catalog, request, requestJson, fingerprint, userAgent)
                 }
             } catch (e: HoglakeException) {
                 Metrics.commitFailureResult(e)?.let { Metrics.commitRecorded(catalog, it) }
@@ -425,6 +432,7 @@ class CommitService(
         catalogName: String,
         req: CommitRequest,
         requestJson: String?,
+        fingerprint: ByteArray?,
         userAgent: String? = null,
     ): CommitResult {
         // Resolve only the catalog before checking receipts. Replays must not
@@ -439,24 +447,79 @@ class CommitService(
         Locks.acquireCatalogCommitLock(h, catalogId, commitLockTimeoutMs)
 
         // Under the same catalog lock as publication, so concurrent retries
-        // cannot both allocate rows. A receipt is not tied to snapshot expiry.
+        // cannot both allocate rows. A receipt is not tied to snapshot
+        // expiry — it has its own retention, which the cleanup sweep
+        // enforces (`HOGLAKE_RECEIPT_RETENTION_SECONDS`, 7 days; see
+        // CleanupService.purgeCommitReceipts for why a receipt has to
+        // outlive any payload a client may still replay).
         req.idempotencyKey?.let { key ->
             val receipt =
                 h.createQuery(
                     """
-                    SELECT snapshot_id, schema_version, request::text AS request
+                    SELECT snapshot_id, schema_version, fingerprint, request::text AS request
                     FROM hog_commit_receipt WHERE catalog_id = :catalog AND idempotency_key = :key
                     """,
                 ).bind("catalog", catalogId).bind("key", key)
                     .map { rs, _ ->
-                        // storedPayloadObjectMapper, NOT the strict API mapper: this
-                        // JSON was written by a replica of this service, which during
-                        // a rolling deploy may be a NEWER one carrying a field this
-                        // version does not know. A strict decode would throw here,
-                        // inside the commit tail under the catalog lock, and turn a
-                        // half-finished deploy into 500s on replay.
-                        val stored = storedPayloadObjectMapper().readValue<CommitRequest>(rs.getString("request"))
-                        if (commitFingerprint(stored) != requestJson) {
+                        val stored = rs.getBytes("fingerprint")
+                        val same =
+                            when {
+                                stored == null -> {
+                                    // A PRE-V24 RECEIPT, which carries the body and no
+                                    // digest. Re-canonicalize and compare strings, which
+                                    // is what this check did before the column existed.
+                                    // Deleted with the `request` column once no
+                                    // null-fingerprint row is left (V24's header names
+                                    // the follow-up).
+                                    //
+                                    // storedPayloadObjectMapper, NOT the strict API mapper:
+                                    // this JSON was written by a replica of this service,
+                                    // which during a rolling deploy may be a NEWER one
+                                    // carrying a field this version does not know. A strict
+                                    // decode would throw here, inside the commit tail under
+                                    // the catalog lock, and turn a half-finished deploy into
+                                    // 500s on replay.
+                                    val body =
+                                        storedPayloadObjectMapper().readValue<CommitRequest>(rs.getString("request"))
+                                    commitFingerprint(body) == requestJson
+                                }
+                                stored.firstOrNull() != COMMIT_FINGERPRINT_VERSION -> {
+                                    // A DIGEST THIS BUILD CANNOT COMPARE, and the answer
+                                    // is the stored snapshot rather than a refusal.
+                                    //
+                                    // The byte moves when the canonical string moves (see
+                                    // COMMIT_FINGERPRINT_VERSION), and an old canonical
+                                    // string is unrecoverable — so there is no comparison
+                                    // to make. The two available answers are "this key was
+                                    // published, here is its snapshot" and "422, your
+                                    // request differs". The first is true of every correct
+                                    // client and of the one case a wrong one could reach
+                                    // (a key genuinely reused with a different payload,
+                                    // which then gets the earlier publication's result
+                                    // instead of a refusal — a client bug reported as a
+                                    // success, which is what every idempotency-key API
+                                    // does). The second is a NEW 4xx on a path deployed
+                                    // writers use, for a whole retention window, caused by
+                                    // OUR format change: the failure AGENT.md's "stage
+                                    // every refusal a live client could hit" forbids.
+                                    //
+                                    // Counted, because it is otherwise invisible: a
+                                    // standing nonzero rate means a version bump is being
+                                    // answered by this arm and the operator should know how
+                                    // many replays it covers.
+                                    Metrics.commitReceiptUnknownDigestVersion(catalogName)
+                                    true
+                                }
+                                else ->
+                                    // THE V24 PATH: 33 bytes against 33 bytes, deciding
+                                    // exactly what the string comparison above decided,
+                                    // because the digest is taken OF that string
+                                    // (commitFingerprintDigest). `contentEquals`, not
+                                    // `==`: arrays compare by identity in Kotlin, and
+                                    // reference equality here would refuse every replay.
+                                    stored.contentEquals(fingerprint)
+                            }
+                        if (!same) {
                             throw HoglakeException.Validation("idempotency_key reused with a different request")
                         }
                         CommitResult(rs.getLong("snapshot_id"), rs.getLong("schema_version"))
@@ -813,12 +876,30 @@ class CommitService(
         applyDeletes(h, catalogId, snapshotId, readSnapshot, nextFileId, resolvedDeletes)
 
         req.idempotencyKey?.let { key ->
+            // THE FINGERPRINT, AND NO BODY. `request` is left NULL: it used
+            // to hold the whole canonical payload, which on the prod-us
+            // events writer's 270-file x 25-column append is 1.5 MB of jsonb,
+            // 566 KB on disk after TOAST, and ~38 ms of the ~100 ms this
+            // commit holds the per-catalog lock (#240). Nothing reads it that
+            // 32 bytes cannot answer — see [commitFingerprintDigest] for what
+            // is lost with it.
+            //
+            // ROLLING-DEPLOY NOTE, and NULL is the deliberate choice. A
+            // pre-V24 replica replaying a receipt this statement wrote reads
+            // `request` as NULL and throws inside its own commit tail: a
+            // transient 500 on an already-published key, for the length of
+            // the deploy, on a path that retries. The alternative — writing a
+            // placeholder body so the old decode succeeds — makes that
+            // replica compare a placeholder against the real request and
+            // answer `idempotency_key reused with a different request`: a 422
+            // that tells a correct client it is wrong, which is strictly
+            // worse than a retryable 500.
             h.createUpdate(
                 """
-                INSERT INTO hog_commit_receipt (catalog_id, idempotency_key, request, snapshot_id, schema_version)
-                VALUES (:catalog, :key, CAST(:request AS jsonb), :snapshot, :schema)
+                INSERT INTO hog_commit_receipt (catalog_id, idempotency_key, fingerprint, snapshot_id, schema_version)
+                VALUES (:catalog, :key, :fingerprint, :snapshot, :schema)
                 """,
-            ).bind("catalog", catalogId).bind("key", key).bind("request", requestJson)
+            ).bind("catalog", catalogId).bind("key", key).bind("fingerprint", fingerprint)
                 .bind("snapshot", snapshotId).bind("schema", schemaVersion).execute()
         }
         return CommitResult(snapshotId, schemaVersion)

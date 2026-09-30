@@ -1,4 +1,5 @@
-import { screen } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
@@ -37,19 +38,33 @@ const activity = {
   longest_transaction_seconds: 0.4,
 };
 
+/**
+ * WIRE-SHAPED, and the shape is the assertion. Every int64 field here is
+ * a bare JSON NUMBER, because that is what the server sends: the client
+ * turns it into an exact decimal string only for names registered in
+ * `api/int64.ts`'s INT64_FIELDS, and leaves everything else a `number`.
+ *
+ * This fixture used to hand the page pre-stringified values, which is a
+ * runtime the page never sees — and it hid a real bug: six of the tables
+ * list's seven numeric columns were not registered, so `int64Column`
+ * (which requires `typeof v === "string"`) marked every row absent and
+ * those headers sorted nothing while showing an arrow. Found in review
+ * of #240, which added the `toast` column and inherited it. With numbers
+ * here, that failure is visible to `sorts by total bytes…` below.
+ */
 const table = {
   name: "hog_data_file",
-  live_tuples: "2000000",
-  dead_tuples: "800000",
+  live_tuples: 2000000,
+  dead_tuples: 800000,
   dead_ratio: 0.2857,
-  table_bytes: "4294967296",
-  index_bytes: "1073741824",
-  toast_bytes: "0",
-  total_bytes: "5368709120",
-  seq_scans: "2",
-  index_scans: "5000000",
+  table_bytes: 4294967296,
+  index_bytes: 1073741824,
+  toast_bytes: 0,
+  total_bytes: 5368709120,
+  seq_scans: 2,
+  index_scans: 5000000,
   last_autovacuum: "2026-09-17T12:00:00Z",
-  autovacuum_count: "40",
+  autovacuum_count: 40,
 };
 
 const indexes = [
@@ -122,6 +137,90 @@ describe("database page", () => {
       screen.getByText(/partial WHERE end_snapshot IS NULL/),
     ).toBeInTheDocument();
     expect(screen.getByText("critical")).toBeInTheDocument();
+  });
+
+  /**
+   * The column #240 needed and the page did not have.
+   *
+   * hog_commit_receipt was 58.2 GiB in production, 58.1 of it TOAST, and
+   * this list showed it as 61.8 MiB for a year — because it carried heap
+   * and indexes, and TOAST is neither. The column is the fix; the default
+   * sort on `total` is what makes the size the page is ALREADY ordered by
+   * (the server's own ORDER BY) legible in the header.
+   */
+  it("shows TOAST and total bytes, with the table sorted by total", async () => {
+    // THREE TABLES IN A DELIBERATE PROP ORDER, because
+    // `applySort(tables, …)` always sorts the PROP rather than the
+    // previous render's output: with two rows, or with an order that
+    // happens to match, every ordering assertion below is satisfied by
+    // the server order alone and asserts nothing. Prop order is
+    // [file, receipt, upload]; total-descending is [receipt, file,
+    // upload]; toast-ascending is [file, upload, receipt]. No two of
+    // the three agree.
+    mount(
+      health({
+        tables: [
+          { ...table, name: "hog_data_file" },
+          {
+            // #240's numbers: a table that is almost entirely TOAST.
+            ...table,
+            name: "hog_commit_receipt",
+            table_bytes: 64800000,
+            index_bytes: 12000000,
+            toast_bytes: 62400000000,
+            total_bytes: 62476800000,
+          },
+          {
+            ...table,
+            name: "hog_upload",
+            table_bytes: 1048576,
+            index_bytes: 524288,
+            toast_bytes: 8192,
+            total_bytes: 1581056,
+          },
+        ],
+      }),
+    );
+    expect(await screen.findByText("hog_commit_receipt")).toBeInTheDocument();
+    const receiptRow = screen.getByText("hog_commit_receipt").closest("tr")!;
+    const cells = within(receiptRow).getAllByRole("cell").map((c) => c.textContent);
+    // The TOAST column is the one that makes the 58 GiB visible at all,
+    // and the total is the one that makes it comparable.
+    expect(cells).toContain("58.1 GiB");
+    expect(cells).toContain("58.2 GiB");
+
+    // Scoped to THIS table: the page renders an index list below whose
+    // first column is also a hog_* name, so an unscoped row query would
+    // be asserting about whichever table happened to come first.
+    const tables = receiptRow.closest("table")!;
+    const order = () =>
+      within(tables)
+        .getAllByRole("row")
+        .slice(1)
+        .map((r) => within(r).getAllByRole("cell")[0]?.textContent);
+
+    // The table OPENS sorted on total, descending: the header says which
+    // column the order is on, and it agrees with the server's.
+    const total = within(tables).getByRole("button", { name: /^total/ }).closest("th")!;
+    expect(total.getAttribute("aria-sort")).toBe("descending");
+    expect(order()).toEqual(["hog_commit_receipt", "hog_data_file", "hog_upload"]);
+
+    // And TOAST is explained rather than left as a word: an operator who
+    // has never met out-of-line storage needs the tooltip to know why a
+    // 61.8 MiB table costs 58 GiB.
+    const toast = within(tables).getByRole("button", { name: /^toast/ });
+    expect(toast.getAttribute("title")).toMatch(/jsonb and text/);
+
+    // THE COLUMN ALSO HAS TO SORT, and it only does because
+    // "toast_bytes" is registered in `api/int64.ts`'s INT64_FIELDS. The
+    // fixture's values are wire-shaped NUMBERS; unregistered, they stay
+    // numbers, `int64Column`'s `isDecimalInt` marks every row absent,
+    // `applySort` returns the prop order, and the click reorders nothing
+    // while the header shows an arrow. Two clicks = ascending.
+    await userEvent.click(toast);
+    await userEvent.click(toast);
+    expect(toast.closest("th")!.getAttribute("aria-sort")).toBe("ascending");
+    expect(order()).toEqual(["hog_data_file", "hog_upload", "hog_commit_receipt"]);
   });
 
   it("says so plainly when there is nothing to report", async () => {

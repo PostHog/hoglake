@@ -240,6 +240,11 @@ class MaintenanceLedgerIntegrationTest {
             .isZero()
         assertThat(result["settled_elsewhere"].asLong()).isZero()
         assertThat(result["deadline_skipped"].asLong()).isZero()
+        // And receipts_purged, the newest of them (#240, V24): the same
+        // rule, for the same reason — the purge did not exist when this
+        // row was written, so nothing it counts could have happened.
+        assertThat(result["receipts_purged"].asLong()).isZero()
+        assertThat(result["receipts_purge_failures"].asLong()).isZero()
         // Everything the row did carry survives untouched.
         assertThat(result["removed"].asLong()).isEqualTo(7)
         assertThat(result["missing"].asLong()).isEqualTo(1)
@@ -251,6 +256,8 @@ class MaintenanceLedgerIntegrationTest {
                 "objects_removed",
                 "settled_elsewhere",
                 "deadline_skipped",
+                "receipts_purged",
+                "receipts_purge_failures",
             )
     }
 

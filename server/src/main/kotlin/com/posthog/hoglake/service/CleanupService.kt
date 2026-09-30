@@ -14,6 +14,7 @@ import com.posthog.hoglake.persistence.MaintenanceRunStore
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
+import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.useTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials
@@ -585,6 +586,27 @@ class CleanupService(
      * page — rather than sleeping a second.
      */
     private val ledgerPurgeBudgetMs: Long = LEDGER_PURGE_BUDGET_MS,
+    /**
+     * How long a commit receipt is kept (HOGLAKE_RECEIPT_RETENTION_SECONDS,
+     * 7 days); `<= 0` purges nothing, which is V7's keep-forever
+     * behaviour. See [purgeCommitReceipts] and `Config`'s knob for why
+     * the number is a correctness floor and not only a size one.
+     */
+    private val receiptRetentionSeconds: Long = RECEIPT_RETENTION_SECONDS,
+    /**
+     * Receipts the purge deletes per page ([RECEIPT_PURGE_PAGE]).
+     * Constructor-tunable so a test can make the WALK observable —
+     * several pages, and a run the budget stops — without seeding a
+     * production-sized receipt table.
+     */
+    private val receiptPurgePage: Int = RECEIPT_PURGE_PAGE,
+    /**
+     * Wall clock the receipt purge may spend per run
+     * ([RECEIPT_PURGE_BUDGET_MS]). Constructor-tunable for the same
+     * reason as [ledgerPurgeBudgetMs]: 0 stops the walk before its first
+     * page, which makes the budget's stop observable without sleeping.
+     */
+    private val receiptPurgeBudgetMs: Long = RECEIPT_PURGE_BUDGET_MS,
 ) {
     /**
      * The production wiring, and the ONLY place the service's knobs are
@@ -616,6 +638,7 @@ class CleanupService(
         claimLeaseSeconds = config.cleanupClaimLeaseSeconds,
         workers = config.cleanupWorkers,
         loopEnabled = config.cleanupIntervalMs > 0,
+        receiptRetentionSeconds = config.receiptRetentionSeconds,
     )
 
     private val log = KotlinLogging.logger {}
@@ -650,7 +673,25 @@ class CleanupService(
         require(ledgerPurgeBudgetMs >= 0) {
             "ledgerPurgeBudgetMs must not be negative (got $ledgerPurgeBudgetMs)"
         }
+        require(receiptPurgePage > 0) { "receiptPurgePage must be positive (got $receiptPurgePage)" }
+        // 0 is legal for the same reason it is on the ledger budget: a
+        // test uses it to stop the walk before its first page.
+        require(receiptPurgeBudgetMs >= 0) {
+            "receiptPurgeBudgetMs must not be negative (got $receiptPurgeBudgetMs)"
+        }
     }
+
+    /**
+     * What one catalog's receipt purge did: rows deleted, and pages that
+     * threw.
+     *
+     * TWO NUMBERS BECAUSE ZERO IS AMBIGUOUS WITH ONE. `purged = 0` alone
+     * describes "nothing was eligible", "the run budget expired first"
+     * and "every page timed out" identically, and the third is the one
+     * that matters — it is the state the 58 GiB legacy backlog fails in.
+     * See [purgeCommitReceipts].
+     */
+    private data class ReceiptPurge(val purged: Long = 0, val failures: Long = 0)
 
     private data class Entry(val removalId: Long, val path: String, val reason: String)
 
@@ -674,7 +715,7 @@ class CleanupService(
         batchSize: Int,
         trigger: MaintenanceTrigger = MaintenanceTrigger.MANUAL,
     ): CleanupResult =
-        drainCatalog(catalog, batchSize, trigger).also {
+        drainCatalog(catalog, batchSize, trigger, receiptPurgeDeadline()).also {
             // ONCE PER RUN, after the drain: the retention purge is
             // instance-wide, so a fan-out must not pay for it per catalog
             // (see [runOnceAllCatalogs], which is why this is not inside
@@ -687,18 +728,24 @@ class CleanupService(
         catalog: String,
         batchSize: Int,
         trigger: MaintenanceTrigger,
+        /**
+         * When the RUN's receipt-purge budget expires — one value for the
+         * whole sweep, not one per catalog. See [receiptPurgeDeadline].
+         */
+        receiptDeadline: Long,
     ): CleanupResult =
         runStore.recorded(catalog, MaintenanceTask.CLEANUP, trigger) {
-            runDrain(catalog, batchSize)
+            runDrain(catalog, batchSize, receiptDeadline)
         }
 
     private fun runDrain(
         catalog: String,
         batchSize: Int,
+        receiptDeadline: Long,
     ): CleanupResult {
         val result =
             try {
-                doRunOnce(catalog, batchSize)
+                doRunOnce(catalog, batchSize, receiptDeadline)
             } catch (e: Throwable) {
                 Audit.event("cleanup", catalog, null, Audit.failureOutcome(e), e.message)
                 throw e
@@ -728,14 +775,20 @@ class CleanupService(
     private fun doRunOnce(
         catalog: String,
         batchSize: Int,
+        receiptDeadline: Long,
     ): CleanupResult {
         if (batchSize <= 0) {
             throw HoglakeException.Validation("batch size must be positive (got $batchSize)")
         }
-        val catalogId =
+        // The whole row, not just the id: the receipt purge's cutoff has a
+        // floor derived from this catalog's snapshot retention (see
+        // [purgeCommitReceipts]), and reading it here costs nothing on top
+        // of the lookup the drain already does.
+        val catalogInfo =
             jdbi.withHandleUnchecked { h ->
-                CatalogRepo.require(h, catalog).catalogId
+                CatalogRepo.require(h, catalog)
             }
+        val catalogId = catalogInfo.catalogId
         // What this run has already handled. A still-referenced row (and
         // a row whose delete failed) has its claim RELEASED so the next
         // run, and an operator reading the queue, can see it — which also
@@ -783,6 +836,34 @@ class CleanupService(
         // [runOnce] and [runOnceAllCatalogs]. The maintenance-run ledger's
         // purge IS per catalog, and stays.
         purgeMaintenanceLedger(catalog, catalogId)
+        // THE RECEIPT PURGE IS PER CATALOG, like the run-ledger purge
+        // above and unlike the drained-ledger one: V24's index leads on
+        // `catalog_id`, and the cutoff's floor is derived from THIS
+        // catalog's snapshot retention, so there is nothing instance-wide
+        // to amortize.
+        //
+        // FENCED, because retention is hygiene and the drain's report is
+        // not: a purge that throws is a WARN and a zero on the wire, and
+        // the drain it followed still says what it did. The next sweep
+        // starts again from the oldest eligible receipt, so nothing is
+        // lost but one interval. (The WARN is the only trace; nothing
+        // counts it.)
+        val receipts =
+            try {
+                purgeCommitReceipts(catalog, catalogId, catalogInfo.snapshotRetentionSeconds, receiptDeadline)
+            } catch (e: Exception) {
+                // Anything the per-page fence did not already catch: the
+                // catalog lookup, a pool failure, a bug. Counted as one
+                // failure for the same reason the pages are — a zero that
+                // is not "nothing eligible" has to be distinguishable.
+                log.warn(e) {
+                    "cleanup: the commit-receipt retention purge failed for catalog '$catalog'; " +
+                        "the drain itself is unaffected and the next run retries from the oldest " +
+                        "eligible receipt"
+                }
+                ReceiptPurge(failures = 1)
+            }
+        Metrics.commitReceiptPurgeFailures(catalog, receipts.failures)
         val total = tallies.fold(Tally()) { a, b -> a + b }
         return CleanupResult(
             total.removed,
@@ -796,6 +877,8 @@ class CleanupService(
             // it and every client already reads it (see
             // CleanupResult.deadlineSkipped).
             deadlineSkipped = 0,
+            receiptsPurged = receipts.purged,
+            receiptsPurgeFailures = receipts.failures,
         )
     }
 
@@ -1308,6 +1391,195 @@ class CleanupService(
     }
 
     /**
+     * COMMIT-RECEIPT RETENTION (#240): receipts of [catalogId] older than
+     * the effective cutoff are hard-deleted, in bounded pages, and the
+     * count goes on the run's `CleanupResult`.
+     *
+     * WHY THE TABLE NEEDED THIS AT ALL. `hog_commit_receipt` was written
+     * once per idempotent commit and never read except on replay, and
+     * nothing deleted a row — V7's "receipts outlive snapshot expiry"
+     * implemented as "outlive everything". On gigahog-prod-us that was
+     * 366,740 rows and 58.2 GiB (58.1 of it TOAST) by 2026-09-30, growing
+     * ~4 GiB/day and 4-5x that after pyhoglake #234. V24 takes the body
+     * out; this is the other half, and AGENT.md's rule is explicit that a
+     * table written per commit needs a retention AND a bounded purge from
+     * the day it is created.
+     *
+     * THE CUTOFF HAS A PER-CATALOG FLOOR, and it is a correctness floor
+     * rather than a courtesy. A receipt purged while a client can still
+     * replay its request does not produce an error — the replay becomes a
+     * COMMIT, publishing the same files again under a new snapshot, with
+     * every counter reporting success. That is the ACCEPTED CONSEQUENCE
+     * of giving receipts a retention at all, and
+     * `PurgedReceiptReplayIntegrationTest` asserts it rather than
+     * describing it: two live `hog_data_file` rows over one path, with
+     * non-overlapping row-id spans, and nothing anywhere reporting a
+     * problem. There is no detector for it and none is wanted; the fence
+     * is that the receipt outlives every payload a client may hold,
+     * which is what this cutoff is. The longest legitimate gap between
+     * a prepared payload and its retry is set by the CATALOG's snapshot
+     * retention (pyhoglake keeps a prepared payload for at least
+     * `snapshot_retention_seconds / 2`, hedgerow's `PendingStore` keeps
+     * one across restarts), so the cutoff is
+     * `max(receiptRetentionSeconds, 2 x snapshot_retention_seconds)`: the
+     * instance knob unless this catalog's own window makes it too short,
+     * never shorter than the knob. A catalog with retention DISABLED
+     * contributes no floor — its snapshots are never expired, so the
+     * derivation has no term, and the instance knob stands.
+     *
+     * THE WALK IS A PREFIX, NOT A SEARCH, which is why it carries none of
+     * [purgeDrainedLedger]'s cursor/skip/empty-page machinery — see
+     * [RECEIPT_PURGE_PAGE_SQL] for the difference. Pages of
+     * [receiptPurgePage] under a RUN-scoped wall budget (see
+     * [receiptPurgeDeadline]), each its own transaction under its own
+     * `statement_timeout`, stopping on a short page (nothing eligible
+     * left), on the budget, or on a page that failed. Nothing here takes
+     * the commit lock, and no page is held across anything but its own
+     * DELETE.
+     *
+     * THE PAGE IS BOUNDED IN RECEIPTS AND THE WORK IS IN TOAST CHUNKS,
+     * and for seven days after the V24 deploy those are different
+     * numbers by two orders of magnitude. A legacy receipt carries a
+     * ~160 KiB `request` body, which is ~82 chunk rows in the TOAST
+     * relation, and `heap_delete` calls `heap_toast_delete` on a tuple
+     * with external attributes SYNCHRONOUSLY, inside the page's own
+     * transaction — so a page of 1,000 legacy receipts is 1,000 heap
+     * deletes plus ~82,000 chunk deletes and their TOAST-index entries,
+     * against a 58 GiB relation that is not in `shared_buffers`. Every
+     * post-V24 receipt stores nothing out of line and costs none of that.
+     * [RECEIPT_PURGE_PAGE] is sized for the expensive regime and both
+     * measurements are recorded there.
+     *
+     * HENCE `SET LOCAL statement_timeout`, which is the bound the wall
+     * budget cannot be. The budget is checked between pages, so without a
+     * per-statement bound "one page over the budget" means one page of up
+     * to the session's 60 s (`Database.SESSION_INIT_SQL`) — and a page
+     * that cannot finish in [RECEIPT_PURGE_STATEMENT_TIMEOUT] is a page
+     * that is too big, which is a thing to learn in five seconds rather
+     * than in sixty.
+     *
+     * A FAILED PAGE IS COUNTED, not swallowed. Without
+     * [ReceiptPurge.failures] a page that times out is indistinguishable
+     * on every surface from "nothing was eligible" — both report
+     * `receipts_purged = 0` — and the failure mode is that seven days
+     * after the deploy every sweep forever attempts the same first page,
+     * times out, logs, reports 0, and the 58 GiB never goes while the
+     * console reads exactly like a healthy idle instance. The count rides
+     * the ledger row and `hoglake_commit_receipt_purge_failures_total`.
+     * Pages already committed still count as purged: they are separate
+     * transactions, so a failure on page 3 does not un-delete pages 1
+     * and 2.
+     *
+     * WHAT IT DOES RECLAIM, corrected from an earlier draft of this
+     * comment that had it backwards. `heap_delete` DELETES the chunk rows
+     * (it does not merely mark the parent tuple dead), autovacuum then
+     * reclaims them, and because every surviving receipt is post-V24 and
+     * stores nothing out of line, the TOAST relation ends with no live
+     * chunks at all — so plain VACUUM's truncation phase can return
+     * essentially the whole 58 GiB of FILES. `DROP COLUMN request` (the
+     * follow-up V24's header owes) returns none of it by itself: it sets
+     * `attisdropped` and leaves both the TOAST relation and the existing
+     * toast pointers alone. What never shrinks either way is the RDS
+     * ALLOCATED volume, so the win is free space, backup size and restore
+     * time rather than a smaller bill.
+     *
+     * THE ONE-TIME DRAIN IS ALSO AN AUTOVACUUM EVENT, and it is the real
+     * cost: ~31M dead chunk tuples over 58 GiB, hours of throttled I/O
+     * beside the commit path. It takes no blocking lock. V24's deploy
+     * note says so.
+     *
+     * IT MUST NEVER FAIL THE DRAIN, so the caller fences it too: anything
+     * that escapes this function is a WARN and a failure count, and the
+     * drain it followed still reports what it did. That is
+     * [purgeDrainedLedger]'s rule for the same reason — retention is
+     * hygiene, and hygiene is not allowed to misreport a sweep.
+     */
+    private fun purgeCommitReceipts(
+        catalog: String,
+        catalogId: Long,
+        snapshotRetentionSeconds: Long?,
+        deadline: Long,
+    ): ReceiptPurge {
+        if (receiptRetentionSeconds <= 0) return ReceiptPurge()
+        // NULL snapshot retention -> THE KNOB, and the one line is the
+        // whole of it. A catalog with retention off never expires a
+        // snapshot, so pyhoglake's prepared-payload shelf life there is
+        // `inf` (client.py: `float("inf") if seconds is None`) and no
+        // DERIVED floor can cover an unbounded window. The knob is the
+        // floor, which means idempotency is unprotected for a payload
+        // held past it — see `Config.receiptRetentionSeconds`, which says
+        // the same thing about hedgerow on every catalog. Every real
+        // catalog has retention set, so this is an edge rather than a
+        // regime.
+        val floor =
+            snapshotRetentionSeconds?.let { (it * 2).coerceAtMost(RECEIPT_FLOOR_CEILING_SECONDS) }
+                ?: receiptRetentionSeconds
+        val retention = maxOf(receiptRetentionSeconds, floor)
+        var purged = 0L
+        var failures = 0L
+        var pages = 0
+        var stop = "nothing older than the cutoff"
+        while (true) {
+            if (System.nanoTime() >= deadline) {
+                stop = "the ${receiptPurgeBudgetMs}ms run budget"
+                break
+            }
+            val gone =
+                try {
+                    jdbi.inTransactionUnchecked { h ->
+                        h.execute("SET LOCAL statement_timeout = '$RECEIPT_PURGE_STATEMENT_TIMEOUT'")
+                        h.createUpdate(RECEIPT_PURGE_PAGE_SQL)
+                            .bind("catalogId", catalogId)
+                            .bind("page", receiptPurgePage)
+                            .bind("retention", retention)
+                            .execute()
+                    }
+                } catch (e: Exception) {
+                    // One page, not the walk and not the drain. WARN
+                    // because the counter says HOW MANY and only the log
+                    // says WHY — a statement timeout here means the page
+                    // is too big for the rows it is meeting, which is a
+                    // knob, not a bug.
+                    failures++
+                    log.warn(e) {
+                        "cleanup: a commit-receipt purge page failed for catalog '$catalog' " +
+                            "(page $receiptPurgePage, retention ${retention}s, bound " +
+                            "$RECEIPT_PURGE_STATEMENT_TIMEOUT); $purged receipts already purged this " +
+                            "run are unaffected and the next run retries from the oldest eligible"
+                    }
+                    stop = "a failed page"
+                    break
+                }
+            pages++
+            purged += gone
+            // The eligible rows are a dense prefix of the index range, so
+            // a page that could not be filled is the end of them. There is
+            // no un-purgeable row to walk past.
+            if (gone < receiptPurgePage) break
+        }
+        if (purged > 0 || failures > 0) {
+            log.debug {
+                "cleanup: purged $purged commit receipts for catalog '$catalog' over $pages " +
+                    "pages of $receiptPurgePage ($failures failed), stopped on $stop " +
+                    "(retention ${retention}s)"
+            }
+        }
+        return ReceiptPurge(purged, failures)
+    }
+
+    /**
+     * When this RUN's receipt-purge budget expires.
+     *
+     * Per run rather than per catalog: `runOnceAllCatalogs` computes it
+     * once and hands the same value to every catalog's drain, so a
+     * sweep's receipt-purge wall cost is [receiptPurgeBudgetMs] whatever
+     * the catalog count. The purge WORK stays per catalog (the index
+     * leads on `catalog_id`, and the cutoff's floor is derived from the
+     * catalog's own snapshot retention); only the clock is shared.
+     */
+    private fun receiptPurgeDeadline(): Long = System.nanoTime() + Duration.ofMillis(receiptPurgeBudgetMs).toNanos()
+
+    /**
      * Ledger retention: drained rows older than [ledgerRetentionSeconds]
      * are hard-deleted so the soft-delete ledger cannot itself accumulate
      * without bound (the A1 lesson, applied to the fix for A3). Undrained
@@ -1508,10 +1780,22 @@ class CleanupService(
      */
     fun runOnceAllCatalogs(batchSize: Int): List<Pair<String, CleanupResult>> {
         val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // ONE receipt-purge budget for the whole sweep, computed here and
+        // shared by every catalog's drain. Inside `doRunOnce` the purge is
+        // necessarily PER CATALOG — V24's index leads on `catalog_id` and
+        // the cutoff's floor is derived per catalog — but its wall BUDGET
+        // must not be, or a sweep's receipt-purge cost is
+        // `N x receiptPurgeBudgetMs` and grows with the catalog count
+        // while nothing in the loop bounds it. The first catalogs in the
+        // list can therefore spend the whole budget; that is the intended
+        // behaviour and it self-corrects, because a catalog whose
+        // receipts went unpurged this sweep is first in line next sweep
+        // once the earlier ones have nothing eligible left.
+        val receiptDeadline = receiptPurgeDeadline()
         val results = mutableListOf<Pair<String, CleanupResult>>()
         for (name in names) {
             try {
-                results += name to drainCatalog(name, batchSize, MaintenanceTrigger.LOOP)
+                results += name to drainCatalog(name, batchSize, MaintenanceTrigger.LOOP, receiptDeadline)
             } catch (e: Exception) {
                 log.error(e) { "cleanup drain failed for catalog '$name'; continuing" }
             }
@@ -1993,5 +2277,181 @@ class CleanupService(
 
         /** Default run-ledger retention: 7 days (HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS). */
         const val MAINTENANCE_LEDGER_RETENTION_SECONDS = 7L * 24 * 60 * 60
+
+        /**
+         * Default receipt retention: 7 days
+         * (HOGLAKE_RECEIPT_RETENTION_SECONDS; `Config` carries the
+         * argument for the number). 0 here would make every hand-built
+         * service purge nothing, which is the wrong default for a class
+         * whose tests are the only callers of the primary constructor.
+         */
+        const val RECEIPT_RETENTION_SECONDS = 7L * 24 * 60 * 60
+
+        /**
+         * Receipts deleted per page.
+         *
+         * 200, NOT [LEDGER_PURGE_PAGE]'s 1,000, and the difference is the
+         * whole of P1-1: A PAGE IS BOUNDED IN RECEIPTS AND THE WORK IS IN
+         * TOAST CHUNKS. A post-V24 receipt is ~100 bytes of fixed-width
+         * columns and stores nothing out of line; a PRE-V24 one carries a
+         * ~160 KiB `request` body, which is ~80 rows in the TOAST
+         * relation that `heap_delete` removes synchronously inside the
+         * page's transaction. For the first retention window after the
+         * deploy, the only eligible rows are the expensive kind.
+         *
+         * MEASURED, both regimes, by
+         * `CleanupReceiptPurgeIntegrationTest` (PG 18, one catalog, every
+         * row eligible, the legacy fixture at 150 KiB of out-of-line body
+         * per row):
+         *
+         *   post-V24 rows (no body):    1.6-5.6 us/row
+         *   legacy rows (150 KiB):     49-187 us/row, 10-37 ms per 200-row page
+         *
+         * ~60-100x per row, and the fixture is the OPTIMISTIC end of it:
+         * its TOAST relation is 91 MiB and fits in the container's cache,
+         * production's is 58 GiB. What keeps the production page from
+         * being random I/O is
+         * that the legacy rows all share one `created_at` (V24's fast
+         * default), so the walk takes them in ctid order, which is
+         * insertion order, which is the order their chunks were written —
+         * the reads are largely sequential. At 200 receipts a page is
+         * ~32 MB of mostly-sequential reads, ~27 ms on the fixture and a
+         * few hundred milliseconds cold: well inside
+         * [RECEIPT_PURGE_STATEMENT_TIMEOUT] with room for the difference
+         * between a fixture and a volume.
+         *
+         * THE LEGACY DRAIN, re-stated for this page size. 366,740 rows is
+         * 1,834 pages. At [RECEIPT_PURGE_BUDGET_MS] and a few hundred ms
+         * per cold page that is ~10-40 pages per run, so ~50-180 runs —
+         * ONE TO FOUR DAYS at the cleanup loop's 30-minute default,
+         * starting seven days after the deploy. An operator who wants the
+         * space back faster drives `POST .../maintenance/cleanup`, which
+         * runs this same purge with a fresh budget per call. Steady state
+         * is nothing next to that: ~72k receipts expire a day at
+         * ~50 commits/min, which is ~360 cheap pages, and one run absorbs
+         * them.
+         */
+        const val RECEIPT_PURGE_PAGE = 200
+
+        /**
+         * Per-statement bound on one page.
+         *
+         * THE BUDGET CANNOT BE THIS BOUND. [RECEIPT_PURGE_BUDGET_MS] is
+         * checked BETWEEN pages, so without a statement bound a single
+         * page inherits the session's 60 s
+         * (`Database.SESSION_INIT_SQL`) and "one page over the budget"
+         * means a minute. Five seconds is two orders of magnitude above
+         * the measured page in either regime, so it can only fire on a
+         * page that is genuinely too big for the rows it is meeting —
+         * which is a thing to learn in five seconds, retryably, with a
+         * counted failure, rather than in sixty.
+         *
+         * Matched to the migration window's `lock_timeout` value for the
+         * same reason every other bound in this repo is a stated number
+         * rather than a derived one: it is the figure an operator can
+         * hold in their head while reading a WARN.
+         */
+        const val RECEIPT_PURGE_STATEMENT_TIMEOUT = "5s"
+
+        /**
+         * Ceiling on the floor the purge derives from a catalog's
+         * snapshot retention (see [purgeCommitReceipts]).
+         *
+         * 30 days. Without it a catalog PATCHed to 90-day snapshot
+         * retention gets a 180-day receipt floor and effectively never
+         * purges, silently — and `2 x` an arbitrary operator-supplied
+         * `bigint` is also the only arithmetic here that could overflow.
+         * The knob is still the lower bound, so capping the derived term
+         * can only ever shorten a floor that was longer than a month,
+         * never shorten the configured retention.
+         */
+        const val RECEIPT_FLOOR_CEILING_SECONDS = 30L * 24 * 60 * 60
+
+        /**
+         * Wall clock the receipt purge may spend per run.
+         *
+         * PER RUN, not per catalog: `runOnceAllCatalogs` computes one
+         * deadline and shares it across the sweep, so the cost does not
+         * scale with the catalog count (see [receiptPurgeDeadline]).
+         *
+         * TEN SECONDS, where [LEDGER_PURGE_BUDGET_MS] is one, and the
+         * difference is the one-time drain. The ledger purge walks a
+         * table heading for 137M rows and is genuinely instance-wide, so
+         * a second per run is the right pace for it. This purge has a
+         * 366,740-row backlog to clear ONCE and then ~360 cheap pages a
+         * day forever; at one second per run the backlog would take
+         * weeks. Ten seconds of a 30-minute cleanup cycle is a 0.5% duty
+         * on one pooled connection, holding no lock, after the drain has
+         * finished — nothing waits on it, and it turns the backlog into
+         * days (see [RECEIPT_PURGE_PAGE]'s arithmetic).
+         *
+         * The budget is checked BETWEEN pages, so the real bound is one
+         * page over it — and [RECEIPT_PURGE_STATEMENT_TIMEOUT] is what
+         * bounds that page, which is the half a wall budget cannot do.
+         */
+        const val RECEIPT_PURGE_BUDGET_MS = 10_000L
+
+        /**
+         * ONE PAGE of the receipt purge: delete up to `:page` of ONE
+         * catalog's receipts older than the cutoff, through V24's
+         * `hog_commit_receipt_created (catalog_id, created_at)` index,
+         * and report how many went.
+         *
+         * ONE NUMBER, WHERE [PURGE_PAGE_SQL] NEEDS THREE, and the
+         * difference is worth stating because it is the reason this purge
+         * has no cursor, no skip and no empty-page cap. The drained-ledger
+         * walk steps over a key (`removal_id`) that is UNCORRELATED with
+         * its predicate (`drained_at < cutoff`), so a page can examine
+         * 1,000 rows and purge none of them, forever, and the machinery
+         * exists to walk past that. Here the predicate is ON THE INDEXED
+         * COLUMN: the eligible rows are exactly a dense PREFIX of the
+         * catalog's `(catalog_id, created_at)` range, so every page but
+         * the last deletes a full page, `purged < :page` means "nothing
+         * eligible is left", and a page that purges nothing cannot have a
+         * successor that does.
+         *
+         * SCOPED TO ONE CATALOG, where the ledger purge is deliberately
+         * global. The index leads on `catalog_id`, so a per-catalog page
+         * is a descent rather than a filter, and the caller already holds
+         * the catalog's id and its snapshot retention — which is what the
+         * cutoff's floor is derived from, and it differs per catalog.
+         *
+         * THE DELETE ADDRESSES THE PAGE BY `ctid`, and the two forms that
+         * look more natural are both wrong. Joining back on the PRIMARY
+         * KEY (`(catalog_id, idempotency_key) IN (page)`) makes the
+         * planner hash-join 1,000 keys against a SEQUENTIAL SCAN of the
+         * catalog's whole receipt table — measured on the 100,000-row
+         * fixture as 2,568 buffers of seq scan on top of the page's own
+         * 1,006, i.e. the per-page cost is O(the catalog's receipts) and
+         * the index bought nothing. Widening the page into a RANGE
+         * (`created_at <= max(page)`) is worse: V24 dates every legacy
+         * row at the migration, so 366,740 rows share one timestamp on
+         * gigahog-prod-us and a range delete would take all of them in
+         * one statement — the unbounded-DELETE shape of the 2026-09-28
+         * outage. `ctid` is exact, bounded by the page, and safe on this
+         * table because a receipt is INSERT-only: nothing UPDATEs one, so
+         * no live row's ctid moves, and the subselect and the delete are
+         * one statement under one snapshot regardless.
+         *
+         * `internal` so the plan test can EXPLAIN the statement production
+         * issues (`V24CommitReceiptRetentionMigrationIntegrationTest`).
+         *
+         * Binds `:catalogId`, `:page` and `:retention`. The clock is the
+         * DATABASE's, as it is for every other retention statement here:
+         * a cutoff computed on a pod would be that pod's clock skew.
+         */
+        internal const val RECEIPT_PURGE_PAGE_SQL: String =
+            """
+            DELETE FROM hog_commit_receipt
+             WHERE ctid = ANY (
+                 ARRAY(
+                     SELECT ctid FROM hog_commit_receipt
+                      WHERE catalog_id = :catalogId
+                        AND created_at < now() - make_interval(secs => :retention)
+                      ORDER BY created_at
+                      LIMIT :page
+                 )
+             )
+            """
     }
 }
