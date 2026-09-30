@@ -5,6 +5,7 @@ import { listConsumers } from "../api/client";
 import type { ConsumerSummary, ConsumerTableOffset } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
+import { SnapshotId } from "../components/SnapshotId";
 import { formatTime } from "../lib/format";
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
@@ -84,7 +85,12 @@ function ConsumerGroup({
                 )}
               </td>
               <td className="mono">{o.table_uuid}</td>
-              <td className="num mono">{o.committed_snapshot}</td>
+              {/* A committed offset is a snapshot id, and the only
+                  question ever asked of it is how far behind head it
+                  is — so it dates itself like every other id. */}
+              <td className="num mono">
+                <SnapshotId catalog={catalog} id={o.committed_snapshot} />
+              </td>
               <td className="mono">{formatTime(o.updated_at)}</td>
             </tr>
           ))}

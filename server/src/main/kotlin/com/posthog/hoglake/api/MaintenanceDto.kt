@@ -83,9 +83,9 @@ data class CleanupResultDto(
      * 0 for rows an older server wrote — see CLEANUP_COUNTERS_ADDED_LATER.
      */
     val objectsRemoved: Long,
-    /** Rows already settled by another writer when the sub-batch took the lock. */
+    /** Rows a sub-batch could not settle because the row was no longer its own. */
     val settledElsewhere: Long,
-    /** Rows a sub-batch's hold budget stopped short of; a later hold drains them. */
+    /** Always 0: the hold budget it counted bounded a lock the drain no longer takes. */
     val deadlineSkipped: Long,
 )
 

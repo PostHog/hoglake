@@ -15,6 +15,7 @@ import type {
   MaintenanceRunPage,
   MaintenanceStatus,
   Namespace,
+  PartitionListing,
   PartitionValues,
   PartitionStatsResponse,
   ScanFile,
@@ -136,6 +137,151 @@ export const partitionValuesFixture: PartitionValues = {
       truncated: false,
     },
   ],
+};
+
+/**
+ * The partitions tab's listing: two day/bucket partitions under the
+ * current spec, one under an older one, and one whose row measures the
+ * sample never took (the pre-V22 shape — null, not zero).
+ */
+export const partitionListingFixture: PartitionListing = {
+  sampled_at: new Date(Date.now() - 90_000).toISOString(),
+  // The scan ran for half an hour before it published: the numbers are
+  // that old, which is what the footer must say.
+  sample_started: new Date(Date.now() - 1_890_000).toISOString(),
+  sampled_snapshot_id: "412",
+  spec: {
+    spec_id: "1",
+    fields: [
+      { field: "ts_day", transform: "day", source_field_id: "1" },
+      { field: "url_bucket", transform: "bucket", transform_param: 16, source_field_id: "3" },
+    ],
+  },
+  total: 3,
+  stale_spec_groups: 1,
+  partitions: [
+    {
+      spec_id: "1",
+      values: [
+        { field: "ts_day", raw: "20697", decoded: "2026-09-01" },
+        { field: "url_bucket", raw: "7", decoded: "bucket 7/16" },
+      ],
+      file_count: "12",
+      small_file_count: "9",
+      total_bytes: "1200000",
+      small_file_bytes: "900000",
+      avg_file_bytes: "100000",
+      dv_count: "1",
+      debt_score: "9",
+      record_count: "4200",
+      last_written_snapshot: "410",
+    },
+    {
+      spec_id: "1",
+      values: [
+        { field: "ts_day", raw: "20698", decoded: "2026-09-02" },
+        { field: "url_bucket", raw: null, decoded: null },
+      ],
+      file_count: "3",
+      small_file_count: "0",
+      total_bytes: "900000",
+      small_file_bytes: "0",
+      avg_file_bytes: "300000",
+      dv_count: "0",
+      debt_score: "0",
+      record_count: null,
+      last_written_snapshot: null,
+    },
+    {
+      spec_id: "0",
+      values: [
+        { field: "ts_day", raw: "20000", decoded: "2024-10-04" },
+        { field: "url_bucket", raw: "1", decoded: "bucket 1/16" },
+      ],
+      file_count: "1",
+      small_file_count: "1",
+      total_bytes: "1000",
+      small_file_bytes: "1000",
+      avg_file_bytes: "1000",
+      dv_count: "0",
+      debt_score: "0",
+      record_count: "7",
+      last_written_snapshot: "100",
+    },
+  ],
+};
+
+/** An unpartitioned table: one group, empty values, no spec at head. */
+export const unpartitionedPartitionListingFixture: PartitionListing = {
+  sampled_at: new Date(Date.now() - 60_000).toISOString(),
+  sample_started: new Date(Date.now() - 120_000).toISOString(),
+  sampled_snapshot_id: "9",
+  total: 1,
+  stale_spec_groups: 0,
+  partitions: [
+    {
+      values: [],
+      file_count: "4",
+      small_file_count: "4",
+      total_bytes: "4000",
+      small_file_bytes: "4000",
+      avg_file_bytes: "1000",
+      dv_count: "0",
+      debt_score: "4",
+      record_count: "40",
+      last_written_snapshot: "9",
+    },
+  ],
+};
+
+/**
+ * Two pages of two day-partitions each, for the "Load more" walk:
+ * `total` is 4 throughout, so has-more is exact and the last page ends
+ * the walk without an empty probe.
+ */
+export function pagedPartitionListingFixture(offset: number): PartitionListing {
+  const day = (n: number) => ({
+    spec_id: "1",
+    values: [
+      {
+        field: "ts_day",
+        raw: String(n),
+        decoded: `1970-01-0${n + 1}`,
+      },
+    ],
+    file_count: "1",
+    small_file_count: "1",
+    total_bytes: "100",
+    small_file_bytes: "100",
+    avg_file_bytes: "100",
+    dv_count: "0",
+    debt_score: "0",
+    record_count: "1",
+    last_written_snapshot: "5",
+  });
+  return {
+    sampled_at: new Date(Date.now() - 60_000).toISOString(),
+    sample_started: new Date(Date.now() - 120_000).toISOString(),
+    sampled_snapshot_id: "5",
+    spec: {
+      spec_id: "1",
+      fields: [{ field: "ts_day", transform: "day", source_field_id: "1" }],
+    },
+    total: 4,
+    stale_spec_groups: 0,
+    partitions: offset === 0 ? [day(0), day(1)] : [day(2), day(3)],
+  };
+}
+
+/** The warm-up state: the table is there, the measurement is not. */
+export const unsampledPartitionListingFixture: PartitionListing = {
+  sampled_at: null,
+  sample_started: null,
+  sampled_snapshot_id: null,
+  spec: partitionListingFixture.spec,
+  total: 0,
+  stale_spec_groups: 0,
+  partitions: [],
 };
 
 /**

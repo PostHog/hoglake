@@ -10,6 +10,7 @@ import type {
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonBlock } from "../components/Skeleton";
+import { SnapshotId } from "../components/SnapshotId";
 import {
   LedgerUnavailableNotice,
   RunOutcomeBadge,
@@ -91,11 +92,21 @@ function Backlog({
           </div>
           <div>
             <dt>earliest snapshot</dt>
-            <dd className="mono">{status.backlog.earliest_snapshot_id}</dd>
+            <dd className="mono">
+              <SnapshotId
+                catalog={catalog}
+                id={status.backlog.earliest_snapshot_id}
+              />
+            </dd>
           </div>
           <div>
             <dt>head snapshot</dt>
-            <dd className="mono">{status.backlog.head_snapshot_id}</dd>
+            <dd className="mono">
+              <SnapshotId
+                catalog={catalog}
+                id={status.backlog.head_snapshot_id}
+              />
+            </dd>
           </div>
         </dl>
       );
@@ -303,9 +314,22 @@ export function MaintenancePage() {
       {status.isPending && <SkeletonBlock />}
       {status.data && (
         <p className="subtle">
-          {status.data.sampled_at
-            ? `Backlog sampled ${formatTime(status.data.sampled_at)} (snapshot ${status.data.sampled_snapshot_id ?? "—"}).`
-            : "Backlog summary warming up — counts are unknown until the first sample completes."}
+          {status.data.sampled_at ? (
+            <>
+              Backlog sampled {formatTime(status.data.sampled_at)} (snapshot{" "}
+              {status.data.sampled_snapshot_id === undefined ? (
+                "—"
+              ) : (
+                <SnapshotId
+                  catalog={catalog}
+                  id={status.data.sampled_snapshot_id}
+                />
+              )}
+              ).
+            </>
+          ) : (
+            "Backlog summary warming up — counts are unknown until the first sample completes."
+          )}
         </p>
       )}
       {status.data && (

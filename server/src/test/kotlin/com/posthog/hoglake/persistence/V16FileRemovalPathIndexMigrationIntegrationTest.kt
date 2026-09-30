@@ -196,6 +196,13 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
 
         assertThat(indexDef()).describedAs("%s absent before V16", INDEX).isNull()
         guardPlanBeforeV16 = explainGuard()
+        // The drain's statement is the CLAIM's candidate select, which
+        // reads V21's `claimed_at`. This fixture sits at V15 because that
+        // is where V16's index is absent, so V21's own FILE is applied out
+        // of order — read off disk rather than restated here, and
+        // idempotent, so the `Database.migrate` below re-applies it for
+        // free. Nothing V21 does touches the index this file is about.
+        PgTestSupport.applyMigrationFile(db, "V21__cleanup_claim.sql")
         drainPlanBeforeV16 = explainDrain()
 
         Database.migrate(db.dataSource)
@@ -364,14 +371,21 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
             }
         }
 
+    /**
+     * The drain's candidate select — the claim's inner statement (V21),
+     * which is what `hog_file_removal_drain` serves. EXPLAINed rather
+     * than the claim UPDATE that wraps it, because EXPLAIN ANALYZE of
+     * the UPDATE would claim the fixture's rows for real.
+     */
     private fun explainDrain(): String =
         explain { h ->
             h.createQuery(
                 "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
-                    CleanupService.DRAIN_BATCH_SQL,
+                    CleanupService.CLAIM_CANDIDATE_SQL,
             )
                 .bind("catalogId", catalogId)
                 .bind("limit", CleanupService.SUB_BATCH)
+                .bind("leaseSeconds", CleanupService.CLAIM_LEASE_SECONDS.toDouble())
                 .bind("stagingGraceSeconds", CleanupService.STAGING_GRACE_SECONDS.toDouble())
                 .mapTo(String::class.java).list().joinToString("\n")
         }
@@ -749,10 +763,11 @@ class V16FileRemovalPathIndexMigrationIntegrationTest {
                     h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
                     h.createQuery(
                         "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
-                            CleanupService.DRAIN_BATCH_SQL,
+                            CleanupService.CLAIM_CANDIDATE_SQL,
                     )
                         .bind("catalogId", cat)
                         .bind("limit", CleanupService.SUB_BATCH)
+                        .bind("leaseSeconds", CleanupService.CLAIM_LEASE_SECONDS.toDouble())
                         .bind("stagingGraceSeconds", CleanupService.STAGING_GRACE_SECONDS.toDouble())
                         .mapTo(String::class.java).list().joinToString("\n")
                 }

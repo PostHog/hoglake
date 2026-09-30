@@ -1,0 +1,53 @@
+{
+  "_comment": [
+    "Partition-value decoding vectors, SHARED by two implementations of one rule.",
+    "Read by server/src/test/kotlin/com/posthog/hoglake/model/PartitionValueDecodingTest.kt",
+    "and by webui/test/partitions.test.ts, both of which pin `count` so a vector",
+    "added to the file and not to one side's expectations cannot pass unnoticed.",
+    "The rule is the WRITER's: pyhoglake/transforms.py produces these ordinals.",
+    "Two implementations exist because the partitions tab filters and sorts on the",
+    "decoded value SERVER-side (before paging) while the files tab decodes in the",
+    "browser. The precedent for a shared vector file is",
+    "pyhoglake/tests/vectors/bounds_vectors.json.",
+    "A null stored value is NOT in this table: it is the one deliberate divergence",
+    "(the server returns null so the listing can sort and filter it; the browser",
+    "renders the literal 'null' because a cell must show something), and each side",
+    "pins it in its own test."
+  ],
+  "count": 23,
+  "vectors": [
+    { "transform": "month", "raw": "675", "expected": "2026-04", "why": "months since 1970-01" },
+    { "transform": "month", "raw": "0", "expected": "1970-01" },
+    { "transform": "month", "raw": "11", "expected": "1970-12" },
+    { "transform": "month", "raw": "12", "expected": "1971-01" },
+    { "transform": "month", "raw": "-1", "expected": "1969-12", "why": "floors below the epoch; naive arithmetic gives 1970--1" },
+    { "transform": "month", "raw": "-12", "expected": "1969-01" },
+    { "transform": "month", "raw": "-13", "expected": "1968-12" },
+    { "transform": "year", "raw": "56", "expected": "2026", "why": "the calendar year, not an offset" },
+    { "transform": "year", "raw": "0", "expected": "1970" },
+    { "transform": "year", "raw": "-1", "expected": "1969" },
+    { "transform": "day", "raw": "0", "expected": "1970-01-01" },
+    { "transform": "day", "raw": "20713", "expected": "2026-09-17" },
+    { "transform": "day", "raw": "-1", "expected": "1969-12-31" },
+    { "transform": "hour", "raw": "0", "expected": "1970-01-01T00" },
+    { "transform": "hour", "raw": "25", "expected": "1970-01-02T01" },
+    { "transform": "bucket", "raw": "3", "transform_param": 16, "expected": "bucket 3/16", "why": "a bucket INDEX; rendered bare, 3 reads as data" },
+    { "transform": "bucket", "raw": "3", "expected": "bucket 3" },
+    { "transform": "identity", "raw": "42", "expected": "42" },
+    { "transform": "truncate", "raw": "abc", "expected": "abc", "why": "a transform a newer writer added: the stored value is the best answer" },
+    { "transform": "month", "raw": "not-a-number", "expected": "not-a-number", "why": "a malformed ordinal must not become a confident wrong date" },
+    { "transform": "day", "raw": "9007199254740993", "expected": "9007199254740993", "why": "past Number.MAX_SAFE_INTEGER: refused on both sides so they agree on which inputs decode" },
+    {
+      "transform": "day",
+      "raw": "9007199254740991",
+      "expected": "9007199254740991",
+      "why": "AT the safe-integer bound: representable as a JS number and NOT as an instant. Both sides must degrade to the stored string; the browser used to throw RangeError out of new Date(...).toISOString(), which took the files tab's render down."
+    },
+    {
+      "transform": "hour",
+      "raw": "-9007199254740991",
+      "expected": "-9007199254740991",
+      "why": "the negative end of the same boundary"
+    }
+  ]
+}

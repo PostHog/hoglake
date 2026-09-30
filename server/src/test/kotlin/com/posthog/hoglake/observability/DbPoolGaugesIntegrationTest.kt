@@ -30,12 +30,23 @@ class DbPoolGaugesIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
 
     /**
-     * The smallest pool `Config`'s own boot check allows: it refuses
-     * anything under `compactionParallelGroups +
-     * FOREGROUND_CONNECTION_RESERVE`, so "every connection is out" is
-     * five connections rather than an arbitrary small number.
+     * The smallest pool `Config`'s own boot check allows for a pod running
+     * BOTH loops: it refuses anything under
+     * `compactionParallelGroups + cleanupWorkers +
+     * FOREGROUND_CONNECTION_RESERVE`, because both background draws hold a
+     * pooled connection across a long statement (a commit-lock wait, and
+     * the cleanup drain's reference check) and the check adds them.
+     *
+     * The two intervals below are part of that derivation rather than
+     * decoration: each draw is priced only when ITS loop is on, so a
+     * fixture that left compaction's interval at its default of 0 would be
+     * deriving a pool size from a draw the check prices at zero. So
+     * "every connection is out" is six connections for a workload that
+     * genuinely runs both, derived from the check rather than written down.
      */
-    private val poolSize = Config().compactionParallelGroups + Config.FOREGROUND_CONNECTION_RESERVE
+    private val poolSize =
+        Config().compactionParallelGroups + Config().cleanupWorkers +
+            Config.FOREGROUND_CONNECTION_RESERVE
 
     private val cfg =
         Config(
@@ -46,6 +57,9 @@ class DbPoolGaugesIntegrationTest {
             dbUser = PgTestSupport.USER,
             dbPassword = PgTestSupport.PASSWORD,
             dbPoolSize = poolSize,
+            // Both loops ON, because that is the pool size above.
+            compactionIntervalMs = 3_600_000,
+            cleanupIntervalMs = 1_800_000,
         )
 
     // The production pool builder, not a copy of its settings: the

@@ -1,9 +1,7 @@
 package com.posthog.hoglake.service
 
 import com.posthog.hoglake.hydrator.ObjectStore
-import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
-import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import org.assertj.core.api.Assertions.assertThat
@@ -24,8 +22,18 @@ import java.time.Duration
  * always liveness-checked (a queue entry is a suggestion, never an
  * authorization), missing objects drain as success, still-referenced
  * paths are skipped with the object AND queue row surviving, and
- * sub-batches commit independently. Ends with the full lifecycle:
+ * sub-batches settle independently. Ends with the full lifecycle:
  * expire -> cleanup -> the queued objects are gone from S3.
+ *
+ * AND THE CLAIM (V21), which is the half that has no visible outcome of
+ * its own: the drain is a claimed work queue that takes NO advisory lock
+ * anywhere, so the cases below pin the lease and the fences directly —
+ * that no run takes a lock at all, that workers partition the queue,
+ * that a lapsed claim is reclaimed and a fresh one is not, and that a
+ * worker whose claim moved under it cannot write the ledger. Every one
+ * of those is invisible in `removed`/`missing`, which is why they are
+ * asserted on the statement stream and on the row's claim columns rather
+ * than on counters.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -48,6 +56,9 @@ class CleanupServiceIntegrationTest {
     fun tearDown() = db.close()
 
     private companion object {
+        /** The claim statement's `worker` binding, as the SqlLogger renders it. */
+        val WORKER_BINDING = Regex("worker:([^,}]+)")
+
         const val BUCKET = "hoglake-cleanup"
 
         /** A second bucket, so a sub-batch can span two and prove the per-bucket chunking. */
@@ -133,6 +144,66 @@ class CleanupServiceIntegrationTest {
 
     private fun putObject(path: String) = objects.put(path, "bytes".toByteArray())
 
+    /**
+     * Stamp a claim on a row, [ageSeconds] old — how another worker's
+     * claim looks to this one, and the only way to make a LAPSED one
+     * without waiting out a 900 s lease. The drain's own claim is a real
+     * one; this is a fixture for the claims it has to reason about.
+     */
+    private fun claimRow(
+        removalId: Long,
+        worker: String,
+        ageSeconds: Long = 0,
+    ) = jdbi.useHandleUnchecked { h ->
+        h.execute(
+            "UPDATE hog_file_removal SET claimed_by = ?, " +
+                "claimed_at = now() - make_interval(secs => ?) WHERE removal_id = ?",
+            worker,
+            ageSeconds.toDouble(),
+            removalId,
+        )
+    }
+
+    /** How many DISTINCT workers claimed in a recorded statement stream. */
+    private fun workerCount(issued: List<String>): Int =
+        issued
+            .filter { it.contains("SET claimed_at = now()") }
+            .mapNotNull { line -> WORKER_BINDING.find(line)?.groupValues?.get(1) }
+            .distinct()
+            .size
+
+    /** The distinct worker ids that CLAIMED in a recorded statement stream. */
+    private fun claimants(
+        issued: List<String>,
+        prefix: String,
+    ): List<String> =
+        issued
+            .filter { it.contains("SET claimed_at = now()") }
+            .flatMap { line -> Regex(Regex.escape(prefix) + "#\\d+").findAll(line).map { it.value } }
+            .distinct()
+            .sorted()
+
+    /**
+     * Every statement a drain issued, in order, as its rendered SQL and
+     * its BINDING — the binding because the worker id rides a `?` and
+     * which worker claimed what is half of what the concurrency cases
+     * assert. The service is built on a Jdbi of its own so the logger
+     * sees only this drain.
+     */
+    private fun recordingJdbi(
+        issued: MutableList<String>,
+        dataSource: javax.sql.DataSource = db.dataSource,
+    ): org.jdbi.v3.core.Jdbi =
+        com.posthog.hoglake.Database.jdbi(dataSource).also { j ->
+            j.setSqlLogger(
+                object : org.jdbi.v3.core.statement.SqlLogger {
+                    override fun logAfterExecution(context: org.jdbi.v3.core.statement.StatementContext) {
+                        issued += "${context.renderedSql} || bound=${context.binding}"
+                    }
+                },
+            )
+        }
+
     /** Paths still awaiting drain (soft-deleted ledger rows excluded). */
     private fun queuedPaths(catalogId: Long): List<String> =
         jdbi.withHandleUnchecked { h ->
@@ -149,6 +220,9 @@ class CleanupServiceIntegrationTest {
         val lastAttemptAt: java.time.OffsetDateTime?,
         val drainedAt: java.time.OffsetDateTime?,
         val drainedOutcome: String?,
+        /** The claim (V21): who holds the row, and since when. */
+        val claimedAt: java.time.OffsetDateTime?,
+        val claimedBy: String?,
     )
 
     /** Every ledger row (drained or not), in queue order. */
@@ -156,7 +230,8 @@ class CleanupServiceIntegrationTest {
         jdbi.withHandleUnchecked { h ->
             h.createQuery(
                 """
-                SELECT path, attempts, last_attempt_at, drained_at, drained_outcome
+                SELECT path, attempts, last_attempt_at, drained_at, drained_outcome,
+                       claimed_at, claimed_by
                 FROM hog_file_removal WHERE catalog_id = ? ORDER BY removal_id
                 """,
             )
@@ -168,6 +243,8 @@ class CleanupServiceIntegrationTest {
                         lastAttemptAt = rs.getObject("last_attempt_at", java.time.OffsetDateTime::class.java),
                         drainedAt = rs.getObject("drained_at", java.time.OffsetDateTime::class.java),
                         drainedOutcome = rs.getString("drained_outcome"),
+                        claimedAt = rs.getObject("claimed_at", java.time.OffsetDateTime::class.java),
+                        claimedBy = rs.getString("claimed_by"),
                     )
                 }
                 .list()
@@ -386,26 +463,34 @@ class CleanupServiceIntegrationTest {
     }
 
     @Test
-    fun `a ticket a compaction commit settled between select and lock is skipped, not alerted`() {
-        // The realistic interleaving, and it is a commit doing its job.
-        // CompactionService's group commit settles its own staging
-        // ticket 'registered' in the transaction that registers the
-        // output path. The drain's batch select runs OUTSIDE the commit
-        // lock, so that settle can land between the select and the
-        // sub-batch that holds the row — at which point the path IS a
-        // live file.
+    fun `a ticket a compaction commit settled between the claim and the check is settled_elsewhere`() {
+        // THE ONE RACE THE CLAIM CANNOT PREVENT, and it is a commit
+        // doing its job. CompactionService's group commit settles its own
+        // staging ticket 'registered' in the transaction that registers
+        // the output path. It refuses to do that while an UNEXPIRED claim
+        // holds the row (its re-read is `FOR UPDATE` and reads
+        // claimed_at), so this can only happen to a claim whose lease
+        // lapsed — a worker that was killed, or one that spent longer on
+        // S3 than HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS. The fixture's
+        // "commit" is that group: it registers the path and settles the
+        // ticket exactly as `commitGroup` does, claim cleared and all.
         //
-        // Before the under-lock re-check, all four of these followed: an
-        // ERROR log, a `cleanup_violation` audit event, a
-        // `still_referenced` count that pages someone, and an
-        // attempts/last_attempt_at bump on a settled row. The row is
-        // simply not this drain's any more.
+        // What must NOT follow is an alert. The reference check sees a
+        // live file row for the path and calls it referenced, and all
+        // four of these used to follow: an ERROR log, a
+        // `cleanup_violation` audit event, a `still_referenced` count
+        // that pages someone, and an attempts/last_attempt_at bump on a
+        // settled row. The row is simply not this worker's any more, and
+        // the FENCE on the attempts bump is the only thing that can tell
+        // the two apart — which is why its RETURNING is what the
+        // violation count is taken from.
         //
         // ORDER-INDEPENDENT BY CONSTRUCTION: the row under test is a
-        // staging ticket placed behind a FULL staging sub-batch, so it
-        // is in the second staging hold whatever order the reasons
-        // drain in, and the commit fires from the first hold's first
-        // probe. Nothing here rests on bulk running before staging.
+        // staging ticket placed behind a FULL staging sub-batch, so it is
+        // in the second staging sub-batch whatever order the reasons are
+        // worked in, and the commit fires from the first sub-batch's
+        // first probe. Nothing here rests on bulk running before
+        // staging.
         val catalogId = seedCatalog("cl-settled-elsewhere")
         val filler =
             (1..CleanupService.STAGING_SUB_BATCH).map {
@@ -420,50 +505,54 @@ class CleanupServiceIntegrationTest {
         val removalId = stagingTicket(catalogId, path)
 
         // A second transaction plays the compaction commit: register the
-        // path and settle the ticket together, once, from inside the
-        // FIRST sub-batch's object-store work — which is after this
-        // run's batch select and before the second sub-batch takes its
-        // lock.
+        // path and settle the ticket together, once, from BEFORE the
+        // reference check of the sub-batch that holds the row — the one
+        // window a claim cannot close, because the claim has already
+        // committed and the check has not yet read. (Firing it any earlier
+        // no longer reaches the drain at all: the claim itself refuses a
+        // settled row, which is why this is driven off the check's own
+        // statement rather than off an object-store call.)
         val committed = java.util.concurrent.atomic.AtomicBoolean()
-        val committer =
-            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteIfExists(
-                    pathUri: String,
-                    mayIssueCall: () -> Boolean,
-                ): Outcome {
-                    if (committed.compareAndSet(false, true)) {
-                        jdbi.useTransactionUnchecked { h ->
-                            h.execute(
-                                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) " +
-                                    "VALUES (?, 1, 0)",
-                                catalogId,
-                            )
-                            h.execute(
-                                """
-                                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id,
-                                    begin_snapshot, path, record_count, file_size_bytes,
-                                    row_id_start)
-                                VALUES (?, 1, 1, 1, ?, 10, 100, 0)
-                                """,
-                                catalogId,
-                                path,
-                            )
-                            h.execute(
-                                "UPDATE hog_file_removal SET drained_at = now(), " +
-                                    "drained_outcome = 'registered' WHERE removal_id = ?",
-                                removalId,
-                            )
-                        }
+        val racing = com.posthog.hoglake.Database.jdbi(db.dataSource)
+        racing.setSqlLogger(
+            object : org.jdbi.v3.core.statement.SqlLogger {
+                override fun logBeforeExecution(context: org.jdbi.v3.core.statement.StatementContext) {
+                    if (!context.renderedSql.contains("SELECT path FROM hog_data_file")) return
+                    if (!context.binding.toString().contains(path)) return
+                    if (!committed.compareAndSet(false, true)) return
+                    jdbi.useTransactionUnchecked { h ->
+                        h.execute(
+                            "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) " +
+                                "VALUES (?, 1, 0)",
+                            catalogId,
+                        )
+                        h.execute(
+                            """
+                            INSERT INTO hog_data_file (catalog_id, data_file_id, table_id,
+                                begin_snapshot, path, record_count, file_size_bytes,
+                                row_id_start)
+                            VALUES (?, 1, 1, 1, ?, 10, 100, 0)
+                            """,
+                            catalogId,
+                            path,
+                        )
+                        // commitGroup's settle, verbatim.
+                        h.execute(
+                            "UPDATE hog_file_removal SET drained_at = now(), " +
+                                "drained_outcome = 'registered', last_attempt_at = now() " +
+                                "WHERE removal_id = ?",
+                            removalId,
+                        )
                     }
-                    return super.deleteIfExists(pathUri, mayIssueCall)
                 }
-            }
+            },
+        )
 
         val before = ledgerRows(catalogId).single { it.path == path }
         val result =
             withAuditCapture { capture ->
                 val r =
-                    CleanupService(jdbi, committer, stagingGraceSeconds = 0)
+                    CleanupService(racing, removals, stagingGraceSeconds = 0)
                         .runOnce("cl-settled-elsewhere", batchSize = 100)
                 assertThat(capture.lines())
                     .describedAs("a committing compaction group is not an invariant violation")
@@ -471,6 +560,7 @@ class CleanupServiceIntegrationTest {
                 r
             }
 
+        assertThat(committed.get()).describedAs("the race must have been driven").isTrue()
         assertThat(result.stillReferenced)
             .describedAs("the settled ticket must not be counted as a violation")
             .isZero()
@@ -484,25 +574,38 @@ class CleanupServiceIntegrationTest {
             .isEqualTo("registered")
         assertThat(after.attempts).describedAs("no attempt was made on a settled row").isZero()
         assertThat(after.lastAttemptAt)
-            .describedAs("last_attempt_at must not move on a row this drain never touched")
-            .isEqualTo(before.lastAttemptAt)
+            .describedAs(
+                "last_attempt_at is the COMMIT's own stamp (removal_id %d, before=%s): what must " +
+                    "not have happened is a touch by this drain, which `attempts == 0` above is",
+                removalId,
+                before.lastAttemptAt,
+            )
+            .isNotNull()
         assertThat(removals.exists(path))
             .describedAs("the registered object is untouched")
             .isTrue()
     }
 
     @Test
-    fun `both ledger writes backstop a registered that lands inside the sub-batch's own hold`() {
-        // The remainder the under-lock re-check cannot cover. That
-        // re-check is the first statement under the lock, so it catches
-        // a settle that landed BEFORE it; a settle that lands after it,
-        // inside this sub-batch's own hold, reaches the two statements
-        // that write the ledger. Narrower than the realistic race (a
-        // commit would have to take the advisory lock this hold is
-        // holding), which is why `drained_at IS NULL` on SETTLE_SQL and
-        // on BUMP_ATTEMPTS_SQL is the backstop and not the catcher —
-        // but unfenced, each writes over another writer's record, and
-        // the ledger is the only record there is.
+    fun `a registered that lands after the deletes is refused AND reported as a violation`() {
+        // The window the reference check cannot cover: a settle that
+        // lands AFTER it, while this sub-batch is talking to S3. Both
+        // ledger writes carry `drained_at IS NULL AND claimed_by =
+        // :worker`, and unfenced each would write over another writer's
+        // record — the ledger is the only record there is that the path
+        // became a live catalog file.
+        //
+        // UNREACHABLE AS OF THIS CHANGE, and asserted anyway because it
+        // is the only detector: `commitGroup` refuses any ticket cleanup
+        // has TOUCHED (claimed or attempted), so a group cannot register a
+        // path a drain is working. If that ever stops being true, the
+        // shape is a live file row pointing at a deleted object, which no
+        // other check in the system can see — every `staging_tickets` arm
+        // passes once the file row exists. So the drain reads back the
+        // rows its settle did not match and CLASSIFIES them: a
+        // `'registered'` over a path THIS sub-batch deleted is an ERROR, a
+        // `cleanup_violation` audit event and a counted invariant
+        // violation, not ordinary contention.
         //
         // TWO tickets, because the row can leave a sub-batch by either
         // door: `settled` settles (SETTLE_SQL's fence) and `failed`
@@ -516,39 +619,74 @@ class CleanupServiceIntegrationTest {
         val settledId = stagingTicket(catalogId, settled)
         val failedId = stagingTicket(catalogId, failed)
 
-        fun register(removalId: Long) =
-            jdbi.useHandleUnchecked { h ->
-                h.execute(
-                    "UPDATE hog_file_removal SET drained_at = now(), drained_outcome = 'registered' " +
-                        "WHERE removal_id = ? AND drained_at IS NULL",
-                    removalId,
-                )
-            }
+        // TWO SHAPES OF OTHER WRITER, because the settle's two fence
+        // terms catch different ones and a fixture that only produced
+        // compaction's shape would leave `drained_at IS NULL` asserted by
+        // nothing. `clearClaim = true` is `commitGroup` exactly (it clears
+        // the claim it just judged expired), and `claimed_by = :worker` is
+        // what refuses this drain afterwards. `clearClaim = false` is any
+        // writer that settles the row and leaves the claim alone — an
+        // operator's manual UPDATE, or a future writer that forgets — and
+        // there `drained_at IS NULL` is the ONLY term that can refuse it.
+        fun register(
+            removalId: Long,
+            clearClaim: Boolean,
+        ) = jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET drained_at = now(), drained_outcome = 'registered'" +
+                    (if (clearClaim) ", claimed_at = NULL, claimed_by = NULL " else " ") +
+                    "WHERE removal_id = ? AND drained_at IS NULL",
+                removalId,
+            )
+        }
 
         val racer =
             object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteIfExists(
-                    pathUri: String,
-                    mayIssueCall: () -> Boolean,
-                ): Outcome {
-                    // Inside the hold: after the re-check, before the
-                    // ledger write.
+                override fun deleteIfExists(pathUri: String): Outcome {
+                    // After the reference check, before the ledger write.
                     if (pathUri == failed) {
-                        register(failedId)
+                        register(failedId, clearClaim = true)
                         throw IllegalStateException("object store failed after the other writer settled")
                     }
-                    val outcome = super.deleteIfExists(pathUri, mayIssueCall)
-                    register(settledId)
+                    val outcome = super.deleteIfExists(pathUri)
+                    register(settledId, clearClaim = false)
                     return outcome
                 }
             }
         val before = ledgerRows(catalogId).associateBy { it.path }
 
         val result =
-            CleanupService(jdbi, racer, stagingGraceSeconds = 0)
-                .runOnce("cl-settle-backstop", batchSize = 100)
+            withAuditCapture { capture ->
+                val r =
+                    CleanupService(jdbi, racer, stagingGraceSeconds = 0)
+                        .runOnce("cl-settle-backstop", batchSize = 100)
+                assertThat(capture.lines())
+                    .describedAs("the deleted-then-registered path must be named in the audit stream")
+                    .anySatisfy {
+                        assertThat(it)
+                            .contains("action=cleanup_violation")
+                            .contains("outcome=invariant_violation")
+                            .contains("object=$settled")
+                    }
+                assertThat(capture.lines())
+                    .describedAs("and the run's own event must carry the violation outcome")
+                    .anySatisfy {
+                        assertThat(it).contains("action=cleanup").contains("outcome=invariant_violation")
+                    }
+                r
+            }
 
         assertThat(result.removed).describedAs("a row settled elsewhere is not counted").isZero()
+        assertThat(result.settledElsewhere)
+            .describedAs("both doors out of the sub-batch report the row as another writer's")
+            .isEqualTo(2)
+        assertThat(result.stillReferenced)
+            .describedAs(
+                "the row whose OBJECT this sub-batch deleted and whose ledger row came back " +
+                    "'registered' is an invariant violation — a live file row for a deleted " +
+                    "object — and it is the only signature that state has",
+            )
+            .isEqualTo(1)
         assertThat(result.objectsRemoved)
             .describedAs("the object did go, and that is counted separately from the ledger row")
             .isEqualTo(1)
@@ -582,16 +720,9 @@ class CleanupServiceIntegrationTest {
         }
         val flaky =
             object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteBatch(
-                    paths: Collection<String>,
-                    mayIssueCall: () -> Boolean,
-                ): BatchOutcome {
-                    val outcome = super.deleteBatch(paths.filter { it != doomed }, mayIssueCall)
-                    return outcome.copy(
-                        failures =
-                            outcome.failures + mapOf(doomed to "AccessDenied: simulated per-key failure"),
-                    )
-                }
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> =
+                    super.deleteBatch(paths.filter { it != doomed }) +
+                        mapOf(doomed to "AccessDenied: simulated per-key failure")
             }
 
         val result = CleanupService(jdbi, flaky).runOnce("cl-perkey", batchSize = 100)
@@ -657,18 +788,19 @@ class CleanupServiceIntegrationTest {
     }
 
     @Test
-    fun `staging tickets drain in their own small sub-batches`() {
-        // The lock-hold bound, as code. A compaction_staging row costs a
-        // HEAD and a DELETE (no batched form reports 'absent'), so a
-        // 1,000-row sub-batch of them would be 1,000 probe pairs in ONE
-        // hold — ~128 s at the measured 64 ms per round trip, 40x the
-        // hold this change removed. The grace clusters them too, because
-        // tickets become eligible in the order their groups ran.
+    fun `staging tickets settle in their own small sub-batches`() {
+        // A compaction_staging row costs a HEAD and a DELETE (no batched
+        // form reports 'absent'), so ONE claim of the default 1,000 could
+        // hold 1,000 probe pairs — ~128 s at the measured 64 ms per round
+        // trip. It is no longer a lock hold; it is a block of work whose
+        // settle is all-or-nothing, and the grace CLUSTERS the rows,
+        // because tickets become eligible in the order their groups ran.
+        // So they settle 25 at a time, which is what this pins.
         //
-        // The hold IS the transaction, and it is observed from outside
-        // it: a sub-batch's settles are invisible to another connection
-        // until it commits, so the count of settled rows read on a
-        // separate connection is constant within a hold and steps at
+        // The SUB-BATCH is the transaction, and it is observed from
+        // outside it: a sub-batch's settles are invisible to another
+        // connection until it commits, so the count of settled rows read
+        // on a separate connection is constant within one and steps at
         // every boundary. That is the probe counter's reset.
         val catalogId = seedCatalog("cl-staging-holds")
         val tickets = (1..60).map { "s3://$BUCKET/cl-staging-holds/s$it.parquet" }
@@ -681,10 +813,7 @@ class CleanupServiceIntegrationTest {
         val holdSizes = mutableListOf<Int>()
         val counting =
             object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteIfExists(
-                    pathUri: String,
-                    mayIssueCall: () -> Boolean,
-                ): Outcome {
+                override fun deleteIfExists(pathUri: String): Outcome {
                     val settled =
                         jdbi.withHandleUnchecked { h ->
                             h.createQuery(
@@ -699,7 +828,7 @@ class CleanupServiceIntegrationTest {
                     }
                     probesThisHold++
                     holdSizes[holdSizes.lastIndex] = probesThisHold
-                    return super.deleteIfExists(pathUri, mayIssueCall)
+                    return super.deleteIfExists(pathUri)
                 }
             }
 
@@ -710,151 +839,12 @@ class CleanupServiceIntegrationTest {
         assertThat(result.removed).isEqualTo(60)
         assertThat(holdSizes)
             .describedAs(
-                "60 tickets at %d per hold: two FULL holds and a remainder, and the full ones " +
-                    "must be exactly the sub-batch — `<= 25` would also pass for a drain that " +
-                    "probed one row per hold",
+                "60 tickets at %d per sub-batch: two FULL sub-batches and a remainder, and the " +
+                    "full ones must be exactly the sub-batch — `<= 25` would also pass for a " +
+                    "drain that probed one row per transaction",
                 CleanupService.STAGING_SUB_BATCH,
             )
             .containsExactly(CleanupService.STAGING_SUB_BATCH, CleanupService.STAGING_SUB_BATCH, 10)
-    }
-
-    @Test
-    fun `a hold stops issuing calls once its budget is spent, and leaves the rest untouched`() {
-        // The bound that a call COUNT cannot state. Each call may take a
-        // whole RemovalStore.apiCallTimeout, so 25 probe pairs could
-        // reach 500 s — long past the idle_in_transaction_session_timeout
-        // every pooled connection is opened with. Past that Postgres
-        // kills the backend: the sub-batch rolls back WITH ITS OBJECTS
-        // ALREADY DELETED and its ledger rows unsettled, and the next
-        // run drains the same rows and does it again, forever.
-        //
-        // Driven with an injected clock rather than sleeps. A deadline
-        // test that sleeps is a deadline test that is flaky, and at a
-        // 20 s budget it is also a 20 s test.
-        val catalogId = seedCatalog("cl-hold-budget")
-        val tickets = (1..6).map { "s3://$BUCKET/cl-hold-budget/s$it.parquet" }
-        tickets.forEach {
-            putObject(it)
-            stagingTicket(catalogId, it)
-        }
-        // The clock advances only when a call is ISSUED — one gated call
-        // is one 4 s step — so the deadline is a function of calls made
-        // and nothing else.
-        val now = java.util.concurrent.atomic.AtomicLong(0)
-        val perCall = Duration.ofSeconds(4)
-        val slow =
-            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteIfExists(
-                    pathUri: String,
-                    mayIssueCall: () -> Boolean,
-                ): Outcome =
-                    super.deleteIfExists(pathUri) {
-                        mayIssueCall().also { if (it) now.addAndGet(perCall.toNanos()) }
-                    }
-            }
-        // Budget 20 s, call bound 10 s, so the gate passes while at most
-        // 10 s is spent. At 4 s per call:
-        //
-        //   row 1 HEAD    elapsed  0 <= 10, runs,  0 ->  4
-        //   row 1 DELETE  elapsed  4 <= 10, runs,  4 ->  8   (removed)
-        //   row 2 HEAD    elapsed  8 <= 10, runs,  8 -> 12
-        //   row 2 DELETE  elapsed 12 >  10, REFUSED
-        //
-        // so one row drains, row 2 is left mid-probe with its object
-        // intact, and rows 2..6 are deadline_skipped. The hold ends at
-        // 12 s, inside the 20 s budget, which is the one-call headroom
-        // the gate reserves.
-        val drain =
-            CleanupService(
-                jdbi,
-                slow,
-                stagingGraceSeconds = 0,
-                nanoTime = { now.get() },
-            )
-
-        val first = drain.runOnce("cl-hold-budget", batchSize = 100)
-
-        assertThat(first.removed)
-            .describedAs("only row 1 fits: its DELETE is the last call that starts inside the budget")
-            .isEqualTo(1)
-        assertThat(first.missing).isZero()
-        assertThat(first.deadlineSkipped)
-            .describedAs("rows 2..6 were claimed and never attempted")
-            .isEqualTo(5)
-        val undrained = queuedPaths(catalogId)
-        assertThat(undrained).describedAs("the remainder is still queued").hasSize(5)
-        assertThat(ledgerRows(catalogId).filter { it.path in undrained })
-            .describedAs(
-                "a row the deadline never reached was not ATTEMPTED: no attempts bump, no " +
-                    "last_attempt_at, and its object is untouched — including row 2, whose HEAD " +
-                    "ran but whose DELETE was refused",
-            )
-            .allSatisfy {
-                assertThat(it.attempts).isZero()
-                assertThat(it.lastAttemptAt).isNull()
-            }
-        undrained.forEach { assertThat(removals.exists(it)).isTrue() }
-
-        // And they are simply the next run's work: a fresh drain gets a
-        // fresh budget.
-        var drained = first.removed + first.missing
-        repeat(6) {
-            now.set(0)
-            drained += drain.runOnce("cl-hold-budget", batchSize = 100).let { r -> r.removed + r.missing }
-        }
-        assertThat(drained).isEqualTo(tickets.size.toLong())
-        assertThat(queuedPaths(catalogId)).isEmpty()
-    }
-
-    @Test
-    fun `a drain whose budget settles nothing is not silent`() {
-        // The counter's whole reason. A hold that ends on its budget
-        // before a single row settles reports removed = missing =
-        // still_referenced = 0, which is the shape of an idle drain — so
-        // without deadline_skipped in the audit condition, a drain
-        // wedged on a slow object store looks exactly like a drain with
-        // an empty queue, in the audit stream AND in the maintenance run
-        // ledger.
-        //
-        // 11 s per call against a 20 s budget and a 10 s call bound:
-        // row 1's HEAD runs (elapsed 0), row 1's DELETE is refused
-        // (elapsed 11 > 10), and the run settles nothing at all.
-        val catalogId = seedCatalog("cl-hold-wedged")
-        val tickets = (1..6).map { "s3://$BUCKET/cl-hold-wedged/s$it.parquet" }
-        tickets.forEach {
-            putObject(it)
-            stagingTicket(catalogId, it)
-        }
-        val now = java.util.concurrent.atomic.AtomicLong(0)
-        val stalled =
-            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
-                override fun deleteIfExists(
-                    pathUri: String,
-                    mayIssueCall: () -> Boolean,
-                ): Outcome =
-                    super.deleteIfExists(pathUri) {
-                        mayIssueCall().also { if (it) now.addAndGet(Duration.ofSeconds(11).toNanos()) }
-                    }
-            }
-
-        withAuditCapture { capture ->
-            val result =
-                CleanupService(jdbi, stalled, stagingGraceSeconds = 0, nanoTime = { now.get() })
-                    .runOnce("cl-hold-wedged", batchSize = 100)
-
-            assertThat(result.removed).isZero()
-            assertThat(result.missing).isZero()
-            assertThat(result.stillReferenced).isZero()
-            assertThat(result.deadlineSkipped)
-                .describedAs("every row was claimed and none was attempted")
-                .isEqualTo(tickets.size.toLong())
-            assertThat(capture.lines())
-                .describedAs("a run that settled nothing because its budget ran out must say so")
-                .anySatisfy {
-                    assertThat(it).contains("action=cleanup").contains("deadline_skipped=6")
-                }
-        }
-        assertThat(queuedPaths(catalogId)).hasSize(6)
     }
 
     @Test
@@ -899,13 +889,23 @@ class CleanupServiceIntegrationTest {
         assertThat(removals.exists(dvPath)).isTrue()
         assertThat(queuedPaths(catalogId)).containsExactly(dataPath, dvPath)
         // Each skip recorded an attempt; a second run records another.
+        // And the CLAIM IS RELEASED: a row this run will not settle must
+        // be visible to the next one and to an operator reading the
+        // queue, not held for a lease it has no use for. (It is also what
+        // makes the second run below bump attempts at all — a row still
+        // claimed by the first would be skipped until the lease lapsed.)
         for (row in ledgerRows(catalogId)) {
             assertThat(row.attempts).isEqualTo(1)
             assertThat(row.lastAttemptAt).isNotNull()
             assertThat(row.drainedAt).isNull()
+            assertThat(row.claimedAt).describedAs("the claim is released with the bump").isNull()
+            assertThat(row.claimedBy).isNull()
         }
         svc.runOnce("cl-live", batchSize = 100)
         assertThat(ledgerRows(catalogId).map { it.attempts }).containsOnly(2)
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.claimedBy).describedAs("released again by the second run").isNull()
+        }
     }
 
     @Test
@@ -1027,46 +1027,1266 @@ class CleanupServiceIntegrationTest {
     }
 
     @Test
-    fun `drain sub-batches take the per-catalog commit lock`() {
-        // Pinned regression (bug hunt #2, locking half): the reference
-        // check and the physical delete must be serialized against the
-        // commit tail via the SAME advisory lock every commit takes.
-        // Without it, an in-flight commit past its own removal-queue
-        // check could insert a hog_data_file row for a queued path that
-        // referencedPaths (READ COMMITTED) cannot see yet — the drain
-        // would delete the object under the about-to-commit live row.
-        // With the lock, the drain waits for the commit to finish (and
-        // then sees its rows), or the commit waits for the sub-batch.
-        // This test asserts the lock is actually taken: while a fake
-        // "commit" holds it, the drain makes no progress.
-        val catalogId = seedCatalog("cl-lock")
-        val path = "s3://$BUCKET/cl-lock/f.parquet"
+    fun `a full run takes no advisory lock of any kind`() {
+        // THE HEADLINE PROPERTY, and the only test that can see it.
+        // Every other case here asserts OUTCOMES, and a drain that takes
+        // the per-catalog commit lock produces identical outcomes — it
+        // just pays its reference check, its DeleteObjects call and its
+        // settle with the lock every commit on the catalog queues on
+        // (~19 s per 1,000-row sub-batch measured on gigahog-prod-us,
+        // which is why cleanup is off in production).
+        //
+        // The run is deliberately a MIXED one — bulk rows, a staging
+        // ticket past its grace, a still-referenced row, and the ledger
+        // purge — so every statement-issuing path in the class is
+        // exercised inside the recording. A `pg_advisory_xact_lock`
+        // anywhere in that stream fails this.
+        val catalogId = seedCatalog("cl-no-lock")
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 1, 0)",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start)
+                VALUES (?, 1, 1, 1, 's3://$BUCKET/cl-no-lock/live.parquet', 10, 100, 0)
+                """,
+                catalogId,
+            )
+        }
+        val live = "s3://$BUCKET/cl-no-lock/live.parquet"
+        val bulk = (1..3).map { "s3://$BUCKET/cl-no-lock/f$it.parquet" }
+        val ticket = "s3://$BUCKET/cl-no-lock/staged.parquet"
+        (bulk + live).forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        putObject(ticket)
+        stagingTicket(catalogId, ticket)
+
+        val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val result =
+            CleanupService(recordingJdbi(issued), removals, stagingGraceSeconds = 0)
+                .runOnce("cl-no-lock", batchSize = 100)
+
+        assertThat(result.removed).describedAs("the run did real work").isEqualTo(4)
+        assertThat(result.stillReferenced).isEqualTo(1)
+        assertThat(issued)
+            .describedAs("the run must issue statements at all, or this asserts nothing")
+            .isNotEmpty()
+        assertThat(issued)
+            .describedAs(
+                "cleanup takes NO advisory lock — not the per-catalog commit lock, not a " +
+                    "single-flight lock of its own:%n%s",
+                issued.joinToString("\n---\n"),
+            )
+            .noneSatisfy { assertThat(it).contains("pg_advisory") }
+        // And the claim is what replaced it: one UPDATE ... FOR UPDATE
+        // SKIP LOCKED, whose own transaction ends before the first
+        // object-store call. A mutation that dropped SKIP LOCKED would
+        // turn concurrent workers back into a queue with nothing else
+        // here noticing.
+        assertThat(issued.filter { it.contains("FOR UPDATE SKIP LOCKED") })
+            .describedAs("the claim partitions the queue instead of serializing on a lock")
+            .isNotEmpty()
+    }
+
+    // ---- the claim (V21) ---------------------------------------------------
+
+    @Test
+    fun `concurrent workers partition the queue and settle every row exactly once`() {
+        // WHAT SKIP LOCKED BUYS, and it is the reason there is no
+        // single-flight advisory lock: two workers cannot claim the same
+        // row, so they need no coordination at all. A row settled twice
+        // would show up as `removed` exceeding the queue (the counter is
+        // per settle, not per row), and a row NOT settled would show up
+        // as a leftover in the queue — so the two assertions together are
+        // "exactly once, and all of them".
+        //
+        // THE OVERLAP IS FORCED, not hoped for. Without the latch the
+        // first worker can finish all eight claims before the executor
+        // schedules the second, and the test would pass without ever
+        // having run two workers at once (review C10's finding on the
+        // predecessor of this test). Each worker's first delete counts
+        // the latch down and then waits for the others, so all four hold
+        // a claim simultaneously by construction.
+        val catalogId = seedCatalog("cl-workers")
+        val paths = (1..40).map { "s3://$BUCKET/cl-workers/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        val workers = 4
+        val arrived = java.util.concurrent.CountDownLatch(workers)
+        val everyoneArrived = java.util.concurrent.atomic.AtomicBoolean()
+        val waited = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+        val rendezvous =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> {
+                    if (waited.add(Thread.currentThread().threadId())) {
+                        arrived.countDown()
+                        if (arrived.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                            everyoneArrived.set(true)
+                        }
+                    }
+                    return super.deleteBatch(paths)
+                }
+            }
+
+        val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val result =
+            CleanupService(
+                recordingJdbi(issued),
+                rendezvous,
+                subBatchSize = 5,
+                workers = workers,
+                workerIdPrefix = "wk",
+            ).runOnce("cl-workers", batchSize = 100)
+
+        assertThat(everyoneArrived.get())
+            .describedAs("all %d workers must have held a claim at the same time", workers)
+            .isTrue()
+        assertThat(result.removed)
+            .describedAs("one settle per row: a row settled twice would count twice")
+            .isEqualTo(paths.size.toLong())
+        assertThat(result.settledElsewhere)
+            .describedAs("no worker's settle was refused, because no two claimed one row")
+            .isZero()
+        assertThat(result.stillReferenced).isZero()
+        assertThat(queuedPaths(catalogId)).describedAs("nothing was left behind").isEmpty()
+        paths.forEach { assertThat(removals.exists(it)).isFalse() }
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedOutcome).isEqualTo("deleted")
+            assertThat(it.attempts).describedAs("no row was touched twice").isZero()
+            assertThat(it.claimedBy).describedAs("a settled row carries no claimant").isNull()
+            assertThat(it.claimedAt).isNull()
+        }
+        // The queue really was PARTITIONED — several worker ids claimed —
+        // rather than one worker draining it while three idled.
+        val claimants =
+            issued
+                .filter { it.contains("SET claimed_at = now()") }
+                .flatMap { Regex("""wk#\d+""").findAll(it).map { m -> m.value } }
+                .distinct()
+        assertThat(claimants)
+            .describedAs("every worker claims under its OWN id:%n%s", claimants)
+            .hasSize(workers)
+    }
+
+    @Test
+    fun `two concurrent runs on one catalog drain it once between them`() {
+        // The same property one level up: two `runOnce` calls (two
+        // replicas, or a manual POST landing on top of the loop) partition
+        // the queue instead of fighting over it. Neither reports a refused
+        // settle, and between them they drain the queue exactly once.
+        val catalogId = seedCatalog("cl-two-runs")
+        val paths = (1..20).map { "s3://$BUCKET/cl-two-runs/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        val arrived = java.util.concurrent.CountDownLatch(2)
+        val bothArrived = java.util.concurrent.atomic.AtomicBoolean()
+        val waited = java.util.concurrent.ConcurrentHashMap.newKeySet<Long>()
+        val rendezvous =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> {
+                    if (waited.add(Thread.currentThread().threadId())) {
+                        arrived.countDown()
+                        if (arrived.await(30, java.util.concurrent.TimeUnit.SECONDS)) {
+                            bothArrived.set(true)
+                        }
+                    }
+                    return super.deleteBatch(paths)
+                }
+            }
+        // Two SERVICES, so the two runs carry different worker ids exactly
+        // as two pods would; a shared instance would still be two claims,
+        // but it would not pin that the fence is per worker.
+        val a = CleanupService(jdbi, rendezvous, subBatchSize = 5, workerIdPrefix = "runA")
+        val b = CleanupService(jdbi, rendezvous, subBatchSize = 5, workerIdPrefix = "runB")
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(2)
+        val results =
+            try {
+                listOf(
+                    pool.submit<com.posthog.hoglake.model.CleanupResult> { a.runOnce("cl-two-runs", 100) },
+                    pool.submit<com.posthog.hoglake.model.CleanupResult> { b.runOnce("cl-two-runs", 100) },
+                ).map { it.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+            } finally {
+                pool.shutdownNow()
+            }
+
+        assertThat(bothArrived.get()).describedAs("the two runs must have overlapped").isTrue()
+        assertThat(results.sumOf { it.removed })
+            .describedAs("every row settled, and none twice: %s", results)
+            .isEqualTo(paths.size.toLong())
+        assertThat(results).allSatisfy {
+            assertThat(it.settledElsewhere).describedAs("no refused settle: %s", it).isZero()
+            assertThat(it.stillReferenced).isZero()
+            assertThat(it.removed).describedAs("both runs did work: %s", results).isPositive()
+        }
+        assertThat(queuedPaths(catalogId)).isEmpty()
+        paths.forEach { assertThat(removals.exists(it)).isFalse() }
+    }
+
+    @Test
+    fun `the batch is a budget PER WORKER, so workers multiply the run's rows`() {
+        // THE THROUGHPUT ARITHMETIC, as code. The budget used to be ONE
+        // counter for the run, handed out in sub-batch chunks, so
+        // `HOGLAKE_CLEANUP_WORKERS` above `batch / subBatch` was dead
+        // weight: four workers at the production batch and sub-batch left
+        // two of them with nothing to claim, while the knob's own KDoc
+        // promised N times the rate. Per worker, a run asks for
+        // `workers x batch` rows, which is what the rows/hour in Config's
+        // KDoc is derived from.
+        //
+        // The queue is deliberately TWICE what the run may take, so the
+        // assertion is the budget and not the queue's size: every worker
+        // gets full claims and stops on its own budget.
+        val catalogId = seedCatalog("cl-per-worker-budget")
+        val paths = (1..40).map { "s3://$BUCKET/cl-per-worker-budget/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+
+        val result =
+            CleanupService(jdbi, removals, subBatchSize = 5, workers = 4, workerIdPrefix = "budget")
+                .runOnce("cl-per-worker-budget", batchSize = 5)
+
+        assertThat(result.removed)
+            .describedAs("4 workers x a 5-row budget each, not one 5-row budget between them")
+            .isEqualTo(20)
+        assertThat(queuedPaths(catalogId))
+            .describedAs("and the run stops there rather than draining the queue")
+            .hasSize(20)
+        assertThat(result.settledElsewhere).isZero()
+        // A single worker at the same budget takes a quarter of it, which
+        // is the other half of the arithmetic.
+        val single =
+            CleanupService(jdbi, removals, subBatchSize = 5, workers = 1, workerIdPrefix = "solo")
+                .runOnce("cl-per-worker-budget", batchSize = 5)
+        assertThat(single.removed).isEqualTo(5)
+        assertThat(queuedPaths(catalogId)).hasSize(15)
+    }
+
+    @Test
+    fun `a lapsed claim is reclaimed and a fresh one is left strictly alone`() {
+        // THE LEASE, in both directions, and both halves are the same
+        // predicate: `claimed_at IS NULL OR claimed_at < now() - lease`.
+        // Drop it and a live worker's rows are stolen while it is
+        // deleting them; invert it and a dead worker's rows are never
+        // reclaimed at all. The fixture stamps the two claims itself,
+        // which is the only way to have a 900 s lease lapse inside a
+        // test.
+        val catalogId = seedCatalog("cl-lease")
+        val lapsed = "s3://$BUCKET/cl-lease/lapsed.parquet"
+        val fresh = "s3://$BUCKET/cl-lease/fresh.parquet"
+        putObject(lapsed)
+        putObject(fresh)
+        val lapsedId = queue(catalogId, lapsed)
+        val freshId = queue(catalogId, fresh)
+        claimRow(lapsedId, "dead-worker", ageSeconds = 2 * CleanupService.CLAIM_LEASE_SECONDS)
+        claimRow(freshId, "live-worker", ageSeconds = 0)
+        val before = ledgerRows(catalogId).single { it.path == fresh }
+
+        val result = CleanupService(jdbi, removals).runOnce("cl-lease", batchSize = 100)
+
+        assertThat(result.removed).describedAs("the dead worker's row, and only it").isEqualTo(1)
+        assertThat(result.settledElsewhere).isZero()
+        assertThat(removals.exists(lapsed)).isFalse()
+        assertThat(ledgerRows(catalogId).single { it.path == lapsed }.drainedOutcome)
+            .isEqualTo("deleted")
+
+        val after = ledgerRows(catalogId).single { it.path == fresh }
+        assertThat(removals.exists(fresh))
+            .describedAs("a live worker is presumed to be deleting its own object")
+            .isTrue()
+        assertThat(after.drainedAt).describedAs("and its row is not settled by us").isNull()
+        assertThat(after.attempts).describedAs("nor touched: no attempt was made on it").isZero()
+        assertThat(after.claimedBy).describedAs("the claim stands, unchanged").isEqualTo("live-worker")
+        assertThat(after.claimedAt).isEqualTo(before.claimedAt)
+        assertThat(queuedPaths(catalogId)).containsExactly(fresh)
+
+        // Age that claim past the lease and the very same drain takes it.
+        claimRow(freshId, "live-worker", ageSeconds = 2 * CleanupService.CLAIM_LEASE_SECONDS)
+        assertThat(CleanupService(jdbi, removals).runOnce("cl-lease", batchSize = 100).removed)
+            .isEqualTo(1)
+        assertThat(removals.exists(fresh)).isFalse()
+        assertThat(queuedPaths(catalogId)).isEmpty()
+    }
+
+    @Test
+    fun `a worker whose claim was taken from it cannot settle the row`() {
+        // THE OTHER HALF OF THE LEASE. A worker that spends longer on S3
+        // than the lease loses the row to whoever reclaims it — and must
+        // not then stamp its own outcome over that worker's. `claimed_by =
+        // :worker` on the settle is the fence; without it the ledger would
+        // say this drain settled a row it no longer held, which is the
+        // same class of lie as overwriting a compaction group's
+        // 'registered'.
+        //
+        // The theft happens from inside the delete, i.e. after the claim
+        // and before the settle, which is exactly the window a lapsed
+        // lease opens.
+        val catalogId = seedCatalog("cl-stolen")
+        val path = "s3://$BUCKET/cl-stolen/f.parquet"
         putObject(path)
-        queue(catalogId, path)
+        val removalId = queue(catalogId, path)
+        val thief =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> {
+                    val failures = super.deleteBatch(paths)
+                    claimRow(removalId, "another-worker", ageSeconds = 0)
+                    return failures
+                }
+            }
+
+        val result = CleanupService(jdbi, thief).runOnce("cl-stolen", batchSize = 100)
+
+        assertThat(result.removed).describedAs("the settle was refused, so nothing is counted").isZero()
+        assertThat(result.settledElsewhere)
+            .describedAs("and the row is reported as somebody else's")
+            .isEqualTo(1)
+        assertThat(result.objectsRemoved)
+            .describedAs(
+                "the object did go — that is counted separately, and it is why the re-drain " +
+                    "settles it rather than failing",
+            )
+            .isEqualTo(1)
+        assertThat(result.stillReferenced).isZero()
+        val row = ledgerRows(catalogId).single()
+        assertThat(row.drainedAt).describedAs("undrained: the new claimant settles it").isNull()
+        assertThat(row.claimedBy).isEqualTo("another-worker")
+        assertThat(row.attempts).describedAs("a refused settle is not an attempt bump either").isZero()
+        assertThat(removals.exists(path)).isFalse()
+    }
+
+    @Test
+    fun `a worker killed after its deletes leaves the rows claimed until the lease expires`() {
+        // THE CRASH THE LEASE EXISTS FOR. The claim commits before the
+        // first delete and the settle is a later transaction, so a worker
+        // that dies in between leaves rows undrained, claimed, and with
+        // their objects already gone. Nothing may touch them until the
+        // lease lapses — and when it does, the re-drain must settle them
+        // without an error, because `DeleteObjects` reports a key that was
+        // never there exactly like one it removed.
+        //
+        // (A bulk row settles 'deleted' on that re-drain, not 'absent':
+        // only the `compaction_staging` path keeps the HEAD that can tell
+        // the two apart — see the staging-ticket case above, which is
+        // where 'absent' is pinned.)
+        val catalogId = seedCatalog("cl-crash")
+        val paths = (1..3).map { "s3://$BUCKET/cl-crash/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        val killed =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> {
+                    super.deleteBatch(paths)
+                    throw IllegalStateException("the pod went away between the delete and the settle")
+                }
+            }
+
+        assertThatThrownBy {
+            CleanupService(jdbi, killed, workerIdPrefix = "doomed").runOnce("cl-crash", batchSize = 100)
+        }
+            .isInstanceOf(IllegalStateException::class.java)
+
+        paths.forEach { assertThat(removals.exists(it)).describedAs("%s", it).isFalse() }
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedAt).describedAs("nothing settled").isNull()
+            assertThat(it.claimedBy).describedAs("the claim outlives the worker").startsWith("doomed")
+            assertThat(it.attempts).isZero()
+        }
+
+        // A run inside the lease must not touch them: the dead worker is
+        // indistinguishable from a slow one until the lease says otherwise.
+        val tooSoon = CleanupService(jdbi, removals).runOnce("cl-crash", batchSize = 100)
+        assertThat(tooSoon.removed).isZero()
+        assertThat(tooSoon.missing).isZero()
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedAt).isNull()
+            assertThat(it.claimedBy).startsWith("doomed")
+        }
+
+        // Past the lease, a healthy drain reclaims and settles them, with
+        // no error and no failed delete over the already-absent keys.
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET claimed_at = now() - make_interval(secs => ?) " +
+                    "WHERE catalog_id = ?",
+                (2 * CleanupService.CLAIM_LEASE_SECONDS).toDouble(),
+                catalogId,
+            )
+        }
+        val reclaimed = CleanupService(jdbi, removals).runOnce("cl-crash", batchSize = 100)
+        assertThat(reclaimed.removed).isEqualTo(paths.size.toLong())
+        assertThat(reclaimed.settledElsewhere).isZero()
+        assertThat(reclaimed.stillReferenced).isZero()
+        assertThat(queuedPaths(catalogId)).isEmpty()
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedOutcome).isEqualTo("deleted")
+            assertThat(it.attempts).describedAs("a re-drain of a gone object is not a failure").isZero()
+            assertThat(it.claimedBy).isNull()
+        }
+    }
+
+    @Test
+    fun `a worker whose claim was taken cannot bump attempts or clear the new claim`() {
+        // THE BUMP'S FENCE, and the half the theft test cannot reach. That
+        // test steals the claim on the SUCCESS path, so the row goes to
+        // SETTLE_SQL; this one steals it on the SKIP path, where the row
+        // goes to BUMP_ATTEMPTS_SQL instead. The bump does not merely
+        // record an attempt — it RELEASES the claim — so unfenced it would
+        // clear the live claim of the worker that reclaimed the row and
+        // hand the same path to a third claimer while the second is
+        // deleting it. That is the failure the lease exists to prevent,
+        // reached through the release rather than the settle.
+        //
+        // The seam is the reference check: by the time it answers, the
+        // claim has moved.
+        val catalogId = seedCatalog("cl-stolen-skip")
+        val path = "s3://$BUCKET/cl-stolen-skip/live.parquet"
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot) VALUES (?, 1, 0)",
+                catalogId,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                    path, record_count, file_size_bytes, row_id_start)
+                VALUES (?, 1, 1, 1, ?, 10, 100, 0)
+                """,
+                catalogId,
+                path,
+            )
+        }
+        putObject(path)
+        val removalId = queue(catalogId, path)
+
+        // Steal the claim from inside the reference check: the statement
+        // is the drain's own, and the theft lands after the claim and
+        // before the bump.
+        val stolen = java.util.concurrent.atomic.AtomicBoolean()
+        val racing = com.posthog.hoglake.Database.jdbi(db.dataSource)
+        racing.setSqlLogger(
+            object : org.jdbi.v3.core.statement.SqlLogger {
+                override fun logAfterExecution(context: org.jdbi.v3.core.statement.StatementContext) {
+                    if (!context.renderedSql.contains("SELECT path FROM hog_data_file")) return
+                    if (!stolen.compareAndSet(false, true)) return
+                    claimRow(removalId, "another-worker", ageSeconds = 0)
+                }
+            },
+        )
+
+        val result =
+            withAuditCapture { capture ->
+                val r =
+                    CleanupService(racing, removals, workerIdPrefix = "loser")
+                        .runOnce("cl-stolen-skip", batchSize = 100)
+                assertThat(capture.lines())
+                    .describedAs("a row this worker no longer holds is not its violation to report")
+                    .noneSatisfy { assertThat(it).contains("action=cleanup_violation") }
+                r
+            }
+
+        assertThat(stolen.get()).describedAs("the theft must have been driven").isTrue()
+        assertThat(result.stillReferenced)
+            .describedAs("the fence refused the bump, so there is no violation to count")
+            .isZero()
+        assertThat(result.settledElsewhere)
+            .describedAs("the row is reported as somebody else's instead")
+            .isEqualTo(1)
+        assertThat(result.removed).isZero()
+        val row = ledgerRows(catalogId).single()
+        assertThat(row.attempts).describedAs("the fence refused the bump").isZero()
+        assertThat(row.claimedBy)
+            .describedAs("and the bump must NOT clear the claim of the worker that took the row")
+            .isEqualTo("another-worker")
+        assertThat(row.claimedAt)
+            .describedAs("nor its timestamp — the new lease still runs")
+            .isNotNull()
+        assertThat(removals.exists(path))
+            .describedAs("the referenced object is untouched throughout")
+            .isTrue()
+    }
+
+    @Test
+    fun `a claim SKIPS the rows another claim holds instead of waiting for them`() {
+        // THE PREDICATE THE WHOLE "no single-flight lock" ARGUMENT RESTS
+        // ON, and EXPLAIN cannot see it: the plan of `FOR UPDATE` and of
+        // `FOR UPDATE SKIP LOCKED` are byte-identical (`LockRows` in both),
+        // because the wait policy is not a plan property. So the skip is
+        // driven: a second connection holds one candidate row, and a
+        // `lock_timeout` on the claiming connection turns "waits" into an
+        // observable failure. Without SKIP LOCKED this statement raises
+        // 55P03 instead of returning the rows it could lock.
+        val catalogId = seedCatalog("cl-skip-locked")
+        val ids = (1..4).map { queue(catalogId, "s3://$BUCKET/cl-skip-locked/f$it.parquet") }
+        val held = ids.first()
 
         val holder = jdbi.open()
-        val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
         try {
             holder.begin()
-            Locks.acquireCatalogCommitLock(holder, catalogId)
+            holder.createQuery("SELECT removal_id FROM hog_file_removal WHERE removal_id = ? FOR UPDATE")
+                .bind(0, held).mapTo(Long::class.javaObjectType).one()
 
-            val drain = executor.submit<CleanupResult> { svc.runOnce("cl-lock", batchSize = 100) }
-            Thread.sleep(500)
-            // Blocked behind the "commit": nothing settled, object intact.
-            assertThat(drain.isDone).isFalse()
-            assertThat(queuedPaths(catalogId)).containsExactly(path)
-            assertThat(removals.exists(path)).isTrue()
-
-            holder.rollback() // the "commit" finishes; the drain proceeds
-            val result = drain.get(30, java.util.concurrent.TimeUnit.SECONDS)
-            assertThat(result.removed).isEqualTo(1)
-            assertThat(queuedPaths(catalogId)).isEmpty()
-            assertThat(removals.exists(path)).isFalse()
+            val taken =
+                jdbi.withHandleUnchecked { h ->
+                    // SET LOCAL inside a transaction, not SET: this handle
+                    // goes back to a pool of eight that the rest of the
+                    // class borrows from, and a session-scoped
+                    // `lock_timeout` would ride it into every later test —
+                    // the `is_local` hazard, in a test rather than in
+                    // production code.
+                    h.begin()
+                    try {
+                        h.execute("SET LOCAL lock_timeout = '2s'")
+                        h.createQuery(CleanupService.CLAIM_CANDIDATE_SQL)
+                            .bind("catalogId", catalogId)
+                            .bind("limit", 3)
+                            .bind("leaseSeconds", CleanupService.CLAIM_LEASE_SECONDS.toDouble())
+                            .mapTo(Long::class.javaObjectType)
+                            .list()
+                    } finally {
+                        h.rollback()
+                    }
+                }
+            assertThat(taken)
+                .describedAs(
+                    "the held row is SKIPPED, not waited for — which is why concurrent workers " +
+                        "need no coordination and no single-flight lock",
+                )
+                .doesNotContain(held)
+            assertThat(taken)
+                .describedAs("and the skip does not consume the LIMIT: three other rows came back")
+                .hasSize(3)
+                .containsExactlyElementsOf(ids.drop(1))
         } finally {
             if (holder.isInTransaction) holder.rollback()
             holder.close()
-            executor.shutdownNow()
         }
+    }
+
+    @Test
+    fun `a partly deleted sub-batch leaves the rest claimed, and the re-drain settles it whole`() {
+        // The crash the previous test could not produce: a bulk sub-batch
+        // is one `DeleteObjects` call PER BUCKET CHUNK, so a throw out of
+        // the SECOND chunk leaves some objects gone, some present, and
+        // every row claimed and unsettled. What has to hold is that the
+        // re-drain after the lease does not care which is which —
+        // `DeleteObjects` reports a key that was never there exactly like
+        // one it removed, so the whole sub-batch settles 'deleted' with no
+        // failure and no attempts bump.
+        val catalogId = seedCatalog("cl-crash-partial")
+        objects.createBucket(SECOND_BUCKET)
+        val first = (1..3).map { "s3://$BUCKET/cl-crash-partial/f$it.parquet" }
+        val second = (1..3).map { "s3://$SECOND_BUCKET/cl-crash-partial/g$it.parquet" }
+        (first + second).forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        val chunks = java.util.concurrent.atomic.AtomicInteger()
+        val killed =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteChunk(
+                    bucket: String,
+                    chunk: List<Pair<String, String>>,
+                ): Map<String, String> {
+                    if (chunks.incrementAndGet() > 1) {
+                        throw IllegalStateException("the pod went away between two chunks")
+                    }
+                    return super.deleteChunk(bucket, chunk)
+                }
+            }
+
+        assertThatThrownBy {
+            CleanupService(jdbi, killed, workerIdPrefix = "doomed").runOnce("cl-crash-partial", 100)
+        }
+            .isInstanceOf(IllegalStateException::class.java)
+
+        val gone = (first + second).filter { !removals.exists(it) }
+        assertThat(gone)
+            .describedAs("exactly one bucket's chunk went; the other never was attempted")
+            .hasSize(3)
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedAt).describedAs("nothing settled").isNull()
+            assertThat(it.claimedBy).describedAs("every row is still the dead worker's").startsWith("doomed")
+            assertThat(it.attempts).isZero()
+        }
+
+        // Past the lease a healthy drain settles the whole sub-batch,
+        // including the three keys that are already gone.
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                "UPDATE hog_file_removal SET claimed_at = now() - make_interval(secs => ?) " +
+                    "WHERE catalog_id = ?",
+                (2 * CleanupService.CLAIM_LEASE_SECONDS).toDouble(),
+                catalogId,
+            )
+        }
+        val reclaimed = CleanupService(jdbi, removals).runOnce("cl-crash-partial", 100)
+        assertThat(reclaimed.removed).isEqualTo(6)
+        assertThat(reclaimed.settledElsewhere).isZero()
+        assertThat(queuedPaths(catalogId)).isEmpty()
+        assertThat(ledgerRows(catalogId)).allSatisfy {
+            assertThat(it.drainedOutcome).isEqualTo("deleted")
+            assertThat(it.attempts).describedAs("a re-drain over a mixed batch is not a failure").isZero()
+        }
+        (first + second).forEach { assertThat(removals.exists(it)).isFalse() }
+    }
+
+    @Test
+    fun `a worker's failure reaches the run as itself, at one worker and at four`() {
+        // THE TWO WORKER COUNTS FAIL DIFFERENTLY unless the wrapper is
+        // unwrapped: `workers == 1` runs inline and throws the store's
+        // exception, `workers > 1` goes through `invokeAll(...).get()` and
+        // would throw an ExecutionException wrapping it. The run ledger's
+        // `error`, the audit event's detail and the manual POST's status
+        // all read that exception, so which one an operator sees must not
+        // depend on a knob.
+        val catalogId = seedCatalog("cl-worker-failure")
+        (1..8).forEach {
+            val p = "s3://$BUCKET/cl-worker-failure/f$it.parquet"
+            putObject(p)
+            queue(catalogId, p)
+        }
+        val exploding =
+            object : RemovalStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun deleteBatch(paths: Collection<String>): Map<String, String> =
+                    throw IllegalStateException("object store is on fire")
+            }
+
+        for (workers in listOf(1, 4)) {
+            assertThatThrownBy {
+                CleanupService(jdbi, exploding, subBatchSize = 2, workers = workers)
+                    .runOnce("cl-worker-failure", batchSize = 2)
+            }
+                .describedAs("at %d worker(s) the cause must arrive as itself", workers)
+                .isInstanceOf(IllegalStateException::class.java)
+                .hasMessageContaining("object store is on fire")
+        }
+    }
+
+    @Test
+    fun `the ledger purge walks PAST an un-purgeable window, across catalogs`() {
+        // THE SHAPE THAT CAUSED THE 2026-09-28 OUTAGE, removed — and the
+        // second-order version of it, removed too. The purge used to be
+        // one `DELETE ... WHERE catalog_id = :c AND drained_at < cutoff`,
+        // which no index on this table can serve (both are partial on
+        // `drained_at IS NULL`, the complement of what it deletes), so it
+        // was a sequential scan with an unbounded row count against a
+        // ledger heading for ~137M rows.
+        //
+        // It now pages the PRIMARY KEY with no `catalog_id` — a per-catalog
+        // window would bound the rows DELETED without bounding the rows
+        // READ — and that global window is why a page with nothing to purge
+        // is SKIPPED rather than treated as the end of the walk: stopping
+        // there would park EVERY catalog's retention behind ONE catalog's
+        // un-purgeable rows (a tenant whose drain is wedged holds a block
+        // of undrained ids, and nothing in the deployment would purge
+        // again). What bounds the skipping is the wall budget.
+        //
+        // ITS OWN DATABASE, because the walk's stopping point is a
+        // property of the whole table and sharing this class's database
+        // would make the assertion depend on every other test's rows.
+        PgTestSupport.freshDatabase().use { own ->
+            fun catalog(name: String): Long =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        "INSERT INTO hog_catalog (name, data_path) VALUES (:n, 's3://$BUCKET/') " +
+                            "RETURNING catalog_id",
+                    ).bind("n", name).mapTo(Long::class.java).one()
+                }
+
+            val a = catalog("cl-purge-a")
+            val b = catalog("cl-purge-b")
+
+            fun insert(
+                catalogId: Long,
+                name: String,
+                drained: Boolean,
+            ) = own.jdbi.useHandleUnchecked { h ->
+                h.createUpdate(
+                    "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason, " +
+                        "drained_at, drained_outcome) VALUES (:c, :p, 'data', 'snapshot_expiry', " +
+                        "CASE WHEN :drained THEN now() - interval '40 days' END, " +
+                        "CASE WHEN :drained THEN 'deleted' END)",
+                )
+                    .bind("c", catalogId)
+                    .bind("p", "s3://$BUCKET/purge/$name")
+                    .bind("drained", drained)
+                    .execute()
+            }
+
+            fun remaining(): List<String> =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery("SELECT path FROM hog_file_removal ORDER BY removal_id")
+                        .mapTo(String::class.java)
+                        .list()
+                        .map { it.substringAfterLast('/') }
+                }
+
+            // Catalog A's expired rows, then a wedged tenant's block of
+            // UNDRAINED rows in the middle of the key, then catalog B's
+            // expired rows above them — and one of B's that is NOT expired.
+            (1..2).forEach { insert(a, "a-old$it", drained = true) }
+            (1..3).forEach { insert(b, "b-wedged$it", drained = false) }
+            (1..2).forEach { insert(b, "b-old$it", drained = true) }
+            own.jdbi.useHandleUnchecked { h ->
+                h.createUpdate(
+                    "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason, " +
+                        "drained_at, drained_outcome) VALUES (:c, :p, 'data', 'snapshot_expiry', " +
+                        "now(), 'deleted')",
+                ).bind("c", b).bind("p", "s3://$BUCKET/purge/b-fresh").execute()
+            }
+
+            // A page of ONE, so every un-purgeable row is a page that
+            // purges nothing: the walk has to skip three of them in a row
+            // to reach what is above.
+            CleanupService(own.jdbi, removals, ledgerPurgePage = 1)
+                .runOnce("cl-purge-a", batchSize = 100)
+
+            assertThat(remaining())
+                .describedAs(
+                    "the wedged rows survive (undrained), the FRESH drained row survives " +
+                        "(inside retention), and everything expired below AND ABOVE the wedge is " +
+                        "purged — the walk skipped the un-purgeable window instead of parking on it",
+                )
+                .containsExactly("b-wedged1", "b-wedged2", "b-wedged3", "b-fresh")
+
+            // AND THE SCOPE IS THE INSTANCE, not the catalog the run was
+            // for: this run was `cl-purge-a`, and catalog B's expired rows
+            // went with A's. That is the design (a per-catalog page bounds
+            // deletions and not work) and it is what the endpoint's
+            // OpenAPI description now tells an operator.
+            val survivorsByCatalog =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        "SELECT c.name, count(*) FROM hog_file_removal r " +
+                            "JOIN hog_catalog c USING (catalog_id) GROUP BY c.name ORDER BY c.name",
+                    ).map { rs, _ -> rs.getString(1) to rs.getLong(2) }.list()
+                }
+            assertThat(survivorsByCatalog)
+                .describedAs("a run for catalog A purged catalog B's expired ledger rows too")
+                .containsExactly("cl-purge-b" to 4L)
+        }
+    }
+
+    @Test
+    fun `a wedge wider than the cap stops the walk, a narrower one is walked past`() {
+        // THE CAP IS ABOUT DAY ONE, not about wedges. The cursor restarts
+        // at the bottom of the primary key every run, and on a queue that
+        // is behind, the bottom is the UNDRAINED backlog — 2.6M rows on
+        // gigahog-prod-us, ~2,600 pages with nothing to purge. Uncapped,
+        // the walk spends its whole wall budget on them EVERY run and
+        // never reaches a purgeable row; capped, it gives up after
+        // LEDGER_PURGE_EMPTY_PAGES and says so.
+        //
+        // What the cap must NOT cost is the wedge-skip the walk exists
+        // for, so both sides are asserted against the same fixture shape:
+        // a block of un-purgeable rows with purgeable rows above it, once
+        // wider than the cap and once narrower.
+        fun run(
+            wedge: Int,
+            label: String,
+        ): List<String> {
+            var remaining = listOf<String>()
+            PgTestSupport.freshDatabase().use { own ->
+                val catalogId =
+                    own.jdbi.withHandleUnchecked { h ->
+                        h.createQuery(
+                            "INSERT INTO hog_catalog (name, data_path) VALUES (:n, 's3://$BUCKET/') " +
+                                "RETURNING catalog_id",
+                        ).bind("n", label).mapTo(Long::class.java).one()
+                    }
+                own.jdbi.useHandleUnchecked { h ->
+                    // One purgeable row at the bottom so the walk starts,
+                    // then the wedge, then two purgeable rows above it.
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason,
+                                                      drained_at, drained_outcome)
+                        SELECT :c, 's3://$BUCKET/$label/below', 'data', 'snapshot_expiry',
+                               now() - interval '40 days', 'deleted'
+                        """,
+                    ).bind("c", catalogId).execute()
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                        SELECT :c, 's3://$BUCKET/$label/wedge' || g, 'data', 'snapshot_expiry'
+                        FROM generate_series(1, :n) g
+                        """,
+                    ).bind("c", catalogId).bind("n", wedge).execute()
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason,
+                                                      drained_at, drained_outcome)
+                        SELECT :c, 's3://$BUCKET/$label/above' || g, 'data', 'snapshot_expiry',
+                               now() - interval '40 days', 'deleted'
+                        FROM generate_series(1, 2) g
+                        """,
+                    ).bind("c", catalogId).execute()
+                }
+                // A page of one, so one un-purgeable row is one page with
+                // nothing to purge and the cap is reached at exactly
+                // LEDGER_PURGE_EMPTY_PAGES of them.
+                CleanupService(own.jdbi, removals, ledgerPurgePage = 1)
+                    .runOnce(label, batchSize = 100)
+                // THE ORDER THIS FIXTURE DEPENDS ON, asserted rather than
+                // assumed: the drain settles the wedge rows (their objects
+                // were never uploaded) and the purge runs AFTER it, so the
+                // wedge was un-purgeable *while the walk passed it* — it is
+                // drained now, but freshly, and inside retention.
+                assertThat(
+                    own.jdbi.withHandleUnchecked { h ->
+                        h.createQuery(
+                            "SELECT count(*) FROM hog_file_removal WHERE path LIKE '%/wedge%' " +
+                                "AND drained_at > now() - interval '1 hour'",
+                        ).mapTo(Int::class.java).one()
+                    },
+                )
+                    .describedAs("the drain settled the wedge, and the purge ran after it")
+                    .isEqualTo(wedge)
+                remaining =
+                    own.jdbi.withHandleUnchecked { h ->
+                        h.createQuery(
+                            "SELECT path FROM hog_file_removal WHERE drained_at < " +
+                                "now() - interval '30 days' ORDER BY removal_id",
+                        ).mapTo(String::class.java).list().map { it.substringAfterLast('/') }
+                    }
+            }
+            return remaining
+        }
+
+        // WIDER than the cap: the walk stops inside the wedge, so the
+        // expired rows above it survive this run.
+        assertThat(run(CleanupService.LEDGER_PURGE_EMPTY_PAGES + 1, "cl-wedge-wide"))
+            .describedAs(
+                "a wedge wider than the %d-page cap ends the walk; the rows above it are the " +
+                    "next run's work",
+                CleanupService.LEDGER_PURGE_EMPTY_PAGES,
+            )
+            .containsExactly("above1", "above2")
+
+        // NARROWER than the cap: the walk skips it and purges what is
+        // above, which is the property the cap must not cost.
+        assertThat(run(CleanupService.LEDGER_PURGE_EMPTY_PAGES - 1, "cl-wedge-narrow"))
+            .describedAs("a wedge inside the cap is walked past and everything expired goes")
+            .isEmpty()
+    }
+
+    @Test
+    fun `a purge that examined pages and deleted nothing reports itself at INFO`() {
+        // The state an operator has to be able to see. A walk that gave up
+        // on the cap and one that ran out of budget both look exactly like
+        // a purge with nothing to do — in the database and, at debug, in
+        // the log. This is the line that tells them apart, and the stop
+        // reason is in it.
+        PgTestSupport.freshDatabase().use { own ->
+            val catalogId =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        "INSERT INTO hog_catalog (name, data_path) VALUES ('cl-purge-info', " +
+                            "'s3://$BUCKET/') RETURNING catalog_id",
+                    ).mapTo(Long::class.java).one()
+                }
+            own.jdbi.useHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                    SELECT :c, 's3://$BUCKET/cl-purge-info/wedge' || g, 'data', 'snapshot_expiry'
+                    FROM generate_series(1, :n) g
+                    """,
+                )
+                    .bind("c", catalogId)
+                    .bind("n", CleanupService.LEDGER_PURGE_EMPTY_PAGES + 2)
+                    .execute()
+            }
+
+            val logged = java.util.concurrent.CopyOnWriteArrayList<String>()
+            withInfoCapture(logged) {
+                CleanupService(own.jdbi, removals, ledgerPurgePage = 1)
+                    .runOnce("cl-purge-info", batchSize = 100)
+            }
+            assertThat(logged)
+                .describedAs("the stop reason is reported, and it names the cap:%n%s", logged)
+                .anySatisfy {
+                    assertThat(it)
+                        .contains("purged 0 drained ledger rows")
+                        .contains("${CleanupService.LEDGER_PURGE_EMPTY_PAGES} consecutive pages")
+                }
+        }
+    }
+
+    @Test
+    fun `the purge stops on its wall budget rather than walking a whole ledger in one run`() {
+        // THE SECOND STOP CONDITION, which the page walk needs and nothing
+        // else asserts: a ledger with more eligible rows than one run
+        // should spend on is PACED, not walked to the end. Driven with a
+        // budget of zero — the honest way to make a wall clock observable
+        // without sleeping — so the loop stops before its first page and
+        // the rows survive; the same service with the default budget
+        // clears them.
+        PgTestSupport.freshDatabase().use { own ->
+            val catalogId =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        "INSERT INTO hog_catalog (name, data_path) " +
+                            "VALUES ('cl-purge-budget', 's3://$BUCKET/') RETURNING catalog_id",
+                    ).mapTo(Long::class.java).one()
+                }
+            own.jdbi.useHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason,
+                                                  drained_at, drained_outcome)
+                    SELECT :c, 's3://$BUCKET/cl-purge-budget/' || g, 'data', 'snapshot_expiry',
+                           now() - interval '40 days', 'deleted'
+                    FROM generate_series(1, 20) g
+                    """,
+                ).bind("c", catalogId).execute()
+            }
+
+            fun remaining(): Int =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery("SELECT count(*) FROM hog_file_removal").mapTo(Int::class.java).one()
+                }
+
+            // AND IT SAYS SO. A budget that is already spent before the
+            // first page IS a budget stop, and reporting it as one is the
+            // difference between "paced" and "silently did nothing" —
+            // which is the indistinguishability that made the 2026-09-28
+            // misdiagnosis slow. The earlier form only reported a stop
+            // after at least one page, so this exact case was invisible.
+            val logged = java.util.concurrent.CopyOnWriteArrayList<String>()
+            withDebugCapture(logged) {
+                CleanupService(own.jdbi, removals, ledgerPurgePage = 1, ledgerPurgeBudgetMs = 0)
+                    .runOnce("cl-purge-budget", batchSize = 100)
+            }
+            assertThat(remaining())
+                .describedAs("a spent budget stops the walk before it starts, and nothing is lost")
+                .isEqualTo(20)
+            assertThat(logged)
+                .describedAs("the stop is reported, not silent:%n%s", logged)
+                .anySatisfy { assertThat(it).contains("stopped on the 0ms budget") }
+
+            CleanupService(own.jdbi, removals, ledgerPurgePage = 1)
+                .runOnce("cl-purge-budget", batchSize = 100)
+            assertThat(remaining())
+                .describedAs("and the next run, with a real budget, clears them")
+                .isZero()
+        }
+    }
+
+    @Test
+    fun `the manual path on a loop-off pod runs one worker, whatever the knob says`() {
+        // THE CLAMP THE POOL REFUSAL RESTS ON. `POST /v1/maintenance/cleanup`
+        // runs this drain on whichever pod serves it, including pods whose
+        // loop is disabled — and `Config` prices a loop-off pod at exactly
+        // ONE worker, because pricing four would refuse every API replica
+        // in the fleet. Without the clamp, `HOGLAKE_CLEANUP_WORKERS=4` with
+        // the loop off boots and then takes four pooled connections the
+        // moment somebody curls the endpoint: the failure the refusal says
+        // it prevents, through a configuration it approved.
+        //
+        // The worker count is visible in the claims' `claimed_by` binding,
+        // which is `<prefix>#<index>` — so "one worker" is one distinct id.
+        val catalogId = seedCatalog("cl-clamp")
+        val paths = (1..12).map { "s3://$BUCKET/cl-clamp/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+
+        val offIssued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        CleanupService(
+            recordingJdbi(offIssued),
+            removals,
+            subBatchSize = 2,
+            workers = 4,
+            workerIdPrefix = "loopoff",
+            loopEnabled = false,
+        ).runOnce("cl-clamp", batchSize = 2)
+        assertThat(claimants(offIssued, "loopoff"))
+            .describedAs("a loop-off pod runs the one worker its Config priced:%n%s", offIssued)
+            .containsExactly("loopoff#0")
+
+        // With the loop ON the same four workers are what the refusal
+        // priced, and all four run.
+        val onIssued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        CleanupService(
+            recordingJdbi(onIssued),
+            removals,
+            subBatchSize = 2,
+            workers = 4,
+            workerIdPrefix = "loopon",
+            loopEnabled = true,
+        ).runOnce("cl-clamp", batchSize = 2)
+        assertThat(claimants(onIssued, "loopon"))
+            .describedAs("with the loop on, the configured count is the count that runs")
+            .hasSize(4)
+    }
+
+    @Test
+    fun `the production wiring clamps the manual path when the loop is off`() {
+        // THE WIRING ITSELF, which nothing pinned. The clamp is what makes
+        // `Config`'s pool refusal true — a loop-off pod draws the ONE
+        // connection the refusal priced, not `HOGLAKE_CLEANUP_WORKERS` of
+        // them — and until this test the predicate behind it
+        // (`cleanupIntervalMs > 0`) was spelled out at the `App.kt` call
+        // site, where `loopEnabled`'s default of `true` meant a later edit
+        // could write `loopEnabled = true` and leave the whole suite green
+        // while the refusal's argument stopped holding in the shipped
+        // binary. The derivation now lives in the service's own `Config`
+        // constructor, which is what App uses and what this builds.
+        val catalogId = seedCatalog("cl-wiring")
+        (1..12).forEach {
+            val p = "s3://$BUCKET/cl-wiring/f$it.parquet"
+            putObject(p)
+            queue(catalogId, p)
+        }
+
+        fun cfg(intervalMs: Long) =
+            com.posthog.hoglake.Config(
+                cleanupIntervalMs = intervalMs,
+                cleanupWorkers = 4,
+                cleanupSubBatchSize = 2,
+                cleanupStagingGraceSeconds = 0,
+            )
+
+        val offIssued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        CleanupService(recordingJdbi(offIssued), removals, cfg(intervalMs = 0))
+            .runOnce("cl-wiring", batchSize = 2)
+        assertThat(workerCount(offIssued))
+            .describedAs(
+                "a Config with the loop OFF must produce a service that runs ONE worker, " +
+                    "whatever HOGLAKE_CLEANUP_WORKERS says:%n%s",
+                offIssued,
+            )
+            .isEqualTo(1)
+
+        val onIssued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        CleanupService(recordingJdbi(onIssued), removals, cfg(intervalMs = 1_800_000))
+            .runOnce("cl-wiring", batchSize = 2)
+        assertThat(workerCount(onIssued))
+            .describedAs("and with the loop ON, the four workers the refusal priced")
+            .isEqualTo(4)
+    }
+
+    @Test
+    fun `an arm that comes back empty is not asked again for the rest of the run`() {
+        // EFFICIENCY, PINNED. The two arms share a worker's iterations, so
+        // an arm whose queue is empty used to be re-claimed once per
+        // iteration for as long as the OTHER arm kept finding work — up to
+        // `batchSize / subBatchSize` wasted round trips per worker per run
+        // (80 at the production defaults). Zeroing the empty arm's budget
+        // on its first empty claim is the fix, and the statement stream is
+        // the only place it is visible: the outcomes are identical either
+        // way.
+        val catalogId = seedCatalog("cl-empty-arm")
+        val paths = (1..60).map { "s3://$BUCKET/cl-empty-arm/f$it.parquet" }
+        paths.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+
+        val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val result =
+            CleanupService(recordingJdbi(issued), removals, subBatchSize = 10, stagingGraceSeconds = 0)
+                .runOnce("cl-empty-arm", batchSize = 60)
+
+        assertThat(result.removed).describedAs("the bulk arm did six sub-batches of work").isEqualTo(60)
+        val claims = issued.filter { it.contains("SET claimed_at = now()") }
+        assertThat(claims.count { it.contains("reason <> 'compaction_staging'") })
+            .describedAs("six bulk claims of ten:%n%s", claims.joinToString("\n---\n"))
+            .isEqualTo(6)
+        assertThat(claims.count { it.contains("reason = 'compaction_staging'") })
+            .describedAs(
+                "and the staging arm is asked ONCE — it came back empty, so the remaining five " +
+                    "iterations must not ask it again:%n%s",
+                claims.joinToString("\n---\n"),
+            )
+            .isEqualTo(1)
+    }
+
+    @Test
+    fun `a sweep over two catalogs walks the retention purge ONCE, not once per catalog`() {
+        // THE HOIST, pinned. The purge walks the removal table's primary
+        // key with no `catalog_id`, so it is instance-wide work: called
+        // per catalog it would pay N wall budgets to re-walk the same
+        // prefix of the key, which on a catalog-rich deployment is the
+        // whole budget spent N times on the same pages. The outcomes are
+        // identical either way — the rows that go, go — so the statement
+        // stream is the only place the saving is visible.
+        //
+        // Its own database, so the sweep sees exactly two catalogs.
+        PgTestSupport.freshDatabase().use { own ->
+            fun catalog(name: String): Long =
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        "INSERT INTO hog_catalog (name, data_path) VALUES (:n, 's3://$BUCKET/') " +
+                            "RETURNING catalog_id",
+                    ).bind("n", name).mapTo(Long::class.java).one()
+                }
+            val a = catalog("sweep-a")
+            val b = catalog("sweep-b")
+            // One expired ledger row per catalog, so the walk has work and
+            // the page count is small and predictable.
+            own.jdbi.useHandleUnchecked { h ->
+                for (c in listOf(a, b)) {
+                    h.createUpdate(
+                        "INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason, " +
+                            "drained_at, drained_outcome) VALUES (:c, :p, 'data', " +
+                            "'snapshot_expiry', now() - interval '40 days', 'deleted')",
+                    ).bind("c", c).bind("p", "s3://$BUCKET/sweep/$c").execute()
+                }
+            }
+
+            val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+            val results =
+                CleanupService(
+                    recordingJdbi(issued, own.dataSource),
+                    removals,
+                    ledgerPurgePage = 1_000,
+                ).runOnceAllCatalogs(batchSize = 100)
+
+            assertThat(results.map { it.first })
+                .describedAs("both catalogs were drained")
+                .containsExactlyInAnyOrder("sweep-a", "sweep-b")
+            // The walk over a two-row ledger is ONE page (both rows purge,
+            // the window is short, so it stops) — and exactly one walk, not
+            // one per catalog.
+            val pages = issued.filter { it.contains("WITH page AS") }
+            assertThat(pages)
+                .describedAs(
+                    "one purge walk for the whole sweep, not one per catalog:%n%s",
+                    pages.joinToString("\n---\n"),
+                )
+                .hasSize(1)
+            assertThat(
+                own.jdbi.withHandleUnchecked { h ->
+                    h.createQuery("SELECT count(*) FROM hog_file_removal").mapTo(Long::class.java).one()
+                },
+            )
+                .describedAs("and it purged both catalogs' expired rows, which is the point of one walk")
+                .isZero()
+        }
+    }
+
+    @Test
+    fun `a claim never mixes the two reasons, and a staging claim is capped at STAGING_SUB_BATCH`() {
+        // THE REASON-AWARE SPLIT, pinned behaviourally. The arithmetic for
+        // it lives in RemovalStoreBoundsTest, but an assertion over
+        // CONSTANTS cannot stop the two statements being merged back into
+        // the one whose worst case is 22x the lease — a merged claim would
+        // take 1,000 tickets under a single 900 s lease and still produce
+        // identical outcomes everywhere else in this class. What tells
+        // them apart is the STATEMENT STREAM: one claim per reason, and a
+        // staging claim that stops at 25 however large the sub-batch is.
+        val catalogId = seedCatalog("cl-arms")
+        (1..30).forEach {
+            val p = "s3://$BUCKET/cl-arms/bulk$it.parquet"
+            putObject(p)
+            queue(catalogId, p)
+        }
+        (1..30).forEach {
+            val p = "s3://$BUCKET/cl-arms/ticket$it.parquet"
+            putObject(p)
+            stagingTicket(catalogId, p)
+        }
+
+        // batch 30 per arm, sub-batch 1,000: the bulk arm takes its 30 in
+        // ONE claim (a merged claim would take all 60 in that one), and
+        // the staging arm needs TWO because its own statement stops at 25.
+        val issued = java.util.concurrent.CopyOnWriteArrayList<String>()
+        val result =
+            CleanupService(
+                recordingJdbi(issued),
+                removals,
+                subBatchSize = 1_000,
+                stagingGraceSeconds = 0,
+            ).runOnce("cl-arms", batchSize = 30)
+
+        assertThat(result.removed).describedAs("the whole queue drains").isEqualTo(60)
+        val claims = issued.filter { it.contains("SET claimed_at = now()") }
+        assertThat(claims)
+            .describedAs("the run must claim at all:%n%s", claims.joinToString("\n---\n"))
+            .isNotEmpty()
+        assertThat(claims)
+            .describedAs("every claim asks for ONE reason, because the lease bounds a CLAIM")
+            .allSatisfy {
+                assertThat(it).satisfiesAnyOf(
+                    { s -> assertThat(s).contains("reason <> 'compaction_staging'") },
+                    { s -> assertThat(s).contains("reason = 'compaction_staging'") },
+                )
+            }
+        // THE LOAD-BEARING COUNT: 30 tickets at 25 per claim is two
+        // staging claims. A merged claim would issue ONE statement for all
+        // 60 rows and red here.
+        assertThat(claims.count { it.contains("reason = 'compaction_staging'") })
+            .describedAs(
+                "%d tickets at %d per claim is two staging claims:%n%s",
+                30,
+                CleanupService.STAGING_SUB_BATCH,
+                claims.joinToString("\n---\n"),
+            )
+            .isEqualTo(2)
+        assertThat(claims.count { it.contains("reason <> 'compaction_staging'") })
+            .describedAs("and the bulk arm takes its 30 in one claim of up to %d", 1_000)
+            .isEqualTo(1)
+    }
+
+    @Test
+    fun `a bulk backlog bigger than the batch does not starve the staging tickets`() {
+        // THE STARVATION THE PER-ARM BUDGET REMOVES. With one budget
+        // shared by both arms and bulk going first, a catalog whose bulk
+        // queue exceeds the batch gave staging exactly one claim — 25 rows
+        // per worker per run — and with `batchSize <= subBatchSize` it gave
+        // them NOTHING, because the bulk arm spent the budget in the first
+        // iteration. On gigahog-prod-us that is ~9.4k orphaned tickets at
+        // 50/h: eight days, with /verify's `staging_tickets.leaked` arm
+        // (a 6 h bound) firing for every one of them the whole time.
+        //
+        // The fixture is that exact shape: a bulk queue larger than the
+        // batch, and more than one staging claim's worth of tickets behind
+        // it. Both budgets are spent in the same run.
+        val catalogId = seedCatalog("cl-starve")
+        val bulk = (1..40).map { "s3://$BUCKET/cl-starve/bulk$it.parquet" }
+        val tickets = (1..60).map { "s3://$BUCKET/cl-starve/ticket$it.parquet" }
+        bulk.forEach {
+            putObject(it)
+            queue(catalogId, it)
+        }
+        tickets.forEach {
+            putObject(it)
+            stagingTicket(catalogId, it)
+        }
+
+        // batch 30 < the 40-row bulk queue, sub-batch 10, grace 0: under a
+        // shared budget the bulk arm would take 30 and staging would get
+        // at most 25 — and on the second iteration, nothing.
+        val result =
+            CleanupService(jdbi, removals, subBatchSize = 10, stagingGraceSeconds = 0)
+                .runOnce("cl-starve", batchSize = 30)
+
+        assertThat(result.removed)
+            .describedAs("30 of each reason, not 30 between them")
+            .isEqualTo(60)
+        val drained = ledgerRows(catalogId).filter { it.drainedAt != null }.map { it.path }
+        assertThat(drained.count { it.contains("/ticket") })
+            .describedAs("the staging budget is the tickets' own, so the bulk backlog cannot spend it")
+            .isEqualTo(30)
+        assertThat(drained.count { it.contains("/bulk") }).isEqualTo(30)
+        assertThat(queuedPaths(catalogId))
+            .describedAs("and the remainder of both is the next run's")
+            .hasSize(40)
     }
 
     @Test
@@ -1111,6 +2331,55 @@ class CleanupServiceIntegrationTest {
         }
 
         fun lines(): List<String> = events.map { e -> e.argumentArray.orEmpty().joinToString(" ") { it.toString() } }
+    }
+
+    /**
+     * Capture the cleanup service's own app-log lines (not the audit
+     * stream) for the duration of [block], at INFO.
+     *
+     * Needed for the purge's stop reason, which has no other channel: a
+     * walk that gave up on the empty-page cap and one that ran out of
+     * budget both look exactly like a purge with nothing to do, in the
+     * database and in the counters.
+     */
+    private fun withInfoCapture(
+        sink: MutableList<String>,
+        block: () -> Unit,
+    ) = withCapture(sink, ch.qos.logback.classic.Level.INFO, block)
+
+    /** The same at DEBUG, for the lines an operator only gets on request. */
+    private fun withDebugCapture(
+        sink: MutableList<String>,
+        block: () -> Unit,
+    ) = withCapture(sink, ch.qos.logback.classic.Level.DEBUG, block)
+
+    private fun withCapture(
+        sink: MutableList<String>,
+        level: ch.qos.logback.classic.Level,
+        block: () -> Unit,
+    ) {
+        val logger =
+            org.slf4j.LoggerFactory.getLogger(CleanupService::class.java)
+                as ch.qos.logback.classic.Logger
+        val ctx = org.slf4j.LoggerFactory.getILoggerFactory() as ch.qos.logback.classic.LoggerContext
+        val appender =
+            object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
+                override fun append(event: ch.qos.logback.classic.spi.ILoggingEvent) {
+                    sink += event.formattedMessage
+                }
+            }
+        appender.context = ctx
+        appender.start()
+        val previous = logger.level
+        logger.level = level
+        logger.addAppender(appender)
+        try {
+            block()
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+            logger.level = previous
+        }
     }
 
     private fun <T> withAuditCapture(block: (AuditCapture) -> T): T {

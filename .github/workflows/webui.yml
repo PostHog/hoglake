@@ -7,12 +7,20 @@ on:
       - "webui/**"
       # The OpenAPI spec is the wire contract the console conforms to.
       - "server/src/main/resources/openapi/hoglake.yaml"
+      # Cross-language vectors the console's own tests read: partition
+      # decoding is implemented twice (server-side for the partitions
+      # listing's filter and sort, browser-side for the files tab), and
+      # the shared table is what keeps the two equal. A change to it
+      # must run BOTH suites, so it triggers this workflow as well as
+      # the server's.
+      - "server/src/test/resources/vectors/**"
       - ".github/workflows/webui.yml"
   pull_request:
     branches: [main]
     paths:
       - "webui/**"
       - "server/src/main/resources/openapi/hoglake.yaml"
+      - "server/src/test/resources/vectors/**"
       - ".github/workflows/webui.yml"
 
 permissions:

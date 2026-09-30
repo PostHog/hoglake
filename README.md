@@ -93,7 +93,7 @@ schema evolution, time travel, the changefeed and maintenance calls.
 | [server/](server/README.md) | The control plane: Kotlin, Ktor, JDBI, Flyway |
 | [server/trino/](server/trino/README.md) | Integration harness for the native Trino connector kept in [PostHog/trino](https://github.com/PostHog/trino/tree/master/plugin/trino-hoglake) |
 | [pyhoglake/](pyhoglake/README.md) | Python client; owns the parquet writer path |
-| [webui/](webui/README.md) | Management console: React, Vite, TypeScript |
+| [webui/](webui/README.md) | Management console: React, Vite, TypeScript. The table page's `partitions` tab reads the maintenance sampler's last published generation, so its numbers are a sample at the snapshot it names, never a live read |
 | [hedgerow/](hedgerow/README.md) | Replication daemon; append-only, single destination |
 | [duckdb-client/](duckdb-client/README.md) | DuckDB extension — reads, writes, DML, DDL and time travel over the REST contract |
 | [bench/](bench/README.md) | Benchmark harness behind the numbers below |

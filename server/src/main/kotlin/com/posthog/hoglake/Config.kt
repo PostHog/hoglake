@@ -66,7 +66,8 @@ data class Config(
      * `hoglake_background_loop_failures_total`, and retried on the next
      * interval, so it is a delay rather than a loss). There is no
      * arithmetic here that prevents it: `Config.FOREGROUND_CONNECTION_RESERVE`
-     * bounds COMPACTION's draw on the pool, not the foreground's. A
+     * bounds COMPACTION's and CLEANUP's draw on the pool, not the
+     * foreground's. A
      * workload that runs loops and serves traffic should set
      * `HOGLAKE_REQUEST_THREADS` below `HOGLAKE_DB_POOL_SIZE` by the
      * number of loops it runs.
@@ -173,26 +174,143 @@ data class Config(
     /** Queue entries drained per cleanup run, per catalog. */
     val cleanupBatchSize: Int = env("HOGLAKE_CLEANUP_BATCH", "2000").toInt(),
     /**
-     * Rows per drain sub-batch — one transaction, which holds the
-     * per-catalog commit lock across its reference check, its
-     * object-store calls and its settle.
+     * Rows per drain sub-batch, and therefore rows per CLAIM: the drain
+     * claims a sub-batch in one short transaction, works it with no
+     * transaction open, and settles it in another. It takes no catalog
+     * lock at any point.
      *
      * 1,000 is S3's own ceiling on ONE DeleteObjects request, so a
      * default sub-batch whose paths share a bucket is one round trip.
      * It was 25, sized for a drain that issued a HEAD and a DELETE per
-     * path: each hold ran ~3.2 s and a 2,000-row run spent ~255 s
-     * holding the lock, which took commit latency from 200-400 ms to
-     * 12-22 s and got both API pods liveness-killed (gigahog-prod-us,
-     * 2026-09-24).
+     * path UNDER THE COMMIT LOCK: each hold ran ~3.2 s and a 2,000-row
+     * run spent ~255 s holding the lock, which took commit latency from
+     * 200-400 ms to 12-22 s and got both API pods liveness-killed
+     * (gigahog-prod-us, 2026-09-24). The lock is gone — what remains is
+     * that keys past 1,000, or spread across buckets, chunk into more
+     * calls inside the same sub-batch, so raising this past the ceiling
+     * buys nothing.
      *
-     * What scales the hold is the number of CALLS, not this number:
-     * keys past 1,000, or spread across buckets, chunk into more calls
-     * inside the same hold, so raising this past the ceiling buys
-     * nothing. It does not apply to `compaction_staging` rows, which
-     * drain in their own sub-batches of 25 because they cost a HEAD and
-     * a DELETE each — see CleanupService.STAGING_SUB_BATCH.
+     * It does not apply to `compaction_staging` rows, which settle in
+     * their own sub-batches of 25 because they cost a HEAD and a DELETE
+     * each — see CleanupService.STAGING_SUB_BATCH — and a claim of
+     * nothing but tickets is the one shape that can approach
+     * HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS (~128 s at the measured 64 ms
+     * per round trip, against 900 s).
      */
     val cleanupSubBatchSize: Int = env("HOGLAKE_CLEANUP_SUB_BATCH", "1000").toInt(),
+    /**
+     * How long a cleanup worker's claim on a queue row is honoured
+     * before any worker may reclaim it. Default 900 s.
+     *
+     * A LEASE, not a lock. The drain claims rows in one short
+     * transaction (`claimed_at`/`claimed_by`, V21), commits it before
+     * the first object-store call, and settles in another — so a worker
+     * that dies in between leaves rows claimed, and this is how long
+     * they wait before somebody retries them. Wrong in either direction
+     * costs work and never an object: too short and two workers issue
+     * the same idempotent delete while the loser's settle is refused by
+     * the `claimed_by` fence (counted `settled_elsewhere`); too long and
+     * a killed pod's rows idle for a lease.
+     *
+     * CLEANUP'S ALONE. Compaction does NOT read it: its group commit
+     * refuses any staging ticket cleanup has touched at all
+     * (`claimed_at IS NULL AND attempts = 0`), because a LAPSED claim
+     * does not mean the object survived — it means nobody knows. So there
+     * is no number the two services have to agree about, and lengthening
+     * the lease cannot make compaction register a path a drain deleted.
+     */
+    val cleanupClaimLeaseSeconds: Long = env("HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS", "900").toLong(),
+    /**
+     * Parallel cleanup workers per run per catalog. Default **1 — the
+     * sequential drain this server has always run**, so a deployment
+     * that sets nothing changes in no way.
+     *
+     * Each worker runs its own claim -> work -> settle loop over its own
+     * sub-batches until the run's HOGLAKE_CLEANUP_BATCH is consumed or
+     * the queue is empty for the catalog. They need no coordination: the
+     * claim's `FOR UPDATE SKIP LOCKED` partitions the queue between
+     * workers, and between replicas, for free.
+     *
+     * THE CADENCE IS THE THREE KNOBS TOGETHER, and the arithmetic is
+     * worth doing before touching any of them. [cleanupBatchSize] is a
+     * budget PER WORKER AND PER REASON — bulk rows and
+     * `compaction_staging` tickets are claimed by separate statements and
+     * spend separate budgets, so the bulk backlog cannot starve the
+     * tickets — which makes the ceiling
+     * `HOGLAKE_CLEANUP_WORKERS x 2 x HOGLAKE_CLEANUP_BATCH` rows per run.
+     * The rate to size against is the bulk half, since staging tickets
+     * arrive at compaction's group rate rather than expiry's:
+     *
+     *     rows/h = workers x batch x 3600000 / HOGLAKE_CLEANUP_INTERVAL_MS
+     *
+     * At the compiled defaults (1 x 2,000 per 30 min) that is **4,000
+     * rows/h**, which is a deliberately conservative floor and nowhere
+     * near a busy catalog's arrivals (~190k/h on gigahog-prod-us, with a
+     * 2.6M-row backlog as of 2026-09-29). THE DEFAULTS DO NOT CLEAR A
+     * BACKLOG; the values that do live in the chart, not in this repo,
+     * and they are a pair — a batch large enough to keep the workers busy
+     * and an interval near a run's own duration. A run's duration is set
+     * by the reference check: 19 s cold and tens of ms warm per 1,000
+     * paths, measured on gigahog-prod-us, so 4 workers x 1,000 rows is
+     * ~20 s cold and the matching interval is ~30 s.
+     *
+     * A worker's rate is one sub-batch per (reference check + one
+     * DeleteObjects call), and those are independent per worker, so N
+     * workers is close to N times the rate until the database's random
+     * reads saturate — sub-linear past two or three on one RDS instance,
+     * which is the reason to raise this knob with a measurement rather
+     * than by analogy.
+     *
+     * A RUN'S DURATION IS THE LONGER OF THE TWO ARMS, and at the defaults
+     * that is the STAGING one, not bulk: 2,000 tickets at 25 per claim is
+     * 80 claims of 50 round trips, ~300 s at the measured 64 ms, against
+     * the bulk arm's 2 sub-batches of ~20 s cold. So an interval derived
+     * from the bulk arm alone under-counts a run that has tickets to
+     * drain; size the interval against whichever arm the catalog's queue
+     * actually holds (on a queue of ordinary expiry rows, bulk; while the
+     * ~9.4k orphaned tickets clear, staging).
+     *
+     * A WORKER IS A POOLED CONNECTION FOR THE LENGTH OF ITS REFERENCE
+     * CHECK, and that is what sizes the pool: the check is the 19 s
+     * statement this whole change exists to get OFF the commit lock, and
+     * it is held on a pooled handle for its whole duration. The claim and
+     * the settle are milliseconds; the check is not. That is why the boot
+     * refusal below is AGGREGATE with compaction's parallel groups — the
+     * two together must leave the foreground its reserve, because a
+     * writer that cannot get a CONNECTION fails with a Hikari timeout (a
+     * 500) instead of the typed, retryable CommitQueueTimeout (503 +
+     * Retry-After) the admission contract promises, with nothing in the
+     * 500 naming the knob.
+     *
+     * EACH LOOP IS PRICED WHERE IT RUNS. Both loops are per-workload —
+     * `BackgroundLoops.register` returns early at `intervalMs <= 0` — so
+     * the refusal prices `compactionParallelGroups` only when compaction's
+     * interval is non-zero and this knob only when cleanup's is. A pod
+     * that runs neither draws neither, and refusing it would refuse a draw
+     * that cannot happen there.
+     *
+     * THE ONE DELIBERATELY UNPRICED CONNECTION is the manual endpoint's.
+     * `POST /v1/maintenance/cleanup` runs this same drain on whichever pod
+     * serves it, including one whose loop is off, so the SERVICE CLAMPS
+     * that path to ONE worker (see `CleanupService`'s `loopEnabled`) and
+     * the arithmetic accepts that one connection rather than pricing four
+     * on every pod in the fleet. Per workload, why it is safe:
+     * **gigahog-server** pods run neither loop and are the only pods
+     * behind the ingress, so a manual POST lands where the priced draw is
+     * 0 and one connection is trivially available; the **maintenance**
+     * pods run compaction but serve no ingress, so a manual run reaches
+     * them only through a port-forward and then costs exactly one
+     * connection above the priced draw, which the clamp bounds.
+     *
+     * WHAT THE ROLLOUT STILL HAS TO DO: at the maintenance shape (pool 10,
+     * reserve 4, compaction on at 6 groups) the budget is exactly spent by
+     * compaction, so TURNING CLEANUP ON — even at one worker — needs
+     * `HOGLAKE_DB_POOL_SIZE` >= 11, and the four-worker drain-down needs
+     * >= 14, or `HOGLAKE_COMPACTION_PARALLEL_GROUPS` comes down for the
+     * duration. That is a chart change BEFORE the interval is set, and the
+     * boot refusal is what makes forgetting it loud.
+     */
+    val cleanupWorkers: Int = env("HOGLAKE_CLEANUP_WORKERS", "1").toInt(),
     /**
      * How long the drain leaves a fresh `compaction_staging` ticket
      * alone.
@@ -657,7 +775,8 @@ data class Config(
         // [FOREGROUND_CONNECTION_RESERVE] is a FLOOR, not a model of
         // demand, and the arithmetic below is only the part that can be
         // checked. What it guarantees is that raising
-        // HOGLAKE_COMPACTION_PARALLEL_GROUPS cannot by itself leave the
+        // HOGLAKE_COMPACTION_PARALLEL_GROUPS (or HOGLAKE_CLEANUP_WORKERS,
+        // which the same refusal covers) cannot by itself leave the
         // pool with nothing: four connections stay outside compaction's
         // reach. It does NOT promise four are enough — the other
         // background loops (hydrator, expiry, cleanup, verify, the
@@ -733,21 +852,97 @@ data class Config(
                 "after its 5s connectionTimeout instead of queueing in the dispatcher, where a " +
                 "wait is measured and shed with a typed 503. Raise HOGLAKE_DB_POOL_SIZE with it."
         }
-        require(compactionParallelGroups <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
-            "HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups needs a database pool " +
-                "of at least ${compactionParallelGroups + FOREGROUND_CONNECTION_RESERVE} " +
-                "(HOGLAKE_DB_POOL_SIZE is $dbPoolSize): each concurrent compaction group holds a " +
-                "pooled connection across its commit-lock wait, and leaving fewer than " +
-                "$FOREGROUND_CONNECTION_RESERVE for the foreground turns commit backpressure " +
-                "from a typed 503 into a connection-pool timeout"
+        require(cleanupWorkers >= 1) {
+            "HOGLAKE_CLEANUP_WORKERS=$cleanupWorkers must be at least 1 (1 is the sequential " +
+                "drain, and 0 would turn the loop into a no-op with nothing saying so — set " +
+                "HOGLAKE_CLEANUP_INTERVAL_MS=0 to turn cleanup off on purpose)"
+        }
+        // ONE CHECK, BOTH DRAWS, EACH PRICED ONLY WHERE ITS LOOP RUNS.
+        //
+        // One check, because the two knobs spend the same pool and two
+        // independent checks each passed while together they took all of
+        // it: at the maintenance shape (pool 10, reserve 4, groups 6)
+        // `compactionParallelGroups <= 6` and `cleanupWorkers <= 6` are
+        // both satisfied by 6 + 4 = 10 of 10 connections, and the first
+        // foreground commit gets a Hikari timeout and a 500 instead of the
+        // typed, retryable 503 the admission contract promises — the exact
+        // failure both checks said they existed to prevent.
+        //
+        // Per loop, because both are per-workload:
+        // `BackgroundLoops.register` returns early at `intervalMs <= 0`,
+        // so a pod with an interval of 0 starts no groups and no workers
+        // and has no draw to price. Pricing either one unconditionally
+        // refuses a draw that cannot happen on that pod, which is how an
+        // earlier version of this check would have crash-looped a whole
+        // fleet for a drain that was not running.
+        //
+        // NEITHER DRAW IS BRIEF where it exists: a compaction group holds
+        // a connection across its commit-lock wait, a cleanup worker holds
+        // one for its reference check (19 s cold per 1,000 paths on
+        // gigahog-prod-us — see [cleanupWorkers]). The reserve is a FLOOR,
+        // not a model of demand: what this refusal guarantees is only that
+        // raising either knob cannot by itself leave the foreground
+        // nothing. The consequence is a ROLLOUT CONSTRAINT rather than a
+        // default change — at the maintenance shape compaction alone
+        // spends the budget, so turning cleanup on needs the pool raised
+        // (or compaction's parallelism lowered) in the chart first, and a
+        // boot failure naming both knobs is the right place to learn it.
+        //
+        // The manual endpoint's one clamped worker is the single
+        // deliberately unpriced connection in the arithmetic.
+        //
+        // WHY THE UNPRICED CONNECTION IS SAFE, per workload, because the
+        // answer differs: gigahog-server pods run NEITHER loop (both
+        // intervals are 0) and are the only pods behind the ingress, so a
+        // manual `POST /v1/maintenance/cleanup` lands where the priced
+        // draw is 0 and one connection is trivially available. The
+        // maintenance pods run compaction but serve no ingress, so a
+        // manual run reaches them only through a port-forward, and then
+        // costs exactly ONE connection above the priced draw — which is
+        // what `CleanupService`'s clamp to a single worker bounds.
+        val compactionDraw = if (compactionIntervalMs > 0) compactionParallelGroups else 0
+        val cleanupDraw = if (cleanupIntervalMs > 0) cleanupWorkers else 0
+        val loopState =
+            if (cleanupIntervalMs > 0) {
+                "the cleanup loop is ON, HOGLAKE_CLEANUP_INTERVAL_MS=$cleanupIntervalMs"
+            } else {
+                "the cleanup loop is OFF (HOGLAKE_CLEANUP_INTERVAL_MS=$cleanupIntervalMs), so its " +
+                    "draw is not priced here: POST /v1/maintenance/cleanup still runs the drain on " +
+                    "whichever pod serves it, clamped to ONE worker, and that single connection is " +
+                    "the one deliberately unpriced draw — free on a server pod (no loops, so the " +
+                    "priced draw is 0) and one above the priced draw on a maintenance pod, which " +
+                    "serves no ingress and is reachable only by port-forward"
+            }
+        require(compactionDraw + cleanupDraw <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
+            "a compaction draw of $compactionDraw " +
+                "(HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups, " +
+                "HOGLAKE_COMPACTION_INTERVAL_MS=$compactionIntervalMs) plus a cleanup draw of " +
+                "$cleanupDraw ($loopState; HOGLAKE_CLEANUP_WORKERS=$cleanupWorkers) needs a " +
+                "database pool of at least " +
+                "${compactionDraw + cleanupDraw + FOREGROUND_CONNECTION_RESERVE} " +
+                "(HOGLAKE_DB_POOL_SIZE is $dbPoolSize): a compaction group holds a pooled " +
+                "connection across its commit-lock wait and a cleanup worker holds one across its " +
+                "reference check (19 s cold per 1,000 paths on gigahog-prod-us), so the two draw " +
+                "on the same pool at the same time. Leaving fewer than " +
+                "$FOREGROUND_CONNECTION_RESERVE connections for the foreground turns commit " +
+                "backpressure from a typed 503 into a connection-pool timeout. Raise " +
+                "HOGLAKE_DB_POOL_SIZE, or lower HOGLAKE_COMPACTION_PARALLEL_GROUPS"
+        }
+        require(cleanupClaimLeaseSeconds > 0) {
+            "HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS=$cleanupClaimLeaseSeconds must be positive: a " +
+                "lease of 0 makes every claim immediately reclaimable, so two workers would " +
+                "drain the same row by construction (the default is " +
+                "${com.posthog.hoglake.service.CleanupService.CLAIM_LEASE_SECONDS})"
         }
     }
 
     companion object {
         /**
-         * Pooled connections HOGLAKE_COMPACTION_PARALLEL_GROUPS must
-         * leave for everything else. See the `require` above: a floor,
-         * not a model of demand.
+         * Pooled connections the background loops that hold one for a
+         * long statement — HOGLAKE_COMPACTION_PARALLEL_GROUPS and
+         * HOGLAKE_CLEANUP_WORKERS, checked TOGETHER — must leave for
+         * everything else. See the `require` above: a floor, not a model
+         * of demand.
          */
         const val FOREGROUND_CONNECTION_RESERVE = 4
 

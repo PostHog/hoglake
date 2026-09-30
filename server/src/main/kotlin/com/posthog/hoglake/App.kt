@@ -7,6 +7,7 @@ import com.posthog.hoglake.api.installBlockingDispatch
 import com.posthog.hoglake.api.installDebugRoutes
 import com.posthog.hoglake.api.installErrorMapping
 import com.posthog.hoglake.api.installMaintenanceRoutes
+import com.posthog.hoglake.api.installPartitionListingRoutes
 import com.posthog.hoglake.api.installPartitionStatsRoutes
 import com.posthog.hoglake.api.installPublicationRoutes
 import com.posthog.hoglake.api.installScanRoutes
@@ -32,6 +33,7 @@ import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
+import com.posthog.hoglake.service.PartitionListingService
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
@@ -107,16 +109,30 @@ class App private constructor(
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
         )
-    private val removalStore = RemovalStore(cfg)
-    private val cleanupService =
-        CleanupService(
+
+    /**
+     * The per-table partitions tab, over the same published sample and
+     * the same policy the debt ranking uses — a sample computed under a
+     * different compaction policy is unusable for both.
+     */
+    private val partitionListingService =
+        PartitionListingService(
             jdbi,
-            removalStore,
-            subBatchSize = cfg.cleanupSubBatchSize,
-            ledgerRetentionSeconds = cfg.removalLedgerRetentionSeconds,
-            maintenanceLedgerRetentionSeconds = cfg.maintenanceLedgerRetentionSeconds,
-            stagingGraceSeconds = cfg.cleanupStagingGraceSeconds,
+            smallFileThresholdBytes = cfg.compactionTargetBytes,
+            minInputFiles = cfg.compactionMinInputFiles,
+            maxInputFiles = cfg.compactionMaxInputFiles,
         )
+    private val removalStore = RemovalStore(cfg)
+
+    /**
+     * Every cleanup knob comes from `CleanupService`'s own `Config`
+     * constructor rather than being spelled out here, because one of the
+     * derivations is load-bearing: the clamp that makes `Config`'s pool
+     * refusal true (one worker when the loop is off) has to key on the
+     * same predicate the refusal prices on, and stating it at this call
+     * site is how the two could quietly diverge.
+     */
+    private val cleanupService = CleanupService(jdbi, removalStore, cfg)
 
     /**
      * Paced retirement of dropped tables' file rows — the other half of
@@ -317,6 +333,7 @@ class App private constructor(
             DatabaseHealthService(jdbi),
         )
         app.installPartitionStatsRoutes(partitionStatsService)
+        app.installPartitionListingRoutes(partitionListingService)
         app.installPublicationRoutes()
         app.installDebugRoutes()
     }

@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { decodePartition, decodeValue } from "../src/lib/partitions";
 import type { Column, DataFile, PartitionSpec } from "../src/api/types";
@@ -9,6 +11,22 @@ import type { Column, DataFile, PartitionSpec } from "../src/api/types";
  * These cases pin the arithmetic against the writer's own definitions
  * (pyhoglake/transforms.py) and the refusals against the cases where the
  * page does not hold enough information to decode honestly.
+ *
+ * THE decodeValue CASES ARE NOT BELOW — they are in
+ * `server/src/test/resources/vectors/partition_decode_vectors.json`,
+ * read by this file and by
+ * `server/src/test/kotlin/com/posthog/hoglake/model/PartitionValueDecodingTest.kt`,
+ * both of which pin its `count`. There are two implementations of one
+ * rule because the partitions tab's `filter=` and its default sort are
+ * decoded SERVER-side (they happen before paging) while the files tab
+ * decodes in the browser; the one file is what keeps them equal, and
+ * `.github/workflows/webui.yml` triggers this suite on a change to it.
+ * Add a case to the JSON, not to either test.
+ *
+ * ONE DELIBERATE DIFFERENCE: a null stored value renders as the literal
+ * "null" here, because a table cell has to show something, and comes
+ * back as a real null from the server, because the listing sorts nulls
+ * first and matches them with an empty filter.
  */
 
 const columns: Column[] = [
@@ -40,60 +58,52 @@ function file(over: Partial<DataFile> = {}): DataFile {
   };
 }
 
-describe("transform decoding", () => {
-  it("month is months since 1970-01, matching the writer", () => {
-    // The value from the screenshot that prompted this: 675 reads as a
-    // number and means April 2026.
-    expect(decodeValue("month", "675")).toBe("2026-04");
-    expect(decodeValue("month", "0")).toBe("1970-01");
-    expect(decodeValue("month", "11")).toBe("1970-12");
-    expect(decodeValue("month", "12")).toBe("1971-01");
+/**
+ * THE SHARED TABLE, parsed rather than restated. The same file drives
+ * `server/src/test/kotlin/com/posthog/hoglake/model/PartitionValueDecodingTest.kt`,
+ * and both sides pin `count`, so a vector added to the file and to only
+ * one side's expectations cannot pass unnoticed.
+ */
+const VECTORS: {
+  count: number;
+  vectors: {
+    transform: string;
+    raw: string;
+    transform_param?: number;
+    expected: string;
+  }[];
+} = JSON.parse(
+  // Resolved from the vitest root (`webui/`), not from import.meta.url:
+  // vitest serves transformed modules over a non-file URL, so
+  // `new URL(..., import.meta.url)` is not a path here.
+  readFileSync(
+    resolve(
+      process.cwd(),
+      "../server/src/test/resources/vectors/partition_decode_vectors.json",
+    ),
+    "utf8",
+  ),
+);
+
+describe("transform decoding, against the shared vectors", () => {
+  it("the vector file's count matches its contents", () => {
+    expect(VECTORS.vectors).toHaveLength(VECTORS.count);
   });
 
-  it("month floors below the epoch instead of producing month 0 or -1", () => {
-    // Negative ordinals are legal (the writer floors), and naive
-    // arithmetic yields "1970--1" or month 0 here.
-    expect(decodeValue("month", "-1")).toBe("1969-12");
-    expect(decodeValue("month", "-12")).toBe("1969-01");
-    expect(decodeValue("month", "-13")).toBe("1968-12");
-  });
+  it.each(VECTORS.vectors)(
+    "$transform($raw) = $expected",
+    ({ transform, raw, transform_param, expected }) => {
+      expect(decodeValue(transform, raw, transform_param)).toBe(expected);
+    },
+  );
 
-  it("year is the calendar year, not an offset", () => {
-    expect(decodeValue("year", "56")).toBe("2026");
-    expect(decodeValue("year", "0")).toBe("1970");
-    expect(decodeValue("year", "-1")).toBe("1969");
-  });
-
-  it("day and hour are epoch-relative", () => {
-    expect(decodeValue("day", "0")).toBe("1970-01-01");
-    expect(decodeValue("day", "20713")).toBe("2026-09-17");
-    expect(decodeValue("day", "-1")).toBe("1969-12-31");
-    expect(decodeValue("hour", "0")).toBe("1970-01-01T00");
-    expect(decodeValue("hour", "25")).toBe("1970-01-02T01");
-  });
-
-  it("bucket says it is a bucket index, not a value", () => {
-    // Rendered bare, "3" reads as data rather than as a hash bucket.
-    expect(decodeValue("bucket", "3", 16)).toBe("bucket 3/16");
-    expect(decodeValue("bucket", "3")).toBe("bucket 3");
-  });
-
-  it("identity and unknown transforms pass the value through", () => {
-    expect(decodeValue("identity", "42")).toBe("42");
-    // A transform a newer server added: the stored value is still the
-    // best answer available, and inventing one would be worse.
-    expect(decodeValue("truncate", "abc")).toBe("abc");
-  });
-
-  it("nulls and unusable values degrade to what was stored", () => {
+  it("renders a null stored value as the literal 'null'", () => {
+    // The one deliberate divergence from the server, which returns a
+    // real null so the listing can sort nulls first and match them
+    // with an empty filter. A table cell has to show something.
     expect(decodeValue("month", null)).toBe("null");
     expect(decodeValue("identity", null)).toBe("null");
-    // A non-numeric ordinal must not become a date; showing the raw
-    // string is the honest failure.
-    expect(decodeValue("month", "not-a-number")).toBe("not-a-number");
-    // Beyond Number.MAX_SAFE_INTEGER the arithmetic would silently lose
-    // precision, so it is refused too.
-    expect(decodeValue("day", "9007199254740993")).toBe("9007199254740993");
+    expect(decodeValue("bucket", null, 16)).toBe("null");
   });
 });
 

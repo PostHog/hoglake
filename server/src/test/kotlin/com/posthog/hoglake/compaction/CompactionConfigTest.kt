@@ -847,18 +847,46 @@ class CompactionConfigTest {
         // CommitQueueTimeout (503 + Retry-After) the admission contract
         // promises, with nothing in the 500 naming the knob that caused
         // it. Refused where an operator is already reading logs.
+        // THE BUDGET IS SHARED WITH CLEANUP'S WORKERS, AND EACH DRAW IS
+        // PRICED ONLY WHERE ITS LOOP RUNS. A cleanup worker holds a pooled
+        // connection across its reference check (19 s cold per 1,000
+        // paths), so the refusal is
+        // `compactionDraw + cleanupDraw <= pool - reserve` — with each
+        // draw zeroed when its own interval is 0, because
+        // `BackgroundLoops` starts no loop there. So this fixture has to
+        // TURN BOTH LOOPS ON to mean what it says: with the compiled
+        // defaults (compaction interval 0) the compaction draw is zero and
+        // every case below would assert nothing. It is not edited around
+        // the guard; it states the workload it is talking about, the way a
+        // values file has to.
         val pool = Config().dbPoolSize
         val reserve = Config.FOREGROUND_CONNECTION_RESERVE
-        assertThatThrownBy { Config(compactionParallelGroups = pool - reserve + 1) }
+        val workers = Config().cleanupWorkers
+        val budget = pool - reserve - workers
+        val loopsOn: (Int, Int) -> Config = { groups, size ->
+            Config(
+                compactionParallelGroups = groups,
+                compactionIntervalMs = 3_600_000,
+                cleanupWorkers = workers,
+                cleanupIntervalMs = 1_800_000,
+                dbPoolSize = size,
+                requestThreads = size,
+            )
+        }
+        assertThatThrownBy { loopsOn(budget + 1, pool) }
             .isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_COMPACTION_PARALLEL_GROUPS")
+            .hasMessageContaining("HOGLAKE_CLEANUP_WORKERS")
             .hasMessageContaining("HOGLAKE_DB_POOL_SIZE")
         // Exactly at the line is legal, and so is raising the pool with
         // the knob.
-        Config(compactionParallelGroups = pool - reserve)
-        Config(compactionParallelGroups = 32, dbPoolSize = 32 + reserve)
-        assertThatThrownBy { Config(compactionParallelGroups = 32, dbPoolSize = 32 + reserve - 1) }
+        loopsOn(budget, pool)
+        loopsOn(32, 32 + reserve + workers)
+        assertThatThrownBy { loopsOn(32, 32 + reserve + workers - 1) }
             .isInstanceOf(IllegalArgumentException::class.java)
+        // And with compaction's own loop OFF the same group count draws
+        // nothing, which is the per-loop half of the check.
+        Config(compactionParallelGroups = budget + 1, compactionIntervalMs = 0)
     }
 
     @Test

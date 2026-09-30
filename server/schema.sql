@@ -548,7 +548,21 @@ CREATE TABLE hog_file_removal (
     -- Outcome and timestamp travel together.
     drained_at      timestamptz,
     drained_outcome text CHECK (drained_outcome IN ('deleted', 'absent', 'registered')),
-    CHECK ((drained_at IS NULL) = (drained_outcome IS NULL))
+    CHECK ((drained_at IS NULL) = (drained_outcome IS NULL)),
+    -- The CLAIM (V21). The drain is a claimed work queue and takes no
+    -- catalog lock at all: a worker claims rows in one short transaction
+    -- (UPDATE ... WHERE removal_id IN (SELECT ... FOR UPDATE SKIP
+    -- LOCKED)), commits it BEFORE any object-store call, and settles in
+    -- another. claimed_at is a LEASE — past
+    -- HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS (900) another worker may
+    -- reclaim the row, so a killed worker costs one lease and not a
+    -- stuck row — and claimed_by is the FENCE every ledger write
+    -- carries (`AND claimed_by = :worker`), so a lapsed worker cannot
+    -- stamp its outcome over the one that took the row from it.
+    -- CompactionService's group commit reads this row FOR UPDATE and
+    -- treats an unexpired claim as somebody else's work.
+    claimed_at      timestamptz,
+    claimed_by      text
 );
 CREATE INDEX hog_file_removal_drain
     ON hog_file_removal (catalog_id, removal_id)
@@ -622,6 +636,13 @@ CREATE TABLE hog_maintenance_summary (
     sample jsonb,
     scan_state jsonb,
     next_batch_at timestamptz NOT NULL DEFAULT now(),
+    -- The last generation PUBLISHED by a sampler that knows about the
+    -- tier table's record_count / newest_begin_snapshot columns (V22);
+    -- -1 = none. Stamped by the publish statement from a flag the scan
+    -- carries in scan_state, so a generation an older replica began
+    -- publishes without setting it. The partitions listing reports
+    -- those two measures only when this equals published_generation.
+    measures_generation bigint NOT NULL DEFAULT -1,
     CHECK ((sampled_at IS NULL) = (sample IS NULL))
 );
 CREATE INDEX hog_maintenance_summary_due
@@ -646,8 +667,19 @@ CREATE TABLE hog_maintenance_summary_tier (
     total_bytes bigint NOT NULL DEFAULT 0,
     small_bytes bigint NOT NULL DEFAULT 0,
     dv_count bigint NOT NULL DEFAULT 0,
+    -- Rows in the bucket, and when it was last written (V22). A row
+    -- written before V22 carries 0 / NULL, which the partitions listing
+    -- reports as "not sampled" rather than as zero -- the null
+    -- newest_begin_snapshot beside a positive file_count is what tells
+    -- the two apart.
+    record_count bigint NOT NULL DEFAULT 0,
+    newest_begin_snapshot bigint,
     PRIMARY KEY (catalog_id, generation, bucket_key)
 );
+-- The per-table partitions listing filters (catalog, generation, table);
+-- the primary key's bucket_key is a hash and carries no table locality.
+CREATE INDEX hog_maintenance_summary_tier_table
+    ON hog_maintenance_summary_tier (catalog_id, generation, table_id);
 CREATE INDEX hog_data_file_maintenance_scan
     ON hog_data_file (catalog_id, table_id, row_id_start, data_file_id);
 -- The maintenance summary scan walks each bucket smallest-file-first,

@@ -64,6 +64,22 @@ class MaintenanceSummarySampler(
         val targetBytes: Long,
         val minInputFiles: Int,
         val maxInputFiles: Int,
+        /**
+         * Whether THIS scan's accumulators measure `record_count` and
+         * `newest_begin_snapshot` (V22). Carried in the checkpoint so
+         * the PUBLISH can stamp it, rather than being written when the
+         * generation begins: a marker that named the generation being
+         * SCANNED would disagree with `published_generation` for the
+         * whole of every scan, which on a 30-minute production
+         * generation is ~97% of wall-clock time with the two measures
+         * reported as "not measured".
+         *
+         * Defaults false so a checkpoint written by a pre-V22 build and
+         * resumed here is treated as unmeasured — the deploy straddle
+         * V22's header describes. `begin()` constructs it true, so
+         * every scan this build starts publishes measured.
+         */
+        val measures: Boolean = false,
         var table: Long = 0,
         var size: Long = -1,
         var file: Long = 0,
@@ -87,6 +103,10 @@ class MaintenanceSummarySampler(
         val spec: Long?,
         val values: List<String?>?,
         val hasDv: Boolean,
+        /** Rows in the file, summed per bucket for the partitions listing. */
+        val rows: Long,
+        /** The file's begin snapshot; the bucket keeps the newest. */
+        val begin: Long,
     )
 
     private data class Pool(
@@ -104,6 +124,14 @@ class MaintenanceSummarySampler(
         var bytes: Long = 0,
         var smallBytes: Long = 0,
         var dvs: Long = 0,
+        /** Rows in the bucket's live files (V22). */
+        var rows: Long = 0,
+        /**
+         * max(begin_snapshot) over them, null while the bucket has seen
+         * no file — which is also every row a pre-V22 sampler wrote, and
+         * what the listing reads "not sampled yet" off.
+         */
+        var newest: Long? = null,
     )
 
     /** Share a tick's row budget across at most ten catalogs/checkpoints. */
@@ -239,6 +267,7 @@ class MaintenanceSummarySampler(
                     h.createQuery(
                         """
                     SELECT f.table_id, f.data_file_id, f.file_size_bytes, f.stats_state, f.spec_id,
+                           f.record_count, f.begin_snapshot,
                            EXISTS (SELECT 1 FROM hog_delete_file dv WHERE dv.catalog_id = f.catalog_id
                              AND dv.data_file_id = f.data_file_id AND dv.begin_snapshot <= :snapshot
                              AND (dv.end_snapshot IS NULL OR :snapshot < dv.end_snapshot)) AS has_dv,
@@ -271,6 +300,8 @@ class MaintenanceSummarySampler(
                                     )?.array as? Array<*>
                                 )?.map { it as String? },
                                 rs.getBoolean("has_dv"),
+                                rs.getLong("record_count"),
+                                rs.getLong("begin_snapshot"),
                             )
                         }.list()
                 // THE PAGE'S FIRST ROW DECIDES. If it belongs to a
@@ -342,10 +373,24 @@ class MaintenanceSummarySampler(
                         """
                         UPDATE hog_maintenance_summary SET generation = :generation, published_generation = :generation,
                             sampled_at = now(), sample = CAST(:sample AS jsonb), scan_state = NULL,
-                            next_batch_at = now() + make_interval(secs => :refresh)
+                            next_batch_at = now() + make_interval(secs => :refresh),
+                            -- STAMPED AT PUBLISH, from the scan's own
+                            -- flag, so `measures_generation` names the
+                            -- last generation PUBLISHED with the V22
+                            -- measures. A marker written when a
+                            -- generation BEGINS names a generation
+                            -- nobody can read yet and disagrees with
+                            -- published_generation for the whole scan.
+                            -- Left untouched when the scan does not
+                            -- measure (a checkpoint resumed from a
+                            -- pre-V22 build), which is what keeps the
+                            -- deploy straddle unreported.
+                            measures_generation =
+                                CASE WHEN :measured THEN :generation ELSE measures_generation END
                         WHERE catalog_id = :id
                         """,
                     ).bind("generation", generation).bind("sample", json.writeValueAsString(sample))
+                        .bind("measured", scan.measures)
                         .bind("refresh", refreshSeconds).bind("id", job.catalogId).execute()
                 } else {
                     checkpoint(h, job.catalogId, generation, scan)
@@ -379,7 +424,7 @@ class MaintenanceSummarySampler(
             ).bind("id", catalogId).mapTo(Long::class.javaObjectType).findOne().orElse(0L)
         return Scan(
             snapshot, Instant.now(), upper.first, upper.second, upper.third, removal,
-            target, minInputFiles, maxInputFiles,
+            target, minInputFiles, maxInputFiles, measures = true,
         )
     }
 
@@ -458,6 +503,13 @@ class MaintenanceSummarySampler(
                             rs.getLong("pending_max_bytes"),
                             rs.getLong("file_count"), rs.getLong("small_count"), rs.getLong("total_bytes"),
                             rs.getLong("small_bytes"), rs.getLong("dv_count"),
+                            rs.getLong("record_count"),
+                            // A pre-V22 row resumed mid-scan reads back
+                            // 0 / NULL: the ADD COLUMN defaults ARE the
+                            // backward-compatible start, so a generation
+                            // straddling the deploy accumulates from
+                            // there rather than losing its checkpoint.
+                            rs.getObject("newest_begin_snapshot")?.let { (it as Number).toLong() },
                         )
                 }
                 .list().toMap().toMutableMap()
@@ -465,6 +517,8 @@ class MaintenanceSummarySampler(
             val pool = pools.getOrPut(key) { Pool(f.table, f.spec, f.values, quota, maxOf(1, quota), 0) }
             pool.files++
             pool.bytes = satAdd(pool.bytes, f.size)
+            pool.rows = satAdd(pool.rows, f.rows)
+            pool.newest = maxOf(pool.newest ?: f.begin, f.begin)
             if (f.hasDv) pool.dvs++
             if (f.size < target) {
                 pool.small++
@@ -521,17 +575,21 @@ class MaintenanceSummarySampler(
                 """
             INSERT INTO hog_maintenance_summary_tier
                 (catalog_id, generation, bucket_key, table_id, spec_id, partition_values, quota, remaining, pending,
-                 selected, pending_max_bytes, file_count, small_count, total_bytes, small_bytes, dv_count)
+                 selected, pending_max_bytes, file_count, small_count, total_bytes, small_bytes, dv_count,
+                 record_count, newest_begin_snapshot)
             VALUES (:id, :generation, :key, :table, :spec,
                     CASE WHEN :vals::jsonb = 'null'::jsonb THEN NULL
                          ELSE ARRAY(SELECT jsonb_array_elements_text(:vals::jsonb)) END,
                     :quota, :remaining, :pending,
-                    :selected, :pendingMax, :files, :small, :bytes, :smallBytes, :dvs)
+                    :selected, :pendingMax, :files, :small, :bytes, :smallBytes, :dvs,
+                    :rows, :newest)
             ON CONFLICT (catalog_id, generation, bucket_key) DO UPDATE
             SET remaining = excluded.remaining, pending = excluded.pending, selected = excluded.selected,
                 pending_max_bytes = excluded.pending_max_bytes,
                 file_count = excluded.file_count, small_count = excluded.small_count, total_bytes = excluded.total_bytes,
-                small_bytes = excluded.small_bytes, dv_count = excluded.dv_count
+                small_bytes = excluded.small_bytes, dv_count = excluded.dv_count,
+                record_count = excluded.record_count,
+                newest_begin_snapshot = excluded.newest_begin_snapshot
             """,
             )
         for ((key, pool) in pools) {
@@ -541,7 +599,9 @@ class MaintenanceSummarySampler(
                 .bind("remaining", pool.remaining).bind("pending", pool.pending).bind("selected", pool.selected)
                 .bind("pendingMax", pool.pendingMax)
                 .bind("files", pool.files).bind("small", pool.small).bind("bytes", pool.bytes)
-                .bind("smallBytes", pool.smallBytes).bind("dvs", pool.dvs).add()
+                .bind("smallBytes", pool.smallBytes).bind("dvs", pool.dvs)
+                .bind("rows", pool.rows)
+                .bindBySqlType("newest", pool.newest, java.sql.Types.BIGINT).add()
         }
         batch.execute()
     }

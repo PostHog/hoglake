@@ -4,6 +4,8 @@ import {
   formatBytes,
   formatCompactCount,
   formatCount,
+  formatRelativeAge,
+  ageParts,
 } from "../src/lib/format";
 import { identifierError } from "../src/lib/names";
 
@@ -148,5 +150,116 @@ describe("formatAge", () => {
     expect(formatAge(undefined)).toBe("—");
     expect(formatAge(null)).toBe("—");
     expect(formatAge("not-a-date")).toBe("—");
+  });
+});
+
+// The snapshot tooltip's second line. Same LADDER as formatAge (shared
+// `ageParts`), different words — see the agreement test at the end.
+describe("formatRelativeAge", () => {
+  const NOW = new Date("2026-09-29T22:34:07Z");
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const ago = (ms: number) => new Date(NOW.getTime() - ms).toISOString();
+  const S = 1000;
+  const MIN = 60 * S;
+  const H = 60 * MIN;
+  const D = 24 * H;
+
+  it("walks the ladder in words", () => {
+    const cases: [number, string][] = [
+      [0, "just now"],
+      [44 * S, "just now"],
+      // The seconds bucket runs to the ladder's 120s switch, and all of it
+      // reads "just now": a snapshot committed a minute ago has, in the
+      // only sense a reader cares about, just happened.
+      [119 * S, "just now"],
+      [120 * S, "2 min ago"],
+      [3 * MIN, "3 min ago"],
+      [119 * MIN, "119 min ago"],
+      [120 * MIN, "2 hours ago"],
+      [2 * H + 30 * MIN, "3 hours ago"], // rounded, like formatAge
+      [47 * H, "47 hours ago"],
+      [48 * H, "2 days ago"],
+      [3 * D + 5 * H, "3 days ago"],
+      [400 * D, "400 days ago"],
+    ];
+    for (const [elapsed, want] of cases) {
+      expect(formatRelativeAge(ago(elapsed)), `${elapsed}ms`).toBe(want);
+    }
+  });
+
+  it("pluralizes the spelled-out units", () => {
+    expect(formatRelativeAge(ago(3 * H))).toBe("3 hours ago");
+    expect(formatRelativeAge(ago(3 * D))).toBe("3 days ago");
+    // "min" has no plural form — it is the abbreviation, not the word,
+    // for the same reason formatAge uses it: "m" beside counts reads as
+    // the SI mega prefix.
+    expect(formatRelativeAge(ago(5 * MIN))).toBe("5 min ago");
+  });
+
+  it("clamps a future instant to just now instead of a negative age", () => {
+    // Client clock skew, or a snapshot dated slightly ahead of this
+    // browser. "-3 min ago" is never the right thing to print.
+    expect(formatRelativeAge(ago(-3 * MIN))).toBe("just now");
+    expect(formatRelativeAge(ago(-40 * D))).toBe("just now");
+  });
+
+  it("is an em dash for a missing or unparseable instant, like formatAge", () => {
+    expect(formatRelativeAge(undefined)).toBe("—");
+    expect(formatRelativeAge(null)).toBe("—");
+    expect(formatRelativeAge("not-a-date")).toBe("—");
+  });
+});
+
+// The two renderers sit side by side on real screens: the partitions
+// footer prints formatAge and the snapshot id beside it prints
+// formatRelativeAge. They must never name different units for one
+// instant — "sampled 4d ago at snapshot 412" beside a tooltip saying
+// "3 days ago" is the bug this pins shut.
+describe("formatAge and formatRelativeAge share one ladder", () => {
+  const NOW = new Date("2026-09-29T22:34:07Z");
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("agrees on the unit and the number at every threshold", () => {
+    const S = 1000;
+    const MIN = 60 * S;
+    const H = 60 * MIN;
+    const D = 24 * H;
+    const cases: [number, string, string][] = [
+      // elapsed, formatAge, formatRelativeAge
+      [8 * S, "8s", "just now"],
+      [119 * S, "119s", "just now"],
+      [120 * S, "2min", "2 min ago"],
+      [110 * MIN, "110min", "110 min ago"],
+      [119 * MIN, "119min", "119 min ago"],
+      [120 * MIN, "2h", "2 hours ago"],
+      [19 * H + 11 * MIN, "19h", "19 hours ago"],
+      [47 * H, "47h", "47 hours ago"],
+      [48 * H, "2d", "2 days ago"],
+      [3 * D + 12 * H, "4d", "4 days ago"], // 3.5d rounds up in both
+    ];
+    for (const [elapsed, compact, prose] of cases) {
+      const iso = new Date(NOW.getTime() - elapsed).toISOString();
+      expect(formatAge(iso), `${elapsed}ms compact`).toBe(compact);
+      expect(formatRelativeAge(iso), `${elapsed}ms prose`).toBe(prose);
+      // The number and unit agree wherever the prose names one at all.
+      const parts = ageParts(iso)!;
+      expect(compact).toBe(`${parts.value}${parts.unit}`);
+      if (parts.unit !== "s") {
+        expect(prose.startsWith(`${parts.value} `)).toBe(true);
+      }
+    }
   });
 });

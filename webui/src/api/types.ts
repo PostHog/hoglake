@@ -93,6 +93,36 @@ export const SCALAR_COLUMN_TYPES = [
 ] as const;
 
 /**
+ * The types whose values are WHOLE NUMBERS, and the only ones whose
+ * bounds may be digit-grouped for display.
+ *
+ * A decoded bound arrives as its exact raw token, so "626623" from a long
+ * and "626623" from a string column are the same characters — nothing in
+ * the VALUE can tell them apart, and grouping a string's bound would
+ * corrupt it. The column's declared type is the only sound test, which is
+ * why this list exists rather than a regexp at the call site. Floats and
+ * decimals stay out: their tokens carry fraction digits and a grouped
+ * "1,234.5" is a format nobody stores.
+ */
+export const INTEGER_COLUMN_TYPES = [
+  "int8",
+  "int16",
+  "int",
+  "long",
+  "uint8",
+  "uint16",
+  "uint32",
+  "uint64",
+] as const;
+
+export type IntegerColumnType = (typeof INTEGER_COLUMN_TYPES)[number];
+
+/** Whether `type` is one of the whole-number types. */
+export function isIntegerColumnType(type: string): type is IntegerColumnType {
+  return (INTEGER_COLUMN_TYPES as readonly string[]).includes(type);
+}
+
+/**
  * The container types. Readable everywhere (a table can have them), but
  * not creatable from the console — see SCALAR_COLUMN_TYPES.
  */
@@ -493,6 +523,72 @@ export interface PartitionStatsResponse {
   // The compaction target size the report used as its small-file
   // threshold (strict <), for saying what "small" means in bytes.
   small_file_threshold_bytes: Int64;
+}
+
+// ---- per-table partitions listing (GET .../tables/{t}/partitions) --------
+//
+// The measures are a SAMPLE, at `sampled_snapshot_id` rather than at
+// head: the server reads the maintenance sampler's output instead of
+// walking the manifest, which is what makes the tab free. The page says
+// so in its footer rather than implying freshness it does not have.
+
+/**
+ * One partition key/value pair. `decoded` is what the page shows and
+ * what the `filter` parameter matches; `raw` is what the files tab's
+ * `partition=key_index:value` takes, so a row can link to its own files
+ * without re-encoding a date into an ordinal. Both are null together,
+ * for a null partition value.
+ */
+export interface PartitionListingValue {
+  field: string;
+  raw: string | null;
+  decoded: string | null;
+}
+
+export interface PartitionSpecFieldInfo {
+  field: string;
+  transform: PartitionTransform;
+  transform_param?: number;
+  source_field_id: Int64;
+}
+
+export interface PartitionSpecSummary {
+  spec_id: Int64;
+  fields: PartitionSpecFieldInfo[];
+}
+
+export interface PartitionGroup {
+  /** Absent for an unpartitioned vintage. */
+  spec_id?: Int64;
+  values: PartitionListingValue[];
+  file_count: Int64;
+  small_file_count: Int64;
+  total_bytes: Int64;
+  small_file_bytes: Int64;
+  avg_file_bytes: Int64;
+  dv_count: Int64;
+  debt_score: Int64;
+  /** null = the published sample predates the server measuring rows. Not zero. */
+  record_count: Int64 | null;
+  last_written_snapshot: Int64 | null;
+}
+
+export interface PartitionListing {
+  /**
+   * When the sample was PUBLISHED; null = the catalog has no published
+   * sample, and partitions is then empty. NOT the age of the numbers —
+   * a generation runs for tens of minutes and these were measured at
+   * its start. Use `sample_started` for freshness.
+   */
+  sampled_at: string | null;
+  /** When the scan started, i.e. when `sampled_snapshot_id` was captured. */
+  sample_started: string | null;
+  sampled_snapshot_id: Int64 | null;
+  /** Absent when the table is unpartitioned at head. */
+  spec?: PartitionSpecSummary;
+  total: number;
+  stale_spec_groups: number;
+  partitions: PartitionGroup[];
 }
 
 export interface CommitResult {

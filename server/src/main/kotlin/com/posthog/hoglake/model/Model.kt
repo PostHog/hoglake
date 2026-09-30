@@ -1350,28 +1350,36 @@ data class CleanupResult(
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val objectsRemoved: Long = 0,
     /**
-     * Rows dropped from a sub-batch because they were already settled
-     * between this run's batch select and the sub-batch's lock — a
-     * compaction group's commit settling its own staging ticket
-     * `'registered'`, which is that group committing normally. Not a
-     * failure, and deliberately NOT a `still_referenced` violation,
-     * which is what it used to be counted as.
+     * Rows a sub-batch could not settle because the row was no longer its
+     * own: another writer settled it (a compaction group's commit
+     * settling its own staging ticket `'registered'`, which is that group
+     * committing normally), or this worker's claim lease lapsed and
+     * another worker took the row. Not a failure, and deliberately NOT a
+     * `still_referenced` violation, which is what it used to be counted
+     * as.
+     *
+     * THE ONE ALARMING MISS IS NOT COUNTED HERE. A row settled
+     * `'registered'` over a path this sub-batch had already DELETED is a
+     * live file row pointing at a deleted object; the drain reads the
+     * missed rows back, and that case is counted in [stillReferenced]
+     * with an ERROR and a `cleanup_violation` audit event. It is
+     * unreachable while compaction refuses any ticket cleanup has
+     * touched; it is counted because nothing else in the system could see
+     * it.
      *
      * Defaulted and NON_DEFAULT for the same reason as [objectsRemoved].
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val settledElsewhere: Long = 0,
     /**
-     * Rows a sub-batch's hold budget stopped short of: claimed by the
-     * run, never attempted, left exactly as found and drained by a later
-     * hold.
+     * ALWAYS 0, and retained only because the ledger remembers it.
      *
-     * A standing nonzero here means holds are ending on their budget
-     * rather than on their work — a slow object store, or a sub-batch
-     * size the budget cannot cover — and it is the ONE counter that can
-     * be nonzero while `removed`, `missing` and `stillReferenced` are
-     * all zero, which is why the run's audit event is emitted for it
-     * too. A drain wedged on its budget must not present as idle.
+     * It counted rows a sub-batch's hold budget stopped short of, and
+     * that budget existed to bound a per-catalog commit-lock hold the
+     * drain no longer takes (it claims rows instead and holds no lock at
+     * all). The counter stays on the wire because the maintenance run
+     * ledger holds rows that carry it and every client already reads it;
+     * removing it from the schema would break a read of those rows.
      *
      * Defaulted and NON_DEFAULT for the same reason as [objectsRemoved].
      */
