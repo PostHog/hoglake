@@ -9,6 +9,11 @@ the pre-split commits).
 
 **Never push broken code.** Before every commit and push:
 
+(And before a PR that touches a maintenance loop, the commit path or a
+statement over the manifest tables: the five scale questions at the end
+of [Scale doctrine](#scale-doctrine-read-before-touching-a-query-a-loop-or-a-lock)
+are answered in the PR body.)
+
 ```bash
 cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
 just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
@@ -413,6 +418,118 @@ there would break that gate on every build.
     keeps the O(rows) pass under the commit lock; `POST .../truncate` on
     a multi-million-row table has today's hazard, and redesigning it is
     its own change.
+
+## Scale doctrine (read before touching a query, a loop or a lock)
+
+Three outages in one week came from the same mistake, and none of them
+was a wrong query. Each was a correct query, a correct loop or a
+correct lock written for a catalog of thousands of files and run
+against ten million:
+
+- **2026-09-28, expiry.** One sweep deleted every ended file row below
+  the new floor in one statement, under the per-catalog commit lock,
+  in compaction-commit order (random heap reads). ~50k files per sweep
+  at 700-870 µs each; the 60 s statement timeout fired 195 times in
+  200 sweeps, each failure holding the lock the full 60 s. Mean commit
+  wait 13.5 s, API pods liveness-killed all day.
+- **2026-09-29, cleanup.** The drain re-checked every path's liveness
+  under the commit lock: ~19 s per 1,000 paths on a table whose hot
+  set does not fit the cache, every commit queued behind it. The lock
+  protected nothing (V21).
+- **2026-09-30, compaction.** The planner loaded every small file of a
+  table (9.9M rows, a correlated `array_agg` per row, an `ORDER BY`)
+  into a Kotlin list inside one transaction, then bin-packed in memory
+  for minutes. `idle_in_transaction_session_timeout` killed the
+  connection at 30 s; every sweep failed for eleven hours. The groups
+  it planned were then refused anyway: packed by bytes, checked by
+  rows, 2.9M rows against a ceiling of 552k.
+
+The numbers to design against are production's, not the fixture's.
+gigahog-prod-us on 2026-09-30: one catalog, ~500k snapshots, retention
+3,600 s, ~14M live `hog_data_file` rows, 10M of them on one table
+across ~2,800 partitions, 96% of them under 60 KiB; ~50 commits/min of
+~270 files × 25 columns each, rising 4-5× with pyhoglake's concurrent
+uploads; ~3,600 files added per minute; compaction retiring 64 files
+per 4-minute run. Any code path that is O(files of a table),
+O(snapshots) or O(commits) is O(ten million) here, and the growth rates
+are as important as the counts.
+
+The rules. Every one of them was violated by the code above.
+
+- **Bound every fetch.** No statement on a maintenance or request path
+  reads an unbounded row set into memory. Every candidate, victim or
+  work-queue read has a `LIMIT` sized from the work the run can
+  actually do (compaction: `maxGroupsPerRun × maxInputFiles`; cleanup:
+  the sub-batch; expiry: a file-count batch), and the ledger records
+  when the limit truncated. Selecting from a per-partition summary
+  (the sampler tier) and then fetching rows for the chosen buckets is
+  the shape; "select everything and filter in Kotlin" is not.
+- **Bound every unit of work under a lock or inside a transaction.**
+  A statement under the per-catalog commit lock, or inside any
+  transaction, has a row bound and a `SET LOCAL statement_timeout`
+  smaller than the lock's fair share. Loops of bounded steps, each its
+  own transaction, with a run budget and a pause (the retirement
+  shape), never one statement that is "done when it is done".
+- **Never hold a transaction across non-database work.** Parquet I/O,
+  object-store calls, in-memory sorting and packing, HTTP calls: all
+  of it happens between transactions, never inside one. Read what you
+  need, commit, compute, open a new transaction for the write, and
+  re-check under it what could have changed (liveness, claims). The
+  test suite is the guard: `PgTestSupport` runs test connections with
+  `idle_in_transaction_session_timeout = '2s'` (landing with the
+  compaction planner fix, branch `jakob/compaction-plan-bounded`), so a
+  transaction left open across slow work fails the test the way
+  production fails the pod. Do not raise that value to make a test
+  pass; split the transaction.
+- **Measure per-row cost, not per-statement cost.** A statement's
+  plan says which index it uses; the per-row cost on production's
+  access pattern (random heap reads on a 10M-row table versus PK-order
+  reads) is what decides whether a 50k-row batch takes 1 s or 50 s.
+  Expiry's 700 µs/file versus retirement's 20 µs/row for the same CTE
+  was the whole 2026-09-28 incident. State the per-row figure and the
+  batch that fits the budget in the KDoc.
+- **Prove the plan on a production-shaped fixture.** "An index proves
+  itself against the query it serves" (below) is necessary, not
+  sufficient: a fixture of a few thousand rows proves nothing about a
+  skip scan, a generic-plan flip after pgjdbc's fifth execution, or a
+  correlated subquery. Plan tests for a hot statement seed at least
+  100k rows in the shape production has (the events table's
+  partition skew, mostly-live files, retained history) and assert
+  rows examined and buffers, not only the index name. Record the
+  measured figure in the test and the KDoc, with the fixture size.
+- **Do the growth arithmetic for anything written per commit or per
+  file.** Rows per file per commit × files per commit × commits per
+  minute × retention, in bytes on disk, before the change ships.
+  `hog_commit_receipt` stores 566 KB per 270-file commit and is never
+  purged: ~40 GB/day at today's rate (#240). Column stats are 25 rows
+  per file. Every such table needs a retention and a bounded,
+  PK-walking purge (the removal-ledger purge shape) from the day it is
+  created.
+- **Size groups by every dimension a downstream bound checks.** If a
+  later stage refuses on rows, pack by rows and bytes; if it refuses
+  on heap, pack by the estimate it will apply. A planner that packs by
+  one dimension and refuses on another does nothing forever and says
+  so in a WARN nobody reads.
+- **Stage every refusal that a live client could hit.** A new 4xx on a
+  path a deployed writer uses ships behind a flag (default off) with a
+  counter that shows the fleet has stopped sending the shape, and only
+  then flips. `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` is the model;
+  millpond stripping `read_snapshot` from every payload was found by
+  a review, not by the flag.
+- **Fanout is the multiplier.** Files per commit is set by partitions
+  touched, not rows per flush, so a faster writer produces more files,
+  more stats rows, more change rows and smaller files, not bigger
+  ones. When a change raises the write rate, re-run the arithmetic
+  for expiry (`HOGLAKE_EXPIRY_BATCH × 60 / interval` must exceed the
+  commit rate), compaction throughput, receipt growth and lock duty
+  cycle (hold time per commit × commits per minute).
+
+Before opening a PR that touches a maintenance loop, the commit path,
+or any statement over `hog_data_file`, `hog_snapshot_change`,
+`hog_file_partition_value` or a stats table, the PR body answers:
+what bounds this per run, what bounds it per transaction, what the
+per-row cost is on production's access pattern, what the plan test's
+fixture size is, and what grows per commit and how it is purged.
 
 ## Working conventions
 
