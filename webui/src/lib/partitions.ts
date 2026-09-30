@@ -56,8 +56,22 @@ export type PartitionDecode =
 const MS_PER_DAY = 86_400_000;
 const MS_PER_HOUR = 3_600_000;
 
-/** `YYYY-MM-DD` in UTC. Partition ordinals are epoch-relative, never local. */
-function isoDate(ms: number): string {
+/**
+ * `YYYY-MM-DD` in UTC, or null when the ordinal is not a representable
+ * instant. Partition ordinals are epoch-relative, never local.
+ *
+ * THE NULL IS LOAD-BEARING. `Number.isSafeInteger(9007199254740991)` is
+ * true, so a day ordinal at that bound reaches here, and
+ * `new Date(7.8e23).toISOString()` throws `RangeError: Invalid time
+ * value` — inside render, which took the files tab's PartitionCell (and
+ * the page with it) down. Degrading to the stored string is both the
+ * honest answer and what the server does; the shared vectors in
+ * server/src/test/resources/vectors/partition_decode_vectors.json pin
+ * the two ends of the boundary on both sides.
+ */
+function isoDate(ms: number): string | null {
+  // ±8.64e15 ms is the ECMAScript time-value range.
+  if (!Number.isFinite(ms) || Math.abs(ms) > 8.64e15) return null;
   return new Date(ms).toISOString().slice(0, 10);
 }
 
@@ -86,11 +100,12 @@ export function decodeValue(
       return `${year}-${String(month + 1).padStart(2, "0")}`;
     }
     case "day":
-      return usable ? isoDate(n * MS_PER_DAY) : raw;
+      return (usable ? isoDate(n * MS_PER_DAY) : null) ?? raw;
     case "hour": {
-      if (!usable) return raw;
+      const date = usable ? isoDate(n * MS_PER_HOUR) : null;
+      if (date === null) return raw;
       const at = new Date(n * MS_PER_HOUR);
-      return `${isoDate(n * MS_PER_HOUR)}T${String(at.getUTCHours()).padStart(2, "0")}`;
+      return `${date}T${String(at.getUTCHours()).padStart(2, "0")}`;
     }
     case "bucket":
       // The bucket INDEX, not a value: say so, or it reads as data.

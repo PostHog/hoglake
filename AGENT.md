@@ -216,53 +216,117 @@ there would break that gate on every build.
    purged past `HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS`, default 30d);
    undrained rows accumulate `attempts`/`last_attempt_at`. The ledger
    is also commit-integrated both ways: commits 409 any registered path
-   with an undrained row (path-reuse guard), drain sub-batches run
-   under the per-catalog commit lock, and compaction pre-registers its
-   output path as a `compaction_staging` claim settled
-   `'registered'` on group commit. A bulk sub-batch is
-   `HOGLAKE_CLEANUP_SUB_BATCH` rows (1,000) and one `DeleteObjects`
-   call PER BUCKET CHUNK (1,000 keys is S3's own request ceiling) — not
-   the 25 x (HeadObject + DeleteObject) it was, where one hold ran
-   ~3.2 s and a 2,000-row run spent ~255 s holding the lock across 80
-   slices, took commit latency from 200-400 ms to 12-22 s against the
-   30 s admission bound, and got both API pods liveness-killed. The
-   lock is still what serializes check-then-delete against the commit
-   tail; what changed is that holding it is cheap. `'absent'` is now
+   with an undrained row (path-reuse guard) and compaction
+   pre-registers its output path as a `compaction_staging` claim
+   settled `'registered'` on group commit — and only if cleanup has not
+   TOUCHED that ticket (below).
+   **THE DRAIN IS A CLAIMED WORK QUEUE AND TAKES NO CATALOG LOCK
+   ANYWHERE** (V21). It used to hold the per-catalog commit lock across
+   its reference check, its deletes and its settle; the lock protected
+   nothing, because a commit passes `REMOVAL_QUEUE_COLLISION_SQL` only
+   when no UNDRAINED row names the path, the drain reads only undrained
+   rows, and every queue insert (expiry, retirement, compaction
+   staging) happens inside a transaction that already holds the commit
+   lock from its collision check to its commit — EXCEPT that two of the
+   four inserters take NO commit lock, and the proof has to name them:
+   `CompactionService.stageOutputPath`'s initial stage is an autocommit
+   INSERT, safe because the path is a UUID that sweep just minted and
+   nobody else knows; and `UploadService.fenceAndQueue` takes none
+   deliberately, serialized instead by the `hog_upload` ROW LOCK that
+   `UploadService.register` takes inside the commit transaction plus its
+   `CommitConflict` on a claim that is no longer active — THAT is the arm
+   the removed commit lock was standing in for. The standing constraint
+   that follows: a commit registering a path with no `hog_upload` claim
+   has no serializer against a concurrent queue insert for that path,
+   unreachable today only because paths are never reused.
+   What the lock cost was measured on gigahog-prod-us 2026-09-24: **~19 s
+   of held lock per 1,000-row sub-batch**, during which every commit on
+   the catalog waits — which is why cleanup is OFF in production; as of
+   2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h,
+   ~9.4k of them orphaned `compaction_staging` tickets past grace. Three steps now, and the
+   transaction boundaries are the design: **CLAIM** (`UPDATE ... WHERE
+   removal_id IN (SELECT ... FOR UPDATE SKIP LOCKED) RETURNING`,
+   stamping `claimed_at`/`claimed_by`, committed BEFORE any
+   object-store call — so nothing is open across S3 and
+   `idle_in_transaction_session_timeout` bounds nothing here);
+   **WORK** (the reference check, then the deletes, no transaction and
+   no lock); **SETTLE** (one short transaction, fenced on `drained_at
+   IS NULL AND claimed_by = :worker`, `RETURNING` the rows it really
+   took — the rest are `settled_elsewhere`). `SKIP LOCKED` is why
+   `HOGLAKE_CLEANUP_WORKERS` (default 1) workers and any number of
+   replicas partition the queue with no coordination and no
+   single-flight lock. `HOGLAKE_CLEANUP_BATCH` is a budget PER WORKER, so
+   a run asks for `workers x batch` rows and the standing rate is
+   `workers x batch x 3600000 / HOGLAKE_CLEANUP_INTERVAL_MS` — **4,000
+   rows/h at the compiled defaults**, a floor nowhere near ~190k/h of
+   arrivals. THE DEFAULTS DO NOT CLEAR A BACKLOG; the values that do are a
+   chart change (a batch that keeps the workers busy, an interval near a
+   run's own duration, which the 19 s cold reference check sets). The boot
+   refusal is AGGREGATE with compaction —
+   `compactionParallelGroups + cleanupWorkers <= dbPoolSize -
+   FOREGROUND_CONNECTION_RESERVE` — because a worker holds a pooled
+   connection across that 19 s check, so at the production shape (pool 10,
+   reserve 4, groups 6) the pool must be raised before ANY worker count is
+   legal. A claim is a **LEASE**
+   (`HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS`, 900): a worker killed
+   between claim and settle leaves rows claimed until it lapses, and
+   the `claimed_by` fence is what stops the lapsed worker writing the
+   ledger afterwards. The RETURNING of the attempts bump is also what
+   `still_referenced` is COUNTED from: a compaction group that commits
+   between a claim and its reference check makes the path live, and
+   only the fence can tell that from a real violation. THE LEASE IS CLEANUP'S
+   ALONE: `commitGroup` re-reads its staging ticket `FOR UPDATE` and takes
+   it only if NOBODY HAS TOUCHED IT — `drained_at IS NULL AND claimed_at
+   IS NULL AND attempts = 0`, the same three terms in its `'registered'`
+   settle — because an expired claim does not mean the object survived, it
+   means nobody knows, and a row lock cannot stand between a DELETE no
+   transaction holds and a registration. A worker past its lease, a worker
+   killed after its DELETE, and a lost `DeleteObjects` response (which
+   bumps `attempts` and releases the claim) are the three routes; each
+   costs ONE GROUP (re-stage + `SkippedConflict`, fresh UUID next sweep)
+   rather than a live file row pointing at a deleted object. The drain
+   also reads back the rows its settle did not match and counts a
+   `'registered'` over a path it had already deleted as an invariant
+   violation with a `cleanup_violation` audit event — unreachable by the
+   above, and the only signature that state would ever have.
+   A bulk sub-batch is
+   `HOGLAKE_CLEANUP_SUB_BATCH` rows (1,000, and also the size of one
+   claim) and one `DeleteObjects` call PER BUCKET CHUNK (1,000 keys is
+   S3's own request ceiling) — not the 25 x (HeadObject +
+   DeleteObject) it was, where one hold ran ~3.2 s and a 2,000-row run
+   spent ~255 s holding the lock across 80 slices, took commit latency
+   from 200-400 ms to 12-22 s against the 30 s admission bound, and got
+   both API pods liveness-killed. `'absent'` is
    PRODUCED only by `compaction_staging` rows — it also remains on
-   every row settled before the change, which the 30-day ledger keeps
+   every row settled before batching landed, which the 30-day ledger keeps
    visible — and those rows keep HeadObject + DeleteObject because
    `/verify`'s `staging_tickets` arm reads that outcome. Because they
-   cost two round trips each they drain in their OWN sub-batches of 25.
-   A hold is bounded in TIME, not in calls — each call may take a whole
-   `RemovalStore.apiCallTimeout`, so 25 probe pairs could otherwise
-   reach 500 s and a three-chunk bulk sub-batch 30 s. The gate refuses
-   to START a call without a whole call bound of room left, so what it
-   enforces is `hold <= HOLD_BUDGET = 2 x call bound`, with
-   `HOLD_BUDGET + one call <= min(idle bound, admission bound)`
-   (20 s + 10 s <= 30 s at the defaults). Both terms derive from
-   `Database.SESSION_INIT_SQL_IDLE_TIMEOUT` and the EFFECTIVE
-   `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS`, so lowering admission shortens the
-   hold with it — a budget written against the idle bound alone holds
-   the lock for 20 s inside a 6 s admission window and 503s every
-   writer. Past the idle bound Postgres kills the backend and the
-   sub-batch rolls back with its objects already deleted, forever. Rows
-   a deadline stops short of are left untouched for the next hold and
-   COUNTED (`deadline_skipped`), which is also what keeps a
-   budget-wedged drain out of the "nothing to do" branch. Typical is
-   nowhere near the budget: ~64 ms for a one-request bulk hold, ~3.2 s
-   for 25 probe pairs. And the drain
+   cost two round trips each they settle in their OWN sub-batches of 25,
+   which is now a unit of PROGRESS (each sub-batch settles in its own
+   transaction) rather than of lock hold. The worst case a claim can
+   hold is 1,000 tickets, ~128 s of round trips at the measured 64 ms,
+   which is why the CLAIM is reason-aware — a bulk claim is
+   `HOGLAKE_CLEANUP_SUB_BATCH` rows and one `DeleteObjects` per bucket
+   chunk, a staging claim is 25 tickets and 50 calls (500 s at the call
+   bound, inside the 900 s lease), where one mixed claim of 1,000 tickets
+   would have been 20,000 s of calls under a single lease. The old
+   `deadline_skipped` / `HOLD_BUDGET` machinery bounded a lock hold that
+   no longer exists and is GONE — the counter stays on the wire, always 0, because the
+   maintenance ledger holds rows that carry it. And the drain
    leaves a staging row
    alone until it is past `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h,
    which must stay well under `/verify`'s 6 h staging-ticket age) so a
    ticket whose group is still uploading is not settled out from under
-   it. The first statement under the lock RE-CHECKS that each row is
-   still undrained, because a compaction commit can settle one between
-   the batch select and the lock, and treating that as a
-   `still_referenced` violation alerts on a group committing normally;
-   both ledger writes are fenced on `drained_at IS NULL` as the
-   backstop. `hoglake_files_removed_total` counts DISTINCT paths
+   it. `hoglake_files_removed_total` counts DISTINCT paths
    (`objects_removed`), not the settled rows, which a duplicate path
-   makes two of.
+   makes two of. And the ledger purge is a LOOP OF BOUNDED DELETES paging
+   the primary key from the bottom (`LEDGER_PURGE_PAGE` ids per page, a
+   wall budget, stopping at the first page with nothing to purge): the old
+   single `DELETE ... WHERE drained_at < cutoff` had no access path at all
+   — every index on the table is partial on `drained_at IS NULL` — so it
+   was a sequential scan with an unbounded row count against a ledger
+   heading for ~137M rows, which is the shape of the 2026-09-28
+   expiry-lock outage.
 5. **Expiry never passes head or (when `consumer_floor`) the min
    consumer offset**, and names the pinning consumer. Ranges below
    `earliest_snapshot_id` are 410 Gone — consumers reconcile, never
@@ -654,6 +718,135 @@ there would break that gate on every build.
   (404/409/410/422; commit admission timeout 503 + Retry-After; parse
   failures 400). New failure modes get a typed exception, not a status
   code sprinkled in a route.
+- **The request path never blocks the event loop, and the probe never
+  borrows a request connection** (#218). `App.module` installs ONE
+  interceptor (`api/BlockingDispatch.kt`, `ApplicationCallPipeline`'s
+  `Plugins` phase) that runs the rest of the pipeline — routing, the
+  handler, serialization — under a bounded dispatcher of
+  `HOGLAKE_REQUEST_THREADS` threads, default `HOGLAKE_DB_POOL_SIZE`.
+  One seam, not ~90 `withContext` calls, because the failure mode of
+  the per-handler form is a new route that looks like its neighbours
+  and reintroduces the incident with nothing redding. Handlers ran on
+  `eventLoopGroupProxy-4-1` — Ktor sizes Netty's call group from
+  `availableProcessors` and the pod has one CPU — so a `commit/prepared`
+  waiting the 30 s admission bound owned the only thread, three 5 s
+  `/healthz` probes went unserved, liveness killed the pod, and the
+  restart discarded every queued commit. `Main.kt` also FLOORS NETTY'S
+  CALL GROUP, and only that (`HOGLAKE_NETTY_CALL_GROUP_SIZE`,
+  `max(4, availableProcessors)`), which is defence in depth, not the
+  fix. Ktor sizes the call group at `availableProcessors` exactly and
+  the worker group at `parallelism / 2 + 1`, so the same floor on the
+  worker group would RAISE it on every pod with more than two CPUs;
+  there is no `HOGLAKE_NETTY_WORKER_GROUP_SIZE` and there should not
+  be —
+  those threads do socket IO, not blocking work, and #218 produced no
+  evidence about them.
+  Excess requests QUEUE, and THE QUEUE IS BOUNDED BY AGE, NOT DEPTH.
+  The interceptor stamps `System.nanoTime()` before the hand-off and
+  FREEZES the wait at admission (`RequestAdmission.admit`), records
+  `hoglake_request_queue_wait_seconds`, sheds
+  a request whose wait already passed the admission bound with the
+  typed 503 + Retry-After BEFORE it borrows a connection
+  (`RequestAdmission.refuseIfQueueExhausted`, counted as
+  `hoglake_requests_shed_total`), and charges the rest of
+  the wait against the advisory-lock bound inside
+  `Locks.acquireCatalogCommitLock`
+  (`RequestAdmission.remainingLockTimeoutMs`, an ambient
+  `ThreadLocal.asContextElement` established at the same seam, floored
+  so a request never arrives with a useless remainder and never raised
+  above a bound an operator set lower). One budget, charged once: 25 s
+  queued plus a fresh 30 s lock wait was 55 s of server time for a
+  caller that had gone. FROZEN, not read live, and the difference is
+  not cosmetic: elapsed-since-dispatch grows with THE HANDLER'S OWN
+  EXECUTION, so `POST .../maintenance/compact` — a synchronous sweep on
+  the handler thread — would take the lock with the 1 s floor for every
+  group after the first 30 s of the run and 503 blaming a queue wait
+  that never happened. The seam lives in its OWN PHASE between
+  `Plugins` and `Call`, not in `Plugins`: same-phase interceptors run
+  in registration order, so at `Plugins` it shed AHEAD of `RequestId`
+  and the 503 went out with no `X-Request-Id` — the response class most
+  likely to be investigated being the one that could not be. A DEPTH cap was rejected — the number that
+  matters to a caller is how long it waited, and a cap turns a brief
+  burst into refusals while a slow wedge under it stays invisible.
+  The shed is judged at ADMISSION (when a call reaches a thread), so a
+  pool that never frees one queues rather than refuses, and
+  readiness-on-sustained-saturation is still the follow-up: today a
+  wedged pod answers `/healthz` 200 and stays in the Service.
+  Sizing at the pool rather than above it is the same argument
+  `HOGLAKE_COMPACTION_PARALLEL_GROUPS`' boot check makes, and it is a
+  BOOT REFUSAL for the same reason: handler threads above the pool
+  queue inside `getConnection` and 500 after Hikari's 5 s bound instead
+  of queueing in the dispatcher. `HOGLAKE_REQUEST_THREADS >
+  HOGLAKE_DB_POOL_SIZE` is refused naming both knobs, as are a
+  dispatcher of zero threads, a probe timeout under Hikari's own 250 ms
+  floor, and a call group of zero. The default reserves NOTHING for the
+  background loops: on the API workload the chart turns them all off,
+  but a pod that runs loops and serves traffic should set
+  `HOGLAKE_REQUEST_THREADS` below the pool by the number of loops it
+  runs. SHUTDOWN ORDER IS PART OF THE FIX: `Main.kt` stops the ENGINE
+  first and only then closes the loops and the pools, and both new
+  pools close with `shutdown()` + a bounded wait rather than
+  `shutdownNow()` — interrupting an in-flight commit to save a second
+  of shutdown is the behaviour #218 complains about.
+  `/healthz`, `/livez` and `/metrics` BYPASS the dispatcher
+  (`PROBE_PATHS`, matched on a path normalised for trailing slashes —
+  MEASURED: `/healthz/` is a 404 today, because this server does not
+  install Ktor 3's `IgnoreTrailingSlash`, and normalising makes it a
+  FAST 404 rather than a queued timeout and removes the trap where
+  installing that one-line plugin later would route a real probe
+  through the saturated pool with nothing redding) — they are the
+  surfaces an operator reaches for exactly when the queue is longest — and `/healthz` runs on its own threads over
+  its own ONE-CONNECTION pool (`HealthProbe`),
+  bounded four ways by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` (Hikari
+  `connectionTimeout`, pgjdbc `connectTimeout`/`socketTimeout`, session
+  `statement_timeout`) with a wall-clock deadline of twice it. The
+  zombie-server property is unchanged — a database that does not answer
+  is still a 503 — but "the pool is busy serving commits" is no longer
+  indistinguishable from it. The deadline ABANDONS its task rather than
+  cancelling it (`withTimeoutOrNull` cannot interrupt a blocking JDBC
+  call), and probes single-flight WITH AN AGE BOUND: an in-flight
+  attempt is joined only while it is younger than its own deadline,
+  because joining on "still running" alone lets one hung task pin
+  `/healthz` at 503 for the rest of the pod's life — a permanently
+  unready pod, the same outage in a different costume. Past that it is
+  abandoned and a fresh attempt runs on the SECOND thread (which is why
+  there are two, and why two is also the cap: with both hung the probe
+  refuses to launch a third and answers 503, so a permanent hang costs
+  a fixed number of parked threads).
+  Metrics: `hoglake_db_pool_active`/`_idle`/`_pending`/`_max` (Hikari's
+  request pool; `pending > 0` is the alert — a caller queued inside
+  `getConnection` with 5 s before it is a 500),
+  `hoglake_request_pool_active`/`_queued`/`_max` (the dispatcher) and
+  the `hoglake_request_queue_wait_seconds` histogram (what the
+  saturation cost), `hoglake_request_queue_abandoned_total` (calls that
+  left the queue without ever reaching a thread — the histogram is
+  CONDITIONED ON SURVIVAL, so under a convoy bad enough that callers
+  give up first the surviving waits are the SHORT ones and its p99 can
+  FALL while the instance gets worse; read the two together),
+  `hoglake_requests_shed_total` (refusals at handler entry — NOT in
+  `hoglake_commits_total{result="timeout"}`, because a shed request is
+  refused before Routing has parsed a catalog to tag, and for the same
+  reason it carries no `route` tag) and
+  `hoglake_health_probe_attempts_hung` (the probe's outstanding
+  attempts; 2 is the cap and an ABSORBING STATE — two hangs park both
+  threads forever and `/healthz` then answers 503 indistinguishably
+  from a dead database, so 2 against a live Postgres means restart the
+  pod). Handlers queued in the dispatcher hold no catalog
+  connection; handlers pending on Hikari do, so the two families are
+  read together. The pool gauges are read straight off the pools at
+  scrape time — no sampler — and the Hikari MXBean is resolved INSIDE
+  each lambda, because a reference captured at registration can be null
+  (the pool is lazy) or stale across a reopen, and a gauge frozen on a
+  dead pool reports calm while the live one saturates. `active` counts
+  THREADS and is an approximation; `queued` counts calls waiting for
+  their FIRST thread and is NOT `executor.queue.size`, which also holds
+  the re-dispatch of every already-admitted coroutine that resumed.
+  The Ktor TEST ENGINE cannot see any of this: it has no call group and
+  no event loop, so a blocked handler starves nothing and `/healthz`
+  answers whether or not the fix exists. The property is pinned against
+  the REAL Netty engine on a real port
+  (`api/RequestDispatchIntegrationTest`), and any future change to
+  request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
   expiry, cleanup, compaction, verify, retirement, metrics sampler)
   registers with
@@ -753,9 +946,10 @@ there would break that gate on every build.
     cancels halves the batch size FOR THAT TABLE for the rest of the
     run, because the per-row cost is the row plus its cascade and a
     200-column table has ~20x the fan-out. CleanupService's hold-budget
-    arithmetic deliberately does NOT apply: a retirement connection
-    makes no object-store calls, so it is never idle in transaction and
-    the idle bound cannot fire on it. A batch deletes DELETION VECTORS
+    arithmetic does not apply and no longer exists at all: a retirement
+    connection makes no object-store calls, so it is never idle in
+    transaction, and the drain those bounds were written for holds no
+    lock any more (invariant 4). A batch deletes DELETION VECTORS
     FIRST, by `data_file_id`, with NO `end_snapshot` clause — the
     data-file delete cascades `hog_delete_file`, so any DV left when it
     runs is taken away UN-QUEUED and its puffin leaks forever (bug hunt
@@ -763,8 +957,10 @@ there would break that gate on every build.
   - **Retirement feeds cleanup, and the two are coupled by the queue
     ceiling.** Every row a retirement batch deletes queues one path, and
     the drain is much the slower of the two (`HOGLAKE_CLEANUP_BATCH` per
-    `HOGLAKE_CLEANUP_INTERVAL_MS`, against a hold that has to pay one
-    `DeleteObjects` round trip). Unpaced, a 3M-row table converts a
+    `HOGLAKE_CLEANUP_INTERVAL_MS`, against a sub-batch that has to pay
+    one `DeleteObjects` round trip — times `HOGLAKE_CLEANUP_WORKERS`,
+    since the batch is a PER-WORKER budget and a worker's rate no longer
+    costs anyone the commit lock). Unpaced, a 3M-row table converts a
     bounded metadata problem into a 3M-row queue — ~1.9 GB of ledger at
     the measured 631 bytes per undrained row — so a run whose catalog is
     already over `HOGLAKE_RETIREMENT_QUEUE_CEILING` declines to start.

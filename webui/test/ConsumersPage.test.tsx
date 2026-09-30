@@ -114,3 +114,39 @@ describe("ConsumersPage", () => {
     expect(alert).toHaveTextContent("not_found");
   });
 });
+
+// A committed offset IS a snapshot id, and the only question ever asked
+// of one is how far behind head it is.
+describe("ConsumersPage snapshot id tooltips", () => {
+  it("dates a committed offset on hover", async () => {
+    const probe = "/v1/catalogs/analytics/snapshots?after=4204&limit=1";
+    const fetchMock = mockFetch((url) => {
+      if (url === consumersUrl) return jsonResponse(listingFixture);
+      if (url === probe)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: "4205",
+              snapshot_time: "2026-09-06T09:59:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return undefined;
+    });
+    renderApp("/catalogs/analytics/consumers");
+    const user = userEvent.setup();
+
+    const offset = await screen.findByText("4205");
+    expect(offset).toHaveAttribute("data-snapshot-id", "4205");
+    // No probe for ANY offset before the hover.
+    const asked = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked().some((u) => u.includes("after="))).toBe(false);
+
+    await user.hover(offset);
+    const instant = await screen.findByText("2026-09-06 09:59:00Z");
+    expect(instant.closest('[role="tooltip"]')).not.toBeNull();
+    expect(asked().filter((u) => u.includes("after="))).toEqual([probe]);
+  });
+});

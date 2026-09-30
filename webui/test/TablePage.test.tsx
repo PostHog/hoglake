@@ -150,7 +150,9 @@ describe("TablePage", () => {
     expect(
       screen.getByText("s3://hog-lake/analytics/events/pageviews/data-00101.parquet"),
     ).toBeInTheDocument();
-    expect(screen.getByText("500,000")).toBeInTheDocument();
+    // Scoped to the row: the row-id bound columns are grouped too, so
+    // "500,000" is file 101's record_count AND file 102's span start.
+    expect(fileRowCells("101")).toContain("500,000");
 
     // The stats state is the SHAPE now, not a pill spending a column's
     // width on the word "provided": a file with statistics gets a
@@ -237,10 +239,14 @@ describe("TablePage", () => {
 
     // Both ends of every file's span, the pending and failed files
     // included: row ids need no statistics.
+    // Digit-grouped, like the record counts beside them: a row id is a
+    // whole number and 1,234,566 is read at a glance where 1234566 is not.
+    // The raw token stays in the cell's title.
     expect(fileRowCells("101")).toContain("0");
-    expect(fileRowCells("101")).toContain("499999");
-    expect(fileRowCells("102")).toContain("979999");
-    expect(fileRowCells("103")).toContain("1234566");
+    expect(fileRowCells("101")).toContain("499,999");
+    expect(fileRowCells("102")).toContain("979,999");
+    expect(fileRowCells("103")).toContain("1,234,566");
+    expect(screen.getByTitle("1234566").textContent).toBe("1,234,566");
   });
 
   it("bounds a sorted table's files by its leading sort field", async () => {
@@ -269,8 +275,10 @@ describe("TablePage", () => {
       screen.queryByRole("columnheader", { name: /_hog_row_id/ }),
     ).not.toBeInTheDocument();
 
-    expect(fileRowCells("201")).toContain("1000");
-    expect(fileRowCells("201")).toContain("4999");
+    // user_id is a long, so its bounds group. The TYPE decides that: the
+    // decoded token "1000" looks the same coming from a string column.
+    expect(fileRowCells("201")).toContain("1,000");
+    expect(fileRowCells("201")).toContain("4,999");
 
     // A stored NULL bound is an answer — the column is all-null, so
     // nothing can be pruned on it — and it is labelled as one.
@@ -458,7 +466,14 @@ describe("TablePage", () => {
     await user.type(screen.getByLabelText("snapshot id"), "4100");
     await user.click(screen.getByRole("button", { name: "Go" }));
 
-    expect(await screen.findByText("@ snapshot 4100")).toBeInTheDocument();
+    // The id inside the badge is a SnapshotId (its own element, so it can
+    // carry a tooltip), which is why this reads the badge's text content
+    // rather than matching one text node.
+    // Anchored: toHaveTextContent takes a substring, so a bare
+    // "@ snapshot 4100" would also pass on "@ snapshot 41005".
+    expect(await screen.findByText(/@ snapshot/)).toHaveTextContent(
+      /^@ snapshot 4100$/,
+    );
     expect(fetchMock).toHaveBeenCalledWith(
       `${base}?snapshot=4100`,
       expect.anything(),
@@ -466,7 +481,7 @@ describe("TablePage", () => {
 
     // Files tab inherits the snapshot.
     await user.click(screen.getByRole("tab", { name: "files" }));
-    await screen.findByText("500,000");
+    await screen.findByText("254,567");
     // The files request carries the snapshot (plus the page params).
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining(`${base}/files?snapshot=4100`),
@@ -491,7 +506,7 @@ describe("TablePage", () => {
     mockFetch(happyHandler);
     renderApp(route);
     await user.click(screen.getByRole("tab", { name: "files" }));
-    await screen.findByText("500,000");
+    await screen.findByText("254,567");
 
     const copies = screen.getAllByRole("button", { name: "Copy path" });
     expect(copies.length).toBe(filesFixture.length);
@@ -560,8 +575,12 @@ describe("TablePage", () => {
     // upper is row_id_start + record_count - 1. These are the ordering
     // key an unsorted table's files are read by, and both ends are past
     // the point where a Number round-trip would start lying.
-    expect(screen.getByText("9007199254740995")).toBeInTheDocument();
-    expect(screen.getByText("18014398509481987")).toBeInTheDocument();
+    // Grouped for reading, exact in the title — formatCount groups the
+    // decimal STRING, so no digit is lost on the way.
+    expect(screen.getByText("9,007,199,254,740,995")).toBeInTheDocument();
+    expect(screen.getByText("18,014,398,509,481,987")).toBeInTheDocument();
+    expect(screen.getByTitle("9007199254740995")).toBeInTheDocument();
+    expect(screen.getByTitle("18014398509481987")).toBeInTheDocument();
     // file_size_bytes 2^62+1: humanized cell, exact value in the tooltip.
     const sizeCell = screen.getByTitle("4611686018427387905");
     expect(sizeCell).toBeInTheDocument();
@@ -765,10 +784,16 @@ describe("TablePage", () => {
       await screen.findByRole("button", { name: "toggle stats for file 101" }),
     );
 
-    // long bounds, exact — 2^53+1 would round to ...992 through a double.
-    expect(await screen.findByText("9007199254740993")).toBeInTheDocument();
-    expect(screen.getByText("9223372036854775807")).toBeInTheDocument();
-    // decimal at the column scale, token verbatim.
+    // long bounds, exact — 2^53+1 would round to ...992 through a double —
+    // and grouped, because the column says it is a long. The raw token is
+    // the cell's title, for pasting into a query.
+    expect(
+      await screen.findByText("9,007,199,254,740,993"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("9,223,372,036,854,775,807")).toBeInTheDocument();
+    expect(screen.getByTitle("9007199254740993")).toBeInTheDocument();
+    // decimal NOT grouped: the token carries fraction digits, and the
+    // column scale is what the cell has to show.
     expect(screen.getByText("1.50")).toBeInTheDocument();
     expect(screen.getByText("999.99")).toBeInTheDocument();
     // strings verbatim; a nested leaf shows its dotted path.
@@ -886,5 +911,79 @@ describe("TablePage", () => {
     expect(alert).toHaveTextContent("not_found");
     // Stats header still up.
     expect(screen.getByText("1,234,567")).toBeInTheDocument();
+  });
+});
+
+// begin_snapshot is the files table's own snapshot id: the snapshot that
+// added the file, which is only ever read as "how new is this file".
+describe("TablePage snapshot id tooltips", () => {
+  it("dates begin_snapshot on hover, and asks for nothing until then", async () => {
+    const probe = "/v1/catalogs/analytics/snapshots?after=4000&limit=1";
+    const fetchMock = mockFetch((url) => {
+      if (url === probe)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: "4001",
+              snapshot_time: "2026-09-02T08:00:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return happyHandler(url);
+    });
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    const begin = await screen.findByText("4001");
+    expect(begin).toHaveAttribute("data-snapshot-id", "4001");
+    // A page of files must not fire a lookup for ANY row — three rows,
+    // three distinct begin_snapshots, and none of them asked for.
+    const asked = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked().some((u) => u.includes("after="))).toBe(false);
+
+    await user.hover(begin);
+    const instant = await screen.findByText("2026-09-02 08:00:00Z");
+    expect(instant.closest('[role="tooltip"]')).not.toBeNull();
+    expect(asked().filter((u) => u.includes("after="))).toEqual([probe]);
+    // Sorting by that column still works — the wrapper is inside the cell,
+    // not around it.
+    expect(
+      screen.getByRole("button", { name: /^begin_snapshot/ }),
+    ).toBeInTheDocument();
+  });
+});
+
+// The stats expander was a 13px glyph with no box and people missed it.
+describe("files tab stats expander", () => {
+  it("is a real button whose state is its aria-expanded, not its glyph", async () => {
+    mockFetch(happyHandler);
+    renderApp(route);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("tab", { name: "files" }));
+    const toggle = await screen.findByRole("button", {
+      name: "toggle stats for file 101",
+    });
+
+    // The label and the tooltip are the accessible surface and must not
+    // move with the visual redress.
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
+    expect(toggle.getAttribute("title")).toMatch(/Column statistics/);
+    const glyph = toggle.querySelector(".expand-chevron");
+    expect(glyph).not.toBeNull();
+    const mark = glyph!.textContent;
+
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "true");
+    // The SAME glyph in both states — CSS rotates it, so the control's
+    // box cannot change size under the column.
+    expect(toggle.querySelector(".expand-chevron")!.textContent).toBe(mark);
+    expect(toggle).toHaveAttribute("aria-label", "toggle stats for file 101");
+
+    await user.click(toggle);
+    expect(toggle).toHaveAttribute("aria-expanded", "false");
   });
 });

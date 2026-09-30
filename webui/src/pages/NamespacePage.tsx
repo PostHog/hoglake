@@ -6,6 +6,7 @@ import { SCALAR_COLUMN_TYPES, type ColumnType, type TableSummary } from "../api/
 import { ClampedText } from "../components/ClampedText";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
+import { SnapshotId } from "../components/SnapshotId";
 import { formatBytes, formatCount } from "../lib/format";
 import { columnNameError, identifierError } from "../lib/names";
 import { applySort, int64Column, nextSort, textColumn } from "../lib/sort";
@@ -303,7 +304,16 @@ export function NamespacePage() {
                       humanized: "1.2K snapshots" and a truncated snapshot
                       id are both worse than the digits. */}
                   <td className="num mono">{t.snapshot_count ?? "—"}</td>
-                  <td className="num mono">{t.earliest_snapshot_id ?? "—"}</td>
+                  <td className="num mono">
+                    {t.earliest_snapshot_id === undefined ? (
+                      "—"
+                    ) : (
+                      <SnapshotId
+                        catalog={catalog}
+                        id={t.earliest_snapshot_id}
+                      />
+                    )}
+                  </td>
                   {/* A comment runs to 16384 chars, so the cell shows its
                       first line and keeps the row's height. Text content
                       only — it is user data, never HTML. */}

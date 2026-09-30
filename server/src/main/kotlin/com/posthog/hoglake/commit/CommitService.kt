@@ -112,6 +112,40 @@ class CommitService(
          * index's own partial predicate, so dropping it costs the index
          * as well as the meaning.
          *
+         * IT IS UNCHANGED BY THE CLEANUP CLAIM (V21), and that is the
+         * half of the drain's safety argument that lives here. A claimed
+         * row is still an UNDRAINED row, so a commit registering that
+         * path still gets a 409 until it settles — which is why the
+         * drain can delete an object with no lock at all. The pair is:
+         * this guard refuses to make a queued path live, and the drain
+         * only ever reads rows that are still queued.
+         *
+         * WHAT REMAINS IS A QUEUE INSERT RACING A REGISTRATION, and there
+         * are FOUR inserters with THREE serializers — stated here because
+         * an earlier version of this argument said "every queue insert
+         * happens under the commit lock" and two of the four do not:
+         *
+         *  - `ExpiryService` / `RetirementService`: under the commit
+         *    lock, and only for paths whose file rows they just deleted;
+         *  - `CompactionService.stageOutputPath`'s INITIAL stage: NO
+         *    lock (autocommit, before the rewrite), safe because the path
+         *    is a UUID that sweep just minted and nobody else knows. Its
+         *    re-stage runs inside `commitGroup` and so under the lock;
+         *  - `UploadService.fenceAndQueue`: NO commit lock, deliberately.
+         *    Serialized by the `hog_upload` ROW LOCK — `UploadService
+         *    .register` takes `FOR UPDATE` on the claim rows inside THIS
+         *    transaction and raises `CommitConflict` unless the claim is
+         *    still active, while the sweep re-evaluates its candidate
+         *    predicate after waiting on that lock. This is the arm the
+         *    removed commit lock was standing in for.
+         *
+         * The standing constraint that follows: a commit path that
+         * registers a path with NO `hog_upload` claim has no serializer
+         * against a concurrent queue insert for that path. Unreachable
+         * today (paths are never reused, and every externally-supplied
+         * path arrives through an upload claim) — a future one must bring
+         * its own serializer.
+         *
          * Binds `:catalogId` and the `:paths` array. No interpolated
          * values (invariant 9 intact).
          */
@@ -444,12 +478,17 @@ class CommitService(
         val validatedAppends = resolvedAppends.map { validateFiles(h, catalogId, it) }
         validateDeleteRegistrations(resolvedDeletes)
 
-        // 3b. Removal-queue collision check (under the commit lock, so it
-        // serializes with cleanup's drain sub-batches, which take the same
-        // lock): a registered path with an UNDRAINED hog_file_removal row
-        // is scheduled for physical deletion — accepting it would let the
-        // cleanup drain delete the object out from under the new live row
-        // (path reuse under a deterministic path scheme / writer retry).
+        // 3b. Removal-queue collision check, and IT IS THE SERIALIZER
+        // NOW RATHER THAN THE COMMIT LOCK: cleanup's drain takes no lock
+        // at all (V21 — it claims rows instead), so what keeps it off a
+        // path this commit is registering is this refusal plus the fact
+        // that the drain reads only UNDRAINED rows. A registered path with
+        // an undrained hog_file_removal row is scheduled for physical
+        // deletion — accepting it would let the drain delete the object
+        // out from under the new live row (path reuse under a
+        // deterministic path scheme / writer retry). A CLAIMED row is
+        // still an undrained row, so the refusal stands for the whole
+        // time the path is somebody's work.
         // Duplicate paths against live/historical file rows stay legal —
         // this rejects only paths the cleanup queue currently owns; once
         // the entry drains (drained_at set) the path is registrable again.
@@ -649,10 +688,18 @@ class CommitService(
     /**
      * Reject any registered path (data or DV) that has an undrained
      * hog_file_removal row in this catalog: the path is scheduled for
-     * physical deletion and the cleanup drain (serialized against this
-     * check by the shared per-catalog advisory lock) would delete the
-     * object out from under the new row. Typed 409 — the writer retries
-     * with a fresh path, or after the drain settles the entry.
+     * physical deletion and the cleanup drain would delete the object out
+     * from under the new row. Typed 409 — the writer retries with a fresh
+     * path, or after the drain settles the entry.
+     *
+     * THIS CHECK IS HALF OF THE DRAIN'S SAFETY ARGUMENT, and since V21 it
+     * is not backed by a shared advisory lock: cleanup claims rows
+     * (`claimed_at`/`claimed_by`) and takes no catalog lock anywhere. A
+     * claimed row is still an UNDRAINED row, so this refusal covers the
+     * whole time a path is somebody's work, and the drain never reads a
+     * row that is not still queued. See [REMOVAL_QUEUE_COLLISION_SQL] for
+     * the other half — which queue inserters race a registration, and
+     * what serializes each of them.
      */
     private fun checkRemovalQueueCollisions(
         h: Handle,

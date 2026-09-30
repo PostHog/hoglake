@@ -5,6 +5,7 @@ import { createCatalog, listCatalogs } from "../api/client";
 import type { Catalog } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
 import { SkeletonRows } from "../components/Skeleton";
+import { SnapshotId } from "../components/SnapshotId";
 import { formatAge, formatBytes, formatCount } from "../lib/format";
 import { ageColumn, applySort, int64Column, nextSort, textColumn } from "../lib/sort";
 import type { ColumnSort, SortState } from "../lib/sort";
@@ -190,7 +191,9 @@ export function CatalogsPage() {
                   >
                     {c.live_size_bytes === undefined ? "—" : formatBytes(c.live_size_bytes)}
                   </td>
-                  <td className="num mono">{c.head_snapshot_id}</td>
+                  <td className="num mono">
+                    <SnapshotId catalog={c.name} id={c.head_snapshot_id} />
+                  </td>
                   {/* An em dash until the catalog has been sampled, like
                       the totals: an unknown age is not a zero age. */}
                   <td

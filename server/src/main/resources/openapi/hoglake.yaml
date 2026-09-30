@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: hoglake
-  version: 1.3.4-dev
+  version: 1.3.5-dev
   description: |
     The hoglake control plane: a Postgres-native lakehouse catalog.
     Clients never touch the backing Postgres; parquet lives in object
@@ -41,14 +41,16 @@ paths:
     get:
       operationId: healthz
       summary: >
-        Readiness — the catalog database must answer (SELECT 1 through
-        the pool, fail-fast on a dead pool). Use as the Kubernetes
-        readiness probe.
+        Readiness — the catalog database must answer (SELECT 1 on the
+        probe's own dedicated connection, not through the request pool,
+        bounded by HOGLAKE_HEALTH_PROBE_TIMEOUT_MS). A busy request
+        pool reads 200; only a database that does not answer reads 503.
+        Use as the Kubernetes readiness probe.
       responses:
         "200":
           description: The catalog is reachable.
         "503":
-          description: The catalog is unreachable or the pool is dead.
+          description: The catalog database did not answer inside the probe's deadline.
   /metrics:
     servers: [{ url: / }]
     get:
@@ -566,6 +568,94 @@ paths:
         "410": { $ref: "#/components/responses/Gone" }
         "422": { $ref: "#/components/responses/Validation" }
 
+  /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions:
+    get:
+      operationId: listTablePartitions
+      summary: The table's partitions, as the maintenance sampler last measured them
+      description: >
+        One row per (spec vintage, partition value tuple), with the file,
+        byte, deletion-vector, row and compaction-debt measures the
+        maintenance sampler recorded for it. THE NUMBERS ARE A SAMPLE, at
+        `sampled_snapshot_id` rather than at head: the listing reads
+        hog_maintenance_summary_tier, so it walks no manifest, takes no
+        lock and adds nothing to a commit. That is also why it accepts no
+        `snapshot`/`at_timestamp` — there is exactly one snapshot it can
+        answer at, and the response names it. A table whose catalog has
+        no published sample yet answers 200 with `sampled_at: null`,
+        `total: 0` and no partitions; the table exists, the measurement
+        does not.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/table" }
+        - name: sort
+          in: query
+          required: false
+          description: >
+            Column to order by; defaults to `partition`. `partition`
+            orders by the DECODED value tuple in key order (nulls first,
+            the stored value as the tiebreak), which is what the console
+            shows. Direction defaults to asc for `partition` and desc for
+            every measure — a measure column is clicked to find the
+            biggest. `rows` and `last_written` sort nulls last in both
+            directions: "not sampled" is never the answer to "which is
+            biggest".
+          schema:
+            type: string
+            enum: [partition, files, small_files, debt, total_size,
+                   avg_size, dvs, rows, last_written]
+        - name: order
+          in: query
+          required: false
+          description: Sort direction; overrides the column's default.
+          schema:
+            type: string
+            enum: [asc, desc]
+        - name: limit
+          in: query
+          required: false
+          description: Page size; defaults to 100, capped at 1000.
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+        - name: offset
+          in: query
+          required: false
+          description: Rows to skip; use with `limit` to page. Defaults to 0.
+          schema: { type: integer, minimum: 0 }
+        - name: filter
+          in: query
+          required: false
+          description: >
+            Restrict to partitions whose DECODED value for one key starts
+            with the given text, as `key_index:text`, case-insensitively —
+            so `0:2026-09` selects every day of that month under a day
+            transform. Repeatable; multiple params AND together. An EMPTY
+            text (`0:`) matches the NULL partition value, which no prefix
+            could otherwise name. This is NOT the files listing's
+            `partition` parameter: that one matches the stored value
+            exactly, this one matches what the console displays. A
+            key_index outside the table's current spec is 422.
+          explode: true
+          schema: { type: array, items: { type: string } }
+      responses:
+        "200":
+          description: The table's sampled partitions, one page.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PartitionListing" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "422":
+          description: >
+            An out-of-range filter key_index, or a table with more
+            sampled partition groups than the listing will materialise
+            (it decodes, sorts and pages in memory, so the whole group
+            set is read per request). The group cap is on the TABLE, not
+            on the request: `filter` is applied after the read, so
+            narrowing does not make such a table listable — use
+            GET /catalogs/{catalog}/stats/partitions for it.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ApiError" }
+
   /catalogs/{catalog}/namespaces/{namespace}/tables/{table}/partitions/values:
     get:
       operationId: getPartitionValues
@@ -984,6 +1074,18 @@ paths:
         liveness-checked against live references before physical
         deletion; still-referenced entries are skipped and counted (an
         invariant violation, never a deletion).
+      description: >
+        The drain itself is scoped to this catalog. Its retention purge is
+        NOT: the same run hard-deletes settled ledger rows past
+        HOGLAKE_REMOVAL_LEDGER_RETENTION_SECONDS across EVERY catalog,
+        because the purge walks the removal table's primary key rather
+        than one catalog's rows — a per-catalog walk would bound the rows
+        it deletes without bounding the rows it reads. The cutoff is a
+        per-process constant, so every catalog's rows are judged by the
+        same rule. The run also uses one worker rather than
+        HOGLAKE_CLEANUP_WORKERS when this pod's cleanup loop is disabled,
+        so a hand-triggered drain cannot take more of the connection pool
+        than the pod's configuration reserved for it.
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/maintenanceBatch" }
@@ -3720,16 +3822,21 @@ components:
           type: integer
           format: int64
           description: >
-            Rows dropped from a sub-batch because another writer had already
-            settled them — a compaction group settling its own staging ticket
-            'registered'. Normal, not a failure.
+            Rows a sub-batch could not settle because the row was no longer
+            its own: another writer had already settled it (a compaction group
+            settling its own staging ticket 'registered'), or this worker's
+            claim lease lapsed and another worker took the row. Normal, not a
+            failure — the one alarming case, a path registered after this drain
+            deleted its object, is reported as an invariant violation in
+            still_referenced instead, with a cleanup_violation audit event.
         deadline_skipped:
           type: integer
           format: int64
           description: >
-            Rows a sub-batch's hold budget stopped short of: claimed by the run,
-            never attempted, and drained by a later hold. Standing nonzero means
-            holds are ending on their budget rather than on their work.
+            Always 0. It counted rows a sub-batch's hold budget stopped short
+            of, and that budget bounded a commit-lock hold the drain no longer
+            takes. Retained on the wire because the maintenance run ledger
+            holds rows that carry it.
 
     RehydrateResult:
       type: object
@@ -4518,6 +4625,158 @@ components:
             its scaled minimum (see the compaction endpoint) is excluded.
             Uses the same bounds and target as compaction. The ranking
             key (desc, ties by small_file_bytes desc).
+
+    PartitionListingValue:
+      type: object
+      required: [field, raw, decoded]
+      description: >
+        One partition key/value pair, in key order. Both forms ship
+        because both are load-bearing: `decoded` is what the console
+        shows and what `filter` matches, `raw` is what the files
+        listing's `partition=key_index:value` takes, so a row can link to
+        its own files without re-encoding a date into an ordinal. Both
+        are null exactly together, for a null partition value.
+      properties:
+        field:
+          type: string
+          description: >
+            Display name: the source column's dotted path for an identity
+            transform, `<path>_<transform>` otherwise ("ts_month").
+        raw: { type: string, nullable: true, description: The stored, transformed value. }
+        decoded:
+          type: string
+          nullable: true
+          description: >
+            The value as displayed — a date for day/month/year/hour
+            ordinals, "bucket i/n" for a bucket index, the stored string
+            for identity, truncate and anything a newer writer adds. An
+            ordinal that cannot be interpreted degrades to the stored
+            string rather than to a confident wrong date.
+
+    PartitionSpecField:
+      type: object
+      required: [field, transform, source_field_id]
+      properties:
+        field: { type: string, description: Display name, as on PartitionListingValue. }
+        transform: { type: string }
+        transform_param:
+          type: integer
+          description: Present only for bucket(n).
+        source_field_id: { type: integer, format: int64 }
+
+    PartitionSpecSummary:
+      type: object
+      required: [spec_id, fields]
+      description: The table's partition spec at HEAD, which may be newer than some groups'.
+      properties:
+        spec_id: { type: integer, format: int64 }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionSpecField" }
+
+    PartitionGroup:
+      type: object
+      required: [values, file_count, small_file_count, total_bytes,
+                 small_file_bytes, avg_file_bytes, dv_count, debt_score,
+                 record_count, last_written_snapshot]
+      description: >
+        One sampled partition: the live files sharing one (spec_id,
+        partition value tuple) as the sampler last saw them. An
+        unpartitioned table is a single group with empty `values` and no
+        `spec_id`; files written under an older spec group under THEIR
+        spec id — vintages never mix.
+      properties:
+        spec_id:
+          type: integer
+          format: int64
+          description: >
+            Spec the group's files were written under (not necessarily
+            the table's current one). Omitted for an unpartitioned
+            vintage.
+        values:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionListingValue" }
+        file_count: { type: integer, format: int64 }
+        small_file_count:
+          type: integer
+          format: int64
+          description: Files under the compaction target size (strict <).
+        total_bytes: { type: integer, format: int64 }
+        small_file_bytes: { type: integer, format: int64 }
+        avg_file_bytes:
+          type: integer
+          format: int64
+          description: total_bytes / file_count, floored; 0 with no files.
+        dv_count:
+          type: integer
+          format: int64
+          description: Live deletion vectors over the partition's files.
+        debt_score:
+          type: integer
+          format: int64
+          description: >
+            Actionable compaction debt, the same measure
+            /stats/partitions ranks by.
+        record_count:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            Rows in the partition, or NULL when the published sample
+            predates the sampler measuring them (the column's default is
+            0, which is why null and zero are different answers here).
+        last_written_snapshot:
+          type: integer
+          format: int64
+          nullable: true
+          description: >
+            max(begin_snapshot) over the partition's files; null on a
+            sample that predates the measure, and on a group with no
+            files.
+
+    PartitionListing:
+      type: object
+      required: [sampled_at, sample_started, sampled_snapshot_id, total,
+                 stale_spec_groups, partitions]
+      properties:
+        sampled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            When the sample the numbers come from was PUBLISHED; NULL
+            when the catalog has no usable published sample, in which
+            case partitions is empty and total is 0. The numbers are
+            older than this by however long the scan ran — use
+            sample_started for freshness.
+        sample_started:
+          type: string
+          format: date-time
+          nullable: true
+          description: >
+            When the sample's scan STARTED, which is when
+            sampled_snapshot_id was captured. A generation takes tens of
+            minutes on a production catalog, so this and sampled_at can
+            differ by that much; this is the age of the numbers.
+        sampled_snapshot_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: The snapshot the sample measured at. Every number below is at it, not at head.
+        spec:
+          $ref: "#/components/schemas/PartitionSpecSummary"
+        total:
+          type: integer
+          description: Groups matching the filter, before paging.
+        stale_spec_groups:
+          type: integer
+          description: >
+            Of those, the ones whose vintage is not the current spec —
+            partitions a spec change left behind. Counted over the
+            filtered set, so it agrees with `total`.
+        partitions:
+          type: array
+          items: { $ref: "#/components/schemas/PartitionGroup" }
 
     PartitionStatsReport:
       type: object

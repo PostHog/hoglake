@@ -302,3 +302,47 @@ describe("NamespacePage", () => {
     expect(alert).toHaveTextContent("not_found");
   });
 });
+
+// EARLIEST_SNAPSHOT is the column that provoked the tooltip: a bare id in
+// a listing places nothing in time.
+describe("NamespacePage snapshot id tooltips", () => {
+  it("dates earliest_snapshot_id on hover and keeps the absent one an em dash", async () => {
+    const probe = "/v1/catalogs/analytics/snapshots?after=6&limit=1";
+    const fetchMock = mockFetch((url) => {
+      if (url === tablesUrl) return jsonResponse(tablesFixture);
+      if (url === probe)
+        return jsonResponse({
+          snapshots: [
+            {
+              snapshot_id: "7",
+              snapshot_time: "2026-09-01T00:00:00Z",
+              schema_version: "7",
+            },
+          ],
+          has_more: true,
+        });
+      return undefined;
+    });
+    renderApp("/catalogs/analytics/namespaces/events");
+    const user = userEvent.setup();
+
+    const earliest = await screen.findByText("7");
+    expect(earliest).toHaveAttribute("data-snapshot-id", "7");
+    // No probe for ANY id before the hover, not merely for this one.
+    const asked = () => fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(asked().some((u) => u.includes("after="))).toBe(false);
+
+    await user.hover(earliest);
+    const instant = await screen.findByText("2026-09-01 00:00:00Z");
+    expect(instant.closest('[role="tooltip"]')).not.toBeNull();
+    expect(asked().filter((u) => u.includes("after="))).toEqual([probe]);
+
+    // A table with no retained earliest snapshot keeps its em dash: there
+    // is no id to date, and a tooltip trigger over nothing is a lie.
+    const clicks = screen.getByText("clicks").closest("tr")!;
+    const cells = clicks.querySelectorAll("td");
+    const earliestCell = cells[cells.length - 2];
+    expect(earliestCell.textContent).toBe("—");
+    expect(earliestCell.querySelector("[data-snapshot-id]")).toBeNull();
+  });
+});

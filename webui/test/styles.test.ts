@@ -52,3 +52,51 @@ describe("styles.css", () => {
     expect(depth, "file ends inside an open rule").toBe(0);
   });
 });
+
+/**
+ * Two rules whose sizes are load-bearing: the files table's stats column
+ * holds either an expander button or a "no stats" marker, and the code's
+ * own comment promises they are the same box so the column cannot jump
+ * between rows. jsdom applies no stylesheet, so a DOM test can never see
+ * this — the sheet itself is the only place to assert it.
+ */
+function declarations(selector: string): Record<string, string> {
+  const at = rules.indexOf(`${selector} {`);
+  if (at === -1) throw new Error(`no rule for ${selector}`);
+  const body = rules.slice(at + selector.length + 2, rules.indexOf("}", at));
+  const out: Record<string, string> = {};
+  for (const line of body.split(";")) {
+    const [prop, ...rest] = line.split(":");
+    if (rest.length === 0) continue;
+    out[prop.trim()] = rest.join(":").trim();
+  }
+  return out;
+}
+
+describe("files tab stats column", () => {
+  it("sizes the expander to a 24x24 hit area", () => {
+    // The control was a bare 13px glyph and people missed it; 24px is the
+    // smallest pointer target anyone recommends.
+    const toggle = declarations("button.expand-toggle");
+    expect(toggle.width).toBe("24px");
+    expect(toggle.height).toBe("24px");
+    // And the glyph inside it is bigger than the body text.
+    expect(declarations(".expand-chevron")["font-size"]).toBe("16px");
+  });
+
+  it("gives the stats marker the identical box, so the column cannot jump", () => {
+    const toggle = declarations("button.expand-toggle");
+    const marker = declarations(".stats-marker");
+    expect(marker.width).toBe(toggle.width);
+    expect(marker.height).toBe(toggle.height);
+  });
+
+  it("rotates the chevron instead of swapping a character", () => {
+    // A swapped glyph cannot animate and can change the box's metrics.
+    // Read from the raw sheet: `rules` has its string literals stripped,
+    // which takes the attribute selector's value with them.
+    expect(css).toMatch(
+      /button\.expand-toggle\[aria-expanded="true"\] \.expand-chevron \{[^}]*transform: rotate\(90deg\)/,
+    );
+  });
+});

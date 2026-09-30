@@ -34,16 +34,35 @@ object PgTestSupport {
      * failures a version move produces are rarely in application code:
      * they are statistics views that moved columns, catalog shapes, and
      * planner changes — none of which a unit test can see.
+     *
+     * VISIBLE, not private, for the one class that must run its OWN
+     * container because its subject is stopping it
+     * (`HealthProbeIntegrationTest`): it has to start the same image the
+     * rest of the suite pins, or a version override would silently skip
+     * it.
      */
-    private val image: String =
+    val image: String =
         System.getProperty("pgImage")
             ?: System.getenv("HOGLAKE_TEST_PG_IMAGE")
             ?: "postgres:18"
 
+    /**
+     * The role every test database is created with — the same spelling
+     * `Config`'s own defaults carry, so a fixture that points a
+     * `Config` at [TestDb.jdbcUrl] needs no credential overrides.
+     *
+     * Named here rather than copied into each test: the health probe
+     * (#218) builds its connection from `Config`, so a fixture that
+     * restated these would silently stop matching the container the day
+     * either moved.
+     */
+    const val USER: String = "hoglake"
+    const val PASSWORD: String = "hoglake"
+
     private val container: PostgreSQLContainer<*> by lazy {
         PostgreSQLContainer(image)
-            .withUsername("hoglake")
-            .withPassword("hoglake")
+            .withUsername(USER)
+            .withPassword(PASSWORD)
             .also { it.start() }
     }
 
@@ -104,6 +123,44 @@ object PgTestSupport {
                 .load()
                 .migrate()
         }
+
+    /**
+     * Apply ONE migration file OUT OF ORDER, read off disk, without
+     * touching Flyway's history.
+     *
+     * For the fixture that has to sit BELOW a migration to observe what
+     * it changed, while running a service whose statements need a LATER
+     * migration's columns: `V17FilePathIndexMigrationIntegrationTest`
+     * arrives at V16 because that is where V17's indexes are absent, and
+     * it captures its statement off a real cleanup drain — whose claim
+     * needs V21's `claimed_at`/`claimed_by`. The alternative, restating
+     * the DDL in the test, is the shape AGENT.md calls out: a copy
+     * asserts only that it compiles, and it would silently stop matching
+     * the day the migration moved.
+     *
+     * The history is deliberately UNTOUCHED, so the fixture's later
+     * `Database.migrate` applies the file again. Every migration this is
+     * used with must therefore be idempotent — which the repo's are, for
+     * the separate reason that a retried migration must be free.
+     */
+    fun applyMigrationFile(
+        db: TestDb,
+        fileName: String,
+    ) {
+        val file = java.io.File("src/main/resources/db/migration/$fileName")
+        require(file.isFile) { "no such migration file: $fileName (looked in ${file.absolutePath})" }
+        val sql = file.readText()
+        db.jdbi.useHandle<Exception> { h ->
+            h.begin()
+            try {
+                h.createScript(sql).execute()
+                h.commit()
+            } catch (e: Exception) {
+                h.rollback()
+                throw e
+            }
+        }
+    }
 
     @Synchronized
     private fun freshEmpty(productionSession: Boolean = false): TestDb {
