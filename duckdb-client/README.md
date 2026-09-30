@@ -26,9 +26,10 @@ pyhoglake — the same contract, a different language.
 ## Status
 
 Read, write, DML, DDL, time travel, metadata functions and maintenance
-passthroughs are implemented and verified against a live dev stack; six
-capabilities are blocked on wire gaps and are listed as such rather
-than faked.
+passthroughs are implemented and verified against a live dev stack; the
+capabilities still blocked on wire gaps — nullability and default
+AlterOps (hoglake#38) and global column statistics (hoglake#39) — are
+listed as such rather than faked.
 
 | Doc | What |
 |---|---|
@@ -43,7 +44,7 @@ summary.
 Divergences from DuckLake are deliberate and documented (in DESIGN.md
 and PARITY.md), never silent: DDL is eager (own server snapshot, so
 `ROLLBACK` does not undo it), UPDATE assigns new row ids (the
-`FileRegistration` wire has no `explicit_row_ids`), uncommitted INSERTs
+`FileRegistration` wire has no `explicit_row_ids`; hoglake#30), uncommitted INSERTs
 are invisible to their own transaction's scans (own DELETEs are not —
 those merge), and written partitions are identity-transform only.
 

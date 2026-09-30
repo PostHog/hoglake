@@ -80,7 +80,10 @@ database rejects states the code shouldn't have to defend against.
 
 `commit/CommitService.kt`. A commit is one SQL transaction that opens
 by taking a **per-catalog advisory transaction lock**
-(`persistence/Locks.kt`: `pg_advisory_xact_lock(4740871, catalog_id)`).
+(`persistence/Locks.kt`:
+`pg_advisory_xact_lock((4740871::bigint << 32) | (catalog_id::bigint &
+4294967295))` — the single-bigint form, and the key must be computed
+identically everywhere or serialization silently breaks).
 Every DDL and data commit tail serializes on it, which is what makes
 snapshot ids dense and allocator math trivial; everything expensive a
 client does (writing parquet) happened before the request, so the
@@ -95,7 +98,11 @@ appends**); for deletes, additionally a per-file check that the
 deletion vector being superseded wasn't itself replaced after the read
 snapshot. A hit is HTTP 409 with the offending table named; the client
 refreshes and retries. Omitting `read_snapshot` is a blind append with
-no conflict window — but a *stated* `read_snapshot` below the expiry
+no conflict window — except when the files carry `partition_values`,
+which `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` (default false) will
+refuse with 422; today the server WARNs once per resolved table and
+counts `hoglake_blind_partitioned_appends_total`. A *stated*
+`read_snapshot` below the expiry
 floor is **410 Gone** (the change rows that would prove the window
 clean were expired with their snapshots; the message names the floor
 and when it was reached), never a silently truncated conflict check.
@@ -105,7 +112,12 @@ Validation failures (unknown table, bad field id, malformed stats) are
 Two more admission gates run under the lock. A commit may carry an
 `expected_table_uuid` per table — the incarnation guard: if the live
 table's uuid differs (drop+recreate raced the writer), the whole
-commit 409s with zero writes. And every registered path (data file or
+commit 409s with zero writes, under the typed code `table_recreated`. A
+conflict that is DDL on a touched table after the request's
+`read_snapshot` is 409 `ddl_since_read_snapshot`. Neither is retryable,
+and both carry `tables` and `retry: re-prepare` in the body: the
+recovery is to re-read the table and prepare a new request, which is
+also the recovery for the below-floor 410 above. And every registered path (data file or
 DV) is checked against **undrained `hog_file_removal` rows**: a path
 still scheduled for physical deletion is refused with 409 — otherwise
 cleanup's drain could delete an object a newer commit just made live
@@ -214,6 +226,15 @@ hydrator, so it simply has none — acceptable, because row-group
 alignment is an optimization and even cuts are always correct.
 Compaction registers the list for every output from the footer its
 writer just produced, at no extra IO.
+
+One client-side note with a server cost: pyhoglake's
+`prepare_append_tables` uploads a commit's objects concurrently (the
+`fast-upload` extra, bounded by `concurrency=` or
+`PYHOGLAKE_UPLOAD_CONCURRENCY`, hoglake#234), so a faster client raises
+files-per-commit rather than commits per second. Every per-file cost
+here scales with that number — the hydrator's sweep, the expiry and
+retirement arithmetic, and the commit receipt, whose stored request body
+is the one that grows fastest (hoglake#240).
 
 ### Row lineage
 
@@ -339,7 +360,10 @@ catalog's `data_path` prefix at commit.
 
 `service/AlterService.kt`, `POST /alter`: a list of typed operations —
 `add_column`, `drop_column`, `rename_column`, `promote_column`,
-`rename_table`, `set_partition_spec`, `set_sort_order` — applied **in
+`rename_table`, `set_partition_spec`, `set_sort_order`, and the V11
+metadata ops `add_column_with_metadata`, `set_table_comment`,
+`set_column_comment`, `set_properties` (`versioned-table-metadata-v1`)
+— applied **in
 order, atomically, as one DDL commit** (one snapshot, one
 `table_altered` change row, one schema-version bump). Renames keep the
 `field_id` (end the old row, begin a new one with the same id), so
@@ -359,9 +383,38 @@ Every point-in-time read (`getTable`, `/files`, `/scan`) takes
 `?snapshot=` or `?at_timestamp=` (mutually exclusive). Timestamp
 resolution is one indexed lookup: the largest snapshot with
 `snapshot_time <= t`; after head resolves to head; before the earliest
-*retained* snapshot is 410. Table-level aggregates (`record_count`,
-`file_count`, `file_size_bytes`) are always computed from the files
-visible at the requested snapshot — never from head-scoped counters.
+*retained* snapshot is 410.
+
+`Table.read_snapshot_id` names the snapshot a read resolved at — the
+catalog head when the request named no `snapshot`/`at_timestamp`, the
+resolved snapshot otherwise. It is required and always present, on every
+path including `totals=false`, because it describes the READ and not the
+totals; a writer caches the response and sends it back as a commit's
+`read_snapshot`, which the existing OCC then validates.
+
+The three table-level aggregates (`record_count`, `file_count`,
+`file_size_bytes`) are three-way, and OPTIONAL on the wire:
+
+- On a TIME-TRAVEL read (`snapshot` or `at_timestamp`), and on a
+  createTable/alterTable receipt, they are aggregated from the manifest
+  and exact at that snapshot, with no freshness fields — a scan is the
+  only correct answer for a past snapshot, and an exact number has no
+  age.
+- On a HEAD read they come from the maintenance sampler's published
+  generation (the same source `/maintenance/status` and
+  `/stats/partitions` read, summed per table — `persistence/TierTotalsRepo.kt`),
+  so the request reads one indexed row set and never the manifest.
+  `totals_snapshot_id` names the snapshot they are exact at and
+  `totals_as_of` when it was captured; expect minutes to tens of minutes
+  behind head. They are ABSENT when the published generation is not an
+  answer for the table, and absent means NOT SAMPLED, never zero.
+- Under `totals=false` all five are absent. That is the identity read,
+  and what a per-flush writer should send.
+
+The namespace listing is the asymmetry: `TableSummary`'s three totals
+are still required and still aggregated from the manifest, exact at the
+catalog head, so the two endpoints can disagree by the sample's age for
+the same table (#235).
 
 ### The changefeed and consumer offsets
 
@@ -414,21 +467,8 @@ The lineage is **recorded, not derived**: V14 adds
 when it publishes a replacement, so the hop is one indexed equality
 (`hog_table_replacement_lineage`, partial on `replaced_table_id IS NOT
 NULL`). The derivation `old.dropped_snapshot = new.created_snapshot` is used
-**exactly once**, in V14's one-time backfill, where it is exact rather
-than probable: `dropped_snapshot` has exactly two writers (the
-replacement branch and `dropTable`, both via `TableRepo.markDropped`),
-`hog_table` rows are inserted from exactly one place
-(`TableRepo.insertTable`, called only by `createTable`), every DDL
-transaction mints its own snapshot under the commit lock, and views,
-compaction and data commits never write `hog_table` at all — so a
-snapshot that both retires a table and creates one is a replacement and
-can be nothing else, in any environment. What the backfill repairs is
-the **rolling-deploy window**: a 1.2.0 replica still publishes
-replacements without writing `replaced_table_id`, and each one strands
-a retired incarnation whose consumer offset pins expiry until the edge
-exists. Re-running the `UPDATE` is the repair; no automated job is wired
-up because production carries no replacements yet, and an operator can
-run it by hand if that stops being true. The derivation is **not** used
+**exactly once**, in V14's one-time backfill, which has run in all three
+environments. The derivation is **not** used
 at runtime, for two reasons. Nothing enforces it, and the cost of it
 being wrong is deleting a consumer's position on a table it is still
 draining.
@@ -497,9 +537,13 @@ boundaries as the design:
 
 The lock it used to hold protected nothing, and cost ~19 s per 1,000-row
 sub-batch on gigahog-prod-us (2026-09-24), during which every commit on
-the catalog waited — which is why cleanup is off in production. As of
-2026-09-29 the queue stands at ~2.6M undrained rows growing ~190k/h, about
-9.4k of them orphaned `compaction_staging` tickets past their grace.
+the catalog waited — which is why cleanup was off in production until
+the lock came out. Cleanup is ON in prod-us since 2026-09-29, at 60 s /
+batch 10,000 / 1 worker; dev and prod-eu carry no `maintenance:` block
+at all and so run the chart defaults (30 min / batch 2,000). The queue
+stood at ~2.6M undrained rows growing ~190k/h on 2026-09-29, about 9.4k
+of them orphaned `compaction_staging` tickets past their grace, and the
+drain-down cleared it that day.
 
 The reason the lock was unnecessary is the pair it was half of: a commit
 passes the path-reuse guard only when no UNDRAINED row names the path, and
@@ -547,12 +591,18 @@ interval near a run's own duration, which the reference check sets at ~20 s
 cold for 4 x 1,000 rows). A worker holds a pooled connection across that
 check, so `HOGLAKE_COMPACTION_PARALLEL_GROUPS + HOGLAKE_CLEANUP_WORKERS`
 is refused at boot above `HOGLAKE_DB_POOL_SIZE -
-FOREGROUND_CONNECTION_RESERVE`: at the production shape (pool 10, reserve
-4, groups 6) the pool has to be raised before any worker count is legal. A claim is a
+FOREGROUND_CONNECTION_RESERVE`: at the default pool of 10 with reserve 4
+and 6 groups, no worker count is legal, which is why prod-us raised
+`dbPoolSize` to 16 — that is what makes 1 worker (and up to 6) legal. A claim is a
 **lease**, not a lock (`HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS`, 900 s): a
 worker killed between its claim and its settle leaves rows claimed until
 the lease lapses, and `DeleteObjects` is idempotent so the re-drain
-settles exactly as the first attempt would have. The `claimed_by` fence
+settles exactly as the first attempt would have. Note that
+`HOGLAKE_CLEANUP_SUB_BATCH`, `HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS` and
+`HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` are server-default-only today:
+the chart has no template for any of them, so they cannot be set in any
+environment, and changing one needs chart template work first. The
+`claimed_by` fence
 is the other half of that: a worker whose lease lapsed while it was
 talking to S3 can no longer write the ledger, so it cannot stamp its
 outcome over the worker that took the row from it. The fence is also
@@ -719,23 +769,14 @@ puts every output back under the target, so at 2 it converges on the
 target from below one rewrite at a time, roughly 4x the bytes moved.
 That is the ladder by another name.
 
-Measured at the default of 5, two ways, because they disagree:
-*draining* a static backlog costs about **2x** the input bytes against
-the ladder's **4x** — ingest-sized files reach the target band in one
-rewrite, and the outputs consolidate pairwise from there. But *steady
-state*, a trickle arriving on an already-compacted partition, is about
-**2.4x** against the ladder's **2.5x** — barely a win, and a 5.6x LOSS
-without the dominance split described above. So the claim is one rewrite
-to reach the target band, not one rewrite per file for all time.
-
-This replaced a geometric ladder of size tiers, which packed each file
-against its own tier's floor and promoted it a rung at a time. The
-consequence was that the same bytes were rewritten once per rung — four
-passes to reach 512 MiB from ~53 MiB ingest — and every rung above the
-first saved nothing, because the compression had already happened on
-the first pass. In production that read as `2 -> 1 files, 121 MiB ->
-121 MiB`, fifteen seconds of decompress-and-recompress, repeating on a
-catalog with no ingest at all.
+Measured at the default of 5: draining a static backlog costs about
+**2x** the input bytes, because ingest-sized files reach the target band
+in one rewrite and the outputs consolidate pairwise from there. So the
+claim is one rewrite to reach the target band, not one rewrite per file
+for all time — and without the dominance split described above, steady
+state is a 5.6x LOSS. This replaced a geometric ladder of size tiers
+(#151, V10), which rewrote the same bytes once per rung while every rung
+above the first saved nothing.
 
 `HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN` (default 1) caps executed
 attempts per catalog, including failures and skips.
@@ -989,35 +1030,13 @@ reason: `ParquetRewriter` reads the whole group into an
 `ArrayList<Group>` and calls `sortedWith`. An in-memory sort needs the
 group in memory.
 
-The replacement is an **external merge sort**, and compaction is
-unusually well placed for one:
-
-- **A compaction OUTPUT needs no sort at all.** This rewriter sorts
-  what it writes — the sort spec is *binding for compaction rewrites*
-  (`schema.sql`) — so such an input is an already-sorted RUN, and
-  merging k runs needs one row per run in a priority queue:
-  **O(files)** live rows, not O(group).
-- **A CLIENT-WRITTEN file cannot assume it.** A client's sort order is
-  **advisory** — `schema.sql` says so, and the server never verifies
-  file sortedness. But such a file is bounded by the ingest flush size,
-  so sorting one is bounded by that one file: sort each alone, spill it
-  as a temp run, and stream-merge the runs like any other.
-
-  Note which case carries the bytes now. Under the ladder most input
-  was a previous output being carried up a rung, so most groups were
-  free merges; one-pass compaction consumes each file once, so nearly
-  every input is client-written and the spill path is the ordinary one.
-  The external sort is more work to build than it was, and worth more:
-  it is the only thing that lets a SORTED table reach the target in one
-  rewrite. Note also that the spill
-  needs a scratch directory of its own — compaction streams both ends
-  now (`S3InputFile` / `S3OutputFile`) and touches no local disk, so the
-  per-group temp dir this plan was written to borrow no longer exists.
-
-That removes the heap bound on group size entirely, and with it this
-knob, the row ceiling and the `heap_budget` skip. Until it lands, the
-levers are the pod ladder above and dropping a table's sort order (which
-moves it to the streaming path, where group size costs no heap at all).
+The replacement is an **external merge sort**, tracked as hoglake#134.
+It would remove the heap bound on group size entirely, and with it this
+knob, the row ceiling and the `heap_budget` skip; it is the only thing
+that lets a SORTED table reach the target in one rewrite. Until it
+lands, the levers are the pod ladder below and dropping a table's sort
+order (which moves the table to the streaming path, where group size
+costs no heap at all).
 
 ### Sizing it against the pod
 
@@ -1035,7 +1054,9 @@ Compaction streams both ends now (`S3InputFile` / `S3OutputFile`), so
 its transport costs one 8 MiB readahead buffer and one 16 MiB part
 buffer — flat, whatever the group holds. The table below still assumes
 the old peak, so every row is conservative by roughly 130 MiB; nobody
-has re-derived it or claimed the headroom.
+has re-derived it or claimed the headroom. Gigahog runs the last row:
+the chart sets `sortedHeapBytes: 17179869184` (16 GiB) on the
+`gigahog-maintenance` pod and cites this table's 31% figure for it.
 
 Bigger pods buy proportionally bigger groups. Holding peak at ~45% of a
 heap that is 70% of the pod, for a ten-column event table:
@@ -1167,7 +1188,10 @@ Coverage is 100% of live layouts, not just the easy ones:
   physical type skips the group (`unconvertible_schema` — detected
   before any bytes are staged); the unproducible set is narrowings,
   physical mismatches, decimal-scale changes, non-micros time(stamp)
-  units, nested inputs, and INT96.
+  units, and INT96. Nested containers are NOT in it: list/struct/map are
+  copied through recursively, so a nested table compacts like any other,
+  and an input whose nested SHAPE disagrees with the live column is
+  `unconvertible_schema` rather than a guess.
 - **Aborted uploads can't orphan objects.** Before uploading, the
   output path pre-registers as an undrained `hog_file_removal` row
   (reason `compaction_staging`) — a claim ticket. A successful group
@@ -1253,6 +1277,44 @@ The catalog reports on itself instead of waiting for ops SQL:
   with (so the ranking predicts what a sweep would do), plus
   stale-spec-group counts. The webui's compaction-debt page renders
   this.
+- **`GET .../tables/{t}/partitions`** — one row per (spec vintage,
+  partition value tuple) with the file, byte, deletion-vector, row and
+  compaction-debt measures **as the maintenance sampler last measured
+  them**. It reads `hog_maintenance_summary_tier`, so it walks no
+  manifest, takes no lock and adds nothing to a commit — which is also
+  why it accepts no `snapshot`/`at_timestamp`: there is exactly one
+  snapshot it can answer at, and the response names it as
+  `sampled_snapshot_id`. A catalog with no published sample answers 200
+  with `sampled_at: null`, `total: 0` and no partitions — the table
+  exists, the measurement does not. Sorting, `limit`/`offset` and a
+  repeatable `filter` of `key_index:text` (matched against the DECODED
+  value, so `0:2026-09` is a month) are query parameters; a table with
+  more sampled groups than the listing will materialise is 422, because
+  it decodes, sorts and pages in memory. The webui's partitions tab
+  renders this.
+- **`GET .../tables/{t}/partitions/values`** — the partition fields at
+  the read snapshot, each with the distinct STORED, transformed values
+  it takes across the live files (most-frequent first, capped at 500;
+  `truncated` marks a field past the cap). This one is a live read, not
+  a sample: it takes `snapshot`/`at_timestamp`, and the values are
+  returned verbatim for a client to offer as a filter and echo back as
+  `partition=key_index:value` on `GET .../files`.
+- **`GET .../maintenance/status`** and **`GET .../maintenance/runs`**,
+  with instance-wide twins at **`GET /maintenance/status`** and
+  **`GET /maintenance/runs`** — the read side of `hog_maintenance_run`
+  (the ledger every background sweep and manual trigger writes) plus the
+  persisted summaries. `status` is per-task: loop cadence, the task's own
+  backlog keys (hydrator `pending_files`/`failed_files`, expiry's
+  retention and floors, cleanup `queued_removals` and
+  `oldest_queued_age_seconds`, compaction `small_files`/`target_bytes`,
+  verify nothing) and its most recent recorded run. Counts are absent
+  until a sample exists — unknown, not zero. `runs` pages the ledger
+  newest-first on an exclusive `before` run_id cursor, optionally
+  filtered by `task` (422 on an unknown one), 50 per page and capped at
+  500. Neither queries the manifest. The instance-wide pair is the
+  ops feed: same conventions, run rows carry their catalog name, and
+  `/maintenance/status` pages catalogs on an exclusive `after` name
+  cursor.
 - **`GET /consumers`** — every consumer in the catalog with per-table
   offsets, table names resolved, dropped tables flagged (offsets
   outlive drops by design — an offset on a dropped table is data, not
@@ -1261,8 +1323,8 @@ The catalog reports on itself instead of waiting for ops SQL:
   display name (`HOGLAKE_INSTANCE_NAME`, e.g. "GigaHog"), shown in the
   webui topbar so nobody mistakes prod for dev.
 - **`GET /export`** — the DR manifest (snapshot range + live-file
-  manifest + consumer offsets, consistent at head) is fully specified
-  in the OpenAPI and answers **501** until built (gaps.md B5).
+  manifest + consumer offsets, consistent at head) is specified, not yet
+  implemented — see that section below.
 
 ### Observability
 
@@ -1332,6 +1394,29 @@ transaction (`observability/`):
   one structured JSON line on the `hoglake.audit` logger — actor,
   action, object, outcome, request id — strictly *after* its
   transaction resolves. Request ids ride `X-Request-Id` in and out.
+- **`GET /v1/database/health`** (`persistence/DatabaseHealthRepo.kt`,
+  `service/DatabaseHealthService.kt`): the health of the Postgres
+  INSTANCE behind the catalog, read from the statistics views, plus
+  findings that interpret those numbers for this schema. It reads
+  catalog and `pg_stat_*` relations only — never a `hog_*` table — so
+  its cost does not scale with the manifest, and it carries NO query
+  text, because `pg_stat_activity.query` holds literal values (object
+  paths, identifiers, author strings) and only durations and counts may
+  cross the wire. Each finding is a `severity` (`INFO`, `WARN` or
+  `CRITICAL`, sorted worst-first) plus a stable `code`, a `detail` of
+  what was measured and a `hoglake_impact` saying why it matters HERE —
+  the second half is the reason this endpoint exists rather than a link
+  to a generic Postgres dashboard. The CRITICAL-capable codes are
+  `invalid_indexes`, `inactive_replication_slot`,
+  `prepared_transactions`, `commit_lock_held`, `autovacuum_disabled`,
+  `xid_wraparound` and `idle_in_transaction` (which escalates from WARN
+  to CRITICAL with the age of the oldest idle transaction, because an
+  open transaction pins the vacuum horizon for the whole database and
+  every expiry delete and compaction supersession stays unreclaimable
+  until it ends). The WARN set is `long_transaction`, `lock_wait`,
+  `dead_tuples`, `never_analyzed`, `sequential_scans`, `unused_indexes`,
+  `cache_hit_ratio`, `connection_saturation` and
+  `checkpoints_requested`; `temp_files` is INFO.
 - **Health**: `/healthz` proves the catalog is reachable (`SELECT 1`
   on the probe's OWN one-connection pool, bounded four ways by
   `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS` — Hikari `connectionTimeout`,
@@ -1359,8 +1444,9 @@ running), and structured, bounded shutdown (cancel + join, 5s cap).
 DDL) → assemble → start loops → serve.
 
 **Every route handler's blocking work runs off the Netty event loop**
-(`api/BlockingDispatch.kt`, #218): one interceptor at the `Plugins`
-phase, installed once by `App.module`, runs the rest of the pipeline
+(`api/BlockingDispatch.kt`, #218): one interceptor in its own phase,
+inserted after `Plugins` so it never sheds ahead of `RequestId`,
+installed once by `App.module`, runs the rest of the pipeline
 under a bounded dispatcher of `HOGLAKE_REQUEST_THREADS` threads
 (default `HOGLAKE_DB_POOL_SIZE`). `/healthz`, `/livez` and `/metrics`
 bypass it, matched on a path normalised for trailing slashes, so a full
@@ -1414,13 +1500,11 @@ catalogs that vanish retire with the next sweep (`MultiGauge`, whole
 row set replaced), like every other per-catalog gauge.
 
 Like compaction, the interval defaults to **0 — off** and turning it
-on is a per-workload ops decision: in Gigahog the server workload is
-expected to leave it at `0` while the maintenance workload sets
-`3600000`, so the aggregate pass never runs on the pods serving the
-commit tail. That split lives in PostHog/charts and has not landed
-yet; until it does, every workload inherits the default and the sweep
-runs nowhere — the manual trigger still works everywhere. A default of
-an hour here would have run it on every replica instead.
+on is a per-workload ops decision: in Gigahog the server workload leaves
+it at `0` while the maintenance workload sets `3600000`, so the
+aggregate pass never runs on the pods serving the commit tail. The chart
+renders that split today. A default of an hour here would have run it on
+every replica instead.
 
 ### Specified, not yet implemented
 
@@ -1429,6 +1513,10 @@ a table's changefeed and produces rows to Kafka, its progress tracked
 as a first-class consumer offset (so the retention floor protects
 unpublished ranges automatically). Fully specified in the OpenAPI
 (endpoints return 501) so clients can build against the shape.
+
+**`GET /catalogs/{c}/export`** — the DR manifest (snapshot range +
+live-file manifest + consumer offsets, consistent at head), likewise
+fully specified in the OpenAPI and answering 501 until built.
 
 ## Operational endpoints and probe contracts
 
@@ -1440,6 +1528,13 @@ Served at the root (not under `/v1`), documented in
 | `GET /livez` | Process liveness only — never touches the database | **liveness** (a database outage must not restart pods) |
 | `GET /healthz` | Readiness: the catalog must answer (`SELECT 1` on the probe's own connection, bounded by `HOGLAKE_HEALTH_PROBE_TIMEOUT_MS`; the zombie-server incident is why it touches the database at all, #218 is why it no longer touches the request pool) | **readiness** (an unready pod leaves the Service) |
 | `GET /metrics` | Prometheus text exposition | scrape target, never a probe |
+
+One more read-only operational endpoint is served under `/v1`, not the
+root:
+
+| Endpoint | What | Kubernetes probe |
+|---|---|---|
+| `GET /v1/database/health` | Postgres-instance health from the statistics views, with interpreted findings (see Observability) — instance-level, never a `hog_*` read, and carries no query text | never a probe |
 
 The webui container serves its own static `GET /health` (nginx `return
 200`, independent of the SPA fallback and the API proxy) as its probe
@@ -1488,8 +1583,9 @@ container attached to the compose network — as the endpoint.
 
 ## Layout
 
-- `src/main/resources/db/migration/` — Flyway (single squashed V1
-  pre-release; `schema.sql` is the canonical twin, equivalence-tested).
+- `src/main/resources/db/migration/` — Flyway. `V1__init.sql` is frozen
+  as of v1.0.0 and the chain is append-only from there; V22 is the
+  latest. `schema.sql` is the canonical twin, equivalence-tested.
 - `src/main/kotlin/com/posthog/hoglake/`
   - `model/` — domain types (mirror the OpenAPI schemas).
   - `persistence/` — JDBI repositories; all SQL parameterized.

@@ -119,6 +119,13 @@ snapshot it read, and the server refuses it if a conflicting change landed in
 between — a typed refusal naming the reason, not a message to pattern-match.
 The serialization point is a per-catalog advisory lock held for milliseconds.
 
+Three refusals share one recovery: 409 `ddl_since_read_snapshot` (DDL landed on
+a touched table after the request's `read_snapshot`), 409 `table_recreated` (the
+incarnation named by `expected_table_uuid` is no longer the live one) and a 410
+for a `read_snapshot` below the catalog's expiry floor. None is retryable —
+re-read the table and prepare a new request, which is what the 409 bodies say as
+`retry: re-prepare`.
+
 ## Types
 
 The column vocabulary is closed: 27 wire names, enforced identically by the `ColType` enum, the `hog_column.col_type` CHECK and the OpenAPI `ColumnDef.type` enum, which `ScalarTypeParityTest` asserts against each other from their actual files. Bounds are stored in the Iceberg single-value serialization of the **mapped** Iceberg type, never of the hoglake type — that is what keeps manifest generation a mechanical copy. Depth in [docs/iceberg-federation.md](docs/iceberg-federation.md) §2; this is the card, in `ColType` order, with adjacent names sharing a row when they share a mapping.
@@ -150,15 +157,7 @@ The column vocabulary is closed: 27 wire names, enforced identically by the `Col
 - **`json` is string bytes** — same encoding, same comparison — and takes identity partitioning only.
 - **Signed zeros are canonical.** A `float`/`double` lower bound stores `-0.0` and an upper bound `+0.0`. The two are IEEE-equal, but Iceberg's evaluators compare in natural order, where `-0.0 < 0.0`, so the pair (lower `+0.0`, upper `-0.0`) would read as an empty range and prune away a file that holds `0.0`. Every door that stores a bound canonicalizes; the cases are pinned cross-language in `pyhoglake/tests/vectors/bounds_vectors.json`.
 
-**`variant`** is a catalog scalar — one node, one field id, no children — whose parquet storage is nonetheless a group: `metadata` (required) plus `value` and/or `typed_value`, addressed by name, as the variant specification mandates. The field id sits on the group and nothing below it needs one. It has no single-value encoding, so no scalar bounds, no partition transform, no sort-key contract and no promotion in either direction; shredded child statistics are not whole-column statistics and are omitted. Compaction skips a table holding one at any depth, and the rewriter refuses it explicitly. A variant inside a `list`, `struct` or `map` is expressible and means exactly what a top-level one means.
-
-**Containers** are native and one-for-one with Iceberg, element/key/value field ids included. A `list` has exactly one child named `element`; a `map` has exactly two, `key` then `value`, and the key is required; a `struct` has one or more children keeping the user's names. Nesting depth is capped at 8 with a top-level column counting as 1, measured from the graft point — adding a 3-deep struct into a 6-deep one is refused exactly like declaring a 9-deep column — and every DDL path also caps a table at 10,000 column nodes. Statistics are per leaf: a container carries no values and gets no stats row, and a commit shipping one for a container field id is refused by name, while a list's `element`, a map's `key`/`value` and a struct leaf all get counts and bounds like any scalar. A struct leaf is a legal partition or sort source; the container itself and anything beneath a `list` or `map` are refused, each naming which of the two applies.
-
-**Permanent refusals**, each a named 422 rather than "unknown type": `int128` and `uint128` need 39 decimal digits and exceed Iceberg's widest exact numeric, decimal(38); `timetz` and `interval` have no Iceberg mapping; the DuckLake geometry family (`point`, `linestring`, `polygon`, `multipoint`, `multilinestring`, `multipolygon`, `linestring_z`, `geometrycollection`) is out of scope. None of them is a "not yet" — there is no facade story to write.
-
-**Promotion** is the intersection of two sets hoglake does not own: DuckLake's documented promotion table, and Iceberg schema-evolution legality of the induced facade change. That leaves the signed ladder (`int8`→`int16`/`int`/`long`, `int16`→`int`/`long`, `int`→`long`), the unsigned ladder up to `uint32`, and `float`→`double`. Two exclusions are deliberate and cut in opposite directions: anything→`uint64` is DuckLake-legal, but `uint64` maps to decimal(20,0) and int/long→decimal is not an Iceberg evolution; while `uint8`→`int` and `timestamp_s`→`timestamp_ms` lose nothing at all and are absent from DuckLake's table, and a hoglake catalog must never accept DDL a DuckLake client would reject. Containers never promote, in either direction; a struct leaf promotes by the ordinary matrix, since promotion is keyed on field id.
-
-**Transforms** are `identity`, `bucket(n)` (Murmur3, bit-compatible with Iceberg) and `year`/`month`/`day`/`hour`. Bucket sources are a positive allowlist — `int8`, `int16`, `int`, `long`, `uint8`, `uint16`, `decimal`, `date`, `time`, `timestamp`, `timestamptz`, `string`, `uuid`, `binary` — so a new column type is not bucketable until someone decides how it hashes. `boolean`, `float` and `double` are outside the specification's Appendix-B hash domain; `json` has no canonical byte form, so equal documents with different bytes would scatter across partitions; and `uint32`, `uint64`, `timestamp_s`, `timestamp_ms` and `timestamp_ns` are a hash-domain mismatch, because Appendix B hashes the mapped type's representation while the client computes bucket values and the server only accepts the strings it is sent — admitting these needs a client hashing contract and cross-language vectors first. The temporal transforms take `date` and every timestamp precision. pyhoglake's allowlist is pinned set-equal to the server's by a test that parses the Kotlin.
+The `variant`, container, permanent-refusal, promotion and transform rules are stated once, in [docs/iceberg-federation.md](docs/iceberg-federation.md) §2.5-§2.8 and its "Native VARIANT publication" subsection.
 
 ## Compared to DuckLake and Iceberg
 
@@ -216,18 +215,24 @@ loudly rather than reporting numbers it cannot stand behind.
 
 A feature-complete control plane, with a Python client, a replication daemon, a
 management console, a native Trino connector, a DuckDB extension and a
-benchmark harness. Everything is tested; nothing is deployed, authenticated, or
-has touched production data. That last sentence is the roadmap.
+benchmark harness. Everything is tested, and it is deployed as Gigahog in three
+environments — dev, prod-us and prod-eu. Authentication is still out of scope.
 
 Known gaps are tracked as [issues](https://github.com/PostHog/hoglake/issues).
-The larger ones: authentication and tenancy, the Iceberg REST facade (designed,
-unbuilt), a converter from the predecessor's catalogs, and a TLA model check of
-the commit protocol.
+The larger ones: [#240](https://github.com/PostHog/hoglake/issues/240) (every
+commit body kept forever, ~40 GB/day),
+[#235](https://github.com/PostHog/hoglake/issues/235) (the namespace listing
+still aggregates the manifest per table),
+[#233](https://github.com/PostHog/hoglake/issues/233) /
+[#236](https://github.com/PostHog/hoglake/issues/236) (blind partitioned
+appends, unguarded until the server flag flips) and
+[#134](https://github.com/PostHog/hoglake/issues/134) (compaction's in-memory
+sort).
 
 ## Development
 
 ```bash
-just test-all      # the server suite, then the client suites
+just test-all      # the server suite, then the pyhoglake suite
 just lint-all      # ktlint, ruff check and format, mypy
 just dev           # the dev stack plus the server in the foreground
 just --list        # everything, including the per-component recipes
@@ -253,7 +258,6 @@ implementations together.
 | Doc | What |
 |---|---|
 | [docs/iceberg-federation.md](docs/iceberg-federation.md) | What the Iceberg REST facade requires of v1: field ids, type mapping, transforms, delete encoding, bounds |
-| [docs/metadata-schema.md](docs/metadata-schema.md) | The `hog_*` schema inventory and its invariants, mirroring [server/schema.sql](server/schema.sql) |
 | [docs/trino-integration.md](docs/trino-integration.md) | The native connector, and the commit shapes that keep Trino writes a translation away |
 | [docs/operational-notes.md](docs/operational-notes.md) | What hoglake changes operationally and what it does not; sizing, and the ceilings to watch |
 | [docs/fuzzing.md](docs/fuzzing.md) | Property testing and fuzzing: hypothesis, kotest-property, cross-language codec vectors |

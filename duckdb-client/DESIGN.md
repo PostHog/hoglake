@@ -75,7 +75,10 @@ token setting so the slot exists.
 
 Error taxonomy (mirrors pyhoglake `errors.py`): 404 not-found, 409
 conflict (commit conflicts retryable; `"the table was recreated"` in
-the ApiError text marks the incarnation-guard refusal — never retried),
+the ApiError text marks the incarnation-guard refusal — never retried;
+the server now sends the typed code `table_recreated`, so the text grep
+is a fallback for an older server and switching to the code is client
+work),
 410 expired (below the expiry floor; surfaced with the floor detail),
 422 validation (never retried), 503 `commit_queue_timeout` (retryable
 backpressure; honors `Retry-After`). Retries: commit-loop only, default
@@ -343,7 +346,7 @@ are rejected at CREATE/ALTER with a clear error. Column names beginning
 | SQL | Wire |
 |---|---|
 | `CREATE SCHEMA` | POST `/namespaces` |
-| `DROP SCHEMA` | **gap**: no wire op (finding: DELETE `/namespaces/{ns}`) |
+| `DROP SCHEMA` | DELETE `/namespaces/{ns}` (emptiness precondition, no CASCADE; optional `expected_namespace_id` guard) — client work not done |
 | `CREATE TABLE` | POST `/tables` |
 | `CREATE TABLE ... PARTITIONED BY / SORTED BY` | create + one `/alter` (`set_partition_spec` / `set_sort_order`) |
 | `DROP TABLE` | DELETE `/tables/{t}` (no CASCADE, as DuckLake) |
@@ -352,7 +355,7 @@ are rejected at CREATE/ALTER with a clear error. Column names beginning
 | `ALTER TABLE RENAME TO` | `rename_table` |
 | `SET PARTITIONED BY / SORTED BY` | `set_partition_spec` / `set_sort_order` |
 | `CREATE/DROP VIEW` | POST/DELETE `/views` with `dialect: duckdb`; only duckdb-dialect views bind on read, others listed but error on use |
-| `COMMENT ON` | **gap**: no wire support |
+| `COMMENT ON` | `/alter` ops `set_table_comment` / `set_column_comment` / `set_properties` (`versioned-table-metadata-v1`) — client work not done |
 | `SET/DROP NOT NULL`, `SET DEFAULT`, nested-field ops | **gap**: not in `AlterOp` (flat schema, no defaults on the wire) |
 
 Multiple ALTER clauses batch into one `/alter` call (atomic, ordered —
@@ -456,19 +459,30 @@ front door (what it is, how to build it, how to run the live suite).
 See [PARITY.md](PARITY.md) for the per-capability checklist
 (implemented / partial / wire gap / not-carried-over / todo).
 
-## Findings for the server (no server changes made)
+## Findings for the server
 
 1. ~~`/scan` (`ScanFile`) carries no per-file column bounds → no
    file-level zone-map pruning for external engines.~~ **Addressed**
    server-side: opt-in `include=column_stats` (narrowed by
    `stats_fields`) adds per-file bounds to the scan plan. The extension
    does not request them yet (see step 3 above).
-2. No `DELETE /namespaces/{ns}` → `DROP SCHEMA` unimplementable.
+2. ~~No `DELETE /namespaces/{ns}` → `DROP SCHEMA` unimplementable.~~
+   **CLOSED.** `DELETE /catalogs/{c}/namespaces/{ns}` (`dropNamespace`) is
+   a DDL commit that produces a snapshot, with an emptiness precondition
+   (409 for a namespace holding live tables or views, matching
+   `dropTable`'s no-CASCADE position) and an optional
+   `expected_namespace_id` identity guard checked under the commit lock.
+   Binding it to `DROP SCHEMA` is client work.
 3. No staged/transactional DDL commit → DuckDB DDL cannot participate
    in transaction rollback (documented divergence).
 4. `/changes` has no update pre/post-image semantics (append-only v1)
    → `ducklake_table_changes` parity is partial by wire design.
-5. No comment/tag storage for tables/columns → `COMMENT ON` gap.
+5. ~~No comment/tag storage for tables/columns → `COMMENT ON` gap.~~
+   **CLOSED** by the `versioned-table-metadata-v1` capability:
+   `set_table_comment`, `set_column_comment`, `set_properties` and
+   `add_column_with_metadata` are AlterOps, and `Column` and `TableInfo`
+   carry versioned `comment` fields. Binding `COMMENT ON` to them is
+   client work.
 6. `/namespaces` and `.../tables` listings are head-only (no
    `snapshot=` param) → catalog listings inside a pinned transaction
    can drift from the pinned snapshot (per-table fetches are pinned).
@@ -499,14 +513,21 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    SCHEMA carries the reserved id without the catalog saying so —
    caught at compaction, and by this client at read time, but never at
    registration.
-10. No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
-   attach can never produce a client-side snapshot id (reads stay
-   consistent because the server re-resolves the same timestamp to the
-   same snapshot; `hoglake_current_snapshot` errors instead of lying).
-   Returning the resolved snapshot id on time-travel responses (or a
-   resolve endpoint) would close this.
+10. ~~No timestamp→snapshot resolution on the wire: a SNAPSHOT_TIME
+   attach can never produce a client-side snapshot id.~~ **CLOSED** by
+   exactly the proposed fix: `TableInfo.read_snapshot_id` is required and
+   always present — the catalog head when the request named no
+   `snapshot`/`at_timestamp`, the resolved snapshot otherwise. Making
+   `hoglake_current_snapshot` answer from it under a SNAPSHOT_TIME pin,
+   instead of erroring, is client work.
 11. Environment note (historical): earlier rounds found the dev
    stack's hydrator hydrating nothing (files stuck `pending`,
    compaction starved). As of 2026-09-12 the stack hydrates and
    compacts again; the fixture force-compacts `points` and the
    suite reads real compaction output (explicit `_hog_row_id`).
+12. Partitioned INSERT sends no `read_snapshot`, so its commits are
+   exactly the blind-partitioned-append shape
+   `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` will 422 once the server
+   flag flips. `storage/hoglake_transaction.cpp` and
+   `storage/hoglake_insert.cpp` must start carrying one first
+   (hoglake#236).
