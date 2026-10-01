@@ -1,6 +1,8 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
+import com.posthog.hoglake.model.ColumnDef
 import org.apache.parquet.column.Encoding
 import org.apache.parquet.column.statistics.Statistics
 import org.apache.parquet.hadoop.metadata.BlockMetaData
@@ -44,12 +46,18 @@ class FooterStatsTest {
 
     private fun schema(vararg fields: Type): MessageType = MessageType("root", fields.toList())
 
-    /** Statistics with the given raw min/max bytes and null count (null = unknown). */
+    /**
+     * Statistics with the given raw min/max bytes, null count (null =
+     * unknown) and NaN count (null = unset, which is what every footer
+     * written before parquet-format added the field says and what
+     * `Statistics.Builder` defaults to).
+     */
     private fun stats(
         type: PrimitiveType,
         min: ByteArray?,
         max: ByteArray?,
         nulls: Long? = 0L,
+        nans: Long? = null,
     ): Statistics<*> {
         val b = Statistics.getBuilderForReading(type)
         if (min != null && max != null) {
@@ -57,6 +65,7 @@ class FooterStatsTest {
             b.withMax(max)
         }
         if (nulls != null) b.withNumNulls(nulls)
+        if (nans != null) b.withNanCount(nans)
         return b.build()
     }
 
@@ -292,7 +301,60 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `an ALL-NULL row group contributes nothing and leaves the valued chunks' bounds alone`() {
+        // THE SPARSE-COLUMN BUG. parquet-java reports
+        // `hasNonNullValue == false` for two different chunks: one whose
+        // min/max it refused, and one that simply holds no non-null
+        // value. Treating them alike nulled a whole column's bounds the
+        // first time ANY row group was all-null — and a compaction
+        // output is many 128 MiB row groups, so for a sparse column that
+        // was every output, every time. An all-null chunk has no values,
+        // so it has nothing to say about the range: skip it.
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m =
+            meta(
+                schema(a),
+                10,
+                // All ten values null: numNulls == the chunk's valueCount.
+                listOf(chunk(a, 10, stats(a, null, null, nulls = 10), compressedSize = 40)),
+                listOf(chunk(a, 10, stats(a, le(5L), le(9L), nulls = 2), compressedSize = 60)),
+            )
+        with(agg(m, CatalogColumn(1, "a", ColType.LONG, null))[1L]!!) {
+            assertThat(valueCount).describedAs("both chunks' values are counted").isEqualTo(20)
+            assertThat(nullCount).describedAs("both chunks' nulls are counted").isEqualTo(12)
+            assertThat(sizeBytes).isEqualTo(100)
+            assertThat(lowerBound)
+                .describedAs("the valued chunk's minimum, not NULL")
+                .isEqualTo(le(5L))
+            assertThat(upperBound).isEqualTo(le(9L))
+        }
+    }
+
+    @Test
+    fun `a column whose EVERY chunk is all-null has no bounds, because it has no values`() {
+        val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
+        val m =
+            meta(
+                schema(a),
+                10,
+                listOf(chunk(a, 10, stats(a, null, null, nulls = 10))),
+                listOf(chunk(a, 5, stats(a, null, null, nulls = 5))),
+            )
+        with(agg(m, CatalogColumn(1, "a", ColType.LONG, null))[1L]!!) {
+            assertThat(valueCount).isEqualTo(15)
+            assertThat(nullCount).isEqualTo(15)
+            assertThat(lowerBound).describedAs("no value, so no bound — not a guess").isNull()
+            assertThat(upperBound).isNull()
+        }
+    }
+
+    @Test
     fun `one chunk without min-max poisons bounds for the whole file`() {
+        // The OTHER side of the all-null rule above: this chunk's ten
+        // values are all non-null (null_count 0) and it still states no
+        // min/max, so it holds values this footer does not bound — and a
+        // bound that covers only part of a file would make a pruner drop
+        // rows that are there.
         val a = leaf("a", PrimitiveType.PrimitiveTypeName.INT64)
         val m =
             meta(
@@ -647,6 +709,135 @@ class FooterStatsTest {
     }
 
     @Test
+    fun `a decimal column with NO declared scale reads a scale-0 leaf`() {
+        // `type_params` carrying only a precision is ordinary — it is
+        // pyhoglake's shape for an integral decimal, it is what
+        // BoundWire.scaleOf reads as 0, and it is what ParquetRewriter
+        // STAMPS as `decimalType(0, precision)` on a compaction output's
+        // leaf. Reading a null catalog scale as "unknown" dropped the
+        // bounds of every such column on both this path and
+        // compaction's, for a scale the file and the catalog agreed on.
+        val d =
+            leaf(
+                "d",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.decimalType(0, 10),
+            )
+        val m = meta(schema(d), 10, listOf(chunk(d, 10, stats(d, byteArrayOf(-3), byteArrayOf(11)))))
+        val out = agg(m, CatalogColumn(1, "d", ColType.DECIMAL, decimalScale = null))
+        assertThat(out[1L]!!.lowerBound).isEqualTo(byteArrayOf(-3))
+        assertThat(out[1L]!!.upperBound).isEqualTo(byteArrayOf(11))
+    }
+
+    @Test
+    fun `a decimal column with no declared scale still refuses a SCALED leaf`() {
+        // The default is 0, not "whatever the file says": a leaf
+        // declaring scale 2 under a column the catalog says is scale 0
+        // is a real mismatch, and its bounds mean something else.
+        val d =
+            leaf(
+                "d",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.decimalType(2, 10),
+            )
+        val m = meta(schema(d), 10, listOf(chunk(d, 10, stats(d, byteArrayOf(1), byteArrayOf(2)))))
+        val out = agg(m, CatalogColumn(1, "d", ColType.DECIMAL, decimalScale = null))
+        assertThat(out[1L]!!.lowerBound).isNull()
+        assertThat(out[1L]!!.upperBound).isNull()
+    }
+
+    // ---- parquet's own serialization limit ---------------------------------
+
+    @Test
+    fun `a chunk whose min and max are too big for parquet to WRITE drops bounds, keeps counts`() {
+        // parquet-java keeps the full min/max in the in-memory
+        // ParquetMetadata but refuses to serialize a chunk's statistics
+        // at all once `minBytes.length + maxBytes.length` reaches
+        // ParquetMetadataConverter.MAX_STATS_SIZE (4096). The hydrator
+        // reads files, so it never SEES such a pair; compaction reads
+        // the writer's in-memory footer, so it did — and would have
+        // stored bounds the file itself does not carry, which a later
+        // rehydrate would replace with NULL.
+        val s =
+            leaf(
+                "s",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.stringType(),
+            )
+        val lo = ByteArray(2_100) { 'a'.code.toByte() }
+        val hi = ByteArray(2_100) { 'b'.code.toByte() }
+        val m = meta(schema(s), 10, listOf(chunk(s, 10, stats(s, lo, hi, nulls = 1))))
+        with(agg(m, CatalogColumn(1, "s", ColType.STRING, null))[1L]!!) {
+            assertThat(valueCount).isEqualTo(10)
+            assertThat(nullCount).isEqualTo(1)
+            assertThat(lowerBound).isNull()
+            assertThat(upperBound).isNull()
+        }
+    }
+
+    @Test
+    fun `a chunk one byte UNDER parquet's limit keeps its bounds`() {
+        // 2047 + 2048 = 4095, which `Statistics.isSmallerThan(4096)`
+        // accepts — so the footer will carry this pair and so does the
+        // stats row. The gate is the limit, not a conservative guess.
+        val s =
+            leaf(
+                "s",
+                PrimitiveType.PrimitiveTypeName.BINARY,
+                logical = LogicalTypeAnnotation.stringType(),
+            )
+        val lo = ByteArray(2_047) { 'a'.code.toByte() }
+        val hi = ByteArray(2_048) { 'b'.code.toByte() }
+        val m = meta(schema(s), 10, listOf(chunk(s, 10, stats(s, lo, hi, nulls = 0))))
+        with(agg(m, CatalogColumn(1, "s", ColType.STRING, null))[1L]!!) {
+            assertThat(lowerBound).isEqualTo(lo)
+            assertThat(upperBound).isEqualTo(hi)
+        }
+    }
+
+    // ---- nan_count ---------------------------------------------------------
+
+    @Test
+    fun `nan_count sums across chunks when every chunk carries one`() {
+        // `Statistics.nan_count` is real (parquet-java 1.18.1,
+        // isNanCountSet/getNanCount) and only float/double statistics
+        // ever set it. This surface used to hard-code null, which cost
+        // the one count Iceberg defines for floating-point columns on
+        // every file either door produced.
+        val d = leaf("d", PrimitiveType.PrimitiveTypeName.DOUBLE)
+        val m =
+            meta(
+                schema(d),
+                20,
+                listOf(chunk(d, 10, stats(d, le(1.0), le(2.0), nulls = 0, nans = 3))),
+                listOf(chunk(d, 10, stats(d, le(0.5), le(4.0), nulls = 1, nans = 2))),
+            )
+        with(agg(m, CatalogColumn(1, "d", ColType.DOUBLE, null))[1L]!!) {
+            assertThat(nanCount).isEqualTo(5)
+            assertThat(nullCount).isEqualTo(1)
+            assertThat(lowerBound).isEqualTo(le(0.5))
+            assertThat(upperBound).isEqualTo(le(4.0))
+        }
+    }
+
+    @Test
+    fun `one chunk with no nan_count drops the whole column's`() {
+        // A partial sum of a count is worse than no count: it would
+        // understate, and nothing downstream could tell. pyarrow and
+        // ClickHouse write no nan_count at all, so this is the ordinary
+        // shape for a foreign file.
+        val d = leaf("d", PrimitiveType.PrimitiveTypeName.DOUBLE)
+        val m =
+            meta(
+                schema(d),
+                20,
+                listOf(chunk(d, 10, stats(d, le(1.0), le(2.0), nulls = 0, nans = 3))),
+                listOf(chunk(d, 10, stats(d, le(0.5), le(4.0), nulls = 0, nans = null))),
+            )
+        assertThat(agg(m, CatalogColumn(1, "d", ColType.DOUBLE, null))[1L]!!.nanCount).isNull()
+    }
+
+    @Test
     fun `uuid fixed16 bounds pass through`() {
         val lo = ByteArray(16) { 0x00 }
         val hi = ByteArray(16) { 0xAB.toByte() }
@@ -963,6 +1154,45 @@ class FooterStatsTest {
             .isEqualTo(java.math.BigInteger.ONE.shiftLeft(63).toByteArray())
         assertThat(out[1L]!!.upperBound)
             .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+    }
+
+    @Test
+    fun `uint64 bounds merge across row groups by MAGNITUDE, not as signed longs`() {
+        // The cross-chunk merge is where a uint64's representation
+        // earns its keep: the decode produces a BigInteger in
+        // [0, 2^64) precisely so that the min/max reduction over row
+        // groups compares magnitudes. Read as signed longs, everything
+        // at or above 2^63 is negative, so the LOWER bound here would
+        // come back as 2^63+10 — above half the file's values, which is
+        // the shape a pruner reads as "these rows are not here".
+        //
+        // (This replaces a `compareValues`-level test; see
+        // IcebergSingleValueTest for the comparator's own contract.)
+        val a =
+            leaf(
+                "a",
+                PrimitiveType.PrimitiveTypeName.INT64,
+                logical = LogicalTypeAnnotation.intType(64, false),
+            )
+        val m =
+            meta(
+                schema(a),
+                20,
+                // 7 .. 2^63 (Long.MIN_VALUE's bit pattern)
+                listOf(chunk(a, 10, stats(a, le(7L), le(Long.MIN_VALUE)))),
+                // 2^63+10 .. 2^64-1
+                listOf(chunk(a, 10, stats(a, le(Long.MIN_VALUE + 10), le(-1L)))),
+            )
+        val out = agg(m, CatalogColumn(1, "a", ColType.UINT64, null))
+        assertThat(out[1L]!!.lowerBound)
+            .describedAs("7, not the signed minimum 2^63+10")
+            .isEqualTo(java.math.BigInteger.valueOf(7).toByteArray())
+        assertThat(out[1L]!!.upperBound)
+            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+        // The counterexample, so neither anchor can be read as a
+        // tautology: both of the second chunk's bounds are negative
+        // longs.
+        assertThat(Long.MIN_VALUE + 10).isNegative()
     }
 
     @Test
@@ -1324,5 +1554,63 @@ class FooterStatsTest {
             .isTrue()
         // And the child that carries none still flags the contract.
         assertThat(FooterStats.missingFieldIds(schema(nested))).isTrue()
+    }
+
+    // ---- Column -> CatalogColumn -------------------------------------------
+    //
+    // Compaction already HOLDS the live columns as `Column` (its rewrite
+    // shape is bound to them), so it converts rather than re-reading
+    // them from hog_column per group. The conversion is what decides
+    // which stats rows a compaction output gets, so it is tested
+    // directly: a dropped recursion step would silently cost every
+    // nested leaf its row, which is exactly the bug the hydrator's own
+    // `columnTypes`-over-top-level-only had.
+
+    @Test
+    fun `asCatalogColumns recurses, so a leaf inside a struct is a column of its own`() {
+        val cols =
+            listOf(
+                Column(1, 0, ColumnDef("id", ColType.LONG, nullable = false)),
+                Column(
+                    2,
+                    1,
+                    ColumnDef("addr", ColType.STRUCT),
+                    listOf(
+                        Column(3, 0, ColumnDef("city", ColType.STRING)),
+                        Column(
+                            4,
+                            1,
+                            ColumnDef("geo", ColType.STRUCT),
+                            listOf(Column(5, 0, ColumnDef("lat", ColType.DOUBLE))),
+                        ),
+                    ),
+                ),
+            )
+        val out = cols.asCatalogColumns()
+        assertThat(out.map { it.fieldId to it.name }).containsExactly(1L to "id", 2L to "addr")
+        assertThat(out[0].children).isEmpty()
+        val addr = out[1]
+        assertThat(addr.type).isEqualTo(ColType.STRUCT)
+        assertThat(addr.children.map { it.fieldId to it.name }).containsExactly(3L to "city", 4L to "geo")
+        // Two levels down, which is where a single non-recursive map
+        // would have stopped.
+        assertThat(addr.children[1].children.single())
+            .isEqualTo(CatalogColumn(5, "lat", ColType.DOUBLE, null))
+    }
+
+    @Test
+    fun `asCatalogColumns reads a declared decimal scale and leaves an absent one null`() {
+        val out =
+            listOf(
+                Column(1, 0, ColumnDef("cents", ColType.DECIMAL, typeParams = mapOf("precision" to 10, "scale" to 2))),
+                Column(2, 1, ColumnDef("bare", ColType.DECIMAL, typeParams = mapOf("precision" to 10))),
+                Column(3, 2, ColumnDef("none", ColType.DECIMAL)),
+            ).asCatalogColumns()
+        assertThat(out.map { it.decimalScale })
+            // Null, not 0: the absent-means-0 default lives in
+            // FooterStats.decodeDecimal, which is the one place both
+            // this producer and the hydrator's own pass through — see
+            // the scale-0-leaf tests above.
+            .containsExactly(2, null, null)
     }
 }

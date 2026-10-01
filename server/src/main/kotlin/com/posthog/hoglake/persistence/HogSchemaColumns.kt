@@ -108,8 +108,11 @@ object HogSchemaColumns {
                     // ScanService.planScan (include=split_offsets) only.
                     "split_offsets",
                 ),
-            // FileRepo stats mappers, Hydrator.upsertStats,
-            // CompactionService.aggregateStats.
+            // FileRepo.columnStatsMapper / scanColumnStatsMapper (the
+            // shared read shapes) and AlterService's promote re-encode on
+            // the read side; CommitService.writeAppends,
+            // Hydrator.upsertStats and CompactionService.commitGroup on
+            // the write side.
             "hog_file_column_stats" to
                 setOf(
                     "catalog_id", "data_file_id", "field_id", "value_count", "null_count",

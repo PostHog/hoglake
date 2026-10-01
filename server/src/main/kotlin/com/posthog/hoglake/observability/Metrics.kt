@@ -164,15 +164,18 @@ object Metrics {
     }
 
     /**
-     * hoglake_stats_repaired_total{source=commit|hydrator|compaction} —
-     * stats rows stored only after StatsSanity had to repair them (an
-     * undecodable or inverted bound dropped, an impossible count
-     * clamped).
+     * hoglake_stats_repaired_total{source=commit|hydrator} — stats rows
+     * stored only after StatsSanity had to repair them (an undecodable
+     * or inverted bound dropped, an impossible count clamped).
      *
-     * `compaction` is the one that can fire on HISTORY: it repairs the
-     * input rows it merges, which may predate the rule entirely, so a
-     * standing nonzero count there means old malformed rows are still
-     * being read rather than that something is writing new ones.
+     * `commit` is a client's shipped `column_stats`; `hydrator` is a
+     * footer, including a COMPACTION OUTPUT's — compaction derives its
+     * output's stats with FooterStats.aggregate, whose own
+     * `FooterStats.sane` is the door, so a repair on a compacted file
+     * reports as `hydrator`. There is no longer a `compaction` source at
+     * all: nothing re-reads and re-merges the inputs' stored rows, so
+     * the one surface that could repair HISTORY is gone (a backfill of
+     * historical malformed rows remains a separate operation).
      *
      * Nonzero means a WRITER is producing metadata its own data
      * contradicts. Silence here is the normal state; a rising line is a

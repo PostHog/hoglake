@@ -1,6 +1,7 @@
 package com.posthog.hoglake.hydrator
 
 import com.posthog.hoglake.model.ColType
+import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.maxUnsignedParquetWidth
@@ -8,6 +9,7 @@ import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.apache.parquet.column.statistics.Statistics
+import org.apache.parquet.format.converter.ParquetMetadataConverter
 import org.apache.parquet.hadoop.metadata.BlockMetaData
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.schema.GroupType
@@ -36,6 +38,35 @@ data class CatalogColumn(
 )
 
 /**
+ * A materialized [Column] forest as [FooterStats] wants it.
+ *
+ * The hydrator builds its [CatalogColumn]s straight out of `hog_column`
+ * because that is all it has; compaction already HOLDS the same columns
+ * as `Column` (its rewrite shape is bound to them), so it converts
+ * rather than re-reading them per group. Recursive, because a leaf
+ * inside a struct/list/map is what a stats row is keyed on.
+ *
+ * `decimalScale` is `type_params.scale` when the map carries one and
+ * NULL when it does not — the same shape the hydrator's own reader
+ * produces from the jsonb column. It is not a parity claim about
+ * [com.posthog.hoglake.compaction.ParquetRewriter], which reads the
+ * same key but defaults an absent scale to 0 on the spot; the default
+ * lives in [FooterStats.decodeDecimal] instead, so every producer of a
+ * [CatalogColumn] agrees with the rewriter without having to remember
+ * to.
+ */
+fun List<Column>.asCatalogColumns(): List<CatalogColumn> =
+    map { col ->
+        CatalogColumn(
+            fieldId = col.fieldId,
+            name = col.def.name,
+            type = col.def.type,
+            decimalScale = (col.def.typeParams?.get("scale") as? Number)?.toInt(),
+            children = col.children.asCatalogColumns(),
+        )
+    }
+
+/**
  * Pure footer-to-stats aggregation: takes a parquet footer
  * ([ParquetMetadata], parquet-java — the project's one parquet library)
  * and the table's live catalog columns, and produces per-field
@@ -48,11 +79,15 @@ data class CatalogColumn(
  * field ids lose rename-safety, and [missingFieldIds] flags them for
  * the rename guard).
  *
- * Bounds are only produced when every column chunk contributes reliable
- * statistics (present with a decodable min/max under the catalog type,
- * not NaN; parquet-java itself refuses unreliable pre-TYPE_DEFINED_ORDER
- * deprecated min/max at footer decode). Anything else leaves the bounds
- * NULL — never guessed.
+ * Bounds are the min/max over the chunks that HOLD VALUES, and are
+ * produced only when every such chunk states them reliably (a decodable
+ * min/max under the catalog type, not NaN, small enough that parquet
+ * writes it to the footer at all; parquet-java itself refuses unreliable
+ * pre-TYPE_DEFINED_ORDER deprecated min/max at footer decode). One chunk
+ * that holds values and does not state them leaves the column's bounds
+ * NULL — never guessed. An ALL-NULL chunk is not such a chunk: it has
+ * nothing to bound, so it is skipped rather than allowed to null the
+ * column (see [ChunkBounds]).
  */
 object FooterStats {
     private val log = KotlinLogging.logger {}
@@ -809,6 +844,8 @@ object FooterStats {
         var nullCountKnown = true
         var sizeBytes = 0L
         var boundsOk = true
+        var nanCount = 0L
+        var nanCountKnown = true
         var min: Any? = null
         var max: Any? = null
         var chunks = 0
@@ -832,14 +869,23 @@ object FooterStats {
                     nullFree -> Unit
                     else -> nullCountKnown = false
                 }
+                // nan_count is per-chunk and optional, so the file's
+                // total is only knowable when EVERY chunk carries one —
+                // one silent chunk and the sum would understate, which
+                // for a count a pruner reads is worse than absence.
+                if (st != null && st.isNanCountSet) nanCount += st.nanCount else nanCountKnown = false
                 if (boundsOk) {
-                    val bounds = chunkBounds(col, leaf, st)
-                    if (bounds == null) {
-                        boundsOk = false
-                    } else {
-                        val (lo, hi) = bounds
-                        if (min == null || compare(col.type, lo, min!!) < 0) min = lo
-                        if (max == null || compare(col.type, hi, max!!) > 0) max = hi
+                    when (val bounds = chunkBounds(col, leaf, st, chunk.valueCount)) {
+                        // The chunk holds no values at all, so it has
+                        // nothing to say about the column's range and
+                        // must not be allowed to say "unknown" either.
+                        ChunkBounds.NoValues -> Unit
+                        ChunkBounds.Unreliable -> boundsOk = false
+                        is ChunkBounds.Of -> {
+                            val (lo, hi) = bounds
+                            if (min == null || compare(col.type, lo, min!!) < 0) min = lo
+                            if (max == null || compare(col.type, hi, max!!) > 0) max = hi
+                        }
                     }
                 }
             }
@@ -864,30 +910,108 @@ object FooterStats {
             fieldId = col.fieldId,
             valueCount = valueCount,
             nullCount = nullCount,
-            // Parquet footers carry no NaN counts; honest null over a guess.
-            nanCount = null,
+            // Parquet DOES carry a NaN count: `Statistics.nan_count`,
+            // read back through `isNanCountSet`/`getNanCount`
+            // (parquet-java 1.18.1). Only float/double statistics ever
+            // set one, so every other column still answers null, and so
+            // does a float/double file from a writer that omitted it
+            // (pyarrow, ClickHouse) — honest null over a guess, but no
+            // longer null when the footer actually knows.
+            nanCount = if (nanCountKnown) nanCount else null,
             sizeBytes = sizeBytes,
             lowerBound = if (boundsOk && min != null) encodeBound(col.type, min!!) else null,
             upperBound = if (boundsOk && max != null) encodeBound(col.type, max!!) else null,
         )
     }
 
-    /** Decoded (lower, upper) for one chunk, or null when unreliable. */
+    /**
+     * What one column chunk contributes to its column's bounds. Three
+     * answers, not two, and the third is the one a two-valued version
+     * got wrong: "I hold no values" is not "I do not know my range".
+     */
+    private sealed interface ChunkBounds {
+        /** The chunk's decoded (lower, upper). */
+        data class Of(val lower: Any, val upper: Any) : ChunkBounds
+
+        /**
+         * The chunk is ALL NULL: it has no non-null minimum because it
+         * has no non-null values, so it bounds nothing and poisons
+         * nothing. The column's bounds are the min/max over the chunks
+         * that DO hold values, and null only when no chunk does.
+         */
+        data object NoValues : ChunkBounds
+
+        /**
+         * The chunk may hold values whose range this footer does not
+         * state (or states unusably). The column's bounds go NULL,
+         * because a bound that covers only part of a file is not a
+         * bound — a pruner would drop rows that are there.
+         */
+        data object Unreliable : ChunkBounds
+    }
+
+    /**
+     * One chunk's contribution to its column's bounds.
+     *
+     * [chunkValueCount] is `ColumnChunkMetaData.valueCount`, the only
+     * thing that separates the two reasons parquet-java reports
+     * `hasNonNullValue == false`: a chunk whose null count equals its
+     * value count is ALL NULL (it has no minimum because it has no
+     * values), and any other such chunk had its min/max withheld or
+     * refused. Conflating them cost the bounds of every sparse column on
+     * every compaction output: an output is many 128 MiB row groups
+     * (`ParquetRewriter.newWriter` sets no block size, so
+     * `ParquetWriter.DEFAULT_BLOCK_SIZE`), and one all-null row group
+     * nulled the whole column.
+     */
     private fun chunkBounds(
         col: CatalogColumn,
         leaf: Leaf,
         st: Statistics<*>?,
-    ): Pair<Any, Any>? {
-        // hasNonNullValue is false when the footer carried no reliable
-        // min/max (parquet-java already dropped deprecated min/max whose
-        // sort order is untrustworthy) or the chunk was all-null.
-        if (st == null || !st.hasNonNullValue()) return null
-        val rawMin = st.minBytes ?: return null
-        val rawMax = st.maxBytes ?: return null
-        val lo = decode(col, leaf, rawMin, upper = false) ?: return null
-        val hi = decode(col, leaf, rawMax, upper = true) ?: return null
-        if (isNan(lo) || isNan(hi)) return null
-        return lo to hi
+        chunkValueCount: Long,
+    ): ChunkBounds {
+        // No statistics object, or one carrying nothing at all
+        // (`isEmpty` = neither a min/max NOR a null count): the chunk's
+        // range is simply unstated.
+        if (st == null || st.isEmpty) return ChunkBounds.Unreliable
+        if (!st.hasNonNullValue()) {
+            // A null count that accounts for every value in the chunk is
+            // the all-null chunk. Otherwise the chunk holds values and
+            // the footer declined to bound them — parquet-java drops
+            // deprecated min/max whose sort order it cannot trust, and a
+            // float/double chunk of nothing but NaNs lands here too.
+            return if (st.isNumNullsSet && st.numNulls == chunkValueCount) {
+                ChunkBounds.NoValues
+            } else {
+                ChunkBounds.Unreliable
+            }
+        }
+        val rawMin = st.minBytes ?: return ChunkBounds.Unreliable
+        val rawMax = st.maxBytes ?: return ChunkBounds.Unreliable
+        // BOUNDS THIS FILE'S OWN FOOTER DOES NOT CARRY ARE NOT BOUNDS.
+        // parquet-java keeps the full min/max in the in-memory
+        // ParquetMetadata but refuses to SERIALIZE a chunk's statistics
+        // once `minBytes.length + maxBytes.length` reaches
+        // ParquetMetadataConverter.MAX_STATS_SIZE
+        // (`Statistics.isSmallerThan`, and with the default
+        // `statisticsTruncateLength` of Integer.MAX_VALUE nothing is
+        // truncated first). Compaction reads the writer's in-memory
+        // footer, so without this it would store multi-KB bounds that
+        // re-reading the file can never reproduce — and a later
+        // rehydrate would replace them with NULL. Refuse them on both
+        // paths so the two agree.
+        if (rawMin.size.toLong() + rawMax.size.toLong() >= ParquetMetadataConverter.MAX_STATS_SIZE) {
+            log.debug {
+                "column ${col.name} (field ${col.fieldId}) has a chunk whose min/max " +
+                    "(${rawMin.size} + ${rawMax.size} bytes) exceeds parquet's MAX_STATS_SIZE and so " +
+                    "is not written to the footer at all; skipping bounds"
+            }
+            return ChunkBounds.Unreliable
+        }
+        val lo = decode(col, leaf, rawMin, upper = false) ?: return ChunkBounds.Unreliable
+        val hi = decode(col, leaf, rawMax, upper = true) ?: return ChunkBounds.Unreliable
+        if (isNan(lo) || isNan(hi)) return ChunkBounds.Unreliable
+        return ChunkBounds.Of(lo, hi)
     }
 
     private fun isNan(v: Any): Boolean = (v is Float && v.isNaN()) || (v is Double && v.isNaN())
@@ -1234,7 +1358,20 @@ object FooterStats {
         val parquetScale =
             (leaf.primitive.logicalTypeAnnotation as? LogicalTypeAnnotation.DecimalLogicalTypeAnnotation)
                 ?.scale ?: return null
-        val catalogScale = col.decimalScale ?: return null
+        // ABSENT SCALE MEANS 0, and it has to mean that HERE rather than
+        // in each producer of a [CatalogColumn]. A `decimal` column
+        // whose type_params carry only a precision is ordinary
+        // (pyhoglake's convention, and `BoundWire.scaleOf`'s), and
+        // [com.posthog.hoglake.compaction.ParquetRewriter] already
+        // treats it as 0 in both directions: it STAMPS
+        // `decimalType(scale ?: 0, …)` on the output leaf and refuses an
+        // input whose own parquet scale differs from `scale ?: 0`. So a
+        // file's leaf says 0 while the catalog said nothing — and
+        // returning null here read that agreement as a mismatch and
+        // dropped the bounds of every such column, on both this path and
+        // compaction's. One default, in the one place both doors pass
+        // through.
+        val catalogScale = col.decimalScale ?: 0
         if (parquetScale != catalogScale) {
             log.warn {
                 "decimal scale mismatch for ${col.name}: parquet=$parquetScale catalog=$catalogScale; skipping bounds"

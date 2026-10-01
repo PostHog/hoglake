@@ -728,9 +728,11 @@ the project's one parquet library, shared with the hydrator's footer
 reads) happens entirely before the commit transaction; the commit
 re-verifies each input is still live under the exact planned identity
 (plan-to-commit races skip the group), end-snapshots inputs (time
-travel keeps them; expiry reclaims them later), aggregates stats from
-typed decoded bounds — treating an undecodable bound as absent, never
-wedging on it — and the changefeed excludes compacted outputs so
+travel keeps them; expiry reclaims them later), registers the output's
+stats from the footer the rewrite just wrote — the same
+`FooterStats.aggregate` the hydrator runs, so the counts and bounds are
+exactly the rows the writer emitted and no input stats row is read at
+all — and the changefeed excludes compacted outputs so
 consumers never see merged rows re-appear as fresh appends.
 
 Grouping is ONE PASS of ordinary **bin packing**, the shape Iceberg's
@@ -1177,9 +1179,10 @@ Coverage is 100% of live layouts, not just the easy ones:
   end-snapshot together. The commit re-verifies the exact DV identity
   it planned against — a vector that grew or appeared since planning
   skips the group (`dv_superseded` in the result), so a post-plan
-  delete is never dropped. Because the registered stats of a DV'd
-  input describe pre-delete data, outputs with DVs applied register as
-  `stats_state='pending'` and the hydrator re-derives honest stats.
+  delete is never dropped. A DV'd group's output needs no hydrator
+  sweep: its stats come from the footer the rewrite wrote, which
+  counted the survivors because the survivors are what it wrote, so the
+  output registers `stats_state='provided'` like any other.
 - **Heterogeneous-schema groups compact.** Inputs written under
   different schema versions rewrite under the LIVE schema, mapped by
   field id: a live column absent from an input null-fills, promoted

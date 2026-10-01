@@ -428,6 +428,31 @@ class IcebergSingleValueTest {
         }
 
         @Test
+        fun `uint64 compares by magnitude across 2 to the 63, where a signed long flips`() {
+            // `compareValues` has no production caller any more (the
+            // compaction bounds-merge it served is gone); this is its
+            // contract, test-only, and FooterStatsTest covers the same
+            // magnitude rule where it is now enforced.
+            //
+            // The decoded form is a BigInteger precisely so that the
+            // comparator reads these as magnitudes. Read as signed
+            // longs, everything at or above 2^63 is negative, so 7 would
+            // be the LARGER of the two — which is how a bound pair comes
+            // back inverted and a pruner drops a file that has the rows.
+            val small = BigInteger.valueOf(7)
+            val max = BigInteger.ONE.shiftLeft(64).subtract(BigInteger.ONE)
+            assertThat(IcebergSingleValue.compareValues(ColType.UINT64, small, max))
+                .describedAs("7 < 2^64-1 by magnitude")
+                .isLessThan(0)
+            assertThat(IcebergSingleValue.compareValues(ColType.UINT64, BigInteger.ONE.shiftLeft(63), small))
+                .describedAs("2^63 > 7 by magnitude, though its signed long is negative")
+                .isGreaterThan(0)
+            // The counterexample, so the anchors above cannot be read as
+            // a tautology.
+            assertThat(max.toLong()).isNegative()
+        }
+
+        @Test
         fun `timestamp_s and timestamp_ms store micros, exactly like timestamp`() {
             for (type in listOf(ColType.TIMESTAMP_S, ColType.TIMESTAMP_MS)) {
                 assertThat(IcebergSingleValue.encode(type, -1_500_000L))
