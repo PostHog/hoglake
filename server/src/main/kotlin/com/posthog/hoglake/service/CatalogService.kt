@@ -189,10 +189,18 @@ class CatalogService(private val jdbi: Jdbi) {
             }
         }
 
-    fun listNamespaces(catalog: String): List<NamespaceInfo> =
+    fun listNamespaces(
+        catalog: String,
+        snapshot: Long? = null,
+        atTimestamp: Instant? = null,
+    ): List<NamespaceInfo> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
-            NamespaceRepo.listLive(h, cat.catalogId)
+            if (snapshot == null && atTimestamp == null) {
+                NamespaceRepo.listLive(h, cat.catalogId)
+            } else {
+                NamespaceRepo.listAt(h, cat.catalogId, resolveReadSnapshot(h, cat, snapshot, atTimestamp))
+            }
         }
 
     fun getNamespace(
@@ -708,15 +716,29 @@ class CatalogService(private val jdbi: Jdbi) {
     fun listTables(
         catalog: String,
         namespace: String,
+        snapshot: Long? = null,
+        atTimestamp: Instant? = null,
     ): List<TableSummaryInfo> =
         jdbi.withHandleUnchecked { h ->
             val cat = requireCatalog(h, catalog)
-            val ns = requireNamespace(h, cat, namespace)
-            // No head argument: the statement reads the catalog's head and
-            // expiry floor itself, so every number in every row comes off
-            // ONE MVCC snapshot without a transaction, an isolation level,
-            // or any assumption about what the caller is already inside.
-            TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
+            if (snapshot == null && atTimestamp == null) {
+                val ns = requireNamespace(h, cat, namespace)
+                // No head argument: the statement reads the catalog's head and
+                // expiry floor itself, so every number in every row comes off
+                // ONE MVCC snapshot without a transaction, an isolation level,
+                // or any assumption about what the caller is already inside.
+                TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId)
+            } else {
+                val at = resolveReadSnapshot(h, cat, snapshot, atTimestamp)
+                // The namespace AT the snapshot, not the live one: a pinned
+                // reader must still list a namespace dropped after its pin.
+                val ns =
+                    NamespaceRepo.findAt(h, cat.catalogId, namespace, at)
+                        ?: throw HoglakeException.NotFound(
+                            "namespace '$namespace' in catalog '$catalog' at snapshot $at",
+                        )
+                TableRepo.listLiveSummaries(h, cat.catalogId, ns.namespaceId, at)
+            }
         }
 
     // ---- files + changefeed ----------------------------------------------

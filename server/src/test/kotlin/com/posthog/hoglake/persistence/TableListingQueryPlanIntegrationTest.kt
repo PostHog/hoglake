@@ -253,6 +253,7 @@ class TableListingQueryPlanIntegrationTest {
             )
                 .bind("catalogId", catalogId)
                 .bind("namespaceId", namespaceId)
+                .bindByType("snapshot", null, Long::class.javaObjectType)
                 .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
                 .mapTo(String::class.java)
                 .list()

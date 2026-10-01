@@ -39,6 +39,65 @@ object NamespaceRepo {
             throw e
         }
 
+    /**
+     * The namespaces visible at [snapshot], derived from the change log:
+     * hog_namespace carries only a liveness flag, but every create and
+     * drop records a namespace_created / namespace_dropped change row.
+     *
+     * Visible at S = no create after S, and either not dropped or
+     * dropped after S. Expiry cascades change rows away only BELOW the
+     * floor, and a read at S is refused below the floor, so a missing
+     * row always means "before every readable S": a namespace whose
+     * create expired was created before S, and a dropped namespace whose
+     * drop expired was gone before S. Names are unique at any one S (a
+     * same-named namespace can only be created after the drop).
+     */
+    fun listAt(
+        handle: Handle,
+        catalogId: Long,
+        snapshot: Long,
+    ): List<NamespaceInfo> =
+        handle.createQuery(
+            """
+            SELECT namespace_id, name FROM hog_namespace n
+            WHERE catalog_id = :catalogId AND $VISIBLE_AT
+            ORDER BY name
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("snapshot", snapshot)
+            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .list()
+
+    /** [listAt]'s rule for one name. */
+    fun findAt(
+        handle: Handle,
+        catalogId: Long,
+        name: String,
+        snapshot: Long,
+    ): NamespaceInfo? =
+        handle.createQuery(
+            """
+            SELECT namespace_id, name FROM hog_namespace n
+            WHERE catalog_id = :catalogId AND name = :name AND $VISIBLE_AT
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("name", name)
+            .bind("snapshot", snapshot)
+            .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
+            .findOne()
+            .orElse(null)
+
+    private const val VISIBLE_AT = """NOT EXISTS (
+                SELECT 1 FROM hog_snapshot_change sc
+                WHERE sc.catalog_id = n.catalog_id AND sc.object_id = n.namespace_id
+                  AND sc.kind = 'namespace_created' AND sc.snapshot_id > :snapshot)
+              AND (NOT n.dropped OR EXISTS (
+                SELECT 1 FROM hog_snapshot_change sc
+                WHERE sc.catalog_id = n.catalog_id AND sc.object_id = n.namespace_id
+                  AND sc.kind = 'namespace_dropped' AND sc.snapshot_id > :snapshot))"""
+
     fun findLiveByName(
         handle: Handle,
         catalogId: Long,

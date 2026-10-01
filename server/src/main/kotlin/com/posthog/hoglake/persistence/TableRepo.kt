@@ -476,15 +476,20 @@ object TableRepo {
      *
      * `kind = ANY(:kinds)` is not decoration: `object_id` spans three id
      * spaces and only the kind says which (see [ChangeKind.TABLE_SCOPED]).
+     *
+     * [snapshot] pins every number to that snapshot; null reads the
+     * catalog head inside the statement (see `bounds`).
      */
     fun listLiveSummaries(
         handle: Handle,
         catalogId: Long,
         namespaceId: Long,
+        snapshot: Long? = null,
     ): List<TableSummaryInfo> =
         handle.createQuery(LIVE_SUMMARIES_SQL)
             .bind("catalogId", catalogId)
             .bind("namespaceId", namespaceId)
+            .bindByType("snapshot", snapshot, Long::class.javaObjectType)
             .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
             .map(tableSummaryMapper)
             .list()
@@ -527,7 +532,10 @@ object TableRepo {
     internal val LIVE_SUMMARIES_SQL =
         """
             WITH bounds AS (
-                SELECT last_snapshot_id AS snapshot, earliest_snapshot_id AS earliest
+                -- A null :snapshot is a head read, resolved HERE so the
+                -- head and every number below come off one MVCC snapshot.
+                SELECT coalesce(CAST(:snapshot AS bigint), last_snapshot_id) AS snapshot,
+                       earliest_snapshot_id AS earliest
                 FROM hog_catalog WHERE catalog_id = :catalogId
             )
             SELECT t.table_id, t.table_uuid, tv.name, tv.comment,
