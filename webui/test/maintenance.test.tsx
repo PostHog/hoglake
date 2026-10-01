@@ -134,6 +134,21 @@ describe("maintenance outcome and history", () => {
     expect(screen.getByText(/invalid-data 3/)).toBeInTheDocument();
   });
 
+  it("explains the heap-budget count on hover", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, heap_budget_exceeded: "13" },
+        }}
+      />,
+    );
+    expect(screen.getByText("heap-budget 13")).toHaveAttribute(
+      "title",
+      expect.stringContaining("HOGLAKE_COMPACTION_SORTED_HEAP_BYTES"),
+    );
+  });
+
   describe("loopCadence", () => {
     /**
      * The header's whole job is answering "is this task running?" from
@@ -354,6 +369,19 @@ describe("isQuietRun", () => {
     ["compaction", "failed_groups"],
   ] as const)("keeps a %s run whose %s is nonzero", (task, field) => {
     expect(isQuietRun(withField(quiet[task], field, "1"))).toBe(false);
+  });
+
+  it("calls a compaction sweep quiet when the heap budget is its only count", () => {
+    // The ceiling obeyed is configuration, not a fault, and a dense table
+    // reports the same residue every sweep.
+    expect(
+      isQuietRun(withField(quiet.compaction, "heap_budget_exceeded", "13")),
+    ).toBe(true);
+  });
+
+  it("keeps a compaction sweep that did work beside a heap-budget count", () => {
+    const worked = withField(quiet.compaction, "heap_budget_exceeded", "4");
+    expect(isQuietRun(withField(worked, "groups_compacted", "1"))).toBe(false);
   });
 
   it("keeps an expiry sweep capped by the consumer floor", () => {

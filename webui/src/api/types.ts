@@ -774,14 +774,19 @@ export interface CompactionResult {
    */
   invalid_data?: Int64;
   /**
-   * Groups the SORTED rewrite path declined because materializing them
-   * to sort would not fit the compaction heap budget: a group formed on
-   * input bytes with too many rows for the heap. Refused in metadata at
-   * planning time, before any object-store IO.
+   * FILES the SORTED rewrite path's row ceiling cannot put in a group.
+   * Groups are packed to the ceiling (a capacity beside the byte
+   * target), so a dense sorted table gets smaller groups, not refused
+   * ones. What is counted is the residue: files with so many rows that
+   * no two fit under the ceiling. A file whose own rows exceed the
+   * ceiling is never fetched as a candidate, so it is not counted.
+   * Decided in metadata at planning time, before any object-store IO.
    *
    * Durable like invalid_data, but the fault is neither the writer's nor
    * the schema's — it is a table whose sort order and row width exceed
-   * the heap the server was given. TEMPORARY: the ceiling exists only
+   * the heap the server was given. It clears by raising
+   * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or by dropping the table's sort
+   * order. The rest of the table still compacts. TEMPORARY: the ceiling exists only
    * because the sorted rewrite sorts a whole group in memory, and an
    * external merge sort removes it (an input that is itself a compaction
    * output is an already-sorted run).
