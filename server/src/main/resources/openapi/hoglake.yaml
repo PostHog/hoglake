@@ -111,15 +111,26 @@ paths:
   /catalogs/{catalog}/namespaces:
     get:
       operationId: listNamespaces
-      parameters: [ { $ref: "#/components/parameters/catalog" } ]
+      description: >
+        The namespaces live at head, or at `snapshot`/`at_timestamp`.
+        A pinned listing includes a namespace dropped after the pin and
+        excludes one created after it, so it agrees with the pinned
+        table reads.
+      parameters:
+        - { $ref: "#/components/parameters/catalog" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
       responses:
         "200":
-          description: Namespaces
+          description: Namespaces (at the requested snapshot; default head)
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/Namespace" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "422": { $ref: "#/components/responses/Validation" }
     post:
       operationId: createNamespace
       parameters: [ { $ref: "#/components/parameters/catalog" } ]
@@ -187,10 +198,13 @@ paths:
       operationId: listTables
       summary: List a namespace's live tables with their rollups
       description: >
-        HEAD-ONLY: there are no snapshot / at-timestamp parameters here,
-        so every field of every row — the comment, the file aggregates
-        and the history counts — answers for the catalog head, read in
-        one REPEATABLE READ transaction so they cannot disagree.
+        Every field of every row — the comment, the file aggregates and
+        the history counts — answers for ONE snapshot: head by default,
+        or the one `snapshot`/`at_timestamp` names, read in one
+        statement so they cannot disagree. A pinned listing includes a
+        table dropped after the pin and excludes one created after it,
+        and resolves `{namespace}` at the pin too, so a namespace
+        dropped after the pin still lists its tables.
 
 
         NOT PAGED, and that is the known limit of this endpoint. One row
@@ -206,14 +220,19 @@ paths:
       parameters:
         - { $ref: "#/components/parameters/catalog" }
         - { $ref: "#/components/parameters/namespace" }
+        - { $ref: "#/components/parameters/snapshot" }
+        - { $ref: "#/components/parameters/atTimestamp" }
       responses:
         "200":
-          description: Tables (live at head)
+          description: Tables (live at the requested snapshot; default head)
           content:
             application/json:
               schema:
                 type: array
                 items: { $ref: "#/components/schemas/TableSummary" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410": { $ref: "#/components/responses/Gone" }
+        "422": { $ref: "#/components/responses/Validation" }
     post:
       operationId: createTable
       summary: Create a table (DDL commit; produces a snapshot)
@@ -3251,7 +3270,7 @@ components:
           type: [string, "null"]
           maxLength: 16384
           description: >
-            The table's comment as of the listed snapshot (head), from
+            The table's comment as of the listed snapshot, from
             the same versioned row the name comes from. Absent when the
             table has no comment; a server older than this field omits
             it too, so a client must treat absent and null alike.
@@ -3259,7 +3278,7 @@ components:
           type: integer
           format: int64
           description: >
-            Rows in the data files LIVE at head, the same aggregate the
+            Rows in the data files LIVE at the listed snapshot, the same aggregate the
             Table object reports — never the gross append counter. It is
             GROSS of deletion vectors: a row masked by a live DV is still
             counted, because the count comes from each file's registered
@@ -3270,11 +3289,11 @@ components:
         file_count:
           type: integer
           format: int64
-          description: Data files live at head.
+          description: Data files live at the listed snapshot.
         file_size_bytes:
           type: integer
           format: int64
-          description: Total size of the data files live at head.
+          description: Total size of the data files live at the listed snapshot.
         snapshot_count:
           type: integer
           format: int64
@@ -3282,7 +3301,8 @@ components:
             How many RETAINED snapshots carry a change row for this
             table. Snapshots are catalog-wide, so a table's snapshots
             are defined through the change log: distinct snapshot ids at
-            or above the catalog's earliest_snapshot_id whose change row
+            or above the catalog's earliest_snapshot_id, and at or below
+            the listed snapshot, whose change row
             names this table (the table-scoped change kinds —
             table_created / table_dropped / table_altered /
             table_inserted_into / table_deleted_from / table_compacted).

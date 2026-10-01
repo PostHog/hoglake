@@ -176,6 +176,32 @@ def test_list_namespaces(client, httpx_mock):
     assert cat.list_namespaces() == ["a", "b"]
 
 
+def test_list_namespaces_time_travel_params(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces?snapshot=3",
+        json=[{"name": "a"}],
+    )
+    assert cat.list_namespaces(snapshot=3) == ["a"]
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces?at_timestamp=2026-09-04T12%3A00%3A00",
+        json=[],
+    )
+    assert cat.list_namespaces(at_timestamp="2026-09-04T12:00:00") == []
+    with pytest.raises(ValueError):
+        cat.list_namespaces(snapshot=3, at_timestamp="2026-09-04T12:00:00")
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces?snapshot=1",
+        json={"error": "expired", "detail": "earliest retained snapshot is 4"},
+        status_code=410,
+    )
+    with pytest.raises(ExpiredError):
+        cat.list_namespaces(snapshot=1)
+
+
 # -- tables -----------------------------------------------------------------
 
 
@@ -396,6 +422,35 @@ def test_list_tables(client, httpx_mock):
     assert bare.comment is None
     assert bare.earliest_snapshot_id is None
     assert bare.record_count == 0
+
+
+def test_list_tables_time_travel_params(client, httpx_mock):
+    cat = _catalog(client, httpx_mock)
+    from pyhoglake.client import Namespace
+
+    ns = Namespace(cat, "ns1")
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables?snapshot=3",
+        json=[],
+    )
+    assert ns.list_tables(snapshot=3) == []
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables?at_timestamp=2026-09-04T12%3A00%3A00",
+        json=[],
+    )
+    assert ns.list_tables(at_timestamp="2026-09-04T12:00:00") == []
+    with pytest.raises(ValueError):
+        ns.list_tables(snapshot=3, at_timestamp="2026-09-04T12:00:00")
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables?snapshot=1",
+        json={"error": "validation", "detail": "snapshot 1 out of range"},
+        status_code=422,
+    )
+    with pytest.raises(ValidationError):
+        ns.list_tables(snapshot=1)
 
 
 def test_list_tables_tolerates_a_server_without_the_rollup(client, httpx_mock):

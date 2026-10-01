@@ -79,7 +79,13 @@ fun Application.installApiRoutes(
 
                 route("/namespaces") {
                     get {
-                        call.respond(catalogs.listNamespaces(call.catalog()).map { it.toDto() })
+                        call.respond(
+                            catalogs.listNamespaces(
+                                call.catalog(),
+                                call.longQuery("snapshot"),
+                                call.instantQuery("at_timestamp"),
+                            ).map { it.toDto() },
+                        )
                     }
                     post {
                         val req = call.receive<CreateNamespaceRequestDto>()
@@ -106,8 +112,12 @@ fun Application.installApiRoutes(
                     route("/{namespace}/tables") {
                         get {
                             call.respond(
-                                catalogs.listTables(call.catalog(), call.namespace())
-                                    .map { it.toDto() },
+                                catalogs.listTables(
+                                    call.catalog(),
+                                    call.namespace(),
+                                    call.longQuery("snapshot"),
+                                    call.instantQuery("at_timestamp"),
+                                ).map { it.toDto() },
                             )
                         }
                         post {

@@ -225,6 +225,36 @@ class ReadParityApiTest {
         }
 
     @Test
+    fun `listings take snapshot and at_timestamp on the wire`() =
+        api { client ->
+            client.seed("ls")
+            val pin = body(client.get("/v1/catalogs/ls"))["head_snapshot_id"].asLong()
+            client.postJson("/v1/catalogs/ls/namespaces", """{"name": "later"}""")
+
+            val names = body(client.get("/v1/catalogs/ls/namespaces?snapshot=$pin")).map { it["name"].asText() }
+            assertThat(names).containsExactly("ns")
+            val tables = body(client.get("/v1/catalogs/ls/namespaces/ns/tables?snapshot=$pin"))
+            assertThat(tables.map { it["name"].asText() }).containsExactly("t")
+            assertThat(
+                client.get("/v1/catalogs/ls/namespaces?at_timestamp=2999-01-01T00:00:00Z").status,
+            ).isEqualTo(HttpStatusCode.OK)
+
+            assertApiError(
+                client.get("/v1/catalogs/ls/namespaces?snapshot=1&at_timestamp=2999-01-01T00:00:00Z"),
+                HttpStatusCode.UnprocessableEntity,
+                "validation",
+            )
+            db.jdbi.withHandleUnchecked { h ->
+                h.createUpdate("UPDATE hog_catalog SET earliest_snapshot_id = 2 WHERE name = 'ls'").execute()
+            }
+            assertApiError(
+                client.get("/v1/catalogs/ls/namespaces/ns/tables?snapshot=1"),
+                HttpStatusCode.Gone,
+                "expired",
+            )
+        }
+
+    @Test
     fun `at_timestamp parameter handling on the wire`() =
         api { client ->
             client.seed("ts")
