@@ -137,6 +137,10 @@ function positive(value: Int64 | undefined): boolean {
  *
  * Expiry's new_earliest_snapshot_id is deliberately ignored: it reports where
  * the floor STANDS, which every sweep does whether or not the floor moved.
+ * Compaction's heap_budget_exceeded is ignored on the same footing: it is
+ * the configured heap ceiling being obeyed, not a fault, and a table too
+ * dense to pair reports the same count on every sweep until the
+ * configuration changes.
  */
 export function isQuietRun(run: MaintenanceRun): boolean {
   if (run.status !== "ok") return false;
@@ -184,7 +188,6 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         r.dv_superseded,
         r.unconvertible_schema,
         r.invalid_data,
-        r.heap_budget_exceeded,
         r.failed_groups,
         // claimed_elsewhere COUNTS AS WORK, on the offsets_released
         // precedent above: it is the only thing a sweep can report on a
@@ -328,8 +331,10 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
               skipped {formatCount(r.skipped_conflicts)}, dv-superseded{" "}
               {formatCount(r.dv_superseded)}, unconvertible{" "}
               {formatCount(r.unconvertible_schema)}, invalid-data{" "}
-              {formatCount(r.invalid_data ?? "0")}, heap-budget{" "}
-              {formatCount(r.heap_budget_exceeded ?? "0")}
+              {formatCount(r.invalid_data ?? "0")},{" "}
+              <span className="th-hint" title={HEAP_BUDGET_TITLE}>
+                heap-budget {formatCount(r.heap_budget_exceeded ?? "0")}
+              </span>
             </span>
           )}
         </>
@@ -426,12 +431,26 @@ const TASK_FILTER_KEY = "hoglake-runs-task";
 const HIDE_QUIET_KEY = "hoglake-runs-hide-quiet";
 const SWITCH = ["on", "off"] as const;
 
+// For an operator who does not know the sorted rewrite path. The count
+// is FILES (CompactionService's refused list), not groups.
+const HEAP_BUDGET_TITLE =
+  "Files that compaction left as they are on this run because they have " +
+  "too many rows to merge. A table with a sort order is compacted by " +
+  "sorting a group of files in memory, and the memory for that sort is " +
+  "limited (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES). Each of these files " +
+  "has too many rows to share a group with another file. The rest of " +
+  "the table still compacts, and no data is lost or wrong. To clear it, " +
+  "raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES on a pod with enough " +
+  "memory, or remove the table's sort order.";
+
 const HIDE_QUIET_TITLE =
   "Hide runs that succeeded and changed nothing: every pod records a row " +
   "for every sweep of every catalog, so most rows are no-ops. A failed run " +
   "is never hidden, and neither is one carrying a warning — compaction " +
   "failures or skips, still-referenced cleanup entries, an expiry floored " +
-  "by a consumer — even when its counts are all zero. The table pages back " +
+  "by a consumer — even when its counts are all zero. Files held back by " +
+  "the compaction heap budget do not count: that is the configuration " +
+  "working, not a warning. The table pages back " +
   "through the ledger to fill a screen, up to a fixed number of requests, " +
   "then says how far back it looked.";
 
@@ -498,7 +517,7 @@ export function RunsTable({ catalog }: { catalog?: string }) {
   // search SETTLES — enough rows visible, or the ledger exhausted. A poll
   // refresh therefore cannot re-arm it: on a catalog that is quiet all the
   // way down, the search runs once and then stays stopped.
-  const searchKey = `${catalog ?? ""} ${taskFilter} ${hideQuiet}`;
+  const searchKey = `${catalog ?? ""}\u0000${taskFilter}\u0000${hideQuiet}`;
   const [armedFor, setArmedFor] = useState(searchKey);
   const [spent, setSpent] = useState(0);
   if (armedFor !== searchKey) {
