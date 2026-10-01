@@ -788,7 +788,6 @@ class CompactionConfigTest {
                 fileSizeBytes = 10,
                 footerSize = null,
                 rowIdStart = id,
-                statsProvided = true,
             )
 
         val a = CompactionGroup(listOf(candidate(1), candidate(2), candidate(3)), 7, listOf("2026-09-24"))
@@ -841,7 +840,6 @@ class CompactionConfigTest {
                 fileSizeBytes = 10,
                 footerSize = null,
                 rowIdStart = id,
-                statsProvided = true,
             )
 
         val files = listOf(candidate(1), candidate(2))
@@ -884,7 +882,6 @@ class CompactionConfigTest {
                             fileSizeBytes = 10,
                             footerSize = null,
                             rowIdStart = id,
-                            statsProvided = true,
                         )
                     },
                 specId = 7,

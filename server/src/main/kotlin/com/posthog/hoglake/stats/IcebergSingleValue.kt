@@ -353,9 +353,16 @@ object IcebergSingleValue {
      * compares as UTF-8 bytes unsigned (== code-point order — Java's
      * String.compareTo is UTF-16 unit order, which disagrees above the
      * BMP); UUID/BINARY compare bytes unsigned; everything else through
-     * its natural Comparable. This is what makes compaction's
-     * bounds-merge correct where a raw byte compare of the ENCODINGS
-     * would not be (signed little-endian ints do not sort bytewise).
+     * its natural Comparable — a raw byte compare of the ENCODINGS would
+     * not do (signed little-endian ints do not sort bytewise).
+     *
+     * NO PRODUCTION CALLER as of compaction's footer-stats change: it
+     * was the compaction bounds-merge's comparator, and that merge is
+     * gone (FooterStats does its own typed comparison over decoded
+     * footer values). What remains is a tested contract — the fuzz
+     * target, the round-trip tests and the property tests check bound
+     * pairs with it — kept because it is the project's one statement of
+     * the ordering every bound pair must satisfy.
      */
     @Suppress("UNCHECKED_CAST")
     fun compareValues(

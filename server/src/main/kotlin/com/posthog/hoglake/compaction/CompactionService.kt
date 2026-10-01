@@ -1,7 +1,9 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.hydrator.FooterSplitOffsets
+import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.hydrator.asCatalogColumns
 import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
@@ -11,7 +13,6 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.SortFieldDef
-import com.posthog.hoglake.model.StatsSanity
 import com.posthog.hoglake.model.allNodes
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
@@ -26,7 +27,6 @@ import com.posthog.hoglake.persistence.SortRepo
 import com.posthog.hoglake.persistence.TableRepo
 import com.posthog.hoglake.persistence.TierTotalsRepo
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
-import com.posthog.hoglake.stats.IcebergSingleValue
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
@@ -840,7 +840,6 @@ data class CompactionCandidate(
      */
     val footerSize: Long?,
     val rowIdStart: Long,
-    val statsProvided: Boolean,
     /**
      * `hog_data_file.explicit_row_ids` — true when this file is a
      * COMPACTION OUTPUT and carries its row ids in a physical
@@ -1041,14 +1040,13 @@ data class CompactionPlan(
  * end_snapshot falls under the retention floor — exactly the
  * superseded-DV lifecycle. Nothing else enters hog_file_removal here.
  *
- * Stats for the output are aggregated server-side from the inputs'
- * hog_file_column_stats: counts sum; bounds are recomputed from the
- * TYPED decoded bounds (IcebergSingleValue.decode + compareValues +
- * re-encode) — a raw binary min/max of the encodings would be wrong for
- * signed little-endian types. If any input lacks provided stats — or
- * any input has a DV, which makes the inputs' counts wrong for the
- * survivor set — the output registers as 'pending' and the hydrator
- * fills it from the footer.
+ * Stats for the output come from the FOOTER THE REWRITE JUST WROTE
+ * ([FooterStats.aggregate], the hydrator's own function): the parquet
+ * writer accumulated them over exactly the rows it wrote, so they are
+ * exact for the survivor set, cost no catalog read and no object read,
+ * and are right for a group with DV'd inputs too. The output therefore
+ * registers 'provided' whenever the writer handed back a footer, and
+ * 'pending' only when it did not — the hydrator's ordinary path.
  */
 class CompactionService(
     private val jdbi: Jdbi,
@@ -1116,21 +1114,7 @@ class CompactionService(
          * 0 = the unbounded wait this path used to take unconditionally.
          */
         val commitLockTimeoutMs: Long = 0,
-    ) {
-        /**
-         * Live column types by field id (stats aggregation), over EVERY
-         * node of the column forest — not just the top level.
-         *
-         * Stats are keyed on LEAF field ids, and a leaf inside a struct,
-         * a list or a map is not a top-level column. Built from the
-         * top-level list alone, the merge silently dropped every nested
-         * leaf's stats row on the way through compaction: counts and
-         * bounds present before the rewrite, gone after it, with nothing
-         * anywhere saying so.
-         */
-        val columnTypes: Map<Long, ColType>
-            get() = columns.allNodes().associate { it.fieldId to it.def.type }
-    }
+    )
 
     private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
 
@@ -1185,6 +1169,23 @@ class CompactionService(
      * under the mutation it existed to catch.
      */
     internal var beforeFetch: (Handle) -> Unit = {}
+
+    /**
+     * A hook [commitGroup] calls on its OWN transaction's handle, once
+     * the catalog commit lock is held and before the commit tail runs —
+     * so a test can make a statement in that transaction FAIL for real.
+     *
+     * The property it exists for is [executeGroup]'s failure isolation,
+     * and only a genuine driver exception tests it: the sweep has to
+     * charge a `failed_groups` and carry on when a commit statement dies
+     * of anything that is not a lock timeout (a `statement_timeout`
+     * cancellation, SQLSTATE 57014, is the one production produced). A
+     * fake exception thrown from Kotlin would not travel the same path,
+     * because the arm under test is keyed on the driver's SQLSTATE.
+     * Default is a no-op, called once per commit attempt, and nothing
+     * but a test ever sets it.
+     */
+    internal var beforeCommitTail: (Handle) -> Unit = {}
 
     /** Public metadata-only planning for one table (also the test surface). */
     fun planTable(
@@ -1921,13 +1922,13 @@ class CompactionService(
             }
         return """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
-                   f.footer_size, f.row_id_start, f.stats_state, f.explicit_row_ids,
+                   f.footer_size, f.row_id_start, f.explicit_row_ids,
                    f.spec_id,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count$valuesProjection
               FROM (
                     SELECT f0.catalog_id, f0.data_file_id, f0.path, f0.record_count,
                            f0.file_size_bytes, f0.footer_size, f0.row_id_start,
-                           f0.stats_state, f0.explicit_row_ids, f0.spec_id
+                           f0.explicit_row_ids, f0.spec_id
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
@@ -2085,7 +2086,6 @@ class CompactionService(
             fileSizeBytes = rs.getLong("file_size_bytes"),
             footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
             rowIdStart = rs.getLong("row_id_start"),
-            statsProvided = rs.getString("stats_state") == "provided",
             explicitRowIds = rs.getBoolean("explicit_row_ids"),
             dv =
                 rs.getObject("dv_id")?.let {
@@ -2847,6 +2847,42 @@ class CompactionService(
             // not count this and doRunOnce pulls the next candidate.
             return GroupTally(claimedElsewhere = 1)
         }
+
+        // ONE bad-group path, reached from TWO catch arms, and it has to
+        // be a function rather than a shared arm because of what a
+        // `throw` inside a catch block does: it leaves the try
+        // statement, so the SIBLING arms — including the `Throwable` one
+        // below, which is the whole failure-isolation mechanism — never
+        // see it. The `UnableToExecuteStatementException` arm used to
+        // rethrow a non-lock-timeout straight out of `executeGroup`,
+        // where nothing caught it: `f.get()` in [executeWave] surfaced
+        // it as an `ExecutionException` and the ENTIRE sweep aborted
+        // with an empty ledger result, losing the accounting of every
+        // group that had not started yet (on gigahog-prod-us, 2026-09-30:
+        // one group's `statement_timeout` took ~58 others with it and
+        // the run recorded `{}`). A statement that dies for a reason
+        // this code has no rule for is ONE failed group, like any other.
+        fun failGroup(e: Throwable): GroupTally {
+            // AN INTERRUPT IN DISGUISE STILL HAS TO SET THE FLAG.
+            //
+            // `e is InterruptedException` was not enough. The object
+            // store's client, the HTTP stack under it and NIO all
+            // translate an interrupt into something else — a
+            // `ClosedByInterruptException`, an SDK exception wrapping
+            // one, an `IOException` with it somewhere down the cause
+            // chain — and several of them CLEAR the flag on the way
+            // past. On the sequential path this frame runs on the
+            // sweep's own thread, so a cancellation that arrives as a
+            // wrapped exception and leaves the flag down is a sweep
+            // that was asked to stop, counted the group as an ordinary
+            // failure, and carried on to the next one.
+            if (wasInterrupt(e)) Thread.currentThread().interrupt()
+            log.error(e) {
+                "compaction group of ${group.files.size} files failed for " +
+                    "$catalog/${ctx.namespace}.${ctx.table}; continuing"
+            }
+            return GroupTally(failedGroups = 1)
+        }
         var committed = false
         try {
             return when (val outcome = compactGroup(ctx, group)) {
@@ -2892,7 +2928,11 @@ class CompactionService(
             // the typed CommitQueueTimeout. Counting that as
             // `failed_groups` would read as a broken compactor when it
             // is a busy catalog.
-            if (!Pg.isLockTimeout(e)) throw e
+            //
+            // ANYTHING ELSE IS AN ORDINARY FAILED GROUP, and it takes
+            // [failGroup] rather than a `throw` — see that function for
+            // the sweep this arm's rethrow used to kill.
+            if (!Pg.isLockTimeout(e)) return failGroup(e)
             log.warn {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} hit the commit transaction's " +
@@ -2962,26 +3002,7 @@ class CompactionService(
             // wedges the sweep — but it IS counted: an uncounted
             // swallow is a silently-dead compactor with a green run
             // ledger (the NoSuchBucket incident).
-            //
-            // AN INTERRUPT IN DISGUISE STILL HAS TO SET THE FLAG.
-            //
-            // `e is InterruptedException` was not enough. The object
-            // store's client, the HTTP stack under it and NIO all
-            // translate an interrupt into something else — a
-            // `ClosedByInterruptException`, an SDK exception wrapping
-            // one, an `IOException` with it somewhere down the cause
-            // chain — and several of them CLEAR the flag on the way
-            // past. On the sequential path this frame runs on the
-            // sweep's own thread, so a cancellation that arrives as a
-            // wrapped exception and leaves the flag down is a sweep
-            // that was asked to stop, counted the group as an ordinary
-            // failure, and carried on to the next one.
-            if (wasInterrupt(e)) Thread.currentThread().interrupt()
-            log.error(e) {
-                "compaction group of ${group.files.size} files failed for " +
-                    "$catalog/${ctx.namespace}.${ctx.table}; continuing"
-            }
-            return GroupTally(failedGroups = 1)
+            return failGroup(e)
         } finally {
             // RELEASED ONLY IF THE GROUP DID NOT COMMIT, and that
             // asymmetry is the point.
@@ -3276,13 +3297,50 @@ class CompactionService(
         // contract, and then readers cut the file evenly.
         val splitOffsets = rewritten.footer?.let { FooterSplitOffsets.of(it, outputBytes) }
 
+        // THE OUTPUT'S STATS COME OFF THE FOOTER THE WRITER JUST BUILT,
+        // not out of the catalog. The parquet writer accumulated a
+        // min/max/null-count per column chunk over exactly the rows it
+        // wrote, so the aggregate below is EXACT for the survivor set,
+        // needs no query, and holds no connection — and it is the same
+        // [FooterStats.aggregate] the hydrator runs on every
+        // client-written file, sanity checks included.
+        //
+        // What it replaces, and why: this used to sum the INPUTS'
+        // hog_file_column_stats rows (`WHERE data_file_id IN (<ids>)`)
+        // and re-merge their typed bounds. Fan-in scales with the byte
+        // target, so on gigahog-prod-us a group is 2,048 files: an
+        // IN-list of 2,048 ids against the PK
+        // `(catalog_id, data_file_id, field_id)` is 2,048 index range
+        // scans, each yielding that file's ~26 adjacent column rows —
+        // ~2,048 index descents and ~53k heap rows, spread across a
+        // 66 GiB table's pages written at different times — to recompute
+        // what the writer had just observed directly. On 2026-09-30 that
+        // read crossed the 60 s session statement_timeout and every
+        // sweep failed. It also had to give up on any group with a DV'd
+        // input, whose registered counts describe pre-delete rows: those
+        // outputs registered 'pending' and waited for a hydrator sweep
+        // to re-read the footer from S3. The footer answers both.
+        //
+        // Null footer = the writer gave none back (ParquetRewriter asks
+        // for it outside the failure path and never lets it fail the
+        // rewrite), which is the one case that still registers 'pending'
+        // for the hydrator. An EMPTY aggregate is not that case: it
+        // registers 'provided' with no rows, exactly as the hydrator
+        // leaves such a file.
         val stats =
-            if (group.files.all { it.statsProvided && it.dv == null }) {
-                aggregateStats(group.files.map { it.dataFileId }, ctx)
-            } else {
-                // A DV'd input's registered counts describe pre-delete
-                // rows; honest 'pending' beats wrong 'provided'.
-                null
+            rewritten.footer?.let { footer ->
+                FooterStats.aggregate(footer, ctx.columns.asCatalogColumns(), outputPath)
+                    .map { agg ->
+                        ColumnStats(
+                            fieldId = agg.fieldId,
+                            valueCount = agg.valueCount,
+                            nullCount = agg.nullCount,
+                            nanCount = agg.nanCount,
+                            sizeBytes = agg.sizeBytes,
+                            lowerBound = agg.lowerBound,
+                            upperBound = agg.upperBound,
+                        )
+                    }
             }
         val outcome =
             commitGroup(
@@ -3345,6 +3403,28 @@ class CompactionService(
      * per-catalog commit lock, CommitService's tail shape (parallel
      * code by design — its helpers are private and shaped around
      * appends; the comments here mark each mirrored step).
+     *
+     * [stats] is the output's own footer aggregate (see [compactGroup]):
+     * a list — possibly EMPTY — registers the file 'provided', and null
+     * registers it 'pending' for the hydrator. Null means the writer
+     * returned no footer, nothing else.
+     *
+     * An empty list cannot happen for a compaction output today, and is
+     * accepted rather than rejected only to keep one contract with the
+     * hydrator, whose client-written files can produce it. The output
+     * schema is machine-generated from the live columns, so the shapes
+     * FooterStats refuses a whole file for — duplicate field ids,
+     * duplicate names inside a group — are structurally impossible here,
+     * and a zero-row group still produces a row per column. If one ever
+     * did arrive it registers 'provided' with no stats rows, which is
+     * what the hydrator does with such a file.
+     *
+     * The two paths' rows are not identical, and the difference is
+     * deliberate: the hydrator's flip also sets `missing_field_ids` and
+     * `split_offsets` from the footer it read, while compaction sets
+     * `split_offsets` and leaves `missing_field_ids` at its DEFAULT
+     * false — correct for its own output, which stamps an id on every
+     * node it writes.
      */
     private fun commitGroup(
         ctx: TableContext,
@@ -3360,6 +3440,7 @@ class CompactionService(
     ): GroupOutcome =
         jdbi.inTransactionUnchecked { h ->
             Locks.acquireCatalogCommitLock(h, ctx.catalogId, ctx.commitLockTimeoutMs)
+            beforeCommitTail(h)
 
             // RE-CLAIM THE STAGING TICKET: THE OBJECT IS ONLY OURS TO
             // REGISTER IF NOBODY HAS TOUCHED THE TICKET. It used to be the
@@ -3704,173 +3785,6 @@ class CompactionService(
 
             GroupOutcome.Committed(snapshotId, outputBytes)
         }
-
-    // ---- stats aggregation -----------------------------------------------
-
-    /**
-     * Merge the inputs' per-column stats into the output's: counts sum;
-     * bounds are recomputed by DECODING each input bound to its typed
-     * value, comparing typed, and re-encoding the winner — never a raw
-     * binary compare of the encodings (wrong for signed little-endian
-     * types). A field only gets a stats row when EVERY input has one
-     * (heterogeneous groups: an added column simply has no row); within
-     * a field, nan/size/bounds go null if any input's is null.
-     */
-    private fun aggregateStats(
-        inputIds: List<Long>,
-        ctx: TableContext,
-    ): List<ColumnStats> {
-        data class StatsRow(
-            val fieldId: Long,
-            val valueCount: Long,
-            val nullCount: Long,
-            val nanCount: Long?,
-            val sizeBytes: Long?,
-            val lower: ByteArray?,
-            val upper: ByteArray?,
-        )
-
-        val rows =
-            jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                SELECT field_id, value_count, null_count, nan_count, size_bytes,
-                       lower_bound, upper_bound
-                FROM hog_file_column_stats
-                WHERE catalog_id = :catalogId AND data_file_id IN (<ids>)
-                """,
-                )
-                    .bind("catalogId", ctx.catalogId)
-                    .bindList("ids", inputIds)
-                    .map { rs, _ ->
-                        StatsRow(
-                            fieldId = rs.getLong("field_id"),
-                            valueCount = rs.getLong("value_count"),
-                            nullCount = rs.getLong("null_count"),
-                            nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
-                            sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
-                            lower = rs.getBytes("lower_bound"),
-                            upper = rs.getBytes("upper_bound"),
-                        )
-                    }
-                    .list()
-            }
-
-        val columnTypes = ctx.columnTypes
-        val out = mutableListOf<ColumnStats>()
-        for ((fieldId, fieldRows) in rows.groupBy { it.fieldId }) {
-            if (fieldRows.size != inputIds.size) continue // not every input covered the field
-            val type = columnTypes[fieldId] ?: continue // column dropped since the inputs landed
-            // REPAIR ON READ, before the merge. Every row here was
-            // stored before StatsSanity existed or came through a door
-            // that predates it, so an inverted pair or an impossible
-            // count can already be sitting in the table — and a merge
-            // takes min(lowers) and max(uppers), which carries the
-            // damage into a BRAND NEW file and keeps it live for
-            // another compaction generation. Repairing the inputs as
-            // they are read stops the propagation without a migration;
-            // a backfill of the historical rows is a separate operation
-            // (noted as a follow-up, deliberately not done here — it
-            // rewrites rows for files nothing is compacting).
-            val clean =
-                fieldRows.map { r ->
-                    sane(
-                        ColumnStats(
-                            fieldId = fieldId,
-                            valueCount = r.valueCount,
-                            nullCount = r.nullCount,
-                            nanCount = r.nanCount,
-                            sizeBytes = r.sizeBytes,
-                            lowerBound = r.lower,
-                            upperBound = r.upper,
-                        ),
-                        type,
-                        "input of ${ctx.namespace}.${ctx.table}",
-                    )
-                }
-            // And again on the MERGE: the sum of sound inputs is not
-            // automatically sound (bounds merged from files with
-            // different live types, counts that overflow their
-            // relationship), and this is the row that gets stored.
-            out +=
-                sane(
-                    ColumnStats(
-                        fieldId = fieldId,
-                        valueCount = clean.sumOf { it.valueCount },
-                        nullCount = clean.sumOf { it.nullCount },
-                        nanCount =
-                            if (clean.any { it.nanCount == null }) null else clean.sumOf { it.nanCount!! },
-                        sizeBytes =
-                            if (clean.any { it.sizeBytes == null }) null else clean.sumOf { it.sizeBytes!! },
-                        lowerBound = mergeBound(type, clean.map { it.lowerBound }, takeUpper = false),
-                        upperBound = mergeBound(type, clean.map { it.upperBound }, takeUpper = true),
-                    ),
-                    type,
-                    "merged output for ${ctx.namespace}.${ctx.table}",
-                )
-        }
-        return out.sortedBy { it.fieldId }
-    }
-
-    /**
-     * One stats row through [StatsSanity], warning + counting any
-     * repair under the `compaction` source.
-     *
-     * The THIRD door. The commit path and the hydrator each ran this
-     * rule; compaction wrote `hog_file_column_stats` directly, so a
-     * malformed row could be merged into a new file's metadata and stay
-     * live — and every reader prunes on it.
-     */
-    private fun sane(
-        stats: ColumnStats,
-        type: ColType,
-        where: String,
-    ): ColumnStats {
-        val checked = StatsSanity.check(stats, type)
-        // The sanitizer's output is stored whether or not it reported
-        // anything: signed-zero canonicalization is a conformance
-        // rewrite, not a repair, so it carries no warning and no metric.
-        if (checked.repairs.isNotEmpty()) {
-            Metrics.statsRepaired("compaction")
-            log.warn {
-                "column stats for field_id ${stats.fieldId} in the $where are not internally " +
-                    "consistent (${checked.repairs.joinToString("; ")}); using the repaired row"
-            }
-        }
-        return checked.stats
-    }
-
-    private fun mergeBound(
-        type: ColType,
-        bounds: List<ByteArray?>,
-        takeUpper: Boolean,
-    ): ByteArray? {
-        if (bounds.any { it == null }) return null
-        // A bound that does not decode under the LIVE type (wrong width —
-        // e.g. a 4-byte int bound left behind by a pre-fix promote, or one
-        // a racing hydrator wrote under the pre-promote type) is treated
-        // as ABSENT, nulling this column's merged bound: honest missing
-        // metadata over a poison group that would throw here every sweep
-        // until the inputs expire. The sweep must never wedge on stats.
-        val decoded =
-            bounds.map { bound ->
-                try {
-                    IcebergSingleValue.decode(type, bound!!)
-                } catch (e: IllegalArgumentException) {
-                    log.warn {
-                        "compaction bound-merge: input bound (${bound!!.size} bytes) does not " +
-                            "decode as ${type.wire} (${e.message}); treating as absent"
-                    }
-                    return null
-                }
-            }
-        val winner =
-            decoded.reduce { a, b ->
-                val cmp = IcebergSingleValue.compareValues(type, a, b)
-                if ((cmp < 0) != takeUpper) a else b
-            }
-        return IcebergSingleValue.encode(type, winner)
-    }
 
     // ---- loops -----------------------------------------------------------
 

@@ -1,6 +1,8 @@
 package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.commit.CommitService
+import com.posthog.hoglake.hydrator.CatalogColumn
+import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.hydrator.Hydrator
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.AlterOp
@@ -39,9 +41,11 @@ import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
+import org.apache.parquet.io.api.Binary
 import org.apache.parquet.schema.LogicalTypeAnnotation
 import org.apache.parquet.schema.MessageType
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName
@@ -347,98 +351,57 @@ class CompactionServiceIntegrationTest {
      * mixes DV-bearing and DV-free inputs.
      */
     @Test
-    fun `a malformed pre-existing stats row cannot reach the compaction output`() {
-        // The THIRD door. Commit and the hydrator both sanitize; this
-        // path wrote hog_file_column_stats directly, so a row stored
-        // before the sanitizer existed could be merged into a new
-        // file's metadata and stay live for another compaction
-        // generation. Readers prune on these.
-        val fx = fixture(dvOnMiddle = false)
-
-        // A MIXED population, which is the only one that tests what the
-        // comment claims. Corrupting every input makes input-repair and
-        // output-repair indistinguishable: both produce null bounds, so
-        // the assertion passes with the input-level repair deleted.
+    fun `the inputs' stats rows are not read at all - deleting every one changes nothing`() {
+        // THE ABSENCE OF THE READ, asserted the only way that cannot
+        // pass for the wrong reason. This path used to fetch the inputs'
+        // hog_file_column_stats and re-merge them, which made every
+        // property of those rows a property of the output: a row stored
+        // before StatsSanity existed could be carried into a brand new
+        // file's metadata (the defence was a repair-on-read), a
+        // wrong-width bound from a pre-fix promote first threw out of
+        // the merge every sweep and then nulled the column's bound, and
+        // a group whose inputs had no rows at all could not be done.
         //
-        // Corrupt exactly ONE of the three inputs. The true range across
-        // them is -10..5. With the input repaired, the bad file
-        // contributes nothing and the merge is null (its counts no
-        // longer cover the field). WITHOUT it, min(-10, 500) = -10 and
-        // max(5, 100) = 100 — a pair that is NOT inverted, so
-        // StatsSanity sees nothing wrong and it is stored live. Every
-        // pruner then reads `lower = -10, upper = 100` and drops the
-        // file for `WHERE id < -10`... and worse, an inverted-looking
-        // pair would at least have been caught. A plausible wrong answer
-        // beats a detectable one, which is why this needs its own test.
-        val victim =
+        // Corrupting a row proves none of that once the output is the
+        // footer's: an exact-footer assertion passes whether the
+        // corruption was ignored or merely survived a repair. DELETING
+        // every input row does prove it — a path that still read them
+        // would have nothing to read, so it could only produce 'pending'
+        // or a short row, and this test would fail.
+        val fx = fixture(dvOnMiddle = false)
+        val deleted =
             db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
+                h.createUpdate(
                     """
-                    SELECT min(f.data_file_id) FROM hog_data_file f
-                      JOIN hog_catalog c ON c.catalog_id = f.catalog_id
-                     WHERE c.name = :cat
+                    DELETE FROM hog_file_column_stats s
+                     USING hog_catalog c
+                     WHERE c.catalog_id = s.catalog_id AND c.name = :cat
                     """,
-                ).bind("cat", fx.cat).mapTo(Long::class.java).one()
+                ).bind("cat", fx.cat).execute()
             }
-        db.jdbi.useHandleUnchecked { h ->
-            h.createUpdate(
-                """
-                UPDATE hog_file_column_stats s
-                   SET lower_bound = :lo, upper_bound = :hi, null_count = value_count + 7
-                  FROM hog_catalog c
-                 WHERE c.catalog_id = s.catalog_id AND c.name = :cat
-                   AND s.field_id = 1 AND s.data_file_id = :victim
-                """,
-            )
-                .bind("cat", fx.cat)
-                .bind("victim", victim)
-                .bind("lo", longLe(500))
-                .bind("hi", longLe(100))
-                .execute()
-        }
+        assertThat(deleted).describedAs("3 inputs x 3 columns").isEqualTo(9)
 
         val result = svc.runOnce(fx.cat, cfg)
-        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.groupsCompacted).describedAs("the sweep is not wedged").isEqualTo(1)
 
         val output = catalogs.listFiles(fx.cat, "ns", "t").single()
-        val row =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT value_count, null_count, lower_bound, upper_bound
-                      FROM hog_file_column_stats s
-                      JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                     WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = 1
-                    """,
-                )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .map { rs, _ ->
-                        listOf(
-                            rs.getLong("value_count"),
-                            rs.getLong("null_count"),
-                        ) to (rs.getBytes("lower_bound") to rs.getBytes("upper_bound"))
-                    }
-                    .one()
-            }
-        val (counts, bounds) = row
-        assertThat(counts[1])
-            .describedAs("null_count must not exceed the value_count it is a subset of")
-            .isLessThanOrEqualTo(counts[0])
-        // The merged bound must not be the plausible-looking blend of a
-        // sound file's minimum with a corrupt file's maximum.
-        assertThat(bounds.first to bounds.second)
-            .describedAs("a repaired input contributes no bound, so the merge has none")
-            .isEqualTo(null to null)
-        // The inverted pair is DROPPED, not narrowed: nothing in the row
-        // says which of the two was the wrong one, so keeping either
-        // would be picking at random — and the kept one would prune.
-        assertThat(bounds.first).describedAs("inverted lower bound must not survive").isNull()
-        assertThat(bounds.second).describedAs("inverted upper bound must not survive").isNull()
+        assertThat(output.statsState.wire).isEqualTo("provided")
+        val stats = storedStats(fx.cat, output.dataFileId)
+        assertThat(stats).containsOnlyKeys(1L, 2L, 3L)
+        // EXACT, from the footer, for all fifteen rows — the bounds span
+        // the negatives, which a raw binary min/max of the little-endian
+        // encodings would get wrong.
+        assertThat(stats.getValue(1L).valueCount).isEqualTo(15)
+        assertThat(stats.getValue(1L).nullCount)
+            .describedAs("id is required; no input row said so and the footer does")
+            .isZero()
+        assertThat(stats.getValue(1L).lower).isEqualTo(IcebergSingleValue.encodeLong(-10))
+        assertThat(stats.getValue(1L).upper).isEqualTo(IcebergSingleValue.encodeLong(5))
+        assertThat(stats.getValue(2L).lower).isEqualTo(IcebergSingleValue.encodeString("a"))
+        assertThat(stats.getValue(2L).upper).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
+        assertThat(stats.getValue(3L).upper).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
+        assertVerifyPasses(fx.cat)
     }
-
-    private fun longLe(v: Long): ByteArray =
-        java.nio.ByteBuffer.allocate(8).order(java.nio.ByteOrder.LITTLE_ENDIAN).putLong(v).array()
 
     private fun fixture(dvOnMiddle: Boolean = true): Fixture {
         val cat = "compact-e2e-${counter.incrementAndGet()}"
@@ -596,9 +559,11 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isEqualTo(13) // 15 gross - 2 deleted
         assertThat(output.rowIdStart).isEqualTo(0) // min surviving id; positional meaning void
         assertThat(output.beginSnapshot).isEqualTo(compactionSnap)
-        // A DV'd input makes the inputs' registered counts wrong for the
-        // survivor set: honest 'pending', hydrator fills from the footer.
-        assertThat(output.statsState.wire).isEqualTo("pending")
+        // 'provided' even though an input carried a DV: the stats come
+        // off the footer the rewrite wrote, which describes the
+        // SURVIVORS. (The dedicated assertions are in `a group with a
+        // DV'd input registers provided stats over the survivors only`.)
+        assertThat(output.statsState.wire).isEqualTo("provided")
         val before = catalogs.listFiles(fx.cat, "ns", "t", snapshot = compactionSnap - 1)
         assertThat(before.map { it.path }).containsExactlyElementsOf(fx.paths)
         assertThat(before.none { it.explicitRowIds }).isTrue()
@@ -768,7 +733,11 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `a DV-free group aggregates typed stats from the inputs`() {
+    fun `a DV-free group's output stats come from the footer the rewrite just wrote`() {
+        // NOT from the inputs' hog_file_column_stats, which this path
+        // used to read back and re-merge. The expected numbers below are
+        // what the fixture's fifteen rows actually contain, computed
+        // from the rows rather than from any stored row.
         val fx = fixture(dvOnMiddle = false)
         val result = svc.runOnce(fx.cat, cfg)
         assertThat(result.groupsCompacted).isEqualTo(1)
@@ -779,113 +748,104 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isEqualTo(15)
         assertThat(output.statsState.wire).isEqualTo("provided")
 
-        // -- typed stats aggregation: signed long bounds span the negative
-        //    inputs; string/double bounds merge correctly; counts sum.
-        val stats =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT field_id, value_count, null_count, lower_bound, upper_bound
-                    FROM hog_file_column_stats s
-                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                    WHERE c.name = :cat AND s.data_file_id = :fileId
-                    """,
-                )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .map { rs, _ ->
-                        rs.getLong("field_id") to
-                            Triple(
-                                rs.getLong("value_count") to rs.getLong("null_count"),
-                                rs.getBytes("lower_bound"),
-                                rs.getBytes("upper_bound"),
-                            )
-                    }
-                    .list()
-                    .toMap()
-            }
+        val stats = storedStats(fx.cat, output.dataFileId)
+        // The reserved _hog_row_id leaf is in the file but not in the
+        // catalog's column list, so it gets no row.
         assertThat(stats).containsOnlyKeys(1L, 2L, 3L)
-        assertThat(stats[1L]!!.first).isEqualTo(15L to 0L)
-        assertThat(stats[1L]!!.second).isEqualTo(IcebergSingleValue.encodeLong(-10))
-        assertThat(stats[1L]!!.third).isEqualTo(IcebergSingleValue.encodeLong(5))
-        assertThat(stats[2L]!!.first).isEqualTo(15L to 2L)
-        assertThat(stats[2L]!!.second).isEqualTo(IcebergSingleValue.encodeString("a"))
-        assertThat(stats[2L]!!.third).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
-        assertThat(stats[3L]!!.first).isEqualTo(15L to 2L)
+
+        // id (field 1, required): every row, no nulls, and the bounds
+        // span the negatives — a raw binary min/max of the little-endian
+        // encodings would get these wrong.
+        assertThat(stats[1L]!!.valueCount to stats[1L]!!.nullCount).isEqualTo(15L to 0L)
+        assertThat(stats[1L]!!.lower).isEqualTo(IcebergSingleValue.encodeLong(-10))
+        assertThat(stats[1L]!!.upper).isEqualTo(IcebergSingleValue.encodeLong(5))
+
+        // name (field 2): two of the fifteen rows have none; the widest
+        // strings present are "a" and "mid-4".
+        assertThat(stats[2L]!!.valueCount to stats[2L]!!.nullCount).isEqualTo(15L to 2L)
+        assertThat(stats[2L]!!.lower).isEqualTo(IcebergSingleValue.encodeString("a"))
+        assertThat(stats[2L]!!.upper).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
+
+        // score (field 3): two nulls; the smallest value written is 0.0
+        // and the largest 9.0.
+        assertThat(stats[3L]!!.valueCount to stats[3L]!!.nullCount).isEqualTo(15L to 2L)
         // -0.0, not +0.0: a stored lower bound takes the sign Iceberg
         // fixes for the role, so a total-order evaluator cannot read the
-        // pair as an empty range. Same number, canonical bytes — and
-        // this is the compaction door proving it all the way to the row.
-        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(-0.0))
-        assertThat(stats[3L]!!.third).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
+        // pair as an empty range. Same number, canonical bytes — and it
+        // proves StatsSanity still runs on this door, since the footer's
+        // own minimum for that column is +0.0.
+        assertThat(stats[3L]!!.lower).isEqualTo(IcebergSingleValue.encodeDouble(-0.0))
+        assertThat(stats[3L]!!.upper).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
+
+        // nan_count comes from the footer too, and only float/double
+        // statistics carry one: the double column answers 0 because
+        // these fifteen rows hold no NaN, and the long and the string
+        // answer null because parquet never records a NaN count for a
+        // type that has no NaN.
+        assertThat(stats[3L]!!.nanCount).isZero()
+        assertThat(listOf(stats[1L]!!.nanCount, stats[2L]!!.nanCount)).containsOnly(null)
+        // size_bytes is the footer's own per-column chunk total.
+        assertThat(stats.values.map { it.sizeBytes }).doesNotContainNull()
         assertVerifyPasses(fx.cat)
     }
 
-    @Test
-    fun `a wrong-width stats bound never wedges the sweep - the group compacts with that bound null`() {
-        // Pinned regression (bug hunt #5, belt-and-braces half): a bound
-        // that does not decode under the live type (a 4-byte residue from
-        // a pre-fix promote, or a racing hydrator's stale-typed upsert)
-        // used to throw out of mergeBound EVERY sweep — a poison group
-        // wedged until its inputs expired. It must instead be treated as
-        // absent: the group compacts, that column's merged bound is null.
-        val fx = fixture(dvOnMiddle = false)
-        db.jdbi.useHandleUnchecked { h ->
-            h.execute(
+    private data class StoredStats(
+        val valueCount: Long,
+        val nullCount: Long,
+        val nanCount: Long?,
+        val sizeBytes: Long?,
+        val lower: ByteArray?,
+        val upper: ByteArray?,
+    )
+
+    /** Every stored hog_file_column_stats row for one file, by field id. */
+    private fun storedStats(
+        cat: String,
+        dataFileId: Long,
+    ): Map<Long, StoredStats> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
                 """
-                UPDATE hog_file_column_stats SET lower_bound = ?
-                WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = ?)
-                  AND data_file_id = ? AND field_id = 1
+                SELECT field_id, value_count, null_count, nan_count, size_bytes,
+                       lower_bound, upper_bound
+                  FROM hog_file_column_stats s
+                  JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                 WHERE c.name = :cat AND s.data_file_id = :fileId
                 """,
-                IcebergSingleValue.encodeInt(-10),
-                fx.cat,
-                fx.fileIds[0],
             )
+                .bind("cat", cat)
+                .bind("fileId", dataFileId)
+                .map { rs, _ ->
+                    rs.getLong("field_id") to
+                        StoredStats(
+                            valueCount = rs.getLong("value_count"),
+                            nullCount = rs.getLong("null_count"),
+                            nanCount = rs.getObject("nan_count")?.let { (it as Number).toLong() },
+                            sizeBytes = rs.getObject("size_bytes")?.let { (it as Number).toLong() },
+                            lower = rs.getBytes("lower_bound"),
+                            upper = rs.getBytes("upper_bound"),
+                        )
+                }
+                .list()
+                .toMap()
         }
 
-        val result = svc.runOnce(fx.cat, cfg)
-        assertThat(result.groupsCompacted).isEqualTo(1) // not wedged
-
-        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
-        val stats =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats s
-                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                    WHERE c.name = :cat AND s.data_file_id = :fileId
-                    """,
-                )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .map { rs, _ ->
-                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
-                    }
-                    .list()
-                    .toMap()
-            }
-        // The poisoned side is null (honest absence), the clean side merged.
-        assertThat(stats[1L]!!.first).isNull()
-        assertThat(stats[1L]!!.second).isEqualTo(IcebergSingleValue.encodeLong(5))
-        // Untouched columns merged normally.
-        assertThat(stats[2L]!!.first).isEqualTo(IcebergSingleValue.encodeString("a"))
-        assertThat(stats[3L]!!.second).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
-    }
-
     @Test
-    fun `a mixed-width bound pair from a promotion race merges to null, not to garbage`() {
-        // The race AlterService documents: the promote-time re-encode
-        // rewrites existing 4-byte bounds to 8, but a hydrator already
-        // in flight under the OLD type can land another 4-byte row
-        // AFTER it. The merge then sees one bound of each width for the
-        // same column, and decoding a 4-byte payload as the live 8-byte
-        // type is not a near miss — it is an exception, which used to
-        // wedge the group on every sweep until its inputs expired.
+    fun `a column added after the inputs is null-filled in the output - counted, with no bounds`() {
+        // This was `a mixed-width bound pair from a promotion race merges
+        // to null, not to garbage`: a promote rewrites existing 4-byte
+        // bounds to 8, a hydrator already in flight under the OLD type
+        // can land another 4-byte row after it, and the merge then saw
+        // one bound of each width for one column. No merge, no race — the
+        // output's stats never touch those rows.
         //
-        // Exercised on a NEW type so the backstop is known to cover the
-        // parity set too: uint8 -> uint32 is int -> long in Iceberg
-        // terms, so it is a width-changing promotion exactly like
-        // int -> long, just with neither name saying "long".
+        // What the output's own footer says about such a column is the
+        // thing worth pinning, and it is not "nothing": the rewriter
+        // writes the LIVE schema, so a column added after every input was
+        // written exists in the output as an all-null chunk. The footer
+        // therefore reports a full value_count, a full null_count, and NO
+        // bounds — an all-null chunk has no non-null minimum to bound —
+        // which is the honest row for a column that holds no values.
         val fx = fixture(dvOnMiddle = false)
         val added =
             alter.alterTable(
@@ -896,7 +856,8 @@ class CompactionServiceIntegrationTest {
             )
         val field = added.columns.single { it.def.name == "small" }.fieldId
 
-        // Pre-promotion bounds on every input, in the 4-byte int encoding.
+        // The stale-typed input rows the old merge choked on, still
+        // written, still promoted underneath, and now read by nothing.
         db.jdbi.useHandleUnchecked { h ->
             for (fileId in fx.fileIds) {
                 h.execute(
@@ -914,16 +875,17 @@ class CompactionServiceIntegrationTest {
                 )
             }
         }
-
+        // uint8 -> uint32 is int -> long in Iceberg terms: a
+        // width-changing promotion exactly like int -> long, with
+        // neither name saying "long".
         alter.alterTable(
             fx.cat,
             "ns",
             "t",
             listOf(AlterOp.PromoteColumn("small", ColType.UINT32)),
         )
-
-        // The promote widened all of them; now simulate the racing
-        // hydrator by putting ONE back to the pre-promotion width.
+        // The promote widened all three; put ONE back to the
+        // pre-promotion width, which is the racing hydrator's landing.
         db.jdbi.useHandleUnchecked { h ->
             h.execute(
                 """
@@ -943,158 +905,447 @@ class CompactionServiceIntegrationTest {
         assertThat(result.groupsCompacted).describedAs("the sweep is not wedged").isEqualTo(1)
 
         val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
-        val merged =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT lower_bound, upper_bound FROM hog_file_column_stats s
-                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                    WHERE c.name = :cat AND s.data_file_id = :fileId AND s.field_id = :field
-                    """,
-                )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .bind("field", field)
-                    .map { rs, _ -> rs.getBytes("lower_bound") to rs.getBytes("upper_bound") }
-                    .one()
-            }
-        // Honest absence, not a bound merged from a payload that was
-        // reinterpreted at the wrong width.
-        assertThat(merged.first).describedAs("mixed-width merge yields no lower bound").isNull()
-        assertThat(merged.second).describedAs("mixed-width merge yields no upper bound").isNull()
+        val stats = storedStats(fx.cat, output.dataFileId)
+        val small = stats.getValue(field)
+        assertThat(small.valueCount).describedAs("the column is in the output, null-filled").isEqualTo(15)
+        assertThat(small.nullCount).isEqualTo(15)
+        assertThat(small.lower).describedAs("an all-null chunk bounds nothing").isNull()
+        assertThat(small.upper).describedAs("an all-null chunk bounds nothing").isNull()
+        // One value-less column must not cost the file's other bounds.
+        assertThat(stats[1L]!!.lower).isEqualTo(IcebergSingleValue.encodeLong(-10))
+        assertThat(stats[2L]!!.upper).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
+        assertThat(stats[3L]!!.upper).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
+    }
 
-        // The columns that were consistent still merged normally — one
-        // poisoned field must not null the whole file's stats.
-        val others =
-            db.jdbi.withHandleUnchecked { h ->
-                h.createQuery(
-                    """
-                    SELECT count(*) FROM hog_file_column_stats s
-                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                    WHERE c.name = :cat AND s.data_file_id = :fileId
-                      AND s.field_id <> :field AND s.lower_bound IS NOT NULL
-                    """,
-                )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .bind("field", field)
-                    .mapTo(Long::class.java)
-                    .one()
+    /**
+     * A catalog + `ns.t` with [cols], two single-row-group input files
+     * written from [fileSchema], and nothing else. For the stats shapes
+     * the generic fixture's id/name/score cannot express.
+     */
+    private fun twoFileTable(
+        name: String,
+        cols: List<ColumnDef>,
+        fileSchema: MessageType,
+        file1: List<(Group) -> Unit>,
+        file2: List<(Group) -> Unit>,
+    ): String {
+        val cat = "compact-$name-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", cols)
+        val regs =
+            listOf(file1, file2).mapIndexed { i, rows ->
+                val bytes = customParquetBytes(fileSchema, rows)
+                val path = "s3://$BUCKET/$cat/data/ns/t/$name$i.parquet"
+                store.put(path, bytes)
+                // No columnStats: nothing downstream reads them, and
+                // registering none proves it again for free.
+                FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
             }
-        assertThat(others).describedAs("unaffected columns keep their merged bounds").isGreaterThan(0)
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        return cat
     }
 
     @Test
-    fun `bound-merge is unsigned for uint64 and byte-ordered for json`() {
-        // The two new types whose merge is NOT its natural JVM ordering.
-        // uint64 decodes to a BigInteger, so the winner must be picked by
-        // magnitude across the 2^63 boundary where a signed long would
-        // flip; json decodes to a String, which must compare as UTF-8
-        // BYTES (String.compareTo is UTF-16 unit order, and the two
-        // disagree above the BMP).
-        val fx = fixture(dvOnMiddle = false)
-        val added =
-            alter.alterTable(
-                fx.cat,
-                "ns",
-                "t",
-                listOf(
-                    AlterOp.AddColumn(ColumnDef("big", ColType.UINT64)),
-                    AlterOp.AddColumn(ColumnDef("doc", ColType.JSON)),
-                ),
-            )
-        val bigField = added.columns.single { it.def.name == "big" }.fieldId
-        val docField = added.columns.single { it.def.name == "doc" }.fieldId
+    fun `a decimal column with no declared scale gets bounds, and a scaled one keeps its scale`() {
+        // `type_params` WITHOUT a `scale` is ordinary — pyhoglake's
+        // convention, BoundWire.scaleOf's, and ParquetRewriter's, all of
+        // which read an absent scale as 0; the rewriter even STAMPS
+        // `decimalType(0, precision)` on the output leaf. The footer
+        // decode used to be the one reader that did not, treating a
+        // null catalog scale as "unknown" and dropping the bounds of
+        // every such column on both this path and the hydrator's.
+        val bare =
+            Types.optional(PrimitiveTypeName.BINARY)
+                .`as`(LogicalTypeAnnotation.decimalType(0, 10)).id(1).named("bare")
+        val cents =
+            Types.optional(PrimitiveTypeName.BINARY)
+                .`as`(LogicalTypeAnnotation.decimalType(2, 10)).id(2).named("cents")
 
-        // Per input file: a uint64 bound pair straddling 2^63, and a json
-        // pair whose UTF-8 order differs from UTF-16 order. The first
-        // file's uint64 lower is written NON-MINIMALLY (a redundant
-        // leading sign byte), which is what a sloppy writer produces and
-        // which the merge must re-minimalise on re-encode.
-        val twoPow63 = java.math.BigInteger.ONE.shiftLeft(63)
-        val uintBounds =
-            listOf(
-                byteArrayOf(0, 0, 0, 0, 0, 0, 0, 0, 7) to twoPow63.toByteArray(),
-                twoPow63.toByteArray() to twoPow63.add(java.math.BigInteger.TEN).toByteArray(),
-                java.math.BigInteger.valueOf(9).toByteArray() to
-                    java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray(),
+        fun row(
+            b: Long,
+            c: Long,
+        ): (Group) -> Unit =
+            { g ->
+                g.add("bare", Binary.fromConstantByteArray(java.math.BigInteger.valueOf(b).toByteArray()))
+                g.add("cents", Binary.fromConstantByteArray(java.math.BigInteger.valueOf(c).toByteArray()))
+            }
+
+        val cat =
+            twoFileTable(
+                "decimal",
+                listOf(
+                    ColumnDef("bare", ColType.DECIMAL, typeParams = mapOf("precision" to 10)),
+                    ColumnDef("cents", ColType.DECIMAL, typeParams = mapOf("precision" to 10, "scale" to 2)),
+                ),
+                Types.buildMessage().addField(bare).addField(cents).named("t"),
+                // bare: -3 .. 7 here, cents: -0.01 .. 14.20
+                file1 = listOf(row(-3, -1), row(7, 1420)),
+                // bare: 11 (the file's and the group's maximum)
+                file2 = listOf(row(11, 500)),
             )
-        // The orders only diverge ABOVE the BMP, so the discriminating
-        // pair needs an astral codepoint: U+1F600 is F0 9F 98 80 in
-        // UTF-8, above U+FFFD's EF BF BD, but its UTF-16 lead surrogate
-        // D83D is BELOW FFFD. A String.compareTo merge would pick the
-        // replacement character as the upper bound; the byte order picks
-        // the emoji.
-        val jsonBounds =
-            listOf(
-                """{"a":1}""" to """{"z":1}""",
-                """{"b":1}""" to """{"😀":1}""",
-                """{"c":1}""" to """{"�":1}""",
+
+        assertThat(svc.runOnce(cat, cfg).groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.statsState.wire).isEqualTo("provided")
+        val stats = storedStats(cat, output.dataFileId)
+        // The scale-less column, which used to get NULL bounds here.
+        assertThat(stats.getValue(1L).lower)
+            .describedAs("absent type_params.scale means 0, the same as the leaf the rewriter wrote")
+            .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(-3)))
+        assertThat(stats.getValue(1L).upper)
+            .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(11)))
+        // And the declared-scale column bounds the UNSCALED integer, so
+        // -0.01 and 14.20 are -1 and 1420 — the Iceberg encoding, which
+        // carries the scale in the catalog and never in the bytes.
+        assertThat(stats.getValue(2L).lower)
+            .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(-1)))
+        assertThat(stats.getValue(2L).upper)
+            .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(1420)))
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `nan_count is the footer's own count, not a null placeholder`() {
+        // Parquet DOES carry a NaN count — `Statistics.nan_count`,
+        // reachable through isNanCountSet/getNanCount — and the writer
+        // accumulated this output's over exactly the rows it wrote. It
+        // used to be hard-coded null here with a comment saying footers
+        // carry no such thing, which cost the one count Iceberg defines
+        // for floating-point columns (nan_value_counts) on every file
+        // either door produced.
+        val v = Types.optional(PrimitiveTypeName.DOUBLE).id(1).named("v")
+        val cat =
+            twoFileTable(
+                "nan",
+                listOf(ColumnDef("v", ColType.DOUBLE)),
+                Types.buildMessage().addField(v).named("t"),
+                file1 = listOf({ g: Group -> g.add("v", 1.0) }, { g: Group -> g.add("v", Double.NaN) }),
+                // A NULL as well as a NaN: the two are counted
+                // separately and neither may be mistaken for the other.
+                file2 = listOf({ g: Group -> g.add("v", Double.NaN) }, { _: Group -> }),
             )
-        db.jdbi.useHandleUnchecked { h ->
-            for ((i, fileId) in fx.fileIds.withIndex()) {
-                val rows =
+
+        assertThat(svc.runOnce(cat, cfg).groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        val row = storedStats(cat, output.dataFileId).getValue(1L)
+        assertThat(row.valueCount).isEqualTo(4)
+        assertThat(row.nullCount).describedAs("one row has no value at all").isEqualTo(1)
+        assertThat(row.nanCount).describedAs("two of the three present values are NaN").isEqualTo(2)
+        // A NaN is never a bound (StatsSanity refuses one outright, and
+        // parquet's own statistics leave it out of min/max), so the only
+        // non-NaN value is both bounds.
+        assertThat(row.lower).isEqualTo(IcebergSingleValue.encodeDouble(1.0))
+        assertThat(row.upper).isEqualTo(IcebergSingleValue.encodeDouble(1.0))
+        assertVerifyPasses(cat)
+    }
+
+    @Test
+    fun `bounds parquet refuses to write are not stored either - both doors agree`() {
+        // parquet-java keeps a chunk's full min/max in the in-memory
+        // ParquetMetadata but will not SERIALIZE its statistics once
+        // minBytes.length + maxBytes.length reaches
+        // ParquetMetadataConverter.MAX_STATS_SIZE (4096). Compaction
+        // reads the writer's in-memory footer, so without the size gate
+        // it would store multi-KB bounds that re-reading the file can
+        // never reproduce — and a later rehydrate would replace them
+        // with NULL, silently changing a live file's pruning metadata.
+        val big =
+            Types.optional(PrimitiveTypeName.BINARY)
+                .`as`(LogicalTypeAnnotation.stringType()).id(1).named("big")
+
+        fun row(c: Char): (Group) -> Unit = { g -> g.add("big", c.toString().repeat(2_200)) }
+        val cat =
+            twoFileTable(
+                "bigstring",
+                listOf(ColumnDef("big", ColType.STRING)),
+                Types.buildMessage().addField(big).named("t"),
+                file1 = listOf(row('a'), row('b')),
+                file2 = listOf(row('c')),
+            )
+
+        assertThat(svc.runOnce(cat, cfg).groupsCompacted).isEqualTo(1)
+        val output = catalogs.listFiles(cat, "ns", "t").single()
+        assertThat(output.statsState.wire).isEqualTo("provided")
+        val row = storedStats(cat, output.dataFileId).getValue(1L)
+        assertThat(row.valueCount).describedAs("counts are unaffected").isEqualTo(3)
+        assertThat(row.nullCount).isZero()
+        assertThat(row.lower).describedAs("4,400 bytes of bounds the file does not carry").isNull()
+        assertThat(row.upper).isNull()
+
+        // And the file itself proves it: re-reading the output's footer
+        // and running the SAME aggregation finds no statistics at all
+        // for that chunk — parquet dropped the whole object, null_count
+        // included — so the hydrator's answer is "no row", never a
+        // bound. Neither door can produce one, which is the agreement
+        // that matters.
+        val reread =
+            FooterStats.aggregate(
+                footerOf(store.get(output.path)),
+                listOf(CatalogColumn(1, "big", ColType.STRING, null)),
+                output.path,
+            )
+        assertThat(reread)
+            .describedAs("the written footer carries no statistics for an oversized chunk")
+            .isEmpty()
+        assertVerifyPasses(cat)
+    }
+
+    private fun footerOf(bytes: ByteArray): ParquetMetadata {
+        val tmp = Files.createTempFile("compact-footer", ".parquet")
+        try {
+            Files.write(tmp, bytes)
+            return ParquetFileReader.open(LocalInputFile(tmp)).use { it.footer }
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+    }
+
+    @Test
+    fun `a group with a DV'd input registers provided stats over the survivors only`() {
+        // THE CASE THE OLD CODE COULD NOT DO AT ALL. A DV'd input's
+        // registered counts describe pre-delete rows, so summing them
+        // would have claimed rows the output does not contain; the merge
+        // refused the group's stats outright, registered 'pending', and
+        // left a hydrator sweep to fetch the same footer back out of S3.
+        // The footer the writer just built counts the SURVIVORS, because
+        // the survivors are what it wrote.
+        val fx = fixture(dvOnMiddle = true)
+        // TWO MORE vectors, so that every assertion below can tell a
+        // survivor aggregate from a gross one. With only f2's interior
+        // rows deleted, each column's extremes and every null still
+        // survived, so lower_bound, upper_bound and null_count were all
+        // identical for the 15 rows and for the 11 — the counts alone
+        // moved, and only on value_count.
+        //
+        // f3: position 1 is id 2 / score 9.0 (the group's largest score)
+        // and position 4 is id 5 / score 0.5 (the group's largest id),
+        // so both of those columns' UPPER bounds move.
+        registerDv(fx.cat, fx.fileIds[2], "s3://$BUCKET/${fx.cat}/dv/f3.puffin", listOf(1L, 4L))
+        // f1: position 0 is id -10 (the group's smallest id, so id's
+        // LOWER bound moves to -8) and position 2 is the row with a NULL
+        // name AND a NULL score, so both of those columns' null_counts
+        // move from 2 to 1.
+        registerDv(fx.cat, fx.fileIds[0], "s3://$BUCKET/${fx.cat}/dv/f1.puffin", listOf(0L, 2L))
+
+        val result = svc.runOnce(fx.cat, cfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.filesIn).isEqualTo(3)
+
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single()
+        assertThat(output.recordCount).describedAs("15 gross - 6 deleted").isEqualTo(9)
+        assertThat(output.statsState.wire).isEqualTo("provided")
+
+        val stats = storedStats(fx.cat, output.dataFileId)
+        assertThat(stats).containsOnlyKeys(1L, 2L, 3L)
+        // Every column counts 9, not the 15 the inputs are registered
+        // with — nothing here is a sum of pre-delete counts.
+        assertThat(stats.values.map { it.valueCount })
+            .describedAs("counts are the survivors', matching record_count")
+            .containsOnly(output.recordCount)
+        // id: -10 and 5 both died with their vectors, leaving -8 and 4.
+        assertThat(stats[1L]!!.nullCount).isZero()
+        assertThat(stats[1L]!!.lower)
+            .describedAs("id -10 died with f1's vector; the bound is the surviving minimum")
+            .isEqualTo(IcebergSingleValue.encodeLong(-8))
+        assertThat(stats[1L]!!.upper)
+            .describedAs("id 5 died with f3's vector; the bound is the surviving maximum")
+            .isEqualTo(IcebergSingleValue.encodeLong(4))
+        // name: f1's null died, so only f3's is left; "mid-4" and "a"
+        // both survive.
+        assertThat(stats[2L]!!.nullCount)
+            .describedAs("one of the two nulls died with f1's vector")
+            .isEqualTo(1)
+        assertThat(stats[2L]!!.lower).isEqualTo(IcebergSingleValue.encodeString("a"))
+        assertThat(stats[2L]!!.upper).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
+        // score: 9.0 died with f3's vector, so 8.0 is the surviving
+        // maximum; 0.0 survives in f2 and stores as the role-signed
+        // -0.0; the null that died was f1's.
+        assertThat(stats[3L]!!.nullCount)
+            .describedAs("one of the two nulls died with f1's vector")
+            .isEqualTo(1)
+        assertThat(stats[3L]!!.lower).isEqualTo(IcebergSingleValue.encodeDouble(-0.0))
+        assertThat(stats[3L]!!.upper)
+            .describedAs("score 9.0 died with f3's vector")
+            .isEqualTo(IcebergSingleValue.encodeDouble(8.0))
+        assertVerifyPasses(fx.cat)
+    }
+
+    /**
+     * The SEQUENTIAL arm: `parallelGroups = 1`, no pool, [executeWave]
+     * calling [CompactionService.executeGroup] on the sweep's own
+     * thread. The rethrow escaped straight out of `runOnce` here.
+     */
+    @Test
+    fun `a commit statement that dies for an unruled reason fails ONE group, not the sweep`() {
+        assertOneGroupFails(parallelGroups = 1)
+    }
+
+    /**
+     * The POOL arm, and the one production took: at
+     * `parallelGroups` > 1 every group runs on a worker, so the escaping
+     * exception came back out of `f.get()` in [executeWave] wrapped in
+     * an `ExecutionException` — a different catch shape, outside
+     * `executeGroup`'s own arms, and the one that killed the whole
+     * sweep's ledger. The sequential arm alone would have left it
+     * untested.
+     */
+    @Test
+    fun `the same unruled commit failure on a POOL worker also fails ONE group`() {
+        assertOneGroupFails(parallelGroups = 2)
+    }
+
+    private fun assertOneGroupFails(parallelGroups: Int) {
+        // gigahog-prod-us, 2026-09-30: the commit's stats read crossed
+        // the session statement_timeout, and the arm that catches
+        // UnableToExecuteStatementException RETHREW it because it was not
+        // a lock timeout. A `throw` inside a catch block leaves the try
+        // statement, so the sibling `catch (e: Throwable)` — the
+        // per-group failure isolation — never saw it; `f.get()` in
+        // executeWave surfaced an ExecutionException and the whole sweep
+        // died with an empty ledger result, losing every group that had
+        // not started.
+        //
+        // The seam makes a commit statement fail FOR REAL (SQLSTATE
+        // 57014 out of the driver, not a hand-thrown Kotlin exception),
+        // because the arm under test is keyed on the driver's SQLSTATE.
+        val cat = "compact-commit-fail-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        val cols =
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            )
+        catalogs.createTable(cat, "ns", "a", cols)
+        catalogs.createTable(cat, "ns", "b", cols)
+
+        fun file(
+            name: String,
+            rows: List<TestRow>,
+        ): FileRegistration {
+            val bytes = parquetBytes(rows)
+            val path = "s3://$BUCKET/$cat/data/$name.parquet"
+            store.put(path, bytes)
+            return FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
+        }
+
+        commits.commit(
+            cat,
+            CommitRequest(
+                appends =
                     listOf(
-                        bigField to uintBounds[i],
-                        docField to
-                            (
-                                IcebergSingleValue.encodeString(jsonBounds[i].first) to
-                                    IcebergSingleValue.encodeString(jsonBounds[i].second)
+                        TableAppend(
+                            "ns",
+                            "a",
+                            listOf(
+                                file("a1", listOf(TestRow(1, "a", 1.0))),
+                                file("a2", listOf(TestRow(2, "b", 2.0))),
                             ),
-                    )
-                for ((field, pair) in rows) {
-                    h.execute(
-                        """
-                        INSERT INTO hog_file_column_stats
-                            (catalog_id, data_file_id, field_id, value_count, null_count,
-                             lower_bound, upper_bound)
-                        VALUES ((SELECT catalog_id FROM hog_catalog WHERE name = ?), ?, ?, 5, 0, ?, ?)
-                        """,
-                        fx.cat,
-                        fileId,
-                        field,
-                        pair.first,
-                        pair.second,
-                    )
-                }
+                        ),
+                        TableAppend(
+                            "ns",
+                            "b",
+                            listOf(
+                                file("b1", listOf(TestRow(3, "c", 3.0))),
+                                file("b2", listOf(TestRow(4, "d", 4.0))),
+                            ),
+                        ),
+                    ),
+            ),
+        )
+
+        // Its OWN service instance: the hook is per-instance state and
+        // the shared `svc` is used by every other test in this class.
+        // Fires exactly ONCE, on whichever group commits first — the
+        // assertion below is about the counts, not about which table
+        // lost, so the sweep's group order does not matter.
+        val failing = CompactionService(db.jdbi, store, cfg)
+        val fired = java.util.concurrent.atomic.AtomicBoolean(false)
+        failing.beforeCommitTail = { h ->
+            if (fired.compareAndSet(false, true)) {
+                h.execute("SET LOCAL statement_timeout = '1ms'")
+                h.createQuery("SELECT 1 FROM pg_sleep(0.05)").mapTo(Int::class.javaObjectType).one()
             }
         }
 
-        assertThat(svc.runOnce(fx.cat, cfg).groupsCompacted).isEqualTo(1)
+        val policy = cfg.copy(targetBytes = 2048, parallelGroups = parallelGroups)
+        val result = failing.runOnce(cat, policy)
+        assertThat(fired.get()).describedAs("the seam ran").isTrue()
+        // BOTH groups accounted for: one failed, one compacted. Before
+        // the fix this call threw and there was no result at all.
+        assertThat(result.failedGroups).isEqualTo(1)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        // One table is down to its compacted output; the other still
+        // holds both inputs, so its group re-plans next sweep.
+        val survivor = listOf("a", "b").single { catalogs.listFiles(cat, "ns", it).size == 2 }
+        val compacted = listOf("a", "b").single { it != survivor }
+        assertThat(catalogs.listFiles(cat, "ns", compacted)).hasSize(1)
 
-        val output = catalogs.listFiles(fx.cat, "ns", "t").single { it.explicitRowIds }
-        val merged =
+        // The RUN is ok, not failed: a failed group is a counter, not a
+        // broken sweep.
+        val row =
             db.jdbi.withHandleUnchecked { h ->
                 h.createQuery(
                     """
-                    SELECT field_id, lower_bound, upper_bound FROM hog_file_column_stats s
-                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
-                    WHERE c.name = :cat AND s.data_file_id = :fileId
+                    SELECT status, CAST(result AS text) AS result
+                      FROM hog_maintenance_run
+                     WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                       AND task = 'compaction'
+                     ORDER BY run_id DESC
+                     LIMIT 1
                     """,
                 )
-                    .bind("cat", fx.cat)
-                    .bind("fileId", output.dataFileId)
-                    .map { rs, _ ->
-                        rs.getLong("field_id") to Pair(rs.getBytes("lower_bound"), rs.getBytes("upper_bound"))
-                    }
-                    .list()
-                    .toMap()
+                    .bind("cat", cat)
+                    .map { rs, _ -> rs.getString("status") to rs.getString("result") }
+                    .one()
             }
+        assertThat(row.first).isEqualTo("ok")
+        val resultJson = com.fasterxml.jackson.databind.ObjectMapper().readTree(row.second)
+        assertThat(resultJson["failed_groups"].asLong()).isEqualTo(1)
+        assertThat(resultJson["groups_compacted"].asLong()).isEqualTo(1)
 
-        // uint64: smallest is 7, largest 2^64-1 — a signed merge would
-        // have called 2^63 and above negative and picked 7 as the max.
-        assertThat(merged[bigField]!!.first)
-            .describedAs("uint64 lower re-minimalises the 9-byte input")
-            .isEqualTo(java.math.BigInteger.valueOf(7).toByteArray())
-        assertThat(merged[bigField]!!.second)
-            .isEqualTo(java.math.BigInteger.ONE.shiftLeft(64).subtract(java.math.BigInteger.ONE).toByteArray())
+        // The failed group's staged output is left for the cleanup drain:
+        // two tickets, one settled 'registered' by the group that
+        // committed and one still undrained.
+        val tickets = removalRows(cat).filter { it.reason == "compaction_staging" }
+        assertThat(tickets).hasSize(2)
+        assertThat(tickets.map { it.drainedOutcome }).containsExactlyInAnyOrder("registered", null)
 
-        // json: byte order puts the two-byte UTF-8 sequence on top.
-        assertThat(merged[docField]!!.first).isEqualTo(IcebergSingleValue.encodeString("""{"a":1}"""))
-        assertThat(merged[docField]!!.second)
-            .describedAs("json upper is the UTF-8 byte winner, not the UTF-16 one")
-            .isEqualTo(IcebergSingleValue.encodeString("""{"😀":1}"""))
+        // THE CLAIM IS RELEASED, which is what makes a failed group a
+        // retry rather than a 15-minute outage for that table. The
+        // committed group keeps a SHORT claim on purpose (so a sibling's
+        // pre-commit plan does not spend a rewrite on dead inputs); the
+        // failed one must hold nothing.
+        assertThat(claimedTables(cat))
+            .describedAs("only the committed group's short-lease claim is left")
+            .containsExactly(catalogs.getTable(cat, "ns", compacted).tableId)
+
+        // And the retry really happens: with the seam disarmed the next
+        // sweep compacts the group that failed, with nothing in the way.
+        failing.beforeCommitTail = {}
+        val retry = failing.runOnce(cat, policy)
+        assertThat(retry.failedGroups).isZero()
+        assertThat(retry.groupsCompacted).describedAs("the failed group re-planned and ran").isEqualTo(1)
+        assertThat(catalogs.listFiles(cat, "ns", survivor)).hasSize(1)
     }
+
+    /** Table ids holding a live (unexpired) compaction claim. */
+    private fun claimedTables(cat: String): List<Long> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT cl.table_id FROM hog_compaction_claim cl
+                  JOIN hog_catalog c ON c.catalog_id = cl.catalog_id
+                 WHERE c.name = :cat AND cl.expires_at > now()
+                 ORDER BY cl.table_id
+                """,
+            )
+                .bind("cat", cat)
+                .mapTo(Long::class.java)
+                .list()
+        }
 
     @Test
     fun `changefeed replays original files and never the compacted output`() {
@@ -1910,6 +2161,15 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isZero()
         assertThat(output.rowIdStart).isZero() // min input start: diagnostics only
         assertThat(readRowIds(store.get(output.path))).isEmpty()
+        // AN EMPTY FILE'S STATS ARE KNOWN, not pending: the writer's
+        // footer has zero row groups, so the aggregate is legitimately
+        // empty and the file registers 'provided' with no rows rather
+        // than waiting for a hydrator sweep that would read the same
+        // footer and reach the same answer. A pending empty file would
+        // be re-fetched from S3 forever by a sweep that can never
+        // improve on it.
+        assertThat(output.statsState.wire).isEqualTo("provided")
+        assertThat(storedStats(cat, output.dataFileId)).isEmpty()
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
         assertVerifyPasses(cat)
     }
@@ -2581,7 +2841,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `inputs with pending stats produce a pending output for the hydrator`() {
+    fun `inputs with pending stats still produce a provided output - the footer needs no input rows`() {
         val cat = "compact-pending-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
@@ -2604,12 +2864,25 @@ class CompactionServiceIntegrationTest {
         assertThat(result.groupsCompacted).isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()
-        assertThat(output.statsState.wire).isEqualTo("pending")
+        // The inputs had NO stats rows at all — which is exactly why the
+        // old merge could not produce any, and registered the output
+        // 'pending' for a hydrator sweep to come back and read the
+        // footer out of S3. The rewrite already held that footer.
+        assertThat(output.statsState.wire).isEqualTo("provided")
         assertThat(output.recordCount).isEqualTo(3)
         assertThat(readSchemaOnly(store.get(output.path)).fields.map { it.name })
             .containsExactly("id", ParquetRewriter.ROW_ID_COLUMN)
-        // Offsets do not wait for the hydrator: they come off the footer
-        // compaction wrote, whatever the stats state.
+        // Only `id` is live, so only `id` gets a row: the dropped
+        // name/score leaves are not in the output file and _hog_row_id is
+        // not a catalog column.
+        val stats = storedStats(cat, output.dataFileId)
+        assertThat(stats).containsOnlyKeys(1L)
+        assertThat(stats.getValue(1L).valueCount).isEqualTo(3)
+        assertThat(stats.getValue(1L).nullCount).isZero()
+        assertThat(stats.getValue(1L).lower).isEqualTo(IcebergSingleValue.encodeLong(1))
+        assertThat(stats.getValue(1L).upper).isEqualTo(IcebergSingleValue.encodeLong(3))
+        // Offsets do not wait for the hydrator either: same footer, same
+        // commit.
         assertThat(storedSplitOffsets(cat, output.dataFileId))
             .containsExactlyElementsOf(ThriftRowGroupStarts.of(store.get(output.path)).offsets)
     }
