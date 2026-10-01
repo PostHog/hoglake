@@ -57,13 +57,7 @@ object NamespaceRepo {
         catalogId: Long,
         snapshot: Long,
     ): List<NamespaceInfo> =
-        handle.createQuery(
-            """
-            SELECT namespace_id, name FROM hog_namespace n
-            WHERE catalog_id = :catalogId AND $VISIBLE_AT
-            ORDER BY name
-            """,
-        )
+        handle.createQuery(LIST_AT_SQL)
             .bind("catalogId", catalogId)
             .bind("snapshot", snapshot)
             .map { rs, _ -> NamespaceInfo(rs.getLong("namespace_id"), rs.getString("name")) }
@@ -78,8 +72,9 @@ object NamespaceRepo {
     ): NamespaceInfo? =
         handle.createQuery(
             """
-            SELECT namespace_id, name FROM hog_namespace n
-            WHERE catalog_id = :catalogId AND name = :name AND $VISIBLE_AT
+            SELECT n.namespace_id, n.name
+            $VISIBLE_FROM
+            WHERE n.catalog_id = :catalogId AND n.name = :name AND $VISIBLE_WHERE
             """,
         )
             .bind("catalogId", catalogId)
@@ -89,14 +84,47 @@ object NamespaceRepo {
             .findOne()
             .orElse(null)
 
-    private const val VISIBLE_AT = """NOT EXISTS (
-                SELECT 1 FROM hog_snapshot_change sc
-                WHERE sc.catalog_id = n.catalog_id AND sc.object_id = n.namespace_id
-                  AND sc.kind = 'namespace_created' AND sc.snapshot_id > :snapshot)
-              AND (NOT n.dropped OR EXISTS (
-                SELECT 1 FROM hog_snapshot_change sc
-                WHERE sc.catalog_id = n.catalog_id AND sc.object_id = n.namespace_id
-                  AND sc.kind = 'namespace_dropped' AND sc.snapshot_id > :snapshot))"""
+    /**
+     * [listAt]'s statement, `internal` so the plan test EXPLAINs the SQL
+     * production runs.
+     *
+     * One LATERAL probe per namespace, on `hog_snapshot_change_conflict`
+     * (catalog_id, object_id, kind, snapshot_id). The aggregate keeps the
+     * LATERAL from being flattened, which is the point: the EXISTS form
+     * this replaced let the planner turn the drop check into a hashed
+     * SubPlan over `snapshot_id > :snapshot` with catalog_id only a hash
+     * key, which read every change row above the pin in EVERY catalog.
+     * A set-based form (one aggregate over the two kinds) is no better
+     * here: no index leads on (catalog_id, kind), so it reads the
+     * catalog's whole change log.
+     *
+     * MEASURED by `NamespaceListingQueryPlanIntegrationTest` (3,000
+     * namespaces in one catalog, 200,000 table change rows on the same
+     * object ids, a second catalog of the same size; PG 18, warm, serial,
+     * custom and generic plans alike): one probe per namespace at about
+     * 3 shared buffers each.
+     */
+    internal val LIST_AT_SQL =
+        """
+            SELECT n.namespace_id, n.name
+            $VISIBLE_FROM
+            WHERE n.catalog_id = :catalogId AND $VISIBLE_WHERE
+            ORDER BY n.name
+        """
+
+    private const val VISIBLE_FROM = """FROM hog_namespace n
+            CROSS JOIN LATERAL (
+                SELECT bool_or(sc.kind = 'namespace_created') AS created_after,
+                       bool_or(sc.kind = 'namespace_dropped') AS dropped_after
+                FROM hog_snapshot_change sc
+                WHERE sc.catalog_id = n.catalog_id
+                  AND sc.object_id = n.namespace_id
+                  AND sc.kind IN ('namespace_created', 'namespace_dropped')
+                  AND sc.snapshot_id > :snapshot
+            ) c"""
+
+    // bool_or over no rows is NULL, hence IS NOT TRUE / IS TRUE.
+    private const val VISIBLE_WHERE = "c.created_after IS NOT TRUE AND (NOT n.dropped OR c.dropped_after IS TRUE)"
 
     fun findLiveByName(
         handle: Handle,

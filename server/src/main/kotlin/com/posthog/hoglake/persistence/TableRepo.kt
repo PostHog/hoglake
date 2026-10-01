@@ -8,7 +8,11 @@ import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableSummaryInfo
 import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.mapper.RowMapper
+import org.jdbi.v3.core.statement.StatementContext
+import org.jdbi.v3.core.statement.StatementCustomizer
 import org.jdbi.v3.core.statement.UnableToExecuteStatementException
+import org.postgresql.PGStatement
+import java.sql.PreparedStatement
 import java.util.UUID
 
 /** Resolved table identity + the version row that made it visible. */
@@ -479,6 +483,17 @@ object TableRepo {
      *
      * [snapshot] pins every number to that snapshot; null reads the
      * catalog head inside the statement (see `bounds`).
+     *
+     * NEVER SERVER-PREPARED ([CUSTOM_PLANS_ONLY]). The plan above is the
+     * CUSTOM plan. After pgjdbc server-prepares a statement (its fifth
+     * execution on a connection), Postgres may switch to a GENERIC plan,
+     * and this statement's generic plan drives the change-log lateral
+     * from `hog_snapshot_change_by_snapshot` with `object_id` demoted to
+     * a Filter: every change row in the snapshot range, once per table.
+     * MEASURED on the plan test's fixture: 760,400 change rows looked at
+     * for a relation of 4,000, and a pinned listing switched to that plan
+     * after its first custom executions on one connection (head reads
+     * stayed custom there, but their generic plan is the same shape).
      */
     fun listLiveSummaries(
         handle: Handle,
@@ -491,8 +506,24 @@ object TableRepo {
             .bind("namespaceId", namespaceId)
             .bindByType("snapshot", snapshot, Long::class.javaObjectType)
             .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
+            .addCustomizer(CUSTOM_PLANS_ONLY)
             .map(tableSummaryMapper)
             .list()
+
+    /**
+     * pgjdbc `prepareThreshold = 0` for one statement: it is sent unnamed
+     * on every execution, and Postgres plans an unnamed statement custom
+     * each time, so a generic plan is never a candidate.
+     */
+    private val CUSTOM_PLANS_ONLY =
+        object : StatementCustomizer {
+            override fun beforeExecution(
+                stmt: PreparedStatement,
+                ctx: StatementContext,
+            ) {
+                stmt.unwrap(PGStatement::class.java).prepareThreshold = 0
+            }
+        }
 
     /**
      * [listLiveSummaries]'s statement, `internal` so the plan test

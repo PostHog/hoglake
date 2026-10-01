@@ -682,8 +682,21 @@ class Catalog:
             )
         return Namespace(self, name)
 
-    def list_namespaces(self) -> list[str]:
-        body = self._client._request("GET", self._path("/namespaces"))
+    def list_namespaces(
+        self,
+        snapshot: int | None = None,
+        at_timestamp: datetime | str | None = None,
+    ) -> list[str]:
+        """Namespace names at head, or at ``snapshot`` / ``at_timestamp``.
+
+        A pinned listing names what existed at the pin, including a
+        namespace dropped after it, so it agrees with pinned table reads.
+        """
+        body = self._client._request(
+            "GET",
+            self._path("/namespaces"),
+            params=_travel_params(snapshot, at_timestamp),
+        )
         return [ns["name"] for ns in body]
 
     # -- snapshots ---------------------------------------------------------
@@ -986,8 +999,22 @@ class Namespace:
         )
         return Table(self, TableInfo.from_wire(body))
 
-    def list_tables(self) -> list[TableSummary]:
-        body = self._catalog._client._request("GET", self._path("/tables"))
+    def list_tables(
+        self,
+        snapshot: int | None = None,
+        at_timestamp: datetime | str | None = None,
+    ) -> list[TableSummary]:
+        """Table summaries at head, or at ``snapshot`` / ``at_timestamp``.
+
+        Every field of every row answers for that one snapshot. A pinned
+        listing includes a table dropped after the pin and resolves this
+        namespace at the pin too.
+        """
+        body = self._catalog._client._request(
+            "GET",
+            self._path("/tables"),
+            params=_travel_params(snapshot, at_timestamp),
+        )
         return [TableSummary.from_wire(t) for t in body]
 
     # -- views -------------------------------------------------------------

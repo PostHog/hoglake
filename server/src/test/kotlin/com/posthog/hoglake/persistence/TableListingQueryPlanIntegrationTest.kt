@@ -14,6 +14,8 @@ import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import org.junit.jupiter.params.ParameterizedTest
+import org.junit.jupiter.params.provider.EnumSource
 
 /**
  * The plan behind `TableRepo.listLiveSummaries`, on a manifest and a
@@ -240,25 +242,42 @@ class TableListingQueryPlanIntegrationTest {
         }
     }
 
-    /** EXPLAIN ANALYZE of the production statement, serial plan only. */
-    private fun plan(): String =
-        db.jdbi.inTransactionUnchecked { h ->
-            // A Gather reports its workers' scans with loops= equal to the
-            // worker count, which would make the arithmetic below depend
-            // on the machine's core count.
-            h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-            h.createQuery(
-                "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
-                    TableRepo.LIVE_SUMMARIES_SQL,
-            )
-                .bind("catalogId", catalogId)
-                .bind("namespaceId", namespaceId)
-                .bindByType("snapshot", null, Long::class.javaObjectType)
-                .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
-                .mapTo(String::class.java)
-                .list()
-                .joinToString("\n")
-        }
+    /**
+     * The plans the listing can run under.
+     *
+     * HEAD binds a null snapshot (the statement resolves head itself).
+     * PINNED binds a snapshot below head, as a time-travel listing does
+     * (#28). Both are CUSTOM plans, which is the only kind production
+     * runs: see the last test in this class.
+     *
+     * The pin is head - 1: every table and every live file began at
+     * snapshot 1 and the dead files ended at 2, so the per-table bounds
+     * below hold unchanged.
+     */
+    enum class Shape { HEAD, PINNED }
+
+    private val explain = "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) "
+
+    /**
+     * EXPLAIN ANALYZE of the production statement, serial plan only,
+     * headed by its [Shape] so every failure message names it.
+     */
+    private fun plan(shape: Shape): String =
+        "-- $shape\n" +
+            db.jdbi.inTransactionUnchecked { h ->
+                // A Gather reports its workers' scans with loops= equal to the
+                // worker count, which would make the arithmetic below depend
+                // on the machine's core count.
+                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
+                h.createQuery(explain + TableRepo.LIVE_SUMMARIES_SQL)
+                    .bind("catalogId", catalogId)
+                    .bind("namespaceId", namespaceId)
+                    .bindByType("snapshot", if (shape == Shape.PINNED) head - 1 else null, Long::class.javaObjectType)
+                    .bindArray("kinds", String::class.java, ChangeKind.TABLE_SCOPED.map { it.wire })
+                    .mapTo(String::class.java)
+                    .list()
+                    .joinToString("\n")
+            }
 
     // ---- reading a plan, by WORK rather than by output rows ---------------
 
@@ -345,9 +364,10 @@ class TableListingQueryPlanIntegrationTest {
             }
         }
 
-    @Test
-    fun `neither inner relation is sequentially scanned`() {
-        val text = plan()
+    @ParameterizedTest
+    @EnumSource(Shape::class)
+    fun `neither inner relation is sequentially scanned`(shape: Shape) {
+        val text = plan(shape)
         for (relation in INNER_RELATIONS) {
             assertThat(text)
                 .describedAs("the listing must not sequentially scan %s:\n%s", relation, text)
@@ -355,9 +375,10 @@ class TableListingQueryPlanIntegrationTest {
         }
     }
 
-    @Test
-    fun `each inner scan is index-driven, not a scan of the whole relation`() {
-        val text = plan()
+    @ParameterizedTest
+    @EnumSource(Shape::class)
+    fun `each inner scan is index-driven, not a scan of the whole relation`(shape: Shape) {
+        val text = plan(shape)
         for (relation in INNER_RELATIONS) {
             val scans = scanNodes(text, relation)
             assertThat(scans)
@@ -377,9 +398,10 @@ class TableListingQueryPlanIntegrationTest {
         }
     }
 
-    @Test
-    fun `no inner relation has more rows than it holds looked at, filtered ones included`() {
-        val text = plan()
+    @ParameterizedTest
+    @EnumSource(Shape::class)
+    fun `no inner relation has more rows than it holds looked at, filtered ones included`(shape: Shape) {
+        val text = plan(shape)
         val sizes =
             mapOf(
                 "hog_data_file" to DATA_FILE_ROWS.toLong(),
@@ -415,9 +437,10 @@ class TableListingQueryPlanIntegrationTest {
         }
     }
 
-    @Test
-    fun `the driving scan reads the catalog's version rows once, and the laterals only this namespace's`() {
-        val text = plan()
+    @ParameterizedTest
+    @EnumSource(Shape::class)
+    fun `the driving scan reads the catalog's version rows once, and the laterals only this namespace's`(shape: Shape) {
+        val text = plan(shape)
         val driving = scanNodes(text, DRIVING_RELATION).single()
         assertThat(driving.index)
             .describedAs("the driving scan must be index-driven:\n%s", text)
@@ -463,8 +486,9 @@ class TableListingQueryPlanIntegrationTest {
         }
     }
 
-    @Test
-    fun `no inner scan costs more buffers than reading its relation once`() {
+    @ParameterizedTest
+    @EnumSource(Shape::class)
+    fun `no inner scan costs more buffers than reading its relation once`(shape: Shape) {
         // The row bound above and this one fail on different plans, so
         // both are here. Rows catch a scan that reads too much; buffers
         // catch a scan that reads the same pages repeatedly — and buffers
@@ -477,7 +501,7 @@ class TableListingQueryPlanIntegrationTest {
         // the whole predicate sits far inside it (measured: 1,786 of a
         // ~3,000 budget on hog_data_file); the degraded catalog-only plan
         // spent 207,000.
-        val text = plan()
+        val text = plan(shape)
         for (relation in INNER_RELATIONS) {
             for (scan in scanNodes(text, relation)) {
                 val budget = relationPages(relation, scan.index) * 2 + scan.loops * 8
@@ -561,6 +585,25 @@ class TableListingQueryPlanIntegrationTest {
         assertThat(rows).allSatisfy {
             assertThat(it.snapshotCount).isEqualTo(CHANGES_PER_TABLE / 2L + 1)
             assertThat(it.earliestSnapshotId).isEqualTo(floor)
+        }
+    }
+
+    @Test
+    fun `the listing is never server-prepared, so it never runs a generic plan`() {
+        // The generic plan of this statement reads the change log by
+        // snapshot range once per table (see listLiveSummaries). Without
+        // the customizer, a dozen pinned executions on one connection are
+        // server-prepared and Postgres switches to that plan.
+        db.jdbi.useHandleUnchecked { h ->
+            repeat(
+                12,
+            ) { i -> TableRepo.listLiveSummaries(h, catalogId, namespaceId, if (i % 2 == 0) head - 1 else null) }
+            val prepared =
+                h.createQuery(
+                    "SELECT name || ' generic=' || generic_plans || ' custom=' || custom_plans " +
+                        "FROM pg_prepared_statements WHERE statement LIKE '%hog_table_version tv%'",
+                ).mapTo(String::class.java).list()
+            assertThat(prepared).describedAs("server-prepared listing statements").isEmpty()
         }
     }
 }
