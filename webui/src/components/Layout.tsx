@@ -166,6 +166,35 @@ function Breadcrumbs() {
   );
 }
 
+const RELEASES_URL = "https://github.com/PostHog/hoglake/releases";
+
+function releaseNotesUrl(version: string | undefined): string {
+  // Only a plain X.Y.Z is a tagged release. main carries the NEXT
+  // version with a -dev suffix, and BuildInfo answers "unknown" when it
+  // cannot read its version; neither has a tag, so both land on the
+  // newest actual release instead.
+  return version && /^\d+\.\d+\.\d+$/.test(version)
+    ? `${RELEASES_URL}/tag/v${version}`
+    : `${RELEASES_URL}/latest`;
+}
+
+function Footer() {
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  return (
+    <footer className="footer">
+      <span>Copyright 2026 PostHog, Inc.</span>
+      <a href={releaseNotesUrl(data?.version)} target="_blank" rel="noreferrer">
+        Release notes
+      </a>
+    </footer>
+  );
+}
+
 export function Layout() {
   useDocumentTitle();
   return (
@@ -192,6 +221,7 @@ export function Layout() {
       <main className="content">
         <Outlet />
       </main>
+      <Footer />
     </div>
   );
 }
