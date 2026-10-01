@@ -430,6 +430,22 @@ class CompactionGroupingTest {
     }
 
     @Test
+    fun `a group the row capacity closes needs two files, not the byte minimum`() {
+        // gigahog-prod-us, 2026-09-30, ingest.heatmap_events_raw: flush
+        // files of ~355k rows against a ceiling of 1,065,220 fit three to
+        // a group, and at minInputFiles = 5 the planner refused all 8,277
+        // of them on the first sweep while the table grew a file a
+        // minute per pod. A row-closed group is the largest the sorted
+        // path can make of those files; three -> one is a compaction.
+        val packed = packRows(List(7) { 20 * mib to 355_000L }, rowCapacity = 1_065_220, min = 5)
+        assertThat(packed.groups.map { it.size }).describedAs("3 + 3, and the remainder waits").containsExactly(3, 3)
+        assertThat(packed.rowBoundRefusals).isEmpty()
+        for (g in packed.groups) {
+            assertThat(g.sumOf { it.second }).isLessThanOrEqualTo(1_065_220L)
+        }
+    }
+
+    @Test
     fun `a short remainder the BYTES left behind is still dropped silently`() {
         // The control for the test above: the row capacity is generous,
         // the remainder is short because the bucket has run out of
@@ -492,12 +508,12 @@ class CompactionGroupingTest {
             val taken = packed.groups.flatten()
             val refused = packed.rowBoundRefusals.flatten()
             assertThat(taken.size + refused.size).isLessThanOrEqualTo(files.size)
-            // And every refusal is genuinely short of what it needed,
-            // never a group that could have been rewritten.
+            // And every refusal is a single file: a row-closed group
+            // needs only two, so anything the capacity closed with two
+            // or more is rewritten, never refused. The byte minimum has
+            // no say here, which is the rule this branch introduced.
             for (g in packed.rowBoundRefusals) {
-                val largest = g.maxOf { it.first }
-                val need = maxOf(2L, minOf(min.toLong(), if (largest <= 0) min.toLong() else target / largest))
-                assertThat(g.size.toLong()).describedAs("a refusal is short by definition").isLessThan(need)
+                assertThat(g.size).describedAs("a row refusal is one file the capacity closed alone").isEqualTo(1)
             }
         }
     }

@@ -153,11 +153,13 @@ class CompactionGrouping private constructor(
      * 552,336), while a group packed WITH the bound simply closes
      * earlier and gets rewritten.
      *
-     * A file whose own rows exceed [rowCapacity] cannot be grouped with
-     * anything, and is emitted as a one-file group so the `need` rule
-     * below drops it — reported in [Packing.rowBoundRefusals] rather
-     * than disappearing, because a table that cannot compact at all
-     * must not do so silently.
+     * A group the row capacity closes needs only TWO files, whatever
+     * [minInputFiles] says: it is the largest group the sorted path can
+     * make of those files, and waiting for more never changes that. A
+     * file the capacity closes ALONE — one no other candidate fits
+     * beside, or one whose own rows exceed [rowCapacity] — is reported
+     * in [Packing.rowBoundRefusals] rather than disappearing, because a
+     * table that cannot compact at all must not do so silently.
      */
     fun <T> groups(
         files: List<T>,
@@ -199,21 +201,31 @@ class CompactionGrouping private constructor(
             // identical rule while streaming.
             val largest = size(group.last().value)
             val fit = if (largest <= 0) minInputFiles.toLong() else targetBytes / largest
-            val need = max(2L, min(minInputFiles.toLong(), fit)).toInt()
+            // A group the ROW capacity closed is the LARGEST group the
+            // sorted path can ever make of these files: the ceiling comes
+            // from the table's schema and the process's heap, neither of
+            // which more appends change, so holding out for
+            // `minInputFiles` means the same files close the same short
+            // group on every sweep, forever. Two files → one is still a
+            // compaction, so a row-closed group needs only two. The byte
+            // rule's minimum stays: its short remainders DO fill as files
+            // arrive. gigahog-prod-us 2026-09-30: `heatmap_events_raw`'s
+            // ~355k-row flush files fit three to a 1,065,220-row ceiling,
+            // and at `minInputFiles = 5` every one of its 8,277 groups
+            // was refused while the table grew a file a minute per pod.
+            val need = if (closedByRows) 2 else max(2L, min(minInputFiles.toLong(), fit)).toInt()
             val ordered = group.sortedBy { it.index }.map { it.value }
             if (group.size >= need) {
                 result += ordered
             } else if (closedByRows) {
-                // A group the ROW capacity closed short of the minimum.
-                // The bytes rule's own short remainders are the ordinary
-                // "wait for more appends" case and are dropped silently,
-                // because more files will arrive and fill them. This one
-                // will NOT fill: the ceiling is a property of the table's
-                // schema and the process's heap, so the same files close
-                // the same short group on every sweep, forever, until an
-                // operator moves one of the two. Handed back so the
-                // planner can count and name it (the old code's
-                // `heap_budget_exceeded`).
+                // One file the capacity closed alone: the candidate after
+                // it did not fit beside it, or its own rows exceed the
+                // capacity. Handed back so the planner can count and name
+                // it (`heap_budget_exceeded`) rather than let a table
+                // whose files are too dense to pair do so silently. Not
+                // necessarily permanent — a sparser file arriving later
+                // may pair with it — but nothing in THIS candidate set
+                // will.
                 rowRefused += ordered
             }
             start = endExclusive
@@ -325,16 +337,18 @@ class CompactionGrouping private constructor(
 
     /**
      * What one bucket's pack produced: the groups worth rewriting, and
-     * the ones only the ROW capacity stopped.
+     * the single files only the ROW capacity stopped.
      *
      * [rowBoundRefusals] exists because the two reasons a group can be
      * dropped are not the same news. A short group the BYTE rule left
      * behind fills up as more files arrive, so it is dropped silently
-     * and always was. A short group the row capacity closed will never
-     * fill: the capacity comes from the table's schema and the process's
-     * heap, neither of which more files change, so the identical short
-     * group is formed and dropped on every sweep until an operator
-     * raises the heap or drops the sort order. Handing those back is
+     * and always was. A file the row capacity closed ALONE is one no
+     * other candidate fits beside (or whose own rows exceed the
+     * capacity): the capacity comes from the table's schema and the
+     * process's heap, and files of that density keep arriving, so the
+     * same shape is formed and dropped on every sweep until an operator
+     * raises the heap or drops the sort order (a row-closed group of two
+     * or more is rewritten, see [groups]). Handing those back is
      * what keeps that condition from being invisible, which is the
      * failure mode `CompactionGrouping`'s own KDoc names for the scaling
      * file minimum ("Silently: no group forms, so nothing is refused and
