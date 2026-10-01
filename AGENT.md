@@ -10,9 +10,10 @@ the pre-split commits).
 **Never push broken code.** Before every commit and push:
 
 (And before a PR that touches a maintenance loop, the commit path or a
-statement over the manifest tables: the five scale questions at the end
+statement over the manifest tables: the six scale questions at the end
 of [Scale doctrine](#scale-doctrine-read-before-touching-a-query-a-loop-or-a-lock)
-are answered in the PR body.)
+are answered in the PR body, the sixth being what ran on the local
+stack and what it showed.)
 
 ```bash
 cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
@@ -415,15 +416,28 @@ against ten million:
   protected nothing (V21). Cleanup was off in production until it came
   out, and is ON in prod-us since 2026-09-29 at 60 s / batch 10,000 /
   1 worker.
-- **2026-09-30, compaction. OPEN — the fix is on branch
-  `jakob/compaction-plan-bounded`, unmerged, where the other two shipped
-  (#220, #225).** The planner loads every small file of a
+- **2026-09-30, compaction (#247, shipped in 1.3.6; the other two
+  shipped as #220, #225).** The planner loaded every small file of a
   table (9.9M rows, a correlated `array_agg` per row, an `ORDER BY`)
-  into a Kotlin list inside one transaction, then bin-packs in memory
+  into a Kotlin list inside one transaction, then bin-packed in memory
   for minutes. `idle_in_transaction_session_timeout` killed the
   connection at 30 s; every sweep failed for eleven hours. The groups
   it planned were then refused anyway: packed by bytes, checked by
   rows, 2.9M rows against a ceiling of 552k.
+- **2026-09-30 again, 55 minutes after #247 rolled (#255).** The fix
+  raised fan-in from 64 to 2,048 files per group and measured one
+  thing in the per-group path: the commit-lock hold, on a cache-hot
+  fixture. The same path read the inputs' `hog_file_column_stats` rows
+  to build the output's stats: 2,048 index descents, ~53k heap rows on
+  a 66 GiB table, and it crossed the 60 s `statement_timeout` once the
+  rotation cursor reached colder buckets. A `throw` inside a catch arm
+  then bypassed the sibling arm that counts a failed group, so one
+  group's timeout aborted the whole sweep with an empty ledger row,
+  seven runs in a row. The full suite was green at 2,149 tests. Both
+  defects showed in under a minute on the compose stack with four
+  tables and a trigger that failed one output insert: `main` died with
+  zero outputs, the branch recorded one failed group and committed the
+  rest.
 
 The numbers to design against are production's, not the fixture's.
 gigahog-prod-us on 2026-09-30: one catalog, ~500k snapshots, retention
@@ -494,6 +508,27 @@ The rules. Every one of them was violated by the code above.
   partition skew, mostly-live files, retained history) and assert
   rows examined and buffers, not only the index name. Record the
   measured figure in the test and the KDoc, with the fixture size.
+- **Run it on the local stack before it ships.** The suite proves
+  statements and functions; it does not prove the path. A change to a
+  migration, a maintenance loop, the commit path, or any statement
+  over the manifest tables is run end to end on the compose stack
+  (`just up` builds the server image from the working tree; the
+  harness in #255's PR body is the shape) before the PR is opened:
+  the migration applied to a database that already holds data, the
+  loop driven through its API trigger with the knobs the PR changes
+  set to their production values, a fault injected where production
+  will inject one (a trigger that raises on an insert, a
+  `statement_timeout` of 1 ms, an object missing from the store), and
+  the ledger, the file rows and the output footers read back. When
+  the change fixes an incident, run `main` through the same harness
+  first so the PR shows the before and the after. The compose stack's
+  data is small, so it will not reproduce a cost that only exists at
+  ten million rows; that is what the plan test above is for. What it
+  does reproduce is everything a unit fixture mocks away: boot,
+  Flyway, the pool and its session bounds, the real object store, a
+  sweep's accounting when one unit of work fails, and what the
+  console shows for it. The PR body says what ran and what it showed;
+  "the suite is green" is not an answer to this question.
 - **Do the growth arithmetic for anything written per commit or per
   file.** Rows per file per commit × files per commit × commits per
   minute × retention, in bytes on disk, before the change ships.
@@ -539,7 +574,8 @@ or any statement over `hog_data_file`, `hog_snapshot_change`,
 `hog_file_partition_value` or a stats table, the PR body answers:
 what bounds this per run, what bounds it per transaction, what the
 per-row cost is on production's access pattern, what the plan test's
-fixture size is, and what grows per commit and how it is purged.
+fixture size is, what grows per commit and how it is purged, and what
+ran on the local stack and what it showed.
 
 ## Working conventions
 
