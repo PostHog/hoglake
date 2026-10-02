@@ -1072,10 +1072,40 @@ ran on the local stack and what it showed.
     is FIFO so W maintainers tax every foreground commit by
     `(W - 0.5) x hold` and the work is idempotent. A batch sets its own
     transaction-local `statement_timeout` —
-    `min(session statement_timeout / 4, admission / 2)` — and a batch it
-    cancels halves the batch size FOR THAT TABLE for the rest of the
-    run, because the per-row cost is the row plus its cascade and a
-    200-column table has ~20x the fan-out. CleanupService's hold-budget
+    `min(session statement_timeout / 4, admission / 2)`. A batch it
+    CANCELS IS COUNTED AND NOT RESIZED (#263): every batch of every
+    table of every run runs at `HOGLAKE_RETIREMENT_BATCH`, the cancelled
+    one rolls back whole, the table is left for the next run, and that
+    run asks for the same rows at the same size. THE PER-ROW COST IS
+    FLAT IN THE BATCH SIZE (`RetirementCostIntegrationTest`: 19.5 µs/row
+    at 2,000 and 19.6 at 8,000), so a batch that crossed the bound
+    crossed it COLD rather than big — and the cancelled statement warmed
+    exactly the pages it touched, which makes the retry the cheap case.
+    This loop used to halve instead, and that locked in a size chosen by
+    the worst page of the night: on millpond-prod-us a 13.9M-row
+    retirement walked from 8,000-row batches to 62 in its first cold
+    hour and stayed there for a day (~4,700 rows per 60 s run, ~280k
+    rows/hour against the ~15.8M/hour the defaults size for, the commit
+    lock idle between ~0.1 s holds), and when the pod was restarted at
+    18:04 UTC on 2026-10-02 at a configured 1,000 it retired 36,000 rows
+    in its first run and was back at 62 by 18:19. THE ONE CASE THAT
+    NEEDS A HUMAN is a table that times out run after run — its per-row
+    cascade does not fit the bound at this batch, and no retry will
+    change that — so alert on
+    `hoglake_retirement_consecutive_timeouts{catalog,table}`
+    (`RetirementGauges`, a MultiGauge whose row exists only between a
+    table's first timeout and its next NON-TIMEOUT outcome, so the
+    series RETIRES on recovery and `>= 3` needs no `for` clause) and
+    lower `HOGLAKE_RETIREMENT_BATCH` on the instance that retires that
+    catalog — the knob is process-wide.
+    `hoglake_retirement_timeouts_total` is the per-run rate and is
+    deliberately NOT the alert: an occasional tick is a cache miss. The
+    cost of not retrying in-run is stated rather than hidden: an
+    intermittently cold table forfeits the rest of ONE run's budget per
+    timeout, which on a one-table catalog is the whole run, and that is
+    accepted — re-attempting on a busy RDS to exploit a maybe-warm page
+    needs its own backoff and attempt cap for a hope rather than a plan.
+    CleanupService's hold-budget
     arithmetic does not apply and no longer exists at all: a retirement
     connection makes no object-store calls, so it is never idle in
     transaction, and the drain those bounds were written for holds no

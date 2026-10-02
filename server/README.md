@@ -1519,7 +1519,30 @@ transaction (`observability/`):
   `managed-warehouse/gigahog.json` carries 21 distinct `hoglake_*`
   series and zero `verify` matches, and a repo-wide code search for
   `hoglake_verify` returns 0. `charts/` has no `hoglake_*` reference in
-  `alerts/` either, so no alerting or dashboard change is owed. Plus
+  `alerts/` either, so no alerting or dashboard change is owed.
+  THE ONE PUSHED GAUGE LEFT is
+  `hoglake_retirement_consecutive_timeouts{catalog, table}` (#263):
+  CONSECUTIVE retirement runs that ended one dropped table on its own
+  `statement_timeout`. Retirement does NOT resize its batch in response
+  to a timeout — the per-row cost is flat in the batch size
+  (`RetirementCostIntegrationTest`), so a cancelled batch is a COLD one,
+  and the table is left for the next run at the same size — so
+  `hoglake_retirement_timeouts_total` is a rate that is MEANT to tick
+  occasionally and is deliberately NOT the alert.
+  **Alert on this gauge at `>= 3`, and it needs no `for` clause**,
+  because the streak IS the duration: 3 means three runs in a row, which
+  no cache miss survives. A `MultiGauge` (the shape `ExpiryGauges` uses,
+  and the one the removed verify gauge used), so a row exists ONLY
+  between a table's first timeout and its next non-timeout outcome — a
+  committed batch, a drain, a stuck table — and **ABSENCE IS THE HEALTHY
+  STATE**: the series RETIRES on recovery rather than freezing at its
+  last value, which a counter could not do (it would leave an
+  unclosable alert on a table that is fine). A standing value means
+  `HOGLAKE_RETIREMENT_BATCH` is too large for that table's per-row
+  cascade; the knob is process-wide, so it is lowered on the INSTANCE
+  that retires that catalog (the maintenance workload) and applies to
+  everything that pod retires. The streak is per PROCESS and in memory:
+  a restart republishes it on the first run that still times out. Plus
   source-side counters: commits by outcome, snapshots expired (and superseded
   consumer offsets released, in the sweep's result and audit event),
   files removed,

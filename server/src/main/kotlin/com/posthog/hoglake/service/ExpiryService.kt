@@ -172,9 +172,16 @@ class ExpiryService(
      *
      * IN MEMORY, NOT IN THE DATABASE, and per arm rather than per
      * catalog: it is a throughput hint, not state. Losing it on a restart
-     * costs one sweep's rediscovery, which is `RetirementService`'s
-     * argument for `settledBatchSize` — and the two arms meet different
-     * tables, so a vector arm's cost says nothing about a data arm's.
+     * costs one sweep's rediscovery, which is cheap precisely because
+     * the ladder converges in log2(page) rungs — and the two arms meet
+     * different tables, so a vector arm's cost says nothing about a data
+     * arm's. `RetirementService` carries NO hint of this kind at all
+     * (#263): its per-row cost is flat in the batch, so it reads a
+     * cancelled batch as a COLD one, counts it, and retries the same
+     * size next run. The difference worth testing before this hint is
+     * copied anywhere else is whether the unit's cost is flat in its
+     * size; phase A's is not (it carries a per-snapshot change-row
+     * factor), which is why its ladder is here.
      *
      * It only ever moves DOWN by halving and UP by [PAGE_REGROW_AFTER]
      * clean pages, so a transient slowness cannot pin a catalog at a

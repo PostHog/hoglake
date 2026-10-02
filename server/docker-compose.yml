@@ -82,6 +82,19 @@ services:
       # Output compression: zstd, snappy, gzip, lz4_raw or uncompressed.
       HOGLAKE_COMPACTION_CODEC: ${HOGLAKE_COMPACTION_CODEC:-zstd}
       HOGLAKE_COMPACTION_ZSTD_LEVEL: ${HOGLAKE_COMPACTION_ZSTD_LEVEL:-3}
+      # Retirement is OFF by default here, as it is everywhere but the
+      # maintenance workload: a batch takes the per-catalog commit lock.
+      # Its four TIME knobs are passed through (the queue ceiling is
+      # not, and keeps its 500,000 default) so the loop can be driven on
+      # this stack at production-shaped values — there is no POST
+      # trigger for retirement, deliberately, so this env is the only
+      # way to exercise it end to end:
+      #   HOGLAKE_RETIREMENT_INTERVAL_MS=5000 HOGLAKE_RETIREMENT_BATCH=100 \
+      #   HOGLAKE_RETIREMENT_PAUSE_MS=50 just up
+      HOGLAKE_RETIREMENT_INTERVAL_MS: ${HOGLAKE_RETIREMENT_INTERVAL_MS:-0}
+      HOGLAKE_RETIREMENT_BATCH: ${HOGLAKE_RETIREMENT_BATCH:-8000}
+      HOGLAKE_RETIREMENT_PAUSE_MS: ${HOGLAKE_RETIREMENT_PAUSE_MS:-750}
+      HOGLAKE_RETIREMENT_RUN_BUDGET_MS: ${HOGLAKE_RETIREMENT_RUN_BUDGET_MS:-60000}
       HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS: ${HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS:-1000}
       HOGLAKE_MAINTENANCE_SUMMARY_BATCH: ${HOGLAKE_MAINTENANCE_SUMMARY_BATCH:-10000}
       # 1 s, not production's 60: the dev stack's catalog is tiny, so a
