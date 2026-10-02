@@ -60,6 +60,12 @@ class CompactionConfigTest {
         )
 
     @Test
+    fun `the default claim lease covers the queued plan for one hour`() {
+        assertThat(CompactionConfig.DEFAULT_CLAIM_TTL_SECONDS).isEqualTo(3600)
+        assertThat(Config().compactionClaimTtlSeconds).isEqualTo(3600)
+    }
+
+    @Test
     fun `a config with NO override derates a nested sorted table`() {
         // The default value itself, exercised through the default path.
         // With DEFAULT_NESTED_SORT_EXPANSION at 1 this is an equality and

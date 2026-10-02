@@ -30,8 +30,9 @@ import java.util.UUID
  * [groupKey] is a hex SHA-256 over the group's spec id, its partition
  * values and its sorted input `data_file_id`s. Two replicas planning
  * from the same catalog metadata form the same group and compute the
- * same key with no coordination, which is what lets a plain
- * `INSERT ... ON CONFLICT` be the whole protocol.
+ * same key. `INSERT ... ON CONFLICT` arbitrates each key. A separate
+ * catalog planning lock prevents overlapping plans from reserving
+ * different keys for the same input files.
  *
  * The planner's skip is nevertheless by **overlap**, not by key
  * equality ([liveClaimedFileIds]). Bin packing is a function of the
@@ -102,13 +103,9 @@ internal object CompactionClaimRepo {
      * Every file id under a LIVE claim for this table — the planner's
      * skip set.
      *
-     * Read on the planner's own REPEATABLE READ snapshot, so a claim
-     * taken after that snapshot is invisible here and the group is
-     * planned anyway. That is not a hole to close: the two maintainers
-     * then race exactly as they do today, and the commit-time
-     * re-verification resolves it. Closing it would mean taking the
-     * claim inside planning, which is a write inside a read-only
-     * transaction that exists to give the plan a consistent view.
+     * Read after packing. Execution plans hold the catalog planning lock
+     * until they claim all selected groups. Metadata-only previews do not
+     * take the lock or create claims.
      */
     fun liveClaimedFileIds(
         h: Handle,
@@ -168,6 +165,31 @@ internal object CompactionClaimRepo {
             .mapTo(Int::class.javaObjectType)
             .findOne()
             .isPresent
+
+    /** Refresh only a live claim that this run owns. An expired or replaced claim must stop execution. */
+    fun refresh(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+        groupKey: String,
+        claimant: UUID,
+        ttlSeconds: Long,
+    ): Boolean =
+        h.createUpdate(
+            """
+            UPDATE hog_compaction_claim
+               SET expires_at = now() + make_interval(secs => :ttlSeconds)
+             WHERE catalog_id = :catalogId AND table_id = :tableId
+               AND group_key = :groupKey AND claimant = :claimant
+               AND expires_at > now()
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .bind("groupKey", groupKey)
+            .bind("claimant", claimant)
+            .bind("ttlSeconds", ttlSeconds.toDouble())
+            .execute() == 1
 
     /**
      * Drop our own claim, whatever the group's outcome was.
