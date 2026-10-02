@@ -486,12 +486,25 @@ class RetirementService(
         // prune entirely (the first version of this) left a 3 published
         // forever on a table nothing would ever clear, for as long as
         // the pages stayed full.
+        //
+        // AND THE TABLES PAST THE CEILING ARE RECONCILED, which is the
+        // hole the ceiling alone leaves: one of them can be drained OUT
+        // OF BAND (a manual purge, another instance, a repair) while
+        // low ids keep the page full, so it never enters the prefix,
+        // never reaches a batch outcome, and its streak would be
+        // preserved on every run — a 3 alerting for work that no longer
+        // exists. [STILL_ELIGIBLE_SQL] asks about exactly those ids,
+        // one statement, PK-keyed, over the CURRENTLY-FAILING set (zero
+        // rows in the steady state, in which case it does not run at
+        // all).
+        val ceiling = if (candidates.size >= maxTablesPerRun) candidates.last().tableId else null
         RetirementGauges.retain(
             catalog,
             candidates.map { it.tableId }.toSet(),
             // Null on a short page: nothing is beyond the prefix, so
             // the whole tracked set is in scope.
-            prefixCeiling = if (candidates.size >= maxTablesPerRun) candidates.last().tableId else null,
+            prefixCeiling = ceiling,
+            beyondCeilingStillEligible = { beyond -> stillEligible(catalogId, beyond) },
         )
         if (candidates.isEmpty()) return RetirementResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         stampEligible(catalogId, candidates.map { it.tableId })
@@ -742,6 +755,36 @@ class RetirementService(
         tablesRemaining = remaining.toLong().coerceAtLeast(0),
     )
 
+    /**
+     * Which of [tableIds] are STILL retirable, in one statement.
+     *
+     * Called only for the tracked ids a full candidate page never
+     * reached (see [STILL_ELIGIBLE_SQL] for why that set is small and
+     * why the predicate is shared with the candidate query rather than
+     * restated). It carries its own `statement_timeout` for the reason
+     * every statement on this path does — this one runs OUTSIDE the
+     * commit lock, so the bound is about the connection rather than
+     * about a hold, and a reconciliation that cannot finish must not
+     * become the thing that fails a sweep: on a throw the caller keeps
+     * the streaks it has, which is the same answer as "no information",
+     * and the next run tries again.
+     */
+    private fun stillEligible(
+        catalogId: Long,
+        tableIds: Set<Long>,
+    ): Set<Long> =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery("SELECT set_config('statement_timeout', ?, true)")
+                .bind(0, callBoundMs.toString())
+                .mapToMap()
+                .one()
+            h.createQuery(STILL_ELIGIBLE_SQL)
+                .bind("catalogId", catalogId)
+                .bindArray("tableIds", Long::class.javaObjectType, tableIds.toList())
+                .mapTo(Long::class.javaObjectType)
+                .set()
+        }
+
     private fun budgetSpent(started: Long): Boolean = (nanoTime() - started) / 1_000_000 >= runBudgetMs
 
     /**
@@ -970,6 +1013,28 @@ class RetirementService(
         const val MAX_TABLES_PER_RUN = 1_000
 
         /**
+         * WHAT MAKES A DROPPED TABLE RETIRABLE, as one fragment shared
+         * by [CANDIDATE_SQL] and [STILL_ELIGIBLE_SQL] rather than
+         * written twice.
+         *
+         * The two statements ask the same question for opposite reasons
+         * — one finds work, the other confirms that remembered work
+         * still exists — and a copy would let them DISAGREE: a gauge
+         * pruned on a stricter predicate retires a series the loop is
+         * still working, and one pruned on a looser predicate keeps a
+         * series for a table the loop will never reach. It is bound to
+         * `t`/`c` (the candidate query's aliases) and to `:catalogId`.
+         */
+        private const val ELIGIBLE_PREDICATE: String =
+            """t.dropped_snapshot IS NOT NULL
+              AND t.dropped_snapshot <= c.earliest_snapshot_id
+              AND EXISTS (
+                  SELECT 1 FROM hog_data_file f
+                  WHERE f.catalog_id = t.catalog_id
+                    AND f.table_id = t.table_id
+                    AND f.end_snapshot IS NULL)"""
+
+        /**
          * The eligibility query, `internal` so a test can EXPLAIN the
          * SQL production runs rather than a lookalike.
          *
@@ -1007,15 +1072,44 @@ class RetirementService(
             FROM hog_table t
             JOIN hog_catalog c ON c.catalog_id = t.catalog_id
             WHERE t.catalog_id = :catalogId
-              AND t.dropped_snapshot IS NOT NULL
-              AND t.dropped_snapshot <= c.earliest_snapshot_id
-              AND EXISTS (
-                  SELECT 1 FROM hog_data_file f
-                  WHERE f.catalog_id = t.catalog_id
-                    AND f.table_id = t.table_id
-                    AND f.end_snapshot IS NULL)
+              AND $ELIGIBLE_PREDICATE
             ORDER BY t.table_id
             LIMIT :limit
+            """
+
+        /**
+         * THE RECONCILIATION the timeout gauge needs for the tables a
+         * FULL candidate page never reached, `internal` for the plan
+         * test.
+         *
+         * A tracked table above the page's ceiling can be drained OUT OF
+         * BAND — a manual purge, another instance, an operator's repair
+         * — while lower ids keep the page full. It then never enters the
+         * prefix, never reaches a batch outcome, and the ceiling
+         * predicate in `RetirementGauges.retain` preserves its streak
+         * forever: a 3 alerting for work that no longer exists. This
+         * statement is what closes that: every tracked id past the
+         * ceiling that it does NOT return is gone.
+         *
+         * IT IS CHEAP BECAUSE OF WHAT THE ARRAY HOLDS. The ids are the
+         * CURRENTLY-FAILING tables of one catalog, not its tables: the
+         * steady state is zero (no rows, no statement — the caller
+         * skips it), and the ceiling is `maxTablesPerRun`, the same
+         * bound the candidate read already carries. Each id is one
+         * `hog_table` PK probe plus the `hog_data_file_live` descent the
+         * EXISTS needs — the same per-candidate cost
+         * [CANDIDATE_SQL] pays, for a strictly smaller set — and it is
+         * ONE statement rather than one per id, under the same
+         * transaction-local bound as everything else on this path.
+         */
+        internal const val STILL_ELIGIBLE_SQL: String =
+            """
+            SELECT t.table_id
+            FROM hog_table t
+            JOIN hog_catalog c ON c.catalog_id = t.catalog_id
+            WHERE t.catalog_id = :catalogId
+              AND t.table_id = ANY(:tableIds)
+              AND $ELIGIBLE_PREDICATE
             """
 
         /**

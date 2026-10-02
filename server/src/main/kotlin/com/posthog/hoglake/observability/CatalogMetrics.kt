@@ -167,12 +167,14 @@ object ExpiryGauges {
  * ledger row, the service's logs and `hog_table.retirement_eligible_at`
  * all key on.
  *
- * [retain] PRUNES WITHIN THE PREFIX IT WAS GIVEN, which is how a
- * truncated candidate read is still usable: the query is `ORDER BY
- * table_id LIMIT maxTablesPerRun`, so a full page proves nothing about
- * ids past its last one and everything below it. The caller passes that
- * last id as `prefixCeiling`; tables above it keep their series, tables
- * below it that the page did not return lose theirs.
+ * [retain] PRUNES WITHIN THE PREFIX IT WAS GIVEN AND RECONCILES WHAT IS
+ * PAST IT, which is how a truncated candidate read is still usable: the
+ * query is `ORDER BY table_id LIMIT maxTablesPerRun`, so a full page
+ * proves everything below its last id and nothing above it. Tables
+ * below the ceiling that the page did not return lose their series;
+ * tables above it are re-checked for eligibility in one bounded
+ * statement, because a table drained OUT OF BAND up there would
+ * otherwise keep its streak forever.
  *
  * ONE WRITER, which is what makes the non-atomic read-modify-publish
  * below sound. Retirement has no HTTP trigger (deliberately — a trigger
@@ -277,21 +279,52 @@ object RetirementGauges {
      * table id on a full page and NULL on a short one (where the set is
      * the whole eligible set and every tracked id is in scope).
      *
-     * Skipping the prune altogether on a full page — the shape this
-     * replaces — is the bug Copilot found on #282: a drained table's
-     * streak of 3 had nothing left that could ever clear it while the
-     * catalog's pages stayed full, so the alert outlived the table.
+     * [beyondCeilingStillEligible] CLOSES THE REST, and the two guards
+     * are for two different mistakes, both found by review on #282:
+     *
+     *  - pruning on a full page alone retires a series for a table that
+     *    is still eligible and still failing (the first version);
+     *  - skipping the prune on a full page leaves a drained table's
+     *    streak with nothing that can ever clear it (the second);
+     *  - and the ceiling alone leaves a THIRD: a tracked table ABOVE the
+     *    ceiling, drained out of band while low ids keep the page full,
+     *    never enters the prefix and never reaches a batch outcome, so
+     *    its streak is preserved on every run — a 3 alerting for work
+     *    that no longer exists.
+     *
+     * So the ids past the ceiling are RECONCILED instead of assumed: the
+     * callback is handed exactly those ids and returns the subset that
+     * is still retirable, and everything it omits is pruned. It is
+     * called ONLY when there are such ids (never on a short page, never
+     * in the steady state where nothing is tracked), and it is one
+     * bounded statement over the currently-failing set — see
+     * `RetirementService.STILL_ELIGIBLE_SQL`. A callback that THROWS
+     * leaves those streaks alone: "no information" is not "gone", and
+     * the next run asks again.
      */
     fun retain(
         catalog: String,
         tableIds: Set<Long>,
         prefixCeiling: Long? = null,
+        beyondCeilingStillEligible: ((Set<Long>) -> Set<Long>)? = null,
     ) {
+        val mine = streaks.keys.filter { it.first == catalog }
+        val beyond =
+            if (prefixCeiling == null) {
+                emptySet()
+            } else {
+                mine.map { it.second }.filter { it > prefixCeiling && it !in tableIds }.toSet()
+            }
+        val stillEligible =
+            if (beyond.isEmpty() || beyondCeilingStillEligible == null) {
+                beyond
+            } else {
+                runCatching { beyondCeilingStillEligible(beyond) }.getOrElse { beyond }
+            }
         val gone =
-            streaks.keys.filter { (name, tableId) ->
-                name == catalog &&
-                    tableId !in tableIds &&
-                    (prefixCeiling == null || tableId <= prefixCeiling)
+            mine.filter { (_, tableId) ->
+                tableId !in tableIds &&
+                    (prefixCeiling == null || tableId <= prefixCeiling || tableId !in stillEligible)
             }
         if (gone.isEmpty()) return
         gone.forEach { streaks.remove(it) }

@@ -1365,6 +1365,72 @@ class RetirementServiceIntegrationTest {
     }
 
     @Test
+    fun `a tracked table drained out of band above the page ceiling is reconciled away`() {
+        // THE THIRD AND LAST SHAPE OF THIS BUG (#282, review pass 2).
+        // The ceiling makes a full page safe for the ids BELOW it, but
+        // a tracked table ABOVE it is in neither set: the page never
+        // reaches it, so it never gets a batch outcome, and the ceiling
+        // predicate preserves its streak. Drain it out of band — a
+        // manual purge, another instance, an operator's repair — and
+        // its 3 alerts forever for work that no longer exists.
+        //
+        // The page here never reaches either tracked table: three
+        // low-id eligible tables against `maxTablesPerRun = 2`, so the
+        // ceiling is always the second of them and both tracked ids are
+        // past it, run after run.
+        //
+        // MUTATION: drop `beyondCeilingStillEligible` (pass only the
+        // ceiling) and this reds on `drained`, whose series survives
+        // its rows. The same case also pins the OTHER direction: a
+        // reconciliation that pruned everything past the ceiling would
+        // red on `alive`.
+        val catalog = "ret-beyond-ceiling"
+        val f = droppedWithRows(catalog, rows = 4, alsoDropKeeper = true)
+        val third = extraDroppedTable(catalog, f.catalogId, "third", 600_000)
+        val drained = extraDroppedTable(catalog, f.catalogId, "drained", 610_000)
+        val alive = extraDroppedTable(catalog, f.catalogId, "alive", 620_000)
+        assertThat(listOf(doomedTableId(f.catalogId), keeperTableId(f.catalogId), third, drained, alive))
+            .describedAs("the two tracked tables must be the HIGHEST ids, past any page of two")
+            .isSorted()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            RetirementGauges.timedOut(catalog, drained)
+            RetirementGauges.timedOut(catalog, alive)
+            assertThat(streaks(registry, catalog).keys)
+                .containsExactlyInAnyOrder(drained.toString(), alive.toString())
+
+            // Out of band: nothing in this loop took these rows away.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_data_file WHERE catalog_id = :c AND table_id = :t")
+                    .bind("c", f.catalogId).bind("t", drained).execute()
+            }
+
+            val result = service(batch = 100, maxTablesPerRun = 2).runOnce(catalog)
+            assertThat(result.tables)
+                .describedAs("the run worked its page of two and never reached either tracked table")
+                .isEqualTo(2)
+            assertThat(streaks(registry, catalog).keys)
+                .describedAs(
+                    "%d is past the ceiling AND no longer eligible, so the recheck prunes it; " +
+                        "%d is past the ceiling and still eligible, so it keeps its streak",
+                    drained,
+                    alive,
+                )
+                .containsExactly(alive.toString())
+
+            // NOT asserted across a second run, deliberately: this run
+            // drained the two tables its page DID reach, so the next
+            // one's page reaches `alive` and clears its streak through
+            // the Retired arm — correct, and a different case.
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+        }
+    }
+
+    @Test
     fun `a table whose rows vanish before the first batch drains on the probe and loses its streak`() {
         // THE OTHER COPILOT FINDING. The Drained arm can be a table's
         // FIRST outcome: the probe runs between the candidate read and
