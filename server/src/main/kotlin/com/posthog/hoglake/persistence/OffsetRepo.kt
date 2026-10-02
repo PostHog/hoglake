@@ -193,13 +193,19 @@ object OffsetRepo {
     ): Int = handle.createUpdate(RELEASE_ALL_CONSUMERS).bind("catalogId", catalogId).execute()
 
     /**
-     * The forward lineage walk, as a WITH RECURSIVE prelude. Split out
-     * of [RELEASE_ALL_CONSUMERS] so VerifyService's `offset_release`
-     * check can ASK the same question this DELETE answers instead of
-     * restating it: a test that restates the predicate it claims to
-     * mirror asserts only that the file compiles (AGENT.md). The
-     * released set and the flagged set are the same set, by
-     * construction.
+     * The forward lineage walk, as a WITH RECURSIVE prelude.
+     *
+     * It was split out of [RELEASE_ALL_CONSUMERS] so the verify
+     * subsystem's `offset_release` check could ASK the same question this
+     * DELETE answers rather than restate it — a check that restates the
+     * predicate it claims to mirror asserts only that the file compiles
+     * (AGENT.md). #261 removed that check, so the constant now has
+     * exactly ONE consumer and the reason for the split is historical.
+     *
+     * Kept as a named constant anyway, and not inlined: a scrubber that
+     * re-adds the check (#261) has to ask this question and not a
+     * paraphrase of it, and that is the whole point of the fragment
+     * existing under a name.
      */
     internal const val SUPERSEDED_LINEAGE_CTE: String =
         """

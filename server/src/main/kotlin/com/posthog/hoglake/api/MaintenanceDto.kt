@@ -16,8 +16,6 @@ import com.posthog.hoglake.model.MaintenanceStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTaskStatus
 import com.posthog.hoglake.model.RehydrateResult
-import com.posthog.hoglake.model.VerifyCheck
-import com.posthog.hoglake.model.VerifyReport
 import com.posthog.hoglake.service.PatchField
 import io.ktor.server.plugins.BadRequestException
 import java.time.Instant
@@ -227,52 +225,6 @@ data class RehydrateResultDto(
 
 fun RehydrateResult.toDto() = RehydrateResultDto(requeued = requeued)
 
-data class VerifyCheckDto(
-    val check: String,
-    val status: String,
-    val violations: Long,
-    val samples: List<String>,
-    /**
-     * The invariant this check enforces, one paragraph, in AGENT.md's
-     * own words. Additive: existing consumers ignore it, and a report
-     * read by somebody who has never seen the code still says what was
-     * violated rather than only that something was.
-     *
-     * NULLABLE, and optional in the spec, for one reason: the same
-     * `VerifyCheck` schema describes this response AND the `result`
-     * payload of a `verify` row in the maintenance run ledger, which is
-     * stored raw and replayed verbatim. Ledger rows deliberately carry
-     * no descriptions ([VerifyReport.forLedger] — identical constant
-     * prose in every row), and rows written before the field existed
-     * carry none either. Marking it required would make the spec
-     * contradict every historical row. A LIVE response always fills it.
-     */
-    @get:JsonInclude(JsonInclude.Include.NON_NULL)
-    val description: String?,
-)
-
-data class VerifyReportDto(
-    val catalog: String,
-    val status: String,
-    val checks: List<VerifyCheckDto>,
-)
-
-fun VerifyCheck.toDto() =
-    VerifyCheckDto(
-        check = check,
-        status = status,
-        violations = violations,
-        samples = samples,
-        description = description,
-    )
-
-fun VerifyReport.toDto() =
-    VerifyReportDto(
-        catalog = catalog,
-        status = status,
-        checks = checks.map { it.toDto() },
-    )
-
 // ---- maintenance status + run ledger (openapi: MaintenanceStatus, ----
 // ---- MaintenanceRun, MaintenanceRunPage) ------------------------------
 
@@ -414,9 +366,10 @@ data class MaintenanceTaskStatusDto(
     val task: String,
     /**
      * The RESPONDING PROCESS's configured cadence (absent under NON_NULL
-     * for a task with no loop, of which there are none today; 0 = the
-     * loop is off IN THIS PROCESS, which is how the API workload runs
-     * verify). A
+     * for a task with no loop — `verify`, whose subsystem #261
+     * removed, is the only one and it is not in the task list at all;
+     * 0 = the loop is off IN THIS PROCESS, which is how the API
+     * workload runs compaction and retirement). A
      * deployment may run a task's loop in a different pod from the one
      * serving the API, so a reader must never turn this into "the task
      * is not running" — that is [loop]'s job.

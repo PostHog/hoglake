@@ -627,10 +627,12 @@ class RetirementServiceIntegrationTest {
 
         service(batch = 2).runOnce(catalog)
         // MUTATION: drop `AND retirement_eligible_at IS NULL` from the
-        // stamp UPDATE and this reds. It matters because /verify dates
-        // a leak from this instant: a stamp that keeps moving forward
-        // means a table can never be past its grace, and the check can
-        // never fire.
+        // stamp UPDATE and this reds. It matters because the stamp is
+        // the only record of WHEN a table became retirable: one that
+        // keeps moving forward means a table can never be past any
+        // grace a leak check applies to it. (#261 removed the check that
+        // read it; the stamp has to keep accumulating for the
+        // replacement to have anything to read.)
         assertThat(stamp()).isEqualTo(firstStamp)
     }
 
@@ -692,12 +694,11 @@ class RetirementServiceIntegrationTest {
         assertThat(liveFiles(f.catalogId)).isEqualTo(4)
 
         // A SKIPPED RUN STILL STAMPS ELIGIBILITY, and that is what
-        // keeps the skip out of SILENCE. `/verify`'s orphans arm dates
-        // a leak from `retirement_eligible_at`, so a catalog whose
-        // cleanup queue never drains — the state an operator most needs
-        // told about — would otherwise never be stamped, the arm could
-        // never fire, and retirement would wedge with every counter at
-        // zero and every check green.
+        // keeps the skip out of SILENCE. A leak check dates itself from
+        // `retirement_eligible_at`, so a catalog whose cleanup queue
+        // never drains — the state an operator most needs told about —
+        // would otherwise never be stamped, nothing could date the leak,
+        // and retirement would wedge with every counter at zero.
         //
         // MUTATION: move `stampEligible` back below the ceiling check
         // and this reds.
@@ -717,28 +718,12 @@ class RetirementServiceIntegrationTest {
             .describedAs("the eligible table is remaining work, not absence of work")
             .isEqualTo(1)
 
-        // /verify AGREES, once the table is past the grace: the arm
-        // that could never fire now does. This is the end-to-end form
-        // of the same assertion, through the check an operator reads.
-        jdbi.useHandleUnchecked { h ->
-            h.createUpdate(
-                """
-                UPDATE hog_table SET retirement_eligible_at = now() - interval '1 hour'
-                WHERE catalog_id = :c AND dropped_snapshot IS NOT NULL
-                """,
-            ).bind("c", f.catalogId).execute()
-        }
-        val orphans =
-            VerifyService(jdbi, retirementOrphanGraceSeconds = 1, retirementIntervalMs = 0)
-                .runOnce(catalog)
-                .checks
-                .single { it.check == "orphans" }
-        assertThat(orphans.status)
-            .describedAs("a wedged retirement must be visible in /verify, not only in the logs")
-            .isEqualTo("fail")
-        assertThat(orphans.samples).anySatisfy {
-            assertThat(it).contains("retirement is not draining it")
-        }
+        // There is no second opinion to cross-check against any more:
+        // the end-to-end arm here used to drive `/verify`'s orphans
+        // check over the same state and assert it went red. #261 removed
+        // it, so the stamp above is the whole of the evidence a wedged
+        // retirement leaves, and a scrubber that re-reads the stamp is
+        // what restores the end-to-end assertion.
 
         // One more than the queue holds: the run proceeds.
         assertThat(service(ceiling = 5).runOnce(catalog).rowsRetired).isEqualTo(4)

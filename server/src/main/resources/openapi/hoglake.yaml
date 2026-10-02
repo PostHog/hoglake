@@ -956,173 +956,6 @@ paths:
               schema: { $ref: "#/components/schemas/CompactionResult" }
         "404": { $ref: "#/components/responses/NotFound" }
 
-  /catalogs/{catalog}/maintenance/verify:
-    post:
-      operationId: runVerify
-      summary: >
-        Metadata-only invariant scan, on demand: the catalog's global
-        invariants promoted to a production endpoint. Read-only (one
-        REPEATABLE READ MVCC snapshot, no catalog lock — never blocks
-        writers). The same twelve checks the background verify sweep
-        runs — that sweep is OFF by default
-        (HOGLAKE_VERIFY_INTERVAL_MS=0, turned on per workload, like
-        compaction), so on a default deployment this endpoint is the
-        only thing that runs them. Recorded in the maintenance run
-        ledger either way.
-      description: |
-        Twelve checks run in one read-only snapshot. Each also carries
-        its own `description` in the response, so a report is readable
-        without this document. The summaries below are ABRIDGED: the
-        response is the authority on what a check enforces, and nothing
-        keeps these two texts byte-identical — only the check NAMES are
-        contract, and those are pinned against the server by
-        `VerifySpecParityTest`.
-
-        **row_id_tiling** — Invariant 2: row-id ranges are assigned
-        server-side at commit, contiguous per file, tile [0, total) per
-        table, and are never reused (the lineage guarantee). Every
-        positional file row of a table, live and historical alike, must
-        be a non-overlapping interval with a non-negative start; gaps
-        are legal (expiry deletes rows no retained snapshot can reach),
-        overlap never is. Compaction outputs are exempt: they carry
-        their inputs' row ids as data in `_hog_row_id` under reserved
-        field id 2147483646, so their `row_id_start` is only
-        min(input ids).
-
-        **delete_vectors** — Invariant 3: one live deletion vector per
-        data file, supersessions only grow (`delete_count` monotone
-        along `begin_snapshot`), and no vector claims more deletes than
-        its data file has rows.
-
-        **orphans** — Dropping a table end-snapshots its data files,
-        columns and versioned name rows, so a live `hog_data_file`,
-        `hog_column` or `hog_table_version` row on a table carrying a
-        `dropped_snapshot` is a write that outlived its parent.
-
-        **removal_queue** — Invariant 4: physical deletion is never
-        authorized by the queue. An undrained `hog_file_removal` row
-        whose path a file row still claims is cleanup's
-        `still_referenced` alert condition, observed at rest.
-
-        **snapshot_density** — Invariant 1: snapshot ids are dense per
-        catalog, so the retained set is exactly
-        [earliest_snapshot_id, head] — `count(*)` equals
-        head - earliest + 1, min and max on the two ends.
-
-        **next_row_id** — Invariant 2's allocator half:
-        `hog_table_stats.next_row_id` is at or past every positional
-        file's range end, because the allocator can never have handed
-        out a range it does not remember.
-
-        **expiry_floor** — Invariant 5: expiry never passes head or
-        (when `consumer_floor` is set) the min consumer offset, and the
-        sweep's fifth step deletes versioned DDL rows below the floor.
-        At rest: `earliest_snapshot_id <= head`; with `consumer_floor`
-        on, `earliest_snapshot_id` is at or below every
-        `committed_snapshot` whose table row still exists (the same
-        query the sweep floors on, superseded offsets excluded because
-        the sweep releases them first); and no versioned row with
-        `end_snapshot <= earliest_snapshot_id` survives in
-        `hog_data_file`, `hog_delete_file`, `hog_table_version`,
-        `hog_column`, `hog_partition_spec`, `hog_sort_spec` or
-        `hog_view`. That last one has two timings. The five DDL tables
-        have no lag window, since the sweep's fifth step deletes them
-        in the transaction that advances the floor. `hog_data_file` and
-        `hog_delete_file` do: their rows are purged in bounded pages
-        after that transaction commits, outside the commit lock, so
-        they are asserted only against a sweep whose ledger row reports
-        the purge drained (`purge_truncated` false). A purge that
-        stopped early reports `purge_truncated` and `purge_remaining`
-        instead — a backlog, not a broken invariant.
-
-        **visibility_bounds** — Invariant 6: a row is visible at S iff
-        `begin_snapshot <= S AND (end_snapshot IS NULL OR S <
-        end_snapshot)`. Every versioned row must satisfy
-        `begin_snapshot <= head`, `end_snapshot IS NULL OR end_snapshot
-        > begin_snapshot`, and `end_snapshot <= head`; `hog_table`,
-        the identity row, must satisfy `created_snapshot <= head` and
-        `created_snapshot <= dropped_snapshot` when dropped.
-
-        **offset_release** — Whatever mints a new identity releases the
-        old one's consumers. Replacement lineage is recorded in
-        `hog_table.replaced_table_id` and walked forward; a consumer's
-        row on a retired incarnation is released once that same
-        consumer holds an offset at or past a descendant's
-        `created_snapshot`. A row meeting that condition and still
-        present was never released, can never be advanced, and pins the
-        expiry floor forever.
-
-        **staging_tickets** — Compaction pre-registers its output path
-        as an undrained `hog_file_removal` row with reason
-        `compaction_staging`, settled `registered` by the group commit
-        that makes the path live. Flagged: a row settled `registered`
-        whose path the catalog has never heard of; an undrained
-        `compaction_staging` ticket with no file row older than the
-        service's staleness bound (6h by default — an OPERATIONAL
-        judgement rather than a derivation: nothing bounds a rewrite in
-        time, so the bound is set to clear the window in which the
-        ticket is still somebody's job, comfortably above the cleanup
-        drain's cadence); and a ticket drained `absent` whose path IS a
-        file row.
-
-        **upload_claims** — An upload claim is durable ownership of a
-        path before the PUT, settled `registered` inside the commit
-        that registers the path. Flagged: a `registered` claim with an
-        undrained `trino_upload` removal row for its path (a fence
-        raced a registration; `snapshot_expiry` rows are excluded as
-        the normal lifecycle); an `active` claim whose path is a file
-        row (registered without settling); an `abandoned` claim whose
-        path is a file row (fenced a live path).
-
-        **compaction_claims** — `hog_compaction_claim` holds only
-        groups a maintainer is working on right now. The claim is an
-        OPTIMIZATION and never authorization: it lets a second
-        maintenance replica's planner skip a group the first is
-        already rewriting, so the two do not both spend a rewrite and
-        an upload for one to be discarded at commit; correctness
-        against a concurrent rewrite is, and stays, the plan-to-commit
-        re-verification under the catalog commit lock. A violation is
-        therefore redundant work or a leaked row, never a wrong
-        commit.
-
-        The lifecycle is asymmetric on purpose: a group that does NOT
-        commit releases its claim at once, so its files stay
-        immediately retryable; a group that DOES commit keeps the row
-        on a short lease, because a sibling maintainer's plan formed
-        before that commit still names the now-dead inputs and the row
-        is what turns its arrival into a counted skip instead of a
-        wasted rewrite. Either way the row is gone within a lease, and
-        a bulk purge at the head of the next sweep removes it.
-
-        Flagged, and BOTH arms require the claim to be well past its
-        expiry — a claim expires between sweeps and is removed by the
-        NEXT sweep's purge, so the window in between is a correct
-        system rather than a leak. Past that grace: a claim nothing
-        purged (the sweep is no longer reaching its head for this
-        catalog, or compaction itself was turned off after having run,
-        since the purge lives at the head of a sweep); and such a claim
-        on a table that is dropped or gone, which outlived the thing it
-        claimed (the foreign key cascades on the CATALOG only). A LIVE
-        claim is never flagged, whatever its files or its table are
-        doing — on the kept-claim path a live claim over
-        end-snapshotted files IS the normal state of every committed
-        group.
-
-        NOT covered: the field-id contract for inline-stats files
-        (needs S3 footer reads; out of scope for a metadata-only scan).
-      parameters:
-        - { $ref: "#/components/parameters/catalog" }
-      responses:
-        "200":
-          description: >
-            Verification report. status "pass" only when every check
-            passed; per-check violation counts with sample details
-            capped at 20 per check.
-          content:
-            application/json:
-              schema: { $ref: "#/components/schemas/VerifyReport" }
-        "404": { $ref: "#/components/responses/NotFound" }
-
   /catalogs/{catalog}/maintenance/rehydrate:
     post:
       operationId: runRehydrate
@@ -1301,7 +1134,7 @@ paths:
         queue); compaction -> small_files (ACTIONABLE debt: small files
         the planner would put in a group, trailing remainders included,
         before applying the per-run budget), target_bytes;
-        verify -> none (empty object).
+        retirement -> none (empty object).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
       responses:
@@ -4548,6 +4381,16 @@ components:
           description: Failed files flipped back to pending.
 
     VerifyCheck:
+      description: >
+        HISTORICAL. The verify subsystem was removed in #261 — there is
+        no endpoint and no loop that produces this shape any more. It is
+        retained because the maintenance run ledger still HOLDS `verify`
+        rows whose stored `result` has it, for as long as
+        HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS (7 days by default),
+        and a client reading that ledger must still be able to decode
+        them. Nothing pins this schema against a server any more; it is
+        frozen vocabulary, and a paged, resumable scrubber will define
+        its own.
       type: object
       required: [check, status, violations, samples]
       properties:
@@ -4558,10 +4401,8 @@ components:
                  offset_release, staging_tickets, upload_claims,
                  compaction_claims]
           description: >
-            The check's stable id, and the order a report lists them
-            in. An enum rather than prose so a generated client gets
-            the vocabulary and so the server can be pinned against it
-            (VerifySpecParityTest runs a real report and compares).
+            The check's stable id, and the order a report listed them
+            in.
         status:
           type: string
           enum: [pass, fail]
@@ -4579,15 +4420,16 @@ components:
             The invariant this check enforces, one paragraph, so a
             report is readable without the spec. Prose, not an
             identifier — never parse it; switch on `check`.
-            OPTIONAL, and absent in exactly two places, both in the
-            maintenance run ledger rather than here: this schema also
-            describes a `verify` run's stored `result`, which is
-            recorded WITHOUT descriptions (they are constants, and a
-            ledger row would pay for them per row forever) and which for
-            older rows predates the field entirely. A live response to
-            this endpoint always carries it.
+            OPTIONAL, and in practice always absent now: ledger rows
+            were recorded WITHOUT descriptions (they were constants, and
+            a ledger row would have paid for them per row forever), and
+            older rows predate the field entirely. The live responses
+            that carried it are gone with the endpoint.
 
     VerifyReport:
+      description: >
+        HISTORICAL, with VerifyCheck above: the stored `result` of a
+        `verify` row in the maintenance run ledger, and nothing else.
       type: object
       required: [catalog, status, checks]
       properties:
@@ -4895,8 +4737,9 @@ components:
 
         A catalog with no snapshot retention never retires anything,
         because its floor never advances. That is correct rather than a
-        gap, and /verify's orphans check reports that population as an
-        informational count instead of a violation.
+        gap. The verify subsystem's orphans check reported that
+        population as an informational count instead of a violation;
+        #261 removed it and nothing reports it today.
 
 
         This payload appears only in the maintenance run ledger. There
@@ -5002,7 +4845,14 @@ components:
     MaintenanceTask:
       type: string
       enum: [hydrator, expiry, cleanup, compaction, verify, retirement]
-      description: The maintenance-task vocabulary of hog_maintenance_run.
+      description: >
+        The maintenance-task vocabulary of hog_maintenance_run. `verify`
+        is HISTORICAL: #261 removed the subsystem, nothing writes such a
+        row any more, and the task does not appear in
+        MaintenanceStatus.tasks — but the ledger still holds and serves
+        its rows until they age out of
+        HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS, so a client must
+        still accept the value.
 
     MaintenanceRun:
       type: object
@@ -5038,9 +4888,10 @@ components:
           description: >
             The task's result payload — the matching POST response body:
             ExpiryResult for expiry, CleanupResult for cleanup,
-            CompactionResult for compaction, VerifyReport for verify,
-            RetirementResult for retirement (which has no trigger
-            endpoint: the loop is its only driver).
+            CompactionResult for compaction, RetirementResult for
+            retirement (which has no trigger endpoint: the loop is its
+            only driver), and VerifyReport for the historical `verify`
+            rows still inside the ledger's retention window.
             Hydrator loop rows carry the sweep's per-catalog counts
             (claimed, hydrated, failed, transient); manual hydrator rows
             carry RehydrateResult.
@@ -5085,12 +4936,12 @@ components:
           description: >
             Whether every sweep of this task records a run, which is how
             a reader must interpret SILENCE here. True (expiry, cleanup,
-            compaction, verify, retirement): no runs means no loop is
-            running the
-            task. False (hydrator): its sweep is instance-wide and
-            records only for the catalogs it claimed files for, so no
-            runs means no work arrived for this catalog and says nothing
-            about whether the loop is alive.
+            compaction, retirement): no runs means no loop is running
+            the task. False (hydrator, and the historical `verify`): the
+            hydrator's sweep is instance-wide and records only for the
+            catalogs it claimed files for, so no runs means no work
+            arrived for this catalog and says nothing about whether the
+            loop is alive; `verify` has no loop at all any more.
 
     MaintenanceTaskStatus:
       type: object
@@ -5103,8 +4954,9 @@ components:
           description: >
             The RESPONDING PROCESS's configured cadence (0 = the loop is
             off in this process; manual triggers still work — which is
-            how the API workload runs verify). Absent only for a task
-            with no loop at all, of which there are none today. A
+            how the API workload runs compaction). Absent only for a
+            task with no loop at all, of which there are none in the
+            task list. A
             deployment may run a task's loop in a pod other than the one
             serving the API, so this must not be read as "the task is
             not running" — use `loop`.
@@ -5114,8 +4966,8 @@ components:
             - { type: object, nullable: true, enum: [null] }
           description: >
             Always included; null when the task has no loop at all — no
-            task is in that position today, so null now means an older
-            server that had one. A MISSING key means an older server
+            task in the list is in that position, so null now means an
+            older server that had one. A MISSING key means an older server
             that does not report the field at all, which is not the same
             claim.
         last_run:
@@ -5133,7 +4985,7 @@ components:
             cleanup -> queued_removals, oldest_queued_age_seconds
             (absent on an empty queue); compaction -> small_files
             (files the planner would put in a group, excluding groups
-            under their scaled minimum), target_bytes; verify -> none;
+            under their scaled minimum), target_bytes;
             retirement -> none. Retirement carries no backlog number on
             purpose: the honest one is live file rows on dropped tables,
             which is a scan of the manifest and therefore forbidden on

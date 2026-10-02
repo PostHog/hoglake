@@ -14,7 +14,6 @@ import com.posthog.hoglake.service.ExpiryService
 import com.posthog.hoglake.service.MaintenanceStatusService
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.RemovalStore
-import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.testing.PgTestSupport
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
@@ -51,16 +50,11 @@ import java.util.Comparator
 class MaintenanceApiTest {
     private val db = PgTestSupport.freshDatabase()
 
-    // A NON-DEFAULT verify interval on purpose: the default is 0 (the
-    // loop is an ops decision per workload), and asserting the endpoint
-    // reports 0 would not distinguish "reports this process's config"
-    // from "still reports nothing for verify".
     // A NONZERO retirement interval, because the assertion below is
     // about the endpoint reporting THIS PROCESS's cadence and a 0 on
     // both sides could not tell "reported correctly" from "defaulted
-    // on both sides" — the same trap verify's assertion names.
-    private val cfg =
-        Config(hydratorIntervalMs = 0, verifyIntervalMs = 3_600_000, retirementIntervalMs = 120_000)
+    // on both sides".
+    private val cfg = Config(hydratorIntervalMs = 0, retirementIntervalMs = 120_000)
     private val app = App.build(cfg, db.jdbi)
     private val json = ObjectMapper()
 
@@ -108,7 +102,6 @@ class MaintenanceApiTest {
                             maxGroupsPerRun = 1,
                         ),
                     ),
-                    VerifyService(db.jdbi, retirementIntervalMs = 0),
                     // Rehydrate is metadata-only (a stats_state flip); the
                     // store is never contacted by these tests.
                     Hydrator(db.jdbi, compactionStore),
@@ -118,7 +111,6 @@ class MaintenanceApiTest {
                         expiryIntervalMs = 60_000,
                         cleanupIntervalMs = 60_000,
                         compactionIntervalMs = 0,
-                        verifyIntervalMs = 3_600_000,
                         retirementIntervalMs = cfg.retirementIntervalMs,
                         smallFileThresholdBytes = 512L * 1024 * 1024,
                     ),
@@ -360,54 +352,6 @@ class MaintenanceApiTest {
             )
         }
 
-    // ---- maintenance/verify ------------------------------------------------
-
-    @Test
-    fun `verify endpoint reports all-pass on a healthy catalog and 404s unknowns`() =
-        api { client ->
-            client.createCatalog("mnt-verify")
-
-            val report =
-                body(
-                    client.postJson("/v1/catalogs/mnt-verify/maintenance/verify").also {
-                        assertThat(it.status).isEqualTo(HttpStatusCode.OK)
-                    },
-                )
-            assertThat(report["catalog"].asText()).isEqualTo("mnt-verify")
-            assertThat(report["status"].asText()).isEqualTo("pass")
-            val checks = report["checks"].map { it["check"].asText() }
-            assertThat(checks).containsExactly(
-                "row_id_tiling",
-                "delete_vectors",
-                "orphans",
-                "removal_queue",
-                "snapshot_density",
-                "next_row_id",
-                "expiry_floor",
-                "visibility_bounds",
-                "offset_release",
-                "staging_tickets",
-                "upload_claims",
-                "compaction_claims",
-            )
-            for (check in report["checks"]) {
-                assertThat(check["status"].asText()).isEqualTo("pass")
-                assertThat(check["violations"].asLong()).isEqualTo(0)
-                assertThat(check["samples"].isArray).isTrue()
-                // Additive wire field: the invariant, in words, on every
-                // check — the spec marks it required.
-                assertThat(check["description"].asText())
-                    .describedAs("check %s carries its invariant", check["check"].asText())
-                    .isNotBlank()
-            }
-
-            assertApiError(
-                client.postJson("/v1/catalogs/mnt-nope/maintenance/verify"),
-                HttpStatusCode.NotFound,
-                "not_found",
-            )
-        }
-
     // ---- maintenance/rehydrate ----------------------------------------------
 
     @Test
@@ -539,7 +483,6 @@ class MaintenanceApiTest {
                     "expiry",
                     "cleanup",
                     "compaction",
-                    "verify",
                     "retirement",
                 )
 
@@ -558,14 +501,12 @@ class MaintenanceApiTest {
 
             // Compaction's loop is disabled (interval 0) in this wiring.
             assertThat(tasks.getValue("compaction")["loop_interval_ms"].asLong()).isEqualTo(0)
-            // Verify is no longer manual-only: it has a loop of its own
-            // (HOGLAKE_VERIFY_INTERVAL_MS), and the status endpoint must
-            // report the interval THIS process was built with rather than
-            // keep claiming the task has no loop.
-            val verify = tasks.getValue("verify")
-            assertThat(verify["loop_interval_ms"].asLong()).isEqualTo(cfg.verifyIntervalMs)
-            assertThat(cfg.verifyIntervalMs).describedAs("a value 0 could not tell the two apart").isNotZero()
-            assertThat(verify["last_run"].isNull).isTrue()
+            // #261 removed the verify subsystem: the task is gone from
+            // the status list (asserted above) and its route must 404
+            // rather than quietly exist, the same rule the retirement
+            // assertion below applies to a route that never existed.
+            assertThat(client.postJson("/v1/catalogs/mnt-status/maintenance/verify").status)
+                .isEqualTo(HttpStatusCode.NotFound)
             // Retirement has a loop too, reported the same way — and an
             // EMPTY backlog, which is a deliberate absence rather than an
             // omission: the honest number is live file rows on dropped
@@ -601,7 +542,7 @@ class MaintenanceApiTest {
             client.createCatalog("mnt-runs")
             client.postJson("/v1/catalogs/mnt-runs/maintenance/expire")
             client.postJson("/v1/catalogs/mnt-runs/maintenance/expire")
-            client.postJson("/v1/catalogs/mnt-runs/maintenance/verify")
+            client.postJson("/v1/catalogs/mnt-runs/maintenance/cleanup")
 
             val all =
                 body(
@@ -615,7 +556,7 @@ class MaintenanceApiTest {
             assertThat(runIds).isSortedAccordingTo(Comparator.reverseOrder())
             // Every run carries the full wire shape.
             val run = all["runs"][0]
-            assertThat(run["task"].asText()).isEqualTo("verify")
+            assertThat(run["task"].asText()).isEqualTo("cleanup")
             assertThat(run["started_at"].isTextual).isTrue()
             assertThat(run.has("result")).isTrue()
 
@@ -623,6 +564,16 @@ class MaintenanceApiTest {
                 body(client.get("/v1/catalogs/mnt-runs/maintenance/runs?task=expiry"))
             assertThat(expiryOnly["runs"].map { it["task"].asText() })
                 .containsExactly("expiry", "expiry")
+
+            // `verify` is still a LEGAL filter value even though #261
+            // removed the subsystem: the ledger holds its historical rows
+            // for the retention window, and a client reading them must
+            // not get a 422. This catalog has none, so the page is empty
+            // — which is the difference between "gone from the
+            // vocabulary" and "no longer produced".
+            val verifyOnly =
+                body(client.get("/v1/catalogs/mnt-runs/maintenance/runs?task=verify"))
+            assertThat(verifyOnly["runs"]).isEmpty()
 
             // The before cursor pages downward exclusively.
             val page1 =
@@ -673,7 +624,7 @@ class MaintenanceApiTest {
             val byName = status["catalogs"].associateBy { it["catalog"].asText() }
             val a = byName.getValue("mnt-inst-a")
             assertThat(a["tasks"].map { it["task"].asText() })
-                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "verify", "retirement")
+                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "retirement")
             // The one expire run is visible, carrying its catalog name.
             assertThat(a["tasks"].first { it["task"].asText() == "expiry" }["last_run"]["catalog"].asText())
                 .isEqualTo("mnt-inst-a")

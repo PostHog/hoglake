@@ -247,7 +247,7 @@ internal object CompactionClaimRepo {
      * lands on; this covers the rest, which nothing would ever look at
      * again: a group whose files were compacted by the other replica is
      * never re-planned, so its abandoned claim would sit in the table
-     * forever. `compaction_claims` in `/verify` is what reds if this
+     * forever. The verify subsystem's `compaction_claims` check was what redded if this
      * stops running.
      */
     fun purgeExpired(

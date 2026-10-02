@@ -264,8 +264,7 @@ class ScanColumnStatsQueryPlanIntegrationTest {
     /**
      * The statement [FileRepo.providedColumnStatsAt] ACTUALLY ISSUES
      * for a request, captured off an instrumented Jdbi with a
-     * [SqlLogger] — the pattern `FileStatsApiTest.scanStatements` and
-     * `VerifySpecParityTest` use.
+     * [SqlLogger] — the pattern `FileStatsApiTest.scanStatements` uses.
      *
      * Not `providedColumnStatsSql(filtered = ...)` with a flag this
      * test chooses. That version EXPLAINed a statement the test built

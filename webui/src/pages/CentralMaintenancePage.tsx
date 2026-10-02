@@ -3,7 +3,6 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { getInstanceMaintenanceStatus } from "../api/client";
 import type {
   MaintenanceStatus,
-  MaintenanceTask,
   MaintenanceTaskStatus,
 } from "../api/types";
 import { ErrorBox } from "../components/ErrorBox";
@@ -18,12 +17,17 @@ import {
 } from "../components/maintenance";
 import { formatCount, formatTime } from "../lib/format";
 
-const TASKS: MaintenanceTask[] = [
+/**
+ * The matrix's columns: the tasks the STATUS endpoint reports, which is
+ * narrower than the ledger's `MaintenanceTask` vocabulary — `verify` is
+ * still a legal ledger task (#261 removed the subsystem, not the
+ * historical rows) and must never grow a column here again.
+ */
+const TASKS: MaintenanceTaskStatus["task"][] = [
   "hydrator",
   "expiry",
   "cleanup",
   "compaction",
-  "verify",
   // Appended, not inserted: this array is the matrix's COLUMN ORDER and
   // an operator reads it left to right in the order the pipeline runs.
   // Retirement feeds cleanup, so it sits at the end rather than beside
@@ -88,12 +92,6 @@ function taskCell(t: MaintenanceTaskStatus): {
         title:
           "Live files under the compaction target — the debt a sweep would " +
           "plan against. Detail on the catalog's compaction-debt page.",
-      };
-    case "verify":
-      return {
-        number: "",
-        warn: false,
-        title: "Metadata-only invariant scan; runs on demand",
       };
     case "retirement": {
       // No backlog number exists for this task (the honest one is a
@@ -200,7 +198,7 @@ export function CentralMaintenancePage() {
   // Only a CADENCE belongs in a column head. The per-catalog phrasings
   // ("last loop run 2m ago", "nothing to do here") are claims about one
   // row, and a header is the wrong place to make them about all of them.
-  const cadence = (task: MaintenanceTask): string => {
+  const cadence = (task: MaintenanceTaskStatus["task"]): string => {
     const observed = catalogs.map((c) => c.tasks.find((x) => x.task === task)?.loop);
     if (observed.some((loop) => loop === null)) return "manual only";
     return observed.map(loopCadence).find((text) => text?.startsWith("every")) ?? "";

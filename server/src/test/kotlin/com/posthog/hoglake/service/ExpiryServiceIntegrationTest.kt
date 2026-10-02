@@ -29,6 +29,16 @@ class ExpiryServiceIntegrationTest {
     @AfterAll
     fun tearDown() = db.close()
 
+    private companion object {
+        /**
+         * The versioned tables expiry clears in steps 1-2 instead of step
+         * 5, because their rows name OBJECTS: the sweep queues each path
+         * into `hog_file_removal` for the cleanup drain before deleting
+         * the row, which a step-5 bare DELETE would skip and leak.
+         */
+        val FLOOR_CLEARED_BY_THEIR_OWN_STEP = listOf("hog_data_file", "hog_delete_file")
+    }
+
     // ---- seeding -----------------------------------------------------------
 
     /** Catalog with snapshots 0..head, each aged per [ageSeconds]. */
@@ -600,6 +610,57 @@ class ExpiryServiceIntegrationTest {
             assertThat(count("hog_sort_spec")).isEqualTo(1)
             assertThat(count("hog_sort_field")).describedAs("cascaded with its spec").isZero()
         }
+    }
+
+    /**
+     * THE SCHEMA IS THE AUTHORITY ON WHAT IS VERSIONED, not this list.
+     *
+     * [ExpiryService.VERSIONED_RETENTION_TABLES] is a compile-time
+     * vocabulary (invariant 9), so a migration that adds a table
+     * carrying the versioned-row shape and forgets to extend it leaves
+     * step 5 never clearing that table's below-floor corpses: it grows
+     * without bound on DDL churn, and every test in this suite still
+     * passes because they all take their cases FROM the list. This asks
+     * the catalog instead.
+     *
+     * `hog_data_file` and `hog_delete_file` carry the same shape and are
+     * deliberately NOT in the list — steps 1 and 2 clear them by their
+     * own path (they queue objects for the cleanup drain first, which a
+     * bare DELETE would skip), so they are named here as the two known
+     * exclusions rather than left to a `containsAll`. Anything else
+     * appearing in the INTERSECT is a gap.
+     *
+     * This guard used to live in `VerifyServiceIntegrationTest` (its last
+     * assertion was `BELOW_FLOOR_TABLES containsAll
+     * VERSIONED_RETENTION_TABLES`), which is why it reads as a schema
+     * test rather than a verify test: it never needed a verify symbol to
+     * express, and #261 deleting that file took it along as collateral.
+     */
+    @Test
+    fun `VERSIONED_RETENTION_TABLES is every versioned table the schema has`() {
+        val versioned =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT table_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND column_name = 'end_snapshot'
+                    INTERSECT
+                    SELECT table_name FROM information_schema.columns
+                    WHERE table_schema = 'public' AND column_name = 'begin_snapshot'
+                    """,
+                ).mapTo(String::class.java).list()
+            }
+        // An empty INTERSECT would pass a `containsExactly` against an
+        // empty list, so the shape of the query is asserted first.
+        assertThat(versioned).describedAs("the INTERSECT found no versioned table at all").isNotEmpty()
+        assertThat(versioned).containsAll(ExpiryService.VERSIONED_RETENTION_TABLES)
+
+        assertThat(ExpiryService.VERSIONED_RETENTION_TABLES + FLOOR_CLEARED_BY_THEIR_OWN_STEP)
+            .describedAs(
+                "a versioned table expiry's step 5 never clears: add it to " +
+                    "ExpiryService.VERSIONED_RETENTION_TABLES, or to this test's exclusion list " +
+                    "with the step that does clear it",
+            ).containsExactlyInAnyOrderElementsOf(versioned)
     }
 
     @Test

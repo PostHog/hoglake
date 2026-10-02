@@ -179,8 +179,8 @@ MultiFileReaderVirtualColumnBinding HoglakeMultiFileReader::GetVirtualColumnExpr
 		if (has_reserved_column) {
 			// the reserved parquet field id is never allocatable to a
 			// real column (AGENT.md invariant 2). The server cannot
-			// detect this (it never opens registered parquet and
-			// /verify excludes the field-id contract), so the client is
+			// detect this (it never opens registered parquet, and the
+			// removed /verify excluded the field-id contract), so the client is
 			// the enforcement point: refuse the file, typed.
 			throw InvalidInputException(
 			    "hoglake: data file \"%s\" carries the reserved parquet field id %d (_hog_row_id) but the catalog "

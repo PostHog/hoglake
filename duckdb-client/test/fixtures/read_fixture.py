@@ -317,7 +317,7 @@ def main() -> None:
         # ---- reserved-field-id poison (R5-2): an ordinary in-contract
         # registration whose parquet carries the RESERVED field id
         # 2147483646 on a normal column. The server never opens
-        # registered parquet (and /verify excludes the field-id
+        # registered parquet (and the removed /verify excluded the field-id
         # contract), so explicit_row_ids stays false — the client must
         # refuse the file rather than read its contents as row ids. The
         # column also holds a NULL, the R5-1 trigger.

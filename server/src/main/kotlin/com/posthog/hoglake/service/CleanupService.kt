@@ -124,12 +124,25 @@ open class RemovalStore(
      * [Outcome.MISSING] (DeleteObject alone is silently idempotent, so
      * the probe is what distinguishes "removed" from "was never there").
      *
-     * Two round trips per path, so the drain uses it ONLY where the
-     * distinction is read by something: `compaction_staging` tickets,
-     * whose `'absent'` outcome is an arm of `/verify`'s
-     * `staging_tickets` check (a staged path drained `'absent'` that IS
-     * a live file row is the staged-output race resolved the wrong way).
-     * Everything else goes through [deleteBatch].
+     * Two round trips per path, so the drain uses it ONLY for
+     * `compaction_staging` tickets, whose `'absent'` outcome was an arm
+     * of the verify subsystem's `staging_tickets` check (a staged path
+     * drained `'absent'` that IS a live file row is the staged-output
+     * race resolved the wrong way). #261 removed the production check,
+     * so the only reader left is a test —
+     * `CatalogInvariants.assertNoAbsentTicketOverLivePath`, called from
+     * `CompactionServiceIntegrationTest`.
+     *
+     * AND IT IS NOT FREE. Two round trips per path instead of one
+     * batched call is what forces the reason-scoped claim of
+     * [STAGING_SUB_BATCH] (25) rather than `subBatchSize`, which is the
+     * throughput this carve-out costs: at the ~9.4k orphaned tickets and
+     * 50/h this file records below, that is the eight-day drain. Kept for
+     * now because the outcome cannot be reconstructed after the delete
+     * and the scrubber will want it — but keep-or-drop is a DECISION
+     * somebody has to make (tracked in AGENT.md's follow-up line), not a
+     * standing property of the drain. Everything else goes through
+     * [deleteBatch].
      */
     open fun deleteIfExists(pathUri: String): Outcome {
         if (!exists(pathUri)) return Outcome.MISSING
@@ -466,10 +479,12 @@ open class RemovalStore(
  * them.
  *
  * THE ONE CARVE-OUT is `reason = 'compaction_staging'`, which keeps
- * HEAD + DELETE per path: `/verify`'s `staging_tickets` check reads
- * their `'absent'` outcome (a staged path drained `'absent'` that IS a
- * live file row is the staged-output race resolved the wrong way), and
- * a `DeleteObjects` response cannot produce it. `'absent'` therefore
+ * HEAD + DELETE per path to record their `'absent'` outcome (a staged
+ * path drained `'absent'` that IS a live file row is the staged-output
+ * race resolved the wrong way), which a `DeleteObjects` response cannot
+ * produce. Its reader was the verify subsystem's `staging_tickets`
+ * check, removed in #261, so the value is written and unread today.
+ * `'absent'` therefore
  * remains a legal and produced ledger value — for staging tickets, and
  * on every row settled before batching landed, which the 30-day ledger
  * keeps visible.
@@ -969,8 +984,9 @@ class CleanupService(
         // drops to seconds) it got NONE: the bulk arm consumed the budget
         // in the first iteration and the staging `want` was 0 for ever
         // after. On gigahog-prod-us that is ~9.4k orphaned tickets at 50/h
-        // — eight days, with `/verify`'s `staging_tickets.leaked` arm
-        // firing for all of it, on a drain working exactly as designed.
+        // — eight days, with the verify subsystem's
+        // `staging_tickets.leaked` arm firing for all of it, on a drain
+        // working exactly as designed.
         // Per arm, the same queue clears in ~5 runs.
         val budgets = mutableMapOf(false to batchSize, true to batchSize)
         while (budgets.values.any { it > 0 }) {
@@ -1066,8 +1082,8 @@ class CleanupService(
      * path) deletes with [RemovalStore.deleteBatch] — one call per bucket
      * chunk — and settles everything it did not fail as `'deleted'`.
      * True (the `compaction_staging` path) does HEAD + DELETE per path so
-     * `'absent'` still reaches the ledger for `/verify`, and is called
-     * with at most [STAGING_SUB_BATCH] rows for exactly that reason.
+     * `'absent'` still reaches the ledger, and is called with at most
+     * [STAGING_SUB_BATCH] rows for exactly that reason.
      *
      * Nothing is accumulated into the run's counters until the settle
      * transaction has committed: a settle that rolls back must contribute
@@ -1182,10 +1198,11 @@ class CleanupService(
                     // (normal). The other is A LIVE FILE ROW FOR A PATH
                     // THIS SUB-BATCH JUST DELETED, which is an invariant
                     // violation and the ONLY observable signature it has —
-                    // nothing else in the system can see it, because
-                    // /verify's staging_tickets arms all pass once the file
-                    // row exists. So the missed ids are read back and
-                    // classified.
+                    // nothing else in the system could see it — the
+                    // verify subsystem's staging_tickets arms all passed
+                    // once the file row existed, and #261 removed them
+                    // anyway. So the missed ids are read back and
+                    // classified here.
                     //
                     // It is unreachable as of this change: compaction's
                     // re-read refuses any ticket cleanup has TOUCHED
@@ -1813,8 +1830,8 @@ class CleanupService(
         /**
          * `hog_file_removal.reason` for a compaction staging ticket: the
          * one reason the drain treats differently, on both counts — HEAD
-         * before DELETE, so `'absent'` still reaches the ledger for
-         * `/verify`, and the staging grace below.
+         * before DELETE, so `'absent'` still reaches the ledger, and the
+         * staging grace below.
          */
         const val STAGING_REASON = "compaction_staging"
 
@@ -1868,15 +1885,17 @@ class CleanupService(
          * transaction that has already committed eligible, since
          * `scheduled_at < now()` holds for any row this drain can read.
          *
-         * THE CEILING IS `/verify`, not taste:
-         * `VerifyService.DEFAULT_STAGING_TICKET_MAX_AGE_SECONDS` (6 h)
-         * is when `staging_tickets` calls an undrained ticket leaked.
-         * This grace plus `HOGLAKE_CLEANUP_INTERVAL_MS` plus however
-         * long the backlog takes to reach the row must stay well under
-         * that, or the check reports tickets the drain is deliberately
-         * leaving alone — an alert that fires on a healthy system, which
-         * is how an alert stops being read. At the defaults (1 h grace,
-         * 30 min interval) there is a factor of four in hand.
+         * THERE IS NO CEILING ON IT TODAY, and there used to be one:
+         * the verify subsystem's `staging_tickets` check called an
+         * undrained ticket leaked at 6 h, so this grace plus
+         * `HOGLAKE_CLEANUP_INTERVAL_MS` plus however long the backlog
+         * took to reach the row had to stay well under that, or the
+         * check reported tickets the drain was deliberately leaving
+         * alone — an alert firing on a healthy system, which is how an
+         * alert stops being read. At the defaults (1 h grace, 30 min
+         * interval) there was a factor of four in hand. #261 removed
+         * the check; a scrubber that re-adds it inherits the
+         * relationship and has to re-derive the factor.
          *
          * The ticket is inserted BEFORE the rewrite starts, so on an
          * empty queue a drain can settle a fresh one `'absent'` while its

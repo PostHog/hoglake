@@ -127,8 +127,8 @@ function positive(value: Int64 | undefined): boolean {
  *  - A warning or skip counter makes a run loud even when its headline counts
  *    are all zero: compaction's failed_groups / skipped_conflicts /
  *    dv_superseded / unconvertible_schema / invalid_data, cleanup's
- *    still_referenced, expiry's floored_by_consumer, a verify report that
- *    failed or counted violations. Those are exactly the runs where
+ *    still_referenced, expiry's floored_by_consumer, a historical verify
+ *    report that failed or counted violations. Those are exactly the runs where
  *    "0 groups" is the interesting part.
  *  - A null result is NOT quiet. Hiding needs positive evidence that nothing
  *    happened, and a missing payload is the absence of evidence — it is what

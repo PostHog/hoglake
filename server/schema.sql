@@ -138,12 +138,15 @@ CREATE TABLE hog_table (
     -- V20: when the retirement sweep FIRST observed this dropped table
     -- at or below the catalog's expiry floor — i.e. when its file rows
     -- became deletable. NULL for a live table, and for a dropped one no
-    -- sweep has reached yet. Not read on any request path;
-    -- `/verify`'s orphans check reads it, so it can date a leak from
-    -- ELIGIBILITY rather than from the drop (on a catalog whose floor
-    -- moves slowly those are very different instants, and dating from
-    -- the drop would alert on a system working as designed). Stamped
-    -- once, never cleared.
+    -- sweep has reached yet. Not read on any request path, and since
+    -- #261 not read by anything at all: its reader was `/verify`'s
+    -- orphans check, which dated a leak from ELIGIBILITY rather than
+    -- from the drop (on a catalog whose floor moves slowly those are
+    -- very different instants, and dating from the drop would alert on
+    -- a system working as designed). Kept WRITE-ONLY on purpose — the
+    -- instant cannot be reconstructed after the fact, so the paged
+    -- scrubber that re-adds the check needs it to have been
+    -- accumulating. Stamped once, never cleared.
     retirement_eligible_at timestamptz,
     PRIMARY KEY (catalog_id, table_id),
     UNIQUE (catalog_id, table_uuid),

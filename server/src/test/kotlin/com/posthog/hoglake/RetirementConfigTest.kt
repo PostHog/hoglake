@@ -70,7 +70,6 @@ class RetirementConfigTest {
             Config(
                 retirementIntervalMs = 0,
                 compactionIntervalMs = 0,
-                verifyIntervalMs = 0,
             )
         assertThat(api.retirementIntervalMs).isZero()
         assertThat(api.retirementQueueCeiling)

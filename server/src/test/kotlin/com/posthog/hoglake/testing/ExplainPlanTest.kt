@@ -4,8 +4,23 @@ import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 
 /**
- * The parser behind `VerifyQueryPlanIntegrationTest`'s rules, and in
- * particular the POLARITY of [ExplainPlan.Node.filtersPath].
+ * The plan parser, and in particular the POLARITY of
+ * [ExplainPlan.Node.filtersPath].
+ *
+ * `ExplainPlan.nodes` has exactly one caller today:
+ * `observability/CatalogMetricsDroppedTableIntegrationTest` (`:160`,
+ * `:177`, `:200`). The other plan tests parse `EXPLAIN` themselves —
+ * `TableListingQueryPlanIntegrationTest` at `:259`/`:272`, for instance —
+ * so do not mistake this for shared infrastructure they depend on.
+ *
+ * `filtersPath` HAS NO CONSUMER AT ALL since #261 deleted
+ * `VerifyQueryPlanIntegrationTest`, which was the only test that ever
+ * read it. It is retained rather than deleted because the paged scrubber
+ * (#261) inherits the path-probe rule it encodes, and because the rule
+ * itself is a finding rather than a convenience — stated plainly here so
+ * nobody reads the three assertions below as live coverage of a live
+ * rule. If the scrubber lands without a path-probe rule, delete the flag
+ * and these cases with it.
  *
  * That flag carries the rule V16 paid for: a repeated probe on
  * `(catalog_id, path)` is a descent per candidate, while a repeated

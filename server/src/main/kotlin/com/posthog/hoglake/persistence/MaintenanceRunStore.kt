@@ -44,7 +44,7 @@ interface PartialResult {
  *    task: a recording failure is logged and swallowed. The ledger
  *    observes; it does not participate.
  *  - [recorded] is the funnel for tasks keyed by catalog name
- *    (expiry/cleanup/compaction/verify, manual hydrator rehydrate).
+ *    (expiry/cleanup/compaction/retirement, manual hydrator rehydrate).
  *    [recordSweepById] is the hydrator loop's per-catalog fan-out: its
  *    sweep is instance-wide, so it records one row per catalog it
  *    claimed files for.
@@ -200,6 +200,13 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
             """,
         )
             .bindArray("ids", Long::class.javaObjectType, catalogIds)
+            // EVERY task, not the looping ones: this reads the last run
+            // of ANY trigger, and `verify`'s historical rows are all
+            // manual (#261 removed the loop, not the rows). Filtering on
+            // `hasLoop` here would be the wrong predicate and would hide
+            // them. The cost of asking for a task nothing writes is an
+            // empty probe of `hog_maintenance_run_recent
+            // (catalog_id, task, run_id DESC)` — a descent, not a scan.
             .bindArray("tasks", String::class.java, MaintenanceTask.entries.map { it.wire })
             .map { rs, _ -> runMapper(rs) }
             .list()
@@ -220,11 +227,13 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
      *
      * Only tasks that have a loop are asked for ([MaintenanceTask.hasLoop]):
      * for a loop-less task no `run_trigger = 'loop'` row can exist, and the
-     * LATERAL would read every row the catalog has to prove it. Every task
-     * loops today, so the filter is currently a no-op that stays because the
-     * cost of getting it wrong falls on the status endpoint's hot path. For
-     * the tasks that do loop, loop rows vastly outnumber manual ones, so the
-     * index scan stops within a few rows of the newest.
+     * LATERAL would read every row the catalog has to prove it. The filter
+     * is LOAD-BEARING as of #261 — `verify` is the task with no loop, and
+     * its historical rows are all `manual`, so without the filter this
+     * query would scan a catalog's whole ledger per request to find the
+     * loop rows that cannot be there. For the tasks that do loop, loop rows
+     * vastly outnumber manual ones, so the index scan stops within a few
+     * rows of the newest.
      */
     fun recentLoopRunsAll(
         h: Handle,

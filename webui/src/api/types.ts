@@ -657,6 +657,13 @@ export interface CommitResult {
 // response body (wire snake_case), typed per task below. A failed run has
 // `result: null` and carries `error` instead.
 
+/**
+ * `verify` is HISTORICAL: #261 removed the subsystem, so nothing produces a
+ * verify row any more and the task does not appear in MaintenanceStatus.tasks
+ * — but the run ledger still HOLDS and serves its rows until they age out of
+ * HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS (7 days by default), so the
+ * runs feed must keep decoding and rendering them.
+ */
 export type MaintenanceTask =
   | "hydrator"
   | "expiry"
@@ -883,6 +890,7 @@ export interface CompactionResult {
   plan_ms?: Int64;
 }
 
+/** HISTORICAL, with VerifyReport: only a `verify` ledger row carries it. */
 export interface VerifyCheck {
   check: string;
   status: "pass" | "fail";
@@ -891,15 +899,18 @@ export interface VerifyCheck {
   /**
    * The invariant this check enforces, one paragraph, from the server.
    *
-   * OPTIONAL, and the spec says so too: the maintenance run ledger
-   * stores verify results WITHOUT descriptions (they are constants —
-   * paying for them per row forever), and a report served by an older
-   * build carries none either. Prose, never an identifier: switch on
-   * `check`.
+   * OPTIONAL, and in practice always absent: the maintenance run ledger
+   * stored verify results WITHOUT descriptions (they were constants —
+   * paying for them per row forever). Prose, never an identifier: switch
+   * on `check`.
    */
   description?: string;
 }
 
+/**
+ * The stored `result` of a historical `verify` ledger row, and nothing else:
+ * the endpoint that returned it live was removed in #261.
+ */
 export interface VerifyReport {
   catalog: string;
   status: "pass" | "fail";
@@ -972,6 +983,7 @@ export type MaintenanceRun =
   | (MaintenanceRunBase & { task: "expiry"; result: ExpiryResult | null })
   | (MaintenanceRunBase & { task: "cleanup"; result: CleanupResult | null })
   | (MaintenanceRunBase & { task: "compaction"; result: CompactionResult | null })
+  // Historical rows only — see MaintenanceTask.
   | (MaintenanceRunBase & { task: "verify"; result: VerifyReport | null })
   | (MaintenanceRunBase & { task: "retirement"; result: RetirementResult | null });
 
@@ -1001,10 +1013,8 @@ export interface CompactionBacklog {
   target_bytes: Int64;
 }
 
-export type VerifyBacklog = Record<string, never>;
-
 /**
- * Empty, like VerifyBacklog, and on purpose: the honest backlog is live file
+ * Empty on purpose: the honest backlog is live file
  * rows on dropped tables, which is a manifest scan and forbidden on the
  * dashboard path, while a count of dropped TABLES would answer a different
  * question (one dropped 3M-row table and forty dropped empty ones read the
@@ -1037,9 +1047,10 @@ interface MaintenanceTaskStatusBase {
   last_run: MaintenanceRun | null;
   /**
    * Always present on a server that reports it; null = the task has no
-   * loop at all. No task is in that position any more — verify gained
-   * one with HOGLAKE_VERIFY_INTERVAL_MS — so null now means an older
-   * server that had a loop-less task. Absent means an OLDER server
+   * loop at all. No task in the list is in that position — verify, the
+   * one that was, is gone from the list entirely (#261) — so null now
+   * means an older server that had a loop-less task. Absent means an
+   * OLDER server
    * still, which is a different claim from "no loop runs" and must not
    * render as one.
    */
@@ -1051,7 +1062,6 @@ export type MaintenanceTaskStatus =
   | (MaintenanceTaskStatusBase & { task: "expiry"; backlog: ExpiryBacklog })
   | (MaintenanceTaskStatusBase & { task: "cleanup"; backlog: CleanupBacklog })
   | (MaintenanceTaskStatusBase & { task: "compaction"; backlog: CompactionBacklog })
-  | (MaintenanceTaskStatusBase & { task: "verify"; backlog: VerifyBacklog })
   | (MaintenanceTaskStatusBase & { task: "retirement"; backlog: RetirementBacklog });
 
 export interface MaintenanceStatus {

@@ -50,8 +50,6 @@ from .models import (
     SnapshotChange,
     TableInfo,
     TableSummary,
-    VerifyCheck,
-    VerifyReport,
     ViewInfo,
 )
 from .ops import AlterOp
@@ -110,8 +108,6 @@ __all__ = [
     "TableSummary",
     "UnsupportedTypeError",
     "ValidationError",
-    "VerifyCheck",
-    "VerifyReport",
     "View",
     "ViewInfo",
     "__version__",

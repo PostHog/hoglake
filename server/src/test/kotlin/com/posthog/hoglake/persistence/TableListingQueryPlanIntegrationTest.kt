@@ -24,8 +24,8 @@ import org.junit.jupiter.params.provider.EnumSource
  * The listing replaced an N+1 (`listLive` plus one `aggregateAt` per
  * table) with one statement carrying two LATERAL sub-selects. LATERAL
  * is a nested loop BY CONSTRUCTION — one inner execution per table — so
- * the `loops=1` rule `VerifyQueryPlanIntegrationTest` enforces would be
- * the wrong question here. The right one is WORK.
+ * the `loops=1` rule the removed `VerifyQueryPlanIntegrationTest`
+ * enforced would be the wrong question here. The right one is WORK.
  *
  * The first version of this test measured work as `rows × loops` and was
  * WRONG, in the way that matters: EXPLAIN's `rows=` is the count a node

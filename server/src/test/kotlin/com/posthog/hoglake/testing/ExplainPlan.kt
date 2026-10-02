@@ -15,6 +15,9 @@ object ExplainPlan {
      * A plan node: its line, how many times it ran, what it read, and
      * whether it threw rows away on `path` — which is what separates a
      * probe on `(catalog_id, path)` from a probe on a prefix of it.
+     *
+     * [filtersPath] has NO consumer since #261 (see `ExplainPlanTest`);
+     * only `loops` and `buffers` are read today.
      */
     data class Node(
         val line: String,

@@ -93,7 +93,7 @@ React console, Python replication daemon:
 
 | Component | What | Stack | Tests |
 |---|---|---|---|
-| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, verify, metrics, audit | Kotlin 2.4 / JDK 25 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit 6 + Testcontainers (PG18, MinIO) + kotest-property |
+| `server/` | The control plane: DDL, commits (OCC + admission backpressure), scans, changefeed, offsets, retention/expiry/cleanup, hydrator, compaction, retirement, metrics, audit | Kotlin 2.4 / JDK 25 (flox) / Ktor / JDBI / Flyway / parquet-java (footer reads + compaction writes) | JUnit 6 + Testcontainers (PG18, MinIO) + kotest-property |
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel; the namespace listing is NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — `table_uuid` stays on the wire but is shown on the table page, not as a column), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
@@ -155,6 +155,14 @@ the pyhoglake publish workflow refuses a tag that mismatches its
 pyproject. The Python packages' `__version__` attributes read the
 installed metadata, so they are not version strings to bump.
 
+**Pending note for the 1.3.8 release body**: pyhoglake loses the public
+`Catalog.verify()` method and the `VerifyReport` / `VerifyCheck` models
+with #261, in a patch bump and with no changelog in the tree. The
+endpoint it called is gone, so the method could only 404 against a 1.3.8
+server — but it still works against an older one, which is what makes it
+a breaking client change worth a line rather than a silent deletion. Say
+so in the release notes when 1.3.8 is cut.
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a
@@ -189,7 +197,7 @@ there would break that gate on every build.
    source a reader uses, and a reader must refuse a file that
    disagrees with its registration in EITHER direction, because the
    server cannot detect the disagreement (registration never opens the
-   parquet; `/verify` is metadata-only). Both refusals are implemented
+   parquet, and the removed `/verify` was metadata-only). Both refusals are implemented
    and tested in `duckdb-client/`, and COMPACTION enforces them
    server-side as well — it is the one server surface that does open
    the parquet, so `ParquetRewriter.rowIdCarrier` refuses both
@@ -243,11 +251,19 @@ there would break that gate on every build.
    a sweep advances the floor under the commit lock and then purges
    `hog_data_file`/`hog_delete_file` in bounded pages OUTSIDE it, so an
    ended row below the floor is legitimate state for a few sweeps. It is
-   unreadable (410) and immutable while it sits there, each page queues
-   its paths in the same statement that deletes its rows, and
-   `/verify`'s `expiry_floor` asserts that arm only against a sweep whose
-   ledger row reports the purge drained. server/README.md §Retention has
-   the rate arithmetic and the 2026-10-01 incident it comes from.
+   unreadable (410) and immutable while it sits there, and each page
+   queues its paths in the same statement that deletes its rows.
+   NOTHING ASSERTS THE INVARIANT HALF OF THIS ANY MORE: #262 gated
+   `/verify`'s `expiry_floor` file arm on the ledger row reporting the
+   purge drained, precisely so it kept catching a drained purge that
+   still left rows below the floor (its predicate and the floor advance
+   disagreeing) without alerting on the designed lag — and #261 removed
+   the check. UNWATCHED UNTIL #261 ships the paged scrubber. The BACKLOG
+   half still works and never needed verify: `purge_truncated`,
+   `purge_remaining` and `purge_failures` on the ledger row,
+   `hoglake_expiry_purge_truncated_total` and
+   `hoglake_expiry_purge_remaining`. server/README.md §Retention has the
+   rate arithmetic and the 2026-10-01 incident it comes from.
 6. **Versioned-row visibility**: a row is visible at S iff
    `begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot)`.
    Every read path uses exactly this predicate.
@@ -308,7 +324,7 @@ there would break that gate on every build.
     `TableRepo.findLive`/`findAt`, `CommitService.resolveLiveTable`,
     `CompactionService`'s planner AND its commit re-verification,
     `Hydrator.claimPending`/`rehydrateFailed`, `CatalogMetrics`'s
-    sample, `MaintenanceSummarySampler`'s scan, `/verify`'s `orphans`.
+    sample, `MaintenanceSummarySampler`'s scan.
     THREE CARVE-OUTS, and they are the whole list:
     - **path-keyed liveness** (`CleanupService.referencedPaths`,
       `UploadService`'s reclaim/register probes) asks "does ANY row name
@@ -317,7 +333,7 @@ there would break that gate on every build.
       until retirement queues them;
     - **the retirement loop itself**, whose entire job is those rows;
     - **maintenance surfaces that count rows at NO snapshot** (the
-      hydrator, the gauges, the debt sampler, verify) filter on
+      hydrator, the gauges, the debt sampler) filter on
       `hog_table` rather than resolving visibility at a snapshot,
       because there is no snapshot to resolve at.
     TRUNCATE IS NOT COVERED. `CatalogService.truncateTable` is the one
@@ -950,7 +966,7 @@ ran on the local stack and what it showed.
   (`api/RequestDispatchIntegrationTest`), and any future change to
   request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, verify, retirement, metrics sampler)
+  expiry, cleanup, compaction, retirement, metrics sampler)
   registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
@@ -993,7 +1009,7 @@ ran on the local stack and what it showed.
     invariant 11) is the loop that deletes a dropped table's file rows
     and queues their objects.
     `HOGLAKE_RETIREMENT_INTERVAL_MS` is **0 = off** by default, the
-    position compaction and verify take and for a sharper reason: a
+    position compaction takes and for a sharper reason: a
     batch TAKES THE PER-CATALOG COMMIT LOCK, hundreds of times per run,
     so on an API replica it would tax the commit tail it serves. The
     chart turns it on for the maintenance Deployment alone. There is no
@@ -1023,9 +1039,10 @@ ran on the local stack and what it showed.
     ~1,030,000 undrained rows — about **631 MB** of `hog_file_removal`
     at 631 bytes per undrained row, not the ~315 MB the number alone
     suggests. Size storage against the doubled figure. A run the
-    ceiling stops STILL STAMPS `retirement_eligible_at` first, so
-    `/verify`'s orphans arm can report a wedged retirement instead of
-    it being silent; and `HOGLAKE_RETIREMENT_QUEUE_CEILING=0` with the
+    ceiling stops STILL STAMPS `retirement_eligible_at` first, so a
+    wedged retirement is dateable rather than silent — the reader was
+    `/verify`'s orphans arm and #261 removed it, so the column is
+    write-only until a scrubber replaces that check; and `HOGLAKE_RETIREMENT_QUEUE_CEILING=0` with the
     loop ON is REFUSED AT BOOT, because every run would skip forever
     with nothing saying so.
     THE ELAPSED TIME OF A LARGE RETIREMENT IS SET BY THE CLEANUP
@@ -1213,54 +1230,92 @@ ran on the local stack and what it showed.
   files bind columns by name; renaming would silently NULL their
   history in readers). `rename_table` is unaffected. Files registered
   with inline stats never pass through the hydrator, so only
-  deferred-stats files get checked — still a known gap: the verify
-  endpoint is metadata-only by design and can't do the S3 footer reads
-  this check needs.
-- **Maintenance verify — LANDED**: `POST
-  /v1/catalogs/{c}/maintenance/verify` — the
-  QE suite's global-invariant SQL as a metadata-only, read-only
-  endpoint (REPEATABLE READ MVCC snapshot, no catalog lock), and the
-  same code a background sweep runs. **Twelve** checks: row-id tiling
-  (explicit_row_ids-aware), DV uniqueness/monotonicity/bounds,
-  orphaned live rows on dropped tables, still-referenced removal-queue
-  entries, true snapshot density, next_row_id consistency,
-  expiry-floor (invariant 5, sharing ExpiryService's own floor clause),
-  versioned-row visibility bounds (invariant 6, over every versioned
-  table), superseded-offset release (#167, asking OffsetRepo's own
-  predicate), compaction staging tickets (#174), upload claims
-  (#162/#167) and compaction group claims (V15: a claim is an
-  optimization, never authorization, so a violation is redundant work
-  or a leaked row and never a wrong commit). Each check carries a
-  one-paragraph `description` of the invariant it enforces; counts are `count(*)` and samples are capped
-  at 20, trimmed round-robin so a composite check's noisiest class
-  cannot crowd out its siblings.
-  The LOOP is `HOGLAKE_VERIFY_INTERVAL_MS`, **default 0 = off** — like
-  compaction, turning it on is a per-workload ops decision, because an
-  aggregate pass over every catalog must not run on the replicas
-  serving the commit tail. A sweep publishes
-  `hoglake_verify_violations{catalog, check}` (MultiGauge, whole row
-  set, so a vanished catalog's series retire) and counts a catalog it
-  could not read in `hoglake_verify_errors_total{catalog}`; a manual
-  trigger publishes neither. A standing violation warns once per
-  distinct failing-check set, not once per sweep.
-  Every path-equality sub-query is registered in
-  `VerifyService.PATH_EQUALITY_QUERIES` and EXPLAINed against a
-  50k-file manifest (`VerifyQueryPlanIntegrationTest`): the aggregate
-  shapes there read whole relations by design, and `hog_file_removal`'s
-  path index (V16) covers only its UNDRAINED rows — so a query the
-  planner cannot flatten is quadratic and invisible on any
-  fixture-sized catalog. Since `hog_data_file` and `hog_delete_file`
-  carry `(catalog_id, path)` too (V17), a per-candidate index probe is a
-  plan the planner can now pick, and the rule is FOUR clauses rather
-  than "nothing runs twice": a repeated node must be an `Index Scan
-  using <index>`; it may repeat at most once per CANDIDATE (bounded by
-  the ledger + upload rows this catalog owns, counted, and the fixture
-  asserts that bound is below the manifest or it discriminates nothing);
-  each loop must cost a descent (EXPLAIN is asked for `BUFFERS`
-  explicitly — PG 18 emits them by default and 16/17 do not); and the
-  probe must not demote `path` to a `Filter`. A Nested Loop may still
-  never carry a sequential or bitmap scan of a manifest table on its
-  INNER side.
+  deferred-stats files get checked — still a known gap, and nothing
+  else covers it: the verify endpoint was metadata-only by design and
+  could not do the S3 footer reads this check needs, and #261 removed it
+  anyway.
+- **Maintenance verify — REMOVED (#261, 2026-10-01)**: `POST
+  /v1/catalogs/{c}/maintenance/verify`, its background loop
+  (`HOGLAKE_VERIFY_INTERVAL_MS`), its `hoglake_verify_violations` /
+  `hoglake_verify_errors_total` metrics, its console panel and its
+  twelve checks are gone, along with `VerifyService`,
+  `VerifyQueryPlanIntegrationTest` and `VerifySpecParityTest`.
+  WHY, and it is the Scale doctrine's own argument: a run was twelve
+  UNBOUNDED full-table checks in ONE REPEATABLE READ transaction. On
+  gigahog-prod-us (14M live `hog_data_file` rows, 371M
+  `hog_file_column_stats` rows) it crossed the 60 s `statement_timeout`
+  every run, so it was disabled there (`verifyIntervalMs: "0"`) and
+  proved nothing at the only scale that mattered — a checker that is
+  green because it never finished is worse than no checker. Every rule
+  in [Scale doctrine](#scale-doctrine-read-before-touching-a-query-a-loop-or-a-lock)
+  applied to it: no bound per run, no bound per transaction, no
+  per-row figure, a fixture of thousands against a manifest of
+  millions.
+  WHAT CAME WITH IT. `MaintenanceTask.VERIFY` STAYS in the enum
+  (`hasLoop = false`) and in the spec's `MaintenanceTask`, because
+  `hog_maintenance_run.task`'s CHECK (V2, frozen chain) still admits
+  `'verify'` and `MaintenanceRunStore.runMapper` errors on an unknown
+  task — deleting the value would 500 every unfiltered
+  `GET /maintenance/runs` for as long as one historical row survives
+  `HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS`. The spec's
+  `VerifyReport`/`VerifyCheck` schemas and the console's renderer for a
+  `verify` ledger row stay for the same reason, marked HISTORICAL; they
+  go once the retention window has passed everywhere.
+  `HOGLAKE_VERIFY_INTERVAL_MS` is in `Config.REMOVED_INTERVAL_ENV`, a
+  middle tier between `REMOVED_ENV` (any value refused) and ignoring a
+  knob: a POSITIVE value is refused at boot naming #261, while `0` and
+  absence are accepted in silence. `0` is what the gigahog chart renders
+  — unconditionally, from a REQUIRED `verifyIntervalMs`, with no override
+  anywhere under `argocd/gigahog/values/` — so a `REMOVED_ENV`-style
+  refusal would reject every pod over a value that means exactly what is
+  now true. (It would not take production down: the chart sets
+  `maxUnavailable: 0`, so the old ReplicaSet keeps serving and the
+  failure is a STALLED ROLLOUT plus a Degraded Application paging
+  `#alerts-managed-warehouse`, in dev only — prod is behind
+  `require_prod_approval` and the `prod-promote-managed-warehouse`
+  reviewer gate.) A positive value is refused because it is an operator
+  asking for invariant checks that no longer exist, and silence there
+  would leave them believing a catalog is being scrubbed.
+  `RemovedEnvConfigTest` pins both tiers; neither had a test before.
+  The entry graduates into `REMOVED_ENV` once the chart stops rendering
+  the key at all.
+  WHAT IS NOW UNWATCHED. All twelve checks are gone, and the list is
+  exhaustive rather than a sample: `row_id_tiling`, `delete_vectors`,
+  `orphans`, `removal_queue`, `snapshot_density`, `next_row_id`,
+  `expiry_floor`, `visibility_bounds`, `offset_release`,
+  `staging_tickets`, `upload_claims`, `compaction_claims`. THREE of those
+  twelve have another enforcer and their absence here is defensible:
+  `removal_queue` is enforced at drain time by
+  `CleanupService.referencedPaths` and its `still_referenced` counter;
+  `next_row_id` by the commit-path allocator that owns the column; and
+  `orphans`' retirement arm by the stamp + ledger counters in the
+  retirement bullet above. The other nine have no at-rest enforcer in any
+  environment. Four are now asserted in the TEST suite only, by
+  `testing/CatalogInvariants.kt`: `visibility_bounds`, `removal_queue` at
+  the compaction boundary, `snapshot_density` (all 8 concurrent-commit
+  sites in `CompactionParallelIntegrationTest`), and `staging_tickets`
+  arm (c) — rebuilt because they were the oracle's only falsifiable arms
+  at those call sites and nothing else covers them. The versioned-table
+  schema-drift guard that rode in the deleted verify test moved to
+  `ExpiryServiceIntegrationTest` (`VERSIONED_RETENTION_TABLES is every
+  versioned table the schema has`), where it never needed a verify symbol.
+  Three artefacts are now written and read only by tests, kept because
+  none can be reconstructed after the fact:
+  `hog_table.retirement_eligible_at` (no reader at all), and
+  `hog_file_removal`'s `'absent'` outcome plus the HEAD-before-DELETE
+  carve-out that produces it — read only by `CatalogInvariants`.
+  FOLLOW-UP TO DECIDE, not a standing property: that carve-out costs two
+  round trips per staging path, which is what forces
+  `CleanupService.STAGING_SUB_BATCH = 25` instead of the full sub-batch,
+  and at the ~9.4k orphaned tickets / 50 per hour that file records it is
+  an eight-day drain. Keep it for the scrubber or drop it and lose the
+  outcome forever — somebody has to choose. `HOGLAKE_CLEANUP_STAGING_GRACE
+  _SECONDS` also lost its only ceiling (verify's 6 h ticket age) and has
+  none today; a `require` bounding it against the cleanup interval would
+  restore it as code rather than prose.
+  The replacement is a PAGED, RESUMABLE SCRUBBER — one bounded page per
+  transaction, a cursor, a run budget, a per-row figure measured on a
+  production-shaped fixture — tracked as issue #261.
 - **DuckDB client (`duckdb-client/`)**: complete through time travel
   and maintenance functions, verified against the live dev stack, but
   NOT yet in CI and not yet released as of 2026-09-30 (four server

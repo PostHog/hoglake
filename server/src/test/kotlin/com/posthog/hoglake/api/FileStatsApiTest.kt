@@ -1139,7 +1139,8 @@ class FileStatsApiTest {
 
     /**
      * The statements one planScan issues, captured on an instrumented
-     * Jdbi over the same database (the pattern VerifySpecParityTest and
+     * Jdbi over the same database (the pattern
+     * ScanColumnStatsQueryPlanIntegrationTest and
      * CompactionPlanningIntegrationTest use).
      */
     private fun scanStatements(

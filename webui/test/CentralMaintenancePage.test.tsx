@@ -76,7 +76,12 @@ describe("CentralMaintenancePage", () => {
     // loop sweeping every ~69s (#114).
     const headerRow = screen.getAllByRole("row")[0];
     expect(within(headerRow).getByText(/every ~69s/)).toBeInTheDocument();
-    expect(within(headerRow).getByText(/manual only/)).toBeInTheDocument(); // verify
+    // #261 removed the verify subsystem, so the matrix has no column for it.
+    expect(within(headerRow).queryByText(/verify/)).not.toBeInTheDocument();
+    // "manual only" is the OLDER-SERVER rendering of `loop: null`, which
+    // scratch's expiry carries (see the fixture): a task with no loop at
+    // all, which no current build reports.
+    expect(within(headerRow).getByText(/manual only/)).toBeInTheDocument();
     // Retirement is a loop task on a pod that runs it off, exactly like
     // compaction: its column must report the sweeps the LEDGER saw, and
     // "scratch" having never run one must not blank the column.
@@ -176,7 +181,7 @@ describe("CentralMaintenancePage", () => {
     // A task the response DID carry still has its real cell, so the
     // tolerance branch is narrow rather than swallowing the whole row.
     expect(
-      screen.getAllByTitle("Metadata-only invariant scan; runs on demand"),
+      screen.getAllByTitle(/Files awaiting stats hydration/),
     ).toHaveLength(withoutCompaction.catalogs.length);
 
     // And the missing one degrades to a cell that says so, rather than

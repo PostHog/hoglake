@@ -34,7 +34,7 @@ import org.junit.jupiter.api.TestInstance
  * columns is a narrow one — and their product at the measured 106 bytes
  * per entry is 66 MB from a single GET, with nothing in the server
  * refusing it and nothing in the spec bounding it. Every other listing
- * has a ceiling (`/files` 10,000, `/snapshots` 100, verify samples 20).
+ * has a ceiling (`/files` 10,000, `/snapshots` 100).
  *
  * The fixture makes the two factors exactly controllable: a table of
  * [COLUMNS] columns, and files registered directly into the manifest so
