@@ -54,12 +54,38 @@ object CatalogInvariants {
      * identity row rather than a versioned row but carries the same shape
      * under other names (`created_snapshot` / `dropped_snapshot`).
      *
-     * The `end_snapshot <= begin_snapshot` disjunct is unfalsifiable
-     * today — every one of these tables carries
-     * `CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)` —
-     * and is kept deliberately rather than silently: the CHECK is what
-     * backs it, a migration that relaxed one would take the invariant
-     * with it, and this is the surface meant to notice.
+     * BOTH ENDS OF `[0, head]` ARE CHECKED, and the lower one is not
+     * decoration: snapshot ids are non-negative by construction
+     * (`last_snapshot_id` starts at 0 and the allocator only
+     * increments), so a negative id is a row written by something that
+     * bypassed the commit tail — direct SQL, a bad backfill, an overflow
+     * — and `x <= head` is true of every negative value, so the upper
+     * bound alone is blind to all of them. The KDoc promised `[0, head]`
+     * while the predicate enforced only `<= head`; Copilot caught that
+     * on #279.
+     *
+     * ONE LOWER BOUND PER TABLE SHAPE, not one per column, and the
+     * omissions are derivations rather than oversights:
+     *  - `end_snapshot < 0` is IMPLIED. Every versioned table carries
+     *    `CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)`,
+     *    so a negative end forces a negative begin under it, which the
+     *    `begin_snapshot < 0` arm catches. With `begin >= 0` a negative
+     *    end is not even INSERTable.
+     *  - `dropped_snapshot < 0` is IMPLIED too, by a different route:
+     *    `hog_table` has no such CHECK, but a negative dropped is either
+     *    below a non-negative created (the `dropped < created` arm) or
+     *    sits above a created that is itself negative (the
+     *    `created_snapshot < 0` arm).
+     * Both were in the first draft of this fix and were REMOVED after
+     * `CatalogInvariantsIntegrationTest` proved them unfalsifiable: a
+     * disjunct that cannot fire on its own is a claim of coverage that
+     * does not exist, and it would mislead the next person reading for
+     * what is actually enforced.
+     *
+     * `end_snapshot <= begin_snapshot` stays despite being unfalsifiable
+     * for a different reason: it is backed by a CHECK rather than by
+     * another arm here, so a migration that relaxed the CHECK would take
+     * the invariant with it and this is the surface meant to notice.
      */
     fun assertVisibilityBounds(
         jdbi: Jdbi,
@@ -74,7 +100,8 @@ object CatalogInvariants {
                         FROM $table x
                         JOIN hog_catalog c ON c.catalog_id = x.catalog_id
                         WHERE c.name = :cat
-                          AND (x.begin_snapshot > c.last_snapshot_id
+                          AND (x.begin_snapshot < 0
+                               OR x.begin_snapshot > c.last_snapshot_id
                                OR (x.end_snapshot IS NOT NULL
                                    AND (x.end_snapshot <= x.begin_snapshot
                                         OR x.end_snapshot > c.last_snapshot_id)))
@@ -91,7 +118,8 @@ object CatalogInvariants {
                         FROM hog_table t
                         JOIN hog_catalog c ON c.catalog_id = t.catalog_id
                         WHERE c.name = :cat
-                          AND (t.created_snapshot > c.last_snapshot_id
+                          AND (t.created_snapshot < 0
+                               OR t.created_snapshot > c.last_snapshot_id
                                OR (t.dropped_snapshot IS NOT NULL
                                    AND (t.dropped_snapshot < t.created_snapshot
                                         OR t.dropped_snapshot > c.last_snapshot_id)))

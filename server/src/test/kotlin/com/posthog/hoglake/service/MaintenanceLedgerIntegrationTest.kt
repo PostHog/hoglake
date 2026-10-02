@@ -585,9 +585,9 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(cleanupOnly.runs.map { it.task })
             .containsExactly(MaintenanceTask.CLEANUP)
         // `verify` is still a legal filter even though #261 removed the
-        // subsystem: the ledger keeps its historical rows for the
-        // retention window, so the value must parse rather than 422.
-        // This catalog has none.
+        // subsystem: the value must parse rather than 422. This catalog
+        // has no such row; `a LEGACY verify ledger row still decodes...`
+        // below is the one that proves a row actually comes back.
         assertThat(statusSvc.runs("led-runs", MaintenanceTask.VERIFY, before = null, limit = 10).runs)
             .isEmpty()
 
@@ -608,6 +608,118 @@ class MaintenanceLedgerIntegrationTest {
     }
 
     // ---- the instance-wide reads --------------------------------------------
+
+    /**
+     * The twelve-check report the removed `VerifyReport.forLedger()`
+     * wrote, byte-for-byte in shape: no `description` on any check
+     * (ledger rows dropped them — identical constant prose per row), the
+     * `status`/`catalog` rollup, and `violations` as a number.
+     *
+     * A real row from a dev catalog, trimmed to one sample so the
+     * literal stays readable. The check NAMES and their ORDER are the
+     * part that matters: they are what the spec's frozen `VerifyCheck`
+     * enum still lists.
+     */
+    private fun legacyVerifyReport(catalog: String) =
+        """
+        {"catalog":"$catalog","status":"fail","checks":[
+          {"check":"row_id_tiling","status":"pass","violations":0,"samples":[]},
+          {"check":"delete_vectors","status":"pass","violations":0,"samples":[]},
+          {"check":"orphans","status":"pass","violations":0,"samples":[]},
+          {"check":"removal_queue","status":"fail","violations":25,
+           "samples":["removal_id=7 path='s3://b/f0.parquet' queued but still live-referenced"]},
+          {"check":"snapshot_density","status":"pass","violations":0,"samples":[]},
+          {"check":"next_row_id","status":"pass","violations":0,"samples":[]},
+          {"check":"expiry_floor","status":"pass","violations":0,"samples":[]},
+          {"check":"visibility_bounds","status":"pass","violations":0,"samples":[]},
+          {"check":"offset_release","status":"pass","violations":0,"samples":[]},
+          {"check":"staging_tickets","status":"pass","violations":0,"samples":[]},
+          {"check":"upload_claims","status":"pass","violations":0,"samples":[]},
+          {"check":"compaction_claims","status":"pass","violations":0,"samples":[]}
+        ]}
+        """.trimIndent()
+
+    @Test
+    fun `a LEGACY verify ledger row still decodes, and comes back filtered AND unfiltered`() {
+        // WHY `MaintenanceTask.VERIFY` STAYS IN THE ENUM, asserted on a
+        // row rather than argued in a KDoc. #261 removed the subsystem,
+        // but `hog_maintenance_run.task`'s CHECK (V2, frozen chain) still
+        // admits 'verify' and the ledger HOLDS those rows for
+        // HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS — 7 days by
+        // default, longer wherever it is tuned up.
+        //
+        // `MaintenanceRunStore.runMapper` does `fromWire(...) ?: error(...)`,
+        // so dropping the enum value would not degrade one row: it would
+        // make every UNFILTERED `GET /maintenance/runs` throw for as long
+        // as one historical row survives, which is the console's main
+        // screen. That is the failure this pins.
+        //
+        // MUTATION: delete `VERIFY` from `MaintenanceTask` and this stops
+        // compiling; keep it but make `runMapper` skip unknown tasks and
+        // the unfiltered assertion reds. The pre-#279 version of this
+        // test only asserted that `?task=verify` was a legal FILTER on a
+        // catalog with no such row, which passes with no mapper work at
+        // all.
+        val catalogId = seedCatalog("led-legacy-verify")
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_maintenance_run
+                    (catalog_id, task, run_trigger, started_at, finished_at, status, result)
+                VALUES (:c, 'verify', 'manual', now(), now(), 'ok', CAST(:result AS jsonb))
+                """,
+            ).bind("c", catalogId).bind("result", legacyVerifyReport("led-legacy-verify")).execute()
+        }
+        // A second row of a LIVE task, so the unfiltered page has to
+        // decode both and the verify row cannot be the only thing there.
+        ExpiryService(jdbi).runOnce("led-legacy-verify", 10)
+
+        val statusSvc = statusSvc()
+
+        // 1. The FILTERED page returns it, which needs `fromWire` to
+        //    accept the wire value on the way IN as well as out.
+        val filtered = statusSvc.runs("led-legacy-verify", MaintenanceTask.VERIFY, before = null, limit = 10)
+        assertThat(filtered.runs).hasSize(1)
+        val run = filtered.runs.single()
+        assertThat(run.task).isEqualTo(MaintenanceTask.VERIFY)
+        assertThat(run.trigger).isEqualTo(MaintenanceTrigger.MANUAL)
+
+        // 2. The UNFILTERED page returns it beside the live task's row.
+        //    This is the one that throws if the enum loses the value.
+        val unfiltered = statusSvc.runs("led-legacy-verify", task = null, before = null, limit = 10)
+        assertThat(unfiltered.runs.map { it.task })
+            .describedAs("the historical row must not break the page every operator opens")
+            .containsExactlyInAnyOrder(MaintenanceTask.VERIFY, MaintenanceTask.EXPIRY)
+
+        // 3. And through the DTO/normalizer, which must hand a verify
+        //    payload back VERBATIM: `normalizeLedgerResult` has no arm
+        //    for the task, so nothing is injected into a shape no
+        //    current code writes.
+        val result = wireObjectMapper().valueToTree<JsonNode>(run.toDto())["result"]
+        assertThat(result["status"].asText()).isEqualTo("fail")
+        assertThat(result["checks"].map { it["check"].asText() })
+            .describedAs("all twelve checks, in the order the spec's frozen VerifyCheck enum lists")
+            .containsExactly(
+                "row_id_tiling", "delete_vectors", "orphans", "removal_queue",
+                "snapshot_density", "next_row_id", "expiry_floor", "visibility_bounds",
+                "offset_release", "staging_tickets", "upload_claims", "compaction_claims",
+            )
+        val failing = result["checks"].single { it["status"].asText() == "fail" }
+        assertThat(failing["check"].asText()).isEqualTo("removal_queue")
+        assertThat(failing["violations"].asLong())
+            .describedAs("the TRUE count survives the round trip, not the sample length")
+            .isEqualTo(25)
+        assertThat(failing["samples"]).hasSize(1)
+        assertThat(result["checks"]).allSatisfy {
+            assertThat(it.has("description"))
+                .describedAs("a ledger row never stored descriptions, and nothing may invent one")
+                .isFalse()
+        }
+        // Nothing was injected: a verify payload has exactly the keys it
+        // was written with.
+        assertThat(result.fieldNames().asSequence().toList())
+            .containsExactlyInAnyOrder("catalog", "status", "checks")
+    }
 
     private fun statusSvc() =
         MaintenanceStatusService(
