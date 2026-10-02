@@ -1716,12 +1716,18 @@ data class RetirementResult(
     val batches: Long,
     /**
      * Batches cancelled by their own `statement_timeout` and rolled
-     * back. Each one halves the batch size for that table for the rest
-     * of the run: a wide table's cascade fan-out is per ROW, so the
-     * right batch size is a property of the table, not of the config.
-     * A standing nonzero here means the configured batch is too big for
-     * some table in the catalog and the run is paying a rollback to
-     * find that out every time.
+     * back whole. The batch size is NOT changed in response (#263): the
+     * per-row cost is flat in the batch, so a cancelled batch was cold
+     * rather than big, and the table is simply left for the next run at
+     * the same size, its cancelled statement having warmed the pages it
+     * touched.
+     *
+     * So an occasional nonzero here is a cache miss, not a
+     * misconfiguration. The shape that needs a human is the SAME TABLE
+     * timing out run after run, which this per-run total cannot show
+     * and `hoglake_retirement_consecutive_timeouts{catalog,table}` is
+     * the series for. The remedy there is a smaller
+     * HOGLAKE_RETIREMENT_BATCH for that catalog.
      */
     val timeouts: Long,
     /**

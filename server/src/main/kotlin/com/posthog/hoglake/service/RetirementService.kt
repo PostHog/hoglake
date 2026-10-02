@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RetirementResult
 import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.observability.RetirementGauges
 import com.posthog.hoglake.persistence.CatalogRepo
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
@@ -66,8 +67,11 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * The TIME figure moves with the machine (19-24 us/row across runs
  * here); the WAL figure does not, because it is bytes rather than
  * scheduling. What the test ASSERTS, and what the design depends on, is
- * that both are FLAT in the batch size — a superlinear cost would make
- * the adaptive halving below useless.
+ * that both are FLAT IN THE BATCH SIZE — and that flatness is the whole
+ * reason this loop does NOT adapt its batch (see A CANCELLED BATCH IS A
+ * COLD BATCH below). A superlinear cost would make the configured batch
+ * a guess that has to be corrected at runtime; a flat one makes it a
+ * number an operator can set and keep.
  *
  * At gigahog-prod-us's `main.events_raw` (3,008,849 rows) that is
  * ~8.7 GB of WAL here and ~10.2 GB at the 3,389 B/row a second
@@ -99,10 +103,13 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * The only lever is HOGLAKE_CLEANUP_BATCH / _INTERVAL_MS.
  *
  * Those are the numbers an operator tunes against, and they are why the
- * batch is bounded in ROWS while the RUN is bounded in WALL CLOCK: the
+ * batch is bounded in ROWS while the RUN is bounded in WALL CLOCK. The
  * per-row cost is a property of the TABLE (a 200-column table has ~20x
- * the cascade per row), so a fixed row count cannot bound a hold on its
- * own — which is what the adaptive halving below is for.
+ * the cascade per row), so one row count cannot be the right hold for
+ * every schema — which is why the statement bound, not the row count,
+ * is what actually fences a hold, and why a catalog whose tables are
+ * that wide gets a smaller HOGLAKE_RETIREMENT_BATCH set by the operator
+ * who knows it rather than discovered by a rollback.
  *
  * THE FIVE THINGS THE COMMIT LOCK SERIALIZES A BATCH AGAINST, stated
  * because taking that lock at all is a deliberate act (AGENT.md: the
@@ -141,14 +148,67 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * one statement under half the window a foreground commit is willing to
  * queue for.
  *
- * ADAPTIVE, NEVER SPINNING. A batch cancelled by that bound rolls back
- * whole and halves the batch size FOR THAT TABLE for the rest of the
- * run, because "too big" is a fact about the table's cascade fan-out
- * and not about the config. A batch that selects rows and deletes none
- * ends the run for that table and is counted: the select and the
- * DELETEs name the same primary keys, so it cannot happen on a healthy
- * catalog, and the one thing a loop must never do about an impossible
- * state is repeat it.
+ * A CANCELLED BATCH IS A COLD BATCH, NOT A BIG ONE, and that is why
+ * this loop does not resize itself (#263). A batch the statement bound
+ * cancels rolls back whole; it is COUNTED (`timeouts`), logged with the
+ * table and the batch size, the table is left for the next run, and the
+ * next run asks for the SAME batch again.
+ *
+ * The reasoning, in the order it has to be read:
+ *
+ *  - the per-row cost is FLAT in the batch size, measured, above. So a
+ *    batch that crossed the bound did not cross it by being big: it
+ *    crossed it because its rows' pages, stats rows and partition
+ *    values were not in cache. Halving the batch halves the hold, which
+ *    is why the old code's halving appeared to work — but it also
+ *    halves the WORK, so it buys nothing per row and simply moves the
+ *    same cold pages into twice as many holds;
+ *  - the cancelled statement WARMED exactly the pages it touched. The
+ *    retry is the cheap case, not the expensive one, and it is the same
+ *    victim prefix: `VICTIM_SELECT_SQL` is "what is still live on this
+ *    dropped table", ordered by the live index, so the next run asks
+ *    for the rows this one just faulted in;
+ *  - and the old behaviour locked in a size chosen by THE WORST PAGE OF
+ *    THE NIGHT. On millpond-prod-us a 13.9M-row retirement walked from
+ *    8,000-row batches to 62 in its first cold hour and stayed there for
+ *    a day at ~4,700 rows per 60 s run (~280k rows/hour against the
+ *    ~15.8M/hour these defaults size for), the commit lock idle between
+ *    ~0.1 s holds. The maintenance pod was restarted at 18:04 UTC on
+ *    2026-10-02, configured at 1,000 by then: its first run retired
+ *    36,000 rows, and timeouts in the two runs after it had the batch
+ *    back at 62 by 18:19. A transient cost had become a permanent
+ *    setting, twice, and no ledger row or metric said so.
+ *
+ * NO RETRY INSIDE THE RUN EITHER, AND WHAT THAT COSTS. The table is
+ * finished for this run, not re-attempted at the same size a moment
+ * later, and the price is stated rather than hidden: AN INTERMITTENTLY
+ * COLD TABLE FORFEITS THE REST OF ONE RUN'S BUDGET PER TIMEOUT. On a
+ * catalog with one dropped table that is the whole run — up to
+ * HOGLAKE_RETIREMENT_RUN_BUDGET_MS of wall clock that retires nothing,
+ * recovered at the next interval. That is accepted. The alternative is
+ * code that re-attempts a batch in the hope that the cancelled
+ * statement left the pages warm, which on a busy RDS is a hope rather
+ * than a plan: the pages compete with the commit tail's working set,
+ * the retry takes the commit lock again inside the same second, and the
+ * loop would need its own backoff and attempt cap to stay bounded. A
+ * run that does nothing and a run that does nothing twice as slowly are
+ * the same incident; the next interval is the retry.
+ *
+ * WHAT NEEDS A HUMAN IS A TABLE THAT TIMES OUT RUN AFTER RUN, because
+ * that one is not cold — it is a table whose per-row cascade does not
+ * fit the bound at this batch, and the fix is
+ * HOGLAKE_RETIREMENT_BATCH, which an operator sets knowing the schema.
+ * That case is what
+ * [com.posthog.hoglake.observability.RetirementGauges] exists to alert
+ * on: a per-table gauge of CONSECUTIVE runs that timed out, which rises
+ * only while the condition holds and whose series RETIRES the moment
+ * the table makes progress. One cold batch is noise; three runs in a
+ * row is a knob.
+ *
+ * A batch that selects rows and deletes none ends the run for that
+ * table and is counted: the select and the DELETEs name the same
+ * primary keys, so it cannot happen on a healthy catalog, and the one
+ * thing a loop must never do about an impossible state is repeat it.
  *
  * SINGLE FLIGHT PER CATALOG. A second maintainer skips a catalog
  * another one is retiring rather than queueing behind its holds
@@ -174,6 +234,14 @@ class RetirementService(
     private val pauseMs: Long = DEFAULT_PAUSE_MS,
     private val runBudgetMs: Long = DEFAULT_RUN_BUDGET_MS,
     private val queueCeiling: Long = DEFAULT_QUEUE_CEILING,
+    /**
+     * Eligible tables one run reads and stamps; see [MAX_TABLES_PER_RUN]
+     * for the bound's argument. A PARAMETER only so a test can reach a
+     * FULL candidate page without seeding a thousand dropped tables —
+     * production always takes the default, and nothing in Config
+     * exposes it.
+     */
+    private val maxTablesPerRun: Int = MAX_TABLES_PER_RUN,
     private val commitLockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
     /**
      * Monotonic nanoseconds, injected so a test can spend the run
@@ -190,47 +258,12 @@ class RetirementService(
     /** The run ledger; records after the run resolves, never inside it. */
     private val runStore = MaintenanceRunStore(jdbi)
 
-    /**
-     * The batch size the adaptive halving SETTLED ON, per table,
-     * remembered across runs.
-     *
-     * Without this, `n` resets to [batchSize] at the top of every table
-     * of every run, so a wide table pays its whole halving sequence —
-     * each step a rolled-back transaction that held the commit lock for
-     * its full statement bound — EVERY RUN, forever. On a table that
-     * needs six halvings and takes fifty runs to drain, that is three
-     * hundred pointless holds.
-     *
-     * DELIBERATELY IN MEMORY, and deliberately not in the ledger or a
-     * column. It is a hint, not state: it is re-derived in at most a
-     * handful of rollbacks if it is missing, it is per-process so two
-     * maintainers do not have to agree on it, and persisting it would
-     * mean a schema change and a staleness question (a table whose
-     * schema narrowed should go back UP) for something the halving
-     * already answers. It RESETS ON RESTART, which costs one run's
-     * worth of rollbacks on the tables that need them.
-     *
-     * MONOTONE DOWN UNTIL RESTART. Nothing ever raises an entry: the
-     * halving writes it and only a DRAIN removes it, so a table whose
-     * per-row cost FELL — an `ALTER TABLE ... DROP COLUMN` that slims
-     * the stats cascade, a partition spec removed — keeps the small
-     * batch the wide schema earned until the process restarts. That is
-     * a throughput cost and never a correctness one, it is bounded by
-     * the deploy cadence, and the alternative (probing upward) would
-     * pay a rolled-back lock hold to discover the schema changed. If it
-     * ever matters, restart the maintenance pod.
-     *
-     * Keyed by (catalog, table). Bounded by the same thing the
-     * candidate query is: only eligible tables ever enter it, and an
-     * entry is removed when its table drains.
-     */
-    private val settledBatchSize = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, Int>()
-
     init {
         require(batchSize > 0) { "retirement batch size must be positive (got $batchSize)" }
         require(pauseMs >= 0) { "retirement pause must not be negative (got $pauseMs)" }
         require(runBudgetMs > 0) { "retirement run budget must be positive (got $runBudgetMs)" }
         require(queueCeiling >= 0) { "retirement queue ceiling must not be negative (got $queueCeiling)" }
+        require(maxTablesPerRun > 0) { "retirement tables per run must be positive (got $maxTablesPerRun)" }
     }
 
     /**
@@ -428,6 +461,51 @@ class RetirementService(
         // observation that the table BECAME retirable, which is true
         // whether or not this run got to it.
         val candidates = candidates(catalogId)
+        // THE CANDIDATE SET IS AUTHORITATIVE for the timeout gauge, and
+        // an EMPTY one is an answer rather than a no-op: a catalog with
+        // nothing eligible has no table that is timing out, so every
+        // series it had must retire. (`ExpiryGauges.retain`'s rule, for
+        // its reason — a gauge that keeps claiming a drained table is
+        // stuck is an alert nobody can close.) The runs with no answer
+        // are the ones that never got here: the single-flight skip and a
+        // catalog the sweep could not read.
+        //
+        // A FULL PAGE IS AUTHORITATIVE ONLY OVER ITS OWN PREFIX, which
+        // is the whole of the subtlety. `candidates` is `ORDER BY
+        // table_id LIMIT maxTablesPerRun`, so on a full page the
+        // eligible set continues past the last id it returned and
+        // pruning on the page alone would retire the series of a table
+        // that is still eligible and still failing — on exactly the
+        // catalog (a mass drop) where that matters most.
+        //
+        // But the page IS authoritative below its own ceiling: every id
+        // `<= max(candidate table_id)` that the page does not contain
+        // was offered to `ORDER BY table_id` and not returned, so it is
+        // provably no longer eligible. Pruning only there is what keeps
+        // a drained table's streak from outliving it: skipping the
+        // prune entirely (the first version of this) left a 3 published
+        // forever on a table nothing would ever clear, for as long as
+        // the pages stayed full.
+        //
+        // AND THE TABLES PAST THE CEILING ARE RECONCILED, which is the
+        // hole the ceiling alone leaves: one of them can be drained OUT
+        // OF BAND (a manual purge, another instance, a repair) while
+        // low ids keep the page full, so it never enters the prefix,
+        // never reaches a batch outcome, and its streak would be
+        // preserved on every run — a 3 alerting for work that no longer
+        // exists. [STILL_ELIGIBLE_SQL] asks about exactly those ids,
+        // one statement, PK-keyed, over the CURRENTLY-FAILING set (zero
+        // rows in the steady state, in which case it does not run at
+        // all).
+        val ceiling = if (candidates.size >= maxTablesPerRun) candidates.last().tableId else null
+        RetirementGauges.retain(
+            catalog,
+            candidates.map { it.tableId }.toSet(),
+            // Null on a short page: nothing is beyond the prefix, so
+            // the whole tracked set is in scope.
+            prefixCeiling = ceiling,
+            beyondCeilingStillEligible = { beyond -> stillEligible(catalogId, beyond) },
+        )
         if (candidates.isEmpty()) return RetirementResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         stampEligible(catalogId, candidates.map { it.tableId })
 
@@ -454,15 +532,22 @@ class RetirementService(
         var timeouts = 0L
         var stuck = 0L
         var convoyed = 0L
+        // Tables this run ENDED on a timeout. They are past `index` —
+        // the run moved on to the next table rather than retrying a
+        // cold one — but they are not FINISHED, so they belong in
+        // `tables_remaining` with the ones the budget never reached.
+        var timedOutTables = 0
         var index = 0
         while (index < candidates.size) {
             if (budgetSpent(started)) break
             val candidate = candidates[index]
-            val key = catalogId to candidate.tableId
-            // Start from what the last run discovered for THIS table,
-            // never from the configured batch: the rollbacks that found
-            // it are not worth paying twice.
-            var n = settledBatchSize[key] ?: batchSize
+            // EVERY BATCH, EVERY TABLE, EVERY RUN RUNS AT THE CONFIGURED
+            // SIZE. There is no per-table memory of a size discovered by
+            // a rollback: the per-row cost is flat in the batch, so a
+            // cancelled batch was cold rather than big, and the class
+            // KDoc has the prod-us run where the alternative pinned a
+            // 13.9M-row retirement at 62 rows for a day.
+            val n = batchSize
             var touched = false
             var done = false
             while (!done && !budgetSpent(started)) {
@@ -471,6 +556,15 @@ class RetirementService(
                         rows += outcome.rows
                         dvs += outcome.dvs
                         batches++
+                        // A COMMITTED BATCH ENDS THE TABLE'S TIMEOUT
+                        // STREAK, published once per table rather than
+                        // once per batch (the gauge republishes its
+                        // whole row set on every change). Whatever was
+                        // cold about the last run's attempt is warm
+                        // now, which is the normal outcome and the one
+                        // that must not leave an alerting series
+                        // behind.
+                        if (!touched) RetirementGauges.recovered(catalog, candidate.tableId)
                         touched = true
                         // THE DUTY CYCLE, and it is paid after EVERY
                         // committed batch including the last of a
@@ -488,43 +582,69 @@ class RetirementService(
                     }
 
                     BatchOutcome.Drained -> {
-                        // The table is finished: forget its remembered
-                        // size so a future incarnation of the same
-                        // table_id cannot inherit a bound discovered
-                        // for a different schema.
-                        settledBatchSize.remove(key)
+                        // The table is finished, and THIS ARM CAN BE THE
+                        // FIRST OUTCOME: the probe runs between the
+                        // candidate read and any committed batch, so a
+                        // table whose last rows went away in that window
+                        // (another maintainer, an operator's repair)
+                        // drains without ever reaching the Retired arm.
+                        // Its streak has to end here or it survives
+                        // until some later run's retain prunes it —
+                        // which on a catalog whose pages stay full is
+                        // not a bound anyone should rely on.
+                        RetirementGauges.recovered(catalog, candidate.tableId)
                         done = true
                     }
 
                     BatchOutcome.Timeout -> {
                         timeouts++
-                        val halved = maxOf(1, n / 2)
+                        // NO RESIZE, AND NO RETRY INSIDE THIS RUN. The
+                        // batch rolled back whole, the statement warmed
+                        // the pages it touched, and the next run asks
+                        // for the same rows at the same size — so the
+                        // cheapest thing this run can do is leave the
+                        // table alone and spend its budget on the next
+                        // one. Retrying here would hand the same cold
+                        // table a second hold within the same second;
+                        // halving, which is what this arm used to do,
+                        // bought a shorter hold by doing proportionally
+                        // less work (the cost is FLAT in the batch) and
+                        // then kept the smaller size forever.
+                        val streak = RetirementGauges.timedOut(catalog, candidate.tableId)
                         log.warn {
                             "retirement batch of $n rows on catalog '$catalog' table " +
                                 "${candidate.tableId} hit its ${callBoundMs}ms statement bound and " +
-                                "rolled back; halving to $halved for the rest of this run (a wide " +
-                                "table's per-row cascade is what this bound is measuring)"
+                                "rolled back; leaving the table for the next run at the same size " +
+                                "(a cancelled batch is a COLD batch — the per-row cost is flat in " +
+                                "the batch size, and this statement has warmed the pages it " +
+                                "touched). $streak consecutive run(s) have now timed out on this " +
+                                "table; a standing count means HOGLAKE_RETIREMENT_BATCH " +
+                                "($batchSize) is too large for this table's per-row cascade, " +
+                                "which is an operator's call and not this loop's"
                         }
-                        if (n == 1) {
-                            // One row that cannot be deleted inside the
-                            // bound is not a batch-size problem.
-                            done = true
-                        }
-                        n = halved
-                        settledBatchSize[key] = halved
+                        timedOutTables++
+                        done = true
                         // THE PAUSE IS PAID AFTER A TIMEOUT TOO. A
                         // rolled-back batch still HELD the lock for its
                         // whole statement bound before it was
-                        // cancelled, so retrying immediately turns a
-                        // halving sequence into a near-continuous hold
-                        // — the duty cycle is about the lock, and the
-                        // lock does not care whether the transaction
-                        // committed.
+                        // cancelled, so moving straight on to the next
+                        // table's first batch would turn two tables'
+                        // holds into one near-continuous one — the duty
+                        // cycle is about the lock, and the lock does not
+                        // care whether the transaction committed.
                         if (pauseMs > 0) sleep(pauseMs)
                     }
 
                     BatchOutcome.Stuck -> {
                         stuck++
+                        // ANY NON-TIMEOUT TERMINAL OUTCOME ENDS THE
+                        // STREAK, not only a committed batch. A table
+                        // that times out twice and then goes Stuck is
+                        // no longer failing on the statement bound, and
+                        // a gauge that kept republishing its 2 would be
+                        // alerting on the wrong fault forever while
+                        // `skipped_tables` carried the real one.
+                        RetirementGauges.recovered(catalog, candidate.tableId)
                         log.error {
                             "retirement batch on catalog '$catalog' table ${candidate.tableId} " +
                                 "selected rows and deleted none; ending the run for this table " +
@@ -536,6 +656,15 @@ class RetirementService(
                     }
 
                     BatchOutcome.NotEligible -> {
+                        // The Stuck arm's rule: the table did not fail
+                        // on its statement bound this run, so its
+                        // streak is over. (The floor read under the
+                        // lock excluding a table the candidate query
+                        // admitted needs an operator's repair to
+                        // happen at all, and if it does, "this table
+                        // keeps timing out" is not the thing to say
+                        // about it.)
+                        RetirementGauges.recovered(catalog, candidate.tableId)
                         log.debug {
                             "retirement skipped catalog '$catalog' table ${candidate.tableId}: the " +
                                 "floor read under the lock no longer covers drop snapshot " +
@@ -553,12 +682,15 @@ class RetirementService(
                         // COUNTED SEPARATELY from `timeouts`, because
                         // the two ask for opposite remedies. A timeout
                         // says the BATCH is too big for the table and
-                        // the answer is a smaller batch; a convoy says
-                        // somebody else holds the catalog's commit lock
-                        // and the answer is either to leave it alone or
-                        // to look at what is holding it. Summed into one
-                        // counter they would cancel each other out as a
-                        // signal.
+                        // the answer is a smaller batch (set by an
+                        // operator, after
+                        // `hoglake_retirement_consecutive_timeouts` has
+                        // shown the same table failing run after run);
+                        // a convoy says somebody else holds the
+                        // catalog's commit lock and the answer is either
+                        // to leave it alone or to look at what is
+                        // holding it. Summed into one counter they would
+                        // cancel each other out as a signal.
                         convoyed++
                         return tally(
                             tables + if (touched) 1 else 0,
@@ -568,7 +700,7 @@ class RetirementService(
                             timeouts,
                             stuck,
                             convoyed,
-                            remaining = candidates.size - index,
+                            remaining = candidates.size - index + timedOutTables,
                         )
                     }
                 }
@@ -583,7 +715,21 @@ class RetirementService(
             if (!done) break
             index++
         }
-        return tally(tables, rows, dvs, batches, timeouts, stuck, convoyed, remaining = candidates.size - index)
+        // A table the run ENDED ON A TIMEOUT is past `index` and still
+        // unfinished, so it is added back: `tables_remaining` means
+        // "eligible tables this run did not finish", and a cold table
+        // the run deliberately left for the next one is the clearest
+        // case of that there is.
+        return tally(
+            tables,
+            rows,
+            dvs,
+            batches,
+            timeouts,
+            stuck,
+            convoyed,
+            remaining = candidates.size - index + timedOutTables,
+        )
     }
 
     private fun tally(
@@ -609,6 +755,39 @@ class RetirementService(
         tablesRemaining = remaining.toLong().coerceAtLeast(0),
     )
 
+    /**
+     * Which of [tableIds] are STILL retirable, in one statement.
+     *
+     * Called only for the tracked ids a full candidate page never
+     * reached (see [STILL_ELIGIBLE_SQL] for why that set is small and
+     * why the predicate is shared with the candidate query rather than
+     * restated). It carries its own `statement_timeout` for the reason
+     * every statement on this path does — this one runs OUTSIDE the
+     * commit lock, so the bound is about the connection rather than
+     * about a hold, and a reconciliation that cannot finish must not
+     * become the thing that fails a sweep: on a throw the caller keeps
+     * the streaks it has, which is the same answer as "no information",
+     * and the next run tries again.
+     */
+    private fun stillEligible(
+        catalogId: Long,
+        tableIds: Set<Long>,
+    ): Set<Long> =
+        // A transaction, not a bare handle: `set_config(..., true)` is
+        // transaction-local, and in autocommit it would expire with its
+        // own SELECT, leaving the query under the session's bound.
+        jdbi.inTransactionUnchecked { h ->
+            h.createQuery("SELECT set_config('statement_timeout', ?, true)")
+                .bind(0, callBoundMs.toString())
+                .mapToMap()
+                .one()
+            h.createQuery(STILL_ELIGIBLE_SQL)
+                .bind("catalogId", catalogId)
+                .bindArray("tableIds", Long::class.javaObjectType, tableIds.toList())
+                .mapTo(Long::class.javaObjectType)
+                .set()
+        }
+
     private fun budgetSpent(started: Long): Boolean = (nanoTime() - started) / 1_000_000 >= runBudgetMs
 
     /**
@@ -628,7 +807,7 @@ class RetirementService(
         jdbi.withHandleUnchecked { h ->
             h.createQuery(CANDIDATE_SQL)
                 .bind("catalogId", catalogId)
-                .bind("limit", MAX_TABLES_PER_RUN)
+                .bind("limit", maxTablesPerRun)
                 .map { rs, _ -> Candidate(rs.getLong("table_id"), rs.getLong("dropped_snapshot")) }
                 .list()
         }
@@ -767,6 +946,13 @@ class RetirementService(
      */
     fun runOnceAllCatalogs(): List<Pair<String, RetirementResult>> {
         val names = jdbi.withHandleUnchecked { h -> CatalogRepo.listAll(h) }.map { it.name }
+        // THE ONE CALLER THAT KNOWS THE WHOLE SET, which is what
+        // retiring a DELETED catalog's timeout series needs: a
+        // per-catalog run can only prune tables, never the catalog
+        // itself, so without this a catalog dropped while one of its
+        // tables was failing would alert forever
+        // (`ExpiryGauges.retain(names)`, same argument, same shape).
+        RetirementGauges.retainCatalogs(names.toSet())
         val results = mutableListOf<Pair<String, RetirementResult>>()
         for (name in names) {
             try {
@@ -830,6 +1016,28 @@ class RetirementService(
         const val MAX_TABLES_PER_RUN = 1_000
 
         /**
+         * WHAT MAKES A DROPPED TABLE RETIRABLE, as one fragment shared
+         * by [CANDIDATE_SQL] and [STILL_ELIGIBLE_SQL] rather than
+         * written twice.
+         *
+         * The two statements ask the same question for opposite reasons
+         * — one finds work, the other confirms that remembered work
+         * still exists — and a copy would let them DISAGREE: a gauge
+         * pruned on a stricter predicate retires a series the loop is
+         * still working, and one pruned on a looser predicate keeps a
+         * series for a table the loop will never reach. It is bound to
+         * `t`/`c` (the candidate query's aliases) and to `:catalogId`.
+         */
+        private const val ELIGIBLE_PREDICATE: String =
+            """t.dropped_snapshot IS NOT NULL
+              AND t.dropped_snapshot <= c.earliest_snapshot_id
+              AND EXISTS (
+                  SELECT 1 FROM hog_data_file f
+                  WHERE f.catalog_id = t.catalog_id
+                    AND f.table_id = t.table_id
+                    AND f.end_snapshot IS NULL)"""
+
+        /**
          * The eligibility query, `internal` so a test can EXPLAIN the
          * SQL production runs rather than a lookalike.
          *
@@ -867,15 +1075,44 @@ class RetirementService(
             FROM hog_table t
             JOIN hog_catalog c ON c.catalog_id = t.catalog_id
             WHERE t.catalog_id = :catalogId
-              AND t.dropped_snapshot IS NOT NULL
-              AND t.dropped_snapshot <= c.earliest_snapshot_id
-              AND EXISTS (
-                  SELECT 1 FROM hog_data_file f
-                  WHERE f.catalog_id = t.catalog_id
-                    AND f.table_id = t.table_id
-                    AND f.end_snapshot IS NULL)
+              AND $ELIGIBLE_PREDICATE
             ORDER BY t.table_id
             LIMIT :limit
+            """
+
+        /**
+         * THE RECONCILIATION the timeout gauge needs for the tables a
+         * FULL candidate page never reached, `internal` for the plan
+         * test.
+         *
+         * A tracked table above the page's ceiling can be drained OUT OF
+         * BAND — a manual purge, another instance, an operator's repair
+         * — while lower ids keep the page full. It then never enters the
+         * prefix, never reaches a batch outcome, and the ceiling
+         * predicate in `RetirementGauges.retain` preserves its streak
+         * forever: a 3 alerting for work that no longer exists. This
+         * statement is what closes that: every tracked id past the
+         * ceiling that it does NOT return is gone.
+         *
+         * IT IS CHEAP BECAUSE OF WHAT THE ARRAY HOLDS. The ids are the
+         * CURRENTLY-FAILING tables of one catalog, not its tables: the
+         * steady state is zero (no rows, no statement — the caller
+         * skips it), and the ceiling is `maxTablesPerRun`, the same
+         * bound the candidate read already carries. Each id is one
+         * `hog_table` PK probe plus the `hog_data_file_live` descent the
+         * EXISTS needs — the same per-candidate cost
+         * [CANDIDATE_SQL] pays, for a strictly smaller set — and it is
+         * ONE statement rather than one per id, under the same
+         * transaction-local bound as everything else on this path.
+         */
+        internal const val STILL_ELIGIBLE_SQL: String =
+            """
+            SELECT t.table_id
+            FROM hog_table t
+            JOIN hog_catalog c ON c.catalog_id = t.catalog_id
+            WHERE t.catalog_id = :catalogId
+              AND t.table_id = ANY(:tableIds)
+              AND $ELIGIBLE_PREDICATE
             """
 
         /**

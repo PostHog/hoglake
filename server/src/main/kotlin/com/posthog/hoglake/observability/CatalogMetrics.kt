@@ -125,6 +125,264 @@ object ExpiryGauges {
 }
 
 /**
+ * `hoglake_retirement_consecutive_timeouts{catalog, table}` —
+ * CONSECUTIVE retirement runs that ended a table on its own statement
+ * bound, for the one failure this loop cannot fix for itself (#263).
+ *
+ * WHY A STREAK AND NOT A COUNT OF TIMEOUTS. One cancelled batch is a
+ * COLD batch: the per-row cost is flat in the batch size
+ * (`RetirementCostIntegrationTest`), so a batch that crossed the bound
+ * crossed it on cache misses, the cancelled statement warmed the pages
+ * it touched, and the next run's identical batch is the cheap case.
+ * `hoglake_retirement_timeouts_total` already counts those, and on a
+ * healthy instance it is meant to tick occasionally and mean nothing. A
+ * table that times out RUN AFTER RUN is the other thing: its per-row
+ * cascade does not fit the bound at HOGLAKE_RETIREMENT_BATCH, no amount
+ * of retrying will change that, and the fix is for an operator to lower
+ * the knob ON THE INSTANCE THAT RETIRES THAT CATALOG — it is
+ * process-wide rather than per catalog, so the lever is the maintenance
+ * workload's env and it applies to everything that pod retires. The
+ * streak is the only shape that
+ * separates the two, which is why retirement no longer resizes itself
+ * and publishes this instead.
+ *
+ * A GAUGE, AND A [MultiGauge], for the reason [ExpiryGauges] is one (and
+ * the removed verify gauge was — #261): a COUNTER's series never
+ * retires, so a table that recovered would keep its last nonzero
+ * forever — an alert nobody can close, on a table that is fine. Here a committed batch drops the row, `register(..., true)`
+ * replaces the whole set, and the series DISAPPEARS. An alert is
+ * therefore `hoglake_retirement_consecutive_timeouts >= 3` and needs no
+ * `for` clause to suppress one cold run (a one-run blip is `== 1`), and
+ * absence means "no table on this catalog is stuck", which is the
+ * steady state.
+ *
+ * CARDINALITY IS BOUNDED BY THE TABLES THAT ARE CURRENTLY FAILING, not
+ * by the catalog's tables: a row exists only between a table's first
+ * timeout and its next non-timeout outcome. A run's candidate set is
+ * capped at `RetirementService.MAX_TABLES_PER_RUN` (1,000) and [retain]
+ * prunes every key that is no longer eligible, so the worst case per
+ * catalog is 1,000 series — a mass drop where every dropped table times
+ * out — and the steady state is zero. There is deliberately no
+ * `table_name` label: the id is stable across a rename and is what the
+ * ledger row, the service's logs and `hog_table.retirement_eligible_at`
+ * all key on.
+ *
+ * [retain] PRUNES WITHIN THE PREFIX IT WAS GIVEN AND RECONCILES WHAT IS
+ * PAST IT, which is how a truncated candidate read is still usable: the
+ * query is `ORDER BY table_id LIMIT maxTablesPerRun`, so a full page
+ * proves everything below its last id and nothing above it. Tables
+ * below the ceiling that the page did not return lose their series;
+ * tables above it are re-checked for eligibility in one bounded
+ * statement, because a table drained OUT OF BAND up there would
+ * otherwise keep its streak forever.
+ *
+ * ONE WRITER, which is what makes the non-atomic read-modify-publish
+ * below sound. Retirement has no HTTP trigger (deliberately — a trigger
+ * reaches every replica), its loop is a single coroutine, and
+ * `runOnceAllCatalogs` walks catalogs SERIALLY, so every mutation here
+ * comes from one thread in one process. The map is a
+ * `ConcurrentHashMap` for the iteration in [publish] and for the
+ * scrape, NOT because two runs can interleave: if retirement ever gains
+ * a second concurrent driver, the snapshot-then-register below has to
+ * become one synchronized step or a published row set can lose a
+ * concurrent streak.
+ *
+ * IN MEMORY, like every streak. A restart forgets it and the first run
+ * after a restart republishes whatever still times out, which costs one
+ * run of alert latency on a condition that has by then persisted for
+ * however long the deploy took.
+ */
+object RetirementGauges {
+    /**
+     * The MultiGauge and the registry it belongs to, held as a pair for
+     * [ExpiryGauges]' reason: `Metrics.bind` can be called again (tests
+     * bind a fresh registry per case) and a MultiGauge registered
+     * against the old one would publish into a registry nothing
+     * scrapes.
+     */
+    @Volatile
+    private var bound: Pair<MeterRegistry, MultiGauge>? = null
+
+    /** (catalog, table id) -> consecutive runs that timed out on it. */
+    private val streaks = java.util.concurrent.ConcurrentHashMap<Pair<String, Long>, Long>()
+
+    private fun gauge(): MultiGauge? {
+        val registry = Metrics.boundRegistry ?: return null
+        bound?.let { (boundRegistry, gauge) -> if (boundRegistry === registry) return gauge }
+        val gauge =
+            MultiGauge.builder("hoglake_retirement_consecutive_timeouts")
+                .description(
+                    "Consecutive retirement runs that ended a dropped table on its statement " +
+                        "bound (absent = none; a standing value means HOGLAKE_RETIREMENT_BATCH " +
+                        "is too large for that table, and the knob is process-wide: lower it on " +
+                        "the instance that retires the catalog)",
+                )
+                .register(registry)
+        bound = registry to gauge
+        return gauge
+    }
+
+    /**
+     * Record that [tableId] on [catalog] ended a run on its statement
+     * bound, and return the streak INCLUDING this run — the number the
+     * caller logs, so the log and the series cannot disagree.
+     */
+    fun timedOut(
+        catalog: String,
+        tableId: Long,
+    ): Long {
+        val streak = streaks.merge(catalog to tableId, 1L) { a, b -> a + b }!!
+        publish()
+        return streak
+    }
+
+    /**
+     * Record that [tableId] reached a NON-TIMEOUT outcome — a committed
+     * batch, a drain (including the probe that finds the table already
+     * empty), a stuck table, a floor that no longer covers it: its
+     * streak is over and its series goes away.
+     *
+     * Any of those, not only progress. The gauge's claim is "this table
+     * keeps failing on its statement bound", and a table that failed
+     * some other way this run is not making that claim true; the other
+     * faults have their own counters (`skipped_tables`).
+     *
+     * A no-op, and NOT a republish, when there was no streak — which is
+     * the overwhelmingly common case (every table of every healthy run),
+     * and `register(..., true)` walks the whole row set.
+     */
+    fun recovered(
+        catalog: String,
+        tableId: Long,
+    ) {
+        if (streaks.remove(catalog to tableId) != null) publish()
+    }
+
+    /**
+     * Forget every table of [catalog] outside [tableIds] — the eligible
+     * set the run just read — WITHIN THE PREFIX THAT SET COVERS.
+     *
+     * A table that drained, or that stopped being eligible, cannot still
+     * be timing out; without this its row would be republished at its
+     * last value forever, which is `ExpiryGauges.retain`'s unclosable
+     * alert. AN EMPTY SET IS AUTHORITATIVE for the same reason it is
+     * there: a catalog with nothing eligible has nothing stuck. Only
+     * [catalog]'s keys are touched, because that is the only catalog
+     * this caller enumerated.
+     *
+     * [prefixCeiling] IS WHAT MAKES A TRUNCATED READ USABLE. The
+     * candidate query is `ORDER BY table_id LIMIT maxTablesPerRun`, so a
+     * FULL page is a prefix: it proves nothing about ids past its last
+     * one, but it proves everything below it — an id `<= prefixCeiling`
+     * that the page does not contain was offered to that ORDER BY and
+     * not returned, so it is no longer eligible. Pass the page's last
+     * table id on a full page and NULL on a short one (where the set is
+     * the whole eligible set and every tracked id is in scope).
+     *
+     * [beyondCeilingStillEligible] CLOSES THE REST, and the two guards
+     * are for two different mistakes, both found by review on #282:
+     *
+     *  - pruning on a full page alone retires a series for a table that
+     *    is still eligible and still failing (the first version);
+     *  - skipping the prune on a full page leaves a drained table's
+     *    streak with nothing that can ever clear it (the second);
+     *  - and the ceiling alone leaves a THIRD: a tracked table ABOVE the
+     *    ceiling, drained out of band while low ids keep the page full,
+     *    never enters the prefix and never reaches a batch outcome, so
+     *    its streak is preserved on every run — a 3 alerting for work
+     *    that no longer exists.
+     *
+     * So the ids past the ceiling are RECONCILED instead of assumed: the
+     * callback is handed exactly those ids and returns the subset that
+     * is still retirable, and everything it omits is pruned. It is
+     * called ONLY when there are such ids (never on a short page, never
+     * in the steady state where nothing is tracked), and it is one
+     * bounded statement over the currently-failing set — see
+     * `RetirementService.STILL_ELIGIBLE_SQL`. A callback that THROWS
+     * leaves those streaks alone: "no information" is not "gone", and
+     * the next run asks again.
+     */
+    fun retain(
+        catalog: String,
+        tableIds: Set<Long>,
+        prefixCeiling: Long? = null,
+        beyondCeilingStillEligible: ((Set<Long>) -> Set<Long>)? = null,
+    ) {
+        val mine = streaks.keys.filter { it.first == catalog }
+        val beyond =
+            if (prefixCeiling == null) {
+                emptySet()
+            } else {
+                mine.map { it.second }.filter { it > prefixCeiling && it !in tableIds }.toSet()
+            }
+        val stillEligible =
+            if (beyond.isEmpty() || beyondCeilingStillEligible == null) {
+                beyond
+            } else {
+                runCatching { beyondCeilingStillEligible(beyond) }.getOrElse { beyond }
+            }
+        val gone =
+            mine.filter { (_, tableId) ->
+                tableId !in tableIds &&
+                    (prefixCeiling == null || tableId <= prefixCeiling || tableId !in stillEligible)
+            }
+        if (gone.isEmpty()) return
+        gone.forEach { streaks.remove(it) }
+        publish()
+    }
+
+    /**
+     * Forget every catalog outside [catalogs] — the set the FLEET sweep
+     * just enumerated.
+     *
+     * [retain] can only prune TABLES of a catalog that still exists, so
+     * a catalog DELETED while one of its tables was failing would keep
+     * its row forever: nothing else enumerates catalogs, and a deleted
+     * one never gets another run. `ExpiryGauges.retain(names)` exists
+     * for the same hole, and an EMPTY set is authoritative here too — an
+     * instance with no catalogs has nothing stuck, and an early return
+     * on empty is what would republish the last deleted catalog's streak
+     * forever.
+     *
+     * Called by `runOnceAllCatalogs` alone. A single-catalog run must
+     * not call it: it knows one name and would retire every other
+     * catalog's series on the spot.
+     */
+    fun retainCatalogs(catalogs: Set<String>) {
+        val gone = streaks.keys.filterNot { it.first in catalogs }
+        if (gone.isEmpty()) return
+        gone.forEach { streaks.remove(it) }
+        publish()
+    }
+
+    /**
+     * Publish every streak this process holds. EVERY one, not just the
+     * key that changed: `register(..., true)` replaces the row set, so a
+     * one-row publish would delete the siblings and leave a series that
+     * flickered between tables.
+     *
+     * The snapshot and the register are not one atomic step; see the ONE
+     * WRITER paragraph above for why that is sound today and what has to
+     * change if it stops being.
+     */
+    private fun publish() {
+        val gauge = gauge() ?: return
+        gauge.register(
+            streaks.entries.map { (key, streak) ->
+                MultiGauge.Row.of(Tags.of("catalog", key.first, "table", key.second.toString()), streak)
+            },
+            true,
+        )
+    }
+
+    /** Forget the registry binding and the streaks (tests). */
+    fun clear() {
+        bound = null
+        streaks.clear()
+    }
+}
+
+/**
  * One catalog's live totals, as of the last metrics sample.
  *
  * Retained rather than recomputed: the sampler already produces these

@@ -372,15 +372,28 @@ object Metrics {
 
     /**
      * hoglake_retirement_timeouts_total{catalog} — batches rolled back
-     * by their OWN transaction-local statement bound. Each one halves
-     * the batch size for that table, and the size is remembered for
-     * the rest of the process's life, so a standing nonzero means new
-     * tables keep arriving that the configured batch is too big for —
-     * not that the same table is rediscovering it every run.
+     * by their OWN transaction-local statement bound.
      *
-     * The remedy is HOGLAKE_RETIREMENT_BATCH. Convoys are NOT counted
-     * here (see [retirementConvoyed]): they ask for the opposite
-     * remedy, and summing the two hides both.
+     * AN OCCASIONAL TICK HERE IS NOT A PROBLEM, and that is the whole
+     * reading of this series since #263. The per-row cost is flat in
+     * the batch size, so a cancelled batch was COLD, not big; the
+     * statement warmed the pages it touched, the table is left for the
+     * next run at the SAME size, and the retry is the cheap case. The
+     * loop no longer resizes anything in response — the batch is always
+     * HOGLAKE_RETIREMENT_BATCH.
+     *
+     * WHAT MATTERS IS WHETHER IT IS THE SAME TABLE EVERY RUN, which
+     * this counter cannot say and
+     * `hoglake_retirement_consecutive_timeouts{catalog,table}`
+     * ([com.posthog.hoglake.observability.RetirementGauges]) exists to:
+     * alert on that gauge, not on this rate. A standing streak there is
+     * a table whose per-row cascade does not fit the bound at the
+     * configured batch, and the remedy — a smaller
+     * HOGLAKE_RETIREMENT_BATCH on the instance that retires that
+     * catalog, the knob being process-wide — is an operator's call.
+     *
+     * Convoys are NOT counted here (see [retirementConvoyed]): they ask
+     * for a different remedy, and summing the two hides both.
      */
     fun retirementTimeouts(
         catalog: String,

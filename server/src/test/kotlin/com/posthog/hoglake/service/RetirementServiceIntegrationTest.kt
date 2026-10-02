@@ -11,13 +11,18 @@ import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RetirementResult
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.model.TableDeletes
+import com.posthog.hoglake.observability.Metrics
+import com.posthog.hoglake.observability.RetirementGauges
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.testing.PgTestSupport
+import io.micrometer.prometheusmetrics.PrometheusConfig
+import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
+import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
@@ -50,10 +55,21 @@ class RetirementServiceIntegrationTest {
     fun tearDown() = db.close()
 
     /**
-     * Rows for the adaptive-batch case. Enough that ONE statement over
-     * all of them cannot finish inside a 1 ms `statement_timeout` —
-     * which is what the case is about — and small enough to seed and
-     * delete in a second.
+     * `RetirementGauges` is a JVM-GLOBAL object, so a case that leaves a
+     * streak behind leaks it into every later case of every later class
+     * in the same fork — and the streak cases assert an EXACT row set.
+     * Clearing per case costs nothing and is what keeps them from
+     * depending on order. (The service instances are per case already;
+     * the gauge is the only shared state in this file.)
+     */
+    @AfterEach
+    fun clearGauges() = RetirementGauges.clear()
+
+    /**
+     * Rows for the case that drives the real statement bound. Enough
+     * that ONE statement over all of them cannot finish inside the 10 ms
+     * bound that case configures — which is the whole point of it — and
+     * small enough to seed and delete in a second.
      */
     private val bulkRows = 30_000
 
@@ -86,14 +102,18 @@ class RetirementServiceIntegrationTest {
         budgetMs: Long = 60_000,
         ceiling: Long = 500_000,
         commitLockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+        // Production's 1,000, lowered only by the case that needs a FULL
+        // candidate page to exist.
+        maxTablesPerRun: Int = RetirementService.MAX_TABLES_PER_RUN,
         // THE DEFAULT CLOCK IS BOUNDED, not frozen. 100 ms of virtual
         // time per budget check against the 60 s default budget stops
         // any loop at ~600 iterations — which every case here needs
         // three orders of magnitude fewer of, and which turns a
         // mutation that would SPIN (a `Stuck` that reports progress, a
-        // halving that never halves) into a failed assertion instead of
-        // a hung suite. A mutation nobody can re-run is a mutation
-        // nobody re-runs.
+        // Timeout arm that retries the same cold batch instead of
+        // leaving the table) into a failed assertion instead of a hung
+        // suite. A mutation nobody can re-run is a mutation nobody
+        // re-runs.
         clock: TestClock = TestClock(stepNanos = 100_000_000),
         sleeps: MutableList<Long> = mutableListOf(),
     ) = RetirementService(
@@ -105,6 +125,7 @@ class RetirementServiceIntegrationTest {
         pauseMs = 750,
         runBudgetMs = budgetMs,
         queueCeiling = ceiling,
+        maxTablesPerRun = maxTablesPerRun,
         commitLockTimeoutMs = commitLockTimeoutMs,
         nanoTime = { clock.next() },
         sleep = { sleeps += it },
@@ -252,6 +273,183 @@ class RetirementServiceIntegrationTest {
                     Triple(rs.getString("path"), rs.getString("file_kind"), rs.getString("reason"))
                 }
                 .list()
+        }
+
+    /**
+     * [n] extra live data files on the dropped table, seeded by SQL
+     * rather than by commits: a case about batch boundaries needs more
+     * rows than one batch can take, and thousands of round trips
+     * through the commit service would be suite time asserting nothing.
+     */
+    private fun bulkFiles(
+        catalog: String,
+        catalogId: Long,
+        n: Int,
+        table: String = "doomed",
+        idBase: Int = 900_000,
+    ) = jdbi.useHandleUnchecked { h ->
+        h.createUpdate(
+            """
+            INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
+                                       path, record_count, file_size_bytes, row_id_start)
+            SELECT :c, :idBase + g, (SELECT table_id FROM hog_table_version
+                                      WHERE catalog_id = :c AND name = :t
+                                        AND end_snapshot IS NULL),
+                   1, 's3://bucket/$catalog/' || :t || '/bulk-' || g || '.parquet', 1, 1,
+                   :idBase + g
+            FROM generate_series(1, :n) g
+            """,
+        ).bind("c", catalogId).bind("n", n).bind("t", table).bind("idBase", idBase).execute()
+    }
+
+    /**
+     * A catalog whose `doomed` table is dropped, eligible, and carries
+     * [rows] live file rows. [alsoDropKeeper] drops the neighbour too,
+     * so a case can watch the run MOVE ON from one table to the next.
+     */
+    private fun droppedWithRows(
+        catalog: String,
+        rows: Int,
+        alsoDropKeeper: Boolean = false,
+    ): Fixture {
+        val f = seed(catalog, files = 1)
+        bulkFiles(catalog, f.catalogId, rows - 1)
+        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        val last = if (alsoDropKeeper) catalogs.dropTable(catalog, "ns", "keeper").snapshotId else drop
+        setFloor(f.catalogId, last)
+        return f
+    }
+
+    /**
+     * One more dropped, eligible table, with a higher `table_id` than
+     * everything created before it — so a candidate page can be
+     * genuinely TRUNCATED (the eligible set continuing past the prefix)
+     * rather than merely reaching its limit exactly.
+     */
+    private fun extraDroppedTable(
+        catalog: String,
+        catalogId: Long,
+        name: String,
+        idBase: Int,
+    ): Long {
+        catalogs.createTable(catalog, "ns", name, listOf(ColumnDef("id", ColType.LONG, nullable = false)))
+        val tableId =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT table_id FROM hog_table_version WHERE catalog_id = :c AND name = :n",
+                ).bind("c", catalogId).bind("n", name).mapTo(Long::class.java).first()
+            }
+        bulkFiles(catalog, catalogId, 1, table = name, idBase = idBase)
+        val drop = catalogs.dropTable(catalog, "ns", name).snapshotId
+        setFloor(catalogId, drop)
+        return tableId
+    }
+
+    /** The neighbour's id, for the cases that depend on candidate ORDER. */
+    private fun keeperTableId(catalogId: Long): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                "SELECT table_id FROM hog_table_version WHERE catalog_id = :c AND name = 'keeper'",
+            ).bind("c", catalogId).mapTo(Long::class.java).first()
+        }
+
+    /** The dropped table's id — it outlives the drop, as hog_table rows do. */
+    private fun doomedTableId(catalogId: Long): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                "SELECT table_id FROM hog_table_version WHERE catalog_id = :c AND name = 'doomed'",
+            ).bind("c", catalogId).mapTo(Long::class.java).first()
+        }
+
+    /**
+     * The published consecutive-timeout streak for a catalog's tables,
+     * read off the registry the way an alert would — absent is a real
+     * answer and must be distinguishable from zero, so this returns a
+     * MAP rather than a number.
+     */
+    private fun streaks(
+        registry: PrometheusMeterRegistry,
+        catalog: String,
+    ): Map<String, Double> =
+        registry.find("hoglake_retirement_consecutive_timeouts").tag("catalog", catalog).gauges()
+            .associate { it.id.getTag("table")!! to it.value() }
+
+    /**
+     * Cancel the given batch ATTEMPTS of one catalog's retirement the
+     * way a cold page does — deterministically, with no sleeping, no
+     * six-figure fixture and no dependence on the machine's speed.
+     *
+     * THE ERROR IS THE REAL ONE. `RAISE ... USING ERRCODE = '57014'` is
+     * `query_canceled`, the exact SQLSTATE a `statement_timeout`
+     * cancellation carries, and `Pg.isQueryCanceled` is what the
+     * service reads to tell a cancelled batch from a bug. An injection
+     * that raised anything else would exercise the RETHROW path and
+     * prove nothing.
+     *
+     * WHY IT COUNTS ATTEMPTS RATHER THAN ROWS. An AFTER-STATEMENT
+     * trigger with a TRANSITION TABLE fires once per INSERT and can
+     * still see the rows, so it ignores the DV arm (which queues
+     * `delete`-kind paths) and every other case's catalog, and ticks
+     * exactly once per batch attempt. The tick is a `nextval`, the one
+     * counter in Postgres that a ROLLED-BACK transaction does not take
+     * back — which is what makes "cancel attempt 1" mean the first
+     * ATTEMPT rather than the first survivor, across runs.
+     *
+     * The timing-based alternative is `a cancelled batch is counted,
+     * the table is left for the next run, and the batch size is NOT
+     * changed`'s neighbour below: 30,000 rows against a 10 ms bound.
+     * That one proves the bound really fires on real work, which this
+     * cannot; this one pins WHICH attempt fails and therefore what the
+     * run AFTER it does, which is the whole of #263.
+     */
+    private fun cancelAttempts(
+        tag: String,
+        catalogId: Long,
+        attempts: List<Int>,
+    ) = jdbi.useHandleUnchecked { h ->
+        h.execute("CREATE SEQUENCE inject_$tag")
+        h.execute(
+            """
+            CREATE FUNCTION inject_$tag() RETURNS trigger LANGUAGE plpgsql AS $$
+            DECLARE k bigint;
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM queued
+                                WHERE catalog_id = $catalogId AND file_kind = 'data') THEN
+                    RETURN NULL;
+                END IF;
+                SELECT nextval('inject_$tag') INTO k;
+                IF k = ANY (ARRAY[${attempts.joinToString(",")}]) THEN
+                    RAISE EXCEPTION 'injected statement cancellation' USING ERRCODE = '57014';
+                END IF;
+                RETURN NULL;
+            END $$
+            """,
+        )
+        h.execute(
+            """
+            CREATE TRIGGER inject_$tag AFTER INSERT ON hog_file_removal
+            REFERENCING NEW TABLE AS queued
+            FOR EACH STATEMENT EXECUTE FUNCTION inject_$tag()
+            """,
+        )
+    }
+
+    /**
+     * Remove an injection, so no later case's catalog is affected.
+     *
+     * IF EXISTS ON ALL THREE, and the injection is created INSIDE each
+     * case's `try` for the same reason: [cancelAttempts] is three DDL
+     * statements, so a failure between the sequence and the trigger
+     * would otherwise leave a `finally` that throws on the missing
+     * object — and a teardown exception REPLACES the assertion error
+     * that sent us there, which is the failure mode that costs an hour
+     * reading the wrong stack trace.
+     */
+    private fun stopCancelling(tag: String) =
+        jdbi.useHandleUnchecked { h ->
+            h.execute("DROP TRIGGER IF EXISTS inject_$tag ON hog_file_removal")
+            h.execute("DROP FUNCTION IF EXISTS inject_$tag()")
+            h.execute("DROP SEQUENCE IF EXISTS inject_$tag")
         }
 
     // ---- the gate ----------------------------------------------------------
@@ -755,172 +953,552 @@ class RetirementServiceIntegrationTest {
     }
 
     @Test
-    fun `a batch too big for its table is halved rather than failing the run`() {
-        val catalog = "ret-adaptive"
+    fun `a cancelled batch is counted, the table is left for the next run, and the size is NOT changed`() {
+        // #263, and the case the whole change exists for. This arm used
+        // to HALVE the batch for the table and remember the halved size
+        // for the life of the process, which on millpond-prod-us walked
+        // a 13.9M-row retirement from 8,000-row batches to 62 in one
+        // cold hour and kept it there for a day — and did it again
+        // within fifteen minutes of a restart at a configured 1,000.
+        //
+        // The per-row cost is FLAT in the batch size
+        // (`RetirementCostIntegrationTest`), so halving bought a shorter
+        // hold by doing proportionally less work, and the cancelled
+        // statement had already warmed the pages the retry wants. So:
+        // count it, log it, leave the table, and ask for the SAME batch
+        // next run.
+        //
+        // MUTATION: put the halving back (`n = maxOf(1, n / 2)` with or
+        // without a remembered size) and this reds on the second run's
+        // batch count — 6 batches of 50 instead of 3 of 100.
+        val catalog = "ret-no-resize"
+        val f = droppedWithRows(catalog, rows = 300)
+        try {
+            cancelAttempts("noresize", f.catalogId, listOf(1))
+            val svc = service(batch = 100)
+            val first = svc.runOnce(catalog)
+            assertThat(first.timeouts)
+                .describedAs("the cancelled batch is counted ONCE: the run does not retry it")
+                .isEqualTo(1)
+            assertThat(first.batches).isZero()
+            assertThat(first.rowsRetired).isZero()
+            assertThat(liveFiles(f.catalogId))
+                .describedAs("the batch rolled back whole")
+                .isEqualTo(300)
+            assertThat(first.tablesRemaining)
+                .describedAs(
+                    "a table left for the next run is not a FINISHED table, so it is remaining " +
+                        "work — the reading that keeps a cold table out of the quiet branch",
+                )
+                .isEqualTo(1)
+
+            // The next run asks for the same rows at the same size, and
+            // the pages the cancelled statement warmed are the pages it
+            // wants: 300 rows at 100 is three batches, not six.
+            val second = svc.runOnce(catalog)
+            assertThat(second.batches)
+                .describedAs("300 rows in batches of the CONFIGURED 100; a halved size would be 6")
+                .isEqualTo(3)
+            assertThat(second.timeouts).isZero()
+            assertThat(second.rowsRetired).isEqualTo(300)
+            assertThat(liveFiles(f.catalogId)).isZero()
+            assertThat(queued(f.catalogId)).hasSize(300)
+        } finally {
+            stopCancelling("noresize")
+        }
+    }
+
+    @Test
+    fun `the statement bound fires on real work, and one cancelled batch ends the table for the run`() {
+        val catalog = "ret-real-bound"
         val f = seed(catalog, files = 1)
         // A manifest big enough that a whole-batch DELETE cannot finish
-        // inside a 1 ms bound, seeded by SQL rather than by commits: the
+        // inside the bound, seeded by SQL rather than by commits: the
         // point is the SIZE of one statement's work, and thirty thousand
         // round trips through the commit service would be a minute of
         // suite time asserting nothing.
-        jdbi.useHandleUnchecked { h ->
-            h.createUpdate(
-                """
-                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                                           path, record_count, file_size_bytes, row_id_start)
-                SELECT :c, 900000 + g, (SELECT table_id FROM hog_table_version
-                                         WHERE catalog_id = :c AND name = 'doomed'
-                                           AND end_snapshot IS NULL),
-                       1, 's3://bucket/$catalog/doomed/bulk-' || g || '.parquet', 1, 1, g
-                FROM generate_series(1, :n) g
-                """,
-            ).bind("c", f.catalogId).bind("n", bulkRows).execute()
-        }
+        bulkFiles(catalog, f.catalogId, bulkRows)
         val before = liveFiles(f.catalogId)
         assertThat(before).isEqualTo(bulkRows + 1L)
         val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
         setFloor(f.catalogId, drop)
 
-        // A 10 ms statement bound: admission 80 ms / 2 = 40, divided
-        // by BOUNDED_STATEMENTS_PER_BATCH. (It was written as 20 before
-        // the bound started being divided by the statement count, which
+        // A 10 ms statement bound: admission 80 ms / 2 = 40, divided by
+        // BOUNDED_STATEMENTS_PER_BATCH. (It was written as 20 before the
+        // bound started being divided by the statement count, which
         // silently made it 2 ms — near the noise floor, and the test
-        // went intermittent.) A
-        // 30,000-row DELETE with its FK cascades and its queue INSERT
-        // is ~600 ms at the per-row cost `RetirementCostIntegrationTest`
-        // measures, so it cannot finish inside it; halving reaches a
-        // size that can after about six steps. The bound is chosen to
-        // be comfortably above a SMALL batch's cost and comfortably
-        // below a large one's, so the case tests the adaptation rather
-        // than the machine's scheduler — a 1 ms bound is under the cost
-        // of a ONE-ROW batch too, and would make "it never fits" the
-        // outcome on a slow run.
+        // went intermittent.) A 30,000-row DELETE with its FK cascades
+        // and its queue INSERT is ~600 ms at the per-row cost
+        // `RetirementCostIntegrationTest` measures, so it cannot finish
+        // inside it.
         //
-        // The rollback is whole: "too big" is a fact about the table's
-        // cascade fan-out, not about the config.
+        // THE INJECTED-CANCELLATION CASES CANNOT PROVE THIS. A trigger
+        // raising 57014 proves what the service does with the
+        // exception; this proves that the bound fires on real work, on
+        // the real statements, with the real rollback — and that the
+        // loop neither spins on it nor needs its run budget to stop.
         //
-        // MUTATION: remove `n = halved` and this reds — every batch
-        // keeps timing out at the original size, the run retires
-        // nothing, and the only thing that ends it is the run budget.
-        // The clock advances 10 ms per budget check and the budget is
-        // 2 s, so the run is bounded at ~200 iterations WHATEVER the
-        // loop does. That is deliberate: without it, the mutation named
-        // below does not fail an assertion, it spins — and a mutation
-        // that hangs the suite is a mutation nobody re-runs.
-        val result =
+        // MUTATION: remove `done = true` from the Timeout arm and this
+        // reds — the table is retried inside the run until the budget
+        // (10 ms of virtual time per check against 2 s) stops it, ~200
+        // iterations of 10 ms holds, and `timeouts` is in the hundreds.
+        val svc =
             service(
                 batch = bulkRows,
                 budgetMs = 2_000,
                 commitLockTimeoutMs = 80,
                 clock = TestClock(stepNanos = 10_000_000),
-            ).runOnce(catalog)
+            )
+        val result = svc.runOnce(catalog)
         println(
-            "[#193] adaptive batch: started at $bulkRows rows against a 10ms statement bound, " +
-                "took ${result.timeouts} rolled-back batches to find a size that fits, then " +
-                "${result.batches} batches to retire ${result.rowsRetired} rows",
+            "[#263] bound fires on real work: a batch of $bulkRows rows against a " +
+                "${svc.callBoundMs}ms statement bound was cancelled ${result.timeouts} time(s), " +
+                "retired ${result.rowsRetired} rows, and left ${result.tablesRemaining} " +
+                "table(s) for the next run",
         )
         assertThat(result.timeouts)
-            .describedAs("the oversized batches are counted, not swallowed")
-            .isGreaterThan(0)
+            .describedAs("ONE cancelled batch, then the table is left — no retry, no spin")
+            .isEqualTo(1)
+        assertThat(result.rowsRetired).isZero()
         assertThat(liveFiles(f.catalogId))
-            .describedAs("halving made progress: fewer rows than it started with")
-            .isLessThan(before)
-        // Whatever was retired was retired PROPERLY — a rolled-back
-        // batch leaves no half-queued path behind, so the queue holds
-        // exactly what left the manifest.
-        assertThat(queued(f.catalogId).size.toLong())
-            .isEqualTo(before - liveFiles(f.catalogId))
+            .describedAs("the rollback is whole: nothing left the manifest")
+            .isEqualTo(before)
+        assertThat(queued(f.catalogId))
+            .describedAs("and nothing was queued — a rolled-back batch leaves no half-queued path")
+            .isEmpty()
+        assertThat(result.tablesRemaining).isEqualTo(1)
     }
 
     @Test
-    fun `a timed-out batch pauses too, and the size it settled on survives the run`() {
-        // TWO PROPERTIES OF THE SAME LOOP, and both are about the lock
-        // rather than about throughput.
+    fun `a cancelled batch pays the pause, and the run spends the rest of its budget on the next table`() {
+        // TWO PROPERTIES OF THE SAME ARM, and both are about the lock.
         //
         // A rolled-back batch still HELD the commit lock for its whole
-        // statement bound before it was cancelled, so retrying
-        // immediately turns a halving sequence into a near-continuous
-        // hold — the duty cycle is about the lock, and the lock does
-        // not care whether the transaction committed.
+        // statement bound before it was cancelled, so moving straight
+        // on to the next table's first batch would turn two tables'
+        // holds into one near-continuous one — the duty cycle is about
+        // the lock, and the lock does not care whether the transaction
+        // committed.
         //
-        // And `n` used to reset to the configured batch at the top of
-        // every table of every run, so a wide table paid its whole
-        // halving sequence — each step a rolled-back hold — EVERY RUN.
-        // The size the halving settled on is remembered per table for
-        // the life of the process.
-        val catalog = "ret-remember"
-        val f = seed(catalog, files = 1)
-        jdbi.useHandleUnchecked { h ->
-            h.createUpdate(
-                """
-                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                                           path, record_count, file_size_bytes, row_id_start)
-                SELECT :c, 900000 + g, (SELECT table_id FROM hog_table_version
-                                         WHERE catalog_id = :c AND name = 'doomed'
-                                           AND end_snapshot IS NULL),
-                       1, 's3://bucket/$catalog/doomed/bulk-' || g || '.parquet', 1, 1, g
-                FROM generate_series(1, :n) g
-                """,
-            ).bind("c", f.catalogId).bind("n", bulkRows).execute()
+        // And a cold table must not cost the catalog its whole run: the
+        // run leaves it and retires what it can elsewhere. `keeper` is
+        // dropped here too, so there IS an elsewhere.
+        val catalog = "ret-moves-on"
+        val f = droppedWithRows(catalog, rows = 300, alsoDropKeeper = true)
+        // THE NARRATIVE DEPENDS ON CANDIDATE ORDER. `CANDIDATE_SQL` is
+        // `ORDER BY t.table_id`, so "the cold table first, then the
+        // one it moved on to" is only what this case tests while
+        // `doomed` has the lower id — which it does because `seed`
+        // creates it first, and which is asserted rather than assumed
+        // so a fixture reordering cannot silently invert the case.
+        assertThat(doomedTableId(f.catalogId))
+            .describedAs("the cold table must be the FIRST candidate for this case to mean anything")
+            .isLessThan(keeperTableId(f.catalogId))
+        try {
+            cancelAttempts("moveson", f.catalogId, listOf(1))
+            val sleeps = mutableListOf<Long>()
+            val result = service(batch = 100, sleeps = sleeps).runOnce(catalog)
+            assertThat(result.timeouts).isEqualTo(1)
+            // MUTATION: remove the `sleep(pauseMs)` from the Timeout
+            // branch and this reds — the pause count drops to the
+            // committed batches alone, and a rolled-back hold runs back
+            // to back with the next table's.
+            assertThat(sleeps.size.toLong())
+                .describedAs(
+                    "every hold pauses, committed or rolled back: %d batches + %d timeouts",
+                    result.batches,
+                    result.timeouts,
+                )
+                .isEqualTo(result.batches + result.timeouts)
+            // `keeper` holds one file and is dropped: the run moved on
+            // to it and retired it.
+            assertThat(result.rowsRetired).isEqualTo(1)
+            assertThat(liveFiles(f.catalogId, "keeper")).isZero()
+            assertThat(liveFiles(f.catalogId))
+                .describedAs("the cold table is untouched, and left whole")
+                .isEqualTo(300)
+            assertThat(result.tables)
+                .describedAs("one table was retired from; the cold one was not")
+                .isEqualTo(1)
+            assertThat(result.tablesRemaining)
+                .describedAs("the cold table is remaining work even though the run passed it")
+                .isEqualTo(1)
+        } finally {
+            stopCancelling("moveson")
         }
-        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
-        setFloor(f.catalogId, drop)
+    }
 
-        val sleeps = mutableListOf<Long>()
-        // A budget of 500 ms at 10 ms of virtual time per check is ~50
-        // iterations: enough for the halving search plus real progress,
-        // and NOT enough to drain the table — which the second half of
-        // this case needs, and which the assertion below states so a
-        // future change that drains it all fails loudly instead of
-        // confusingly.
-        val svc =
-            service(
-                batch = bulkRows,
-                budgetMs = 500,
-                commitLockTimeoutMs = 80,
-                clock = TestClock(stepNanos = 10_000_000),
-                sleeps = sleeps,
-            )
-        val first = svc.runOnce(catalog)
-        assertThat(first.timeouts).isGreaterThan(0)
-        // MUTATION: remove the `sleep(pauseMs)` from the Timeout branch
-        // and this reds — the pause count drops to the committed
-        // batches alone, and the rolled-back holds run back to back.
-        assertThat(sleeps.size.toLong())
-            .describedAs(
-                "every hold pauses, committed or rolled back: %d batches + %d timeouts, %d pauses",
-                first.batches,
-                first.timeouts,
-                sleeps.size,
-            )
-            .isEqualTo(first.batches + first.timeouts)
+    @Test
+    fun `a table that times out run after run publishes a rising streak, and a committed batch retires it`() {
+        // THE ONE CASE THAT NEEDS A HUMAN, and the only reason this loop
+        // still has a per-table memory of anything. An occasional
+        // timeout is a cold batch and means nothing; the SAME table
+        // failing run after run is a table whose per-row cascade does
+        // not fit the bound at HOGLAKE_RETIREMENT_BATCH, which no retry
+        // can fix. `hoglake_retirement_timeouts_total` cannot tell the
+        // two apart — it is one number for the catalog — so the gauge
+        // is per table, and it RETIRES when the table recovers, which a
+        // counter could never do.
+        //
+        // MUTATION: remove the `RetirementGauges.recovered` call and the
+        // third run leaves a series at 2 — an alert nobody can close on
+        // a table that is fine. Remove the `timedOut` call and the first
+        // two runs publish nothing at all.
+        val catalog = "ret-streak"
+        val f = droppedWithRows(catalog, rows = 300)
+        val tableId = doomedTableId(f.catalogId).toString()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            cancelAttempts("streak", f.catalogId, listOf(1, 2))
+            val svc = service(batch = 100)
 
-        val leftBefore = liveFiles(f.catalogId)
-        assertThat(leftBefore)
-            .describedAs("the first run must leave work for the second, or there is nothing to assert")
-            .isGreaterThan(0)
+            assertThat(svc.runOnce(catalog).timeouts).isEqualTo(1)
+            assertThat(streaks(registry, catalog))
+                .describedAs("one cold run is a published 1, which is deliberately not an alert")
+                .isEqualTo(mapOf(tableId to 1.0))
 
-        // MUTATION: drop `settledBatchSize` and start from `batchSize`
-        // again, and this reds with a second round of timeouts.
-        val second = svc.runOnce(catalog)
-        assertThat(first.timeouts)
-            .describedAs("the first run must really have searched, or there is nothing to remember")
-            .isGreaterThan(1)
-        // FEWER, not zero. The remembered size is the one that worked
-        // last time, and a batch that fits in 10 ms on one run can
-        // exceed it on the next when the machine is busy — that is the
-        // adaptation doing its job, not a regression. What must not
-        // happen is the whole halving sequence being paid again.
-        assertThat(second.timeouts)
-            .describedAs(
-                "the second run starts from the size the first one settled on, so it repeats at " +
-                    "most a step of the search rather than all of it (first run: %d timeouts, " +
-                    "%d rows left for the second)",
-                first.timeouts,
-                leftBefore,
+            assertThat(svc.runOnce(catalog).timeouts).isEqualTo(1)
+            assertThat(streaks(registry, catalog))
+                .describedAs("consecutive, so it rises: this is the series an operator alerts on")
+                .isEqualTo(mapOf(tableId to 2.0))
+
+            val third = svc.runOnce(catalog)
+            assertThat(third.timeouts).isZero()
+            assertThat(third.rowsRetired).isEqualTo(300)
+            assertThat(streaks(registry, catalog))
+                .describedAs(
+                    "a committed batch ends the streak and the SERIES GOES AWAY — absence is " +
+                        "the healthy state, which is why this is a MultiGauge and not a counter",
+                )
+                .isEmpty()
+
+            // And a run with nothing eligible keeps it that way: the
+            // candidate set is authoritative, an empty one included.
+            assertThat(svc.runOnce(catalog).tables).isZero()
+            assertThat(streaks(registry, catalog)).isEmpty()
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+            stopCancelling("streak")
+        }
+    }
+
+    @Test
+    fun `a table that times out and then goes STUCK stops publishing a streak`() {
+        // ANY NON-TIMEOUT TERMINAL OUTCOME ENDS THE STREAK, not only a
+        // committed batch. Without that, a table that times out twice
+        // and then wedges on a swallowed DELETE republishes its 2
+        // forever: an alert pointing at HOGLAKE_RETIREMENT_BATCH while
+        // the actual fault is `skipped_tables`, which has its own
+        // counter and its own remedy.
+        //
+        // MUTATION: remove the `RetirementGauges.recovered` call from
+        // the Stuck arm and this reds — the series stays at 1 with
+        // nothing left that can clear it.
+        val catalog = "ret-streak-stuck"
+        val f = droppedWithRows(catalog, rows = 40)
+        val tableId = doomedTableId(f.catalogId).toString()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            cancelAttempts("stuckstreak", f.catalogId, listOf(1))
+            val svc = service(batch = 20)
+            assertThat(svc.runOnce(catalog).timeouts).isEqualTo(1)
+            assertThat(streaks(registry, catalog)).isEqualTo(mapOf(tableId to 1.0))
+
+            // The Stuck arm's fault injection, as its own case uses it:
+            // a BEFORE DELETE trigger that swallows the delete, so the
+            // victim select returns rows and the DELETE removes none.
+            jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "CREATE FUNCTION swallow_delete() RETURNS trigger AS " +
+                        "$$ BEGIN RETURN NULL; END $$ LANGUAGE plpgsql",
+                )
+                h.execute(
+                    "CREATE TRIGGER swallow_delete BEFORE DELETE ON hog_data_file " +
+                        "FOR EACH ROW EXECUTE FUNCTION swallow_delete()",
+                )
+            }
+            try {
+                val stuck = svc.runOnce(catalog)
+                assertThat(stuck.skippedTables)
+                    .describedAs("the run reports the real fault, which is not a timeout")
+                    .isEqualTo(1)
+                assertThat(stuck.timeouts).isZero()
+                assertThat(streaks(registry, catalog))
+                    .describedAs(
+                        "the table is no longer failing on its statement bound, so the series " +
+                            "that claims it is must go",
+                    )
+                    .isEmpty()
+            } finally {
+                jdbi.useHandleUnchecked { h ->
+                    h.execute("DROP TRIGGER IF EXISTS swallow_delete ON hog_data_file")
+                    h.execute("DROP FUNCTION IF EXISTS swallow_delete()")
+                }
+            }
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+            stopCancelling("stuckstreak")
+        }
+    }
+
+    @Test
+    fun `a table that stops being eligible loses its timeout series without ever committing a batch`() {
+        // THE LEAK A COUNTER CANNOT AVOID AND A GAUGE STILL CAN, so it
+        // is pinned: the streak ends on a committed batch, but a table
+        // can also simply stop being eligible — drained by an operator's
+        // repair, or by anything else that takes its live file rows
+        // away. Nothing then commits a batch for it, so without the
+        // candidate-set retain its row would be republished at its last
+        // value forever: an alert about a table that no longer exists,
+        // which is `ExpiryGauges.retain`'s unclosable alert.
+        //
+        // MUTATION: remove the `RetirementGauges.retain` call and this
+        // reds — the series stays at 1 with nothing left to clear it.
+        val catalog = "ret-streak-retain"
+        val f = droppedWithRows(catalog, rows = 20)
+        val tableId = doomedTableId(f.catalogId).toString()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            cancelAttempts("retain", f.catalogId, listOf(1))
+            val svc = service(batch = 10)
+            assertThat(svc.runOnce(catalog).timeouts).isEqualTo(1)
+            assertThat(streaks(registry, catalog)).isEqualTo(mapOf(tableId to 1.0))
+
+            // The rows go away without retirement doing it, which is
+            // what makes the table stop being a candidate.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_data_file WHERE catalog_id = :c")
+                    .bind("c", f.catalogId).execute()
+            }
+            val idle = svc.runOnce(catalog)
+            assertThat(idle.tables).isZero()
+            assertThat(streaks(registry, catalog))
+                .describedAs("the candidate set is authoritative, and an EMPTY one is an answer")
+                .isEmpty()
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+            stopCancelling("retain")
+        }
+    }
+
+    @Test
+    fun `a full candidate page still prunes within its own prefix, and keeps what is beyond it`() {
+        // COPILOT'S FINDING ON #282, and the one that needed a real
+        // regression test. The first version of this skipped pruning
+        // ENTIRELY on a full candidate page, on the correct observation
+        // that `ORDER BY table_id LIMIT n` says nothing about the ids
+        // past its last one. But it also says EVERYTHING about the ids
+        // below: a table the page did not return, below its ceiling, was
+        // offered to that ORDER BY and refused — it is gone. Skipping
+        // the prune left such a table's streak published with nothing
+        // that could ever clear it, for as long as the catalog's pages
+        // stayed full, which on the mass drop this guard was written for
+        // is indefinitely.
+        //
+        // The page is made full by lowering the bound rather than by
+        // seeding a thousand dropped tables: the property under test is
+        // `candidates.size >= maxTablesPerRun`, and 2 reaches it.
+        //
+        // MUTATION: go back to `if (candidates.size < maxTablesPerRun)`
+        // around the retain and this reds on the drained LOW table,
+        // whose series survives its own table. Drop the `prefixCeiling`
+        // term and it reds on the HIGH one instead, retired while it is
+        // still eligible and still failing.
+        val catalog = "ret-prefix-prune"
+        val f = droppedWithRows(catalog, rows = 20, alsoDropKeeper = true)
+        val low = doomedTableId(f.catalogId)
+        val high = keeperTableId(f.catalogId)
+        // FOUR eligible tables and a page of two, so the page is full,
+        // its ceiling is the SECOND id, and the fourth is genuinely
+        // beyond the prefix: low < high < beyond < farther.
+        val beyond = extraDroppedTable(catalog, f.catalogId, "beyond", 800_000)
+        val farther = extraDroppedTable(catalog, f.catalogId, "farther", 700_000)
+        assertThat(listOf(low, high, beyond, farther)).isSorted()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            // Two streaks by hand — the arm that earns them is tested
+            // elsewhere, and the subject here is the PRUNE: one on the
+            // low table (which will be drained out from under the run)
+            // and one on the table beyond the page's ceiling.
+            RetirementGauges.timedOut(catalog, low)
+            RetirementGauges.timedOut(catalog, farther)
+            assertThat(streaks(registry, catalog).keys)
+                .containsExactlyInAnyOrder(low.toString(), farther.toString())
+
+            // The low table loses its rows to something that is not
+            // retirement, so it drops out of the candidate set.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_data_file WHERE catalog_id = :c AND table_id = :t")
+                    .bind("c", f.catalogId).bind("t", low).execute()
+            }
+
+            // The page is [high, beyond] — `low` is no longer eligible —
+            // so its ceiling is `beyond` and `farther` is past it.
+            val result = service(batch = 100, maxTablesPerRun = 2).runOnce(catalog)
+            assertThat(result.tables)
+                .describedAs("the run worked the two tables its page did return")
+                .isEqualTo(2)
+            assertThat(streaks(registry, catalog).keys)
+                .describedAs(
+                    "%d is below the page's ceiling %d and provably gone, so its series goes; " +
+                        "%d is PAST the ceiling, never in scope, and keeps its streak",
+                    low,
+                    beyond,
+                    farther,
+                )
+                .containsExactly(farther.toString())
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+        }
+    }
+
+    @Test
+    fun `a tracked table drained out of band above the page ceiling is reconciled away`() {
+        // THE THIRD AND LAST SHAPE OF THIS BUG (#282, review pass 2).
+        // The ceiling makes a full page safe for the ids BELOW it, but
+        // a tracked table ABOVE it is in neither set: the page never
+        // reaches it, so it never gets a batch outcome, and the ceiling
+        // predicate preserves its streak. Drain it out of band — a
+        // manual purge, another instance, an operator's repair — and
+        // its 3 alerts forever for work that no longer exists.
+        //
+        // The page here never reaches either tracked table: three
+        // low-id eligible tables against `maxTablesPerRun = 2`, so the
+        // ceiling is always the second of them and both tracked ids are
+        // past it, run after run.
+        //
+        // MUTATION: drop `beyondCeilingStillEligible` (pass only the
+        // ceiling) and this reds on `drained`, whose series survives
+        // its rows. The same case also pins the OTHER direction: a
+        // reconciliation that pruned everything past the ceiling would
+        // red on `alive`.
+        val catalog = "ret-beyond-ceiling"
+        val f = droppedWithRows(catalog, rows = 4, alsoDropKeeper = true)
+        val third = extraDroppedTable(catalog, f.catalogId, "third", 600_000)
+        val drained = extraDroppedTable(catalog, f.catalogId, "drained", 610_000)
+        val alive = extraDroppedTable(catalog, f.catalogId, "alive", 620_000)
+        assertThat(listOf(doomedTableId(f.catalogId), keeperTableId(f.catalogId), third, drained, alive))
+            .describedAs("the two tracked tables must be the HIGHEST ids, past any page of two")
+            .isSorted()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            RetirementGauges.timedOut(catalog, drained)
+            RetirementGauges.timedOut(catalog, alive)
+            assertThat(streaks(registry, catalog).keys)
+                .containsExactlyInAnyOrder(drained.toString(), alive.toString())
+
+            // Out of band: nothing in this loop took these rows away.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_data_file WHERE catalog_id = :c AND table_id = :t")
+                    .bind("c", f.catalogId).bind("t", drained).execute()
+            }
+
+            val result = service(batch = 100, maxTablesPerRun = 2).runOnce(catalog)
+            assertThat(result.tables)
+                .describedAs("the run worked its page of two and never reached either tracked table")
+                .isEqualTo(2)
+            assertThat(streaks(registry, catalog).keys)
+                .describedAs(
+                    "%d is past the ceiling AND no longer eligible, so the recheck prunes it; " +
+                        "%d is past the ceiling and still eligible, so it keeps its streak",
+                    drained,
+                    alive,
+                )
+                .containsExactly(alive.toString())
+
+            // NOT asserted across a second run, deliberately: this run
+            // drained the two tables its page DID reach, so the next
+            // one's page reaches `alive` and clears its streak through
+            // the Retired arm — correct, and a different case.
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+        }
+    }
+
+    @Test
+    fun `a table whose rows vanish before the first batch drains on the probe and loses its streak`() {
+        // THE OTHER COPILOT FINDING. The Drained arm can be a table's
+        // FIRST outcome: the probe runs between the candidate read and
+        // any committed batch, so rows removed in that window take the
+        // table straight to Drained without ever reaching the Retired
+        // arm that used to be the only thing clearing a streak. The
+        // streak would then survive until some later run's retain
+        // happened to prune it — which on a catalog whose pages stay
+        // full is the bug above.
+        //
+        // THE RACE IS STAGED EXACTLY, not approximated. `stampEligible`
+        // is the one statement that runs AFTER the candidate read and
+        // BEFORE the first batch, so a trigger on its UPDATE fires
+        // inside the window the finding is about: the candidate query
+        // has already decided the table is eligible (its rows were live
+        // then), the retain has already run WITH the table in the set
+        // (so it cannot be what clears the streak), and the probe that
+        // follows finds nothing live. Deleting the rows before
+        // `runOnce` instead would take the table out of the candidate
+        // set and test the retain path, which is a different case and
+        // already covered.
+        //
+        // MUTATION: remove `RetirementGauges.recovered` from the Drained
+        // arm and this reds — the series outlives the table's rows.
+        val catalog = "ret-drain-probe"
+        val f = droppedWithRows(catalog, rows = 20)
+        val tableId = doomedTableId(f.catalogId)
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                CREATE FUNCTION drain_on_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    DELETE FROM hog_data_file
+                     WHERE catalog_id = NEW.catalog_id AND table_id = NEW.table_id;
+                    RETURN NULL;
+                END $$
+                """,
             )
-            .isLessThan(first.timeouts)
-        assertThat(second.rowsRetired).isGreaterThan(0)
+            h.execute(
+                "CREATE TRIGGER drain_on_stamp AFTER UPDATE OF retirement_eligible_at ON hog_table " +
+                    "FOR EACH ROW WHEN (NEW.catalog_id = ${f.catalogId}) " +
+                    "EXECUTE FUNCTION drain_on_stamp()",
+            )
+        }
+        try {
+            RetirementGauges.timedOut(catalog, tableId)
+            assertThat(streaks(registry, catalog)).isEqualTo(mapOf(tableId.toString() to 1.0))
+
+            val result = service(batch = 100).runOnce(catalog)
+            assertThat(result.batches)
+                .describedAs("nothing was retired: the probe found the table already empty")
+                .isZero()
+            assertThat(result.timeouts).isZero()
+            assertThat(liveFiles(f.catalogId)).isZero()
+            assertThat(streaks(registry, catalog))
+                .describedAs("a drain is a non-timeout terminal outcome, so the streak ends here")
+                .isEmpty()
+        } finally {
+            jdbi.useHandleUnchecked { h ->
+                h.execute("DROP TRIGGER IF EXISTS drain_on_stamp ON hog_table")
+                h.execute("DROP FUNCTION IF EXISTS drain_on_stamp()")
+            }
+            Metrics.clear()
+            RetirementGauges.clear()
+        }
     }
 
     @Test

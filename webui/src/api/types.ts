@@ -942,8 +942,11 @@ export interface RetirementResult {
   /** Batch transactions that committed; one hold of the commit lock each. */
   batches: Int64;
   /**
-   * Batches their own statement bound cancelled (each halves the batch size
-   * for that table), plus a run that gave up waiting for the commit lock.
+   * Batches their own statement bound cancelled and rolled back whole. The
+   * batch size is unchanged in response — a cancelled batch is a cold one,
+   * and the table is retried at the same size next run. A table that times
+   * out run after run shows up in
+   * hoglake_retirement_consecutive_timeouts{catalog,table}, not here.
    */
   timeouts: Int64;
   /** Tables whose batch selected rows and deleted none — impossible when healthy. */

@@ -30,8 +30,13 @@ import org.junit.jupiter.api.TestInstance
  *
  * It ASSERTS almost nothing, deliberately: a wall-clock bound in a test
  * suite is a flake on a busy machine. What it asserts is the SHAPE the
- * design depends on — that the cost is linear in the batch, so halving
- * the batch really halves the hold — and it prints the constants.
+ * design depends on — that the cost is LINEAR in the batch, so the
+ * per-row cost is FLAT in it — and it prints the constants. That
+ * flatness is load-bearing twice over: it is what makes
+ * HOGLAKE_RETIREMENT_BATCH a hold-length knob an operator can set, and
+ * it is the whole argument for why the loop does NOT resize itself on a
+ * timeout (#263 — a cancelled batch is cold, not big, and halving it
+ * would halve the work with the hold).
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -238,6 +243,22 @@ class RetirementCostIntegrationTest {
 
     @Test
     fun `a batch's cost is linear in its size, and here is the per-row constant`() {
+        // ONE DISCARDED WARM-UP BATCH, and it is the difference between
+        // a test that measures the code and one that measures the first
+        // batch's cache misses. The fixture is seeded, VACUUMed and
+        // CHECKPOINTed and then never read, so the FIRST measured batch
+        // pays every miss the later ones do not: observed 30.0, 19.8,
+        // 19.0 us/row across 2,000/4,000/8,000 — monotonically
+        // DECREASING, a 1.58x spread, and the two-sided 1.5x bound
+        // below red about one run in seven. The cost being measured is
+        // the per-row cascade, not the buffer cache, and the batch the
+        // warm-up runs is `BATCHES.first()` so the smallest measured
+        // batch is the one whose pages are already touched.
+        //
+        // It is DISCARDED rather than reported, because a warm-up's
+        // number is not a measurement of anything: averaging it in
+        // would put the cold miss back into the figure the KDoc quotes.
+        oneBatch(BATCHES.first())
         val costs = BATCHES.map { oneBatch(it) }
         for (c in costs) {
             println(
@@ -256,10 +277,14 @@ class RetirementCostIntegrationTest {
         )
 
         // LINEARITY is what the design leans on: the batch size is a
-        // HOLD LENGTH knob, and halving it on a timeout only helps if
-        // the cost really is per-row. A superlinear cost (a plan that
-        // degrades with the array size, a cascade that rescans) would
-        // make the adaptive halving useless and the default unsafe.
+        // HOLD LENGTH knob, and the per-row cost being flat in it is
+        // what says a cancelled batch was COLD rather than too big —
+        // which is why a timeout is counted and retried at the same
+        // size instead of halved (#263). A superlinear cost (a plan
+        // that degrades with the array size, a cascade that rescans)
+        // would break that reading and make the default unsafe: the
+        // batch would genuinely be the problem, and the knob would have
+        // to come down.
         //
         // THE BOUND IS TIGHTER THAN THE RANGE IT SPANS, which is the
         // only way it discriminates. The batch sizes span 4x, so a
@@ -331,6 +356,9 @@ class RetirementCostIntegrationTest {
         assertThat(remaining.third)
             .describedAs("and its partition values")
             .isEqualTo(remaining.first * PARTITION_VALUES_PER_FILE)
-        assertThat(remaining.first).isLessThanOrEqualTo(FILES - BATCHES.sum().toLong())
+        // `+ BATCHES.first()` for the linearity case's discarded
+        // warm-up batch, which consumes rows like any other.
+        assertThat(remaining.first)
+            .isLessThanOrEqualTo(FILES - BATCHES.sum().toLong() - BATCHES.first().toLong())
     }
 }

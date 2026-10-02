@@ -194,9 +194,11 @@ data class Config(
      * plus its cascade, so a 200-column table costs several times a
      * 25-column one per row. That is why this is a STARTING size rather
      * than a promise: a page that hits its statement bound is HALVED and
-     * retried within the same run (`ExpiryService.walk`, the shape
-     * `RetirementService` uses), down to a page of one, and the halvings
-     * are counted in `hoglake_expiry_halvings_total{phase="purge"}`. A
+     * retried within the same run (`ExpiryService.walk`), down to a page
+     * of one, and the halvings are counted in
+     * `hoglake_expiry_halvings_total{phase="purge"}`. Retirement, whose
+     * batch walk is otherwise this shape, deliberately does NOT do this
+     * (#263) — see Config.retirementBatch. A
      * standing rate on that series means this value is too large for the
      * tables the purge is meeting; `hoglake_expiry_purge_failures_total`
      * means even a page of one could not finish, which is not a page-size
@@ -530,8 +532,18 @@ data class Config(
      * The cost per row is NOT a constant of the code: it is the row
      * plus its cascade — the per-column stats rows and the partition
      * values — so a 200-column table costs ~20x a narrow one per row.
-     * That is why a batch that hits its statement bound halves this for
-     * the table that did it rather than failing the run.
+     * It is also FLAT IN THIS NUMBER (`RetirementCostIntegrationTest`),
+     * which is why the loop does not adapt it: a batch that hits its
+     * statement bound rolls back, is counted, and is retried at this
+     * same size by the next run, because a cancelled batch is a COLD
+     * one and halving it would halve the work with it. The case this
+     * value is wrong for — one table failing run after run — is
+     * reported by
+     * `hoglake_retirement_consecutive_timeouts{catalog,table}` and
+     * fixed by lowering this knob ON THE INSTANCE THAT RETIRES THAT
+     * CATALOG — it is process-wide, so the lever is the maintenance
+     * workload's env and it applies to every catalog that pod retires
+     * (#263).
      *
      * At 3,008,849 rows (gigahog-prod-us `main.events_raw`) these
      * defaults are ~376 batches and ~8.7 GB of WAL in total (2,902

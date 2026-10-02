@@ -4789,13 +4789,15 @@ components:
           format: int64
           description: >
             Batches cancelled by their own transaction-local
-            statement_timeout and rolled back whole, plus a run that
-            gave up waiting for the commit lock. Each cancelled batch
-            halves the batch size for that table for the rest of the
-            run: the per-row cost is the row plus its cascade, so a wide
-            table's right batch size is a property of the table. A
-            standing nonzero means HOGLAKE_RETIREMENT_BATCH is too big
-            for some table here.
+            statement_timeout and rolled back whole. The batch size is
+            not changed in response: the per-row cost is flat in the
+            batch size, so a cancelled batch was COLD rather than big,
+            and the table is left for the next run at the same size with
+            its pages now warm. An occasional nonzero is a cache miss. A
+            table that times out run after run is the case that needs a
+            smaller HOGLAKE_RETIREMENT_BATCH, and the series that shows
+            it is hoglake_retirement_consecutive_timeouts{catalog,table}
+            rather than this per-run total.
         skipped_tables:
           type: integer
           format: int64
