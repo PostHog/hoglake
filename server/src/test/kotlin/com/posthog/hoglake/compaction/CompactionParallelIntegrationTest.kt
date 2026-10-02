@@ -492,7 +492,7 @@ class CompactionParallelIntegrationTest {
             pool.shutdownNow()
             blocking.close()
         }
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     @Test
