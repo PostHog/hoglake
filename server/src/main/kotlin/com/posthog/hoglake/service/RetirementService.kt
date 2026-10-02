@@ -773,7 +773,10 @@ class RetirementService(
         catalogId: Long,
         tableIds: Set<Long>,
     ): Set<Long> =
-        jdbi.withHandleUnchecked { h ->
+        // A transaction, not a bare handle: `set_config(..., true)` is
+        // transaction-local, and in autocommit it would expire with its
+        // own SELECT, leaving the query under the session's bound.
+        jdbi.inTransactionUnchecked { h ->
             h.createQuery("SELECT set_config('statement_timeout', ?, true)")
                 .bind(0, callBoundMs.toString())
                 .mapToMap()
