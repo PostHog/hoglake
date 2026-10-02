@@ -208,14 +208,10 @@ data class CompactionConfig(
      * How long a group claim is held before any maintainer may reclaim
      * it (`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS`).
      *
-     * This is a LEASE LENGTH, so it is bounded below by the longest
-     * rewrite that should still be protected and above by how long a
-     * dead maintainer's files stay untouchable. 900 s covers a
-     * worst-case 64-file group by two orders of magnitude while keeping
-     * the cost of a killed pod to fifteen minutes on the files it held.
-     * Nothing breaks if it is wrong in either direction: too short means
-     * two replicas may duplicate a rewrite (today's behaviour), too long
-     * means a dead claim delays one group.
+     * The lease covers queue time and execution for the entire plan.
+     * The default is one hour. Set a longer lease if a full run can
+     * exceed one hour. A dead worker delays its queued groups until expiry.
+     * Each group refreshes its own lease before execution.
      */
     val claimTtlSeconds: Long = DEFAULT_CLAIM_TTL_SECONDS,
     /**
@@ -239,7 +235,7 @@ data class CompactionConfig(
      * at an expired claim and spend the rewrite anyway.
      *
      * 600 s covers that sweep with margin and stays inside the default
-     * [claimTtlSeconds] of 900.
+     * [claimTtlSeconds] of 3600.
      *
      * # What it costs
      *
@@ -769,13 +765,13 @@ data class CompactionConfig(
          */
         const val DEFAULT_PARALLEL_GROUPS = 1
 
-        /** See [claimTtlSeconds]: fifteen minutes of lease. */
-        const val DEFAULT_CLAIM_TTL_SECONDS = 900L
+        /** See [claimTtlSeconds]: one hour for the full queue. */
+        const val DEFAULT_CLAIM_TTL_SECONDS = 3600L
 
         /**
          * See [committedClaimTtlSeconds]: ten minutes, which covers a
          * full 64-group sweep (~544 s at the measured 8.5 s a group)
-         * with margin and stays inside the 900 s rewrite lease. The
+         * with margin and stays inside the full rewrite lease. The
          * quantity it has to cover is the AGE OF A SIBLING'S PLAN, which
          * is one sweep — not one sweep interval.
          */
@@ -1059,19 +1055,6 @@ class CompactionService(
     private val runStore = MaintenanceRunStore(jdbi)
 
     /**
-     * This process's identity on the group claims it takes
-     * (`hog_compaction_claim.claimant`).
-     *
-     * Per SERVICE INSTANCE, minted once, not per sweep and not per
-     * group: it exists so a release can only delete a claim this process
-     * still holds, and so a reclaimed-then-released claim cannot be
-     * deleted out from under the maintainer that reclaimed it. Nothing
-     * reads it as an address — there is no protocol between maintainers
-     * beyond the row and its expiry.
-     */
-    private val instanceId: UUID = UUID.randomUUID()
-
-    /**
      * Last heap-refusal picture per table, so a permanent condition is
      * logged when it CHANGES rather than on every sweep. One short string
      * per table that has ever been refused; the planner is the only
@@ -1145,9 +1128,8 @@ class CompactionService(
      * the statement AFTER it with `FATAL: terminating connection due to
      * idle-in-transaction timeout`.
      *
-     * The property that prevents it is structural: NO CONNECTION IS HELD
-     * ACROSS THE PACKING. A structural property needs a test that fails
-     * without it, and the only way to write one is to make the packing
+     * No transaction remains open across packing. Execution plans hold
+     * one idle connection for the session advisory lock. The test makes packing
      * take longer than the session's idle bound — hence a seam rather
      * than a sleep in production code. Default is a no-op, called
      * exactly once per table plan, and nothing but a test ever sets it.
@@ -1196,8 +1178,8 @@ class CompactionService(
     ): CompactionPlan = planSnapshot(catalog, namespace, table, cfg).plan
 
     /**
-     * Plan one table in THREE phases, of which only the first and third
-     * hold a database connection.
+     * Plan one table in three phases on one connection. No transaction
+     * remains open across packing. Execution plans also hold a session lock.
      *
      * # Why it is split, and what each phase may do
      *
@@ -1218,7 +1200,7 @@ class CompactionService(
      *    spec that decides whether there is a row ceiling at all, and
      *    the files. That invariant is why this phase is a transaction
      *    and not three autocommit reads.
-     *  - **(b) PACK**, with no connection at all: bin packing, the row
+     *  - **(b) PACK**, outside a transaction: bin packing, the row
      *    ceiling, the WARN. Pure CPU over the rows phase (a) returned.
      *  - **(c) CLAIM READ**, one short autocommit read: which of this
      *    table's files another maintainer is already rewriting.
@@ -1255,12 +1237,20 @@ class CompactionService(
         namespace: String,
         table: String,
         cfg: CompactionConfig,
+    ): PlanWithContext = jdbi.withHandleUnchecked { h -> planSnapshot(h, catalog, namespace, table, cfg) }
+
+    private fun planSnapshot(
+        h: Handle,
+        catalog: String,
+        namespace: String,
+        table: String,
+        cfg: CompactionConfig,
     ): PlanWithContext {
         val startedAt = System.nanoTime()
         // (a) One short read transaction: the table's identity, its
         // shape, and its candidate rows, all on one MVCC snapshot.
         val fetched =
-            jdbi.inTransactionUnchecked { h ->
+            h.inTransaction<CandidateFetch, Exception> {
                 h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
                 // A BOUND TIGHTER THAN THE SESSION'S, because the
                 // doctrine asks every statement inside a transaction for
@@ -1289,13 +1279,13 @@ class CompactionService(
                 beforeFetch(h)
                 fetchCandidates(h, catalog, namespace, table, cfg)
             }
-        // (b) Packing, holding nothing. The hook is the test seam that
+        // (b) Packing outside a transaction. The hook is the test seam that
         // makes this phase slower than the session's idle bound; see
         // [beforePacking].
         beforePacking()
         val packed = pack(fetched, cfg)
         // (c) One short read for the sibling maintainer's claims.
-        val free = withoutClaimedGroups(fetched.ctx, cfg, packed.groups)
+        val free = withoutClaimedGroups(h, fetched.ctx, cfg, packed.groups)
         val planMs = (System.nanoTime() - startedAt) / 1_000_000
         return PlanWithContext(
             fetched.ctx,
@@ -2128,7 +2118,7 @@ class CompactionService(
         files.sortedWith(compareBy({ it.rowIdStart }, { it.dataFileId }))
 
     /**
-     * PHASE (b): bin-pack the fetched candidates, holding no connection.
+     * PHASE (b): bin-pack the fetched candidates outside a transaction.
      *
      * Pure CPU by construction — every argument is already in memory —
      * which is the property [beforePacking] exists to test and the one
@@ -2261,7 +2251,7 @@ class CompactionService(
      *
      * READ IN ITS OWN SHORT TRANSACTION, after the packing, and both
      * halves of that are deliberate. It is outside the candidate read's
-     * snapshot because nothing may be held across the packing; and that
+     * snapshot because packing must run outside a transaction; and that
      * is harmless because this read can only see MORE claims than the
      * candidate snapshot would have — a claim taken during the packing
      * is honoured here, where the old shape planned the group and lost
@@ -2273,7 +2263,7 @@ class CompactionService(
      * rather than throwing: this runs inside `planSnapshot`, which is
      * outside the per-group catch, so an error here would kill the
      * sweep for every catalog on every interval — and it would do so on
-     * behalf of an optimization. `acquireClaim` takes the same position
+     * behalf of an optimization. `planAndClaim` takes the same position
      * on the write.
      *
      * NO SAVEPOINT, unlike the version of this read that lived inside
@@ -2284,6 +2274,7 @@ class CompactionService(
      * rewind.
      */
     private fun withoutClaimedGroups(
+        h: Handle,
         ctx: TableContext,
         cfg: CompactionConfig,
         groups: List<CompactionGroup>,
@@ -2291,9 +2282,7 @@ class CompactionService(
         if (!cfg.claimsEnabled || groups.isEmpty()) return FreeGroups(groups, 0)
         val claimed =
             try {
-                jdbi.withHandleUnchecked { h ->
-                    CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
-                }
+                CompactionClaimRepo.liveClaimedFileIds(h, ctx.catalogId, ctx.tableId)
             } catch (e: Exception) {
                 log.warn(e) {
                     "compaction claim read failed for ${ctx.namespace}.${ctx.table}; " +
@@ -2472,7 +2461,95 @@ class CompactionService(
     }
 
     /** One planned group with the table context its execution needs. */
-    private data class WorkItem(val ctx: TableContext, val group: CompactionGroup)
+    private data class WorkItem(
+        val ctx: TableContext,
+        val group: CompactionGroup,
+        val claimant: UUID? = null,
+        val started: java.util.concurrent.atomic.AtomicBoolean = java.util.concurrent.atomic.AtomicBoolean(false),
+    )
+
+    private data class PlannedWork(val plan: CompactionPlan, val items: List<WorkItem>)
+
+    /**
+     * Reserve this table's queue before another planner can read candidates.
+     * One connection holds the session lock across short transactions and packing.
+     * Claims are bounded by the remaining run budget. File I/O starts after unlock.
+     */
+    private fun planAndClaim(
+        catalog: String,
+        namespace: String,
+        table: String,
+        cfg: CompactionConfig,
+        room: Int,
+        claimant: UUID,
+    ): PlannedWork =
+        jdbi.withHandleUnchecked { h ->
+            val catalogId = catalogIdOf(h, catalog)
+            try {
+                if (cfg.claimsEnabled) {
+                    h.inTransaction<Unit, Exception> { Locks.acquireCatalogCompactionPlanLock(h, catalogId) }
+                }
+                val (ctx, plan) = planSnapshot(h, catalog, namespace, table, cfg)
+                if (!cfg.claimsEnabled) {
+                    return@withHandleUnchecked PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
+                }
+                try {
+                    h.inTransaction<PlannedWork, Exception> {
+                        h.execute("SET LOCAL statement_timeout = '${PLAN_STATEMENT_TIMEOUT_MS}ms'")
+                        val items = mutableListOf<WorkItem>()
+                        var claimed = plan.claimedGroups
+                        for (group in plan.groups) {
+                            if (items.size >= room) break
+                            if (Thread.currentThread().isInterrupted) throw InterruptedException()
+                            if (CompactionClaimRepo.acquire(
+                                    h,
+                                    ctx.catalogId,
+                                    ctx.tableId,
+                                    CompactionClaimRepo.groupKey(group),
+                                    group.files.map { it.dataFileId },
+                                    claimant,
+                                    cfg.claimTtlSeconds,
+                                )
+                            ) {
+                                items += WorkItem(ctx, group, claimant)
+                            } else {
+                                claimed++
+                            }
+                        }
+                        PlannedWork(plan.copy(claimedGroups = claimed), items)
+                    }
+                } catch (e: Exception) {
+                    if (e is InterruptedException || Thread.currentThread().isInterrupted) throw e
+                    log.warn(e) { "compaction plan claims failed for $namespace.$table; continuing without claims" }
+                    PlannedWork(plan, plan.groups.take(room).map { WorkItem(ctx, it) })
+                }
+            } finally {
+                if (cfg.claimsEnabled) Locks.releaseCatalogCompactionPlanLock(h, catalogId)
+            }
+        }
+
+    /** Release queued work on cancellation or a heap refusal. Started groups settle their own claims. */
+    private fun releaseQueuedClaims(items: List<WorkItem>) {
+        val interrupted = Thread.interrupted()
+        try {
+            for (item in items) {
+                if (item.claimant == null || item.started.get()) continue
+                runCatching {
+                    jdbi.withHandleUnchecked { h ->
+                        CompactionClaimRepo.release(
+                            h,
+                            item.ctx.catalogId,
+                            item.ctx.tableId,
+                            CompactionClaimRepo.groupKey(item.group),
+                            item.claimant,
+                        )
+                    }
+                }.onFailure { e -> log.warn(e) { "could not release queued compaction claim; it will expire" } }
+            }
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt()
+        }
+    }
 
     private fun doRunOnce(
         catalog: String,
@@ -2515,6 +2592,8 @@ class CompactionService(
         // one table planned, its groups executed one at a time on the
         // calling thread, the next table planned only if budget remains.
         val pool = groupPool(cfg)
+        val claimant = UUID.randomUUID()
+        var pending = emptyList<WorkItem>()
         var tally = GroupTally()
         val heapExhausted = java.util.concurrent.atomic.AtomicBoolean(false)
         try {
@@ -2532,7 +2611,16 @@ class CompactionService(
                 // and the loop pulls the next group; six groups were
                 // asked to stop and five of them committed afterwards.
                 stopIfInterrupted(tally)
-                val (ctx, plan) = planSnapshot(catalog, namespace, table, cfg)
+                val (plan, items) =
+                    planAndClaim(
+                        catalog,
+                        namespace,
+                        table,
+                        cfg,
+                        cfg.maxGroupsPerRun - tally.attempts,
+                        claimant,
+                    )
+                pending = items
                 // Groups the heap ceiling refused in METADATA, and groups
                 // another maintainer holds. Counted but deliberately NOT
                 // charged to maxGroupsPerRun: every other skip flavor spends
@@ -2555,7 +2643,7 @@ class CompactionService(
                         candidatesTruncated = plan.candidatesTruncated,
                         planMs = plan.planMs,
                     )
-                val queue = ArrayDeque(plan.groups)
+                val queue = ArrayDeque(items)
                 while (queue.isNotEmpty() && !heapExhausted.get()) {
                     val room = cfg.maxGroupsPerRun - tally.attempts
                     if (room <= 0) break
@@ -2572,7 +2660,6 @@ class CompactionService(
                     val wave =
                         (0 until minOf(room.toLong(), cfg.parallelGroups.toLong()).toInt())
                             .mapNotNull { queue.removeFirstOrNull() }
-                            .map { WorkItem(ctx, it) }
                     tally += executeWave(catalog, wave, cfg, pool, heapExhausted)
                     // Between waves as well as between tables: one wave
                     // is up to `parallelGroups` rewrites, which is
@@ -2593,6 +2680,7 @@ class CompactionService(
             throw SweepInterrupted(tally.toResult()).also { it.initCause(e) }
         } finally {
             shutdown(pool, interrupted = Thread.currentThread().isInterrupted)
+            releaseQueuedClaims(pending)
         }
         return tally.toResult()
     }
@@ -2832,14 +2920,10 @@ class CompactionService(
     ): GroupTally {
         val (ctx, group) = item
         if (heapExhausted.get()) return GroupTally.NOT_ATTEMPTED
-        // The claim, taken BEFORE any IO and after the planner already
-        // filtered the groups it could see claimed. The two are not
-        // redundant: the planner reads a snapshot that may predate
-        // another replica's claim, and this is the write that arbitrates.
-        // It is still only an optimization — losing it costs a re-plan
-        // next sweep, and winning it authorizes nothing.
-        val claimKey = if (cfg.claimsEnabled) CompactionClaimRepo.groupKey(group) else null
-        if (claimKey != null && !acquireClaim(ctx, group, claimKey, cfg)) {
+        item.started.set(true)
+        // Refresh the reservation before file I/O. A lost lease spends no I/O.
+        val claimKey = item.claimant?.let { CompactionClaimRepo.groupKey(group) }
+        if (claimKey != null && !refreshClaim(ctx, claimKey, item.claimant, cfg)) {
             log.debug {
                 "compaction group of ${group.files.size} files for " +
                     "$catalog/${ctx.namespace}.${ctx.table} is claimed by another maintainer; " +
@@ -3030,7 +3114,7 @@ class CompactionService(
             // (CompactionConfig.committedClaimTtlSeconds): the only
             // reader it has left is a sibling's plan that predates this
             // commit, and a plan is at most one sweep old. Holding the
-            // row for the full 900 s instead would leave roughly
+            // row for the full rewrite lease instead would leave roughly
             // committed-groups-per-sweep x lease/interval rows per
             // table, every one of whose input-id arrays the planner then
             // reads on every pass.
@@ -3047,11 +3131,11 @@ class CompactionService(
                                 ctx.catalogId,
                                 ctx.tableId,
                                 claimKey,
-                                instanceId,
+                                item.claimant,
                                 cfg.committedClaimTtlSeconds,
                             )
                         } else {
-                            CompactionClaimRepo.release(h, ctx.catalogId, ctx.tableId, claimKey, instanceId)
+                            CompactionClaimRepo.release(h, ctx.catalogId, ctx.tableId, claimKey, item.claimant)
                         }
                     }
                 }.onFailure { e ->
@@ -3065,42 +3149,28 @@ class CompactionService(
         }
     }
 
-    /**
-     * Take the group's claim; false means another maintainer holds a
-     * live one.
-     *
-     * A claim failure is never fatal to the group in the other
-     * direction: if the claim TABLE itself errors, the group proceeds
-     * UNCLAIMED rather than being skipped, because a claim is an
-     * optimization and a broken optimization must not stop compaction.
-     * The planner's own claim read takes the same position (see
-     * [groups]), so a claim table that is missing, locked or broken
-     * costs duplicated work between replicas and costs nothing else.
-     */
-    private fun acquireClaim(
+    /** A broken claim table still permits work; a lost claim does not. */
+    private fun refreshClaim(
         ctx: TableContext,
-        group: CompactionGroup,
         claimKey: String,
+        claimant: UUID,
         cfg: CompactionConfig,
     ): Boolean =
         runCatching {
             jdbi.withHandleUnchecked { h ->
-                CompactionClaimRepo.acquire(
+                CompactionClaimRepo.refresh(
                     h,
                     ctx.catalogId,
                     ctx.tableId,
                     claimKey,
-                    group.files.map { it.dataFileId },
-                    instanceId,
+                    claimant,
                     cfg.claimTtlSeconds,
                 )
             }
         }.getOrElse { e ->
-            log.warn(e) {
-                "compaction claim insert failed for ${ctx.namespace}.${ctx.table}; " +
-                    "rewriting the group unclaimed (the plan-to-commit re-verification is " +
-                    "the correctness backstop, not the claim)"
-            }
+            log.warn(
+                e,
+            ) { "compaction claim refresh failed for ${ctx.namespace}.${ctx.table}; continuing without a claim" }
             true
         }
 

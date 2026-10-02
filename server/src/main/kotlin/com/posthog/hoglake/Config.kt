@@ -870,9 +870,9 @@ data class Config(
      * it. A lease, not a lock: there is no heartbeat, so this is also
      * how long a killed maintainer's files stay untouched.
      *
-     * 900 s covers a worst-case 64-file group by two orders of magnitude.
-     * Wrong in either direction costs only work: too short duplicates a
-     * rewrite, too long delays one group by one lease.
+     * The default lease is one hour and covers the whole plan, including
+     * queue time. Increase it if a full run can exceed one hour.
+     * A short lease permits duplicate work; a long lease delays recovery.
      */
     val compactionClaimTtlSeconds: Long =
         env(
@@ -891,7 +891,7 @@ data class Config(
      * The quantity it has to cover is how OLD that sibling's plan can
      * be, which is one whole SWEEP: a group costs a measured ~8.5 s, so
      * 64 groups is ~544 s. 600 s covers it with margin and stays inside
-     * the 900 s rewrite lease. The cost is rows the planner reads the
+     * the full rewrite lease. The cost is rows the planner reads the
      * input-id arrays of — `committed groups per sweep x lease / sweep
      * duration`, about 70 per table at those settings.
      */

@@ -1067,18 +1067,25 @@ arithmetic bound, against kilobytes per footer for every real file. The
 window is per GROUP and is not divided by `parallelGroups`; an operator
 running both knobs high on a small pod should lower one of them.
 
-`HOGLAKE_COMPACTION_CLAIMS_ENABLED` (default **on**) and
-`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS` (default **900**) stop two
-maintenance replicas rewriting the same group. Both plan from the same
-metadata and so form the same groups; without claims both rewrite and
-upload every one of them and the loser is discarded at commit — a 547 s
-production sweep committed 34 groups and lost 30 that way, each loss a
-full rewrite and upload thrown away and its staged object left for the
-cleanup drain. A maintainer now claims a group before the IO, and the
-other's planner skips it (counted `claimed_elsewhere` in the run
-result, and — like the heap refusals — NOT charged to
-`HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN`, since it spends no IO: the
-sweep refunds the slot and pulls the next candidate).
+`HOGLAKE_COMPACTION_CLAIMS_ENABLED` (default **on**) enables group claims.
+Each execution plan holds a per-catalog advisory lock while it reads candidates,
+packs groups, and claims the selected queue. The queue is limited to the remaining
+run budget. Planning and claims use one connection and separate transactions;
+packing has no open transaction. The lock is separate from the commit and
+retirement locks. Its wait is limited to 15 seconds. File I/O starts after unlock.
+Metadata-only plan previews do not lock or claim work.
+
+`HOGLAKE_COMPACTION_CLAIM_TTL_SECONDS` defaults to **3600** seconds. Set it above
+the longest full run, including queue time. Each group refreshes its live claim
+before execution. An expired or replaced claim skips execution. Each run has
+its own claimant ID, including concurrent runs on one server. Cancellation and
+heap refusal release claims for groups that did not start.
+
+The next planner sees all queued claims and excludes groups with overlapping
+inputs. Claim skips increment `claimed_elsewhere` and do not consume the run
+budget. Existing explicit TTL settings override the new default. Update shorter
+settings before adding concurrent compactors. All compactors must use the new
+planning lock before the full queue protection applies.
 
 **A claim is an optimization and never authorization.** Correctness
 against a concurrent rewrite is, and stays, the plan-to-commit

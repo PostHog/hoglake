@@ -35,6 +35,48 @@ object Locks {
      */
     const val CATALOG_RETIREMENT_LOCK_CLASS: Int = 4740872
 
+    /** Separate from commit and retirement locks. Held only while planning and claiming work. */
+    const val CATALOG_COMPACTION_PLAN_LOCK_CLASS: Int = 4740873
+
+    /**
+     * Take the session lock inside a short transaction with a bounded wait.
+     * The caller must release it on this handle after all plan claims commit.
+     * A session lock permits packing outside a transaction.
+     */
+    fun acquireCatalogCompactionPlanLock(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        handle.execute("SET LOCAL lock_timeout = '15s'")
+        handle.execute("SET LOCAL statement_timeout = '15s'")
+        handle.createQuery(
+            "SELECT pg_advisory_lock(($CATALOG_COMPACTION_PLAN_LOCK_CLASS::bigint << 32) | " +
+                "(?::bigint & 4294967295))",
+        )
+            .bind(0, catalogId)
+            .mapToMap()
+            .one()
+    }
+
+    fun releaseCatalogCompactionPlanLock(
+        handle: Handle,
+        catalogId: Long,
+    ) {
+        try {
+            handle.createQuery(
+                "SELECT pg_advisory_unlock(($CATALOG_COMPACTION_PLAN_LOCK_CLASS::bigint << 32) | " +
+                    "(?::bigint & 4294967295))",
+            )
+                .bind(0, catalogId)
+                .mapTo(Boolean::class.javaObjectType)
+                .one()
+        } catch (e: Exception) {
+            // A pooled connection must never retain this session lock.
+            handle.connection.abort { it.run() }
+            throw e
+        }
+    }
+
     /**
      * Take the per-catalog commit lock for the current transaction.
      * Blocks until the holder commits or rolls back. Must be called

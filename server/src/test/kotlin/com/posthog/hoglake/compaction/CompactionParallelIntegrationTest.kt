@@ -465,6 +465,216 @@ class CompactionParallelIntegrationTest {
         return out
     }
 
+    @Test
+    fun `a staggered planner skips the full queue before the first group completes`() {
+        val fx = fixture("compact-par-z-queued-claims", groups = 5)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blocking = BlockingStore(entered, release)
+        val cfg = policy(fx, parallelGroups = 1)
+        val first = CompactionService(db.jdbi, blocking, cfg)
+        val second = CompactionService(db.jdbi, store, cfg)
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val run = pool.submit<CompactionResult> { first.runOnce(fx.cat) }
+            assertThat(entered.await(30, TimeUnit.SECONDS)).isTrue()
+            assertThat(claimRows(fx.cat)).hasSize(fx.groups)
+            assertThat(claimLeasesSeconds(fx.cat)).allMatch { it > 3500 }
+            val other = second.runOnce(fx.cat)
+            assertThat(other.groupsCompacted).isZero()
+            assertThat(other.claimedElsewhere).isEqualTo(fx.groups.toLong())
+            assertThat(other.skippedConflicts).isZero()
+            release.countDown()
+            assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(fx.groups.toLong())
+            assertThat(stagingTicketOutcomes(fx.cat)).hasSize(fx.groups).containsOnly("registered")
+        } finally {
+            release.countDown()
+            pool.shutdownNow()
+            blocking.close()
+        }
+        assertVerifyPasses(fx.cat)
+    }
+
+    @Test
+    fun `a plan reserves only its remaining budget and leaves other groups available`() {
+        val fx = fixture("compact-par-z-claim-budget", groups = 5)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blocking = BlockingStore(entered, release)
+        val first = CompactionService(db.jdbi, blocking, policy(fx, maxGroups = 2))
+        val second = CompactionService(db.jdbi, store, policy(fx, maxGroups = 3))
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val run = pool.submit<CompactionResult> { first.runOnce(fx.cat) }
+            assertThat(entered.await(30, TimeUnit.SECONDS)).isTrue()
+            assertThat(claimRows(fx.cat)).hasSize(2)
+            val other = second.runOnce(fx.cat)
+            assertThat(other.groupsCompacted).isEqualTo(3)
+            assertThat(other.claimedElsewhere).isEqualTo(2)
+            assertThat(other.skippedConflicts).isZero()
+            release.countDown()
+            val result = run.get(60, TimeUnit.SECONDS)
+            assertThat(result.groupsCompacted).isEqualTo(2)
+            assertThat(result.skippedConflicts).isZero()
+        } finally {
+            release.countDown()
+            pool.shutdownNow()
+            blocking.close()
+        }
+    }
+
+    @Test
+    fun `the planning lock covers packing but permits commits and other catalogs`() {
+        val fx = fixture("compact-par-z-planning-lock", groups = 2)
+        val other = fixture("compact-par-z-other-planning-lock", groups = 1)
+        val (catalogId, _) = ids(fx.cat)
+        val (otherId, _) = ids(other.cat)
+        val packed = CountDownLatch(1)
+        val releasePacking = CountDownLatch(1)
+        val rewrite = CountDownLatch(1)
+        val releaseRewrite = CountDownLatch(1)
+        val blocking = BlockingStore(rewrite, releaseRewrite)
+        val cfg = policy(fx)
+        val svc = CompactionService(db.jdbi, blocking, cfg)
+        val pid = AtomicInteger()
+        svc.beforeFetch = { h -> pid.set(h.createQuery("SELECT pg_backend_pid()").mapTo(Int::class.java).one()) }
+        svc.beforePacking = {
+            packed.countDown()
+            check(releasePacking.await(30, TimeUnit.SECONDS))
+        }
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val run = pool.submit<CompactionResult> { svc.runOnce(fx.cat) }
+            assertThat(packed.await(30, TimeUnit.SECONDS)).isTrue()
+            db.jdbi.inTransactionUnchecked { h ->
+                fun canLock(
+                    lockClass: Int,
+                    id: Long,
+                ): Boolean =
+                    h.createQuery("SELECT pg_try_advisory_xact_lock((:cls::bigint << 32) | (:id::bigint & 4294967295))")
+                        .bind("cls", lockClass).bind("id", id).mapTo(Boolean::class.java).one()
+                assertThat(canLock(Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS, catalogId)).isFalse()
+                assertThat(canLock(Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS, otherId)).isTrue()
+                assertThat(canLock(Locks.CATALOG_COMMIT_LOCK_CLASS, catalogId)).isTrue()
+                assertThat(canLock(Locks.CATALOG_RETIREMENT_LOCK_CLASS, catalogId)).isTrue()
+                val state =
+                    h.createQuery("SELECT state FROM pg_stat_activity WHERE pid = :pid")
+                        .bind("pid", pid.get()).mapTo(String::class.java).one()
+                assertThat(state).isEqualTo("idle")
+            }
+            releasePacking.countDown()
+            assertThat(rewrite.await(30, TimeUnit.SECONDS)).isTrue()
+            // The same service can start a second run after the planning lock is released.
+            val second = svc.runOnce(fx.cat)
+            assertThat(second.groupsCompacted).isZero()
+            assertThat(second.claimedElsewhere).isEqualTo(2)
+            releaseRewrite.countDown()
+            assertThat(run.get(60, TimeUnit.SECONDS).groupsCompacted).isEqualTo(2)
+        } finally {
+            releasePacking.countDown()
+            releaseRewrite.countDown()
+            pool.shutdownNow()
+            blocking.close()
+        }
+    }
+
+    @Test
+    fun `execution skips a queued claim that another run reclaimed`() {
+        val fx = fixture("compact-par-z-reclaimed", groups = 3)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blocking = BlockingStore(entered, release)
+        val cfg = policy(fx)
+        val svc = CompactionService(db.jdbi, blocking, cfg)
+        val plan = svc.planTable(fx.cat, "ns", "t")
+        assertThat(claimRows(fx.cat)).isEmpty()
+        val queued = plan.groups[1]
+        val key = CompactionClaimRepo.groupKey(queued)
+        val (catalogId, tableId) = ids(fx.cat)
+        val other = UUID.randomUUID()
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val run = pool.submit<CompactionResult> { svc.runOnce(fx.cat) }
+            assertThat(entered.await(30, TimeUnit.SECONDS)).isTrue()
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_compaction_claim SET expires_at = now() - interval '1 second' " +
+                        "WHERE catalog_id = ? AND group_key = ?",
+                    catalogId,
+                    key,
+                )
+                assertThat(
+                    CompactionClaimRepo.acquire(
+                        h,
+                        catalogId,
+                        tableId,
+                        key,
+                        queued.files.map { it.dataFileId },
+                        other,
+                        3600,
+                    ),
+                ).isTrue()
+            }
+            release.countDown()
+            val result = run.get(60, TimeUnit.SECONDS)
+            assertThat(result.groupsCompacted).isEqualTo(2)
+            assertThat(result.claimedElsewhere).isEqualTo(1)
+            assertThat(result.skippedConflicts).isZero()
+            assertThat(stagingTicketOutcomes(fx.cat)).hasSize(2)
+            db.jdbi.useHandleUnchecked { h ->
+                assertThat(CompactionClaimRepo.release(h, catalogId, tableId, key, other)).isEqualTo(1)
+            }
+        } finally {
+            release.countDown()
+            pool.shutdownNow()
+            blocking.close()
+        }
+    }
+
+    @Test
+    fun `a failed plan releases the session lock before its connection returns to the pool`() {
+        val fx = fixture("compact-par-z-failed-plan-lock", groups = 1)
+        val (catalogId, _) = ids(fx.cat)
+        val svc = CompactionService(db.jdbi, store, policy(fx))
+        svc.beforePacking = { error("injected packing failure") }
+        org.assertj.core.api.Assertions.assertThatThrownBy { svc.runOnce(fx.cat) }
+            .hasMessageContaining("injected packing failure")
+        db.jdbi.withHandleUnchecked { h ->
+            val held =
+                h.createQuery(
+                    "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND classid = :cls AND objid = :id",
+                ).bind("cls", Locks.CATALOG_COMPACTION_PLAN_LOCK_CLASS).bind("id", catalogId)
+                    .mapTo(Int::class.java).one()
+            assertThat(held).isZero()
+        }
+        assertThat(claimRows(fx.cat)).isEmpty()
+        svc.beforePacking = {}
+        assertThat(svc.runOnce(fx.cat).groupsCompacted).isEqualTo(1)
+    }
+
+    @Test
+    fun `refresh extends only the live claim owned by this run`() {
+        val fx = fixture("compact-par-z-claim-refresh", groups = 1)
+        val (catalogId, tableId) = ids(fx.cat)
+        val owner = UUID.randomUUID()
+        val other = UUID.randomUUID()
+        db.jdbi.useHandleUnchecked { h ->
+            assertThat(CompactionClaimRepo.acquire(h, catalogId, tableId, "key", listOf(1L), owner, 10)).isTrue()
+            assertThat(CompactionClaimRepo.refresh(h, catalogId, tableId, "key", other, 3600)).isFalse()
+            assertThat(CompactionClaimRepo.refresh(h, catalogId, tableId, "key", owner, 3600)).isTrue()
+            assertThat(claimLeasesSeconds(fx.cat)).allMatch { it > 3500 }
+            h.execute(
+                "UPDATE hog_compaction_claim SET expires_at = now() - interval '1 second' WHERE catalog_id = ?",
+                catalogId,
+            )
+            assertThat(CompactionClaimRepo.refresh(h, catalogId, tableId, "key", owner, 3600)).isFalse()
+            assertThat(CompactionClaimRepo.acquire(h, catalogId, tableId, "key", listOf(1L), other, 3600)).isTrue()
+            assertThat(CompactionClaimRepo.refresh(h, catalogId, tableId, "key", owner, 3600)).isFalse()
+            assertThat(CompactionClaimRepo.release(h, catalogId, tableId, "key", owner)).isZero()
+            assertThat(CompactionClaimRepo.release(h, catalogId, tableId, "key", other)).isEqualTo(1)
+        }
+    }
+
     // ---- 3: group claims ---------------------------------------------------
 
     @Test
@@ -1233,6 +1443,7 @@ class CompactionParallelIntegrationTest {
         assertThat(liveFileCount(fx.cat))
             .describedAs("no group may commit after the sweep was asked to stop")
             .isEqualTo(fx.expectedFiles)
+        assertThat(claimRows(fx.cat)).isEmpty()
         // And the ledger says what happened, WITH the counters the sweep
         // had earned (zero here, since the very first group was the one
         // interrupted — the point is that a row exists and is honest).
@@ -1363,6 +1574,7 @@ class CompactionParallelIntegrationTest {
         assertThat(liveFileCount(fx.cat))
             .describedAs("no group may commit after the sweep was asked to stop")
             .isEqualTo(fx.expectedFiles)
+        assertThat(claimRows(fx.cat)).isEmpty()
     }
 
     @Test
@@ -1625,6 +1837,7 @@ class CompactionParallelIntegrationTest {
         val cfg = policy(fx, maxGroups = 5)
         val result = CompactionService(db.jdbi, oomStore, cfg).runOnce(fx.cat, cfg)
         assertThat(result.heapBudgetExceeded).isEqualTo(1)
+        assertThat(claimRows(fx.cat)).isEmpty()
         assertThat(result.groupsCompacted).isZero()
         assertThat(result.failedGroups).isZero()
         assertThat(read)
