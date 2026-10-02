@@ -94,7 +94,7 @@ class App private constructor(
     private val scanService = ScanService(jdbi)
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
-    private val expiryService = ExpiryService(jdbi)
+    private val expiryService = ExpiryService(jdbi, cfg)
     private val verifyService =
         VerifyService(
             jdbi,

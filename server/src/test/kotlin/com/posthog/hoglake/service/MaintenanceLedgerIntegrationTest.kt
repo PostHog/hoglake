@@ -261,6 +261,84 @@ class MaintenanceLedgerIntegrationTest {
             )
     }
 
+    @Test
+    fun `a pre-upgrade expiry row is returned with the purge counters it predates`() {
+        // The expiry twin of the two above, for the two-phase sweep's
+        // four new counters — and for the ONE deliberate exclusion.
+        //
+        // A row written before the sweep was split carries none of them.
+        // `data_files_purged`, `purge_pages`, `purge_failures`,
+        // `advance_halvings` and `purge_halvings` are filled with 0 on
+        // READ (EXPIRY_COUNTERS_ADDED_LATER), which is honest: the purge
+        // did not exist, so nothing it counts could have happened.
+        //
+        // TWO FIELDS MUST STAY ABSENT, for two different reasons.
+        // `purge_truncated` is a BOOLEAN and the filler writes the
+        // integer 0, so listing it would put a spec-invalid value in a
+        // ledger row. `purge_remaining` is an integer, but its ABSENCE
+        // MEANS "unknown": the count is best-effort under a 5 s bound,
+        // and a sweep whose count could not finish omits it rather than
+        // claim a zero that would contradict `purge_truncated`. Filling
+        // it on read would re-introduce exactly that lie. Every console
+        // guard on both is undefined-safe.
+        val catalogId = seedCatalog("led-preupgrade-expiry")
+        val stored =
+            """{"snapshots_expired":4,"data_files_queued":9,"delete_files_queued":0,""" +
+                """"new_earliest_snapshot_id":41}"""
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                """
+                INSERT INTO hog_maintenance_run
+                    (catalog_id, task, run_trigger, started_at, finished_at, status, result)
+                VALUES (:catalogId, 'expiry', 'loop', now(), now(), 'ok', CAST(:result AS jsonb))
+                """,
+            )
+                .bind("catalogId", catalogId)
+                .bind("result", stored)
+                .execute()
+        }
+        // Absent on the way in — otherwise this passes for the wrong reason.
+        val raw = json.readTree(ledgerRows("led-preupgrade-expiry").single().result)
+        assertThat(raw.has("data_files_purged")).isFalse()
+        assertThat(raw.has("purge_truncated")).isFalse()
+
+        val run =
+            jdbi.withHandleUnchecked { h ->
+                MaintenanceRunStore(jdbi).history(h, catalogId, null, null, 10)
+            }.single()
+        val result = wireObjectMapper().valueToTree<JsonNode>(run.toDto())["result"]
+        assertThat(result["data_files_purged"].asLong())
+            .describedAs("normalized on READ; the purge did not exist, so it purged nothing")
+            .isZero()
+        assertThat(result["purge_pages"].asLong()).isZero()
+        assertThat(result["purge_failures"].asLong()).isZero()
+        assertThat(result["advance_halvings"].asLong()).isZero()
+        assertThat(result["purge_halvings"].asLong()).isZero()
+        assertThat(result.has("purge_truncated"))
+            .describedAs("a boolean must NOT be filled with the integer 0")
+            .isFalse()
+        assertThat(result.has("purge_remaining"))
+            .describedAs("and an 'unknown' must NOT be filled with a zero that contradicts it")
+            .isFalse()
+        // Everything the row did carry survives untouched.
+        assertThat(result["snapshots_expired"].asLong()).isEqualTo(4)
+        assertThat(result["data_files_queued"].asLong()).isEqualTo(9)
+        assertThat(result["new_earliest_snapshot_id"].asLong()).isEqualTo(41)
+        assertThat(result.fieldNames().asSequence().toList())
+            .containsExactlyInAnyOrder(
+                "snapshots_expired",
+                "data_files_queued",
+                "delete_files_queued",
+                "new_earliest_snapshot_id",
+                "offsets_released",
+                "data_files_purged",
+                "purge_pages",
+                "purge_failures",
+                "advance_halvings",
+                "purge_halvings",
+            )
+    }
+
     private fun ledgerRows(catalog: String): List<LedgerRow> =
         jdbi.withHandleUnchecked { h ->
             h.createQuery(

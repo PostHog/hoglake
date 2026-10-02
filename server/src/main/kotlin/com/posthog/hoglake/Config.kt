@@ -161,8 +161,93 @@ data class Config(
      * nothing is the only thing a faster cadence buys.
      */
     val expiryIntervalMs: Long = env("HOGLAKE_EXPIRY_INTERVAL_MS", "3600000").toLong(),
-    /** Max snapshots expired per sweep per catalog (incremental expiry). */
+    /**
+     * Max SNAPSHOTS expired per sweep per catalog (incremental expiry).
+     *
+     * Unchanged in meaning by the two-phase sweep: it bounds the floor
+     * advance, which is what bounds the snapshot range delete and its
+     * `hog_snapshot_change` cascade — the one term still inside the
+     * commit-lock transaction. It never bounded the FILE rows (those are
+     * set by what compaction retired in the window, not by how far the
+     * floor moved); `HOGLAKE_EXPIRY_PURGE_PAGE` is that bound.
+     */
     val expiryBatchSize: Int = env("HOGLAKE_EXPIRY_BATCH", "10000").toInt(),
+    /**
+     * File rows one page of expiry's phase-B purge deletes.
+     *
+     * PHASE B IS THE PART THAT IS NOT UNDER THE COMMIT LOCK: the sweep
+     * advances the floor in one short transaction, then deletes the file
+     * rows below it in pages, each page its own transaction under its
+     * own `statement_timeout` (`ExpiryService.PURGE_STATEMENT_TIMEOUT`).
+     * This is the row bound the 2026-10-01 prod-us incident was missing
+     * — one statement deleted a whole compaction wave (12,288 rows plus
+     * ~26 `hog_file_column_stats` rows each) under the lock, 17-25 s of
+     * hold per minute for sixteen hours.
+     *
+     * 1,000, the figure the drained-ledger purge uses, and the
+     * arithmetic that makes it the right order of magnitude: at the
+     * 700-870 us per file this statement measured on prod-us a page is
+     * ~0.7-0.9 s, two orders inside its 5 s statement bound, and
+     * `HOGLAKE_EXPIRY_PURGE_BUDGET_MS` then buys ~10-14 pages per sweep.
+     *
+     * The per-row cost is NOT a constant of the code — it is the row
+     * plus its cascade, so a 200-column table costs several times a
+     * 25-column one per row. That is why this is a STARTING size rather
+     * than a promise: a page that hits its statement bound is HALVED and
+     * retried within the same run (`ExpiryService.walk`, the shape
+     * `RetirementService` uses), down to a page of one, and the halvings
+     * are counted in `hoglake_expiry_halvings_total{phase="purge"}`. A
+     * standing rate on that series means this value is too large for the
+     * tables the purge is meeting; `hoglake_expiry_purge_failures_total`
+     * means even a page of one could not finish, which is not a page-size
+     * problem.
+     */
+    val expiryPurgePage: Int =
+        env(
+            "HOGLAKE_EXPIRY_PURGE_PAGE",
+            "${com.posthog.hoglake.service.ExpiryService.PURGE_PAGE}",
+        ).toInt(),
+    /**
+     * Wall clock expiry's phase-B purge may spend per sweep, per
+     * catalog.
+     *
+     * TEN SECONDS, and it is a THROUGHPUT knob rather than a safety one:
+     * nothing waits on phase B (no lock, one pooled connection), so the
+     * budget only decides how fast the backlog drains.
+     *
+     * THE RATE IS PER CATALOG AND THE LOOP IS FIXED DELAY, which is the
+     * arithmetic an earlier version of this comment got wrong.
+     * `BackgroundLoops.register` runs `body()` and THEN waits
+     * `HOGLAKE_EXPIRY_INTERVAL_MS`, and `runOnceAllCatalogs` sweeps
+     * catalogs serially, so the period is `interval + the sum of every
+     * catalog's sweep` rather than the interval. At ~1,000 rows a page
+     * and ~0.8 s a page a budget-spending sweep is ~10,000-14,000 rows,
+     * so with K catalogs behind on one maintenance pod the hot catalog's
+     * rate is `12,000 x 60 / (15 + 10K)` rows a minute: ~29k at K=1,
+     * ~16k at K=3, ~11k at K=5. Compaction retires ~12,288 files per
+     * ~110 s wave on prod-us, i.e. ~6,700 a minute, so the margin is
+     * ~4x at K=1 and gone somewhere around K=8 — at which point the
+     * symptom is a standing `purge_truncated` and a rising
+     * `hoglake_expiry_purge_remaining`, and the lever is fewer catalogs
+     * per pod or a bigger budget rather than a bigger page.
+     * server/README.md §Retention carries the same derivation for an
+     * operator reading it there.
+     *
+     * The budget is checked BETWEEN pages, so the real bound is one page
+     * over it; `ExpiryService.PURGE_STATEMENT_TIMEOUT` is what bounds
+     * that page, which is the half a wall budget cannot do. A sweep that
+     * spends the whole budget reports `purge_truncated` with the rows it
+     * left (`purge_remaining`), so a purge falling behind is visible in
+     * the ledger rather than inferred from a growing table.
+     *
+     * 0 is legal and means "advance the floor, purge nothing": the
+     * rows stay eligible for the next sweep. It is the shape a test uses
+     * to make the truncation observable without sleeping, and it is not
+     * a configuration anyone should deploy — it turns the purge off while
+     * leaving every other surface reporting a healthy sweep.
+     */
+    val expiryPurgeBudgetMs: Long =
+        env("HOGLAKE_EXPIRY_PURGE_BUDGET_MS", "${com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS}").toLong(),
     /**
      * Cleanup drain interval; 0 disables.
      *
@@ -1015,6 +1100,47 @@ data class Config(
                 "after its 5s connectionTimeout instead of queueing in the dispatcher, where a " +
                 "wait is measured and shed with a typed 503. Raise HOGLAKE_DB_POOL_SIZE with it."
         }
+        // A page of 0 is a purge that deletes nothing forever, and a
+        // page of a million is the 2026-10-01 statement back: at the
+        // measured 700-870 us per file it would be 12-14 MINUTES in one
+        // transaction, so every page would die on
+        // ExpiryService.PURGE_STATEMENT_TIMEOUT and the purge would be
+        // off with a failure counter nobody had a reason to look at yet.
+        // The ceiling is where a page stops fitting its own statement
+        // bound with room to spare, not a tuning opinion.
+        require(expiryPurgePage in 1..MAX_EXPIRY_PURGE_PAGE) {
+            "HOGLAKE_EXPIRY_PURGE_PAGE=$expiryPurgePage must be between 1 and " +
+                "$MAX_EXPIRY_PURGE_PAGE (the default is " +
+                "${com.posthog.hoglake.service.ExpiryService.PURGE_PAGE}): a page past the " +
+                "ceiling cannot finish inside the purge's own " +
+                "${com.posthog.hoglake.service.ExpiryService.PURGE_STATEMENT_TIMEOUT} statement " +
+                "bound at the measured per-row cost, so every page would fail and the purge " +
+                "would stop draining while the sweep still reported an advancing floor."
+        }
+        // A budget of 0 WITH THE LOOP ON is the retirement-ceiling
+        // mistake in another costume: every sweep advances the floor,
+        // every ledger row reads healthy, and the file rows below the
+        // floor accumulate with only `purge_remaining` saying so. Refuse
+        // it at boot naming both knobs; the loop being OFF makes it
+        // harmless, which is why that case is allowed.
+        // THE SIGN CHECK GOES FIRST, and the order is the whole of the
+        // fix: the combined check below reads `=0` in its message, so a
+        // NEGATIVE value used to be refused by a message telling the
+        // operator their value was zero. Each refusal now reports the
+        // value it actually saw.
+        require(expiryPurgeBudgetMs >= 0) {
+            "HOGLAKE_EXPIRY_PURGE_BUDGET_MS=$expiryPurgeBudgetMs must not be negative (the default " +
+                "is ${com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS}; 0 means \"advance " +
+                "the floor, purge nothing\" and is only legal with the expiry loop off)"
+        }
+        require(expiryPurgeBudgetMs > 0 || expiryIntervalMs <= 0) {
+            "HOGLAKE_EXPIRY_PURGE_BUDGET_MS=0 with HOGLAKE_EXPIRY_INTERVAL_MS=" +
+                "$expiryIntervalMs would advance the expiry floor on every sweep and purge none " +
+                "of the file rows below it: the rows (and their stats cascade) would accumulate " +
+                "while every ledger row reported an advancing floor. Set a positive budget (the " +
+                "default is ${com.posthog.hoglake.service.ExpiryService.PURGE_BUDGET_MS}) or set " +
+                "HOGLAKE_EXPIRY_INTERVAL_MS=0 to turn expiry off on purpose."
+        }
         require(cleanupWorkers >= 1) {
             "HOGLAKE_CLEANUP_WORKERS=$cleanupWorkers must be at least 1 (1 is the sequential " +
                 "drain, and 0 would turn the loop into a no-op with nothing saying so — set " +
@@ -1150,6 +1276,15 @@ data class Config(
          * check for why the failure it prevents is silent.
          */
         const val MIN_RECEIPT_RETENTION_SECONDS = 3_600L
+
+        /**
+         * Ceiling on [expiryPurgePage]; see the boot check for the
+         * arithmetic. 50,000 rows at the measured 700-870 us per file is
+         * 35-43 s, which is seven times the purge's own 5 s statement
+         * bound — so anything at or above this is a page that can only
+         * fail, and the whole point of a page is that it finishes.
+         */
+        const val MAX_EXPIRY_PURGE_PAGE = 50_000
 
         /**
          * The default `HOGLAKE_RETIREMENT_QUEUE_CEILING`, named here so

@@ -58,6 +58,44 @@ data class ExpiryResultDto(
      * not meet an absent required field.
      */
     val offsetsReleased: Long,
+    /**
+     * Data-file rows the sweep's phase-B purge deleted below the floor —
+     * equal to [dataFilesQueued] by construction, because the delete and
+     * the `hog_file_removal` insert are one statement. See
+     * `ExpiryResult.dataFilesPurged` for why both are reported.
+     */
+    val dataFilesPurged: Long,
+    /** Pages that purge ran, across both arms; empty pages are not counted. */
+    val purgePages: Long,
+    /**
+     * Purge pages that threw. Separate from the row counters because 0
+     * purged is otherwise the same number for an idle sweep and a
+     * failing one — see `ExpiryResult.purgeFailures`.
+     */
+    val purgeFailures: Long,
+    /**
+     * The purge stopped with work possibly left: the budget, a page that
+     * failed even at one row, or a floor that could not be read.
+     * Serialized unconditionally like the counters: a response that omits
+     * a flag it declares makes every client's `false` a guess.
+     */
+    val purgeTruncated: Boolean,
+    /**
+     * File rows still eligible when a truncated purge stopped — both
+     * tables — saturating at `ExpiryService.PURGE_REMAINING_CAP` each.
+     * 0 when the purge drained, and ABSENT when the count itself could
+     * not finish inside its 5 s bound: see
+     * `ExpiryResult.purgeRemaining` for why an unknown is not reported
+     * as a zero. The one nullable field in this DTO, and the only one
+     * whose absence means something other than "a zero from an older
+     * build".
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val purgeRemaining: Long?,
+    /** Phase-A batch halvings: the floor advance's statement bound firing. */
+    val advanceHalvings: Long,
+    /** Phase-B page halvings, across both arms. */
+    val purgeHalvings: Long,
 )
 
 fun ExpiryResult.toDto() =
@@ -68,6 +106,13 @@ fun ExpiryResult.toDto() =
         newEarliestSnapshotId = newEarliestSnapshotId,
         flooredByConsumer = flooredByConsumer,
         offsetsReleased = offsetsReleased,
+        dataFilesPurged = dataFilesPurged,
+        purgePages = purgePages,
+        purgeFailures = purgeFailures,
+        purgeTruncated = purgeTruncated,
+        purgeRemaining = purgeRemaining,
+        advanceHalvings = advanceHalvings,
+        purgeHalvings = purgeHalvings,
     )
 
 data class CleanupResultDto(
@@ -317,8 +362,30 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "plan_ms",
     )
 
-/** The same, for ExpiryResult. Append-only for the same reason. */
-private val EXPIRY_COUNTERS_ADDED_LATER = listOf("offsets_released")
+/**
+ * The same, for ExpiryResult. Append-only for the same reason.
+ *
+ * TWO FIELDS ARE DELIBERATELY NOT HERE, for two different reasons.
+ * `purge_truncated` is a BOOLEAN and this normalizer fills a missing
+ * field with the integer 0, so listing it would write a value its own
+ * schema does not allow. `purge_remaining` is an integer but its
+ * ABSENCE MEANS SOMETHING: the count is best-effort, and a sweep whose
+ * count could not finish omits it to say "unknown" rather than claim a
+ * zero that would contradict `purge_truncated` (see
+ * `ExpiryResult.purgeRemaining`). Filling that with 0 on read would
+ * re-introduce exactly the lie the nullability exists to prevent, and a
+ * pre-upgrade row's absence is honest for the same reason — it had no
+ * purge. Every console guard on both is undefined-safe.
+ */
+private val EXPIRY_COUNTERS_ADDED_LATER =
+    listOf(
+        "offsets_released",
+        "data_files_purged",
+        "purge_pages",
+        "purge_failures",
+        "advance_halvings",
+        "purge_halvings",
+    )
 
 /** The same, for CleanupResult. Append-only for the same reason. */
 private val CLEANUP_COUNTERS_ADDED_LATER =

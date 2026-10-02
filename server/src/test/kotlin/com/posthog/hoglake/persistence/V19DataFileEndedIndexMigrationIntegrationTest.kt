@@ -89,6 +89,33 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
          */
         const val BUFFERS_PER_ENDED_ROW = 1.2
 
+        /**
+         * The page the statement runs with, which is production's.
+         *
+         * The statement is PAGED since expiry became two-phase: a
+         * `ctid` page of this many rows, ordered by `end_snapshot`, run
+         * outside the commit lock. That changes what each half of this
+         * file measures, and makes the after half's claim stronger.
+         *
+         * BEFORE V19 THE PAGE BOUNDS NOTHING. With no index on
+         * `end_snapshot` the only way to find a page of ended rows is to
+         * read the manifest, so the page bounds the rows DELETED and
+         * leaves the rows EXAMINED at O(the catalog) — the distinction
+         * AGENT.md's bound-every-fetch rule is about, and the reason the
+         * index and the page are two fixes rather than one.
+         *
+         * AFTER V19 THE PAGE IS THE BOUND, and only because the
+         * statement carries no `ORDER BY`. It used to: the page was
+         * ordered by `end_snapshot` so the walk would take the oldest
+         * corpses first, and the plan this file printed was a Bitmap
+         * Heap Scan over the whole eligible set feeding a Sort feeding
+         * the Limit — 2,000 heap blocks for a page of 1,000, i.e. the
+         * examined rows still scaling with the backlog. The ordering is
+         * gone; what this test now pins is that a page costs about [PAGE]
+         * heap buffers no matter how many rows are eligible.
+         */
+        val PAGE = ExpiryService.PURGE_PAGE
+
         /** Put the history back to before V19 (V16's helper, and its reasoning). */
         const val REAPPLY_V19 = "DELETE FROM flyway_schema_history WHERE version::numeric >= 18"
     }
@@ -224,6 +251,11 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
             )
                 .bind("catalogId", catalogId)
                 .bind("newEarliest", FLOOR)
+                // The PRODUCTION page, not the whole eligible set: the
+                // statement is paged now (#260's successor), and a plan
+                // measured at an unbounded page would be a plan nothing
+                // runs.
+                .bind("page", PAGE)
                 .mapTo(String::class.java).list().joinToString("\n")
         }
 
@@ -236,6 +268,18 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
         val seqScan: Boolean,
     )
 
+    /**
+     * The node that does the READING, which since the statement became
+     * paged is not the first node naming the relation.
+     *
+     * A `ctid` page is two nodes over `hog_data_file`: an InitPlan that
+     * finds the page (the seq scan before V19, the index scan after)
+     * and a `Tid Scan` that fetches the named tuples for the DELETE.
+     * The Tid Scan is a lookup of a bounded array and has nothing to
+     * say about the access path, so every assertion in this file is
+     * about the other one — and taking "the first node" would quietly
+     * measure the wrong half.
+     */
     private fun scanNode(
         text: String,
         relation: String,
@@ -243,7 +287,11 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
         val lines = text.lines()
 
         fun indent(l: String) = l.length - l.trimStart().length
-        val i = lines.indexOfFirst { Regex("""Scan.* on $relation\b""").containsMatchIn(it) }
+        val i =
+            lines.indexOfFirst {
+                Regex("""Scan.* on $relation\b""").containsMatchIn(it) &&
+                    !it.contains("Tid Scan")
+            }
         if (i < 0) throw AssertionError("no scan of $relation in:\n$text")
         val line = lines[i]
         val detail = lines.drop(i + 1).takeWhile { it.isNotBlank() && indent(it) > indent(line) }
@@ -254,10 +302,40 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
         fun detailLong(prefix: String): Long? =
             detail.firstOrNull { it.trim().startsWith(prefix) }
                 ?.let { Regex("""(\d+)""").find(it.substringAfter(prefix))?.value?.toLong() }
+        // THE BITMAP CHILD'S BUFFERS COUNT TOO. A Bitmap Index Scan
+        // builds the WHOLE bitmap before its parent's heap scan starts,
+        // so the index half is O(the eligible set) — and reading buffers
+        // off the Bitmap Heap Scan parent alone would exclude exactly the
+        // term a per-page budget is supposed to bound. The parent's
+        // `Buffers:` line in `EXPLAIN (BUFFERS)` does NOT include the
+        // child's, so they are summed here.
+        val childBuffers =
+            detail.filter { it.contains("Bitmap Index Scan") }
+                .mapNotNull { child ->
+                    val i2 = lines.indexOf(child)
+                    lines.drop(i2 + 1).takeWhile { indent(it) > indent(child) }
+                        .firstOrNull { it.trim().startsWith("Buffers:") }
+                }
+                .sumOf { b ->
+                    (Regex("""\bhit=(\d+)""").find(b)?.groupValues?.get(1)?.toLong() ?: 0L) +
+                        (Regex("""\bread=(\d+)""").find(b)?.groupValues?.get(1)?.toLong() ?: 0L)
+                }
         return ScanNode(
             line = line.trim(),
-            index = Regex("""Scan(?: Backward)? using (\S+) on""").find(line)?.groupValues?.get(1),
-            buffers = hit + read,
+            // Two spellings, because the planner has two shapes for the
+            // same index. An ordered Index Scan names it on its own
+            // line; a BITMAP scan names it on the child Bitmap Index
+            // Scan line, and the parent Bitmap Heap Scan — the node
+            // whose buffers are the heap cost — names only the
+            // relation. Reading only the first form made this file
+            // report "no index" for a plan that was using exactly the
+            // index it was built to prove.
+            index =
+                Regex("""Scan(?: Backward)? using (\S+) on""").find(line)?.groupValues?.get(1)
+                    ?: detail.firstNotNullOfOrNull {
+                        Regex("""Bitmap Index Scan on (\S+)""").find(it)?.groupValues?.get(1)
+                    },
+            buffers = hit + read + childBuffers,
             rowsRemovedByFilter = detailLong("Rows Removed by Filter:"),
             indexSearches = detailLong("Index Searches:"),
             seqScan = line.contains("Seq Scan on $relation"),
@@ -341,22 +419,38 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
     }
 
     @Test
-    fun `before V19 expiry's data-file DELETE reads the catalog's whole manifest`() {
+    fun `before V19 a page of expiry's data-file DELETE reads ENDED_EVERY live rows per row it deletes`() {
         // The red half, measured on the same rows the after half runs
-        // on. THE ASSERTION IS THE WORK, NOT THE PLAN NODE: what makes
-        // this statement a problem is that it reads every live row to
-        // find the ended ones, under the commit lock.
+        // on. THE ASSERTION IS THE WORK, NOT THE PLAN NODE, and the work
+        // is the point the page bound alone cannot make: without an
+        // index on `end_snapshot` the scan has to walk the manifest
+        // until it has found a page's worth of ended rows, so the rows
+        // EXAMINED are the page times the inverse ended fraction —
+        // ENDED_EVERY - 1 live rows discarded per row deleted. At
+        // production's 0.6-1.8% that is 55-165 live rows per deleted
+        // row, over a 1.5 GiB relation, and it is why the page and the
+        // index are two fixes rather than one.
         val before = scanNode(expiryPlanBefore, "hog_data_file")
         assertThat(before.seqScan)
             .describedAs("V17's indexes cannot serve `end_snapshot`:%n%s", expiryPlanBefore)
             .isTrue()
         assertThat(before.rowsRemovedByFilter)
-            .describedAs("the whole live manifest is read and thrown away:%n%s", expiryPlanBefore)
+            .describedAs(
+                "a page of %d must discard ~%d live rows to fill itself:%n%s",
+                PAGE,
+                PAGE.toLong() * (ENDED_EVERY - 1),
+                expiryPlanBefore,
+            )
             .isNotNull()
-            .satisfies({ assertThat(it).isGreaterThan(TOTAL_FILES / 2L) })
+            .satisfies({ assertThat(it).isGreaterThan(PAGE.toLong() * (ENDED_EVERY - 1) * 8 / 10) })
         assertThat(before.buffers)
-            .describedAs("the scan costs the relation's heap:%n%s", expiryPlanBefore)
-            .isGreaterThanOrEqualTo(heapPages("hog_data_file") / 2)
+            .describedAs(
+                "and pay the heap for them — a page reads about %d of the manifest's %d pages:%n%s",
+                heapPages("hog_data_file") * PAGE / ENDED_BELOW_FLOOR,
+                heapPages("hog_data_file"),
+                expiryPlanBefore,
+            )
+            .isGreaterThanOrEqualTo(heapPages("hog_data_file") / 4)
     }
 
     @Test
@@ -378,28 +472,33 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
             .describedAs("no part of the predicate may be a post-scan filter:%n%s", expiryPlanAfter)
             .isNull()
 
-        // THE BUDGET IS ONE HEAP BUFFER PER ENDED ROW, derived from the
-        // rows rather than written down — and that is the honest cost
-        // of a SCATTERED population, which is the only kind production
-        // has. A budget of 4x would have passed against a clustered
-        // fixture that costs a tenth of this, which is exactly how the
-        // "91x" this file used to claim was arrived at.
+        // THE BUDGET IS ONE HEAP BUFFER PER ROW IN THE PAGE, not per
+        // ENDED ROW, and that difference is the property paging bought.
+        // Scattered rows cost a heap fetch each — the honest cost of the
+        // only population production has — but the scan now stops at
+        // the page, so the figure does NOT move when the eligible set
+        // does. The fixture holds twice the page in eligible rows for
+        // exactly this reason: if the plan still read the whole set,
+        // this assertion would fail at 2x rather than pass quietly.
         val ended = endedBelowFloor()
         val before = scanNode(expiryPlanBefore, "hog_data_file")
         assertThat(ended)
-            .describedAs("the fixture must really hold the ended rows it thinks it does")
+            .describedAs("the fixture must hold MORE than one page of eligible rows")
             .isBetween(ENDED_BELOW_FLOOR * 8L / 10, ENDED_BELOW_FLOOR * 12L / 10)
+            .satisfies({ assertThat(it).isGreaterThan(PAGE.toLong()) })
         assertThat(after.buffers.toDouble())
             .describedAs(
-                "scattered ended rows cost a heap fetch each: %d buffers for %d ended rows " +
-                    "(%d before, over a %d-page manifest):%n%s",
+                "a page costs about its own size in heap buffers whatever is eligible: " +
+                    "%d buffers for a page of %d, with %d rows eligible (%d before, over a " +
+                    "%d-page manifest):%n%s",
                 after.buffers,
+                PAGE,
                 ended,
                 before.buffers,
                 heapPages("hog_data_file"),
                 expiryPlanAfter,
             )
-            .isLessThanOrEqualTo(ended * BUFFERS_PER_ENDED_ROW)
+            .isLessThanOrEqualTo(PAGE * BUFFERS_PER_ENDED_ROW)
         // It must still WIN at a production-shaped ended fraction. The
         // ratio is `seq pages / ended rows`, so this assertion is the
         // one that goes soft as the fraction rises — deliberately, and
@@ -411,8 +510,8 @@ class V19DataFileEndedIndexMigrationIntegrationTest {
             "[#193] V19 (SCATTERED ended rows, the production shape): expiry's data-file DELETE " +
                 "scan node went from ${before.buffers} buffers (Seq Scan over a " +
                 "${heapPages("hog_data_file")}-page manifest, ${before.rowsRemovedByFilter} rows " +
-                "removed by filter) to ${after.buffers} (Index Scan using $INDEX, Index Searches " +
-                "${after.indexSearches}) for $ended ended rows — " +
+                "removed by filter) to ${after.buffers} (${after.line.substringBefore(" (actual")}, " +
+                "Index Searches ${after.indexSearches}) for a page of $PAGE with $ended eligible — " +
                 "${"%.1f".format(before.buffers.toDouble() / after.buffers)}x at an " +
                 "${"%.1f".format(100.0 * ended / TOTAL_FILES)}%% ended fraction",
         )

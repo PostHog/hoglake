@@ -90,6 +90,115 @@ object VerifyGauges {
 }
 
 /**
+ * `hoglake_expiry_purge_remaining{catalog}` — file rows still eligible
+ * below the floor after the catalog's last expiry sweep, SATURATING at
+ * `ExpiryService.PURGE_REMAINING_CAP`.
+ *
+ * A GAUGE BECAUSE THE QUESTION IS "HOW FAR BEHIND", which a counter
+ * cannot answer. `hoglake_expiry_purge_truncated_total` says the purge
+ * stopped early; this says by how much, so an alert can separate "one
+ * sweep spilled over" from "the backlog is growing". Published 0 by a
+ * drained sweep rather than left absent — `VerifyGauges`' rule, and for
+ * its reason: an alert keys on `> 0` and a healthy catalog should be a
+ * published zero.
+ *
+ * SET BY THE SWEEP, not by the metrics sampler, because it is a property
+ * of a run rather than of the catalog's state: the sweep has just
+ * counted it (and only when it stopped early, since the count is itself
+ * a capped scan), and recomputing it on the sampler's cadence would pay
+ * that scan on catalogs that are perfectly healthy.
+ */
+object ExpiryGauges {
+    /**
+     * The MultiGauge and the registry it belongs to, held as a pair for
+     * `VerifyGauges`' reason: `Metrics.bind` can be called again (tests
+     * bind a fresh registry per case) and a MultiGauge registered
+     * against the old one would publish into a registry nothing scrapes.
+     */
+    @Volatile
+    private var bound: Pair<MeterRegistry, MultiGauge>? = null
+
+    private val latest = java.util.concurrent.ConcurrentHashMap<String, Double>()
+
+    private fun gauge(): MultiGauge? {
+        val registry = Metrics.boundRegistry ?: return null
+        bound?.let { (boundRegistry, gauge) -> if (boundRegistry === registry) return gauge }
+        val gauge =
+            MultiGauge.builder("hoglake_expiry_purge_remaining")
+                .description("File rows still eligible below the expiry floor after the last sweep (0 = drained)")
+                .register(registry)
+        bound = registry to gauge
+        return gauge
+    }
+
+    /**
+     * Record [remaining] for [catalog] and republish every catalog this
+     * process has swept.
+     *
+     * EVERY CATALOG, not just this one: `MultiGauge.register` with
+     * `overwrite = true` replaces the whole row set, so publishing one
+     * row at a time would delete the others on every sweep and leave a
+     * series that flickered between catalogs.
+     */
+    fun publish(
+        catalog: String,
+        remaining: Long?,
+    ) {
+        // NaN for an unknown, which is what Prometheus has for "no
+        // value" — an alert on `> 0` does not fire on it, and neither
+        // does it fire on a fabricated zero that would have claimed the
+        // purge drained. `hoglake_expiry_purge_truncated_total` is the
+        // series that still moves in that state, which is why it and not
+        // this gauge is the one the README nominates for the alert.
+        latest[catalog] = remaining?.toDouble() ?: Double.NaN
+        val gauge = gauge() ?: return
+        gauge.register(
+            latest.entries.map { (name, value) -> MultiGauge.Row.of(Tags.of("catalog", name), value) },
+            true,
+        )
+    }
+
+    /**
+     * Forget every catalog not in [names] — the set the sweep just
+     * enumerated.
+     *
+     * Without it a DROPPED catalog's row is republished at its last value
+     * forever: `latest` only ever gains keys, and the publish deliberately
+     * writes every key it holds (a one-row `register(..., true)` would
+     * delete the siblings). A gauge that keeps claiming a deleted
+     * catalog is 40,000 rows behind is worse than no gauge, because it is
+     * the kind of alert nobody can close.
+     *
+     * Called by the fleet sweep, which is the only caller that knows the
+     * whole set; a single-catalog sweep adds a key and removes none.
+     *
+     * AN EMPTY SET IS AUTHORITATIVE, not a no-op, and the difference is
+     * the last catalog on an instance. `runOnceAllCatalogs` enumerates
+     * the catalogs and then calls this with what it found, so an empty
+     * set means "this instance has none" — and an early return there
+     * would republish the dropped one's backlog forever, which is
+     * exactly the unclosable alert this function exists to prevent. The
+     * caller that must not clear everything is a SINGLE-catalog sweep,
+     * and that one does not call this at all.
+     */
+    fun retain(names: Set<String>) {
+        val gone = latest.keys.filterNot { it in names }
+        if (gone.isEmpty()) return
+        gone.forEach { latest.remove(it) }
+        gauge()?.register(
+            latest.entries.map { (name, value) -> MultiGauge.Row.of(Tags.of("catalog", name), value) },
+            true,
+        )
+    }
+
+    /** Forget the registry binding and the values (tests). */
+    fun clear() {
+        bound = null
+        latest.clear()
+    }
+}
+
+/**
  * One catalog's live totals, as of the last metrics sample.
  *
  * Retained rather than recomputed: the sampler already produces these

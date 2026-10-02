@@ -698,6 +698,53 @@ export interface ExpiryResult {
    * which is undefined-safe.
    */
   offsets_released?: Int64;
+  /**
+   * Data-file rows the sweep's second phase DELETED below the floor,
+   * in bounded pages outside the per-catalog commit lock. Equal to
+   * `data_files_queued` by construction (one statement deletes the row
+   * and queues its path).
+   */
+  data_files_purged?: Int64;
+  /** Pages that purge ran, across its delete-vector and data-file arms. */
+  purge_pages?: Int64;
+  /**
+   * Purge pages that threw. Nonzero means the purge is not draining
+   * even though the floor keeps advancing — the one expiry counter
+   * that is a problem rather than a measurement.
+   */
+  purge_failures?: Int64;
+  /**
+   * The purge stopped with work left: the run budget, a failed page, or
+   * a delete-vector arm that did not drain.
+   *
+   * Optional AND never filled in on read, unlike the counters beside
+   * it: the server's ledger normalizer fills integers, and this is a
+   * boolean. `=== true` is the guard; `undefined` means a run that
+   * predates the two-phase sweep.
+   */
+  purge_truncated?: boolean;
+  /**
+   * File rows still eligible when a truncated purge stopped, saturating
+   * at 100,000 per table. 0 when the purge drained.
+   *
+   * ABSENT MEANS UNKNOWN, not zero, and unlike the counters beside it
+   * this one is never filled in on read: the server's count is
+   * best-effort under a 5 s bound, and a zero beside
+   * `purge_truncated: true` would contradict itself. Guard with
+   * `positive()` and treat absence as "no number to show".
+   */
+  purge_remaining?: Int64;
+  /**
+   * Times the floor advance halved HOGLAKE_EXPIRY_BATCH after its
+   * statement bound fired. Zero on a healthy catalog.
+   */
+  advance_halvings?: Int64;
+  /**
+   * Times a purge page halved after failing. For an all-timeouts sweep
+   * these are the only evidence of where the budget went, which is why
+   * they are on the wire and not only in Prometheus.
+   */
+  purge_halvings?: Int64;
 }
 
 export interface CleanupResult {
