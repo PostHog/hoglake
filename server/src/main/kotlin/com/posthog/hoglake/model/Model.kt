@@ -1240,6 +1240,112 @@ data class ExpiryResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val offsetsReleased: Long = 0,
+    /**
+     * `hog_data_file` rows phase B deleted below the floor.
+     *
+     * EQUAL TO [dataFilesQueued] BY CONSTRUCTION, and both are kept
+     * because they answer different questions and the identity between
+     * them is the thing worth being able to see. The page's delete and
+     * its `hog_file_removal` insert are ONE statement (the
+     * `RETURNING`-fed CTE in `ExpiryService.DATA_FILE_EXPIRY_SQL`), so a
+     * row cannot be purged without its path being queued for the
+     * cleanup drain or the other way round — which is what makes a
+     * crash between the two phases, or a page that times out, leave no
+     * orphaned object. If these two ever disagree on a ledger row,
+     * something has split that statement.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val dataFilesPurged: Long = 0,
+    /**
+     * Pages phase B ran, across its data-file arm (whose pages also take
+     * the vectors riding their files) and its superseded-vector arm.
+     * Pages x `HOGLAKE_EXPIRY_PURGE_PAGE` is the row bound the sweep
+     * actually spent.
+     *
+     * AN EMPTY PAGE IS NOT COUNTED, and that is load-bearing rather than
+     * tidy: each arm must run one page to discover that nothing is
+     * eligible, so counting those made every idle sweep report 2 — which
+     * defeated the console's hide-quiet filter for every expiry row on a
+     * fleet sweeping every 15 seconds.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val purgePages: Long = 0,
+    /**
+     * Pages that THREW — a statement bound fired, or the database was
+     * unreachable.
+     *
+     * Separate from the row counters because 0 rows is the same number
+     * for an idle sweep and for one whose every page timed out, and the
+     * second is the state that matters: the purge would attempt the same
+     * first page forever while the floor kept advancing and the console
+     * kept reading healthy. Pages already committed are still counted as
+     * purged — they are separate transactions, so a failure on page 11
+     * does not un-delete pages 1-10. Rides
+     * `hoglake_expiry_purge_failures_total`.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val purgeFailures: Long = 0,
+    /**
+     * True when phase B stopped with work possibly left: the run budget
+     * expired, a page failed even after halving its way down to one row,
+     * or the catalog's floor could not be read.
+     *
+     * A SUPERSET OF "the budget fired", deliberately. Every one of those
+     * stops has the same consequence for an operator — rows below the
+     * floor survived this sweep — and a flag that only covered the
+     * budget would read `false` for the two cases that are worth acting
+     * on. The log line names which one it was, and
+     * `hoglake_expiry_purge_truncated_total` is the alertable form.
+     *
+     * A BOOLEAN, so it is NOT in `MaintenanceDto`'s
+     * `EXPIRY_COUNTERS_ADDED_LATER` list: that normalizer fills a
+     * missing field with the integer 0, which is not a boolean, and a
+     * ledger row written before this field existed is better left
+     * absent (the console's guard is undefined-safe) than filled with a
+     * type its schema does not declare.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val purgeTruncated: Boolean = false,
+    /**
+     * File rows still eligible when a truncated phase B stopped — BOTH
+     * tables, summed — each SATURATING at
+     * `ExpiryService.PURGE_REMAINING_CAP`. Counting only `hog_data_file`
+     * made a purge stopped inside the vector arm report
+     * `truncated = true, remaining = 0`, which reads as "stopped,
+     * nothing left".
+     *
+     * Counted only when [purgeTruncated] — an uncounted "how far behind
+     * am I" is a backlog nobody sees until the table is the problem, and
+     * an UNCAPPED count is itself the unbounded read this change exists
+     * to remove. A value at the cap means "behind by more than any sweep
+     * will catch up", which is the only reading that changes what an
+     * operator does.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val purgeRemaining: Long = 0,
+    /**
+     * Times phase A halved `HOGLAKE_EXPIRY_BATCH` after its statement
+     * bound fired, and retried inside the same run.
+     *
+     * ON THE WIRE AND NOT ONLY IN PROMETHEUS, because for one failure
+     * mode the halvings are the ONLY evidence: a purge whose every page
+     * times out spends its budget on rungs and reports no rows, and an
+     * operator reading `GET /maintenance/runs` would otherwise see a
+     * truncated sweep with no explanation of where the time went. The
+     * counters say "a knob is too large for this catalog's work" and the
+     * ledger is where that is read per run.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val advanceHalvings: Long = 0,
+    /**
+     * Times a phase-B page halved after failing, across both arms. See
+     * [advanceHalvings] for why this is on the wire, and
+     * `ExpiryService.settledPage` for why the reduced size survives the
+     * sweep — a standing nonzero here with a falling
+     * `data_files_purged` is a ladder that is not converging.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val purgeHalvings: Long = 0,
 )
 
 /** One compaction run's outcome (POST /maintenance/compact + the loop). */

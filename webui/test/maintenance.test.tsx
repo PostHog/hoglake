@@ -74,6 +74,98 @@ describe("maintenance outcome and history", () => {
     expect(isQuietRun(idle)).toBe(true);
   });
 
+  it("calls an idle expiry sweep quiet even though the purge ran pages", () => {
+    // THE REGRESSION THIS PINS, found against a running server: the
+    // server used to count the empty page each arm runs before it can
+    // see that nothing is eligible, so EVERY idle sweep reported
+    // `purge_pages = 2` — and with `purge_pages` in the positive list
+    // the hide-quiet toggle stopped hiding any expiry row on a fleet
+    // sweeping every 15 s. Both halves are fixed; this asserts the
+    // payload either half would break.
+    const idle = {
+      ...expiry,
+      result: {
+        ...expiry.result!,
+        snapshots_expired: "0",
+        data_files_queued: "0",
+        delete_files_queued: "0",
+        offsets_released: "0",
+        floored_by_consumer: undefined,
+        purge_pages: "2",
+        purge_failures: "0",
+        purge_remaining: "0",
+        purge_truncated: false,
+        advance_halvings: "0",
+        purge_halvings: "0",
+      },
+    } as MaintenanceRun;
+    expect(isQuietRun(idle)).toBe(true);
+  });
+
+  it("never calls an expiry sweep quiet when its file purge could not finish", () => {
+    // The two-phase sweep: the floor advances under the commit lock,
+    // the file rows go in bounded pages afterwards. A sweep whose purge
+    // ran out of budget advanced the floor and left rows below it, and
+    // every counter in the row can still read zero — so the flag, not a
+    // count, is what keeps it visible.
+    const truncated = {
+      ...expiry,
+      result: {
+        ...expiry.result!,
+        snapshots_expired: "0",
+        data_files_queued: "0",
+        delete_files_queued: "0",
+        floored_by_consumer: undefined,
+        purge_truncated: true,
+        purge_remaining: "100000",
+      },
+    } as MaintenanceRun;
+    expect(isQuietRun(truncated)).toBe(false);
+    render(<RunSummary run={truncated} />);
+    expect(
+      screen.getByText(/purge truncated, 100,000 rows left/),
+    ).toBeInTheDocument();
+
+    cleanupRender();
+    // A row from a build that predates the flag carries no field at all,
+    // and `undefined` must not read as "truncated".
+    const legacy = {
+      ...truncated,
+      result: {
+        ...truncated.result!,
+        purge_truncated: undefined,
+        purge_remaining: "0",
+      },
+    } as MaintenanceRun;
+    expect(isQuietRun(legacy)).toBe(true);
+  });
+
+  it("shows halvings as an issue, not as a quiet sweep, when nothing else moved", () => {
+    // The all-timeouts sweep: every page hit its statement bound, so the
+    // row counts are zero and the only evidence is the rungs. Before the
+    // badge keyed on them this row showed "purge truncated" and nothing
+    // about why the budget went nowhere.
+    const laddering = {
+      ...expiry,
+      result: {
+        ...expiry.result!,
+        snapshots_expired: "0",
+        data_files_queued: "0",
+        delete_files_queued: "0",
+        floored_by_consumer: undefined,
+        purge_truncated: true,
+        purge_remaining: "4000",
+        purge_halvings: "3",
+      },
+    } as MaintenanceRun;
+    expect(isQuietRun(laddering)).toBe(false);
+    render(<RunSummary run={laddering} />);
+    expect(screen.getByText(/3 page halvings/)).toBeInTheDocument();
+    cleanupRender();
+    render(<RunOutcomeBadge run={laddering} />);
+    expect(screen.getByText("issues")).toBeInTheDocument();
+  });
+
   it("summarises a verify ledger row by its failing checks and their counts", () => {
     // The runs table's outcome column: a passing report is a badge and
     // nothing else, a failing one names WHICH checks and how many
@@ -354,6 +446,10 @@ describe("isQuietRun", () => {
     ["expiry", "snapshots_expired"],
     ["expiry", "data_files_queued"],
     ["expiry", "delete_files_queued"],
+    ["expiry", "purge_failures"],
+    ["expiry", "purge_remaining"],
+    ["expiry", "advance_halvings"],
+    ["expiry", "purge_halvings"],
     ["cleanup", "removed"],
     ["cleanup", "missing"],
     ["cleanup", "still_referenced"],

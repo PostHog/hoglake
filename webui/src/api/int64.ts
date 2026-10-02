@@ -94,6 +94,15 @@ const INT64_FIELDS = new Set([
   "snapshots_expired",
   "data_files_queued",
   "delete_files_queued",
+  "data_files_purged",
+  "purge_pages",
+  "purge_failures",
+  // purge_truncated is a BOOLEAN and deliberately absent: the reviver
+  // only rewrites `number` values, so listing it would be inert, and
+  // listing it would suggest the flag is a count.
+  "purge_remaining",
+  "advance_halvings",
+  "purge_halvings",
   "removed",
   "missing",
   "still_referenced",

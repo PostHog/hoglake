@@ -486,14 +486,19 @@ behind permanently unreleasable, which is the bug being fixed.
 Retention is a **catalog property** (`PATCH /options`:
 `snapshot_retention_seconds`, `consumer_floor`), enforced continuously
 by background sweeps (`service/ExpiryService.kt`), not by an external
-scheduler. Each sweep is one bounded transaction under the commit lock:
-compute the new floor as the minimum of (age cutoff, head−1, current
+scheduler. A sweep is **two phases**, and the split is the fix for the
+2026-10-01 prod-us incident (see below).
+
+**Phase A — the floor advance, under the commit lock, one bounded
+transaction** carrying its own `statement_timeout` (derived:
+`min(session/4, admission/2) / 11` statements, 1,363 ms each at the
+defaults, so the whole hold is at most half the 30 s admission window).
+Compute the new floor as the minimum of (age cutoff, head−1, current
 floor + batch, and — when `consumer_floor` — the **minimum consumer
 offset**, so expiry can never outrun a lagging consumer; the pinning
-consumer is named in the result and the audit line). Then: unreachable
-file rows are deleted (FK cascades take their stats and partition
-values) with their paths queued, and snapshots are removed with **range
-deletes**, never id lists. `earliest_snapshot_id` advances — capturing
+consumer is named in the result and the audit line). Then snapshots are
+removed with **range deletes**, never id lists, and
+`earliest_snapshot_id` advances — capturing
 the new floor snapshot's `snapshot_time` into
 `hog_catalog.earliest_snapshot_time` in the same update, so once the
 rows below the floor are gone the catalog can still say WHEN the floor
@@ -505,7 +510,159 @@ DDL tables (`hog_table_version`, `hog_column`, `hog_partition_spec`,
 `hog_sort_spec`, `hog_view`): rows with
 `end_snapshot <= earliest_snapshot_id` are invisible at every retained
 snapshot and are deleted (spec fields cascade), so DDL churn cannot
-grow the metadata without bound.
+grow the metadata without bound. Those five tables are bounded by DDL
+volume rather than by file volume — thousands of rows on prod-us, not
+millions — which is why they stay in the locked transaction while the
+file rows do not.
+
+**Phase B — the file purge, outside every lock, paged.** A
+`hog_data_file` or `hog_delete_file` row whose `end_snapshot` is at or
+below the committed floor is unreadable (a read below the floor is
+refused 410) and its *eligibility* is immutable: every writer of
+`end_snapshot` either carries `end_snapshot IS NULL` or takes only ids it
+re-read as live under the commit lock, and a commit tail writes the NEW
+HEAD there, which is above the floor by definition. So the rows need no
+lock to delete — and the page's data-file `DELETE` repeats the
+eligibility predicate beside its `ctid` array anyway, because a `ctid`
+array is not a qual a concurrently-updated row gets re-checked against.
+What that buys is a SKIPPED ROW: the page purges one fewer than it
+examined, the walk carries on, and the row waits for a later sweep. It is
+a complete defence only because the vector delete keys off what the
+data-file delete actually removed, so a skipped file keeps its vectors
+instead of losing them to a statement that assumed it was going.
+
+**Each page is one statement in one transaction** under its own 5 s
+`statement_timeout`: it picks up to `HOGLAKE_EXPIRY_PURGE_PAGE` eligible
+data files, deletes them, deletes the delete vectors of the files it
+actually removed (live or superseded — the FK cascade would otherwise
+take them with no `hog_file_removal` row, which is a permanently leaked
+puffin object), and inserts every path into the cleanup queue, all in the
+same statement. So
+a path is queued iff its row is gone, the vector ordering is a fact about
+that page rather than a claim about a whole table, and a crash between
+the phases can orphan nothing. A second, separate arm pages the
+*superseded* vectors — the ones whose own `end_snapshot` is below the
+floor and whose data file is still live — and is probed with an `EXISTS`
+first, because it has no index yet (the partial
+`(catalog_id, end_snapshot)` index that the arm split now makes choosable
+is ticketed with the migration it needs).
+
+**A page is `HOGLAKE_EXPIRY_PURGE_PAGE` data files, not that many ROWS.**
+Each file brings its cascade (~26 `hog_file_column_stats` rows and its
+partition values) and its vectors, and while
+`hog_delete_file_one_live_per_data_file` bounds *live* vectors to one per
+file, nothing bounds *superseded* ones — vectors only grow, and each
+supersession leaves an ended row. So one page deletes `page × (1 +
+supersession depth)` vector rows and queues that many paths. On every
+table any writer in the fleet produces today that depth is 0–1 (millpond
+appends and never deletes; a delete commit supersedes at most once per
+flush), which is why the default page is sized on the stats cascade — but
+a table with deep vector history is the shape that makes a page expensive
+in a way the row count does not show, and the 5 s statement bound plus
+the halving ladder are what bound it. The vector delete probes
+`hog_delete_file_data_lookup` once per deleted file (measured: a nested
+loop, ~2.2 buffers a probe against a 44,000-row vector relation), so the
+*lookup* cost is O(page) whatever the depth; it is the rows it finds that
+are not.
+
+**A floor of 0 skips phase B entirely** — nothing can satisfy
+`end_snapshot <= 0` — so a catalog that has NEVER expired pays nothing at
+all. One that expired before its retention was switched off keeps its
+floor, and still pays an index-only data-file page plus the superseded
+probe every sweep; that is deliberate, because its backlog still has to
+drain.
+
+The rate, done properly — `BackgroundLoops` is fixed **delay**, not fixed
+period, and `runOnceAllCatalogs` sweeps serially:
+
+    rows/sweep      = HOGLAKE_EXPIRY_PURGE_BUDGET_MS / page cost
+    period          = HOGLAKE_EXPIRY_INTERVAL_MS + Σ (every catalog's sweep)
+    rows/min (hot)  = rows/sweep × 60000 / period
+
+At the compiled defaults (page 1,000, budget 10 s) and production's
+measured 700–870 µs per file that is **10,000–14,000 rows a sweep**. With
+K catalogs behind on one maintenance pod and prod-us's 15 s interval the
+hot catalog gets `12,000 × 60/(15 + 10K)` rows a minute: **~29k at K=1,
+~16k at K=3, ~11k at K=5** — not the 40–56k a fixed-period reading would
+suggest. Compaction retires ~12,288 files per **~110 s wave** (six groups
+of 2,048), i.e. ~6,700 a minute, so the margin is ~4× at K=1 and is gone
+somewhere around K=8. When it goes, the symptom is a standing
+`purge_truncated` and a rising `hoglake_expiry_purge_remaining`, and the
+levers are fewer catalogs per maintenance pod or a larger budget — not a
+larger page.
+
+The per-row cost is the row plus its cascade, not a constant of the code:
+`ExpiryPurgeCostMeasurement` measures a 100,000-row fixture with all
+three cascades a production row carries (26 `hog_file_column_stats` rows,
+one `hog_file_partition_value`, the vector probe) and prints the figure
+and the ratio on every run — production's stats relation is 66 GiB and
+does not fit cache, which is the distance from tens of microseconds to
+870. A page that cannot finish inside its 5 s bound is **halved and
+retried inside the same run**, down to a page of one, with the halvings
+counted in `hoglake_expiry_halvings_total{phase="purge"}`; without that,
+one poison page would be retried first on every sweep forever and nothing
+would drain. `HOGLAKE_EXPIRY_PURGE_PAGE` (default 1,000, refused above
+50,000 at boot) and `HOGLAKE_EXPIRY_PURGE_BUDGET_MS` (default 10,000; 0
+with the loop ON is refused at boot, because it would advance the floor
+forever and purge nothing while every ledger row read healthy) are the
+knobs. Neither has a chart template today, so changing one in an
+environment needs chart work first. `HOGLAKE_EXPIRY_BATCH` is unchanged
+in meaning: it bounds SNAPSHOTS, and therefore phase A's
+`hog_snapshot_change` cascade — and it is halved and retried the same way
+when phase A's own statement bound fires
+(`hoglake_expiry_halvings_total{phase="advance"}`).
+
+**What to alert on.** A sweep that spends its budget, hits a failed page,
+or cannot read the floor reports `purge_truncated` with `purge_remaining`
+(saturating at 100,000) and `purge_failures` on its ledger row, and the
+same facts are series: `hoglake_expiry_purge_truncated_total` (the one to
+alert on — a chronically budget-starved purge never *fails*, so
+`…_purge_failures_total` stays at zero and `…_purge_rows_total` looks
+healthy forever), `hoglake_expiry_purge_remaining` (a gauge: how far
+behind), `hoglake_expiry_purge_failures_total` (a page that could not
+finish even at one row), `hoglake_expiry_advance_failures_total` (the
+floor itself is stuck — retention is not being enforced at all) and
+`hoglake_expiry_halvings_total{phase}` (a knob is wrong for the work).
+The halvings are also on the ledger row (`purge_halvings`,
+`advance_halvings`) and badged in the console, because for a sweep whose
+every page hit the 5 s bound they are the only count that moves: the rows
+are zero and the pages are the rungs. A reduced page size is carried to
+the next sweep, so that ladder converges in a few sweeps instead of
+restarting from the configured page every time. **Phase B
+runs even when phase A throws**, and even when phase A advanced nothing,
+so a failed advance does not starve the purge; the ledger row is `failed`
+and still carries what the purge did.
+
+**The consequence for observers:** ended rows below the floor can now
+exist for a few sweeps. `/verify`'s `expiry_floor` therefore asserts its
+`hog_data_file` / `hog_delete_file` arm only against a sweep whose own
+ledger row reports the purge DRAINED; a drained purge that still left
+rows below the floor is still a violation, because it means the purge's
+predicate and the floor advance disagree. And one counter can now fire
+from normal operation: two file rows may legitimately share one path
+(`V16`'s index is non-unique for exactly this reason), and purging one
+while the other survives queues a path the catalog still claims, which is
+what `removal_queue` and the drain's `still_referenced` report — a
+counter AGENT.md's invariant 4 calls alerted. Where the surviving row is
+LIVE that was already true before this change; what is new is that two
+rows both *eligible* can land in different pages, so the window can also
+last a page (a sweep, if the budget stops between them). Nothing is
+deleted in either case — refusing is the drain's whole purpose — and
+closing it means expiry taking each page's whole path-closure, which is a
+separate change.
+
+**Why it is two phases.** It used to be one, and the file GC rode it:
+one unbounded `DELETE FROM hog_data_file WHERE end_snapshot <= floor`
+under the commit lock, plus its cascade into `hog_file_column_stats`
+(26 rows per file, 66 GiB), `hog_file_partition_value` and
+`hog_delete_file`. Compaction 1.3.7 commits six groups of up to 2,048
+files, so each sweep met one whole compaction wave: 12,288 rows, 17–25 s
+of lock hold per minute, ten commits queued behind it when sampled, the
+commit-lock wait p99 pinned at the 30 s admission bound for sixteen
+hours, and API p99 of 20–60 s across routes because parked commits held
+the API pods' pool connections — with RDS idle at 8% CPU the whole time.
+Shortening the sweep interval to 15 s shortens each hold and leaves the
+duty cycle where it was.
 
 Physical deletion is decoupled and paranoid
 (`service/CleanupService.kt`): the queue is a *suggestion*. At drain
@@ -1238,7 +1395,10 @@ The catalog reports on itself instead of waiting for ops SQL:
     ExpiryService's own floor query with the superseded-offset release
     applied; and no versioned row with
     `end_snapshot <= earliest_snapshot_id` survives the sweep that
-    advanced the floor (invariant 5).
+    advanced the floor (invariant 5) — for the five DDL tables
+    always, and for `hog_data_file` / `hog_delete_file` only after a
+    sweep whose purge drained, since those two are purged in pages
+    after that transaction commits (see §Retention).
   - `visibility_bounds` — every versioned row's `begin`/`end` pair is
     inside the catalog's snapshot range and correctly ordered, and
     `hog_table.created_snapshot <= dropped_snapshot` when dropped

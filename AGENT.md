@@ -239,6 +239,15 @@ there would break that gate on every build.
    (`hog_table_version`/`hog_column`/`hog_partition_spec`/`hog_sort_spec`/
    `hog_view`) whose `end_snapshot <= earliest_snapshot_id` — invisible
    at every retained snapshot, so DDL churn cannot grow them unbounded.
+   The FILE rows below the floor are the exception, and deliberately:
+   a sweep advances the floor under the commit lock and then purges
+   `hog_data_file`/`hog_delete_file` in bounded pages OUTSIDE it, so an
+   ended row below the floor is legitimate state for a few sweeps. It is
+   unreadable (410) and immutable while it sits there, each page queues
+   its paths in the same statement that deletes its rows, and
+   `/verify`'s `expiry_floor` asserts that arm only against a sweep whose
+   ledger row reports the purge drained. server/README.md §Retention has
+   the rate arithmetic and the 2026-10-01 incident it comes from.
 6. **Versioned-row visibility**: a row is visible at S iff
    `begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot)`.
    Every read path uses exactly this predicate.

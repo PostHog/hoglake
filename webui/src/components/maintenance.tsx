@@ -167,7 +167,29 @@ export function isQuietRun(run: MaintenanceRun): boolean {
           // even when it expired nothing: on a retention-disabled
           // catalog that is the only work it can report.
           r.offsets_released,
-        ].some(positive) && !r.floored_by_consumer
+          // A purge that could not finish, or whose pages threw, is
+          // work left undone rather than an idle sweep. Folding one of
+          // these away as quiet is how a purge that stops draining looks
+          // like a healthy instance.
+          //
+          // `purge_pages` is deliberately NOT here. The server does not
+          // count an empty page, so a positive value does mean work —
+          // but it is work this list already describes through
+          // `data_files_queued` / `delete_files_queued`, and keying the
+          // filter on a page COUNT once made every expiry row loud: an
+          // earlier build counted the two probe pages an idle sweep
+          // runs, every sweep on the fleet reported `purge_pages = 2`,
+          // and the hide-quiet toggle stopped hiding anything.
+          r.purge_failures,
+          r.purge_remaining,
+          // A halving is a knob discovering it was wrong, and for a
+          // sweep whose every page timed out it is the only count that
+          // moves — the rows are zero and the pages are the rungs.
+          r.advance_halvings,
+          r.purge_halvings,
+        ].some(positive) &&
+        !r.floored_by_consumer &&
+        r.purge_truncated !== true
       );
     }
     case "cleanup": {
@@ -236,7 +258,19 @@ export function RunOutcomeBadge({ run }: { run: MaintenanceRun }) {
     (run.task === "cleanup" && positive(run.result?.still_referenced)) ||
     (run.task === "verify" && run.result?.status === "fail") ||
     (run.task === "hydrator" && run.result && "failed" in run.result && positive(run.result.failed)) ||
-    (run.task === "retirement" && positive(run.result?.skipped_tables));
+    (run.task === "retirement" && positive(run.result?.skipped_tables)) ||
+    // A purge page that threw, a purge that could not finish, or a knob
+    // the work has outgrown. The budget stopping is NOT on its own an
+    // issue — that is the knob working — but a truncated purge that also
+    // halved, or one that reports rows left behind, is a sweep an
+    // operator wants to see without reading the summary: an
+    // all-timeouts sweep purges nothing, so `purge_failures` alone
+    // would leave it looking merely quiet.
+    (run.task === "expiry" &&
+      (positive(run.result?.purge_failures) ||
+        positive(run.result?.purge_halvings) ||
+        positive(run.result?.advance_halvings) ||
+        run.result?.purge_truncated === true));
   if (run.status === "ok" && issues) {
     return <span className="badge stats-failed" title="Invocation completed, but its result contains failures or violations">issues</span>;
   }
@@ -285,6 +319,27 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {positive(r.offsets_released) && (
             <span className="badge">
               released {formatCount(r.offsets_released)} superseded offsets
+            </span>
+          )}
+          {positive(r.purge_failures) && (
+            <span className="badge badge-warn">
+              {formatCount(r.purge_failures)} purge pages failed
+            </span>
+          )}
+          {r.purge_truncated === true && (
+            <span className="badge badge-warn">
+              purge truncated
+              {positive(r.purge_remaining) &&
+                `, ${formatCount(r.purge_remaining)} rows left`}
+            </span>
+          )}
+          {(positive(r.purge_halvings) || positive(r.advance_halvings)) && (
+            <span className="badge badge-warn" title={HALVING_TITLE}>
+              {positive(r.purge_halvings) &&
+                `${formatCount(r.purge_halvings)} page halvings`}
+              {positive(r.purge_halvings) && positive(r.advance_halvings) && ", "}
+              {positive(r.advance_halvings) &&
+                `${formatCount(r.advance_halvings)} batch halvings`}
             </span>
           )}
           {r.floored_by_consumer && (
@@ -443,12 +498,25 @@ const HEAP_BUDGET_TITLE =
   "raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES on a pod with enough " +
   "memory, or remove the table's sort order.";
 
+// For an operator who sees "7 page halvings" and does not know the
+// mechanism. The count is pages, not rows.
+const HALVING_TITLE =
+  "Expiry halved a unit of work after it hit its own time limit, and " +
+  "retried the smaller unit in the same run. For the file purge the " +
+  "reduced page size is kept for the next sweep too, so the sweep after " +
+  "this one starts at a size that works. Nothing is lost or skipped — the " +
+  "rows it did not reach are purged by a later sweep. A number that keeps " +
+  "appearing means HOGLAKE_EXPIRY_PURGE_PAGE (or HOGLAKE_EXPIRY_BATCH, " +
+  "for batch halvings) is larger than this catalog's tables can finish in " +
+  "the time allowed.";
+
 const HIDE_QUIET_TITLE =
   "Hide runs that succeeded and changed nothing: every pod records a row " +
   "for every sweep of every catalog, so most rows are no-ops. A failed run " +
   "is never hidden, and neither is one carrying a warning — compaction " +
   "failures or skips, still-referenced cleanup entries, an expiry floored " +
-  "by a consumer — even when its counts are all zero. Files held back by " +
+  "by a consumer, an expiry whose file purge could not finish or had to " +
+  "halve its page — even when its counts are all zero. Files held back by " +
   "the compaction heap budget do not count: that is the configuration " +
   "working, not a warning. The table pages back " +
   "through the ledger to fill a screen, up to a fixed number of requests, " +

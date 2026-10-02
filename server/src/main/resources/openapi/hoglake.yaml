@@ -1025,8 +1025,15 @@ paths:
         `end_snapshot <= earliest_snapshot_id` survives in
         `hog_data_file`, `hog_delete_file`, `hog_table_version`,
         `hog_column`, `hog_partition_spec`, `hog_sort_spec` or
-        `hog_view` — there is no lag window, since the sweep deletes
-        them in the transaction that advances the floor.
+        `hog_view`. That last one has two timings. The five DDL tables
+        have no lag window, since the sweep's fifth step deletes them
+        in the transaction that advances the floor. `hog_data_file` and
+        `hog_delete_file` do: their rows are purged in bounded pages
+        after that transaction commits, outside the commit lock, so
+        they are asserted only against a sweep whose ledger row reports
+        the purge drained (`purge_truncated` false). A purge that
+        stopped early reports `purge_truncated` and `purge_remaining`
+        instead — a backlog, not a broken invariant.
 
         **visibility_bounds** — Invariant 6: a row is visible at S iff
         `begin_snapshot <= S AND (end_snapshot IS NULL OR S <
@@ -4322,7 +4329,16 @@ components:
       properties:
         snapshots_expired: { type: integer, format: int64 }
         data_files_queued: { type: integer, format: int64 }
-        delete_files_queued: { type: integer, format: int64 }
+        delete_files_queued:
+          type: integer
+          format: int64
+          description: >
+            Delete-vector (puffin) rows the sweep removed and queued for
+            cleanup: the vectors riding each purged data file, taken by
+            the SAME statement that takes the file because the FK cascade
+            would otherwise remove them with no queue row at all, plus
+            the superseded vectors whose own end_snapshot is below the
+            floor and whose data file is still live.
         new_earliest_snapshot_id: { type: integer, format: int64 }
         floored_by_consumer:
           type: string
@@ -4341,6 +4357,99 @@ components:
             no such field, and the ledger replays rows verbatim (the
             read path fills it with 0, which is what a run that
             predates the counter did).
+        data_files_purged:
+          type: integer
+          format: int64
+          description: >
+            Data-file rows the sweep's second phase DELETED below the
+            new floor, in bounded pages outside the per-catalog commit
+            lock. Equal to `data_files_queued` by construction: a page's
+            delete and its cleanup-queue insert are one statement, so a
+            row cannot go without its path being queued. (It does NOT
+            include the delete vectors that went with those rows —
+            `delete_files_queued` counts those.) Not required: a run
+            recorded before the counter existed has no such field, and
+            the ledger replays rows verbatim (the read path fills 0).
+        purge_pages:
+          type: integer
+          format: int64
+          description: >
+            Pages that purge ran, across its data-file and
+            superseded-vector arms. `purge_pages x
+            HOGLAKE_EXPIRY_PURGE_PAGE` is the row bound the sweep
+            actually spent. An EMPTY page is not counted, so an idle
+            sweep reports 0 rather than one page per arm. Not required,
+            for the reason above.
+        purge_failures:
+          type: integer
+          format: int64
+          description: >
+            Purge pages that threw — a statement bound fired, or the
+            database was unreachable. Reported separately because
+            `data_files_purged` alone is 0 for an idle sweep and for one
+            whose every page failed, and only the second needs acting
+            on: the floor keeps advancing either way. Pages already
+            committed still count as purged (each page is its own
+            transaction). Standing nonzero means the page size or the
+            statement bound needs looking at; nothing is corrupt and the
+            next sweep retries from the oldest eligible row. Not
+            required, for the reason above.
+        purge_truncated:
+          type: boolean
+          description: >
+            The purge stopped with work possibly left: the run budget
+            (HOGLAKE_EXPIRY_PURGE_BUDGET_MS) expired, a page failed even
+            at one row, or the catalog's floor could not be read.
+            `purge_remaining` says how far behind, counting both file
+            tables. THE FLAG TO ALERT ON is the matching counter
+            `hoglake_expiry_purge_truncated_total`: a purge that is
+            chronically budget-starved never fails, so the failure
+            counter stays at zero and the rows-purged rate looks healthy
+            while the backlog grows. Not required, and unlike the
+            counters beside it this one is NOT filled in on read: it is a
+            boolean, the ledger's normalizer fills integers, and a row
+            that predates the two-phase sweep is better left without the
+            flag than given a value of the wrong type.
+        purge_remaining:
+          type: integer
+          format: int64
+          description: >
+            File rows still eligible when a truncated purge stopped —
+            `hog_data_file` and `hog_delete_file` together — SATURATING
+            at 100,000 each, because a value at the cap means "behind by
+            more than a sweep can catch up", which is the only reading
+            that changes what an operator does. 0 when the purge drained,
+            and capped rather than exact because an uncapped count over
+            the eligible set is itself the unbounded read the paged purge
+            exists to remove. Also published as the gauge
+            `hoglake_expiry_purge_remaining`. Not required, for the
+            reason above.
+        advance_halvings:
+          type: integer
+          format: int64
+          description: >
+            Times the floor advance halved HOGLAKE_EXPIRY_BATCH after its
+            per-statement bound fired and retried inside the same run.
+            Zero is the expected value on a prod-us-shaped catalog (one
+            hog_snapshot_change row per changed object per snapshot, so a
+            10,000-snapshot batch is ~10-30k cascade rows); a standing
+            nonzero means the configured batch is too large for that
+            catalog's DDL shape. Also
+            `hoglake_expiry_halvings_total{phase="advance"}`. Not
+            required, for the reason above.
+        purge_halvings:
+          type: integer
+          format: int64
+          description: >
+            Times a phase-B page halved after failing, across both arms.
+            On the wire rather than only in Prometheus because for one
+            failure mode these are the only evidence: a purge whose pages
+            all hit their 5 s statement bound spends its budget on rungs
+            and purges nothing, and the reduced page size is carried to
+            the next sweep so the ladder converges. A standing nonzero
+            with a falling `data_files_purged` is a ladder that is not.
+            Also `hoglake_expiry_halvings_total{phase="purge"}`. Not
+            required, for the reason above.
 
     CleanupResult:
       type: object

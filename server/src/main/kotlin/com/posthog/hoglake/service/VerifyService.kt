@@ -794,8 +794,26 @@ class VerifyService(
                     "${rs.getLong("committed_snapshot")}, below the expiry floor " +
                     "${rs.getLong("earliest_snapshot_id")}"
             }
+        // The gate for the two tables expiry purges after the floor
+        // advance commits. Read ONCE per catalog rather than correlated
+        // per row: it is one indexed read of the newest expiry ledger
+        // row, and the answer is a property of the CATALOG's last sweep,
+        // not of any row.
+        val purgeDrained = lastPurgeDrained(h, catalogId)
         var survivors = Violations.NONE
-        for ((table, idColumn, scopeColumn) in BELOW_FLOOR_TABLES) {
+        for ((table, idColumn, scopeColumn, purgedLate) in BELOW_FLOOR_TABLES) {
+            // A below-floor ended file row is the DESIGNED intermediate
+            // state of a two-phase sweep, so the arm asserts the
+            // invariant only where it is actually claimed: after a sweep
+            // whose purge DRAINED. Skipping it otherwise is not a
+            // weakening — a purge that stops early says so on its own
+            // ledger row (`purge_truncated`, `purge_remaining`) and in
+            // `hoglake_expiry_purge_failures_total`, which are the
+            // signals for a BACKLOG. What survives here is the
+            // INVARIANT: a drained purge that still left rows below the
+            // floor means its predicate and the floor advance disagree,
+            // which is a bug no counter would show.
+            if (purgedLate && !purgeDrained) continue
             survivors +=
                 violations(
                     h,
@@ -818,6 +836,57 @@ class VerifyService(
         }
         return check("expiry_floor", EXPIRY_FLOOR_DESCRIPTION, pastHead + belowConsumerFloor + survivors)
     }
+
+    /**
+     * Did this catalog's most recent expiry run DRAIN its file purge?
+     *
+     * The ledger is the only place that fact lives, and it is the right
+     * place: the purge's own run row is what reports `purge_truncated`,
+     * and asking anything else would be inferring a sweep's outcome from
+     * the rows it was supposed to delete — which is the thing being
+     * checked.
+     *
+     * `false` when there is no such row at all, which is the honest
+     * answer rather than a cautious one: no ledger row means nobody can
+     * say whether a purge finished, so the arm it gates has nothing to
+     * assert. That happens on a catalog expiry has never swept, and on
+     * one whose rows the ledger's own retention
+     * (`HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS`) has purged after
+     * a long sweepless stretch.
+     *
+     * `false` for a FAILED run too: a sweep that threw may have thrown
+     * in phase A, before the purge ran at all, and its row carries no
+     * result to read.
+     *
+     * `true` when the field is ABSENT, which covers two shapes and
+     * means the same thing in both: a row written by a build that
+     * predates the two-phase sweep (where the purge WAS the floor
+     * advance's own transaction, so it always drained), and a row from
+     * this build whose purge drained — `purge_truncated` is
+     * `@JsonInclude(NON_DEFAULT)` on the stored model, so `false` is
+     * stored as nothing at all.
+     *
+     * Served by `hog_maintenance_run_recent (catalog_id, task, run_id
+     * DESC)` — one descent, one row.
+     */
+    private fun lastPurgeDrained(
+        h: Handle,
+        catalogId: Long,
+    ): Boolean =
+        h.createQuery(
+            """
+            SELECT status = 'ok' AND coalesce((result->>'purge_truncated')::boolean, false) = false
+                   AS drained
+            FROM hog_maintenance_run
+            WHERE catalog_id = :c AND task = 'expiry'
+            ORDER BY run_id DESC
+            LIMIT 1
+            """,
+        )
+            .bind("c", catalogId)
+            .mapTo(Boolean::class.javaObjectType)
+            .findOne()
+            .orElse(false)
 
     // ---- 8: versioned-row visibility bounds --------------------------------
 
@@ -1307,6 +1376,19 @@ class VerifyService(
             val table: String,
             val idColumn: String,
             val scopeColumn: String = "table_id",
+            /**
+             * True for the two tables expiry purges OUTSIDE the commit
+             * lock, after the floor advance has committed
+             * (`ExpiryService.purge`). A below-floor ended row in one of
+             * them is legitimate state for as long as the purge takes,
+             * so `expiry_floor` asserts their arm only against a sweep
+             * that reported its purge DRAINED — see
+             * [EXPIRY_FLOOR_DESCRIPTION] and [lastPurgeDrained].
+             * `visibility_bounds` uses the same list and does NOT care:
+             * its bounds are head-relative, and a purge-pending row
+             * satisfies them exactly as a purged one would.
+             */
+            val purgedAfterTheFloorAdvance: Boolean = false,
         )
 
         /**
@@ -1515,8 +1597,8 @@ class VerifyService(
          */
         internal val BELOW_FLOOR_TABLES =
             listOf(
-                VersionedTable("hog_data_file", "data_file_id"),
-                VersionedTable("hog_delete_file", "delete_file_id"),
+                VersionedTable("hog_data_file", "data_file_id", purgedAfterTheFloorAdvance = true),
+                VersionedTable("hog_delete_file", "delete_file_id", purgedAfterTheFloorAdvance = true),
                 VersionedTable("hog_table_version", "table_id"),
                 VersionedTable("hog_column", "field_id"),
                 VersionedTable("hog_partition_spec", "spec_id"),
@@ -1580,10 +1662,19 @@ class VerifyService(
                 "dead and is excluded here rather than counted as a floor (offset_release is the " +
                 "check that flags those). And no hog_data_file, hog_delete_file, " +
                 "hog_table_version, hog_column, hog_partition_spec, hog_sort_spec or hog_view row " +
-                "with end_snapshot <= earliest_snapshot_id is still present — there is no lag " +
-                "window on that last one, because steps 1, 2 and 5 of the sweep delete those rows " +
+                "with end_snapshot <= earliest_snapshot_id is still present. That last one has TWO " +
+                "timings. For hog_table_version, hog_column, hog_partition_spec, hog_sort_spec " +
+                "and hog_view there is no lag window: the sweep's fifth step deletes those rows " +
                 "in the same transaction, under the same per-catalog commit lock, that advances " +
-                "the floor."
+                "the floor. For hog_data_file and hog_delete_file there is one, by design: their " +
+                "rows are purged in bounded pages AFTER that transaction commits, outside the " +
+                "lock, because the one unbounded delete that used to ride it held the lock 17-25 " +
+                "seconds a minute and queued every commit behind it. So those two tables are " +
+                "asserted only against a sweep whose own ledger row reports the purge DRAINED " +
+                "(purge_truncated false): a drained purge that still left rows below the floor " +
+                "means its predicate and the floor advance disagree. A purge that stopped early " +
+                "reports purge_truncated with purge_remaining instead, which is a backlog rather " +
+                "than a broken invariant."
 
         const val VISIBILITY_BOUNDS_DESCRIPTION =
             "Invariant 6, versioned-row visibility: a row is visible at S iff begin_snapshot <= S " +

@@ -100,6 +100,117 @@ object Metrics {
     }
 
     /**
+     * hoglake_expiry_purge_rows_total{catalog} — file rows expiry's
+     * phase-B purge DELETED (data files plus delete vectors).
+     *
+     * The rate to compare against the arrival rate: ended rows appear at
+     * compaction's retirement rate (12,288 per sweep on prod-us at
+     * 1.3.7's six groups of 2,048), and a purge whose rate is below that
+     * is a purge falling behind however healthy each sweep looks. The
+     * same number is the cleanup queue's inflow, so it also prices the
+     * drain.
+     */
+    fun expiryPurgeRows(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_expiry_purge_rows_total", count.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_expiry_purge_failures_total{catalog} — pages of that
+     * purge which threw.
+     *
+     * The purge is fenced so it can never fail the floor advance it
+     * follows, so without this a page that hits its statement bound is
+     * indistinguishable on every surface from "nothing was eligible":
+     * `data_files_purged` reads 0 either way, and the floor keeps
+     * advancing, so every other signal says the sweep is working. A
+     * standing nonzero means the page is too big for the rows it is
+     * meeting — a wide table's stats cascade — and the remedy is
+     * HOGLAKE_EXPIRY_PURGE_PAGE. Nothing is corrupt: the next sweep
+     * retries from the oldest eligible row.
+     */
+    fun expiryPurgeFailures(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_expiry_purge_failures_total", count.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_expiry_purge_truncated_total{catalog} — sweeps whose file
+     * purge stopped with work left: the run budget expired, a page
+     * failed its way down to one row, or the floor could not be read.
+     *
+     * THE SERIES TO ALERT ON, and the reason it exists at all. A purge
+     * that is chronically budget-starved never FAILS — every page
+     * succeeds, `hoglake_expiry_purge_rows_total` keeps a healthy-looking
+     * rate forever, and `hoglake_expiry_purge_failures_total` stays at
+     * zero — while the rows below the floor accumulate without bound.
+     * Before this counter the only trace was the ledger row and the
+     * console badge, neither of which Prometheus can see. A sustained
+     * rate near one per sweep per catalog means the budget is too small
+     * for the arrival rate (HOGLAKE_EXPIRY_PURGE_BUDGET_MS, or fewer
+     * catalogs per maintenance pod); a rate that rises and falls is a
+     * catalog catching up after a backlog, which is the design working.
+     *
+     * It is also what makes `/verify`'s `expiry_floor` gating safe: that
+     * check skips its file-row arm while a purge is behind, so "behind"
+     * has to be loud somewhere else, and this is where.
+     */
+    fun expiryPurgeTruncated(catalog: String) {
+        increment("hoglake_expiry_purge_truncated_total", 1.0, "catalog", catalog)
+    }
+
+    /**
+     * hoglake_expiry_advance_failures_total{catalog} — sweeps whose
+     * phase A (the floor advance, under the commit lock) threw after
+     * exhausting its batch halvings.
+     *
+     * ZERO IS THE EXPECTED VALUE, and a nonzero one is actionable in a
+     * way nothing else in the repo was: there is no maintenance-run
+     * failure series anywhere, so before this a floor that stopped
+     * advancing showed up only as a `failed` ledger row nobody scrapes.
+     * The floor not advancing means retention is not being enforced —
+     * snapshots, their change rows and their file rows all stop being
+     * reclaimable — so this is the one expiry series that means "the
+     * feature is off" rather than "the feature is behind".
+     *
+     * The purge still runs on that path, so a nonzero rate here with a
+     * healthy `hoglake_expiry_purge_rows_total` means exactly that: the
+     * backlog below the floor is draining, the floor itself is stuck.
+     */
+    fun expiryAdvanceFailures(catalog: String) {
+        increment("hoglake_expiry_advance_failures_total", 1.0, "catalog", catalog)
+    }
+
+    /**
+     * hoglake_expiry_halvings_total{catalog, phase} — batch or page
+     * halvings, the adaptive bound discovering a cost the configuration
+     * guessed wrong.
+     *
+     * `phase="advance"` is HOGLAKE_EXPIRY_BATCH too large for the
+     * snapshot delete's `hog_snapshot_change` cascade on that catalog;
+     * `phase="purge"` is HOGLAKE_EXPIRY_PURGE_PAGE too large for a
+     * table's per-row cascade. Both are knobs, not bugs, and both are
+     * invisible without a counter: the halved value is remembered only
+     * for the rest of the run, so a standing rate means new work keeps
+     * arriving that the configured size cannot absorb — which is the
+     * same reading `hoglake_retirement_timeouts_total` carries for the
+     * same mechanism.
+     */
+    fun expiryHalvings(
+        catalog: String,
+        phase: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_expiry_halvings_total", count.toDouble(), "catalog", catalog, "phase", phase)
+        }
+    }
+
+    /**
      * hoglake_files_removed_total{catalog} — physical S3 deletes only.
      *
      * Fed from `CleanupResult.objectsRemoved`, which is DISTINCT paths,
