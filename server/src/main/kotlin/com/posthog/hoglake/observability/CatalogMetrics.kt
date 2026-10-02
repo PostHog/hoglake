@@ -118,7 +118,7 @@ object ExpiryGauges {
     @Volatile
     private var bound: Pair<MeterRegistry, MultiGauge>? = null
 
-    private val latest = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val latest = java.util.concurrent.ConcurrentHashMap<String, Double>()
 
     private fun gauge(): MultiGauge? {
         val registry = Metrics.boundRegistry ?: return null
@@ -142,9 +142,15 @@ object ExpiryGauges {
      */
     fun publish(
         catalog: String,
-        remaining: Long,
+        remaining: Long?,
     ) {
-        latest[catalog] = remaining
+        // NaN for an unknown, which is what Prometheus has for "no
+        // value" — an alert on `> 0` does not fire on it, and neither
+        // does it fire on a fabricated zero that would have claimed the
+        // purge drained. `hoglake_expiry_purge_truncated_total` is the
+        // series that still moves in that state, which is why it and not
+        // this gauge is the one the README nominates for the alert.
+        latest[catalog] = remaining?.toDouble() ?: Double.NaN
         val gauge = gauge() ?: return
         gauge.register(
             latest.entries.map { (name, value) -> MultiGauge.Row.of(Tags.of("catalog", name), value) },
@@ -165,9 +171,17 @@ object ExpiryGauges {
      *
      * Called by the fleet sweep, which is the only caller that knows the
      * whole set; a single-catalog sweep adds a key and removes none.
+     *
+     * AN EMPTY SET IS AUTHORITATIVE, not a no-op, and the difference is
+     * the last catalog on an instance. `runOnceAllCatalogs` enumerates
+     * the catalogs and then calls this with what it found, so an empty
+     * set means "this instance has none" — and an early return there
+     * would republish the dropped one's backlog forever, which is
+     * exactly the unclosable alert this function exists to prevent. The
+     * caller that must not clear everything is a SINGLE-catalog sweep,
+     * and that one does not call this at all.
      */
     fun retain(names: Set<String>) {
-        if (names.isEmpty()) return
         val gone = latest.keys.filterNot { it in names }
         if (gone.isEmpty()) return
         gone.forEach { latest.remove(it) }

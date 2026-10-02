@@ -181,7 +181,22 @@ class ExpiryService(
      * small page forever, and a genuinely expensive table is not
      * rediscovered from scratch every sweep.
      */
-    private val settledPage = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val settledPage = java.util.concurrent.ConcurrentHashMap<String, PageHint>()
+
+    /**
+     * A walk's carried state: the page size it settled on and how many
+     * consecutive FULL pages have committed at that size.
+     *
+     * THE STREAK HAS TO BE CARRIED TOO, and that is the half an earlier
+     * version missed. [PAGE_REGROW_AFTER] is 20 clean pages, and a sweep
+     * at the default budget runs ten to fourteen — so with the streak
+     * reset per walk a catalog that does fewer than twenty pages a sweep
+     * could never re-grow at all, and a page halved during one bad
+     * afternoon was permanent for the life of the process. Carrying it
+     * makes the re-grow a decision taken ACROSS sweeps, which is what
+     * the constant's own KDoc says it is.
+     */
+    private data class PageHint(val page: Int, val clean: Int)
 
     init {
         require(purgePage > 0) { "expiry purge page must be positive (got $purgePage)" }
@@ -914,7 +929,7 @@ class ExpiryService(
         val failures: Long = 0,
         val halvings: Long = 0,
         val truncated: Boolean = false,
-        val remaining: Long = 0,
+        val remaining: Long? = 0,
         val floor: Long = 0,
     )
 
@@ -1490,16 +1505,41 @@ class ExpiryService(
 
         // The superseded-vector arm, probed first so a catalog with no
         // such rows — every append-only writer's catalog, which is all
-        // of them today — pays one EXISTS and opens no transaction.
+        // of them today — pays one EXISTS and runs no pages.
+        //
+        // THE PROBE IS A STATEMENT LIKE ANY OTHER, which an earlier
+        // version forgot: it ran before any deadline check, on a handle
+        // with no transaction, under the session's 60 s bound. On a
+        // catalog with a large unindexed `hog_delete_file` that is one
+        // scan of the relation, taken after the budget may already be
+        // spent, and taken for up to a minute — six times the budget it
+        // was supposed to respect. It is now ordered and bounded like a
+        // page: the deadline first, then the scan under
+        // [PURGE_STATEMENT_TIMEOUT].
         val vectors =
-            if (supersededVectorsExist(catalog, catalogId, floor)) {
-                walk(catalog, "superseded delete-file", SUPERSEDED_DELETE_FILE_PURGE_SQL, catalogId, floor, deadline)
-            } else {
-                Walk(drained = true)
+            when (probeSupersededVectors(catalog, catalogId, floor, deadline)) {
+                Probe.SOME ->
+                    walk(
+                        catalog,
+                        "superseded delete-file",
+                        SUPERSEDED_DELETE_FILE_PURGE_SQL,
+                        catalogId,
+                        floor,
+                        deadline,
+                    )
+                Probe.NONE -> Walk(drained = true)
+                // A probe that could not answer is a COUNTED failure and
+                // an undrained arm — never a silent "nothing here" — and
+                // the data-file arm still runs on the remaining budget,
+                // because the two arms are independent and starving the
+                // indexed one for the unindexed one's sake would be the
+                // cross-arm coupling this design removed.
+                Probe.FAILED -> Walk(failures = 1, drained = false, stoppedOn = "a failed probe")
+                Probe.OUT_OF_TIME -> Walk(drained = false, stoppedOn = "the ${purgeBudgetMs}ms run budget")
             }
         val data = walk(catalog, "data-file", DATA_FILE_EXPIRY_SQL, catalogId, floor, deadline)
         val truncated = !(vectors.drained && data.drained)
-        val remaining = if (truncated) remaining(catalog, catalogId, floor) else 0L
+        val remaining: Long? = if (truncated) remaining(catalog, catalogId, floor) else 0L
         val failures = vectors.failures + data.failures
         val vectorRows = data.vectorRows + vectors.vectorRows
         if (data.dataRows > 0 || vectorRows > 0 || truncated || failures > 0) {
@@ -1510,7 +1550,13 @@ class ExpiryService(
                     "${vectors.pages} pages, $failures failed pages, " +
                     "${vectors.halvings + data.halvings} page halvings, stopped on " +
                     "${if (data.drained) vectors.stoppedOn else data.stoppedOn}" +
-                    (if (truncated) " ($remaining file rows still eligible)" else "")
+                    (
+                        if (truncated) {
+                            " (${remaining?.toString() ?: "an unknown number of"} file rows still eligible)"
+                        } else {
+                            ""
+                        }
+                    )
             }
         }
         return Purge(
@@ -1525,27 +1571,54 @@ class ExpiryService(
         )
     }
 
-    /** [SUPERSEDED_DELETE_FILE_PROBE_SQL], fenced: an unreadable probe is a "yes". */
-    private fun supersededVectorsExist(
+    /** What [probeSupersededVectors] learned. */
+    private enum class Probe { SOME, NONE, FAILED, OUT_OF_TIME }
+
+    /**
+     * [SUPERSEDED_DELETE_FILE_PROBE_SQL], deadline-checked and bounded.
+     *
+     * IN A TRANSACTION FOR `SET LOCAL`'S SAKE, as the pages are: the
+     * probe's predicate has no index (see
+     * [SUPERSEDED_DELETE_FILE_PURGE_SQL]), so on a catalog with a large
+     * vector relation it is a scan, and a scan on a pooled connection
+     * with no transaction-local bound inherits the session's 60 s. Five
+     * seconds is the same bound a page gets, for the same reason: a
+     * probe that cannot answer inside it is telling you something, and
+     * a minute is not a better way to hear it.
+     *
+     * [Probe.FAILED] rather than a defaulted answer. "The probe threw"
+     * is not evidence that there is nothing to do, and it is not
+     * evidence that there is, either — so the caller counts it, leaves
+     * the arm undrained, and gets on with the arm that has an index.
+     */
+    private fun probeSupersededVectors(
         catalog: String,
         catalogId: Long,
         floor: Long,
-    ): Boolean =
-        try {
-            jdbi.withHandleUnchecked { h ->
-                h.createQuery(SUPERSEDED_DELETE_FILE_PROBE_SQL)
-                    .bind("catalogId", catalogId)
-                    .bind("newEarliest", floor)
-                    .mapTo(Boolean::class.javaObjectType)
-                    .one()
-            }
+        deadline: Long,
+    ): Probe {
+        if (System.nanoTime() >= deadline) return Probe.OUT_OF_TIME
+        return try {
+            val some =
+                jdbi.inTransactionUnchecked { h ->
+                    h.execute("SET LOCAL statement_timeout = '$PURGE_STATEMENT_TIMEOUT'")
+                    h.createQuery(SUPERSEDED_DELETE_FILE_PROBE_SQL)
+                        .bind("catalogId", catalogId)
+                        .bind("newEarliest", floor)
+                        .mapTo(Boolean::class.javaObjectType)
+                        .one()
+                }
+            if (some) Probe.SOME else Probe.NONE
         } catch (e: Exception) {
-            // A failed probe must not SKIP the arm: the walk is where a
-            // failure gets counted, and "the probe threw" is not
-            // evidence that there is nothing to do.
-            log.warn(e) { "expiry: the superseded-vector probe failed for catalog '$catalog'; walking anyway" }
-            true
+            log.warn(e) {
+                "expiry: the superseded-vector probe for catalog '$catalog' failed inside its " +
+                    "$PURGE_STATEMENT_TIMEOUT bound (floor $floor); counted, and the data-file arm " +
+                    "still runs on the remaining budget. A probe that cannot finish means the " +
+                    "catalog's hog_delete_file wants the partial (catalog_id, end_snapshot) index"
+            }
+            Probe.FAILED
         }
+    }
 
     /**
      * One arm's paged walk: [sql] bound to `:catalogId`, `:newEarliest`
@@ -1581,7 +1654,10 @@ class ExpiryService(
      * budget, so one sweep affords about two of them; [settledPage]
      * carries the rung the walk reached, which is what makes the descent
      * converge across sweeps instead of restarting from the configured
-     * page every time. [PAGE_REGROW_AFTER] clean pages climb back.
+     * page every time. [PAGE_REGROW_AFTER] clean pages climb back — and
+     * the STREAK is carried with the size, because a sweep runs ten to
+     * fourteen pages and the threshold is twenty, so a per-walk streak
+     * would never reach it on any catalog the budget actually bounds.
      *
      * EVERY FAILED PAGE IS COUNTED, including the rungs. An earlier
      * version counted only the final give-up, so a sweep that spent its
@@ -1622,11 +1698,12 @@ class ExpiryService(
         // THE LADDER STARTS WHERE THE LAST ONE LEFT OFF, which is the
         // difference between converging and not. See [settledPage].
         val key = "$catalogId/$arm"
-        var page = (settledPage[key] ?: purgePage).coerceIn(1, purgePage)
-        var clean = 0
+        val hint = settledPage[key]
+        var page = (hint?.page ?: purgePage).coerceIn(1, purgePage)
+        var clean = if (hint?.page == page) hint.clean else 0
 
         fun settle(current: Int): Int {
-            settledPage[key] = current
+            settledPage[key] = PageHint(current, clean)
             return current
         }
         while (true) {
@@ -1668,6 +1745,9 @@ class ExpiryService(
                     // than a bug.
                     val halved = maxOf(1, page / 2)
                     failures++
+                    // A failure ends the streak: the evidence that the
+                    // reduced size is comfortable has to be re-earned at
+                    // whatever size the ladder lands on.
                     clean = 0
                     log.warn(e) {
                         "expiry: a $arm purge page of $page failed for catalog '$catalog' (floor $floor, " +
@@ -1724,8 +1804,12 @@ class ExpiryService(
             // one more failed page to discover otherwise.
             clean++
             if (page < purgePage && clean >= PAGE_REGROW_AFTER) {
-                page = settle(minOf(purgePage, page * 2))
                 clean = 0
+                page = settle(minOf(purgePage, page * 2))
+            } else {
+                // Carried, so the streak survives a sweep that ends
+                // before it is long enough to re-grow on.
+                settle(page)
             }
         }
     }
@@ -1740,28 +1824,42 @@ class ExpiryService(
     private data class PageOutcome(val examined: Long, val dataRows: Long, val vectorRows: Long)
 
     /**
-     * [PURGE_REMAINING_SQL], fenced: an unreadable count is reported as
-     * 0.
+     * [PURGE_REMAINING_SQL], best-effort: `null` is UNKNOWN, and
+     * unknown is reported rather than guessed.
      *
-     * ON ITS OWN HANDLE, deliberately not on the failed page's. A page
-     * that throws leaves its transaction rolled back by
-     * `inTransactionUnchecked`, but the review raised the possibility of
-     * an aborted transaction surviving on the pooled connection — in
-     * which case the very next statement, this one's `SET LOCAL`, would
-     * be the thing that surfaced it, and `purge_remaining` would be
-     * unavailable in exactly the state it exists for. It could not be
-     * reproduced on a clean tree, and this shape makes the question moot
-     * rather than leaving it to be re-litigated: no `SET LOCAL`, no
-     * transaction, one capped read on a connection the failing path
-     * never touched.
+     * NOT 0 ON FAILURE, which an earlier version returned. Zero means
+     * "the purge drained", and a sweep that reports `purge_truncated`
+     * beside a remaining of zero is telling an operator the one thing
+     * that cannot be true. Null travels all the way out: the field is
+     * absent from the ledger row and from the API response, the gauge
+     * publishes NaN rather than a fabricated zero, and the console's
+     * `positive()` guard reads an absent field as "nothing to show".
+     *
+     * BOUNDED, because `LIMIT :cap` bounds the rows MATCHED and not the
+     * rows EXAMINED. The data-file half is an index-only prefix walk, so
+     * for it the two are the same; the vector half has no index yet
+     * (see [SUPERSEDED_DELETE_FILE_PURGE_SQL]) and is a scan whose cost
+     * is the catalog's whole vector relation when few rows match. On a
+     * pooled connection with no transaction-local bound that scan
+     * inherits the session's 60 s — six times the purge's entire budget,
+     * paid AFTER the budget is spent, and paid per catalog, so one
+     * catalog's unindexed count would delay every catalog behind it in
+     * the serial fleet sweep. It runs in a transaction for `SET LOCAL`'s
+     * sake and gives up at [PURGE_STATEMENT_TIMEOUT] with an unknown.
+     *
+     * The transaction is also the answer to the aborted-connection
+     * question a review raised: it is opened fresh, it carries its own
+     * bound, and a failure here is swallowed into `null` rather than
+     * surfacing as the sweep's exception.
      */
     private fun remaining(
         catalog: String,
         catalogId: Long,
         floor: Long,
-    ): Long =
+    ): Long? =
         try {
-            jdbi.withHandleUnchecked { h ->
+            jdbi.inTransactionUnchecked { h ->
+                h.execute("SET LOCAL statement_timeout = '$PURGE_STATEMENT_TIMEOUT'")
                 h.createQuery(PURGE_REMAINING_SQL)
                     .bind("catalogId", catalogId)
                     .bind("newEarliest", floor)
@@ -1770,8 +1868,12 @@ class ExpiryService(
                     .one()
             }
         } catch (e: Exception) {
-            log.warn(e) { "expiry: could not count the rows left eligible for catalog '$catalog'" }
-            0L
+            log.warn(e) {
+                "expiry: could not count the rows left eligible for catalog '$catalog' inside " +
+                    "$PURGE_STATEMENT_TIMEOUT; purge_remaining is reported as unknown rather than 0 " +
+                    "(the vector half of that count has no index yet)"
+            }
+            null
         }
 
     /**
@@ -1804,6 +1906,7 @@ class ExpiryService(
         ExpiryGauges.retain(names.toSet())
         val live = catalogs.map { it.catalogId }.toSet()
         settledPage.keys.removeIf { key -> key.substringBefore('/').toLongOrNull() !in live }
+
         return results
     }
 }

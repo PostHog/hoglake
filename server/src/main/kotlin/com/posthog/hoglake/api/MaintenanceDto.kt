@@ -83,9 +83,15 @@ data class ExpiryResultDto(
     /**
      * File rows still eligible when a truncated purge stopped — both
      * tables — saturating at `ExpiryService.PURGE_REMAINING_CAP` each.
-     * 0 when the purge drained.
+     * 0 when the purge drained, and ABSENT when the count itself could
+     * not finish inside its 5 s bound: see
+     * `ExpiryResult.purgeRemaining` for why an unknown is not reported
+     * as a zero. The one nullable field in this DTO, and the only one
+     * whose absence means something other than "a zero from an older
+     * build".
      */
-    val purgeRemaining: Long,
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val purgeRemaining: Long?,
     /** Phase-A batch halvings: the floor advance's statement bound firing. */
     val advanceHalvings: Long,
     /** Phase-B page halvings, across both arms. */
@@ -359,11 +365,17 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
 /**
  * The same, for ExpiryResult. Append-only for the same reason.
  *
- * `purge_truncated` is deliberately NOT here: it is a BOOLEAN, and this
- * normalizer fills a missing field with the integer 0. A ledger row
- * written before the two-phase sweep existed is better left without the
- * flag — every console guard on it is undefined-safe — than filled with
- * a value its own schema does not allow.
+ * TWO FIELDS ARE DELIBERATELY NOT HERE, for two different reasons.
+ * `purge_truncated` is a BOOLEAN and this normalizer fills a missing
+ * field with the integer 0, so listing it would write a value its own
+ * schema does not allow. `purge_remaining` is an integer but its
+ * ABSENCE MEANS SOMETHING: the count is best-effort, and a sweep whose
+ * count could not finish omits it to say "unknown" rather than claim a
+ * zero that would contradict `purge_truncated` (see
+ * `ExpiryResult.purgeRemaining`). Filling that with 0 on read would
+ * re-introduce exactly the lie the nullability exists to prevent, and a
+ * pre-upgrade row's absence is honest for the same reason — it had no
+ * purge. Every console guard on both is undefined-safe.
  */
 private val EXPIRY_COUNTERS_ADDED_LATER =
     listOf(
@@ -371,7 +383,6 @@ private val EXPIRY_COUNTERS_ADDED_LATER =
         "data_files_purged",
         "purge_pages",
         "purge_failures",
-        "purge_remaining",
         "advance_halvings",
         "purge_halvings",
     )

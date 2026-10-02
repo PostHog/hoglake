@@ -175,12 +175,16 @@ class ExpiryResultSpecParityTest {
     }
 
     @Test
-    fun `purge_truncated is a boolean in the spec and is NOT in the ledger filler list`() {
-        // The one deliberate asymmetry, and the reason it needs a test:
+    fun `purge_truncated is a boolean and purge_remaining is nullable, and neither is filled on read`() {
+        // TWO DELIBERATE ASYMMETRIES, each needing a test.
         // `normalizeLedgerResult` fills a missing field with the INTEGER
-        // 0, so a boolean in that list would be written into a ledger row
-        // as a value its own schema forbids. The console's guard on it is
-        // undefined-safe instead.
+        // 0, so `purge_truncated` — a boolean — would be written into a
+        // ledger row as a value its own schema forbids. And
+        // `purge_remaining` is NULLABLE because its absence means
+        // "unknown": the count runs best-effort under a 5 s bound, and a
+        // zero beside `purge_truncated: true` is the one thing that
+        // cannot be true. Filling either on read would defeat the point;
+        // the console's guards on both are undefined-safe instead.
         val block = schemaBlock("    ExpiryResult:")
         val truncated = block.substringAfter("purge_truncated:").substringBefore("purge_remaining:")
         assertThat(truncated)
@@ -190,6 +194,20 @@ class ExpiryResultSpecParityTest {
             ExpiryResultDto::class.memberProperties.single { it.name == "purgeTruncated" }
                 .returnType.toString()
         assertThat(dtoType).contains("Boolean")
+        val remaining = block.substringAfter("purge_remaining:").substringBefore("advance_halvings:")
+        assertThat(remaining)
+            .describedAs("purge_remaining must be declared nullable:%n%s", remaining)
+            .contains("nullable: true")
+        assertThat(
+            ExpiryResultDto::class.memberProperties.single { it.name == "purgeRemaining" }
+                .returnType.isMarkedNullable,
+        )
+            .describedAs("and nullable on the DTO, so an unknown is an absent field")
+            .isTrue()
+        assertThat(
+            ExpiryResult::class.memberProperties.single { it.name == "purgeRemaining" }
+                .returnType.isMarkedNullable,
+        ).isTrue()
         // The filler list lives in MaintenanceDto as a private val, so it
         // is asserted through its OBSERVABLE effect instead — see
         // MaintenanceLedgerIntegrationTest's pre-upgrade expiry row,

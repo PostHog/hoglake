@@ -1326,6 +1326,15 @@ class ExpiryPurgeIntegrationTest {
             assertThat(gauge(registry, "hoglake_expiry_purge_remaining", "purge-metrics"))
                 .describedAs("and the surviving catalogs keep theirs")
                 .isEqualTo(0.0)
+
+            // AN EMPTY SET IS AUTHORITATIVE. `retain` used to return
+            // early on it, so the LAST catalog on an instance kept its
+            // backlog gauge forever — the unclosable alert this is all
+            // for, in the one case nobody tests.
+            ExpiryGauges.retain(emptySet())
+            assertThat(gauge(registry, "hoglake_expiry_purge_remaining", "purge-metrics"))
+                .describedAs("an empty enumeration means 'this instance has no catalogs'")
+                .isEqualTo(-1.0)
         } finally {
             Metrics.clear()
             ExpiryGauges.clear()
@@ -1343,6 +1352,223 @@ class ExpiryPurgeIntegrationTest {
         name: String,
         catalog: String,
     ): Double = registry.find(name).tags("catalog", catalog).gauge()?.value() ?: -1.0
+
+    @Test
+    fun `the superseded-vector probe runs inside a transaction under the purge's own bound`() {
+        // THE PROBE IS A STATEMENT LIKE ANY OTHER, and an earlier version
+        // forgot it: it ran on a handle with NO TRANSACTION, so it
+        // carried no transaction-local bound and inherited the session's
+        // 60 s. Its predicate has no index (V19 declined one for the
+        // shape it had then), so on a catalog with a large
+        // `hog_delete_file` that is a scan of the relation — up to six
+        // times the purge's entire budget, taken once per catalog in a
+        // serial fleet sweep.
+        //
+        // Asserted by the statements the connection actually issues, in
+        // order: a `SET LOCAL` is only meaningful inside a transaction,
+        // so "the bound immediately precedes the probe" is also "the
+        // probe is in a transaction". That Postgres ENFORCES such a
+        // bound is pinned separately, by the page that `pg_sleep`s past
+        // it.
+        val catalogId = seed("purge-probe-bound", endedBelowFloor = 4, live = 4)
+        seedVectorPerLiveFile(catalogId, endSnapshot = 1)
+        val seen = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val watched = Database.jdbi(db.dataSource)
+        watched.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    val sql = context.renderedSql ?: return
+                    if (sql.contains("SET LOCAL statement_timeout") || sql.contains("SELECT EXISTS")) {
+                        seen += sql.trim().lines().first().trim()
+                    }
+                }
+            },
+        )
+        val result = ExpiryService(watched).runOnce("purge-probe-bound", batchSize = 100)
+        assertThat(result.deleteFilesQueued)
+            .describedAs("the probe found the superseded vectors and the arm purged them")
+            .isEqualTo(4)
+        val probeAt = seen.indexOfFirst { it.contains("SELECT EXISTS") }
+        assertThat(probeAt)
+            .describedAs("the probe must have run: %s", seen)
+            .isGreaterThan(0)
+        assertThat(seen[probeAt - 1])
+            .describedAs("the statement before the probe must be its bound: %s", seen)
+            .contains("SET LOCAL statement_timeout = '${ExpiryService.PURGE_STATEMENT_TIMEOUT}'")
+        assertThat(catalogId).isNotZero()
+    }
+
+    @Test
+    fun `a probe that cannot answer is counted and does not starve the data-file arm`() {
+        // [Probe.FAILED] rather than a defaulted answer. "The probe
+        // threw" is not evidence that there is nothing to do, and it is
+        // not evidence that there is — so it is counted, the arm it gates
+        // is left undrained, and the arm that HAS an index still runs on
+        // the remaining budget. Starving the indexed arm for the
+        // unindexed one's sake would be the cross-arm coupling this
+        // design removed.
+        val catalogId = seed("purge-probe-fail", endedBelowFloor = 6, live = 6)
+        seedVectorPerLiveFile(catalogId, endSnapshot = 1)
+        val poisoned = Database.jdbi(db.dataSource)
+        poisoned.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (context.renderedSql?.contains("SELECT EXISTS") == true) {
+                        throw IllegalStateException("injected: the probe cannot answer")
+                    }
+                }
+            },
+        )
+        val result = ExpiryService(poisoned).runOnce("purge-probe-fail", batchSize = 100)
+        assertThat(result.purgeFailures)
+            .describedAs("a probe that cannot answer is a counted failure, not a silent 'nothing here'")
+            .isEqualTo(1)
+        assertThat(result.purgeTruncated)
+            .describedAs("and the arm it gates is not credited with having drained")
+            .isTrue()
+        assertThat(result.dataFilesPurged)
+            .describedAs("while the data-file arm runs on the remaining budget")
+            .isEqualTo(6)
+        assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
+        assertThat(
+            count("SELECT count(*) FROM hog_delete_file WHERE catalog_id = :c", catalogId),
+        )
+            .describedAs("the superseded vectors wait for a sweep whose probe answers")
+            .isEqualTo(6)
+    }
+
+    @Test
+    fun `the probe is skipped once the budget is gone`() {
+        // Ordering, asserted by its observable: with the budget already
+        // spent the probe must not run at all — so a poisoned probe
+        // cannot produce a failure, because it is never reached.
+        val catalogId = seed("purge-probe-late", endedBelowFloor = 4, live = 4)
+        seedVectorPerLiveFile(catalogId, endSnapshot = 1)
+        val poisoned = Database.jdbi(db.dataSource)
+        poisoned.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (context.renderedSql?.contains("SELECT EXISTS") == true) {
+                        throw IllegalStateException("injected: the probe must not have run")
+                    }
+                }
+            },
+        )
+        val result =
+            ExpiryService(poisoned, purgeBudgetMs = 0).runOnce("purge-probe-late", batchSize = 100)
+        assertThat(result.purgeFailures)
+            .describedAs("the deadline is checked BEFORE the probe, so the probe never ran")
+            .isEqualTo(0)
+        assertThat(result.purgeTruncated).isTrue()
+        assertThat(result.dataFilesPurged).isEqualTo(0)
+        assertThat(fileRows(catalogId)).isEqualTo(8)
+    }
+
+    @Test
+    fun `an unanswerable remaining count is reported as unknown, not as zero`() {
+        // "0 rows left" beside "the purge stopped early" is the one thing
+        // that cannot be true, and it is what this path used to report:
+        // the count was fenced to 0 on failure. It is also unbounded —
+        // `LIMIT :cap` bounds the rows MATCHED, not examined, and the
+        // vector half has no index — so on a pooled connection with no
+        // transaction-local bound it inherited the session's 60 s, after
+        // the budget was already spent, once per catalog in a serial
+        // fleet sweep.
+        val catalogId = seed("purge-unknown", endedBelowFloor = 30, live = 5)
+        val poisoned = Database.jdbi(db.dataSource)
+        poisoned.setSqlLogger(
+            object : SqlLogger {
+                override fun logBeforeExecution(context: StatementContext) {
+                    if (context.renderedSql?.contains("capped_vectors") == true) {
+                        throw IllegalStateException("injected: the remaining count cannot finish")
+                    }
+                }
+            },
+        )
+        val result =
+            ExpiryService(poisoned, purgeBudgetMs = 0).runOnce("purge-unknown", batchSize = 100)
+        assertThat(result.purgeTruncated).isTrue()
+        assertThat(result.purgeRemaining)
+            .describedAs("unknown is null, never 0 — a zero here would contradict purge_truncated")
+            .isNull()
+        // And it does not fail the sweep: the floor still advanced, and
+        // the next sweep still drains.
+        assertThat(result.snapshotsExpired).isEqualTo(5)
+        assertThat(ExpiryService(jdbi).runOnce("purge-unknown", batchSize = 100).dataFilesPurged)
+            .isEqualTo(30)
+        assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
+    }
+
+    @Test
+    fun `the clean-page streak survives the sweep, so a slow catalog can re-grow`() {
+        // PAGE_REGROW_AFTER is 20 clean pages and a budget-bounded sweep
+        // runs ten to fourteen, so a streak reset per walk could never
+        // reach the threshold on any catalog the budget actually bounds:
+        // a page halved during one bad afternoon would be permanent for
+        // the life of the process.
+        //
+        // THE FIXTURE GIVES EACH SWEEP FEWER PAGES THAN THE THRESHOLD, by
+        // giving it fewer ROWS — five eligible rows a sweep at a page of
+        // one is five clean pages, so only a CARRIED streak crosses
+        // twenty, on the fourth sweep. (A short page does not count: the
+        // streak is evidence that a FULL page is comfortable.)
+        val catalogId = seed("purge-regrow", endedBelowFloor = 0, live = 4, head = 5)
+        val svc = ExpiryService(jdbi, purgePage = 4, purgeBudgetMs = 30_000)
+        // Force the hint to the bottom the way production does — a page
+        // that fails, all the way down the ladder.
+        seedEligible(catalogId, 4, from = 100)
+        tripAfter(0)
+        try {
+            svc.runOnce("purge-regrow", batchSize = 100)
+        } finally {
+            dropTrip()
+        }
+        assertThat(endedBelowFloor(catalogId))
+            .describedAs("the ladder spent that sweep failing its way down to a page of one")
+            .isEqualTo(4)
+
+        // Four sweeps of five rows: 5 + 5 + 5 + 5 full pages of one, so
+        // the streak crosses 20 during the fourth and the page doubles.
+        var id = 200
+        repeat(4) {
+            seedEligible(catalogId, 5, from = id)
+            id += 100
+            val sweep = svc.runOnce("purge-regrow", batchSize = 100)
+            assertThat(sweep.purgeFailures).isEqualTo(0)
+            assertThat(sweep.purgePages)
+                .describedAs("each sweep runs fewer pages than PAGE_REGROW_AFTER, which is the point")
+                .isLessThan(ExpiryService.PAGE_REGROW_AFTER.toLong())
+        }
+
+        // The page has re-grown, which only a carried streak can do: six
+        // rows now take three pages of two, not six pages of one.
+        seedEligible(catalogId, 6, from = 900)
+        val after = svc.runOnce("purge-regrow", batchSize = 100)
+        assertThat(after.dataFilesPurged).isEqualTo(6)
+        assertThat(after.purgePages)
+            .describedAs(
+                "a reset streak never reaches 20, so the page would still be 1 and this would be 6",
+            )
+            .isEqualTo(3)
+    }
+
+    /** [n] data-file rows ended at snapshot 1, i.e. eligible below any floor >= 1. */
+    private fun seedEligible(
+        catalogId: Long,
+        n: Int,
+        from: Int,
+    ) = jdbi.useHandleUnchecked { h ->
+        h.createUpdate(
+            """
+            INSERT INTO hog_data_file
+                (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, path,
+                 record_count, file_size_bytes, row_id_start)
+            SELECT :c, :from + g, 1, 0, 1, 's3://b/' || :c || '/e' || (:from + g), 1, 1,
+                   (:from + g) * 10
+            FROM generate_series(1, :n) g
+            """,
+        ).bind("c", catalogId).bind("n", n).bind("from", from).execute()
+    }
 
     // ---- concurrency -------------------------------------------------------
 
@@ -1684,6 +1910,93 @@ class ExpiryPurgeIntegrationTest {
         val hit = Regex("""\bhit=(\d+)""").find(buffers)?.groupValues?.get(1)?.toInt() ?: 0
         val read = Regex("""\bread=(\d+)""").find(buffers)?.groupValues?.get(1)?.toInt() ?: 0
         return hit + read
+    }
+
+    @Test
+    fun `a drained row at an OLDER floor does not make the next advance's pending rows violations`() {
+        // THE WINDOW THIS DESIGN OPENS DELIBERATELY: a sweep advances the
+        // floor and then purges off it, so between the advance and the
+        // purge there are rows below the floor that nothing has reached
+        // yet. `expiry_floor` reads the newest expiry ledger row to
+        // decide whether to assert its file-row arm — and a DRAINED row
+        // only says "nothing was eligible below the floor I READ". If
+        // that floor is older than the catalog's current one, the rows
+        // the newer advance just exposed are legitimately pending, and
+        // without comparing the two the check reports a healthy catalog
+        // as a broken invariant.
+        //
+        // Reproduced as production reproduces it: a sweep drains at floor
+        // 5 and writes its row, then the floor moves to 10 with no newer
+        // expiry row behind it — which is exactly what a pod killed
+        // between the phases leaves.
+        val catalogId = seed("verify-older-floor", endedBelowFloor = 10, live = 10, head = 5)
+        val verify = VerifyService(jdbi, retirementIntervalMs = 0)
+        ExpiryService(jdbi).runOnce("verify-older-floor", batchSize = 100)
+        assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
+        assertThat(
+            verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }.violations,
+        ).isEqualTo(0)
+
+        jdbi.useHandleUnchecked { h ->
+            // A newer wave, ended above the old floor, and a floor
+            // advance that writes no ledger row of its own.
+            h.createUpdate(
+                """
+                INSERT INTO hog_data_file
+                    (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, path,
+                     record_count, file_size_bytes, row_id_start)
+                SELECT :c, 500000 + g, 1, 5, 6, 's3://b/' || :c || '/wave2-' || g, 1, 1, 900000 + g
+                FROM generate_series(1, 10) g
+                """,
+            ).bind("c", catalogId).execute()
+            h.execute(
+                "UPDATE hog_catalog SET last_snapshot_id = 10, earliest_snapshot_id = 10 " +
+                    "WHERE catalog_id = ?",
+                catalogId,
+            )
+        }
+        assertThat(endedBelowFloor(catalogId))
+            .describedAs("ten rows the newer advance exposed and no purge has reached")
+            .isEqualTo(10)
+        val newestExpiryFloor =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT (result->>'new_earliest_snapshot_id')::bigint FROM hog_maintenance_run " +
+                        "WHERE catalog_id = :c AND task = 'expiry' ORDER BY run_id DESC LIMIT 1",
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        assertThat(newestExpiryFloor)
+            .describedAs("the newest expiry row is the drained one, and it names the OLD floor")
+            .isEqualTo(5)
+
+        val check = verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }
+        assertThat(check.violations)
+            .describedAs(
+                "a drained row at floor 5 says nothing about rows below floor 10:%n%s",
+                check.samples,
+            )
+            .isEqualTo(0)
+
+        // And the invariant still holds where it applies: once a sweep
+        // drains AT the current floor, a row left below it is real.
+        ExpiryService(jdbi).runOnce("verify-older-floor", batchSize = 100)
+        assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                INSERT INTO hog_data_file
+                    (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, path,
+                     record_count, file_size_bytes, row_id_start)
+                VALUES (?, 999123, 1, 0, 1, 's3://b/survivor-older-floor', 1, 1, 0)
+                """,
+                catalogId,
+            )
+        }
+        assertThat(
+            verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }.violations,
+        )
+            .describedAs("a purge drained at THIS floor that still left a row is the real thing")
+            .isEqualTo(1)
     }
 
     @Test

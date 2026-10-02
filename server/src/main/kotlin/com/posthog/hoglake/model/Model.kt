@@ -1320,9 +1320,21 @@ data class ExpiryResult(
      * to remove. A value at the cap means "behind by more than any sweep
      * will catch up", which is the only reading that changes what an
      * operator does.
+     *
+     * NULL IS UNKNOWN, AND IS NOT 0. The count is best-effort: its
+     * vector half has no index yet, so on a catalog with a large
+     * `hog_delete_file` it is a scan, and it runs under the purge's own
+     * 5 s bound rather than the session's 60 s so that one catalog's
+     * unindexed count cannot delay every catalog behind it in the serial
+     * fleet sweep. When that bound fires the answer is absent, because
+     * "0" beside `purge_truncated = true` is the one thing that cannot
+     * be true and is exactly the reading this field exists to prevent.
+     * `@JsonInclude(NON_NULL)`: an unknown is an absent field on the
+     * wire and in the ledger, and every console guard on it is
+     * undefined-safe.
      */
-    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
-    val purgeRemaining: Long = 0,
+    @get:JsonInclude(JsonInclude.Include.NON_NULL)
+    val purgeRemaining: Long? = 0,
     /**
      * Times phase A halved `HOGLAKE_EXPIRY_BATCH` after its statement
      * bound fired, and retried inside the same run.

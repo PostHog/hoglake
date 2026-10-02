@@ -866,6 +866,20 @@ class VerifyService(
      * `@JsonInclude(NON_DEFAULT)` on the stored model, so `false` is
      * stored as nothing at all.
      *
+     * AND THE ROW HAS TO BE ABOUT THIS FLOOR. A drained purge says
+     * "nothing was eligible below the floor I READ", which is only an
+     * argument about the floor the catalog has NOW if the two are the
+     * same. Between a sweep that advances the floor and the purge that
+     * follows it — a window this design opens deliberately, and one a
+     * failed phase B or a killed pod can leave open for sweeps — the
+     * newest drained row names an OLDER floor, and the rows the advance
+     * just exposed are legitimately pending. Without the floor
+     * comparison the check reads those as violations and reports a
+     * broken invariant on a healthy catalog. `>=` rather than `=`
+     * because a concurrent replica's sweep can have advanced the floor
+     * further still, and a row drained at or beyond the current floor
+     * is a stronger statement, not a weaker one.
+     *
      * Served by `hog_maintenance_run_recent (catalog_id, task, run_id
      * DESC)` — one descent, one row.
      */
@@ -875,7 +889,11 @@ class VerifyService(
     ): Boolean =
         h.createQuery(
             """
-            SELECT status = 'ok' AND coalesce((result->>'purge_truncated')::boolean, false) = false
+            SELECT status = 'ok'
+               AND coalesce((result->>'purge_truncated')::boolean, false) = false
+               AND coalesce((result->>'new_earliest_snapshot_id')::bigint, -1)
+                   >= (SELECT c.earliest_snapshot_id FROM hog_catalog c
+                        WHERE c.catalog_id = :c)
                    AS drained
             FROM hog_maintenance_run
             WHERE catalog_id = :c AND task = 'expiry'

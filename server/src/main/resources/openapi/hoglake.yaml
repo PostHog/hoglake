@@ -4413,6 +4413,7 @@ components:
         purge_remaining:
           type: integer
           format: int64
+          nullable: true
           description: >
             File rows still eligible when a truncated purge stopped —
             `hog_data_file` and `hog_delete_file` together — SATURATING
@@ -4421,9 +4422,18 @@ components:
             that changes what an operator does. 0 when the purge drained,
             and capped rather than exact because an uncapped count over
             the eligible set is itself the unbounded read the paged purge
-            exists to remove. Also published as the gauge
-            `hoglake_expiry_purge_remaining`. Not required, for the
-            reason above.
+            exists to remove. ABSENT means UNKNOWN, not zero: the count
+            is best-effort under the purge's own 5 s statement bound (its
+            delete-vector half has no index yet, so on a catalog with a
+            large hog_delete_file it is a scan, and one catalog's count
+            must not delay every catalog behind it in the serial fleet
+            sweep). A zero beside `purge_truncated: true` would be the
+            one thing that cannot be true, so an unanswerable count is
+            reported as no answer — and unlike the counters beside it
+            this field is NOT filled in on read for the same reason.
+            Also published as the gauge
+            `hoglake_expiry_purge_remaining`, which carries NaN for an
+            unknown. Not required, for the reason above.
         advance_halvings:
           type: integer
           format: int64

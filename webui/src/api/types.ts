@@ -724,8 +724,14 @@ export interface ExpiryResult {
    */
   purge_truncated?: boolean;
   /**
-   * Rows still eligible when a truncated purge stopped, saturating at
-   * 100,000. 0 when the purge drained.
+   * File rows still eligible when a truncated purge stopped, saturating
+   * at 100,000 per table. 0 when the purge drained.
+   *
+   * ABSENT MEANS UNKNOWN, not zero, and unlike the counters beside it
+   * this one is never filled in on read: the server's count is
+   * best-effort under a 5 s bound, and a zero beside
+   * `purge_truncated: true` would contradict itself. Guard with
+   * `positive()` and treat absence as "no number to show".
    */
   purge_remaining?: Int64;
   /**

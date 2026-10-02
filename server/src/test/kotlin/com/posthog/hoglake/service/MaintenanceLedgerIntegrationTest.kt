@@ -267,15 +267,20 @@ class MaintenanceLedgerIntegrationTest {
         // four new counters — and for the ONE deliberate exclusion.
         //
         // A row written before the sweep was split carries none of them.
-        // `data_files_purged`, `purge_pages`, `purge_failures` and
-        // `purge_remaining` are filled with 0 on READ
-        // (EXPIRY_COUNTERS_ADDED_LATER), which is honest: the purge did
-        // not exist, so nothing it counts could have happened.
-        // `purge_truncated` is NOT in that list and must stay ABSENT,
-        // because the filler writes the integer 0 and this field is a
-        // boolean — a spec-invalid value in a ledger row would be worse
-        // than an absent one, and every console guard on it is
-        // undefined-safe.
+        // `data_files_purged`, `purge_pages`, `purge_failures`,
+        // `advance_halvings` and `purge_halvings` are filled with 0 on
+        // READ (EXPIRY_COUNTERS_ADDED_LATER), which is honest: the purge
+        // did not exist, so nothing it counts could have happened.
+        //
+        // TWO FIELDS MUST STAY ABSENT, for two different reasons.
+        // `purge_truncated` is a BOOLEAN and the filler writes the
+        // integer 0, so listing it would put a spec-invalid value in a
+        // ledger row. `purge_remaining` is an integer, but its ABSENCE
+        // MEANS "unknown": the count is best-effort under a 5 s bound,
+        // and a sweep whose count could not finish omits it rather than
+        // claim a zero that would contradict `purge_truncated`. Filling
+        // it on read would re-introduce exactly that lie. Every console
+        // guard on both is undefined-safe.
         val catalogId = seedCatalog("led-preupgrade-expiry")
         val stored =
             """{"snapshots_expired":4,"data_files_queued":9,"delete_files_queued":0,""" +
@@ -307,11 +312,13 @@ class MaintenanceLedgerIntegrationTest {
             .isZero()
         assertThat(result["purge_pages"].asLong()).isZero()
         assertThat(result["purge_failures"].asLong()).isZero()
-        assertThat(result["purge_remaining"].asLong()).isZero()
         assertThat(result["advance_halvings"].asLong()).isZero()
         assertThat(result["purge_halvings"].asLong()).isZero()
         assertThat(result.has("purge_truncated"))
             .describedAs("a boolean must NOT be filled with the integer 0")
+            .isFalse()
+        assertThat(result.has("purge_remaining"))
+            .describedAs("and an 'unknown' must NOT be filled with a zero that contradicts it")
             .isFalse()
         // Everything the row did carry survives untouched.
         assertThat(result["snapshots_expired"].asLong()).isEqualTo(4)
@@ -327,7 +334,6 @@ class MaintenanceLedgerIntegrationTest {
                 "data_files_purged",
                 "purge_pages",
                 "purge_failures",
-                "purge_remaining",
                 "advance_halvings",
                 "purge_halvings",
             )

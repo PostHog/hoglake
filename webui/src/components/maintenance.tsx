@@ -329,8 +329,9 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {r.purge_truncated === true && (
             <span className="badge badge-warn">
               purge truncated
-              {positive(r.purge_remaining) &&
-                `, ${formatCount(r.purge_remaining)} rows left`}
+              {positive(r.purge_remaining)
+                ? `, ${formatCount(r.purge_remaining)} rows left`
+                : r.purge_remaining === undefined && ", rows left unknown"}
             </span>
           )}
           {(positive(r.purge_halvings) || positive(r.advance_halvings)) && (
