@@ -2482,13 +2482,15 @@ class CompactionService(
         // arm of CompactionClaimRepo.acquire covers a row a re-planned
         // group lands on again; this covers the rest — a group whose
         // files the OTHER replica compacted is never re-planned, so
-        // nothing would ever look at its abandoned claim. `/verify`'s
-        // compaction_claims check is what reds if this stops running.
+        // nothing would ever look at its abandoned claim. The verify
+        // subsystem's compaction_claims check was what redded if this
+        // stopped running; #261 removed it, so nothing does today.
         //
         // Run UNCONDITIONALLY, not under `claimsEnabled`. Turning claims
-        // off does not delete the rows a previous configuration wrote,
-        // and a flag flip that strands them turns `compaction_claims`
-        // red an hour later for a deployment that did nothing wrong. The
+        // off does not delete the rows a previous configuration wrote, so
+        // a flag flip that left them stranded would have turned the old
+        // `compaction_claims` check red an hour later for a deployment
+        // that did nothing wrong. The
         // purge is a DELETE of expired rows: harmless when there are
         // none, and the only thing that cleans up after the flip.
         runCatching {

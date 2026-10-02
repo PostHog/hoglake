@@ -30,7 +30,6 @@ class MaintenanceStatusService(
     private val expiryIntervalMs: Long,
     private val cleanupIntervalMs: Long,
     private val compactionIntervalMs: Long,
-    private val verifyIntervalMs: Long,
     /**
      * NOT defaulted, unlike everything else optional on this class.
      * The value is what `GET /maintenance/status` reports as
@@ -195,17 +194,13 @@ class MaintenanceStatusService(
                         MaintenanceBacklog.CompactionBacklog(sample?.smallFiles, smallFileThresholdBytes),
                         loop(MaintenanceTask.COMPACTION),
                     ),
-                    MaintenanceTaskStatus(
-                        MaintenanceTask.VERIFY,
-                        verifyIntervalMs,
-                        runs[MaintenanceTask.VERIFY],
-                        MaintenanceBacklog.VerifyBacklog,
-                        loop(MaintenanceTask.VERIFY),
-                    ),
                     // Appended, never inserted: the task list's ORDER is
                     // what the webui's matrix and every positional test
                     // read, and a new task in the middle silently
-                    // renumbers both.
+                    // renumbers both. #261 removing `verify` from in
+                    // front of this entry is the same hazard in reverse
+                    // — it moved retirement from index 5 to 4, and the
+                    // positional assertions moved with it.
                     MaintenanceTaskStatus(
                         MaintenanceTask.RETIREMENT,
                         retirementIntervalMs,

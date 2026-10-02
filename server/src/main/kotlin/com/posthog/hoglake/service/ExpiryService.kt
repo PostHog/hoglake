@@ -248,7 +248,7 @@ class ExpiryService(
         /**
          * WHICH OFFSETS CAN FLOOR EXPIRY — the source clause of the
          * consumer-floor query, shared verbatim with
-         * `VerifyService`'s `expiry_floor` check.
+         * the removed verify subsystem's `expiry_floor` check.
          *
          * The join to `hog_table` is the load-bearing part: an offset
          * counts only while its table identity still exists (any
@@ -291,7 +291,8 @@ class ExpiryService(
          * `ON DELETE CASCADE` (`V1__init.sql`), so purging a data-file
          * row takes its vectors away WITHOUT queueing their paths — a
          * permanently leaked puffin object that `CleanupService` never
-         * hears about and `/verify`'s `orphans` arm cannot find.
+         * hears about, and that the removed `/verify`'s `orphans` arm
+         * could not have found either.
          *
          * That ordering was enforced by "the delete-vector arm's page
          * came back SHORT", and a full page comes back short whenever
@@ -1130,12 +1131,19 @@ class ExpiryService(
      * # What changes for an observer
      *
      * Ended rows below the floor can now exist for a few sweeps rather
-     * than for zero of them. `VerifyService.expiryFloor` is the check
-     * that encoded the old timing: its `hog_data_file` /
-     * `hog_delete_file` arm now asserts only against a sweep whose
-     * ledger row reports the purge DRAINED (`VerifyService`'s
-     * `lastPurgeDrained`), while the five DDL tables keep the no-lag
-     * property because step 5 is still phase A's. `visibility_bounds`
+     * than for zero of them. `VerifyService.expiryFloor` was the check
+     * that encoded the old timing, and #262 taught its `hog_data_file` /
+     * `hog_delete_file` arm to assert only against a sweep whose ledger
+     * row reported the purge DRAINED at a floor covering the current
+     * one, while the five DDL tables kept the no-lag property because
+     * step 5 is still phase A's. #261 then removed the whole check, so
+     * NOTHING asserts the invariant half today — a drained purge that
+     * leaves rows below the floor is unwatched until the paged scrubber
+     * (#261). The backlog half is unaffected and never went through
+     * verify: `purge_truncated` / `purge_remaining` / `purge_failures` on
+     * the ledger row, and `hoglake_expiry_purge_truncated_total` /
+     * `hoglake_expiry_purge_remaining`. The rest of that reasoning stands
+     * for whatever replaces the check: `visibility_bounds`
      * uses the same table list and is unaffected — its bounds are
      * HEAD-relative, and a purge-pending row satisfies them exactly as a
      * purged one would; `orphans`, `snapshot_density` and `next_row_id`
@@ -1200,8 +1208,9 @@ class ExpiryService(
         // OffsetRepo.releaseSupersededOffsets), so it is dead state
         // whatever the catalog's retention setting is: GET /consumers
         // shows a position the consumer will never read again, and
-        // /maintenance/verify's offset_release check flags it. It used
-        // to sit after the retention early-return, which meant a
+        // the removed /maintenance/verify's offset_release check used to
+        // flag it. It used to sit after the retention early-return,
+        // which meant a
         // retention-NULL catalog — expiry configured off, which several
         // production catalogs are — could never release anything: the
         // rows were stranded with no code path left that would ever
@@ -1248,7 +1257,7 @@ class ExpiryService(
         // table identity still exists (any incarnation, dropped included
         // — offsets survive drops by design). An offset whose table row
         // is gone entirely (expired away) must not pin retention
-        // forever. VerifyService's expiry_floor check asks the SAME
+        // forever. The removed verify subsystem's expiry_floor check asked the SAME
         // fragment rather than a copy of it.
         val minOffset: Pair<String, Long>? =
             if (cat.consumerFloor) {
@@ -1373,8 +1382,8 @@ class ExpiryService(
      * flourish. [advanceBoundMs] exists to turn a catch-up sweep into a
      * fast retryable failure, so phase A now fails exactly when the
      * backlog is largest — and a purge skipped on that path would
-     * starve forever while the ledger row said only `failed` and
-     * `/verify`'s file arm stayed dark. All phase B needs is the
+     * starve forever while the ledger row said only `failed` and, at the
+     * time, `/verify`'s file arm stayed dark. All phase B needs is the
      * catalog id, which is read before the lock is taken.
      *
      * THE FLOOR IS READ FRESH, not inherited from phase A. The floor is
@@ -1438,11 +1447,13 @@ class ExpiryService(
      * does it properly.
      *
      * A KNOWN FALSE-ALARM WINDOW, stated rather than left to be
-     * rediscovered. `/verify`'s `removal_queue` and the cleanup drain's
-     * `still_referenced` both ask whether an undrained queue row's path
-     * is still claimed by a file row, LIVE OR HISTORICAL — deliberately,
-     * because a historical row still claims its object — and AGENT.md's
-     * invariant 4 calls `still_referenced > 0` an ALERTED violation.
+     * rediscovered. The cleanup drain's `still_referenced` asks whether
+     * an undrained queue row's path is still claimed by a file row, LIVE
+     * OR HISTORICAL — deliberately, because a historical row still
+     * claims its object — and AGENT.md's invariant 4 calls
+     * `still_referenced > 0` an ALERTED violation. (`/verify`'s
+     * `removal_queue` asked the same question until #261; the test-side
+     * `CatalogInvariants.assertRemovalQueueUnreferenced` still does.)
      * Two file rows can legitimately share one path
      * (`V16FileRemovalPathIndexMigrationIntegrationTest` pins it; a
      * replay of a purged receipt is how it arises). Where one of them is

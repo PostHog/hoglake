@@ -49,7 +49,7 @@ duckdb-client/
 │   └── functions/
 │       ├── hoglake_snapshots.cpp, hoglake_table_info.cpp,
 │       ├── hoglake_table_changes.cpp, hoglake_current_snapshot.cpp,
-│       └── hoglake_maintenance.cpp   # compact/expire/cleanup/verify passthroughs
+│       └── hoglake_maintenance.cpp   # compact/expire/cleanup passthroughs
 └── test/sql/…                  # sqllogictests (live dev server + MinIO)
 ```
 
@@ -283,8 +283,8 @@ conflict checks, and the fixture-created ambiguous pairs.
    id 2147483646). The CATALOG's flag decides which source is used —
    never the file's own field ids — and the client then checks that
    the file AGREES with its registration, because the server cannot
-   (registration never opens the parquet; /verify excludes the
-   field-id contract). Both disagreements are refused with a typed
+   (registration never opens the parquet, and the removed /verify
+   excluded the field-id contract anyway). Both disagreements are refused with a typed
    error naming the file, each by its own explicit check (never a
    fall-through): flag false + reserved field id present violates the
    reserved-id invariant (AGENT.md invariant 2) and its row ids cannot

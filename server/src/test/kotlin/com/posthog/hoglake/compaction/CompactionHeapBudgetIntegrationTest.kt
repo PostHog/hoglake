@@ -21,7 +21,6 @@ import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.RemovalStore
-import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
@@ -74,7 +73,6 @@ class CompactionHeapBudgetIntegrationTest {
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
-    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val counter = AtomicInteger(0)
 
     private companion object {
@@ -280,7 +278,6 @@ class CompactionHeapBudgetIntegrationTest {
         val again = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
         assertThat(again.heapBudgetExceeded).isEqualTo(3)
         assertThat(again.failedGroups).isZero()
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -442,7 +439,6 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(liveFileCount(cat))
             .describedAs("and the file count actually fell")
             .isLessThan(filesCount.toLong())
-        assertVerifyPasses(cat)
     }
 
     // ---- OOM containment and the staged-output ledger ----------------------
@@ -494,7 +490,6 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(drained.removed + drained.missing).isEqualTo(1)
         assertThat(drained.stillReferenced).describedAs("never an invariant violation").isZero()
         assertThat(removalRows(fx).single().drainedAt).isNotNull()
-        assertVerifyPasses(fx)
     }
 
     @Test
@@ -528,7 +523,6 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(removalRows(fx)).describedAs("the claimed path is left to reclaim").hasSize(1)
         assertThat(liveFileCount(fx)).isEqualTo(3)
         assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
-        assertVerifyPasses(fx)
     }
 
     @Test
@@ -557,7 +551,6 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(objectExists(staged.single().path))
             .describedAs("nothing may be published at %s", staged.single().path)
             .isFalse()
-        assertVerifyPasses(fx)
     }
 
     /**
@@ -894,13 +887,6 @@ class CompactionHeapBudgetIntegrationTest {
                 }
                 .list()
         }
-
-    private fun assertVerifyPasses(cat: String) {
-        val report = verify.runOnce(cat)
-        assertThat(report.status)
-            .describedAs("verify checks: " + report.checks.joinToString { "${it.check}=${it.violations}" })
-            .isEqualTo("pass")
-    }
 
     private val fixtureColumns =
         listOf(

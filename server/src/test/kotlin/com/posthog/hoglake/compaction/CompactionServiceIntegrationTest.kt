@@ -29,8 +29,8 @@ import com.posthog.hoglake.service.ReplacementTarget
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationService
-import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.stats.IcebergSingleValue
+import com.posthog.hoglake.testing.CatalogInvariants
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import com.posthog.hoglake.testing.ThriftRowGroupStarts
@@ -72,7 +72,7 @@ import java.util.concurrent.atomic.AtomicInteger
  * table_compacted change, the staging-ticket lifecycle), typed stats
  * aggregation, the changefeed-exclusion contract, the plan-to-commit
  * races (input death, DV appearance, DV supersession), orphan
- * reclamation via the cleanup drain, verify composition, and the
+ * reclamation via the cleanup drain, and the
  * expiry lifecycle of compacted-away inputs.
  */
 @Tag("integration")
@@ -83,7 +83,6 @@ class CompactionServiceIntegrationTest {
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
     private val scans = ScanService(db.jdbi)
-    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val creations = TableCreationService(db.jdbi, catalogs, commits)
     private val counter = AtomicInteger(0)
 
@@ -324,13 +323,6 @@ class CompactionServiceIntegrationTest {
                 .list()
         }
 
-    private fun assertVerifyPasses(cat: String) {
-        val report = verify.runOnce(cat)
-        assertThat(report.status)
-            .describedAs("verify checks: " + report.checks.joinToString { "${it.check}=${it.violations}" })
-            .isEqualTo("pass")
-    }
-
     // ---- fixture -----------------------------------------------------------
 
     private class Fixture(
@@ -400,7 +392,6 @@ class CompactionServiceIntegrationTest {
         assertThat(stats.getValue(2L).lower).isEqualTo(IcebergSingleValue.encodeString("a"))
         assertThat(stats.getValue(2L).upper).isEqualTo(IcebergSingleValue.encodeString("mid-4"))
         assertThat(stats.getValue(3L).upper).isEqualTo(IcebergSingleValue.encodeDouble(9.0))
-        assertVerifyPasses(fx.cat)
     }
 
     private fun fixture(dvOnMiddle: Boolean = true): Fixture {
@@ -611,8 +602,21 @@ class CompactionServiceIntegrationTest {
         assertThat(removals.single().reason).isEqualTo("compaction_staging")
         assertThat(removals.single().drainedOutcome).isEqualTo("registered")
 
-        // -- verify composes with explicit-row-id holes: all green.
-        assertVerifyPasses(fx.cat)
+        // -- the at-rest invariants a rewrite can break, over a table
+        //    whose row ids now have HOLES in them (the DV'd rows are
+        //    gone forever) and whose output is explicit-row-id: the one
+        //    shape most likely to put a bound out of range. The verify
+        //    oracle used to stand here; CatalogInvariants says which of
+        //    its arms were real and which were unfalsifiable.
+        CatalogInvariants.assertVisibilityBounds(db.jdbi, fx.cat)
+        CatalogInvariants.assertNoAbsentTicketOverLivePath(db.jdbi, fx.cat)
+        CatalogInvariants.assertSnapshotsDense(db.jdbi, fx.cat)
+        // NOT assertRemovalQueueUnreferenced here: the group commit sets
+        // `drained_at` and `drained_outcome = 'registered'` in the SAME
+        // statement (CompactionService:3777), so this catalog has no
+        // undrained row left and the assertion would be vacuous. Its
+        // call site is the plan-to-commit race below, where the staged
+        // ticket is still undrained — mutation-tested there.
 
         // -- a second run finds nothing left to do.
         val again = svc.runOnce(fx.cat, cfg)
@@ -621,7 +625,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `verify reads a real staging ticket - registered is clean, absent over a live path is not`() {
+    fun `a real staging ticket settled 'absent' over a live path is caught, and 'registered' is clean`() {
         // The ticket here is the one CompactionService minted and settled
         // itself, over an object it really uploaded and registered: the
         // #174 lifecycle end to end, not a row this test invented.
@@ -630,12 +634,15 @@ class CompactionServiceIntegrationTest {
         val ticket = removalRows(fx.cat).single()
         assertThat(ticket.reason).isEqualTo("compaction_staging")
         assertThat(ticket.drainedOutcome).isEqualTo("registered")
-        assertVerifyPasses(fx.cat)
+        CatalogInvariants.assertNoAbsentTicketOverLivePath(db.jdbi, fx.cat)
 
         // Now the race resolved the wrong way: cleanup settled the ticket
         // 'absent' — "this object never existed" — while the catalog is
         // serving reads from the very path it names. The removal ledger is
-        // the only thing that knows that path, so nothing else can see it.
+        // the only thing that knows that path, so nothing else can see it,
+        // and this assertion is the whole reason the 'absent' outcome and
+        // the HEAD-before-DELETE carve-out that produces it still have a
+        // reader after #261 (see CleanupService.STAGING_REASON).
         db.jdbi.useHandleUnchecked { h ->
             h.createUpdate(
                 """
@@ -644,15 +651,10 @@ class CompactionServiceIntegrationTest {
                 """,
             ).bind("cat", fx.cat).execute()
         }
-        val report = verify.runOnce(fx.cat)
-        assertThat(report.status).isEqualTo("fail")
-        val staging = report.checks.single { it.check == "staging_tickets" }
-        assertThat(staging.violations).isEqualTo(1)
-        assertThat(staging.samples.single())
-            .contains(ticket.path)
-            .contains("was drained 'absent' but the catalog holds a file row")
-        assertThat(report.checks.filter { it.status != "pass" }.map { it.check })
-            .containsExactly("staging_tickets")
+        assertThatThrownBy { CatalogInvariants.assertNoAbsentTicketOverLivePath(db.jdbi, fx.cat) }
+            .isInstanceOf(AssertionError::class.java)
+            .hasMessageContaining(ticket.path)
+            .hasMessageContaining("was drained 'absent' but the catalog holds a file row")
     }
 
     @Test
@@ -786,7 +788,6 @@ class CompactionServiceIntegrationTest {
         assertThat(listOf(stats[1L]!!.nanCount, stats[2L]!!.nanCount)).containsOnly(null)
         // size_bytes is the footer's own per-column chunk total.
         assertThat(stats.values.map { it.sizeBytes }).doesNotContainNull()
-        assertVerifyPasses(fx.cat)
     }
 
     private data class StoredStats(
@@ -1002,7 +1003,6 @@ class CompactionServiceIntegrationTest {
             .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(-1)))
         assertThat(stats.getValue(2L).upper)
             .isEqualTo(IcebergSingleValue.encodeDecimalUnscaled(java.math.BigInteger.valueOf(1420)))
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -1037,7 +1037,6 @@ class CompactionServiceIntegrationTest {
         // non-NaN value is both bounds.
         assertThat(row.lower).isEqualTo(IcebergSingleValue.encodeDouble(1.0))
         assertThat(row.upper).isEqualTo(IcebergSingleValue.encodeDouble(1.0))
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -1088,7 +1087,6 @@ class CompactionServiceIntegrationTest {
         assertThat(reread)
             .describedAs("the written footer carries no statistics for an oversized chunk")
             .isEmpty()
-        assertVerifyPasses(cat)
     }
 
     private fun footerOf(bytes: ByteArray): ParquetMetadata {
@@ -1168,7 +1166,6 @@ class CompactionServiceIntegrationTest {
         assertThat(stats[3L]!!.upper)
             .describedAs("score 9.0 died with f3's vector")
             .isEqualTo(IcebergSingleValue.encodeDouble(8.0))
-        assertVerifyPasses(fx.cat)
     }
 
     /**
@@ -1489,13 +1486,19 @@ class CompactionServiceIntegrationTest {
         val staged = removalRows(fx.cat).single { it.reason == "compaction_staging" }
         assertThat(staged.drainedOutcome).isNull()
         assertThat(removalStore.exists(staged.path)).isTrue()
+        // Invariant 4 while the ticket is UNDRAINED, which is the only
+        // window in which it can be violated and the #174 bug class: the
+        // group lost the race, so its staged path is queued for deletion
+        // and no file row may name it. A commitGroup that registered the
+        // output without settling the ticket lands exactly here.
+        CatalogInvariants.assertRemovalQueueUnreferenced(db.jdbi, fx.cat)
         val drained = cleanup.runOnce(fx.cat, batchSize = 100)
         assertThat(drained.removed).isEqualTo(1)
         assertThat(drained.stillReferenced).isZero()
         assertThat(removalStore.exists(staged.path)).isFalse()
         assertThat(removalRows(fx.cat).single { it.reason == "compaction_staging" }.drainedOutcome)
             .isEqualTo("deleted")
-        assertVerifyPasses(fx.cat)
+        CatalogInvariants.assertVisibilityBounds(db.jdbi, fx.cat)
     }
 
     @Test
@@ -1527,7 +1530,6 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isEqualTo(12)
         assertThat(readRowIds(store.get(output.path)))
             .containsExactlyInAnyOrder(0L, 1L, 2L, 3L, 4L, 5L, 7L, 10L, 11L, 12L, 13L, 14L)
-        assertVerifyPasses(fx.cat)
     }
 
     // ---- the cleanup claim vs. the group commit (V21) -----------------------
@@ -1934,7 +1936,6 @@ class CompactionServiceIntegrationTest {
         assertThat(commits.commit(fx.cat, request)).isEqualTo(published)
         val scan = scans.planScan(fx.cat, "ns", "t").single { it.dataFile.dataFileId == lateFileId }
         assertThat(scan.deleteFile?.deleteCount).isEqualTo(2)
-        assertVerifyPasses(fx.cat)
     }
 
     @Test
@@ -1955,7 +1956,6 @@ class CompactionServiceIntegrationTest {
             .isInstanceOf(HoglakeException.CommitConflict::class.java)
             .hasMessageContaining("retired at snapshot $compactionSnap")
         assertThat(catalogs.getCatalog(fx.cat).headSnapshotId).isEqualTo(compactionSnap)
-        assertVerifyPasses(fx.cat)
     }
 
     @Test
@@ -2004,7 +2004,6 @@ class CompactionServiceIntegrationTest {
         assertThat(txnFile.dataFile.recordCount).isEqualTo(rows.size.toLong())
         assertThat(txnFile.deleteFile).isNull()
         assertThat(catalogs.tableWithExactTotals(fx.cat, "ns", "t").recordCount).isEqualTo(23)
-        assertVerifyPasses(fx.cat)
     }
 
     @Test
@@ -2038,7 +2037,6 @@ class CompactionServiceIntegrationTest {
         assertThat(replaced.tableUuid).isEqualTo(prepared.tableUuid).isNotEqualTo(target.tableUuid)
         assertThat(replaced.recordCount).isZero()
         assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()
-        assertVerifyPasses(fx.cat)
     }
 
     /**
@@ -2101,7 +2099,6 @@ class CompactionServiceIntegrationTest {
         assertThat(readRowIds(store.get(compacted.path)))
             .containsExactlyInAnyOrderElementsOf(outputRowIds.filter { it != 5L } + lateRowIds)
         assertThat(scans.planScan(fx.cat, "ns", "t").single().deleteFile).isNull()
-        assertVerifyPasses(fx.cat)
     }
 
     // ---- staging-ticket lifecycle ------------------------------------------
@@ -2123,7 +2120,7 @@ class CompactionServiceIntegrationTest {
     // ---- DV pathology ------------------------------------------------------
 
     @Test
-    fun `an all-deleted group commits an empty output and verify stays green`() {
+    fun `an all-deleted group commits an empty output`() {
         val cat = "compact-empty-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
@@ -2171,7 +2168,6 @@ class CompactionServiceIntegrationTest {
         assertThat(output.statsState.wire).isEqualTo("provided")
         assertThat(storedStats(cat, output.dataFileId)).isEmpty()
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2224,7 +2220,6 @@ class CompactionServiceIntegrationTest {
         // again: the group is simply never worth re-attempting.
         assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
             .containsExactlyInAnyOrderElementsOf(regs.map { it.path })
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2316,7 +2311,7 @@ class CompactionServiceIntegrationTest {
     }
 
     @Test
-    fun `a no-sort-order group compacts by streaming - row-id order, ids preserved, verify green`() {
+    fun `a no-sort-order group compacts by streaming - row-id order, ids preserved`() {
         // The streaming rewrite path (no sort spec -> never materialize
         // the group on the heap; the 400MB-seed OOM lesson). Content
         // contract identical to the sorted path.
@@ -2355,7 +2350,6 @@ class CompactionServiceIntegrationTest {
         assertThat(output.recordCount).isEqualTo(4)
         // Row-id order, ids 0..3 positional by append order.
         assertThat(readRowIds(store.get(output.path))).containsExactly(0L, 1L, 2L, 3L)
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2470,7 +2464,6 @@ class CompactionServiceIntegrationTest {
         // numbering of the surviving ordinals {1, 2} would have produced.
         assertThat(readRowIds(store.get(output.path))).containsExactly(2L, 3L, 5L, 6L)
         assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
-        assertVerifyPasses(cat)
     }
 
     // ---- heterogeneous schemas ---------------------------------------------
@@ -2511,7 +2504,6 @@ class CompactionServiceIntegrationTest {
                 }
             }
         assertThat(ids.sorted()).containsExactlyElementsOf((0L until 51).toList())
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2595,7 +2587,6 @@ class CompactionServiceIntegrationTest {
         assertThat(readRowIds(store.get(output.path))).containsExactlyElementsOf((0L until 4000).toList())
         assertThat(catalogs.listFiles(cat, "ns", "t", before).map { it.path })
             .containsExactlyInAnyOrderElementsOf(inputs.map { it.path })
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2622,7 +2613,6 @@ class CompactionServiceIntegrationTest {
         // Last pair untouched: the failed first group consumed budget.
         assertThat(catalogs.listFiles(cat, "ns", "t").map { it.path })
             .contains(regs[0].path, regs[1].path, regs[4].path, regs[5].path)
-        assertVerifyPasses(cat)
     }
 
     @Test
@@ -2748,7 +2738,6 @@ class CompactionServiceIntegrationTest {
             HetRow(20, null, 1),
             HetRow(30, 1.5, 2),
         )
-        assertVerifyPasses(cat)
     }
 
     @Test

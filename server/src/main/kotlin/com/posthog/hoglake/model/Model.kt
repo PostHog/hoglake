@@ -1547,54 +1547,6 @@ data class CompactionResult(
 )
 
 /**
- * One invariant check inside a verify run (POST /maintenance/verify).
- * [violations] is the TRUE count; [samples] is capped detail
- * (VerifyService.MAX_SAMPLES) so a badly broken catalog cannot produce
- * an unbounded response. [description] states the invariant the check
- * enforces, in the words of AGENT.md's Invariants section, so a report
- * read by somebody who has never seen the code still says what was
- * violated.
- *
- * [description] is NULLABLE, and null in exactly one place: the
- * maintenance run ledger (see [VerifyReport.forLedger]). It is dropped
- * from the JSON entirely under NON_NULL rather than stored empty,
- * because a ledger row is replayed verbatim and an empty string would
- * read as "this check has no invariant" instead of "this row predates
- * the field" — which is also what a row written before the field
- * existed looks like, and the two must be indistinguishable.
- */
-data class VerifyCheck(
-    val check: String,
-    val status: String,
-    val violations: Long,
-    val samples: List<String>,
-    @get:JsonInclude(JsonInclude.Include.NON_NULL)
-    val description: String?,
-)
-
-/** One verify run's report: per-check status + overall rollup. */
-data class VerifyReport(
-    val catalog: String,
-    /** "pass" iff every check passed. */
-    val status: String,
-    val checks: List<VerifyCheck>,
-) {
-    /**
-     * The same report with every [VerifyCheck.description] dropped, for
-     * `hog_maintenance_run.result`.
-     *
-     * The descriptions are constants: identical prose in every row, for
-     * every catalog, on every sweep — about 8 KB per row against a
-     * payload of a few hundred bytes without them, in a ledger that
-     * keeps a week of hourly runs per catalog. The ledger records what
-     * a run FOUND; what the checks MEAN belongs to the code and to the
-     * live response, and a reader who wants it can ask the spec or run
-     * the endpoint. Storing it would be paying per row for a constant.
-     */
-    fun forLedger(): VerifyReport = copy(checks = checks.map { it.copy(description = null) })
-}
-
-/**
  * One rehydrate request's outcome (POST /maintenance/rehydrate):
  * how many 'failed' files were flipped back to 'pending' for the
  * hydrator to retry.
@@ -1831,9 +1783,8 @@ data class RetirementResult(
 /** The maintenance-task vocabulary (hog_maintenance_run.task's CHECK). */
 enum class MaintenanceTask(
     /**
-     * False for a task no background loop ever drives. Every task has
-     * one today — verify gained hers with HOGLAKE_VERIFY_INTERVAL_MS —
-     * but the flag stays, because it is what keeps
+     * False for a task no background loop ever drives: today only
+     * [VERIFY], whose subsystem is gone. It is what keeps
      * MaintenanceRunStore.recentLoopRunsAll from asking for
      * `run_trigger = 'loop'` rows that cannot exist.
      */
@@ -1852,10 +1803,29 @@ enum class MaintenanceTask(
     CLEANUP(hasLoop = true, loopRecordsEverySweep = true),
     COMPACTION(hasLoop = true, loopRecordsEverySweep = true),
 
-    // Every verify sweep records a row (the runOnceAllCatalogs fan-out
-    // records one per catalog, pass or fail), so the gaps between loop
-    // rows really are the loop's cadence.
-    VERIFY(hasLoop = true, loopRecordsEverySweep = true),
+    /**
+     * REMOVED SUBSYSTEM, RETAINED VOCABULARY. #261 deleted
+     * `VerifyService`, its loop, its route and its console panel;
+     * nothing writes a `verify` row any more and
+     * `MaintenanceStatusService` does not list the task.
+     *
+     * The value stays because `hog_maintenance_run.task`'s CHECK
+     * (V2__maintenance.sql, in the frozen append-only chain) still
+     * admits `'verify'` and the ledger still HOLDS those rows for
+     * `HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS` (7 days by
+     * default, longer wherever it is tuned up).
+     * `MaintenanceRunStore.runMapper` does `fromWire(...) ?: error(...)`,
+     * so deleting the value would not degrade one row — it would make
+     * every unfiltered `GET /maintenance/runs` throw for as long as one
+     * historical verify row survives, which is the console's main
+     * screen. It is removable once the retention window has passed
+     * everywhere.
+     *
+     * `hasLoop = false` is now the truth and is load-bearing: it keeps
+     * `recentLoopRunsAll` from asking for `run_trigger = 'loop'` rows
+     * that nothing can write.
+     */
+    VERIFY(hasLoop = false, loopRecordsEverySweep = false),
 
     // Every retirement sweep records a row too — including the ones that
     // retire nothing because no drop has sunk under the floor yet, and
@@ -1956,11 +1926,8 @@ sealed interface MaintenanceBacklog {
         val targetBytes: Long,
     ) : MaintenanceBacklog
 
-    data object VerifyBacklog : MaintenanceBacklog
-
     /**
-     * No backlog number, deliberately, and the same shape as
-     * [VerifyBacklog] for the same reason.
+     * No backlog number, deliberately: an empty object on the wire.
      *
      * The honest backlog here is "live file rows on dropped tables",
      * and that is a count over the MANIFEST — the one thing the
@@ -1969,9 +1936,10 @@ sealed interface MaintenanceBacklog {
      * different question: a catalog with one dropped 3M-row table and
      * one with forty dropped empty ones read identically. So this
      * carries nothing, and what an operator reads instead is the run
-     * ledger's own counters (`rows_retired`, `tables_remaining`) plus
-     * `/verify`'s orphans check, both of which are already per-run
-     * facts rather than a per-request scan.
+     * ledger's own counters (`rows_retired`, `tables_remaining`),
+     * which are already per-run facts rather than a per-request scan.
+     * The verify subsystem's orphans check was the second source until
+     * #261 removed it.
      */
     data object RetirementBacklog : MaintenanceBacklog
 }

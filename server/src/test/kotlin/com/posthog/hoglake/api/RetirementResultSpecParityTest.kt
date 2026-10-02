@@ -20,7 +20,7 @@ import kotlin.reflect.full.memberProperties
  * verbatim.
  *
  * `MaintenanceRun.result` is `type: object` with prose for EVERY task —
- * expiry, cleanup, compaction and verify included — so a `$ref` there
+ * expiry, cleanup and compaction included — so a `$ref` there
  * would be a change to every task's contract rather than an addition to
  * this one, and the spec's `RetirementResult` schema is consequently
  * referenced by nothing. An unreferenced component is dead schema

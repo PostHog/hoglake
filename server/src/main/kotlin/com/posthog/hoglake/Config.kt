@@ -38,7 +38,7 @@ data class Config(
      * bound's, both of which are typed.
      *
      * It is NOT sized at `dbPoolSize` minus the background loops'
-     * draw. The loops (hydrator, expiry, cleanup, compaction, verify,
+     * draw. The loops (hydrator, expiry, cleanup, compaction,
      * retirement, the metrics sampler) share the pool, so under a full
      * dispatcher some foreground requests can still queue on Hikari for
      * up to 5 s and 500. That is the PRE-EXISTING behaviour, unchanged
@@ -410,11 +410,13 @@ data class Config(
      * drain.
      *
      * 0 does not disable the predicate; it makes every ticket from an
-     * already-committed transaction eligible. The UPPER bound is
-     * `/verify`: this plus HOGLAKE_CLEANUP_INTERVAL_MS plus the backlog
-     * must stay well under VerifyService's 6 h staging-ticket age, or
-     * `staging_tickets` alerts on tickets the drain is deliberately
-     * leaving alone.
+     * already-committed transaction eligible. There is no upper bound on
+     * it any more: the ceiling used to be the verify subsystem's 6 h
+     * staging-ticket age (this plus HOGLAKE_CLEANUP_INTERVAL_MS plus the
+     * backlog had to stay well under it, or `staging_tickets` alerted on
+     * tickets the drain was deliberately leaving alone), and verify was
+     * removed in #261. A resumable scrubber that re-adds that check has
+     * to re-derive the relationship.
      */
     val cleanupStagingGraceSeconds: Long = env("HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS", "3600").toLong(),
     /**
@@ -491,27 +493,8 @@ data class Config(
     val receiptRetentionSeconds: Long =
         env("HOGLAKE_RECEIPT_RETENTION_SECONDS", "${7L * 24 * 60 * 60}").toLong(),
     /**
-     * Verify sweep interval; <= 0 disables. Default **0 — OFF**, the
-     * same position compaction takes: the loop belongs to ONE workload,
-     * and which one is an ops decision the chart makes, not a default
-     * every replica inherits.
-     *
-     * The reasoning behind the value the chart sets (one hour on the
-     * maintenance workload): a run is eleven metadata-only aggregate
-     * queries in ONE read-only REPEATABLE READ transaction that takes no
-     * catalog lock, measured at 0.3-1.4 s on dev catalogs including a
-     * 95k-file table. The cadence is therefore chosen against what it
-     * can DETECT rather than what it costs — an invariant violation is a
-     * standing state, a broken row does not heal, so an hour's detection
-     * latency changes nothing an operator can act on. A default of one
-     * hour HERE would have meant every API replica running that
-     * aggregate pass over every catalog against the database that serves
-     * its own commit tail, which is the one place it must not run.
-     */
-    val verifyIntervalMs: Long = env("HOGLAKE_VERIFY_INTERVAL_MS", "0").toLong(),
-    /**
      * Retirement sweep interval; <= 0 disables. Default **0 — OFF**, the
-     * position compaction and verify take, and for the same reason: the
+     * position compaction takes, and for the same reason: the
      * loop belongs to ONE workload. A retirement batch takes the
      * per-catalog COMMIT lock, so a sweep running on the API replicas
      * would tax the commit tail they exist to serve. The chart turns it
@@ -527,8 +510,9 @@ data class Config(
      * because its floor never advances and every snapshot below the
      * drop is still readable. That is correct, not a gap: retiring
      * there would delete rows a legal time-travel read can still ask
-     * for. `/verify`'s orphans check reports that population as an
-     * informational count rather than a violation.
+     * for. The verify subsystem's orphans check used to report that
+     * population as an informational count rather than a violation;
+     * nothing reports it since #261 removed verify.
      */
     val retirementIntervalMs: Long = env("HOGLAKE_RETIREMENT_INTERVAL_MS", "0").toLong(),
     /**
@@ -651,7 +635,7 @@ data class Config(
      * traffic every 15 seconds on every pod that registers the loop —
      * which `App.startBackground` does unconditionally.
      *
-     * Turning the DEFAULT to 0, the way compaction, verify and
+     * Turning the DEFAULT to 0, the way compaction and
      * retirement default off, would be a one-line change here and a
      * fleet-wide observability regression: every `hoglake_*` gauge,
      * `/v1/info`'s instance totals and the catalogs listing's per-
@@ -999,18 +983,7 @@ data class Config(
     val maintenanceSummaryRefreshSeconds: Long = env("HOGLAKE_MAINTENANCE_SUMMARY_REFRESH_SECONDS", "60").toLong(),
 ) {
     init {
-        // A knob that was REMOVED must not be silently ignored. `env()`
-        // is getenv-with-a-default and has no notion of an unknown key,
-        // so a values file still pinning HOGLAKE_COMPACTION_TIER_TARGET
-        // would boot clean and quietly run different defaults — the
-        // geometric ladder it configured is gone, and its old value of 8
-        // is now neither the fan-in nor anything else. Fail at boot and
-        // name the replacements instead.
-        REMOVED_ENV.forEach { (key, replacement) ->
-            require(System.getenv(key) == null) {
-                "$key was removed: $replacement"
-            }
-        }
+        checkRemovedEnv(System::getenv)
         // Concurrent compaction takes connections out of the pool the
         // FOREGROUND shares, and it holds each one across a commit-lock
         // wait. Refuse a configuration where it could take enough of
@@ -1027,7 +1000,7 @@ data class Config(
         // which the same refusal covers) cannot by itself leave the
         // pool with nothing: four connections stay outside compaction's
         // reach. It does NOT promise four are enough — the other
-        // background loops (hydrator, expiry, cleanup, verify, the
+        // background loops (hydrator, expiry, cleanup, retirement, the
         // metrics sampler) draw on the same pool, and on a busy instance
         // the foreground wants more than four of its own. An operator
         // raising this knob raises HOGLAKE_DB_POOL_SIZE with it; the
@@ -1037,9 +1010,10 @@ data class Config(
         // A CEILING OF ZERO IS NOT "NO PACING", IT IS "NEVER RUN", and
         // it fails in the worst available way: the run skips, and
         // before #193's stamp reordering it skipped before recording
-        // eligibility too, so `/verify`'s orphans arm could not fire
-        // either. Retirement would sit at zero forever while every
-        // counter and every check said the system was healthy.
+        // eligibility too, so the verify subsystem's orphans arm could
+        // not fire either. Retirement would sit at zero forever while
+        // every counter said the system was healthy — and since #261
+        // removed verify there is no second opinion at all.
         //
         // `count(*) > 0` is true of any catalog with a single undrained
         // row, which a live catalog always has, so there is no reading
@@ -1050,8 +1024,8 @@ data class Config(
         require(retirementIntervalMs <= 0 || retirementQueueCeiling > 0) {
             "HOGLAKE_RETIREMENT_QUEUE_CEILING=0 with HOGLAKE_RETIREMENT_INTERVAL_MS=" +
                 "$retirementIntervalMs would disable retirement silently: every run would skip " +
-                "on the cleanup-queue check and nothing — not the run ledger, not the metrics, " +
-                "not /verify's orphans check — would say so. Set a positive ceiling (the default " +
+                "on the cleanup-queue check and nothing — not the run ledger, not the metrics " +
+                "— would say so. Set a positive ceiling (the default " +
                 "is $DEFAULT_RETIREMENT_QUEUE_CEILING) or set HOGLAKE_RETIREMENT_INTERVAL_MS=0 " +
                 "to turn the loop off on purpose."
         }
@@ -1302,6 +1276,90 @@ data class Config(
                     "HOGLAKE_COMPACTION_MAX_INPUT_FILES (default 64); the old value of 8 " +
                     "maps to neither.",
             )
+
+        /**
+         * Interval knobs of a REMOVED subsystem: a POSITIVE value is
+         * refused at boot, `0` and absence are accepted in silence.
+         *
+         * The middle tier between [REMOVED_ENV] (any value refused) and
+         * ignoring a knob outright, and it exists because the chart is
+         * not in this repository. `HOGLAKE_VERIFY_INTERVAL_MS` is
+         * rendered UNCONDITIONALLY by the gigahog chart's hoglake
+         * Deployment, from a `verifyIntervalMs` that `values.schema.json`
+         * lists as REQUIRED, so every pod in every environment sets it —
+         * and sets it to `"0"`, with no override anywhere under
+         * `argocd/gigahog/values/`. A [REMOVED_ENV]-style `require` would
+         * therefore refuse every pod over a value that is semantically
+         * identical to absence, stalling the rollout (the chart sets
+         * `maxUnavailable: 0`, so the old ReplicaSet keeps serving and
+         * the Application goes Degraded) until the charts PR merged.
+         *
+         * SPLITTING ON THE VALUE gets both halves right. `0` means "this
+         * loop is off", which is now permanently true, so accepting it
+         * silently is honest and costs no log line on any pod. Anything
+         * POSITIVE is an operator asking for invariant checks that no
+         * longer exist, and answering that with silence — or with a WARN
+         * nobody reads — would leave them believing a catalog is being
+         * scrubbed when nothing is. That is the one failure mode pure
+         * ignoring cannot address, and it is the repo's own idiom to
+         * answer it with a typed refusal naming the knob.
+         *
+         * Each entry graduates into [REMOVED_ENV] once the chart has
+         * stopped rendering it at all.
+         */
+        private val REMOVED_INTERVAL_ENV =
+            mapOf(
+                "HOGLAKE_VERIFY_INTERVAL_MS" to
+                    "the verify subsystem was removed in #261: twelve unbounded full-table " +
+                    "checks in one REPEATABLE READ transaction, which timed out at the 60 s " +
+                    "statement timeout on every production run and was disabled there. A " +
+                    "positive interval would schedule a loop that does not exist, so nothing " +
+                    "would be checked and nothing would say so. Set it to \"0\" or remove it; " +
+                    "the paged, resumable scrubber that replaces it will bring its own knob.",
+            )
+
+        /**
+         * Both removed-knob tiers, over an injected lookup so the
+         * refusals are unit-testable.
+         *
+         * [lookup] rather than `System.getenv` directly for one reason:
+         * these are `require`s in `init`, and a test cannot set a
+         * process environment variable on a modern JVM. Deleting either
+         * tier's refusal used to leave the whole suite green, which is
+         * the condition this seam exists to end — `ConfigTest` drives it
+         * with a map.
+         *
+         * `init` calls it with `System::getenv` and nothing else does.
+         */
+        internal fun checkRemovedEnv(lookup: (String) -> String?) {
+            // A knob that was REMOVED must not be silently ignored.
+            // `env()` is getenv-with-a-default and has no notion of an
+            // unknown key, so a values file still pinning
+            // HOGLAKE_COMPACTION_TIER_TARGET would boot clean and quietly
+            // run different defaults — the geometric ladder it configured
+            // is gone, and its old value of 8 is now neither the fan-in
+            // nor anything else. Fail at boot and name the replacements.
+            REMOVED_ENV.forEach { (key, replacement) ->
+                require(lookup(key) == null) {
+                    "$key was removed: $replacement"
+                }
+            }
+            // The middle tier: a removed subsystem's INTERVAL knob, which
+            // a chart this repository does not own still renders. `0` is
+            // accepted in silence (it is what every environment sets, and
+            // it says exactly what is true); anything positive is an
+            // operator asking for checks that no longer run, and is
+            // refused naming itself. See [REMOVED_INTERVAL_ENV].
+            REMOVED_INTERVAL_ENV.forEach { (key, explanation) ->
+                val raw = lookup(key)?.takeIf { it.isNotBlank() }
+                // An unparseable value is refused too: it cannot be read
+                // as "off", and treating it as 0 would be guessing on an
+                // operator's behalf.
+                require(raw == null || (raw.toLongOrNull() ?: 1L) <= 0L) {
+                    "$key=$raw is not supported: $explanation"
+                }
+            }
+        }
 
         private fun env(
             name: String,

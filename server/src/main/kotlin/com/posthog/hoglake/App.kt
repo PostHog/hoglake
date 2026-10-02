@@ -39,7 +39,6 @@ import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
 import com.posthog.hoglake.service.TableCreationService
-import com.posthog.hoglake.service.VerifyService
 import com.posthog.hoglake.service.ViewService
 import com.zaxxer.hikari.HikariDataSource
 import io.ktor.http.ContentType
@@ -95,16 +94,6 @@ class App private constructor(
     private val viewService = ViewService(jdbi)
     private val optionsService = OptionsService(jdbi)
     private val expiryService = ExpiryService(jdbi, cfg)
-    private val verifyService =
-        VerifyService(
-            jdbi,
-            // The two knobs the staging_tickets description quotes: a
-            // report must explain itself against THIS process's config,
-            // never against the defaults.
-            compactionTargetBytes = cfg.compactionTargetBytes,
-            cleanupIntervalMs = cfg.cleanupIntervalMs,
-            retirementIntervalMs = cfg.retirementIntervalMs,
-        )
 
     /** Same threshold CompactionService plans with: debt == sweepable files. */
     private val partitionStatsService =
@@ -193,7 +182,6 @@ class App private constructor(
             expiryIntervalMs = cfg.expiryIntervalMs,
             cleanupIntervalMs = cfg.cleanupIntervalMs,
             compactionIntervalMs = cfg.compactionIntervalMs,
-            verifyIntervalMs = cfg.verifyIntervalMs,
             retirementIntervalMs = cfg.retirementIntervalMs,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
@@ -335,7 +323,6 @@ class App private constructor(
             expiryService,
             cleanupService,
             compactionService,
-            verifyService,
             hydrator,
             maintenanceStatusService,
             DatabaseHealthService(jdbi),
@@ -368,15 +355,7 @@ class App private constructor(
         loops.register("compaction", cfg.compactionIntervalMs) {
             compactionService.runOnceAllCatalogs()
         }
-        // Default 0 = off, like compaction: the chart turns it on for the
-        // maintenance workload alone (an hour), because an aggregate pass
-        // over every catalog must not run on the replicas serving the
-        // commit tail. The manual trigger stays live everywhere.
-        loops.register("verify", cfg.verifyIntervalMs) {
-            verifyService.runOnceAllCatalogs()
-        }
-        // Default 0 = off, like compaction and verify, and for a sharper
-        // reason than either: a retirement batch TAKES THE PER-CATALOG
+        // Default 0 = off, like compaction, and for a sharper reason: a retirement batch TAKES THE PER-CATALOG
         // COMMIT LOCK, hundreds of times per run. On an API replica that
         // is the commit tail taxing itself. The chart turns it on for the
         // maintenance Deployment, where the drain it feeds also runs.

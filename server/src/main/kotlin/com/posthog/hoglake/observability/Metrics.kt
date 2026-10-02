@@ -57,10 +57,11 @@ object Metrics {
     private var timers: BoundTimers? = null
 
     /**
-     * The bound registry, for the one observability surface in this
-     * package that is a GAUGE rather than a counter and is therefore not
-     * served by [increment]: [VerifyGauges]. Internal — nothing outside
-     * observability/ reaches the registry directly.
+     * The bound registry, for the observability surfaces in this
+     * package that are GAUGES rather than counters and are therefore
+     * not served by [increment] ([CatalogMetrics]'s MultiGauges).
+     * Internal — nothing outside observability/ reaches the registry
+     * directly.
      */
     internal val boundRegistry: MeterRegistry?
         get() = registry
@@ -155,9 +156,13 @@ object Metrics {
      * catalogs per maintenance pod); a rate that rises and falls is a
      * catalog catching up after a backlog, which is the design working.
      *
-     * It is also what makes `/verify`'s `expiry_floor` gating safe: that
-     * check skips its file-row arm while a purge is behind, so "behind"
-     * has to be loud somewhere else, and this is where.
+     * It used to be what made `/verify`'s `expiry_floor` gating safe —
+     * that check skipped its file-row arm while a purge was behind, so
+     * "behind" had to be loud somewhere else. #261 removed the check, so
+     * this counter is no longer the quiet half of a pair: it and
+     * `hoglake_expiry_purge_remaining` are now the ONLY things that say
+     * a catalog is falling behind, and nothing at all says a drained
+     * purge left rows below the floor.
      */
     fun expiryPurgeTruncated(catalog: String) {
         increment("hoglake_expiry_purge_truncated_total", 1.0, "catalog", catalog)
@@ -480,22 +485,6 @@ object Metrics {
      * nonzero value here is storage growing silently.
      */
     fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
-
-    /**
-     * hoglake_verify_errors_total{catalog} — verify sweeps that THREW
-     * for one catalog.
-     *
-     * The verify sweep catches per catalog so one bad catalog cannot
-     * stop the others, which means `hoglake_background_loop_failures_
-     * total` never fires for it — the iteration succeeded. And because
-     * the violation gauge is a MultiGauge refreshed with the sweep's
-     * whole row set, a catalog that throws is simply absent from it:
-     * its series RETIRE, which is correct (the sweep has no answer for
-     * it) and silent (nothing left says so). This counter is the thing
-     * that says so. A standing `increase(...) > 0` is a catalog nobody
-     * is checking, which is worse than a catalog that fails a check.
-     */
-    fun verifyError(catalog: String) = increment("hoglake_verify_errors_total", 1.0, "catalog", catalog)
 
     /** hoglake_background_loop_failures_total{loop} — iterations that threw (loop continued). */
     fun backgroundLoopFailure(loop: String) = increment("hoglake_background_loop_failures_total", 1.0, "loop", loop)

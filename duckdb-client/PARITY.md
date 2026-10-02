@@ -93,7 +93,7 @@ client work not yet done. Last checked against `openapi/hoglake.yaml`
 | `merge_adjacent_files` | DONE (server-side passthrough) | `hoglake_compact(cat, batch)` — POST /maintenance/compact; refused on read-only attaches. Real compaction exercised: the fixture force-compacts `points` via this endpoint and the suite reads the output (`hoglake_compacted_read.test`) |
 | `expire_snapshots` | PARTIAL (server-side passthrough) | `hoglake_expire(cat, batch)`; shape-tested only (no retention configured on the dev catalog, so nothing ever expires in tests) |
 | `cleanup_old_files` | DONE (server-side) | `hoglake_cleanup(cat, batch)` — liveness-checked server-side; shape-tested |
-| verify (no ducklake analogue) | DONE | `hoglake_verify(cat)` |
+| verify (no ducklake analogue) | REMOVED | `hoglake_verify(cat)` existed until hoglake #261 removed the server's verify subsystem (twelve unbounded full-table checks in one transaction). A paged, resumable scrubber will get a new passthrough |
 | `rewrite_data_files`, `delete_orphaned_files`, `flush_inlined_data` | N/A | server policy / inlining dropped |
 | `ducklake_set_option` / `options` / `settings` | TODO | retention PATCH + settings echo are trivial; most ducklake options have no hoglake meaning |
 | `set_commit_message` | TODO | author/message fields already ride CommitRequest |

@@ -1011,7 +1011,7 @@ object ParquetRewriter {
      * disagrees with its registration IN EITHER DIRECTION — "each by
      * its own explicit check (never a fall-through)" — because the
      * server cannot detect the disagreement at registration time
-     * (registration never opens the parquet, and `/verify` is
+     * (registration never opens the parquet, and the removed `/verify` was
      * metadata-only). Compaction is the one server surface that does
      * open it, so it is the one place that can enforce what the docs
      * ask of readers.

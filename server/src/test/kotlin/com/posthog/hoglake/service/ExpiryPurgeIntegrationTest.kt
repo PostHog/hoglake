@@ -280,6 +280,10 @@ class ExpiryPurgeIntegrationTest {
             catalogId,
         )
 
+    /** The catalog's CURRENT floor, which a drained ledger row's floor may lag. */
+    private fun currentFloor(catalogId: Long) =
+        count("SELECT earliest_snapshot_id FROM hog_catalog WHERE catalog_id = :c", catalogId)
+
     private fun queued(catalogId: Long) =
         count(
             "SELECT count(*) FROM hog_file_removal WHERE catalog_id = :c AND reason = 'snapshot_expiry'",
@@ -567,8 +571,9 @@ class ExpiryPurgeIntegrationTest {
         // than a gate. `hog_delete_file` FKs to `hog_data_file`
         // ON DELETE CASCADE, so purging a data-file row takes its
         // vectors with it and queues NOTHING — a leaked puffin object
-        // that cleanup never hears about and `/verify`'s orphans arm
-        // cannot find, because finding it needs a live row.
+        // that cleanup never hears about, and that the removed
+        // `/verify`'s orphans arm could not have found either, because
+        // finding it needs a live row.
         //
         // This used to be a cross-arm gate: "drain every eligible vector
         // first, and start the data-file arm once the vector arm's page
@@ -872,10 +877,13 @@ class ExpiryPurgeIntegrationTest {
         // manual trigger racing the loop, `RetirementService` under only
         // the commit lock — and a walk that read that as "the eligible
         // set is exhausted" would report `drained` with rows still below
-        // the floor. `/verify`'s `expiry_floor` arm then asserts against
-        // exactly that state and reports a violation that is really a
-        // bookkeeping error. It is also the shape of the unsound gate
-        // this design replaced.
+        // the floor — a false `drained`, which is the one state anything
+        // judging this invariant has to be able to trust. `/verify`'s
+        // `expiry_floor` arm asserted against exactly that state until
+        // #261 removed it, so today nothing catches it and this test is
+        // the only thing standing between the walk and a silent false
+        // `drained`. It is also the shape of the unsound gate this design
+        // replaced.
         //
         // Forced deterministically with a `BEFORE DELETE` trigger that
         // RETURNS NULL for a few rows, which cancels their delete
@@ -930,9 +938,11 @@ class ExpiryPurgeIntegrationTest {
         // so it fires exactly when the backlog is largest — and the
         // purge used to be skipped on that path, because the exception
         // propagated before it. Three sweeps in a row then reported
-        // `failed` with a null result, no counters, and `/verify`'s file
-        // arm dark, while 5,000 rows sat below a floor that had already
-        // moved.
+        // `failed` with a null result, no counters, and (at the time)
+        // `/verify`'s file arm dark, while 5,000 rows sat below a floor
+        // that had already moved. The counters this test asserts are now
+        // the WHOLE signal: #261 removed the check that was the other
+        // half.
         //
         // The failure here is a trigger rather than a statement bound, so
         // it is deterministic and is NOT retried by the halving loop
@@ -1913,29 +1923,31 @@ class ExpiryPurgeIntegrationTest {
     }
 
     @Test
-    fun `a drained row at an OLDER floor does not make the next advance's pending rows violations`() {
+    fun `a drained purge's ledger row names the floor it drained AT, not the catalog's current one`() {
         // THE WINDOW THIS DESIGN OPENS DELIBERATELY: a sweep advances the
         // floor and then purges off it, so between the advance and the
         // purge there are rows below the floor that nothing has reached
-        // yet. `expiry_floor` reads the newest expiry ledger row to
-        // decide whether to assert its file-row arm — and a DRAINED row
-        // only says "nothing was eligible below the floor I READ". If
-        // that floor is older than the catalog's current one, the rows
-        // the newer advance just exposed are legitimately pending, and
-        // without comparing the two the check reports a healthy catalog
-        // as a broken invariant.
+        // yet. Anything judging "are there rows below the floor that
+        // should be gone?" has to compare the floor the drained row
+        // reports against the catalog's CURRENT floor — a drained row
+        // only ever says "nothing was eligible below the floor I READ".
+        //
+        // #262 shipped that comparison inside `/verify`'s `expiry_floor`
+        // arm and this test asserted it there. #261 removed verify, so
+        // what is pinned here is the LEDGER FACT the comparison stands
+        // on, which is verify-independent and is what the paged scrubber
+        // will have to read: the newest expiry row names the OLD floor
+        // while the catalog has moved on, and the rows in between are
+        // legitimately pending rather than violations. Nothing asserts
+        // the conclusion today — that is the gap #261 owns.
         //
         // Reproduced as production reproduces it: a sweep drains at floor
         // 5 and writes its row, then the floor moves to 10 with no newer
         // expiry row behind it — which is exactly what a pod killed
         // between the phases leaves.
-        val catalogId = seed("verify-older-floor", endedBelowFloor = 10, live = 10, head = 5)
-        val verify = VerifyService(jdbi, retirementIntervalMs = 0)
-        ExpiryService(jdbi).runOnce("verify-older-floor", batchSize = 100)
+        val catalogId = seed("drained-older-floor", endedBelowFloor = 10, live = 10, head = 5)
+        ExpiryService(jdbi).runOnce("drained-older-floor", batchSize = 100)
         assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
-        assertThat(
-            verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }.violations,
-        ).isEqualTo(0)
 
         jdbi.useHandleUnchecked { h ->
             // A newer wave, ended above the old floor, and a floor
@@ -1958,88 +1970,30 @@ class ExpiryPurgeIntegrationTest {
         assertThat(endedBelowFloor(catalogId))
             .describedAs("ten rows the newer advance exposed and no purge has reached")
             .isEqualTo(10)
-        val newestExpiryFloor =
+
+        val newest =
             jdbi.withHandleUnchecked { h ->
                 h.createQuery(
-                    "SELECT (result->>'new_earliest_snapshot_id')::bigint FROM hog_maintenance_run " +
+                    "SELECT (result->>'new_earliest_snapshot_id')::bigint AS floor, " +
+                        "(result->>'purge_truncated')::boolean AS truncated " +
+                        "FROM hog_maintenance_run " +
                         "WHERE catalog_id = :c AND task = 'expiry' ORDER BY run_id DESC LIMIT 1",
-                ).bind("c", catalogId).mapTo(Long::class.java).one()
+                ).bind("c", catalogId)
+                    .map { rs, _ -> rs.getLong("floor") to rs.getBoolean("truncated") }
+                    .one()
             }
-        assertThat(newestExpiryFloor)
+        assertThat(newest.first)
             .describedAs("the newest expiry row is the drained one, and it names the OLD floor")
             .isEqualTo(5)
+        assertThat(newest.second).describedAs("and it really did drain").isFalse()
+        assertThat(currentFloor(catalogId))
+            .describedAs("while the catalog has moved past it — the two must be compared, never assumed equal")
+            .isEqualTo(10)
 
-        val check = verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }
-        assertThat(check.violations)
-            .describedAs(
-                "a drained row at floor 5 says nothing about rows below floor 10:%n%s",
-                check.samples,
-            )
-            .isEqualTo(0)
-
-        // And the invariant still holds where it applies: once a sweep
-        // drains AT the current floor, a row left below it is real.
-        ExpiryService(jdbi).runOnce("verify-older-floor", batchSize = 100)
+        // And once a sweep drains AT the current floor, the pending rows
+        // are gone: the lag really is a lag and not a leak.
+        ExpiryService(jdbi).runOnce("drained-older-floor", batchSize = 100)
         assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
-        jdbi.useHandleUnchecked { h ->
-            h.execute(
-                """
-                INSERT INTO hog_data_file
-                    (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, path,
-                     record_count, file_size_bytes, row_id_start)
-                VALUES (?, 999123, 1, 0, 1, 's3://b/survivor-older-floor', 1, 1, 0)
-                """,
-                catalogId,
-            )
-        }
-        assertThat(
-            verify.runOnce("verify-older-floor").checks.single { it.check == "expiry_floor" }.violations,
-        )
-            .describedAs("a purge drained at THIS floor that still left a row is the real thing")
-            .isEqualTo(1)
-    }
-
-    @Test
-    fun `a truncated purge is not an expiry_floor violation, and a drained one that leaves rows is`() {
-        // What /verify now claims, and the two states that separate the
-        // designed lag from a real bug. `expiry_floor`'s file-row arm
-        // reads the catalog's newest expiry ledger row: a purge that
-        // reported `purge_truncated` is draining, and rows below the
-        // floor are not a violation; a purge that reported DRAINED and
-        // still left rows means its predicate and the floor advance
-        // disagree, which no counter would show.
-        val catalogId = seed("purge-verify", endedBelowFloor = 10, live = 10)
-        val verify = VerifyService(jdbi, retirementIntervalMs = 0)
-        ExpiryService(jdbi, purgeBudgetMs = 0).runOnce("purge-verify", batchSize = 100)
-        assertThat(endedBelowFloor(catalogId)).isEqualTo(10)
-        val lagging = verify.runOnce("purge-verify").checks.single { it.check == "expiry_floor" }
-        assertThat(lagging.violations)
-            .describedAs("rows below the floor while the purge is behind are not a violation")
-            .isEqualTo(0)
-
-        // Now a sweep that drains, with a row hand-planted below the
-        // floor afterwards: the invariant the check still owns.
-        ExpiryService(jdbi).runOnce("purge-verify", batchSize = 100)
-        assertThat(endedBelowFloor(catalogId)).isEqualTo(0)
-        assertThat(
-            verify.runOnce("purge-verify").checks.single { it.check == "expiry_floor" }.violations,
-        ).isEqualTo(0)
-        jdbi.useHandleUnchecked { h ->
-            h.execute(
-                """
-                INSERT INTO hog_data_file
-                    (catalog_id, data_file_id, table_id, begin_snapshot, end_snapshot, path,
-                     record_count, file_size_bytes, row_id_start)
-                VALUES (?, 999999, 1, 0, 1, 's3://b/survivor', 1, 1, 0)
-                """,
-                catalogId,
-            )
-        }
-        val broken = verify.runOnce("purge-verify").checks.single { it.check == "expiry_floor" }
-        assertThat(broken.violations)
-            .describedAs("a DRAINED purge that left a row below the floor is still a violation")
-            .isEqualTo(1)
-        assertThat(broken.samples.single()).contains("survived the floor advance")
     }
 
     @Test

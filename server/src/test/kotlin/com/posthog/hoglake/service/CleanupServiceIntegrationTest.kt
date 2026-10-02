@@ -404,10 +404,13 @@ class CleanupServiceIntegrationTest {
 
     @Test
     fun `a staging ticket keeps the HEAD, so absent still reaches the ledger`() {
-        // The carve-out, and why it exists: /verify's staging_tickets
-        // check reads 'absent' (a staged path drained 'absent' that IS a
-        // live file row is the staged-output race resolved the wrong
-        // way), and a DeleteObjects response cannot produce that value.
+        // The carve-out, and why it exists: 'absent' distinguishes a
+        // staged path that never existed from one that did (a staged path
+        // drained 'absent' that IS a live file row is the staged-output
+        // race resolved the wrong way), and a DeleteObjects response
+        // cannot produce that value. Its reader was /verify's
+        // staging_tickets check, removed in #261 — the value is written
+        // and unread today, and kept because it cannot be reconstructed.
         // So compaction_staging rows keep the HEAD + DELETE pair the
         // rest of the queue gave up — one row per compaction group, so
         // the two round trips stay affordable.
@@ -2251,8 +2254,9 @@ class CleanupServiceIntegrationTest {
         // per worker per run — and with `batchSize <= subBatchSize` it gave
         // them NOTHING, because the bulk arm spent the budget in the first
         // iteration. On gigahog-prod-us that is ~9.4k orphaned tickets at
-        // 50/h: eight days, with /verify's `staging_tickets.leaked` arm
-        // (a 6 h bound) firing for every one of them the whole time.
+        // 50/h: eight days, with the (since-removed) /verify
+        // `staging_tickets.leaked` arm at its 6 h bound firing for every
+        // one of them the whole time.
         //
         // The fixture is that exact shape: a bulk queue larger than the
         // batch, and more than one staging claim's worth of tickets behind

@@ -296,10 +296,10 @@ describe("maintenance outcome and history", () => {
     });
 
     it("distinguishes a task with no loop from a server that did not answer", () => {
-      // null = a task with no loop at all. No task is in that position
-      // any more — verify gained one with HOGLAKE_VERIFY_INTERVAL_MS —
-      // so null now only reaches this page from an older server that
-      // still had one. undefined = an older server still, which does
+      // null = a task with no loop at all. No task in the list is in
+      // that position — verify, the one that was, is gone from the list
+      // entirely (#261) — so null now only reaches this page from an
+      // older server that still had one. undefined = an older server still, which does
       // not report the field. Rendering the second as the first would
       // put a claim on screen that the response never made, which is
       // why both branches stay.

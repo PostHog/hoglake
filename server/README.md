@@ -634,11 +634,22 @@ so a failed advance does not starve the purge; the ledger row is `failed`
 and still carries what the purge did.
 
 **The consequence for observers:** ended rows below the floor can now
-exist for a few sweeps. `/verify`'s `expiry_floor` therefore asserts its
-`hog_data_file` / `hog_delete_file` arm only against a sweep whose own
-ledger row reports the purge DRAINED; a drained purge that still left
-rows below the floor is still a violation, because it means the purge's
-predicate and the floor advance disagree. And one counter can now fire
+exist for a few sweeps. #262 taught `/verify`'s `expiry_floor` to assert
+its `hog_data_file` / `hog_delete_file` arm only against a sweep whose
+own ledger row reported the purge DRAINED (and, after that PR's review
+round, only when that row's floor covered the catalog's current one), so
+that a drained purge which still left rows below the floor — the purge's
+predicate and the floor advance disagreeing — stayed a violation while
+the designed lag did not. #261 removed the check, so that invariant is
+**unwatched until the paged scrubber lands**. What still holds is the
+BACKLOG signal, which never went through verify: `purge_truncated`,
+`purge_remaining` and `purge_failures` on every ledger row, plus
+`hoglake_expiry_purge_truncated_total` and
+`hoglake_expiry_purge_remaining`.
+`ExpiryPurgeIntegrationTest.a drained purge's ledger row names the floor
+it drained AT, not the catalog's current one` pins the ledger fact the
+comparison stands on, so the scrubber has something to build against.
+And one counter can now fire
 from normal operation: two file rows may legitimately share one path
 (`V16`'s index is non-unique for exactly this reason), and purging one
 while the other survives queues a path the catalog still claims, which is
@@ -813,17 +824,20 @@ bounds the work one claim carries: 25 tickets is 50 round trips (500 s at
 the call bound, inside the 900 s lease), where a single claim of 1,000
 tickets would have been 20,000 s of calls under one lease. They keep HeadObject + DeleteObject, because a `DeleteObjects`
 response cannot distinguish a key it removed from one that was never
-there and `/verify`'s `staging_tickets` check reads exactly that
-distinction as `'absent'`. Because that costs two round trips per row,
+there, and that distinction is recorded as `'absent'`. Its reader was
+`/verify`'s `staging_tickets` check, removed in #261, so the value is
+written and unread today — kept because it cannot be reconstructed
+after the delete. Because that costs two round trips per row,
 they are claimed and settled 25 at a time — a unit of progress (each
 sub-batch settles in its own transaction) and the unit the lease bounds.
 And the drain leaves them alone until they are past
 `HOGLAKE_CLEANUP_STAGING_GRACE_SECONDS` (1 h), because the ticket is
 inserted before the rewrite starts and settling a fresh one while its
 group is still uploading leaves the object with no ticket naming it;
-that grace plus the cleanup interval has to stay well under
-`/verify`'s 6 h staging-ticket age, or the check alerts on tickets the
-drain is deliberately leaving alone. Every other reason settles
+that grace used to have a ceiling — it plus the cleanup interval had to
+stay well under `/verify`'s 6 h staging-ticket age, or the check alerted
+on tickets the drain was deliberately leaving alone — and #261 removed
+the check, so nothing bounds it today. Every other reason settles
 `'deleted'`, whether or not the key was there.
 
 The object-store call bound (`RemovalStore.apiCallTimeout`, 10 s at the
@@ -986,7 +1000,7 @@ HOGLAKE_COMPACTION_PARALLEL_GROUPS > HOGLAKE_DB_POOL_SIZE - 4
 ```
 
 naming both variables in the failure. The four are a FLOOR, not a model
-of demand: the hydrator, expiry, cleanup, verify and the metrics
+of demand: the hydrator, expiry, cleanup, retirement and the metrics
 sampler draw on the same pool, and a busy instance's foreground wants
 more than four of its own. Raise the pool with the knob — at the
 default pool of 10 the ceiling is 6.
@@ -1094,9 +1108,10 @@ purge is not gated on `HOGLAKE_COMPACTION_CLAIMS_ENABLED`, so turning
 the CLAIMS off still clears the rows they left. It does live at the head
 of a SWEEP, though, so turning compaction itself off
 (`HOGLAKE_COMPACTION_INTERVAL_MS=0`) stops it like everything else in a
-sweep — and that is one of the two things `/maintenance/verify`'s
-`compaction_claims` check reds on, the other being an expired claim
-outliving its table.
+sweep — which used to be one of the two things
+`/maintenance/verify`'s `compaction_claims` check redded on (the other
+being an expired claim outliving its table). #261 removed that check,
+so a purge that stops running is unobserved.
 
 `HOGLAKE_COMPACTION_CODEC` (default **zstd**, with
 `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**) is the compression the
@@ -1368,69 +1383,55 @@ the catalog never parses view SQL. Create/drop are DDL commits with
 their own change kinds, so views appear in snapshot history and time
 travel like everything else.
 
-### Self-knowledge: verify, partition debt, consumers, identity
+### Self-knowledge: partition debt, consumers, identity
 
 The catalog reports on itself instead of waiting for ops SQL:
 
-- **`POST /maintenance/verify`** (`service/VerifyService.kt`) — the
-  catalog's global-invariant SQL as a read-only, metadata-only
-  endpoint (one REPEATABLE READ MVCC snapshot, no catalog lock), and
-  the same code the **verify loop** runs on a cadence
-  (`HOGLAKE_VERIFY_INTERVAL_MS`, below). Twelve checks:
-  - `row_id_tiling` — positional overlap; `explicit_row_ids`
-    compaction outputs exempt by design (invariant 2).
-  - `delete_vectors` — one live DV per file, monotone supersession
-    chains, `delete_count <= record_count` (invariant 3).
-  - `orphans` — live `hog_data_file` / `hog_column` /
-    `hog_table_version` rows on a dropped table.
-  - `removal_queue` — undrained queue entries whose path a file row
-    still claims: cleanup's `still_referenced` alert at rest
-    (invariant 4).
-  - `snapshot_density` — `count(*)` equals the dense
-    `[earliest, head]` range (invariant 1).
-  - `next_row_id` — the allocator is never behind a range it handed
-    out (invariant 2).
-  - `expiry_floor` — the floor is at or below head and (under
-    `consumer_floor`) at or below every live consumer offset, using
-    ExpiryService's own floor query with the superseded-offset release
-    applied; and no versioned row with
-    `end_snapshot <= earliest_snapshot_id` survives the sweep that
-    advanced the floor (invariant 5) — for the five DDL tables
-    always, and for `hog_data_file` / `hog_delete_file` only after a
-    sweep whose purge drained, since those two are purged in pages
-    after that transaction commits (see §Retention).
-  - `visibility_bounds` — every versioned row's `begin`/`end` pair is
-    inside the catalog's snapshot range and correctly ordered, and
-    `hog_table.created_snapshot <= dropped_snapshot` when dropped
-    (invariant 6).
-  - `offset_release` — no consumer offset survives on an incarnation
-    whose lineage successor that same consumer has already reconciled
-    past; such a row can never be advanced and pins the floor forever.
-  - `staging_tickets` — compaction's `compaction_staging` claim-ticket
-    lifecycle: settled `registered` with nothing registered, an
-    undrained ticket older than the staleness bound with no file row,
-    or a ticket drained `absent` whose path IS a file row.
-  - `upload_claims` — the upload-claim state machine: a `registered`
-    claim queued for `trino_upload` reclamation, or an
-    `active`/`abandoned` claim whose path the catalog has registered.
-  - `compaction_claims` — the group-claim lease's lifecycle. Both arms
-    require the claim to be well past its expiry, because a claim
-    expires between sweeps and the NEXT sweep's purge removes it, so
-    the window in between is a correct system: one still present past
-    that grace (nothing purged it — the sweep is no longer reaching its
-    head, or compaction was turned off after having run), and one on a
-    table that is dropped or gone. A LIVE claim is never flagged, whatever its files or its
-    table are doing — a committed group keeps its claim on a short
-    lease, so a live claim over end-snapshotted files, or on a table
-    dropped inside that lease, is the ordinary state, and flagging it
-    turned `/verify` red on healthy catalogs. Because a claim is an
-    optimization and never authorization, a violation here means
-    redundant work or a leaked row and never a wrong commit.
-
-  The JSON report carries per-check status, true violation counts
-  (`count(*)`, never the sample length), samples capped at 20, and
-  each check's own one-paragraph `description` of the invariant it
-  enforces.
+- **`POST /maintenance/verify` — REMOVED (#261)**. It ran the catalog's
+  twelve global-invariant checks in one read-only REPEATABLE READ
+  transaction, every one of them an UNBOUNDED full-table aggregate. At
+  gigahog-prod-us's shape (14M live `hog_data_file` rows, 371M
+  `hog_file_column_stats` rows) it hit the 60 s `statement_timeout`
+  every run and was disabled there, so the one deployment that needed a
+  scrubber had none and the ones that ran it had nothing worth
+  scrubbing. `VerifyService`, the loop
+  (`HOGLAKE_VERIFY_INTERVAL_MS` — now `Config.REMOVED_INTERVAL_ENV`: a
+  positive value is refused at boot, `0` and absence pass in silence),
+  `hoglake_verify_violations`,
+  `hoglake_verify_errors_total` and the console's panel went with it.
+  What is NOT watched any more, in any environment: row-id tiling, DV
+  uniqueness and bounds, orphaned rows on dropped tables,
+  still-referenced removal-queue entries, snapshot density,
+  `next_row_id`, the expiry floor, versioned-row visibility bounds,
+  superseded-offset release, staging tickets, upload claims and
+  compaction claims — though three of those twelve have another
+  enforcer (`removal_queue` at drain time via
+  `CleanupService.referencedPaths`, `next_row_id` via the commit-path
+  allocator, `orphans`' retirement arm via the eligibility stamp), and
+  four are now asserted in the test suite by
+  `testing/CatalogInvariants.kt` (`visibility_bounds`, `removal_queue` at
+  the compaction boundary, `snapshot_density`, `staging_tickets` arm (c)).
+  ONE OF THOSE TWELVE HAD JUST BEEN SHARPENED AND IS NOW UNWATCHED
+  TOO. #262 split expiry into a floor advance under the lock and a paged
+  file-row purge off it, so a below-floor ended `hog_data_file` /
+  `hog_delete_file` row became the DESIGNED intermediate state of a
+  two-phase sweep rather than a violation. `expiry_floor`'s file arm was
+  gated on the ledger row reporting `purge_truncated: false` (and, after
+  that PR's own review, on the drained row's floor covering the current
+  one) precisely so it kept asserting the invariant without alerting on
+  the backlog. That gate is gone with the check: a drained purge that
+  still leaves rows below the floor — its predicate and the floor
+  advance disagreeing, which is a bug no counter shows — is **unwatched
+  until #261**. What still works is the BACKLOG half, which never needed
+  verify: `purge_truncated`, `purge_remaining` and `purge_failures` on
+  every ledger row, plus `hoglake_expiry_purge_truncated_total` and
+  `hoglake_expiry_purge_remaining` (see §Retention).
+  The replacement is a PAGED, RESUMABLE scrubber
+  (one bounded page per transaction, a cursor, a run budget, a measured
+  per-row cost) — issue #261. Until then, `MaintenanceTask.VERIFY`, the
+  spec's `VerifyReport`/`VerifyCheck` schemas and the console's ledger
+  renderer stay as HISTORICAL shapes so the ledger's existing `verify`
+  rows still decode for their retention window.
 - **`POST /maintenance/rehydrate`** — the operator requeue for the
   hydrator's structural failures (above): flips `failed` → `pending`,
   catalog-wide or scoped to one namespace+table.
@@ -1470,7 +1471,7 @@ The catalog reports on itself instead of waiting for ops SQL:
   backlog keys (hydrator `pending_files`/`failed_files`, expiry's
   retention and floors, cleanup `queued_removals` and
   `oldest_queued_age_seconds`, compaction `small_files`/`target_bytes`,
-  verify nothing) and its most recent recorded run. Counts are absent
+  retirement nothing) and its most recent recorded run. Counts are absent
   until a sample exists — unknown, not zero. `runs` pages the ledger
   newest-first on an exclusive `before` run_id cursor, optionally
   filtered by `task` (422 on an unknown one), 50 per page and capped at
@@ -1500,20 +1501,18 @@ transaction (`observability/`):
   pending-stats AND failed-stats counts
   (`hoglake_stats_failed_files`), live id-less-file count
   (`hoglake_missing_field_id_files`), live table
-  count, per-consumer lag (cardinality-capped) — plus
-  `hoglake_verify_violations{catalog, check}`, which is NOT sampled:
-  the verify SWEEP pushes each check's true violation count at the end
-  of every pass (0 meaning the check passed) and it stands until the
-  next sweep. A `MultiGauge`, so one sweep replaces the whole row set
-  and a deleted catalog's series retire; and the LOOP alone publishes —
-  a manual trigger on a replica whose loop is off would mint an
-  alerting series nothing ever refreshes. Its companion is
-  `hoglake_verify_errors_total{catalog}`: a catalog whose scan THREW is
-  absent from the gauge (the sweep has no answer for it) and invisible
-  to `hoglake_background_loop_failures_total` (the per-catalog catch
-  means the iteration succeeded), so this counter is the only thing
-  that says a catalog is not being checked at all — alert on
-  `increase(...) > 0` alongside `hoglake_verify_violations > 0`. Plus
+  count, per-consumer lag (cardinality-capped). #261 removed
+  `hoglake_verify_violations{catalog, check}` and
+  `hoglake_verify_errors_total{catalog}` with the verify subsystem —
+  a dashboard or alert still keyed on either would now have a series
+  that never arrives rather than one that reads zero, and nothing behind
+  it to alert on. NOTHING IS: checked on 2026-10-01 against live
+  `PostHog/grafana-dashboards` at `master` (the default branch is
+  `master`, not `main`) commit `1ea38c48`, pushed that day —
+  `managed-warehouse/gigahog.json` carries 21 distinct `hoglake_*`
+  series and zero `verify` matches, and a repo-wide code search for
+  `hoglake_verify` returns 0. `charts/` has no `hoglake_*` reference in
+  `alerts/` either, so no alerting or dashboard change is owed. Plus
   source-side counters: commits by outcome, snapshots expired (and superseded
   consumer offsets released, in the sweep's result and audit event),
   files removed,
@@ -1596,8 +1595,7 @@ transaction (`observability/`):
 `App.kt` wires services into Ktor and `startBackground()` runs the
 loops — hydrator, expiry, cleanup, compaction (default off:
 `HOGLAKE_COMPACTION_INTERVAL_MS=0` — flipping it on is an ops
-decision), **verify** (`HOGLAKE_VERIFY_INTERVAL_MS`, also default
-off: `0`; `<= 0` disables), metrics sampler — as
+decision), retirement (also default off), metrics sampler — as
 **coroutines under one supervisor scope** (`BackgroundLoops`), each
 with its own interval knob
 (`Config.kt`, all env-sourced, `<= 0` disables), per-catalog failure
@@ -1645,29 +1643,25 @@ does socket IO, it is not where blocking work or the probe handler
 runs, and applying this floor there would RAISE it on every pod with
 more than two CPUs.
 
-The **verify loop** runs `VerifyService.runOnceAllCatalogs()`: one
-report per catalog, recorded in the run ledger with trigger `loop`,
-with per-catalog isolation (a catalog that throws is logged and the
-rest proceed — the loop never throws out of an iteration). A catalog
-whose report FAILS is logged at WARN **once per distinct failing-check
-set**, not once an interval: a violation is a standing state, and the
-unchanged-condition log flood is the lesson compaction's heap-refusal
-warning already learned. Every LOOP sweep publishes
-`hoglake_verify_violations{catalog, check}`, set to the true violation
-count and to 0 on a pass, so an alert keys on `> 0` and a healthy
-catalog is a published zero rather than an absent series. A MANUAL run
-deliberately publishes nothing: the trigger works on every replica,
-including the ones with the loop off, and a one-off run there would
-mint an alerting series that nothing ever refreshes. Series for
-catalogs that vanish retire with the next sweep (`MultiGauge`, whole
-row set replaced), like every other per-catalog gauge.
-
-Like compaction, the interval defaults to **0 — off** and turning it
-on is a per-workload ops decision: in Gigahog the server workload leaves
-it at `0` while the maintenance workload sets `3600000`, so the
-aggregate pass never runs on the pods serving the commit tail. The chart
-renders that split today. A default of an hour here would have run it on
-every replica instead.
+There is no **verify loop** any more. It ran
+`VerifyService.runOnceAllCatalogs()` — one twelve-check report per
+catalog, recorded in the ledger with trigger `loop` — behind
+`HOGLAKE_VERIFY_INTERVAL_MS`, default `0` and set to `3600000` only on
+the Gigahog maintenance workload. #261 removed it: every check was an
+unbounded full-table aggregate, and at production scale the sweep
+timed out instead of reporting, so the knob was `"0"` there. The env
+var is now in `Config.REMOVED_INTERVAL_ENV`, which splits on the VALUE:
+`0` and absence pass in silence, a positive value is refused at boot
+naming #261. `0` is what the chart renders — unconditionally, from a
+REQUIRED `verifyIntervalMs`, with no override in any environment — so a
+blanket `REMOVED_ENV` refusal would reject every pod over a value that
+means what is now true. The cost of that would be a stalled rollout
+rather than an outage (`maxUnavailable: 0`, so the old ReplicaSet keeps
+serving; the signal is a Degraded Application, in dev only, with prod
+behind the promotion gate) — but a refusal nobody needs is still a
+refusal. A POSITIVE value is refused because it asks for checks that no
+longer run. `RemovedEnvConfigTest` pins both tiers. The entry graduates
+to `REMOVED_ENV` once the chart stops rendering the key.
 
 ### Specified, not yet implemented
 

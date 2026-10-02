@@ -170,11 +170,6 @@ SELECT result ->> '$.removed' IS NOT NULL, result ->> '$.missing' IS NOT NULL,
 ----
 true	true	true
 
-query I
-SELECT result ->> '$.status' FROM hoglake_verify('lake')
-----
-pass
-
 # unknown catalogs error cleanly
 statement error
 SELECT * FROM hoglake_snapshots('not_attached')
@@ -184,8 +179,10 @@ statement ok
 DETACH lake
 
 # a read-only attach refuses mutating maintenance outright (and a
-# SNAPSHOT pin forces read-only, so pinned readers are covered too);
-# hoglake_verify stays allowed (read-only server op)
+# SNAPSHOT pin forces read-only, so pinned readers are covered too).
+# Every maintenance function the extension exposes is mutating now:
+# hoglake_verify was the one read-only member and hoglake #261 removed
+# both the endpoint and this passthrough.
 statement ok
 ATTACH 'hoglake:duckext-sqltest' AS lake_ro (ENDPOINT '{HOGLAKE_URL}', READ_ONLY)
 
@@ -203,11 +200,6 @@ statement error
 SELECT * FROM hoglake_cleanup('lake_ro')
 ----
 <REGEX>:.*maintenance.*read-only.*
-
-query I
-SELECT result ->> '$.status' FROM hoglake_verify('lake_ro')
-----
-pass
 
 statement ok
 DETACH lake_ro

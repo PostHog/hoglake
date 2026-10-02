@@ -693,6 +693,10 @@ export const maintenanceRunsFixture: MaintenanceRun[] = [
     },
   },
   {
+    // A HISTORICAL row: #261 removed the verify subsystem, but the ledger
+    // keeps serving its rows for the retention window, so the runs feed
+    // must still decode and summarise one. There is no `verify` entry in
+    // maintenanceStatusFixture.tasks, and that asymmetry is the point.
     run_id: "100",
     catalog: "analytics",
     task: "verify",
@@ -789,18 +793,7 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
       loop: { observed_interval_ms: "68800", last_run_at: "2026-09-11T09:59:30Z", records_every_sweep: true },
     },
     {
-      // Verify has a loop of its own now; this fixture is the gigahog
-      // API pod, which runs it OFF (loop_interval_ms 0) while the
-      // maintenance workload sweeps hourly — so the ledger still shows
-      // no loop runs for this catalog.
-      task: "verify",
-      loop_interval_ms: "0",
-      last_run: maintenanceRunsFixture[4],
-      backlog: {},
-      loop: { records_every_sweep: true },
-    },
-    {
-      // Retirement, like compaction and verify, runs on the maintenance
+      // Retirement, like compaction, runs on the maintenance
       // workload: this fixture is the API pod, so its own interval is 0
       // while the ledger shows the other pod's sweeps arriving.
       task: "retirement",
@@ -839,15 +832,26 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
           loop: { records_every_sweep: false },
         },
         {
+          // DELIBERATELY the OLDER-SERVER shape: `loop: null` is what a
+          // build that still had a loop-less task reports, and it is the
+          // only input that makes a column head read "manual only". It
+          // used to ride on `verify`, the one task that really had no
+          // loop; #261 removed that task, so the shape moved here rather
+          // than leaving the branch untested.
+          //
+          // NO `loop_interval_ms`, and that is part of the shape rather
+          // than an omission: the spec says the interval is ABSENT for a
+          // task with no loop (hoglake.yaml, MaintenanceTaskStatus), so a
+          // fixture carrying both would be one no server could emit. The
+          // old `verify` entry had none either.
           task: "expiry",
-          loop_interval_ms: "60000",
           last_run: null,
           backlog: {
             consumer_floor: true,
             earliest_snapshot_id: "0",
             head_snapshot_id: "12",
           },
-          loop: { records_every_sweep: true },
+          loop: null,
         },
         {
           task: "cleanup",
@@ -863,9 +867,8 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
           backlog: { small_files: "0", target_bytes: "536870912" },
           loop: { records_every_sweep: true },
         },
-        { task: "verify", last_run: null, backlog: {}, loop: null },
         {
-          // Not `loop: null` (verify's shape above is deliberately the
+          // Not `loop: null` (expiry's shape above is deliberately the
           // OLDER-SERVER one): retirement has a loop, this catalog has
           // simply never had an eligible drop for it to run on.
           task: "retirement",

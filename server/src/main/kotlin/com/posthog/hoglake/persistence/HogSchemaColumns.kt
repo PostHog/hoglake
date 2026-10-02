@@ -69,10 +69,13 @@ object HogSchemaColumns {
                     "replaced_table_id",
                     // V20: when the retirement sweep FIRST saw this
                     // dropped table under the expiry floor. Written by
-                    // RetirementService, read by /verify's orphans
-                    // check, which dates a leak from eligibility rather
+                    // RetirementService; its reader was /verify's orphans
+                    // check, which dated a leak from eligibility rather
                     // than from the drop — on a catalog whose floor
                     // moves slowly those are very different instants.
+                    // #261 removed that check, so the column is
+                    // written and unread (RetirementService.stampEligible
+                    // for why it keeps accumulating anyway).
                     // Never mapped onto TableRow: nothing on the
                     // request path reads it.
                     "retirement_eligible_at",

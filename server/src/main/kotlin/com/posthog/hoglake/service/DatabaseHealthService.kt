@@ -462,7 +462,8 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                 "Orphaned catalog rows — stats for dropped tables, the tax that cost the " +
                     "predecessor 30-50x on commit — are deliberately not counted here, " +
                     "because every query on this page avoids reading hog_* tables. " +
-                    "Maintenance owns that check: POST /maintenance/verify.",
+                    "Nothing counts them since #261 removed the verify subsystem; a " +
+                    "paged scrubber is the placeholder for getting the check back.",
                 "Counters are cumulative since the last statistics reset, so ratios over a " +
                     "freshly restarted instance mean very little.",
             )

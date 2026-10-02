@@ -293,10 +293,8 @@ class TableReplacementIntegrationTest {
      * anything. The rows were unreachable: the commit path's backward
      * walk only fires when the consumer commits on the successor, and it
      * never will (the whole point is that it reconciled long ago), so
-     * nothing left in the system would ever clear them. `/maintenance/
-     * verify`'s offset_release check would have reported the violation
-     * forever with no action an operator could take. The release is now
-     * the FIRST thing the sweep does, above the retention check.
+     * nothing left in the system would ever clear them. The release is
+     * now the FIRST thing the sweep does, above the retention check.
      */
     @Test
     fun `a retention-null catalog still releases offsets stranded by a replacement`() {
@@ -353,10 +351,9 @@ class TableReplacementIntegrationTest {
         // A second sweep is idempotent AND says so: nothing left to
         // release, so the counter is back to zero.
         assertThat(ExpiryService(db.jdbi).runOnce(cat, batchSize = 1000).offsetsReleased).isZero()
-        // And the invariant scan agrees, which is the surface that would
-        // otherwise have alerted on it forever.
-        val report = VerifyService(db.jdbi, retirementIntervalMs = 0).runOnce(cat)
-        assertThat(report.checks.single { it.check == "offset_release" }.violations).isZero()
+        // The second witness used to be the invariant scan's
+        // offset_release check over the same state; #261 removed it, so
+        // the offset rows above are the whole of the evidence.
     }
 
     /**

@@ -63,7 +63,6 @@ describe("MaintenancePage", () => {
       expect.stringContaining("expiry"),
       expect.stringContaining("cleanup"),
       expect.stringContaining("compaction"),
-      expect.stringContaining("verify"),
       expect.stringContaining("retirement"),
     ]);
 
@@ -108,134 +107,11 @@ describe("MaintenancePage", () => {
       }),
     ).toHaveAttribute("href", "/catalogs/analytics/partitions");
 
-    const verify = screen
-      .getByRole("heading", { name: /verify/ })
-      .closest(".task-panel")!;
-    // Verify has a loop now, and this fixture is the pod that runs it
-    // OFF: the ledger reports no loop runs for this catalog, which is
-    // what the header must say — not "manual only", which was the old
-    // "this task has no loop" rendering.
+    // #261 removed the verify subsystem: no panel, and no trigger
+    // anywhere on the page.
     expect(
-      within(verify as HTMLElement).getByText("no loop runs"),
-    ).toBeInTheDocument();
-    expect(
-      within(verify as HTMLElement).getByRole("button", { name: "Verify" }),
-    ).toBeInTheDocument();
-  });
-
-  it("runs verify on demand and renders the report - status, counts, descriptions, samples", async () => {
-    const report = {
-      catalog: "analytics",
-      status: "fail",
-      checks: [
-        {
-          check: "row_id_tiling",
-          status: "pass",
-          violations: "0",
-          samples: [],
-          description: "Invariant 2: row-id ranges tile [0, total) per table.",
-        },
-        {
-          check: "removal_queue",
-          status: "fail",
-          violations: "25",
-          samples: [
-            "removal_id=7 path='s3://b/f0.parquet' queued but still live-referenced",
-            "removal_id=8 path='s3://b/f1.parquet' queued but still live-referenced",
-          ],
-          description: "Invariant 4: physical deletion is never authorized by the queue.",
-        },
-      ],
-    };
-    const verifyUrl = "/v1/catalogs/analytics/maintenance/verify";
-    const fetchMock = mockFetch((url, init) => {
-      if (url === statusUrl) return jsonResponse(maintenanceStatusFixture);
-      if (url === runsUrl) return jsonResponse(maintenanceRunPageFixture);
-      if (url === verifyUrl && init?.method === "POST") return jsonResponse(report);
-      return undefined;
-    });
-    renderApp("/catalogs/analytics/maintenance");
-
-    const panel = (
-      await screen.findByRole("heading", { name: /verify/ })
-    ).closest(".task-panel")! as HTMLElement;
-    await userEvent.click(within(panel).getByRole("button", { name: "Verify" }));
-
-    // The POST really went out, with no body and no batch parameter.
-    await screen.findByText(/1 of 2 checks failed/);
-    const call = fetchMock.mock.calls.find(([u]) => u === verifyUrl)!;
-    expect((call[1] as RequestInit).method).toBe("POST");
-    expect((call[1] as RequestInit).body).toBeUndefined();
-
-    // The failing check first, with the TRUE count (25) rather than the
-    // number of samples (2) — the whole point of counting separately.
-    const checks = within(panel)
-      .getAllByRole("listitem")
-      .filter((li) => li.classList.contains("verify-check"));
-    expect(checks.map((li) => li.dataset.check)).toEqual([
-      "removal_queue",
-      "row_id_tiling",
-    ]);
-    const failing = checks[0];
-    expect(failing.dataset.status).toBe("fail");
-    expect(within(failing).getByText("25 violations")).toBeInTheDocument();
-    expect(
-      within(failing).getByText(/physical deletion is never authorized/),
-    ).toBeInTheDocument();
-    expect(
-      within(failing).getByText(/removal_id=7 path='s3:\/\/b\/f0.parquet'/),
-    ).toBeInTheDocument();
-    expect(within(checks[1]).getByText("0 violations")).toBeInTheDocument();
-  });
-
-  it("renders a check that carries no description, without an empty explanation line", async () => {
-    // A ledger row replayed from before the field existed, or from a
-    // server that predates it: `description` is absent, and an empty
-    // paragraph would read as "this check has no invariant".
-    const report = {
-      catalog: "analytics",
-      status: "pass",
-      checks: [
-        { check: "orphans", status: "pass", violations: "0", samples: [] },
-      ],
-    };
-    mockFetch((url, init) => {
-      if (url === statusUrl) return jsonResponse(maintenanceStatusFixture);
-      if (url === runsUrl) return jsonResponse(maintenanceRunPageFixture);
-      if (url === "/v1/catalogs/analytics/maintenance/verify" && init?.method === "POST") {
-        return jsonResponse(report);
-      }
-      return undefined;
-    });
-    renderApp("/catalogs/analytics/maintenance");
-    const panel = (
-      await screen.findByRole("heading", { name: /verify/ })
-    ).closest(".task-panel")! as HTMLElement;
-    await userEvent.click(within(panel).getByRole("button", { name: "Verify" }));
-
-    await within(panel).findByText("every check passed");
-    const check = panel.querySelector(".verify-check")!;
-    expect(check.getAttribute("data-check")).toBe("orphans");
-    expect(within(check as HTMLElement).getByText("0 violations")).toBeInTheDocument();
-    expect(check.querySelector(".verify-check-why")).toBeNull();
-  });
-
-  it("surfaces a failed verify request instead of rendering an empty report", async () => {
-    mockFetch((url, init) => {
-      if (url === statusUrl) return jsonResponse(maintenanceStatusFixture);
-      if (url === runsUrl) return jsonResponse(maintenanceRunPageFixture);
-      if (url === "/v1/catalogs/analytics/maintenance/verify" && init?.method === "POST") {
-        return jsonResponse({ error: "not_found", detail: "catalog 'analytics'" }, 404);
-      }
-      return undefined;
-    });
-    renderApp("/catalogs/analytics/maintenance");
-    const panel = (
-      await screen.findByRole("heading", { name: /verify/ })
-    ).closest(".task-panel")! as HTMLElement;
-    await userEvent.click(within(panel).getByRole("button", { name: "Verify" }));
-    expect(await within(panel).findByText(/not_found/)).toBeInTheDocument();
-    expect(panel.querySelector(".verify-report")).toBeNull();
+      screen.queryByRole("button", { name: "Verify" }),
+    ).not.toBeInTheDocument();
   });
 
   it("says nothing about the loop when the server did not report one", async () => {
@@ -362,7 +238,10 @@ describe("MaintenancePage", () => {
     renderApp("/catalogs/analytics/maintenance");
 
     await screen.findByText("every ~69s");
-    expect(screen.getAllByText("No recorded run yet.")).toHaveLength(6);
+    // One per task in the status list — five since #261 removed verify.
+    expect(screen.getAllByText("No recorded run yet.")).toHaveLength(
+      maintenanceStatusFixture.tasks.length,
+    );
     expect(
       await screen.findByText("No runs recorded yet."),
     ).toBeInTheDocument();

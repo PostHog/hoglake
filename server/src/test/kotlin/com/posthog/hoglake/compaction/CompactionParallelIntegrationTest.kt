@@ -10,7 +10,7 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.service.CatalogService
-import com.posthog.hoglake.service.VerifyService
+import com.posthog.hoglake.testing.CatalogInvariants
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
 import org.apache.parquet.example.data.Group
@@ -64,7 +64,6 @@ class CompactionParallelIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
     private val catalogs = CatalogService(db.jdbi)
     private val commits = CommitService(db.jdbi)
-    private val verify = VerifyService(db.jdbi, retirementIntervalMs = 0)
     private val counter = AtomicInteger(0)
 
     private companion object {
@@ -205,13 +204,6 @@ class CompactionParallelIntegrationTest {
 
     private fun liveFileCount(cat: String): Int = catalogs.listFiles(cat, "ns", "t").size
 
-    private fun assertVerifyPasses(cat: String) {
-        val report = verify.runOnce(cat)
-        assertThat(report.status)
-            .describedAs("verify checks: " + report.checks.joinToString { "${it.check}=${it.violations}" })
-            .isEqualTo("pass")
-    }
-
     // ---- 1: concurrent groups within one sweep -----------------------------
 
     @Test
@@ -249,9 +241,22 @@ class CompactionParallelIntegrationTest {
             .isEqualTo(fx.groups)
         // Snapshot ids stay dense and ordered under concurrent commits —
         // invariant 1, which is the one thing the commit lock is for and
-        // therefore the one thing parallel commits could break.
-        assertVerifyPasses(fx.cat)
+        // therefore the one thing parallel commits could break. The
+        // removed verify subsystem's snapshot_density check used to be
+        // what said so here (#261); this is the same assertion, inline.
+        assertSnapshotsDense(fx.cat)
     }
+
+    /**
+     * Invariant 1, the one thing the per-catalog commit lock exists to
+     * protect, asserted after every test here that commits concurrently.
+     *
+     * It was the verify oracle's one genuinely live arm at these call
+     * sites; see [CatalogInvariants] for which of the other eleven were
+     * unfalsifiable and why they are #261's problem rather than this
+     * file's.
+     */
+    private fun assertSnapshotsDense(cat: String) = CatalogInvariants.assertSnapshotsDense(db.jdbi, cat)
 
     @Test
     fun `the sweep never attempts more groups than its budget, however many workers run`() {
@@ -263,7 +268,7 @@ class CompactionParallelIntegrationTest {
         val result = svc.runOnce(fx.cat, policy(fx, parallelGroups = 8, maxGroups = 6))
         assertThat(result.groupsCompacted).isEqualTo(6)
         assertThat(liveFileCount(fx.cat)).isEqualTo(fx.expectedFiles - 6 * fx.filesPerGroup + 6)
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     @Test
@@ -336,7 +341,7 @@ class CompactionParallelIntegrationTest {
             pool.shutdownNow()
             blocking.close()
         }
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     // ---- 2: parallel input opens -------------------------------------------
@@ -532,7 +537,7 @@ class CompactionParallelIntegrationTest {
         assertThat(claimRows(fx.cat))
             .describedAs("expired claims are purged at the head of the next sweep")
             .doesNotContainAnyElementsOf(settled)
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     @Test
@@ -571,7 +576,7 @@ class CompactionParallelIntegrationTest {
             .describedAs("the backstop holds with the optimization off")
             .isEqualTo(fx.groups.toLong())
         assertThat(liveFileCount(fx.cat)).isEqualTo(fx.groups)
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     @Test
@@ -713,7 +718,7 @@ class CompactionParallelIntegrationTest {
             .describedAs("the refunded slot must buy the NEXT candidate: %s", result)
             .isEqualTo(1)
         assertThat(liveFileCount(fx.cat)).isEqualTo(fx.expectedFiles - fx.filesPerGroup + 1)
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     @Test
@@ -961,7 +966,7 @@ class CompactionParallelIntegrationTest {
         assertThat(claimRows(fx.cat))
             .describedAs("turning claims off must not leave rows nothing will ever clear")
             .isEmpty()
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     // ---- 5: shutdown, interruption and the heap stop -----------------------
@@ -1739,7 +1744,7 @@ class CompactionParallelIntegrationTest {
         assertThat(peak.get())
             .describedAs("at most one group was ever inside a rewrite")
             .isEqualTo(n)
-        assertVerifyPasses(fx.cat)
+        assertSnapshotsDense(fx.cat)
     }
 
     // ---- 8: the prefetch window is a WINDOW ---------------------------------

@@ -356,7 +356,6 @@ static unique_ptr<FunctionData> MaintenanceBindFor(ClientContext &context, Table
 static constexpr const char EXPIRE_VERB[] = "expire";
 static constexpr const char COMPACT_VERB[] = "compact";
 static constexpr const char CLEANUP_VERB[] = "cleanup";
-static constexpr const char VERIFY_VERB[] = "verify";
 
 //===--------------------------------------------------------------------===//
 // Registration
@@ -390,10 +389,6 @@ void HoglakeMetadataFunctions::Register(ExtensionLoader &loader) {
 	                      MaintenanceBindFor<CLEANUP_VERB, true>, MaintenanceInit);
 	cleanup.named_parameters["batch"] = LogicalType::BIGINT;
 	loader.RegisterFunction(cleanup);
-
-	TableFunction verify("hoglake_verify", {LogicalType::VARCHAR}, MaintenanceExecute, MaintenanceBindFor<VERIFY_VERB, false>,
-	                     MaintenanceInit);
-	loader.RegisterFunction(verify);
 }
 
 } // namespace duckdb

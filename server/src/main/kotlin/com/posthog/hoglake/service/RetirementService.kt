@@ -49,8 +49,9 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * legal read — and it is documented rather than worked around: an
  * operator who wants the storage back configures retention (or, on a
  * consumer-floored catalog, gets the consumer's offset moving).
- * `/verify`'s orphans check reports that population as an
- * informational count, never a violation, for exactly this reason.
+ * The verify subsystem's orphans check reported that population as an
+ * informational count, never a violation, for exactly this reason;
+ * #261 removed it and nothing reports it today.
  *
  * WHAT A BATCH COSTS, AND WHY EVERY KNOB IS A TIME KNOB. One batch is
  * one transaction holding the per-catalog commit lock.
@@ -409,14 +410,17 @@ class RetirementService(
         // ELIGIBILITY IS RECORDED BEFORE THE CEILING CAN STOP THE RUN,
         // and the order is the whole point.
         //
-        // `retirement_eligible_at` is what `/verify`'s orphans arm dates
-        // a leak from: a dropped table under the floor that STILL holds
-        // live file rows is a violation only once it has been stamped
-        // for longer than the grace. Stamping after the ceiling check
-        // meant a catalog whose cleanup queue never drains — the exact
-        // state an operator most needs told about — was never stamped,
-        // so the arm could never fire and retirement wedged in SILENCE:
-        // every run a no-op, every counter zero, and `/verify` green.
+        // `retirement_eligible_at` is what dates a leak: a dropped
+        // table under the floor that STILL holds live file rows is a
+        // violation only once it has been stamped for longer than the
+        // grace. Stamping after the ceiling check meant a catalog whose
+        // cleanup queue never drains — the exact state an operator most
+        // needs told about — was never stamped, so nothing could date
+        // the leak and retirement wedged in SILENCE: every run a no-op
+        // and every counter zero. The reader was the verify
+        // subsystem's orphans arm, which #261 removed; the stamp stays
+        // because it is the only record of WHEN a table became
+        // retirable, and a resumable scrubber needs it.
         //
         // Stamping first costs one UPDATE on a handful of rows and
         // turns that silence into an alert after the grace. The stamp
@@ -431,8 +435,8 @@ class RetirementService(
             log.info {
                 "retirement for catalog '$catalog' skipped: $queued undrained cleanup-queue rows " +
                     "exceed the ceiling of $queueCeiling; retiring more would grow a queue that " +
-                    "is already not draining. ${candidates.size} eligible table(s) stamped, so " +
-                    "/verify's orphans check will report them once they are past its grace"
+                    "is already not draining. ${candidates.size} eligible table(s) stamped " +
+                    "with the time they became retirable"
             }
             return RetirementResult(
                 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
@@ -632,13 +636,16 @@ class RetirementService(
     /**
      * Stamp `retirement_eligible_at` on first observation, once.
      *
-     * The column is not read by this loop at all — it is read by
-     * `/verify`'s orphans check, which calls a table leaked only after
-     * it has been ELIGIBLE (not merely dropped) for several retirement
-     * intervals. Without a first-observation timestamp that check would
-     * have to date the leak from the DROP, which on a catalog whose
-     * floor moves slowly is an alert on a system working exactly as
-     * designed.
+     * The column is not read by this loop at all, and since #261 it is
+     * not read by anything: its reader was the verify subsystem's
+     * orphans check, which called a table leaked only after it had been
+     * ELIGIBLE (not merely dropped) for several retirement intervals.
+     * Without a first-observation timestamp that check would have had to
+     * date the leak from the DROP, which on a catalog whose floor moves
+     * slowly is an alert on a system working exactly as designed. The
+     * stamp is kept WRITE-ONLY on purpose rather than dropped: it
+     * cannot be reconstructed after the fact, so a scrubber that
+     * re-adds the check needs it to have been accumulating all along.
      *
      * `WHERE retirement_eligible_at IS NULL` is what makes it stamp
      * ONCE: a run that is interrupted and resumed, or a table that
