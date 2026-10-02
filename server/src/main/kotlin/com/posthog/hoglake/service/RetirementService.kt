@@ -234,6 +234,14 @@ class RetirementService(
     private val pauseMs: Long = DEFAULT_PAUSE_MS,
     private val runBudgetMs: Long = DEFAULT_RUN_BUDGET_MS,
     private val queueCeiling: Long = DEFAULT_QUEUE_CEILING,
+    /**
+     * Eligible tables one run reads and stamps; see [MAX_TABLES_PER_RUN]
+     * for the bound's argument. A PARAMETER only so a test can reach a
+     * FULL candidate page without seeding a thousand dropped tables —
+     * production always takes the default, and nothing in Config
+     * exposes it.
+     */
+    private val maxTablesPerRun: Int = MAX_TABLES_PER_RUN,
     private val commitLockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
     /**
      * Monotonic nanoseconds, injected so a test can spend the run
@@ -255,6 +263,7 @@ class RetirementService(
         require(pauseMs >= 0) { "retirement pause must not be negative (got $pauseMs)" }
         require(runBudgetMs > 0) { "retirement run budget must be positive (got $runBudgetMs)" }
         require(queueCeiling >= 0) { "retirement queue ceiling must not be negative (got $queueCeiling)" }
+        require(maxTablesPerRun > 0) { "retirement tables per run must be positive (got $maxTablesPerRun)" }
     }
 
     /**
@@ -461,15 +470,29 @@ class RetirementService(
         // are the ones that never got here: the single-flight skip and a
         // catalog the sweep could not read.
         //
-        // EXCEPT WHEN THE PREFIX WAS TRUNCATED. `candidates` is
-        // `ORDER BY table_id LIMIT MAX_TABLES_PER_RUN`, so a full page
-        // is a PREFIX of the eligible set and says nothing about the
-        // tables beyond it — pruning on it would retire the series of a
-        // table that is still eligible and still failing, every run, on
-        // exactly the catalog (a mass drop) where that matters most.
-        if (candidates.size < MAX_TABLES_PER_RUN) {
-            RetirementGauges.retain(catalog, candidates.map { it.tableId }.toSet())
-        }
+        // A FULL PAGE IS AUTHORITATIVE ONLY OVER ITS OWN PREFIX, which
+        // is the whole of the subtlety. `candidates` is `ORDER BY
+        // table_id LIMIT maxTablesPerRun`, so on a full page the
+        // eligible set continues past the last id it returned and
+        // pruning on the page alone would retire the series of a table
+        // that is still eligible and still failing — on exactly the
+        // catalog (a mass drop) where that matters most.
+        //
+        // But the page IS authoritative below its own ceiling: every id
+        // `<= max(candidate table_id)` that the page does not contain
+        // was offered to `ORDER BY table_id` and not returned, so it is
+        // provably no longer eligible. Pruning only there is what keeps
+        // a drained table's streak from outliving it: skipping the
+        // prune entirely (the first version of this) left a 3 published
+        // forever on a table nothing would ever clear, for as long as
+        // the pages stayed full.
+        RetirementGauges.retain(
+            catalog,
+            candidates.map { it.tableId }.toSet(),
+            // Null on a short page: nothing is beyond the prefix, so
+            // the whole tracked set is in scope.
+            prefixCeiling = if (candidates.size >= maxTablesPerRun) candidates.last().tableId else null,
+        )
         if (candidates.isEmpty()) return RetirementResult(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
         stampEligible(catalogId, candidates.map { it.tableId })
 
@@ -546,13 +569,17 @@ class RetirementService(
                     }
 
                     BatchOutcome.Drained -> {
-                        // The table is finished. Its timeout series, if
-                        // it had one, went when the first batch of this
-                        // run committed; a table that drains on its
-                        // FIRST probe (nothing live left) carries none,
-                        // because a streak only exists for a table that
-                        // timed out and the retain above has already
-                        // dropped it if it is no longer a candidate.
+                        // The table is finished, and THIS ARM CAN BE THE
+                        // FIRST OUTCOME: the probe runs between the
+                        // candidate read and any committed batch, so a
+                        // table whose last rows went away in that window
+                        // (another maintainer, an operator's repair)
+                        // drains without ever reaching the Retired arm.
+                        // Its streak has to end here or it survives
+                        // until some later run's retain prunes it —
+                        // which on a catalog whose pages stay full is
+                        // not a bound anyone should rely on.
+                        RetirementGauges.recovered(catalog, candidate.tableId)
                         done = true
                     }
 
@@ -734,7 +761,7 @@ class RetirementService(
         jdbi.withHandleUnchecked { h ->
             h.createQuery(CANDIDATE_SQL)
                 .bind("catalogId", catalogId)
-                .bind("limit", MAX_TABLES_PER_RUN)
+                .bind("limit", maxTablesPerRun)
                 .map { rs, _ -> Candidate(rs.getLong("table_id"), rs.getLong("dropped_snapshot")) }
                 .list()
         }

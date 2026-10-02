@@ -167,12 +167,12 @@ object ExpiryGauges {
  * ledger row, the service's logs and `hog_table.retirement_eligible_at`
  * all key on.
  *
- * [retain] IS ONLY CALLED ON AN UNTRUNCATED CANDIDATE PREFIX, and that
- * is the caller's job rather than this object's: the candidate query is
- * `ORDER BY table_id LIMIT MAX_TABLES_PER_RUN`, so a FULL page is a
- * prefix that says nothing about the tables past it. Pruning on one
- * would retire a still-failing table's series every run, on exactly the
- * catalog (a mass drop) where that matters most.
+ * [retain] PRUNES WITHIN THE PREFIX IT WAS GIVEN, which is how a
+ * truncated candidate read is still usable: the query is `ORDER BY
+ * table_id LIMIT maxTablesPerRun`, so a full page proves nothing about
+ * ids past its last one and everything below it. The caller passes that
+ * last id as `prefixCeiling`; tables above it keep their series, tables
+ * below it that the page did not return lose theirs.
  *
  * ONE WRITER, which is what makes the non-atomic read-modify-publish
  * below sound. Retirement has no HTTP trigger (deliberately — a trigger
@@ -236,8 +236,9 @@ object RetirementGauges {
 
     /**
      * Record that [tableId] reached a NON-TIMEOUT outcome — a committed
-     * batch, a drain, a stuck table, a floor that no longer covers it:
-     * its streak is over and its series goes away.
+     * batch, a drain (including the probe that finds the table already
+     * empty), a stuck table, a floor that no longer covers it: its
+     * streak is over and its series goes away.
      *
      * Any of those, not only progress. The gauge's claim is "this table
      * keeps failing on its statement bound", and a table that failed
@@ -257,7 +258,7 @@ object RetirementGauges {
 
     /**
      * Forget every table of [catalog] outside [tableIds] — the eligible
-     * set the run just read.
+     * set the run just read — WITHIN THE PREFIX THAT SET COVERS.
      *
      * A table that drained, or that stopped being eligible, cannot still
      * be timing out; without this its row would be republished at its
@@ -266,12 +267,32 @@ object RetirementGauges {
      * there: a catalog with nothing eligible has nothing stuck. Only
      * [catalog]'s keys are touched, because that is the only catalog
      * this caller enumerated.
+     *
+     * [prefixCeiling] IS WHAT MAKES A TRUNCATED READ USABLE. The
+     * candidate query is `ORDER BY table_id LIMIT maxTablesPerRun`, so a
+     * FULL page is a prefix: it proves nothing about ids past its last
+     * one, but it proves everything below it — an id `<= prefixCeiling`
+     * that the page does not contain was offered to that ORDER BY and
+     * not returned, so it is no longer eligible. Pass the page's last
+     * table id on a full page and NULL on a short one (where the set is
+     * the whole eligible set and every tracked id is in scope).
+     *
+     * Skipping the prune altogether on a full page — the shape this
+     * replaces — is the bug Copilot found on #282: a drained table's
+     * streak of 3 had nothing left that could ever clear it while the
+     * catalog's pages stayed full, so the alert outlived the table.
      */
     fun retain(
         catalog: String,
         tableIds: Set<Long>,
+        prefixCeiling: Long? = null,
     ) {
-        val gone = streaks.keys.filter { it.first == catalog && it.second !in tableIds }
+        val gone =
+            streaks.keys.filter { (name, tableId) ->
+                name == catalog &&
+                    tableId !in tableIds &&
+                    (prefixCeiling == null || tableId <= prefixCeiling)
+            }
         if (gone.isEmpty()) return
         gone.forEach { streaks.remove(it) }
         publish()

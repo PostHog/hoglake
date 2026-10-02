@@ -102,6 +102,9 @@ class RetirementServiceIntegrationTest {
         budgetMs: Long = 60_000,
         ceiling: Long = 500_000,
         commitLockTimeoutMs: Long = CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS,
+        // Production's 1,000, lowered only by the case that needs a FULL
+        // candidate page to exist.
+        maxTablesPerRun: Int = RetirementService.MAX_TABLES_PER_RUN,
         // THE DEFAULT CLOCK IS BOUNDED, not frozen. 100 ms of virtual
         // time per budget check against the 60 s default budget stops
         // any loop at ~600 iterations — which every case here needs
@@ -122,6 +125,7 @@ class RetirementServiceIntegrationTest {
         pauseMs = 750,
         runBudgetMs = budgetMs,
         queueCeiling = ceiling,
+        maxTablesPerRun = maxTablesPerRun,
         commitLockTimeoutMs = commitLockTimeoutMs,
         nanoTime = { clock.next() },
         sleep = { sleeps += it },
@@ -281,18 +285,21 @@ class RetirementServiceIntegrationTest {
         catalog: String,
         catalogId: Long,
         n: Int,
+        table: String = "doomed",
+        idBase: Int = 900_000,
     ) = jdbi.useHandleUnchecked { h ->
         h.createUpdate(
             """
             INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
                                        path, record_count, file_size_bytes, row_id_start)
-            SELECT :c, 900000 + g, (SELECT table_id FROM hog_table_version
-                                     WHERE catalog_id = :c AND name = 'doomed'
-                                       AND end_snapshot IS NULL),
-                   1, 's3://bucket/$catalog/doomed/bulk-' || g || '.parquet', 1, 1, g
+            SELECT :c, :idBase + g, (SELECT table_id FROM hog_table_version
+                                      WHERE catalog_id = :c AND name = :t
+                                        AND end_snapshot IS NULL),
+                   1, 's3://bucket/$catalog/' || :t || '/bulk-' || g || '.parquet', 1, 1,
+                   :idBase + g
             FROM generate_series(1, :n) g
             """,
-        ).bind("c", catalogId).bind("n", n).execute()
+        ).bind("c", catalogId).bind("n", n).bind("t", table).bind("idBase", idBase).execute()
     }
 
     /**
@@ -311,6 +318,31 @@ class RetirementServiceIntegrationTest {
         val last = if (alsoDropKeeper) catalogs.dropTable(catalog, "ns", "keeper").snapshotId else drop
         setFloor(f.catalogId, last)
         return f
+    }
+
+    /**
+     * One more dropped, eligible table, with a higher `table_id` than
+     * everything created before it — so a candidate page can be
+     * genuinely TRUNCATED (the eligible set continuing past the prefix)
+     * rather than merely reaching its limit exactly.
+     */
+    private fun extraDroppedTable(
+        catalog: String,
+        catalogId: Long,
+        name: String,
+        idBase: Int,
+    ): Long {
+        catalogs.createTable(catalog, "ns", name, listOf(ColumnDef("id", ColType.LONG, nullable = false)))
+        val tableId =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT table_id FROM hog_table_version WHERE catalog_id = :c AND name = :n",
+                ).bind("c", catalogId).bind("n", name).mapTo(Long::class.java).first()
+            }
+        bulkFiles(catalog, catalogId, 1, table = name, idBase = idBase)
+        val drop = catalogs.dropTable(catalog, "ns", name).snapshotId
+        setFloor(catalogId, drop)
+        return tableId
     }
 
     /** The neighbour's id, for the cases that depend on candidate ORDER. */
@@ -1255,6 +1287,151 @@ class RetirementServiceIntegrationTest {
             Metrics.clear()
             RetirementGauges.clear()
             stopCancelling("retain")
+        }
+    }
+
+    @Test
+    fun `a full candidate page still prunes within its own prefix, and keeps what is beyond it`() {
+        // COPILOT'S FINDING ON #282, and the one that needed a real
+        // regression test. The first version of this skipped pruning
+        // ENTIRELY on a full candidate page, on the correct observation
+        // that `ORDER BY table_id LIMIT n` says nothing about the ids
+        // past its last one. But it also says EVERYTHING about the ids
+        // below: a table the page did not return, below its ceiling, was
+        // offered to that ORDER BY and refused — it is gone. Skipping
+        // the prune left such a table's streak published with nothing
+        // that could ever clear it, for as long as the catalog's pages
+        // stayed full, which on the mass drop this guard was written for
+        // is indefinitely.
+        //
+        // The page is made full by lowering the bound rather than by
+        // seeding a thousand dropped tables: the property under test is
+        // `candidates.size >= maxTablesPerRun`, and 2 reaches it.
+        //
+        // MUTATION: go back to `if (candidates.size < maxTablesPerRun)`
+        // around the retain and this reds on the drained LOW table,
+        // whose series survives its own table. Drop the `prefixCeiling`
+        // term and it reds on the HIGH one instead, retired while it is
+        // still eligible and still failing.
+        val catalog = "ret-prefix-prune"
+        val f = droppedWithRows(catalog, rows = 20, alsoDropKeeper = true)
+        val low = doomedTableId(f.catalogId)
+        val high = keeperTableId(f.catalogId)
+        // FOUR eligible tables and a page of two, so the page is full,
+        // its ceiling is the SECOND id, and the fourth is genuinely
+        // beyond the prefix: low < high < beyond < farther.
+        val beyond = extraDroppedTable(catalog, f.catalogId, "beyond", 800_000)
+        val farther = extraDroppedTable(catalog, f.catalogId, "farther", 700_000)
+        assertThat(listOf(low, high, beyond, farther)).isSorted()
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        try {
+            // Two streaks by hand — the arm that earns them is tested
+            // elsewhere, and the subject here is the PRUNE: one on the
+            // low table (which will be drained out from under the run)
+            // and one on the table beyond the page's ceiling.
+            RetirementGauges.timedOut(catalog, low)
+            RetirementGauges.timedOut(catalog, farther)
+            assertThat(streaks(registry, catalog).keys)
+                .containsExactlyInAnyOrder(low.toString(), farther.toString())
+
+            // The low table loses its rows to something that is not
+            // retirement, so it drops out of the candidate set.
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate("DELETE FROM hog_data_file WHERE catalog_id = :c AND table_id = :t")
+                    .bind("c", f.catalogId).bind("t", low).execute()
+            }
+
+            // The page is [high, beyond] — `low` is no longer eligible —
+            // so its ceiling is `beyond` and `farther` is past it.
+            val result = service(batch = 100, maxTablesPerRun = 2).runOnce(catalog)
+            assertThat(result.tables)
+                .describedAs("the run worked the two tables its page did return")
+                .isEqualTo(2)
+            assertThat(streaks(registry, catalog).keys)
+                .describedAs(
+                    "%d is below the page's ceiling %d and provably gone, so its series goes; " +
+                        "%d is PAST the ceiling, never in scope, and keeps its streak",
+                    low,
+                    beyond,
+                    farther,
+                )
+                .containsExactly(farther.toString())
+        } finally {
+            Metrics.clear()
+            RetirementGauges.clear()
+        }
+    }
+
+    @Test
+    fun `a table whose rows vanish before the first batch drains on the probe and loses its streak`() {
+        // THE OTHER COPILOT FINDING. The Drained arm can be a table's
+        // FIRST outcome: the probe runs between the candidate read and
+        // any committed batch, so rows removed in that window take the
+        // table straight to Drained without ever reaching the Retired
+        // arm that used to be the only thing clearing a streak. The
+        // streak would then survive until some later run's retain
+        // happened to prune it — which on a catalog whose pages stay
+        // full is the bug above.
+        //
+        // THE RACE IS STAGED EXACTLY, not approximated. `stampEligible`
+        // is the one statement that runs AFTER the candidate read and
+        // BEFORE the first batch, so a trigger on its UPDATE fires
+        // inside the window the finding is about: the candidate query
+        // has already decided the table is eligible (its rows were live
+        // then), the retain has already run WITH the table in the set
+        // (so it cannot be what clears the streak), and the probe that
+        // follows finds nothing live. Deleting the rows before
+        // `runOnce` instead would take the table out of the candidate
+        // set and test the retain path, which is a different case and
+        // already covered.
+        //
+        // MUTATION: remove `RetirementGauges.recovered` from the Drained
+        // arm and this reds — the series outlives the table's rows.
+        val catalog = "ret-drain-probe"
+        val f = droppedWithRows(catalog, rows = 20)
+        val tableId = doomedTableId(f.catalogId)
+        val registry = PrometheusMeterRegistry(PrometheusConfig.DEFAULT)
+        Metrics.bind(registry)
+        RetirementGauges.clear()
+        jdbi.useHandleUnchecked { h ->
+            h.execute(
+                """
+                CREATE FUNCTION drain_on_stamp() RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    DELETE FROM hog_data_file
+                     WHERE catalog_id = NEW.catalog_id AND table_id = NEW.table_id;
+                    RETURN NULL;
+                END $$
+                """,
+            )
+            h.execute(
+                "CREATE TRIGGER drain_on_stamp AFTER UPDATE OF retirement_eligible_at ON hog_table " +
+                    "FOR EACH ROW WHEN (NEW.catalog_id = ${f.catalogId}) " +
+                    "EXECUTE FUNCTION drain_on_stamp()",
+            )
+        }
+        try {
+            RetirementGauges.timedOut(catalog, tableId)
+            assertThat(streaks(registry, catalog)).isEqualTo(mapOf(tableId.toString() to 1.0))
+
+            val result = service(batch = 100).runOnce(catalog)
+            assertThat(result.batches)
+                .describedAs("nothing was retired: the probe found the table already empty")
+                .isZero()
+            assertThat(result.timeouts).isZero()
+            assertThat(liveFiles(f.catalogId)).isZero()
+            assertThat(streaks(registry, catalog))
+                .describedAs("a drain is a non-timeout terminal outcome, so the streak ends here")
+                .isEmpty()
+        } finally {
+            jdbi.useHandleUnchecked { h ->
+                h.execute("DROP TRIGGER IF EXISTS drain_on_stamp ON hog_table")
+                h.execute("DROP FUNCTION IF EXISTS drain_on_stamp()")
+            }
+            Metrics.clear()
+            RetirementGauges.clear()
         }
     }
 
