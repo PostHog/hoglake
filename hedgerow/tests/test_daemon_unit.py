@@ -1,7 +1,7 @@
 """Daemon cycle logic against scripted fakes: offset-commit ordering,
 halt paths, at-least-once replay, batching/bounded memory, pacing."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
 
 import pyarrow as pa
@@ -18,7 +18,6 @@ from fakes import (
     delete_file,
     table_batch_reader,
 )
-from pyhoglake import NotFoundError
 
 from hedgerow import (
     DeletesPresentError,
@@ -32,7 +31,9 @@ from hedgerow import (
     ReplicationConfig,
     SchemaMismatchError,
     SourceConfig,
+    UnsupportedFormatError,
 )
+from pyhoglake import NotFoundError
 
 SRC_COLS = (
     col("id", "long", 1, 0, nullable=False),
@@ -738,3 +739,27 @@ def test_truncate_halts_without_advancing_checkpoint(monkeypatch):
         env.daemon.run_once()
     assert env.offset() == before
     assert env.dest_table.total_rows == 1
+
+
+@pytest.mark.parametrize("side", ["source_table", "dest_table"])
+def test_non_parquet_table_refused_even_when_empty(side: str) -> None:
+    env = build_env()
+    getattr(env, side).properties = {
+        "write.format.default": "clickhouse-mergetree-packed"
+    }
+    with pytest.raises(UnsupportedFormatError, match="clickhouse-mergetree-packed"):
+        env.daemon.run_once()
+    assert env.offset() is None
+    assert env.dest_table.total_rows == 0
+
+
+def test_non_parquet_file_refused_before_partial_window_append() -> None:
+    env = build_env(
+        files={1: src_data([1]), 2: src_data([2])}, config=make_config(max_rows=1)
+    )
+    files = env.source_table.files_by_snapshot[2]
+    files[0] = replace(files[0], file_format="clickhouse-mergetree-packed")
+    with pytest.raises(UnsupportedFormatError, match="clickhouse-mergetree-packed"):
+        env.daemon.run_once()
+    assert env.offset() is None
+    assert env.dest_table.total_rows == 0

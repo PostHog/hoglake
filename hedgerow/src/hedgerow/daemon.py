@@ -57,6 +57,8 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyhoglake.types import columns_to_arrow_schema
+
 from pyhoglake import (
     AlreadyExistsError,
     CommitConflictError,
@@ -68,10 +70,10 @@ from pyhoglake import (
     ValidationError,
 )
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
-from pyhoglake.types import columns_to_arrow_schema
 
 from .config import HedgerowConfig
 from .filtering import RowFilter, build_filter
+from .formats import require_parquet
 from .halts import (
     DataIntegrityError,
     DeletesPresentError,
@@ -193,11 +195,17 @@ class Hedgerow:
         self._source_catalog = self._source_client.catalog(cfg.source.catalog)
         self._source_ns = self._source_catalog.namespace(cfg.source.namespace)
         source_table = self._source_ns.table(cfg.source.table)
+        require_parquet(
+            (source_table.properties or {}).get("write.format.default", "parquet")
+        )
         self.source_uuid = source_table.table_uuid
 
         dest_catalog = self._dest_client.catalog(cfg.destination.catalog)
         self._dest_ns = dest_catalog.namespace(cfg.destination.namespace)
         dest_table = self._dest_ns.table(cfg.destination.table)
+        require_parquet(
+            (dest_table.properties or {}).get("write.format.default", "parquet")
+        )
         self.dest_uuid = dest_table.table_uuid
 
         # Destination columns define the projected set; source must cover
@@ -251,6 +259,7 @@ class Hedgerow:
                 f"(pinned uuid {self.source_uuid}) no longer exists. "
                 "HALT: refusing to continue against a dropped table."
             ) from None
+        require_parquet((table.properties or {}).get("write.format.default", "parquet"))
         if table.table_uuid != self.source_uuid:
             raise IncarnationChangedError(
                 f"source table {cfg.catalog}/{cfg.namespace}.{cfg.table} was "
@@ -270,6 +279,7 @@ class Hedgerow:
                 f"destination table {cfg.catalog}/{cfg.namespace}.{cfg.table} "
                 f"(pinned uuid {self.dest_uuid}) no longer exists. HALT."
             ) from None
+        require_parquet((table.properties or {}).get("write.format.default", "parquet"))
         if table.table_uuid != self.dest_uuid:
             raise IncarnationChangedError(
                 f"destination table {cfg.catalog}/{cfg.namespace}.{cfg.table} "
@@ -355,6 +365,9 @@ class Hedgerow:
                 "must reconcile the destination manually (or stop deleting "
                 "from the source)."
             )
+
+        for file in plan.files:
+            require_parquet(file.file_format)
 
         rows_read = rows_appended = appends = 0
         max_rows = cfg.replication.max_rows_per_append

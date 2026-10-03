@@ -18,6 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pyarrow as pa
+
 from pyhoglake import (
     ChangesPlan,
     Column,
@@ -94,6 +95,7 @@ class FakeSourceTable:
     expired_below: int = 0  # changes(from < expired_below) -> 410
     # if set, changes() reports this uuid in the plan (recreate-mid-flight)
     plan_uuid_override: str | None = None
+    properties: dict[str, str] = dc_field(default_factory=dict)
 
     def changes(
         self, from_snapshot: int, to_snapshot: int | None = None
@@ -145,6 +147,7 @@ class FakeDestTable:
     conflict_first_n_appends: int = 0
     _append_calls: int = 0
     _next_snapshot: int = 100
+    properties: dict[str, str] = dc_field(default_factory=dict)
 
     def append(self, data: pa.Table, **kwargs: Any) -> CommitResult:
         self._append_calls += 1

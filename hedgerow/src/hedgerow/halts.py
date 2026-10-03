@@ -79,3 +79,7 @@ class PersistentFailureError(HaltError):
     halting instead of retrying forever."""
 
     exit_code = 9
+
+
+class UnsupportedFormatError(HaltError):
+    exit_code = 10
