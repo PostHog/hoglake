@@ -98,3 +98,10 @@ the test reads the `_hog_row_id` carrier), extension-written and
 pyhoglake-written partition values land in byte-identical partition
 strings, and both directions of the reserved-field-id contract refuse
 typed instead of killing the instance.
+
+## Data formats
+
+The extension reads and writes Parquet tables only.
+It refuses tables with `write.format.default=clickhouse-mergetree-packed`, including empty tables, before scanning or writing objects.
+Scan plans also validate each file format before passing paths to the Parquet reader.
+Use the Python ClickHouse packed adapter for these tables.

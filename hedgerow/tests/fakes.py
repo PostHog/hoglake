@@ -18,7 +18,6 @@ from datetime import UTC, datetime
 from typing import Any
 
 import pyarrow as pa
-
 from pyhoglake import (
     ChangesPlan,
     Column,

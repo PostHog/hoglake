@@ -29,6 +29,11 @@ from .errors import (
     UnsupportedTypeError,
     ValidationError,
 )
+from .formats import (
+    CLICKHOUSE_MERGETREE_PACKED_FORMAT,
+    PARQUET_FORMAT,
+    TABLE_FORMAT_PROPERTY,
+)
 from .models import (
     AppendedFile,
     AppendResult,
@@ -53,6 +58,7 @@ from .models import (
     ViewInfo,
 )
 from .ops import AlterOp
+from .packed import ClickHousePackedAdapter
 from .types import arrow_type_to_coltype, coltype_to_arrow
 
 # Read from the installed metadata so it cannot drift from pyproject.toml.
@@ -68,6 +74,9 @@ __version__ = importlib.metadata.version("pyhoglake")
 logging.getLogger("pyhoglake").addHandler(logging.NullHandler())
 
 __all__ = [
+    "CLICKHOUSE_MERGETREE_PACKED_FORMAT",
+    "PARQUET_FORMAT",
+    "TABLE_FORMAT_PROPERTY",
     "UNGUARDED",
     "AlreadyExistsError",
     "AlterOp",
@@ -78,6 +87,7 @@ __all__ = [
     "CatalogOptions",
     "ChangesPlan",
     "CleanupResult",
+    "ClickHousePackedAdapter",
     "Column",
     "ColumnStats",
     "CommitConflictError",

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.PartitionFieldDef
@@ -92,6 +93,12 @@ class TableCreationService(
                 // the forest prepare refused.
                 TableMetadata.validateComment(definition.comment)
                 TableMetadata.validateProperties(definition.properties)
+                TableMetadata.validateDefinitionForFormat(
+                    definition.properties,
+                    definition.columns,
+                    definition.partitionFields,
+                    definition.sortFields,
+                )
                 catalogs.validateTableDefinition(definition.name, definition.columns)
                 AlterService(
                     jdbi,
@@ -180,6 +187,7 @@ class TableCreationService(
                         "duplicate file paths",
                     )
                 }
+                val tableFormat = FileFormats.tableFormat(operation.definition.properties)
                 files.forEach {
                     if (!it.path.startsWith(
                             operation.writePath,
@@ -187,7 +195,14 @@ class TableCreationService(
                     ) {
                         throw HoglakeException.Validation("file outside operation write_path")
                     }
-                    it.validateFooterSize(required = true)
+                    if (it.fileFormat != tableFormat) {
+                        throw HoglakeException.Validation(
+                            "file_format '${it.fileFormat}' does not match table format '$tableFormat'",
+                        )
+                    }
+                    if (tableFormat == FileFormats.PARQUET) {
+                        it.validateFooterSize(required = true)
+                    }
                 }
                 h.createUpdate(
                     """

@@ -4,6 +4,7 @@ import com.posthog.hoglake.model.ChangeKind
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableSummaryInfo
 import org.jdbi.v3.core.Handle
@@ -133,21 +134,36 @@ object TableRepo {
         createdSnapshot: Long,
         tableUuid: UUID = UUID.randomUUID(),
         replacedTableId: Long? = null,
-    ): UUID =
-        handle.createQuery(
-            """
-            INSERT INTO hog_table (catalog_id, table_id, created_snapshot, table_uuid, replaced_table_id)
-            VALUES (:catalogId, :tableId, :createdSnapshot, :tableUuid, :replacedTableId)
-            RETURNING table_uuid
-            """,
-        )
+        fileFormat: String = FileFormats.PARQUET,
+    ): UUID {
+        val sql =
+            if (fileFormat == FileFormats.PARQUET) {
+                """
+                INSERT INTO hog_table
+                    (catalog_id, table_id, created_snapshot, table_uuid, replaced_table_id)
+                VALUES
+                    (:catalogId, :tableId, :createdSnapshot, :tableUuid, :replacedTableId)
+                RETURNING table_uuid
+                """
+            } else {
+                """
+                INSERT INTO hog_table
+                    (catalog_id, table_id, created_snapshot, table_uuid, replaced_table_id, file_format)
+                VALUES
+                    (:catalogId, :tableId, :createdSnapshot, :tableUuid, :replacedTableId, :fileFormat)
+                RETURNING table_uuid
+                """
+            }
+        return handle.createQuery(sql)
             .bind("catalogId", catalogId)
             .bind("tableId", tableId)
             .bind("createdSnapshot", createdSnapshot)
             .bind("tableUuid", tableUuid)
             .bind("replacedTableId", replacedTableId)
+            .apply { if (fileFormat != FileFormats.PARQUET) bind("fileFormat", fileFormat) }
             .map { rs, _ -> rs.getObject("table_uuid") as UUID }
             .one()
+    }
 
     /**
      * Allocate [count] consecutive field ids from hog_table.next_field_id

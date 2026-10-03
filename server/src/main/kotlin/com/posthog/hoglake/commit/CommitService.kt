@@ -5,6 +5,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.StatsSanity
@@ -15,6 +16,7 @@ import com.posthog.hoglake.observability.Audit
 import com.posthog.hoglake.observability.Metrics
 import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.bindBigintArrayOrNull
+import com.posthog.hoglake.service.UploadRegistration
 import com.posthog.hoglake.storedPayloadObjectMapper
 import io.github.oshai.kotlinlogging.KotlinLogging
 import org.jdbi.v3.core.Handle
@@ -324,9 +326,21 @@ class CommitService(
             validateFiles(
                 h,
                 catalogId,
-                ResolvedAppend(namespace, table, tableId, files, liveSpec(h, catalogId, tableId)),
+                ResolvedAppend(
+                    namespace,
+                    table,
+                    tableId,
+                    files,
+                    liveTableFormat(h, catalogId, tableId),
+                    liveSpec(h, catalogId, tableId),
+                ),
             )
-        com.posthog.hoglake.service.UploadService.register(h, catalogId, uploadOwner, files.map { it.path to "data" })
+        com.posthog.hoglake.service.UploadService.register(
+            h,
+            catalogId,
+            uploadOwner,
+            files.map { UploadRegistration(it.path, "data", it.fileFormat) },
+        )
         checkRemovalQueueCollisions(h, catalogId, listOf(append), emptyList())
         if (files.isEmpty()) return
         val firstId =
@@ -407,6 +421,8 @@ class CommitService(
         val table: String,
         val tableId: Long,
         val files: List<FileRegistration>,
+        /** Effective table storage format; absent property means parquet. */
+        val tableFormat: String,
         /** Live spec with >= 1 field, or null for an unpartitioned table. */
         val spec: LiveSpec?,
     )
@@ -424,6 +440,7 @@ class CommitService(
         val namespace: String,
         val table: String,
         val tableId: Long,
+        val tableFormat: String,
         val files: List<DeleteFileRegistration>,
     )
 
@@ -626,15 +643,27 @@ class CommitService(
             mergedAppends.map { (key, files) ->
                 val (namespace, table) = key
                 val live = resolveGuarded(key)
-                ResolvedAppend(namespace, table, live.tableId, files, liveSpec(h, catalogId, live.tableId))
+                ResolvedAppend(
+                    namespace,
+                    table,
+                    live.tableId,
+                    files,
+                    live.tableFormat,
+                    liveSpec(h, catalogId, live.tableId),
+                )
             }
-        val appendTableIdByName =
-            resolvedAppends.associate { (it.namespace to it.table) to it.tableId }
+        val appendTableByName =
+            resolvedAppends.associateBy { it.namespace to it.table }
         val resolvedDeletes =
             mergedDeletes.map { (key, files) ->
                 val (namespace, table) = key
-                val tableId = appendTableIdByName[key] ?: resolveGuarded(key).tableId
-                ResolvedDeletes(namespace, table, tableId, files)
+                val appended = appendTableByName[key]
+                if (appended != null) {
+                    ResolvedDeletes(namespace, table, appended.tableId, appended.tableFormat, files)
+                } else {
+                    val live = resolveGuarded(key)
+                    ResolvedDeletes(namespace, table, live.tableId, live.tableFormat, files)
+                }
             }
 
         // The second thing read_snapshot is REQUIRED for, and the reason
@@ -797,8 +826,12 @@ class CommitService(
             h,
             catalogId,
             req.idempotencyKey,
-            resolvedAppends.flatMap { a -> a.files.map { it.path to "data" } } +
-                resolvedDeletes.flatMap { d -> d.files.map { it.path to "delete" } },
+            resolvedAppends.flatMap { a ->
+                a.files.map { UploadRegistration(it.path, "data", it.fileFormat) }
+            } +
+                resolvedDeletes.flatMap { d ->
+                    d.files.map { UploadRegistration(it.path, "delete") }
+                },
         )
         checkRemovalQueueCollisions(h, catalogId, resolvedAppends, resolvedDeletes)
 
@@ -1015,10 +1048,10 @@ class CommitService(
             h.prepareBatch(
                 """
             INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                                       path, record_count, file_size_bytes, footer_size,
+                                       path, file_format, record_count, file_size_bytes, footer_size,
                                        row_id_start, stats_state, spec_id, split_offsets)
             VALUES (:catalogId, :dataFileId, :tableId, :beginSnapshot,
-                    :path, :recordCount, :fileSizeBytes, :footerSize,
+                    :path, :fileFormat, :recordCount, :fileSizeBytes, :footerSize,
                     :rowIdStart, :statsState, :specId, :splitOffsets)
             """,
             )
@@ -1118,6 +1151,7 @@ class CommitService(
                     .bind("tableId", append.tableId)
                     .bind("beginSnapshot", snapshotId)
                     .bind("path", file.path)
+                    .bind("fileFormat", file.fileFormat)
                     .bind("recordCount", file.recordCount)
                     .bind("fileSizeBytes", file.fileSizeBytes)
                     .bind("footerSize", file.footerSize)
@@ -1351,8 +1385,12 @@ class CommitService(
         insertBatch.execute()
     }
 
-    /** A live table's id + identity uuid (the incarnation the name currently binds to). */
-    private data class LiveTable(val tableId: Long, val tableUuid: UUID)
+    /** A live table's id, identity uuid and effective storage format. */
+    private data class LiveTable(
+        val tableId: Long,
+        val tableUuid: UUID,
+        val tableFormat: String,
+    )
 
     /**
      * The refusal for a commit whose table did not resolve live: a
@@ -1419,7 +1457,7 @@ class CommitService(
     ): LiveTable? =
         h.createQuery(
             """
-        SELECT tv.table_id, t.table_uuid
+        SELECT tv.table_id, t.table_uuid, t.file_format AS table_format
           FROM hog_table_version tv
           JOIN hog_namespace ns
             ON ns.catalog_id = tv.catalog_id AND ns.namespace_id = tv.namespace_id
@@ -1436,9 +1474,26 @@ class CommitService(
             .bind("catalogId", catalogId)
             .bind("namespace", namespace)
             .bind("table", table)
-            .map { rs, _ -> LiveTable(rs.getLong(1), rs.getObject(2) as UUID) }
+            .map { rs, _ -> LiveTable(rs.getLong(1), rs.getObject(2) as UUID, rs.getString(3)) }
             .findOne()
             .orElse(null)
+
+    private fun liveTableFormat(
+        h: Handle,
+        catalogId: Long,
+        tableId: Long,
+    ): String =
+        h.createQuery(
+            """
+            SELECT file_format
+              FROM hog_table
+             WHERE catalog_id = :catalogId AND table_id = :tableId
+            """,
+        )
+            .bind("catalogId", catalogId)
+            .bind("tableId", tableId)
+            .mapTo(String::class.java)
+            .one()
 
     /**
      * The table's live partition spec, or null when unpartitioned. A spec
@@ -1503,9 +1558,25 @@ class CommitService(
                 .toList()
                 .toMap()
         }
+        if (append.tableFormat !in FileFormats.allowed) {
+            throw HoglakeException.Validation(
+                "$qualified has unsupported table format '${append.tableFormat}'",
+            )
+        }
         for (file in append.files) {
             if (file.path.isBlank()) {
                 throw HoglakeException.Validation("blank file path in append to $qualified")
+            }
+            if (file.fileFormat !in FileFormats.allowed) {
+                throw HoglakeException.Validation(
+                    "unsupported file_format '${file.fileFormat}' for ${file.path} in $qualified",
+                )
+            }
+            if (file.fileFormat != append.tableFormat) {
+                throw HoglakeException.Validation(
+                    "file_format '${file.fileFormat}' for ${file.path} does not match " +
+                        "$qualified format '${append.tableFormat}'",
+                )
             }
             if (file.recordCount < 0) {
                 throw HoglakeException.Validation(
@@ -1522,6 +1593,29 @@ class CommitService(
                 throw HoglakeException.Validation(
                     "negative file_size_bytes for ${file.path} in $qualified",
                 )
+            }
+            if (file.fileFormat == FileFormats.CLICKHOUSE_MERGETREE_PACKED) {
+                if (file.recordCount == 0L || file.fileSizeBytes == 0L) {
+                    throw HoglakeException.Validation(
+                        "packed MergeTree registration ${file.path} must contain at least one row and one byte",
+                    )
+                }
+                if (file.columnStats == null) {
+                    throw HoglakeException.Validation(
+                        "packed MergeTree registration ${file.path} must provide column_stats; " +
+                            "use an empty array when no bounds are available",
+                    )
+                }
+                if (file.footerSize != null) {
+                    throw HoglakeException.Validation(
+                        "packed MergeTree registration ${file.path} must not provide footer_size",
+                    )
+                }
+                if (file.splitOffsets != null) {
+                    throw HoglakeException.Validation(
+                        "packed MergeTree registration ${file.path} must not provide split_offsets",
+                    )
+                }
             }
             // Refused, not repaired: unlike a stats row there is no
             // partial list worth keeping — readers ignore a list that
@@ -1639,6 +1733,11 @@ class CommitService(
         val seenTargets = HashSet<Any>()
         for (deletes in resolved) {
             val qualified = "${deletes.namespace}.${deletes.table}"
+            if (deletes.tableFormat != FileFormats.PARQUET) {
+                throw HoglakeException.Validation(
+                    "$qualified uses '${deletes.tableFormat}' and does not support deletion vectors",
+                )
+            }
             for (reg in deletes.files) {
                 if (reg.path.isBlank()) {
                     throw HoglakeException.Validation("blank delete file path in $qualified")

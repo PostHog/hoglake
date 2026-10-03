@@ -18,6 +18,7 @@ from fakes import (
     delete_file,
     table_batch_reader,
 )
+from pyhoglake import NotFoundError
 
 from hedgerow import (
     DeletesPresentError,
@@ -33,7 +34,6 @@ from hedgerow import (
     SourceConfig,
     UnsupportedFormatError,
 )
-from pyhoglake import NotFoundError
 
 SRC_COLS = (
     col("id", "long", 1, 0, nullable=False),

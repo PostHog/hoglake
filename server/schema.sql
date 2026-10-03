@@ -125,6 +125,7 @@ CREATE TABLE hog_table (
     created_snapshot bigint NOT NULL,
     dropped_snapshot bigint,
     next_field_id bigint NOT NULL DEFAULT 1,
+    file_format text NOT NULL DEFAULT 'parquet',
     -- The replacement edge (V14): the incarnation THIS row replaced, set
     -- by CatalogService.createTable when it publishes an atomic
     -- replacement. Recorded rather than derived from
@@ -150,6 +151,10 @@ CREATE TABLE hog_table (
     retirement_eligible_at timestamptz,
     PRIMARY KEY (catalog_id, table_id),
     UNIQUE (catalog_id, table_uuid),
+    CONSTRAINT hog_table_file_format_check
+        CHECK (file_format IN ('parquet', 'clickhouse-mergetree-packed')),
+    CONSTRAINT hog_table_format_identity
+        UNIQUE (catalog_id, table_id, file_format),
     -- The edge has no FK, so this is its only structural defence: a
     -- self-edge would be a 1-cycle for the recursive walk that follows it.
     CONSTRAINT hog_table_no_self_replacement CHECK (replaced_table_id <> table_id)
@@ -285,7 +290,7 @@ CREATE TABLE hog_data_file (
     end_snapshot    bigint,
     path            text   NOT NULL,   -- absolute object-store URI; no relative chains
     file_format     text   NOT NULL DEFAULT 'parquet'
-                    CHECK (file_format IN ('parquet')),
+                    CHECK (file_format IN ('parquet', 'clickhouse-mergetree-packed')),
     record_count    bigint NOT NULL CHECK (record_count >= 0),
     file_size_bytes bigint NOT NULL CHECK (file_size_bytes >= 0),
     footer_size     bigint,
@@ -326,6 +331,13 @@ CREATE TABLE hog_data_file (
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
 );
+-- NOT VALID avoids a manifest-wide deployment scan. Existing rows predate
+-- the alternate format and are therefore Parquet; new rows are checked.
+ALTER TABLE hog_data_file
+    ADD CONSTRAINT hog_data_file_table_format_fk
+    FOREIGN KEY (catalog_id, table_id, file_format)
+    REFERENCES hog_table (catalog_id, table_id, file_format)
+    NOT VALID;
 CREATE INDEX hog_data_file_live
     ON hog_data_file (catalog_id, table_id, begin_snapshot)
     WHERE end_snapshot IS NULL;
@@ -768,6 +780,9 @@ CREATE TABLE hog_upload (
     prefix text NOT NULL,
     path text NOT NULL,
     file_kind text NOT NULL CHECK (file_kind IN ('data', 'delete')),
+    -- NULL on claims minted by replicas that predate format-aware claims.
+    -- Registration interprets a NULL data format as legacy Parquet only.
+    file_format text,
     state text NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'registered', 'abandoned')),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '24 hours',
     last_scheduled_at timestamptz,
@@ -776,6 +791,107 @@ CREATE TABLE hog_upload (
 );
 CREATE INDEX hog_upload_owner ON hog_upload (catalog_id, owner) WHERE state = 'active';
 CREATE INDEX hog_upload_cleanup ON hog_upload (catalog_id, last_scheduled_at, upload_id) WHERE state <> 'registered';
+
+CREATE FUNCTION hog_enforce_table_version_format()
+RETURNS trigger LANGUAGE plpgsql AS '
+DECLARE
+    expected_format text;
+    actual_format text;
+BEGIN
+    SELECT file_format INTO expected_format
+      FROM hog_table
+     WHERE catalog_id = NEW.catalog_id AND table_id = NEW.table_id;
+    actual_format := COALESCE(NEW.properties ->> ''write.format.default'', ''parquet'');
+    IF expected_format IS NOT NULL AND actual_format <> expected_format THEN
+        RAISE EXCEPTION ''table property format % does not match immutable table format %'',
+            actual_format, expected_format
+            USING ERRCODE = ''check_violation'';
+    END IF;
+    RETURN NEW;
+END';
+
+CREATE TRIGGER hog_table_version_format_guard
+BEFORE INSERT OR UPDATE OF properties ON hog_table_version
+FOR EACH ROW EXECUTE FUNCTION hog_enforce_table_version_format();
+
+CREATE FUNCTION hog_reject_packed_table_mutation()
+RETURNS trigger LANGUAGE plpgsql AS '
+DECLARE
+    row_catalog_id bigint;
+    row_table_id bigint;
+    table_format text;
+    table_created_snapshot bigint;
+    table_dropped_snapshot bigint;
+BEGIN
+    IF TG_OP = ''DELETE'' THEN
+        row_catalog_id := OLD.catalog_id;
+        row_table_id := OLD.table_id;
+    ELSE
+        row_catalog_id := NEW.catalog_id;
+        row_table_id := NEW.table_id;
+    END IF;
+
+    SELECT file_format, created_snapshot, hog_table.dropped_snapshot
+      INTO table_format, table_created_snapshot, table_dropped_snapshot
+      FROM hog_table
+     WHERE catalog_id = row_catalog_id AND table_id = row_table_id;
+
+    IF table_format IS DISTINCT FROM ''clickhouse-mergetree-packed''
+       OR table_dropped_snapshot IS NOT NULL THEN
+        IF TG_OP = ''DELETE'' THEN
+            RETURN OLD;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    IF TG_TABLE_NAME = ''hog_column'' AND TG_OP = ''INSERT''
+       AND NEW.begin_snapshot = table_created_snapshot THEN
+        RETURN NEW;
+    END IF;
+
+    RAISE EXCEPTION ''packed MergeTree table does not support mutation through %'', TG_TABLE_NAME
+        USING ERRCODE = ''check_violation'';
+END';
+
+CREATE TRIGGER hog_packed_column_guard
+BEFORE INSERT OR UPDATE OR DELETE ON hog_column
+FOR EACH ROW EXECUTE FUNCTION hog_reject_packed_table_mutation();
+CREATE TRIGGER hog_packed_partition_guard
+BEFORE INSERT OR UPDATE OR DELETE ON hog_partition_spec
+FOR EACH ROW EXECUTE FUNCTION hog_reject_packed_table_mutation();
+CREATE TRIGGER hog_packed_sort_guard
+BEFORE INSERT OR UPDATE OR DELETE ON hog_sort_spec
+FOR EACH ROW EXECUTE FUNCTION hog_reject_packed_table_mutation();
+CREATE TRIGGER hog_packed_delete_file_guard
+BEFORE INSERT OR UPDATE ON hog_delete_file
+FOR EACH ROW EXECUTE FUNCTION hog_reject_packed_table_mutation();
+CREATE TRIGGER hog_packed_data_file_end_guard
+BEFORE UPDATE OF end_snapshot ON hog_data_file
+FOR EACH ROW EXECUTE FUNCTION hog_reject_packed_table_mutation();
+
+CREATE FUNCTION hog_enforce_claimed_data_file_format()
+RETURNS trigger LANGUAGE plpgsql AS '
+DECLARE
+    claimed_format text;
+BEGIN
+    IF strpos(NEW.path, ''/trino-upload/'') = 0 THEN
+        RETURN NEW;
+    END IF;
+
+    SELECT COALESCE(file_format, ''parquet'') INTO claimed_format
+      FROM hog_upload
+     WHERE catalog_id = NEW.catalog_id AND path = NEW.path AND file_kind = ''data'';
+    IF claimed_format IS NOT NULL AND claimed_format <> NEW.file_format THEN
+        RAISE EXCEPTION ''data file format % does not match upload claim format %'',
+            NEW.file_format, claimed_format
+            USING ERRCODE = ''check_violation'';
+    END IF;
+    RETURN NEW;
+END';
+
+CREATE TRIGGER hog_claimed_data_file_format_guard
+BEFORE INSERT ON hog_data_file
+FOR EACH ROW EXECUTE FUNCTION hog_enforce_claimed_data_file_format();
 
 -- Replacement lineage (V14): the access path for the walk
 -- OffsetRepo.releaseSupersededOffsets runs on every offset commit and

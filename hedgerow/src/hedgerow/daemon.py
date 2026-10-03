@@ -57,8 +57,6 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-from pyhoglake.types import columns_to_arrow_schema
-
 from pyhoglake import (
     AlreadyExistsError,
     CommitConflictError,
@@ -70,6 +68,7 @@ from pyhoglake import (
     ValidationError,
 )
 from pyhoglake import IncarnationChangedError as ClientIncarnationChangedError
+from pyhoglake.types import columns_to_arrow_schema
 
 from .config import HedgerowConfig
 from .filtering import RowFilter, build_filter

@@ -1,10 +1,11 @@
 # pyhoglake
 
 Python client for [hoglake](https://github.com/PostHog/hoglake#readme), the Postgres-native
-lakehouse-catalog control plane. A **thin API wrapper**: no embedded
-engine, no SQL, no direct catalog-database access — ever. The client
-writes parquet to object storage itself and registers it with the
-control plane via footer-shipping commits.
+lakehouse-catalog control plane. A **thin API wrapper**: no direct
+catalog-database access. The standard writer path writes Parquet to
+object storage and registers it with the control plane via footer-shipping
+commits. The optional packed MergeTree adapter invokes a configured
+`clickhouse local` executable; ClickHouse remains outside the library.
 
 ## Install
 
@@ -105,6 +106,54 @@ for s in catalog.snapshots(before=head + 1):
     # (mutually exclusive
     # with non-zero after)
 ```
+
+## Packed MergeTree adapter
+
+`ClickHousePackedAdapter` is the explicit writer and reader for tables created with
+`write.format.default=clickhouse-mergetree-packed`:
+
+```python
+import pyarrow as pa
+from pyhoglake import ClickHousePackedAdapter
+
+packed = ns.create_table(
+    "packed_events",
+    pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("name", pa.string()),
+        ]
+    ),
+    properties={"write.format.default": "clickhouse-mergetree-packed"},
+)
+adapter = ClickHousePackedAdapter("/usr/local/bin/clickhouse")
+adapter.append(packed, pa.table({"id": [1, 2], "name": ["a", "b"]}))
+rows = adapter.read(packed, snapshot=catalog.refresh().head_snapshot_id)
+```
+
+For durable publication, call `prepare_append`, persist the returned JSON payload, then call
+`commit_prepared` with that exact payload. Do not call `prepare_append` again with the same
+idempotency key; replay `commit_prepared` with the persisted payload. Preparation creates one
+MergeTree part in an isolated local directory, refuses any layout except one `data.packed` file,
+claims a fresh `.packed` object
+path from Hoglake, uploads it, and includes Arrow-derived Iceberg bounds in the registration.
+`abandon_prepared` fences a payload that is known not to have committed. Do not abandon after an
+unknown commit outcome; replay the exact payload instead.
+
+Reads request one exact Hoglake scan plan, download only those registered objects, attach them to an
+isolated local table, enable ClickHouse `table_readonly`, and return an Arrow table. They never list
+or scan an object-storage prefix. The adapter currently supports boolean, signed and unsigned integer,
+float, double, string, binary, date, and second/millisecond/microsecond/nanosecond timestamp columns.
+Date and timestamp values must also fit the configured ClickHouse version's `Date32`/`DateTime64`
+ranges; the adapter does not widen those engine domains. Schemas are fixed. Partition specs, sort
+orders, deletion vectors, explicit row IDs, packed-part
+compaction, and mixed-format tables are refused. The writer and reader should use the same ClickHouse
+version; no cross-version compatibility or remote-read performance claim is made.
+
+The adapter also bounds each part, part count and total registered bytes in a read, ClickHouse
+memory, result bytes, worker threads, and process time. Constructor arguments can lower or raise those limits for a
+known workload. The ordinary `Table.append` and `prepare_append_*` methods remain Parquet-only and
+reject packed tables before writing an object.
 
 ## Configuration
 

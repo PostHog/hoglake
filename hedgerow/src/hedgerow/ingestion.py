@@ -12,7 +12,6 @@ from dataclasses import replace
 from tempfile import TemporaryDirectory
 
 import pyarrow.parquet as pq
-
 from pyhoglake import ReconciliationRequiredError
 
 from .buffering import BufferPolicy

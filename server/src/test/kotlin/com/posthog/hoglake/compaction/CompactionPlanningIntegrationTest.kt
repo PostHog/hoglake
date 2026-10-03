@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.MaintenanceBacklog
 import com.posthog.hoglake.model.MaintenanceTask
@@ -21,6 +22,7 @@ import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -66,7 +68,10 @@ class CompactionPlanningIntegrationTest {
         db.close()
     }
 
-    private fun fixture(columns: List<ColumnDef> = listOf(ColumnDef("id", ColType.LONG))): String {
+    private fun fixture(
+        columns: List<ColumnDef> = listOf(ColumnDef("id", ColType.LONG)),
+        properties: Map<String, String> = emptyMap(),
+    ): String {
         val cat = "plan-cat-${counter.incrementAndGet()}"
         db.jdbi.useHandleUnchecked { h ->
             // Raw insert: this suite tests compaction planning, not catalog validation.
@@ -82,7 +87,7 @@ class CompactionPlanningIntegrationTest {
             )
         }
         catalogs.createNamespace(cat, "ns")
-        catalogs.createTable(cat, "ns", "t", columns)
+        catalogs.createTable(cat, "ns", "t", columns, properties)
         return cat
     }
 
@@ -121,6 +126,58 @@ class CompactionPlanningIntegrationTest {
         assertThat(plan.groups.single().files.map { it.path })
             .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/b.parquet")
         assertThat(plan.groups.single().totalBytes).isEqualTo(1200)
+    }
+
+    @Test
+    fun `packed files are excluded from planning and direct execution`() {
+        val cat =
+            fixture(
+                properties =
+                    mapOf(
+                        FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                    ),
+            )
+        val registrations =
+            listOf("a", "b").map { name ->
+                FileRegistration(
+                    path = "s3://bucket/x/$name.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 100,
+                    columnStats = emptyList(),
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }
+        append(cat, *registrations.toTypedArray())
+        assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+
+        val files =
+            db.jdbi.withHandle<List<CompactionCandidate>, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes, f.row_id_start
+                      FROM hog_data_file f
+                      JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                     WHERE c.name = :cat
+                     ORDER BY f.data_file_id
+                    """,
+                )
+                    .bind("cat", cat)
+                    .map { rs, _ ->
+                        CompactionCandidate(
+                            dataFileId = rs.getLong("data_file_id"),
+                            path = rs.getString("path"),
+                            recordCount = rs.getLong("record_count"),
+                            fileSizeBytes = rs.getLong("file_size_bytes"),
+                            footerSize = null,
+                            rowIdStart = rs.getLong("row_id_start"),
+                        )
+                    }
+                    .list()
+            }
+        assertThatThrownBy {
+            svc.compactPlannedGroup(cat, "ns", "t", CompactionGroup(files, null, null))
+        }.isInstanceOf(InvalidDataException::class.java)
+            .hasMessageContaining(FileFormats.CLICKHOUSE_MERGETREE_PACKED)
     }
 
     @Test

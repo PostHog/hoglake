@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.FileColumnStats
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
@@ -276,6 +277,7 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         name: String,
         columns: List<ColumnDef>,
+        properties: Map<String, String> = emptyMap(),
     ): TableInfo =
         Audit.audited(
             "table_create",
@@ -283,7 +285,10 @@ class CatalogService(private val jdbi: Jdbi) {
             "$namespace.$name",
             detail = { "columns=${columns.size}" },
         ) {
-            jdbi.inTransactionUnchecked { h -> createTable(h, catalog, namespace, name, columns) }
+            jdbi.inTransactionUnchecked {
+                    h ->
+                createTable(h, catalog, namespace, name, columns, properties = properties)
+            }
         }
 
     /** Caller may compose creation with file registration in the same transaction. */
@@ -302,6 +307,7 @@ class CatalogService(private val jdbi: Jdbi) {
     ): TableInfo {
         TableMetadata.validateComment(comment)
         TableMetadata.validateProperties(properties)
+        TableMetadata.validateDefinitionForFormat(properties, columns, partitionFields, sortFields)
         validateTableDefinition(name, columns)
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
@@ -347,7 +353,15 @@ class CatalogService(private val jdbi: Jdbi) {
         // consumer's offset release depends on must be a fact, not a
         // convention re-derived later (OffsetRepo.releaseSupersededOffsets).
         val createdUuid =
-            TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid, replacementTableId)
+            TableRepo.insertTable(
+                h,
+                cat.catalogId,
+                tableId,
+                alloc.snapshotId,
+                tableUuid,
+                replacementTableId,
+                FileFormats.tableFormat(properties),
+            )
         // nodeCount, not columns.size: a nested column needs one id per
         // NODE, not one per top-level column. Allocating by size would
         // hand back a range too short and every subtree after the first
@@ -496,6 +510,9 @@ class CatalogService(private val jdbi: Jdbi) {
                         expectedTableUuid = expectedTableUuid,
                         currentTableUuid = t.tableUuid,
                     )
+                }
+                if (com.posthog.hoglake.model.FileFormats.isPacked(t.properties)) {
+                    throw HoglakeException.Validation("packed MergeTree tables do not support truncate")
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)

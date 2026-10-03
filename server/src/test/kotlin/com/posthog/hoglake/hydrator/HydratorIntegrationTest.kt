@@ -188,18 +188,20 @@ class HydratorIntegrationTest {
         recordCount: Long,
         fileSizeBytes: Long,
         footerSize: Long?,
+        fileFormat: String = "parquet",
     ) {
         jdbi.useHandle<Exception> { h ->
             h.execute(
                 """
                 INSERT INTO hog_data_file
-                    (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                    (catalog_id, data_file_id, table_id, begin_snapshot, path, file_format,
                      record_count, file_size_bytes, footer_size, row_id_start, stats_state)
-                VALUES (?, ?, 1, 1, ?, ?, ?, ?, 0, 'pending')
+                VALUES (?, ?, 1, 1, ?, ?, ?, ?, ?, 0, 'pending')
                 """,
                 catalogId,
                 dataFileId,
                 path,
+                fileFormat,
                 recordCount,
                 fileSizeBytes,
                 footerSize,
@@ -298,6 +300,30 @@ class HydratorIntegrationTest {
     }
 
     // ---- tests -------------------------------------------------------------
+
+    @Test
+    fun `packed files are never claimed by the parquet hydrator`() {
+        val catalogId = seedCatalogAndTable()
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "UPDATE hog_table SET file_format = 'clickhouse-mergetree-packed' " +
+                    "WHERE catalog_id = ? AND table_id = 1",
+                catalogId,
+            )
+        }
+        seedDataFile(
+            catalogId,
+            1,
+            "s3://$BUCKET/t1/data.packed",
+            ROWS.toLong(),
+            100,
+            null,
+            fileFormat = "clickhouse-mergetree-packed",
+        )
+
+        assertThat(hydrator.runOnce()).isZero()
+        assertThat(statsState(catalogId, 1)).isEqualTo("pending")
+    }
 
     @Test
     fun `hydrates a pending file end to end - field ids present so the flag stays false`() {

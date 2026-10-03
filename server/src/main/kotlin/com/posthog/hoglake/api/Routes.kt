@@ -129,6 +129,7 @@ fun Application.installApiRoutes(
                                     call.namespace(),
                                     req.name,
                                     req.columns.map { it.toModel() },
+                                    req.properties,
                                 ).toDto(),
                             )
                         }

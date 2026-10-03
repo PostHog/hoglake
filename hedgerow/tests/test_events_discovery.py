@@ -3,14 +3,6 @@ from datetime import UTC, datetime
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from hedgerow.discovery import discover_window
-from hedgerow.events import EventTransform
-from hedgerow.halts import (
-    DataIntegrityError,
-    SchemaMismatchError,
-    UnsupportedFormatError,
-)
-from hedgerow.pending import PendingStore
 from pyhoglake.models import (
     ChangesPlan,
     Column,
@@ -21,6 +13,15 @@ from pyhoglake.models import (
     SortSpec,
     TableInfo,
 )
+
+from hedgerow.discovery import discover_window
+from hedgerow.events import EventTransform
+from hedgerow.halts import (
+    DataIntegrityError,
+    SchemaMismatchError,
+    UnsupportedFormatError,
+)
+from hedgerow.pending import PendingStore
 
 
 def layout():

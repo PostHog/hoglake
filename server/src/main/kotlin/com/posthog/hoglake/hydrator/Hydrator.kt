@@ -751,6 +751,7 @@ class Hydrator(
             JOIN hog_table t
               ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
             WHERE f.stats_state = 'pending'
+              AND f.file_format = 'parquet'
               AND t.dropped_snapshot IS NULL
             ORDER BY f.catalog_id, f.data_file_id
             LIMIT :limit

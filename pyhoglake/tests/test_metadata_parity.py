@@ -192,3 +192,25 @@ def test_totals_false_is_a_documented_parameter():
         "the writer path sends ?totals=false on every table read; the spec "
         "does not document the parameter on GET /tables/{table}"
     )
+
+
+_FILE_FORMATS_REL = Path(
+    "server/src/main/kotlin/com/posthog/hoglake/model/FileFormats.kt"
+)
+
+
+def test_packed_type_subset_matches_server():
+    from pyhoglake.packed import _SUPPORTED_TYPES
+
+    source = _server_file(_FILE_FORMATS_REL).read_text()
+    block = re.search(
+        r"val packedColumnTypes: Set<ColType> =\s*setOf\((.*?)\n\s*\)",
+        source,
+        re.DOTALL,
+    )
+    assert block, "packedColumnTypes block not found in FileFormats.kt"
+    server = {
+        name.lower() if name != "UUID_T" else "uuid"
+        for name in re.findall(r"ColType\.([A-Z0-9_]+)", block.group(1))
+    }
+    assert _SUPPORTED_TYPES == server

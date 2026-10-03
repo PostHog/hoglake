@@ -15,6 +15,8 @@ PYHOGLAKE_DIR="${PYHOGLAKE_DIR:-$HOME/src/hoglake/pyhoglake}"
 
 echo "== fixtures (pyhoglake) =="
 (cd "$PYHOGLAKE_DIR" && HOGLAKE_S3_ENDPOINT="http://$DUCKEXT_S3_ENDPOINT" \
+    uv run python "$HERE/test/fixtures/packed_format_fixture.py")
+(cd "$PYHOGLAKE_DIR" && HOGLAKE_S3_ENDPOINT="http://$DUCKEXT_S3_ENDPOINT" \
     uv run python "$HERE/test/fixtures/read_fixture.py")
 
 # time-travel snapshot ids / timestamps written by the fixture

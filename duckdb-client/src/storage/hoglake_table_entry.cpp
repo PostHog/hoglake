@@ -29,6 +29,10 @@ unique_ptr<BaseStatistics> HoglakeTableEntry::GetStatistics(ClientContext &conte
 }
 
 TableFunction HoglakeTableEntry::GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) {
+	if (table_info.file_format != "parquet") {
+		throw NotImplementedException("hoglake: DuckDB cannot read data format '%s'; use a ClickHouse reader",
+		                              table_info.file_format);
+	}
 	auto function = HoglakeFunctions::GetHoglakeScanFunction(*context.db);
 	auto &transaction = HoglakeTransaction::Get(context, ParentCatalog());
 	function.function_info = HoglakeFunctionInfo::Create(*this, transaction);

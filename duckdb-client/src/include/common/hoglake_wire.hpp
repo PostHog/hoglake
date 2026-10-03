@@ -64,6 +64,7 @@ struct HoglakeSortSpec {
 
 struct HoglakeTableInfo {
 	string name;
+	string file_format = "parquet";
 	string namespace_name;
 	string table_uuid;
 	vector<HoglakeColumn> columns;

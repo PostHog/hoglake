@@ -107,6 +107,62 @@ class ApiIntegrationTest {
             assertThat(spec.bodyAsText()).startsWith("openapi:")
         }
 
+    @Test
+    fun `ordinary table creation can select packed storage`() =
+        api { client ->
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs",
+                    """{"name":"packed","data_path":"s3://hog/packed"}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            assertThat(
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces",
+                    """{"name":"analytics"}""",
+                ).status,
+            ).isEqualTo(HttpStatusCode.Created)
+            val created =
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces/analytics/tables",
+                    """
+                    {"name":"events",
+                     "properties":{"write.format.default":"clickhouse-mergetree-packed"},
+                     "columns":[{"name":"id","type":"long","nullable":false}]}
+                    """,
+                )
+            assertThat(created.status).isEqualTo(HttpStatusCode.Created)
+            assertThat(body(created)["properties"]["write.format.default"].asText())
+                .isEqualTo("clickhouse-mergetree-packed")
+            val committed =
+                client.postJson(
+                    "/v1/catalogs/packed/commit",
+                    """
+                    {"appends":[{"namespace":"analytics","table":"events","files":[
+                      {"path":"s3://hog/packed/data/a.packed",
+                       "file_format":"clickhouse-mergetree-packed",
+                       "record_count":1,"file_size_bytes":10,"column_stats":[]}
+                    ]}]}
+                    """,
+                )
+            assertThat(committed.status).isEqualTo(HttpStatusCode.OK)
+            val alter =
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces/analytics/tables/events/alter",
+                    """{"ops":[{"op":"add_column","column":{"name":"extra","type":"long"}}]}""",
+                )
+            assertThat(alter.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(body(alter)["detail"].asText()).contains("fixed schema")
+            val tableUuid = body(created)["table_uuid"].asText()
+            val truncate =
+                client.post(
+                    "/v1/catalogs/packed/namespaces/analytics/tables/events/truncate" +
+                        "?expected_table_uuid=$tableUuid",
+                )
+            assertThat(truncate.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(body(truncate)["detail"].asText()).contains("do not support truncate")
+        }
+
     // ---- the full lifecycle ----------------------------------------------
 
     @Test

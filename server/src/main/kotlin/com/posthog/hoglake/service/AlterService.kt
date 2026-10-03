@@ -89,6 +89,24 @@ class AlterService(private val jdbi: Jdbi) {
                         currentTableUuid = t.tableUuid,
                     )
                 }
+                ops.filterIsInstance<AlterOp.SetProperties>().forEach {
+                    TableMetadata.validateProperties(it.properties)
+                    TableMetadata.requireFormatUnchanged(t.properties, it.properties)
+                }
+                if (com.posthog.hoglake.model.FileFormats.isPacked(t.properties)) {
+                    val unsupported =
+                        ops.firstOrNull {
+                            it is AlterOp.AddColumn || it is AlterOp.DropColumn ||
+                                it is AlterOp.RenameColumn || it is AlterOp.PromoteColumn ||
+                                it is AlterOp.SetPartitionSpec || it is AlterOp.SetSortOrder
+                        }
+                    if (unsupported != null) {
+                        throw HoglakeException.Validation(
+                            "packed MergeTree tables have a fixed schema and do not support " +
+                                (unsupported::class.simpleName ?: "this alter operation"),
+                        )
+                    }
+                }
                 if (readSnapshot != null) {
                     val head = CatalogRepo.findByName(h, catalog)!!
                     if (readSnapshot < 0 || readSnapshot > head.headSnapshotId) {

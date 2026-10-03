@@ -236,6 +236,37 @@ here scales with that number — the hydrator's sweep, the expiry and
 retirement arithmetic, and the commit receipt, whose stored request body
 is the one that grows fastest (hoglake#240).
 
+### Packed MergeTree format
+
+A table may set `write.format.default=clickhouse-mergetree-packed` at creation. Absence means
+`parquet`, and the effective value is immutable. Every registration must match its table format.
+The packed contract is deliberately narrow: one registered object contains the bytes of one
+ClickHouse `data.packed` part, `column_stats` must be present (an empty array means no bounds), and
+`footer_size` plus Parquet `split_offsets` are forbidden.
+
+Packed tables are append-only, unpartitioned, unsorted, and fixed-schema. They admit only the
+scalar types covered by the Python `ClickHousePackedAdapter`: boolean, signed and unsigned integers,
+float, double, string, binary, date, and timestamp variants, within the configured ClickHouse
+version's `Date32` and `DateTime64` value ranges. Column add, drop, rename, promotion,
+partition or sort changes, truncate, and deletion-vector commits are refused. Drop remains valid.
+The Python adapter exports only a part directory containing exactly `data.packed`; projections and
+ClickHouse metadata that escape that file are outside this format.
+
+Upload claims accept `file_format=clickhouse-mergetree-packed`, persist that selection, and mint a
+fresh `.packed` path. Publication verifies the claimed format and settles the claim in the same
+transaction as the file row. The table identity row also stores the immutable format, and a database
+foreign key prevents any server version from publishing a differently formatted data row. The
+Parquet hydrator filters
+to `file_format='parquet'`, and both compaction candidate selection and direct planned-group execution
+refuse packed inputs. Expiry, retirement, removal-queue fencing, snapshots, row-range allocation, and
+exact-path cleanup keep their existing one-row/one-object behavior.
+
+The DuckDB extension and Hedgerow reject packed tables and files. The Python adapter is the only
+reader and writer in this repository. It materializes an exact snapshot's registered part list into
+an isolated `clickhouse local` table and enables `table_readonly` after attachment. This is a local
+correctness adapter, not evidence of remote-read performance, cross-version ClickHouse compatibility,
+or support in Trino or the planned Iceberg facade.
+
 ### Row lineage
 
 Every append gets a contiguous row-id range per file
