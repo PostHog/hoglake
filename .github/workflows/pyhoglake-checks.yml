@@ -61,6 +61,54 @@ jobs:
       - name: Tests
         run: uv run pytest -q
 
+  packed-clickhouse:
+    name: Packed ClickHouse round trip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: pyhoglake
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+
+      - run: uv sync --locked
+
+      - name: Prepare pinned clickhouse-local wrapper
+        env:
+          CLICKHOUSE_IMAGE: >-
+            clickhouse/clickhouse-server:26.9.8.3@sha256:230b973a00b5bac5b8925bd2898fae95a039aa6f25063fa8c507ffe9e2c7d770
+        run: |
+          docker pull "$CLICKHOUSE_IMAGE"
+          cat > "$RUNNER_TEMP/clickhouse-local" <<EOF
+          #!/usr/bin/env bash
+          set -euo pipefail
+          exec docker run --rm -i --network none \
+            --user "\$(id -u):\$(id -g)" \
+            --volume /tmp:/tmp \
+            --entrypoint clickhouse \
+            "$CLICKHOUSE_IMAGE" "\$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/clickhouse-local"
+          echo "PYHOGLAKE_CLICKHOUSE=$RUNNER_TEMP/clickhouse-local" >> "$GITHUB_ENV"
+
+      # This is the real ClickHouse writer/reader path: it verifies the
+      # one-file data.packed layout, Arrow type round-trip, readonly attach,
+      # and an exact two-part snapshot. The output assertion makes a skip a
+      # failure instead of a green job.
+      - name: Mandatory packed adapter round trip and multi-part read
+        run: |
+          output=$(uv run pytest -q -rA \
+            tests/test_packed.py::test_real_clickhouse_packed_append_and_snapshot_read)
+          printf '%s\n' "$output"
+          case "$output" in
+            *"1 passed"*) ;;
+            *) echo "::error::mandatory packed ClickHouse test did not pass"; exit 1 ;;
+          esac
+
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest

@@ -2967,7 +2967,9 @@ components:
       description: >
         Versioned table properties. Replaced as a whole by set_properties; an empty object clears it.
         `write.format.default` selects `parquet` (also the default when absent) or
-        `clickhouse-mergetree-packed` and is immutable after table creation. Packed tables
+        `clickhouse-mergetree-packed` and is immutable after table creation. Creating the packed
+        value requires the server rollout gate `HOGLAKE_PACKED_MERGETREE_ENABLED=true`; the
+        default-disabled gate returns 422 until the fleet is explicitly enabled. Packed tables
         are append-only, unpartitioned, unsorted, fixed-schema tables over the documented
         scalar subset. Other keys are inert user metadata. Keys are lowercase ASCII
         identifiers; hoglake. and trino. prefixes and partitioning, sorted_by, location,

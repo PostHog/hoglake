@@ -98,7 +98,8 @@ class AlterService(private val jdbi: Jdbi) {
                         ops.firstOrNull {
                             it is AlterOp.AddColumn || it is AlterOp.DropColumn ||
                                 it is AlterOp.RenameColumn || it is AlterOp.PromoteColumn ||
-                                it is AlterOp.SetPartitionSpec || it is AlterOp.SetSortOrder
+                                it is AlterOp.SetPartitionSpec || it is AlterOp.SetSortOrder ||
+                                it is AlterOp.SetColumnComment
                         }
                     if (unsupported != null) {
                         throw HoglakeException.Validation(

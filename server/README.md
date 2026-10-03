@@ -244,11 +244,24 @@ The packed contract is deliberately narrow: one registered object contains the b
 ClickHouse `data.packed` part, `column_stats` must be present (an empty array means no bounds), and
 `footer_size` plus Parquet `split_offsets` are forbidden.
 
+Creation is behind `HOGLAKE_PACKED_MERGETREE_ENABLED`, default `false`. The rollout order is:
+
+1. Deploy the migration and packed-aware server binary to every replica with the gate off.
+2. Verify no older API replica remains. Database fences protect existing packed tables, but the gate
+   prevents creation while the fleet is mixed.
+3. Set `HOGLAKE_PACKED_MERGETREE_ENABLED=true` on every replica that can receive table-creation
+   requests and complete that rollout.
+4. Only then create packed tables and start packed writers.
+
+Turning the gate off again prevents new packed tables; it does not make existing packed tables
+unreadable or change their immutable format.
+
 Packed tables are append-only, unpartitioned, unsorted, and fixed-schema. They admit only the
 scalar types covered by the Python `ClickHousePackedAdapter`: boolean, signed and unsigned integers,
 float, double, string, binary, date, and timestamp variants, within the configured ClickHouse
-version's `Date32` and `DateTime64` value ranges. Column add, drop, rename, promotion,
-partition or sort changes, truncate, and deletion-vector commits are refused. Drop remains valid.
+version's `Date32` and `DateTime64` value ranges. Column add, drop, rename, promotion, column-comment
+changes, partition or sort changes, truncate, and deletion-vector commits are refused. Table comments,
+unrelated table properties, table rename, and drop remain valid.
 The Python adapter exports only a part directory containing exactly `data.packed`; projections and
 ClickHouse metadata that escape that file are outside this format.
 

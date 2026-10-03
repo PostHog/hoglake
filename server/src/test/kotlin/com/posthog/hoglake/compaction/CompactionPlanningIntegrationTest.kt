@@ -45,7 +45,7 @@ import java.util.concurrent.atomic.AtomicInteger
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class CompactionPlanningIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
-    private val catalogs = CatalogService(db.jdbi)
+    private val catalogs = CatalogService(db.jdbi, packedMergeTreeEnabled = true)
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
     private val counter = AtomicInteger(0)

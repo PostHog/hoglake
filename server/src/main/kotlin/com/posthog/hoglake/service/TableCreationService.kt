@@ -93,7 +93,7 @@ class TableCreationService(
                 // the forest prepare refused.
                 TableMetadata.validateComment(definition.comment)
                 TableMetadata.validateProperties(definition.properties)
-                TableMetadata.validateDefinitionForFormat(
+                catalogs.validateTableFormatDefinition(
                     definition.properties,
                     definition.columns,
                     definition.partitionFields,

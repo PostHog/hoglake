@@ -82,7 +82,7 @@ class App private constructor(
      */
     val requestDispatcher = RequestDispatcher(cfg.requestThreads)
 
-    private val catalogService = CatalogService(jdbi)
+    private val catalogService = CatalogService(jdbi, cfg.packedMergeTreeEnabled)
     private val commitService =
         CommitService(
             jdbi,

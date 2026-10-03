@@ -40,7 +40,15 @@ class ApiIntegrationTest {
     // the probe no longer borrows from the request pool, so the fixture
     // has to say which database it should reach. Without it the probe
     // would dial Config's localhost:5432 default and report 503.
-    private val app = App.build(Config(hydratorIntervalMs = 0, jdbcUrl = db.jdbcUrl), db.jdbi)
+    private val app =
+        App.build(
+            Config(
+                hydratorIntervalMs = 0,
+                jdbcUrl = db.jdbcUrl,
+                packedMergeTreeEnabled = true,
+            ),
+            db.jdbi,
+        )
     private val json = ObjectMapper()
 
     @AfterAll
@@ -153,6 +161,13 @@ class ApiIntegrationTest {
                 )
             assertThat(alter.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             assertThat(body(alter)["detail"].asText()).contains("fixed schema")
+            val commentAlter =
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces/analytics/tables/events/alter",
+                    """{"ops":[{"op":"set_column_comment","name":"id","comment":"identifier"}]}""",
+                )
+            assertThat(commentAlter.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(body(commentAlter)["detail"].asText()).contains("SetColumnComment")
             val tableUuid = body(created)["table_uuid"].asText()
             val truncate =
                 client.post(

@@ -54,7 +54,10 @@ import java.util.UUID
  * Reads honor the versioned-row rule: visible at S iff
  * begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
-class CatalogService(private val jdbi: Jdbi) {
+class CatalogService(
+    private val jdbi: Jdbi,
+    private val packedMergeTreeEnabled: Boolean = false,
+) {
     companion object {
         /**
          * Ceiling on a catalog's `data_path`.
@@ -307,7 +310,7 @@ class CatalogService(private val jdbi: Jdbi) {
     ): TableInfo {
         TableMetadata.validateComment(comment)
         TableMetadata.validateProperties(properties)
-        TableMetadata.validateDefinitionForFormat(properties, columns, partitionFields, sortFields)
+        validateTableFormatDefinition(properties, columns, partitionFields, sortFields)
         validateTableDefinition(name, columns)
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
@@ -403,6 +406,22 @@ class CatalogService(private val jdbi: Jdbi) {
             fileSizeBytes = 0,
             snapshotId = alloc.snapshotId,
         )
+    }
+
+    internal fun validateTableFormatDefinition(
+        properties: Map<String, String>,
+        columns: List<ColumnDef>,
+        partitionFields: List<PartitionFieldDef>,
+        sortFields: List<SortFieldDef>,
+    ) {
+        if (FileFormats.isPacked(properties) && !packedMergeTreeEnabled) {
+            throw HoglakeException.Validation(
+                "packed MergeTree table creation is disabled; enable " +
+                    "HOGLAKE_PACKED_MERGETREE_ENABLED only after every server replica " +
+                    "supports the packed format contract",
+            )
+        }
+        TableMetadata.validateDefinitionForFormat(properties, columns, partitionFields, sortFields)
     }
 
     internal fun validateTableDefinition(

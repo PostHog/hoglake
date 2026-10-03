@@ -44,4 +44,44 @@ class CatalogApiIntegrationTest {
             }
         }
     }
+
+    @Test
+    fun `packed table creation is disabled by default with typed validation`() {
+        PgTestSupport.freshDatabase().use { db ->
+            App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0), db.jdbi).use { app ->
+                testApplication {
+                    application { app.module(this) }
+                    assertThat(
+                        client.post("/v1/catalogs") {
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"rollout","data_path":"s3://bucket/rollout/"}""")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.Created)
+                    assertThat(
+                        client.post("/v1/catalogs/rollout/namespaces") {
+                            contentType(ContentType.Application.Json)
+                            setBody("""{"name":"main"}""")
+                        }.status,
+                    ).isEqualTo(HttpStatusCode.Created)
+                    val refused =
+                        client.post("/v1/catalogs/rollout/namespaces/main/tables") {
+                            contentType(ContentType.Application.Json)
+                            setBody(
+                                """
+                                {"name":"packed",
+                                 "properties":{"write.format.default":"clickhouse-mergetree-packed"},
+                                 "columns":[{"name":"id","type":"long"}]}
+                                """,
+                            )
+                        }
+                    assertThat(refused.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                    val error = ObjectMapper().readTree(refused.bodyAsText())
+                    assertThat(error["error"].asText()).isEqualTo("validation")
+                    assertThat(error["detail"].asText()).contains("HOGLAKE_PACKED_MERGETREE_ENABLED")
+                    assertThat(client.get("/v1/catalogs/rollout/namespaces/main/tables").bodyAsText())
+                        .isEqualTo("[]")
+                }
+            }
+        }
+    }
 }

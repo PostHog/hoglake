@@ -110,7 +110,8 @@ for s in catalog.snapshots(before=head + 1):
 ## Packed MergeTree adapter
 
 `ClickHousePackedAdapter` is the explicit writer and reader for tables created with
-`write.format.default=clickhouse-mergetree-packed`:
+`write.format.default=clickhouse-mergetree-packed`. The server must first complete the rollout
+sequence in `server/README.md` and enable `HOGLAKE_PACKED_MERGETREE_ENABLED=true`:
 
 ```python
 import pyarrow as pa

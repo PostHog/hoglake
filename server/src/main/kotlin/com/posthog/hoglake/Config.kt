@@ -14,6 +14,15 @@ data class Config(
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
     val dbPoolSize: Int = env("HOGLAKE_DB_POOL_SIZE", "10").toInt(),
     /**
+     * Rollout gate for creating `clickhouse-mergetree-packed` tables.
+     *
+     * Default false. Enable only after every server replica runs the packed
+     * format contract; database fences keep old replicas from mutating an
+     * existing packed table, but creation stays opt-in so rollout order is an
+     * explicit operator decision.
+     */
+    val packedMergeTreeEnabled: Boolean = boolEnv("HOGLAKE_PACKED_MERGETREE_ENABLED", false),
+    /**
      * How many threads serve blocking route handlers (#218).
      *
      * Every handler's JDBC and object-store work runs on this bounded
