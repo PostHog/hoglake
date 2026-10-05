@@ -33,8 +33,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # This direct job supplies the existing required check for Python-only changes.
-  test:
+  # Combine all Python checks, including the live client suites.
+  python-checks:
     if: always()
     needs: [pyhoglake, check]
     runs-on: ubuntu-latest
