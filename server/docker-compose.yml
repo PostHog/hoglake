@@ -65,6 +65,7 @@ services:
     image: hoglake-server:dev
     environment:
       HOGLAKE_INSTANCE_NAME: dev-compose
+      HOGLAKE_UI_THEME: ${HOGLAKE_UI_THEME:-}
       HOGLAKE_JDBC_URL: jdbc:postgresql://postgres:5432/hoglake
       HOGLAKE_DB_USER: hoglake
       HOGLAKE_DB_PASSWORD: hoglake
@@ -95,6 +96,13 @@ services:
       HOGLAKE_RETIREMENT_BATCH: ${HOGLAKE_RETIREMENT_BATCH:-8000}
       HOGLAKE_RETIREMENT_PAUSE_MS: ${HOGLAKE_RETIREMENT_PAUSE_MS:-750}
       HOGLAKE_RETIREMENT_RUN_BUDGET_MS: ${HOGLAKE_RETIREMENT_RUN_BUDGET_MS:-60000}
+      # The daily reindex check (#268), off by default like retirement and
+      # for the same reason (no POST trigger; this env is the way to drive
+      # it). It is the POLL interval: the run is due once a day at 03:00
+      # UTC, so on a stack with no reindex row yet it runs on the first
+      # poll after 03:00 UTC:
+      #   HOGLAKE_REINDEX_INTERVAL_MS=10000 just up
+      HOGLAKE_REINDEX_INTERVAL_MS: ${HOGLAKE_REINDEX_INTERVAL_MS:-0}
       HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS: ${HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS:-1000}
       HOGLAKE_MAINTENANCE_SUMMARY_BATCH: ${HOGLAKE_MAINTENANCE_SUMMARY_BATCH:-10000}
       # 1 s, not production's 60: the dev stack's catalog is tiny, so a

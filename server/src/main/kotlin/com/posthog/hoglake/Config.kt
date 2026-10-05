@@ -9,6 +9,8 @@ data class Config(
      * Empty = unnamed.
      */
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
+    /** Color theme for the webui. Empty keeps the default palette. */
+    val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
     val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),
@@ -633,6 +635,26 @@ data class Config(
             "$DEFAULT_RETIREMENT_QUEUE_CEILING",
         ).toLong(),
     /**
+     * How often the reindex loop POLLS whether the day's run is due; <= 0
+     * disables it. Default **0 — OFF**, retirement's position and for the
+     * same reason: the task belongs to ONE workload, and the chart turns
+     * it on for the maintenance Deployment alone.
+     *
+     * NOT the cadence. The run itself is once a day at
+     * `ReindexService.RUN_AT_UTC` (03:00 UTC, hardcoded for now), gated
+     * on the run ledger so a restart does not repeat it and a pod that
+     * was down at 03:00 catches up on its first poll that day. This knob
+     * only bounds how late after 03:00 (or after a restart) the run
+     * starts; 300000 (five minutes) is plenty, and a poll costs two
+     * index descents on the ledger.
+     *
+     * What a run does: estimates every hog_* btree index's bloat from
+     * pg_stats and rebuilds at most ONE, the largest over threshold,
+     * with `REINDEX INDEX CONCURRENTLY` on its own connection — see
+     * `ReindexService` for the guards and the bounds.
+     */
+    val reindexIntervalMs: Long = env("HOGLAKE_REINDEX_INTERVAL_MS", "0").toLong(),
+    /**
      * Catalog-health gauge sample interval; <= 0 disables the sampler
      * loop.
      *
@@ -1193,6 +1215,11 @@ data class Config(
         // what `CleanupService`'s clamp to a single worker bounds.
         val compactionDraw = if (compactionIntervalMs > 0) compactionParallelGroups else 0
         val cleanupDraw = if (cleanupIntervalMs > 0) cleanupWorkers else 0
+        // The reindex loop holds ONE pooled connection for a rebuild's
+        // whole duration (up to `ReindexService.REINDEX_STATEMENT_TIMEOUT`,
+        // an hour), and the session lock that keeps it single-flight lives
+        // on that connection — so it is priced like a cleanup worker.
+        val reindexDraw = if (reindexIntervalMs > 0) 1 else 0
         val loopState =
             if (cleanupIntervalMs > 0) {
                 "the cleanup loop is ON, HOGLAKE_CLEANUP_INTERVAL_MS=$cleanupIntervalMs"
@@ -1204,13 +1231,14 @@ data class Config(
                     "priced draw is 0) and one above the priced draw on a maintenance pod, which " +
                     "serves no ingress and is reachable only by port-forward"
             }
-        require(compactionDraw + cleanupDraw <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
-            "a compaction draw of $compactionDraw " +
+        require(compactionDraw + cleanupDraw + reindexDraw <= dbPoolSize - FOREGROUND_CONNECTION_RESERVE) {
+            "a reindex draw of $reindexDraw (HOGLAKE_REINDEX_INTERVAL_MS=$reindexIntervalMs: a " +
+                "rebuild holds one connection for up to an hour) plus a compaction draw of $compactionDraw " +
                 "(HOGLAKE_COMPACTION_PARALLEL_GROUPS=$compactionParallelGroups, " +
                 "HOGLAKE_COMPACTION_INTERVAL_MS=$compactionIntervalMs) plus a cleanup draw of " +
                 "$cleanupDraw ($loopState; HOGLAKE_CLEANUP_WORKERS=$cleanupWorkers) needs a " +
                 "database pool of at least " +
-                "${compactionDraw + cleanupDraw + FOREGROUND_CONNECTION_RESERVE} " +
+                "${reindexDraw + compactionDraw + cleanupDraw + FOREGROUND_CONNECTION_RESERVE} " +
                 "(HOGLAKE_DB_POOL_SIZE is $dbPoolSize): a compaction group holds a pooled " +
                 "connection across its commit-lock wait and a cleanup worker holds one across its " +
                 "reference check (19 s cold per 1,000 paths on gigahog-prod-us), so the two draw " +
@@ -1230,8 +1258,9 @@ data class Config(
     companion object {
         /**
          * Pooled connections the background loops that hold one for a
-         * long statement — HOGLAKE_COMPACTION_PARALLEL_GROUPS and
-         * HOGLAKE_CLEANUP_WORKERS, checked TOGETHER — must leave for
+         * long statement — HOGLAKE_COMPACTION_PARALLEL_GROUPS,
+         * HOGLAKE_CLEANUP_WORKERS and the reindex loop's one rebuild
+         * connection, checked TOGETHER — must leave for
          * everything else. See the `require` above: a floor, not a model
          * of demand.
          */

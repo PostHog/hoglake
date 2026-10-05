@@ -1,0 +1,607 @@
+/* Palettes adapted from iTerm2-Color-Schemes (MIT).
+   Source: https://github.com/mbadolato/iTerm2-Color-Schemes
+   Revision: 31756e77934045c66b28f59463ddb2870606d7ca
+   License: /third-party/iTerm2-Color-Schemes-LICENSE.txt
+   Surfaces and muted text are blends of the source background and text.
+   Text and semantic colors are adjusted for at least 4.5:1 contrast.
+   Themes without a light source use a tinted white background. */
+
+/* 3024 Night / 3024 Day */
+
+:root[data-color-theme="3024"]:not([data-theme="light"]) {
+  --bg: #090300;
+  --bg-raised: #0e0906;
+  --bg-hover: #140e0b;
+  --border: #2e2927;
+  --text: #a5a2a2;
+  --text-dim: #807c7b;
+  --accent: #01a0e4;
+  --ok: #01a252;
+  --warn: #fded02;
+  --bad: #df463b;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="3024"][data-theme="light"] {
+  --bg: #f7f7f7;
+  --bg-raised: #f1f1f1;
+  --bg-hover: #ebebea;
+  --border: #cdcccc;
+  --text: #4a4543;
+  --text-dim: #6b6867;
+  --accent: #0170a0;
+  --ok: #01783d;
+  --warn: #726b01;
+  --bad: #c7291d;
+  --accent-contrast: #ffffff;
+}
+
+/* Ayu / Ayu Light */
+
+:root[data-color-theme="ayu"]:not([data-theme="light"]) {
+  --bg: #0b0e14;
+  --bg-raised: #11141a;
+  --bg-hover: #181a1f;
+  --border: #36383b;
+  --text: #bfbdb6;
+  --text-dim: #898885;
+  --accent: #f9af4f;
+  --ok: #7fd962;
+  --warn: #f9af4f;
+  --bad: #ea6c73;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="ayu"][data-theme="light"] {
+  --bg: #f8f9fa;
+  --bg-raised: #f3f4f5;
+  --bg-hover: #edeef0;
+  --border: #d3d5d6;
+  --text: #5c6166;
+  --text-dim: #686b6e;
+  --accent: #896227;
+  --ok: #43762a;
+  --warn: #896227;
+  --bad: #a84e4e;
+  --accent-contrast: #ffffff;
+}
+
+/* Catppuccin Mocha / Catppuccin Latte */
+
+:root[data-color-theme="catppuccin"]:not([data-theme="light"]) {
+  --bg: #1e1e2e;
+  --bg-raised: #242435;
+  --bg-hover: #2a2b3c;
+  --border: #484a5e;
+  --text: #cdd6f4;
+  --text-dim: #989fb9;
+  --accent: #f5c2e7;
+  --ok: #a6e3a1;
+  --warn: #f9e2af;
+  --bad: #f38ba8;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="catppuccin"][data-theme="light"] {
+  --bg: #eff1f5;
+  --bg-raised: #e9ebf0;
+  --bg-hover: #e4e6eb;
+  --border: #c8cad3;
+  --text: #4c4f69;
+  --text-dim: #636574;
+  --accent: #964c82;
+  --ok: #2e731f;
+  --warn: #8c5912;
+  --bad: #c60e36;
+  --accent-contrast: #ffffff;
+}
+
+/* Dracula / adapted light */
+
+:root[data-color-theme="dracula"]:not([data-theme="light"]) {
+  --bg: #282a36;
+  --bg-raised: #2f313d;
+  --bg-hover: #373843;
+  --border: #5a5b63;
+  --text: #f8f8f2;
+  --text-dim: #bababa;
+  --accent: #bd93f9;
+  --ok: #50fa7b;
+  --warn: #f1fa8c;
+  --bad: #ff7c7c;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="dracula"][data-theme="light"] {
+  --bg: #fcfaff;
+  --bg-raised: #f5f3f8;
+  --bg-hover: #edebf1;
+  --border: #c9c8cf;
+  --text: #282a36;
+  --text-dim: #686872;
+  --accent: #775d9d;
+  --ok: #26783b;
+  --warn: #686c3c;
+  --bad: #ba3e3e;
+  --accent-contrast: #ffffff;
+}
+
+/* Everforest Dark Med / Everforest Light Med */
+
+:root[data-color-theme="everforest"]:not([data-theme="light"]) {
+  --bg: #232a2e;
+  --bg-raised: #292f32;
+  --bg-hover: #2f3537;
+  --border: #4d4f4c;
+  --text: #d3c6aa;
+  --text-dim: #a49d8c;
+  --accent: #a7c080;
+  --ok: #a7c080;
+  --warn: #dbbc7f;
+  --bad: #e68183;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="everforest"][data-theme="light"] {
+  --bg: #efebd4;
+  --bg-raised: #eae6d1;
+  --bg-hover: #e5e2cd;
+  --border: #ccccbc;
+  --text: #57656c;
+  --text-dim: #5e6463;
+  --accent: #596644;
+  --ok: #596644;
+  --warn: #706041;
+  --bad: #904e50;
+  --accent-contrast: #ffffff;
+}
+
+/* GitHub Dark Default / GitHub Light Default */
+
+:root[data-color-theme="github"]:not([data-theme="light"]) {
+  --bg: #0d1117;
+  --bg-raised: #15191f;
+  --bg-hover: #1c2026;
+  --border: #41464c;
+  --text: #e6edf3;
+  --text-dim: #a5abb1;
+  --accent: #58a6ff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --bad: #ff7b72;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="github"][data-theme="light"] {
+  --bg: #ffffff;
+  --bg-raised: #f7f7f7;
+  --bg-hover: #eff0f0;
+  --border: #c9cacb;
+  --text: #1f2328;
+  --text-dim: #626569;
+  --accent: #0968d8;
+  --ok: #116329;
+  --warn: #4d2d00;
+  --bad: #cf222e;
+  --accent-contrast: #ffffff;
+}
+
+/* Gruvbox Dark / Gruvbox Light */
+
+:root[data-color-theme="gruvbox"]:not([data-theme="light"]) {
+  --bg: #282828;
+  --bg-raised: #2f2e2d;
+  --bg-hover: #363532;
+  --border: #575349;
+  --text: #ebdbb2;
+  --text-dim: #b0a589;
+  --accent: #d79921;
+  --ok: #a5a538;
+  --warn: #d79921;
+  --bad: #e38783;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="gruvbox"][data-theme="light"] {
+  --bg: #fbf1c7;
+  --bg-raised: #f4ebc2;
+  --bg-hover: #eee4bd;
+  --border: #cdc5a4;
+  --text: #3c3836;
+  --text-dim: #686457;
+  --accent: #835d14;
+  --ok: #676712;
+  --warn: #835d14;
+  --bad: #c0221c;
+  --accent-contrast: #ffffff;
+}
+
+/* Iceberg Dark / Iceberg Light */
+
+:root[data-color-theme="iceberg"]:not([data-theme="light"]) {
+  --bg: #161821;
+  --bg-raised: #1c1e27;
+  --bg-hover: #22242d;
+  --border: #40424b;
+  --text: #c6c8d1;
+  --text-dim: #91939c;
+  --accent: #84a0c6;
+  --ok: #b4be82;
+  --warn: #e2a478;
+  --bad: #e27878;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="iceberg"][data-theme="light"] {
+  --bg: #e8e9ec;
+  --bg-raised: #e2e3e6;
+  --bg-hover: #dbdde1;
+  --border: #bdbec6;
+  --text: #33374c;
+  --text-dim: #5c5f6d;
+  --accent: #2d539e;
+  --ok: #4a682d;
+  --warn: #8c5228;
+  --bad: #9f3f5f;
+  --accent-contrast: #ffffff;
+}
+
+/* Kanagawa Wave / Kanagawa Lotus */
+
+:root[data-color-theme="kanagawa"]:not([data-theme="light"]) {
+  --bg: #1f1f28;
+  --bg-raised: #26252d;
+  --bg-hover: #2c2c32;
+  --border: #4c4b4b;
+  --text: #dcd7ba;
+  --text-dim: #a3a08e;
+  --accent: #a08cbf;
+  --ok: #819d76;
+  --warn: #c0a36e;
+  --bad: #d67b7d;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="kanagawa"][data-theme="light"] {
+  --bg: #f2ecbc;
+  --bg-raised: #ece7b9;
+  --bg-hover: #e7e1b6;
+  --border: #ccc8a7;
+  --text: #545464;
+  --text-dim: #62625e;
+  --accent: #934b63;
+  --ok: #54683b;
+  --warn: #686236;
+  --bad: #ac3747;
+  --accent-contrast: #ffffff;
+}
+
+/* Monokai Pro / Monokai Pro Light */
+
+:root[data-color-theme="monokai"]:not([data-theme="light"]) {
+  --bg: #2d2a2e;
+  --bg-raised: #343135;
+  --bg-hover: #3b393c;
+  --border: #5f5c5f;
+  --text: #fcfcfa;
+  --text-dim: #bebdbd;
+  --accent: #fc9867;
+  --ok: #a9dc76;
+  --warn: #ffd866;
+  --bad: #ff799a;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="monokai"][data-theme="light"] {
+  --bg: #faf4f2;
+  --bg-raised: #f3edeb;
+  --bg-hover: #ebe5e4;
+  --border: #c8c2c2;
+  --text: #29242a;
+  --text-dim: #686266;
+  --accent: #a94826;
+  --ok: #1c744e;
+  --warn: #935807;
+  --bad: #b2385c;
+  --accent-contrast: #ffffff;
+}
+
+/* Night Owl / Light Owl */
+
+:root[data-color-theme="night-owl"]:not([data-theme="light"]) {
+  --bg: #011627;
+  --bg-raised: #081d2e;
+  --bg-hover: #102435;
+  --border: #344656;
+  --text: #d6deeb;
+  --text-dim: #96a2b0;
+  --accent: #21c7a8;
+  --ok: #22da6e;
+  --warn: #addb67;
+  --bad: #ef5654;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="night-owl"][data-theme="light"] {
+  --bg: #fbfbfb;
+  --bg-raised: #f4f4f5;
+  --bg-hover: #eeeeef;
+  --border: #ceced3;
+  --text: #403f53;
+  --text-dim: #6a6975;
+  --accent: #1f766f;
+  --ok: #077a59;
+  --warn: #846701;
+  --bad: #c33634;
+  --accent-contrast: #ffffff;
+}
+
+/* Nord / Nord Light */
+
+:root[data-color-theme="nord"]:not([data-theme="light"]) {
+  --bg: #2e3440;
+  --bg-raised: #343a46;
+  --bg-hover: #3a404c;
+  --border: #575d69;
+  --text: #d8dee9;
+  --text-dim: #a7adb7;
+  --accent: #88c0d0;
+  --ok: #a3be8c;
+  --warn: #ebcb8b;
+  --bad: #d89fa4;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="nord"][data-theme="light"] {
+  --bg: #e5e9f0;
+  --bg-raised: #dfe3eb;
+  --bg-hover: #dadee5;
+  --border: #bec2cc;
+  --text: #414858;
+  --text-dim: #5b606b;
+  --accent: #47646c;
+  --ok: #56654a;
+  --warn: #6e5f41;
+  --bad: #924a51;
+  --accent-contrast: #ffffff;
+}
+
+/* Oceanic Next / adapted light */
+
+:root[data-color-theme="oceanic-next"]:not([data-theme="light"]) {
+  --bg: #1b2b34;
+  --bg-raised: #213039;
+  --bg-hover: #27363f;
+  --border: #435059;
+  --text: #c1c5cd;
+  --text-dim: #979ea6;
+  --accent: #74b1b2;
+  --ok: #a2c699;
+  --warn: #f2ca73;
+  --bad: #e18386;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="oceanic-next"][data-theme="light"] {
+  --bg: #f9fbfc;
+  --bg-raised: #f1f4f5;
+  --bg-hover: #e9ecee;
+  --border: #c4c9cc;
+  --text: #1b2b34;
+  --text-dim: #5e6970;
+  --accent: #497070;
+  --ok: #596d54;
+  --warn: #7b673b;
+  --bad: #a44e50;
+  --accent-contrast: #ffffff;
+}
+
+/* Atom One Dark / Atom One Light */
+
+:root[data-color-theme="one"]:not([data-theme="light"]) {
+  --bg: #21252b;
+  --bg-raised: #262a30;
+  --bg-hover: #2b2f35;
+  --border: #42474f;
+  --text: #abb2bf;
+  --text-dim: #9499a2;
+  --accent: #61afef;
+  --ok: #98c379;
+  --warn: #e5c07b;
+  --bad: #e27880;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="one"][data-theme="light"] {
+  --bg: #f9f9f9;
+  --bg-raised: #f2f2f2;
+  --bg-hover: #ebebeb;
+  --border: #c7c8c9;
+  --text: #2a2c33;
+  --text-dim: #67696d;
+  --accent: #2f59f1;
+  --ok: #32772e;
+  --warn: #766645;
+  --bad: #bf352e;
+  --accent-contrast: #ffffff;
+}
+
+/* Rose Pine / Rose Pine Dawn */
+
+:root[data-color-theme="rose-pine"]:not([data-theme="light"]) {
+  --bg: #191724;
+  --bg-raised: #201e2b;
+  --bg-hover: #272533;
+  --border: #494756;
+  --text: #e0def4;
+  --text-dim: #a4a2b6;
+  --accent: #ebbcba;
+  --ok: #6497ab;
+  --warn: #f6c177;
+  --bad: #eb6f92;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="rose-pine"][data-theme="light"] {
+  --bg: #faf4ed;
+  --bg-raised: #f4eee9;
+  --bg-hover: #efe9e5;
+  --border: #d3cdd1;
+  --text: #575279;
+  --text-dim: #6a667a;
+  --accent: #925856;
+  --ok: #286983;
+  --warn: #8c5e1f;
+  --bad: #975366;
+  --accent-contrast: #ffffff;
+}
+
+/* Snazzy / adapted light */
+
+:root[data-color-theme="snazzy"]:not([data-theme="light"]) {
+  --bg: #1e1f29;
+  --bg-raised: #252630;
+  --bg-hover: #2c2d36;
+  --border: #4f5056;
+  --text: #ebece6;
+  --text-dim: #aeaead;
+  --accent: #fc55b8;
+  --ok: #50fb7c;
+  --warn: #f0fb8c;
+  --bad: #fd6365;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="snazzy"][data-theme="light"] {
+  --bg: #fff7fc;
+  --bg-raised: #f7eff5;
+  --bg-hover: #efe8ed;
+  --border: #c9c3c9;
+  --text: #1e1f29;
+  --text-dim: #626068;
+  --accent: #b33680;
+  --ok: #26763a;
+  --warn: #676c3c;
+  --bad: #c03335;
+  --accent-contrast: #ffffff;
+}
+
+/* iTerm2 Solarized Dark / iTerm2 Solarized Light */
+
+:root[data-color-theme="solarized"]:not([data-theme="light"]) {
+  --bg: #002b36;
+  --bg-raised: #052f39;
+  --bg-hover: #09323d;
+  --border: #1f444d;
+  --text: #89999b;
+  --text-dim: #889a9d;
+  --accent: #35a69d;
+  --ok: #8c9f0f;
+  --warn: #ba9112;
+  --bad: #e77472;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="solarized"][data-theme="light"] {
+  --bg: #fdf6e3;
+  --bg-raised: #f8f2e0;
+  --bg-hover: #f2eddc;
+  --border: #d9d8cc;
+  --text: #5a6d75;
+  --text-dim: #626b6b;
+  --accent: #1f766f;
+  --ok: #627100;
+  --warn: #836300;
+  --bad: #c22d2a;
+  --accent-contrast: #ffffff;
+}
+
+/* Synthwave / adapted light */
+
+:root[data-color-theme="synthwave"]:not([data-theme="light"]) {
+  --bg: #000000;
+  --bg-raised: #080807;
+  --bg-hover: #0f0f0e;
+  --border: #343430;
+  --text: #dad9c7;
+  --text-dim: #99988b;
+  --accent: #f6188f;
+  --ok: #1ebb2b;
+  --warn: #fdf834;
+  --bad: #f6188f;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="synthwave"][data-theme="light"] {
+  --bg: #fff5fa;
+  --bg-raised: #f7eef3;
+  --bg-hover: #f0e6ec;
+  --border: #cac2c9;
+  --text: #24212c;
+  --text-dim: #66616a;
+  --accent: #c51372;
+  --ok: #13781c;
+  --warn: #6a6816;
+  --bad: #c51372;
+  --accent-contrast: #ffffff;
+}
+
+/* TokyoNight Night / TokyoNight Day */
+
+:root[data-color-theme="tokyo-night"]:not([data-theme="light"]) {
+  --bg: #1a1b26;
+  --bg-raised: #20212d;
+  --bg-hover: #262734;
+  --border: #424558;
+  --text: #c0caf5;
+  --text-dim: #8e95b7;
+  --accent: #bb9af7;
+  --ok: #9ece6a;
+  --warn: #e0af68;
+  --bad: #f7768e;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="tokyo-night"][data-theme="light"] {
+  --bg: #e1e2e7;
+  --bg-raised: #dbdde6;
+  --bg-hover: #d5d9e4;
+  --border: #b8c3dd;
+  --text: #3359b2;
+  --text-dim: #495d8c;
+  --accent: #7541ba;
+  --ok: #4c6531;
+  --warn: #725832;
+  --bad: #af1e49;
+  --accent-contrast: #ffffff;
+}
+
+/* Tomorrow Night / Tomorrow */
+
+:root[data-color-theme="tomorrow"]:not([data-theme="light"]) {
+  --bg: #1d1f21;
+  --bg-raised: #232527;
+  --bg-hover: #292b2d;
+  --border: #454849;
+  --text: #c5c8c6;
+  --text-dim: #939594;
+  --accent: #81a2be;
+  --ok: #b5bd68;
+  --warn: #f0c674;
+  --bad: #d37a7a;
+  --accent-contrast: #000000;
+}
+
+:root[data-color-theme="tomorrow"][data-theme="light"] {
+  --bg: #ffffff;
+  --bg-raised: #f9f9f9;
+  --bg-hover: #f3f3f2;
+  --border: #d4d4d4;
+  --text: #4d4d4c;
+  --text-dim: #6d6d6d;
+  --accent: #416fab;
+  --ok: #5f7600;
+  --warn: #886a00;
+  --bad: #c82829;
+  --accent-contrast: #ffffff;
+}

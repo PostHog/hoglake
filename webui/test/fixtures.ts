@@ -806,6 +806,38 @@ export const maintenanceStatusFixture: MaintenanceStatus = {
         records_every_sweep: true,
       },
     },
+    {
+      // The daily run, on the maintenance workload like retirement: the
+      // API pod's own POLL interval is 0, and the ledger shows one run a
+      // day. Instance-wide, so this row is on every catalog.
+      task: "reindex",
+      loop_interval_ms: "0",
+      last_run: {
+        run_id: "97",
+        catalog: "analytics",
+        task: "reindex",
+        trigger: "loop",
+        started_at: "2026-09-11T03:00:12Z",
+        finished_at: "2026-09-11T03:07:40.000Z",
+        status: "ok",
+        result: {
+          checked: "67",
+          over_threshold: "3",
+          index: "hog_data_file_path",
+          table: "hog_data_file",
+          before_bytes: "15891378176",
+          after_bytes: "644245094",
+          duration_ms: "447000",
+          invalid_dropped: "0",
+        },
+      },
+      backlog: {},
+      loop: {
+        observed_interval_ms: "86400000",
+        last_run_at: "2026-09-11T03:00:12Z",
+        records_every_sweep: true,
+      },
+    },
   ],
 };
 
@@ -815,7 +847,7 @@ export const maintenanceRunPageFixture: MaintenanceRunPage = {
 };
 
 /**
- * The central page's rollup: analytics (with its five tasks) plus a second,
+ * The central page's rollup: analytics (with its six tasks) plus a second,
  * quieter catalog that has never run anything.
  */
 export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
@@ -872,6 +904,12 @@ export const instanceMaintenanceStatusFixture: InstanceMaintenanceStatus = {
           // OLDER-SERVER one): retirement has a loop, this catalog has
           // simply never had an eligible drop for it to run on.
           task: "retirement",
+          last_run: null,
+          backlog: {},
+          loop: { records_every_sweep: true },
+        },
+        {
+          task: "reindex",
           last_run: null,
           backlog: {},
           loop: { records_every_sweep: true },

@@ -844,3 +844,96 @@ describe("RunsTable paging under the filters", () => {
     } finally { client.clear(); }
   });
 });
+
+describe("reindex runs", () => {
+  const base = {
+    run_id: "500",
+    catalog: "analytics",
+    task: "reindex",
+    trigger: "loop",
+    started_at: "2026-10-05T03:00:00Z",
+    finished_at: "2026-10-05T03:07:00Z",
+    status: "ok",
+  } as const;
+  const noop = {
+    ...base,
+    result: { checked: "17", over_threshold: "0", invalid_dropped: "0" },
+  } as MaintenanceRun;
+  const rebuilt = {
+    ...base,
+    result: {
+      checked: "67",
+      over_threshold: "3",
+      index: "hog_data_file_path",
+      table: "hog_data_file",
+      before_bytes: "15891378176",
+      after_bytes: "644245094",
+      duration_ms: "447000",
+      invalid_dropped: "0",
+    },
+  } as MaintenanceRun;
+  const skipped = {
+    ...base,
+    result: {
+      checked: "67",
+      over_threshold: "2",
+      skipped_reason: "retirement_pending",
+      invalid_dropped: "0",
+    },
+  } as MaintenanceRun;
+
+  it("calls the daily check that found nothing quiet, and every other shape loud", () => {
+    expect(isQuietRun(noop)).toBe(true);
+    expect(isQuietRun(rebuilt)).toBe(false);
+    expect(isQuietRun(skipped)).toBe(false);
+    expect(isQuietRun(withField(noop, "invalid_dropped", "1"))).toBe(false);
+    // A skip with no reason recorded (a skewed build) still counted work.
+    expect(isQuietRun(withField(noop, "over_threshold", "1"))).toBe(false);
+    // A skip that fired with nothing over threshold (another REINDEX was
+    // running, so leftovers were left alone) is still loud.
+    expect(isQuietRun(withField(noop, "skipped_reason", "reindex_in_progress"))).toBe(false);
+    expect(isQuietRun({ ...noop, result: null } as MaintenanceRun)).toBe(false);
+    expect(isQuietRun({ ...noop, status: "failed", error: "x" } as MaintenanceRun)).toBe(false);
+  });
+
+  it("renders a rebuild as the index and its sizes", () => {
+    render(<RunSummary run={rebuilt} />);
+    expect(screen.getByText("hog_data_file_path 14.8 GiB→614 MiB")).toBeInTheDocument();
+    expect(screen.getByText("3 over threshold of 67")).toBeInTheDocument();
+  });
+
+  it("names the excluded index and its expected size on a too_large skip", () => {
+    render(
+      <RunSummary
+        run={withField(
+          withField(withField(skipped, "skipped_reason", "too_large"), "index", "hog_file_column_stats_pkey"),
+          "expected_bytes",
+          "16106127360",
+        )}
+      />,
+    );
+    expect(
+      screen.getByText("skipped: too_large (hog_file_column_stats_pkey, 15.0 GiB expected)"),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a skip by its reason", () => {
+    render(<RunSummary run={skipped} />);
+    expect(screen.getByText("skipped: retirement_pending")).toBeInTheDocument();
+  });
+
+  it("renders a no-op as nothing over threshold, with the count it checked", () => {
+    render(<RunSummary run={noop} />);
+    expect(screen.getByText("nothing over threshold (17 checked)")).toBeInTheDocument();
+  });
+
+  it("badges a dropped failed-rebuild leftover", () => {
+    render(<RunSummary run={withField(noop, "invalid_dropped", "1")} />);
+    expect(screen.getByText(/dropped 1 failed-rebuild leftover$/)).toBeInTheDocument();
+  });
+
+  it("is a task the runs table can filter on", async () => {
+    const { RUN_TASK_FILTERS } = await import("../src/components/maintenance");
+    expect(RUN_TASK_FILTERS).toContain("reindex");
+  });
+});

@@ -1026,9 +1026,15 @@ class RetirementService(
          * pruned on a stricter predicate retires a series the loop is
          * still working, and one pruned on a looser predicate keeps a
          * series for a table the loop will never reach. It is bound to
-         * `t`/`c` (the candidate query's aliases) and to `:catalogId`.
+         * `t`/`c` (the candidate query's aliases) only; the catalog filter
+         * is each statement's own.
+         *
+         * `internal` for a THIRD reader with the same need not to
+         * disagree: `ReindexService`'s `retirement_pending` guard asks
+         * "is there retirement work anywhere", and an index rebuilt while
+         * this loop still has rows to delete is rebuilt for nothing.
          */
-        private const val ELIGIBLE_PREDICATE: String =
+        internal const val ELIGIBLE_PREDICATE: String =
             """t.dropped_snapshot IS NOT NULL
               AND t.dropped_snapshot <= c.earliest_snapshot_id
               AND EXISTS (

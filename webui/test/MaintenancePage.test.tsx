@@ -64,7 +64,19 @@ describe("MaintenancePage", () => {
       expect.stringContaining("cleanup"),
       expect.stringContaining("compaction"),
       expect.stringContaining("retirement"),
+      // Appended after retirement, for the same reason.
+      expect.stringContaining("reindex"),
     ]);
+
+    // Reindex: the ledger's DAILY cadence, not the pod's poll interval
+    // ("0" here), and a pointer to where its numbers live.
+    const reindex = screen
+      .getByRole("heading", { name: /reindex/ })
+      .closest(".task-panel")!;
+    expect(within(reindex as HTMLElement).getByText("every ~24h")).toBeInTheDocument();
+    expect(
+      within(reindex as HTMLElement).getByRole("link", { name: "database page" }),
+    ).toHaveAttribute("href", "/database");
 
     // Panels by their heading (the runs table repeats task names in cells).
     const hydrator = screen

@@ -428,6 +428,43 @@ class DatabaseHealthFindingsTest {
     }
 
     /**
+     * `index_bloat`: the finding takes the list ALREADY filtered by the
+     * reindex task's own predicate, so what it can get wrong is firing on
+     * an empty list or saying nothing useful about a full one.
+     */
+    @Test
+    fun `over-threshold indexes are reported with their excess, and none is silent`() {
+        val bloated =
+            listOf(
+                com.posthog.hoglake.model.IndexBloatEstimate(
+                    "hog_file_column_stats",
+                    "hog_file_column_stats_pkey",
+                    sizeBytes = 26L shl 30,
+                    expectedBytes = 2L shl 30,
+                    constraintBacking = true,
+                ),
+                com.posthog.hoglake.model.IndexBloatEstimate(
+                    "hog_data_file",
+                    "hog_data_file_path",
+                    sizeBytes = 6L shl 30,
+                    expectedBytes = 1L shl 30,
+                    constraintBacking = false,
+                ),
+            )
+        val finding =
+            service.findings(server(), activity(), listOf(table()), listOf(index()), bloatedIndexes = bloated)
+                .single { it.code == "index_bloat" }
+        assertThat(finding.severity).isEqualTo(FindingSeverity.WARN)
+        assertThat(finding.title).contains("2 index(es)").contains("29.0 GiB")
+        // Worst first, so the index tomorrow's run rebuilds leads the line.
+        assertThat(finding.detail.indexOf("hog_file_column_stats_pkey"))
+            .isLessThan(finding.detail.indexOf("hog_data_file_path"))
+        assertThat(finding.hoglakeImpact).contains("03:00 UTC").contains("HOGLAKE_REINDEX_INTERVAL_MS")
+        // MUTATION: invert the isNotEmpty() guard and the healthy baseline reds.
+        assertThat(codes()).doesNotContain("index_bloat")
+    }
+
+    /**
      * The `toast_dominant` finding, which exists because #240 was
      * invisible for a year: `hog_commit_receipt` was 58.2 GiB of which
      * 58.1 GiB was TOAST, and the console's tables list carried

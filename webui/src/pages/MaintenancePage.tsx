@@ -162,6 +162,18 @@ function Backlog({
           anything. The runs below are what this task did.
         </p>
       );
+    case "reindex":
+      // No numbers either: index bloat belongs to the DATABASE, so its
+      // numbers live on the database page, and this panel says where.
+      return (
+        <p className="empty">
+          Once a day at 03:00 UTC, estimates every catalog index&rsquo;s bloat
+          and rebuilds at most one — the largest over threshold — with REINDEX
+          INDEX CONCURRENTLY. The run covers the whole database, so every
+          catalog shows the same runs. Per-index estimates are on the{" "}
+          <Link to="/database">database page</Link>.
+        </p>
+      );
   }
 }
 
