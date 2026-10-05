@@ -6,6 +6,7 @@ import { jsonResponse, mockFetch, renderApp } from "./helpers";
 
 beforeEach(() => {
   window.localStorage.clear();
+  document.cookie = "hoglake-color-theme=; path=/; max-age=0";
   delete document.documentElement.dataset.theme;
   delete document.documentElement.dataset.colorTheme;
 });
@@ -39,6 +40,51 @@ describe("instance color theme", () => {
     renderApp("/");
     await screen.findByText("test-instance");
     expect(document.documentElement.dataset.colorTheme).toBeUndefined();
+  });
+
+  it("lets a browser cookie override the instance palette", async () => {
+    document.cookie = "hoglake-color-theme=gruvbox; path=/";
+    instance("catppuccin");
+    renderApp("/");
+    // Applied before /v1/info answers, and kept once it does.
+    expect(document.documentElement.dataset.colorTheme).toBe("gruvbox");
+    await screen.findByText("test-instance");
+    expect(document.documentElement.dataset.colorTheme).toBe("gruvbox");
+  });
+
+  it("falls back to the instance palette for a cookie that names no theme", async () => {
+    document.cookie = "hoglake-color-theme=default; path=/";
+    instance("catppuccin");
+    renderApp("/");
+    await screen.findByText("test-instance");
+    expect(document.documentElement.dataset.colorTheme).toBe("catppuccin");
+  });
+
+  it("picks a palette for this browser from the top bar and previews it at once", async () => {
+    instance("catppuccin");
+    renderApp("/");
+    await waitFor(() => expect(document.documentElement.dataset.colorTheme).toBe("catppuccin"));
+    const picker = screen.getByRole("combobox", { name: "Color theme" });
+    expect(picker).toHaveValue("");
+    expect(screen.getByRole("option", { name: "instance (catppuccin)" })).toBeInTheDocument();
+    const user = userEvent.setup();
+    await user.selectOptions(picker, "gruvbox");
+    expect(document.documentElement.dataset.colorTheme).toBe("gruvbox");
+    expect(document.cookie).toContain("hoglake-color-theme=gruvbox");
+    // Back to the instance's choice: the cookie goes with it.
+    await user.selectOptions(picker, "");
+    expect(document.documentElement.dataset.colorTheme).toBe("catppuccin");
+    expect(document.cookie).not.toContain("hoglake-color-theme=");
+  });
+
+  it("shows the cookie's palette as the picker's current value and names an unthemed instance as default", async () => {
+    document.cookie = "hoglake-color-theme=nord; path=/";
+    instance(undefined);
+    renderApp("/");
+    await screen.findByText("test-instance");
+    expect(screen.getByRole("combobox", { name: "Color theme" })).toHaveValue("nord");
+    expect(screen.getByRole("option", { name: "instance (default)" })).toBeInTheDocument();
+    expect(document.documentElement.dataset.colorTheme).toBe("nord");
   });
 
   it("uses default colors if instance information fails", async () => {

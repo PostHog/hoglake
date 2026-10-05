@@ -6,8 +6,12 @@ import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
 import {
   applyColorTheme,
   applyTheme,
+  COLOR_THEMES,
+  cookieColorTheme,
   initialTheme,
+  persistColorTheme,
   persistTheme,
+  resolveColorTheme,
   type Theme,
 } from "../lib/theme";
 
@@ -38,6 +42,51 @@ function ThemeToggle() {
   );
 }
 
+/**
+ * Per-browser palette override, persisted in the `hoglake-color-theme`
+ * cookie. Applies on every change rather than on commit, so arrowing
+ * through the list previews each palette live; "instance" clears the
+ * cookie and returns to the server's `ui_theme` (named in the option when
+ * the instance has one).
+ */
+function ColorThemePicker() {
+  const { data } = useQuery({
+    queryKey: ["instance-info"],
+    queryFn: getInstanceInfo,
+    staleTime: Infinity,
+    retry: false,
+  });
+  const instanceTheme = data?.ui_theme?.trim().toLowerCase();
+  const [override, setOverride] = useState<string>(() => {
+    const cookie = cookieColorTheme()?.trim().toLowerCase();
+    return COLOR_THEMES.some((t) => t === cookie) ? (cookie as string) : "";
+  });
+  const choose = (value: string) => {
+    setOverride(value);
+    persistColorTheme(value || undefined);
+    applyColorTheme(resolveColorTheme(data?.ui_theme));
+  };
+  const instanceLabel = COLOR_THEMES.some((t) => t === instanceTheme)
+    ? `instance (${instanceTheme})`
+    : "instance (default)";
+  return (
+    <select
+      className="color-theme-picker"
+      value={override}
+      onChange={(e) => choose(e.target.value)}
+      title="Color theme for this browser"
+      aria-label="Color theme"
+    >
+      <option value="">{instanceLabel}</option>
+      {COLOR_THEMES.map((name) => (
+        <option key={name} value={name}>
+          {name}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 function useInstanceAppearance() {
   // Shares the fetch-once ["instance-info"] key with the badges below, so
   // naming the tab costs no extra request.
@@ -48,7 +97,9 @@ function useInstanceAppearance() {
     retry: false,
   });
   const name = data?.name;
-  useEffect(() => applyColorTheme(data?.ui_theme), [data?.ui_theme]);
+  // Runs once before /v1/info answers (cookie only) and again with the
+  // instance's choice; the cookie overrides it either way.
+  useEffect(() => applyColorTheme(resolveColorTheme(data?.ui_theme)), [data?.ui_theme]);
   useEffect(() => {
     // The instance name leads: browser tabs truncate from the RIGHT, and
     // when several hoglake consoles are open the discriminator is the
@@ -227,6 +278,7 @@ export function Layout() {
             openapi.yaml
           </a>
           <ThemeToggle />
+          <ColorThemePicker />
           <HealthIndicator />
         </div>
       </header>
