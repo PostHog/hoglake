@@ -39,6 +39,8 @@ class MaintenanceStatusService(
      * would contradict. Making it required means the compiler asks.
      */
     private val retirementIntervalMs: Long,
+    /** Required for retirement's reason: a default would let App forget to wire it. */
+    private val reindexIntervalMs: Long,
     private val smallFileThresholdBytes: Long,
     private val minInputFiles: Int = CompactionGrouping.DEFAULT_MIN_INPUT_FILES,
     private val maxInputFiles: Int = CompactionGrouping.DEFAULT_MAX_INPUT_FILES,
@@ -211,6 +213,18 @@ class MaintenanceStatusService(
                         // path may never do.
                         MaintenanceBacklog.RetirementBacklog,
                         loop(MaintenanceTask.RETIREMENT),
+                    ),
+                    // Appended, for the reason above. The run is
+                    // instance-wide and recorded against every catalog,
+                    // so every catalog's panel shows the same last run.
+                    // `loop_interval_ms` is the POLL, not the daily
+                    // cadence; `loop` (the ledger) reads ~24 h.
+                    MaintenanceTaskStatus(
+                        MaintenanceTask.REINDEX,
+                        reindexIntervalMs,
+                        runs[MaintenanceTask.REINDEX],
+                        MaintenanceBacklog.ReindexBacklog,
+                        loop(MaintenanceTask.REINDEX),
                     ),
                 ),
         )

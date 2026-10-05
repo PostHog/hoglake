@@ -1034,6 +1034,10 @@ paths:
         horizon and the connection budget are shared by every catalog in
         the database. Reads catalog and pg_stat_* relations only — never
         a hog_* table — so the cost does not scale with the manifest.
+        That includes the per-index bloat estimate
+        (indexes[].estimated_bloat_*), which is the pg_stats arithmetic
+        the reindex task decides on, and refreshes the
+        hoglake_index_bloat_bytes{table,index} gauge as a side effect.
         Carries NO query text: pg_stat_activity.query holds literal
         values (object paths, identifiers, author strings), so only
         durations and counts cross the wire.
@@ -1134,7 +1138,9 @@ paths:
         queue); compaction -> small_files (ACTIONABLE debt: small files
         the planner would put in a group, trailing remainders included,
         before applying the per-run budget), target_bytes;
-        retirement -> none (empty object).
+        retirement -> none (empty object); reindex -> none (empty
+        object: bloat belongs to the database, and GET /database/health
+        reports it).
       parameters:
         - { $ref: "#/components/parameters/catalog" }
       responses:
@@ -4853,9 +4859,128 @@ components:
             Nonzero is the loop pacing itself, not failing: there is no
             cursor to lose, so the next run simply continues.
 
+    ReindexResult:
+      type: object
+      required: [checked, over_threshold, invalid_dropped]
+      description: >
+        One run of the daily index-bloat check (#268): every valid btree
+        index on a hog_* table is estimated from pg_stats (the
+        check_postgres / ioguix arithmetic, no extension), and at most
+        ONE — the largest estimated excess among those over threshold
+        (ratio >= 3.0 on an index of at least 8 MiB, or >= 1 GiB of
+        excess at a ratio of at least 1.5) — is rebuilt with REINDEX INDEX CONCURRENTLY, on its own
+        connection, outside every commit lock. Primary-key and unique
+        indexes are eligible (PG >= 12 rebuilds them in place); on equal
+        excess a non-constraint index goes first.
+
+
+        The run is due once a day at 03:00 UTC, gated on this ledger: a
+        restart does not repeat it, a pod down at 03:00 runs on its first
+        poll that day. The excess rule also needs a ratio of 1.5 (a
+        random-key btree settles at ~1.35 on its own), and a candidate is
+        excluded when it would rebuild to more than 16 GiB or its newest
+        attempt failed; the next candidate goes instead. The loop (HOGLAKE_REINDEX_INTERVAL_MS, default 0 =
+        off, the POLL interval) runs on one maintenance workload; there
+        is no POST trigger. Because the run is instance-wide and the
+        ledger is per-catalog, the same payload is recorded once per
+        catalog.
+
+
+        Null fields are ABSENT. A run that rebuilt nothing carries only
+        the three counters; a failed run (status failed) carries the
+        attempted index and before_bytes, no after_bytes.
+      properties:
+        checked:
+          type: integer
+          format: int64
+          description: Valid btree indexes on hog_* tables the estimate covered.
+        over_threshold:
+          type: integer
+          format: int64
+          description: >
+            Indexes over the threshold, counted before the guards, so a
+            skipped run still says how much is waiting.
+        index:
+          type: string
+          description: >
+            The index rebuilt, whose rebuild failed, or — with
+            skipped_reason too_large / last_attempt_failed — the excluded
+            index that would have gone first. Absent otherwise.
+        table:
+          type: string
+          description: The named index's table.
+        expected_bytes:
+          type: integer
+          format: int64
+          description: >
+            The named index's estimated freshly-built size; present
+            whenever `index` is. Rebuilds are capped at 16 GiB of it
+            (too_large).
+        before_bytes:
+          type: integer
+          format: int64
+          description: pg_relation_size of the index immediately before the rebuild.
+        after_bytes:
+          type: integer
+          format: int64
+          description: pg_relation_size after it. Absent on a failed rebuild.
+        duration_ms:
+          type: integer
+          format: int64
+          description: Wall clock of the REINDEX statement alone.
+        skipped_reason:
+          type: string
+          enum: [retirement_pending, purge_pending, migration_pending, reindex_in_progress,
+                 reindex_lock_held, too_large, last_attempt_failed]
+          description: >
+            Why nothing was rebuilt although the run happened. Absent
+            when no guard fired. retirement_pending: some catalog has a
+            dropped table whose rows retirement may delete now (it is
+            what creates the bloat). purge_pending: some catalog's latest
+            expiry run left purge_remaining at its cap, or truncated with
+            the count unknown (routine lag does not count).
+            migration_pending: a replica holds the migration lock, or
+            Flyway's history has a failed row. reindex_in_progress: any
+            index build is running in this database.
+            reindex_lock_held: another session holds this task's own
+            single-flight lock (a second pod, or the orphaned backend of a
+            pod killed mid-rebuild); today's rebuild is that one, so the
+            day is closed. too_large: every candidate
+            is excluded and the first would rebuild to more than 16 GiB
+            (expected_bytes) — run it by hand, off-peak.
+            last_attempt_failed: every candidate is excluded and the first
+            failed its newest rebuild attempt (excluded until that row
+            leaves the ledger or a human rebuilds it).
+            migration_pending and reindex_in_progress do not close the
+            day: the next poll retries until 06:00 UTC.
+        post_step_error:
+          type: string
+          description: >
+            Present when the REINDEX succeeded but reading it back (the
+            post-rebuild estimate, pg_relation_size) failed: the row stays
+            ok — the rebuild happened, and a failed row would exclude the
+            index the next day — with after_bytes absent.
+        excluded:
+          type: integer
+          format: int64
+          description: >
+            On a run that rebuilt (or attempted) an index: candidates over
+            threshold it passed over as too large or last-attempt-failed.
+            Without it an over-cap index never reaches the ledger while a
+            smaller candidate keeps being rebuilt.
+        invalid_dropped:
+          type: integer
+          format: int64
+          description: >
+            Invalid *_ccnew / *_ccold indexes (the leftover of a failed
+            REINDEX CONCURRENTLY) dropped before the run. Each was
+            maintained on every write and read by nothing. Not dropped
+            while another REINDEX or a migration is in flight, since its
+            own build copy is exactly such an index.
+
     MaintenanceTask:
       type: string
-      enum: [hydrator, expiry, cleanup, compaction, verify, retirement]
+      enum: [hydrator, expiry, cleanup, compaction, verify, retirement, reindex]
       description: >
         The maintenance-task vocabulary of hog_maintenance_run. `verify`
         is HISTORICAL: #261 removed the subsystem, nothing writes such a
@@ -4863,7 +4988,8 @@ components:
         MaintenanceStatus.tasks — but the ledger still holds and serves
         its rows until they age out of
         HOGLAKE_MAINTENANCE_LEDGER_RETENTION_SECONDS, so a client must
-        still accept the value.
+        still accept the value. `reindex` is INSTANCE-WIDE: one run is
+        recorded once per catalog (see ReindexResult).
 
     MaintenanceRun:
       type: object
@@ -4901,8 +5027,10 @@ components:
             ExpiryResult for expiry, CleanupResult for cleanup,
             CompactionResult for compaction, RetirementResult for
             retirement (which has no trigger endpoint: the loop is its
-            only driver), and VerifyReport for the historical `verify`
-            rows still inside the ledger's retention window.
+            only driver), ReindexResult for reindex (the same payload
+            on every catalog's row of one run), and VerifyReport for the
+            historical `verify` rows still inside the ledger's retention
+            window.
             Hydrator loop rows carry the sweep's per-catalog counts
             (claimed, hydrated, failed, transient); manual hydrator rows
             carry RehydrateResult.
@@ -4947,8 +5075,9 @@ components:
           description: >
             Whether every sweep of this task records a run, which is how
             a reader must interpret SILENCE here. True (expiry, cleanup,
-            compaction, retirement): no runs means no loop is running
-            the task. False (hydrator, and the historical `verify`): the
+            compaction, retirement, reindex — whose loop polls but
+            records only the daily run, so its observed interval is
+            ~24 h): no runs means no loop is running the task. False (hydrator, and the historical `verify`): the
             hydrator's sweep is instance-wide and records only for the
             catalogs it claimed files for, so no runs means no work
             arrived for this catalog and says nothing about whether the
@@ -5004,6 +5133,9 @@ components:
             different question (one dropped 3M-row table and forty
             dropped empty ones would read identically). Its run ledger's
             rows_retired and tables_remaining are the numbers to watch.
+            reindex -> none: index bloat is a property of the database,
+            reported by GET /database/health (indexes[].estimated_bloat_*
+            and the index_bloat finding).
 
     DatabaseHealth:
       type: object
@@ -5176,6 +5308,26 @@ components:
             Backs a unique or primary-key constraint, so it is doing a
             job whether or not it is ever scanned and must not be
             reported as droppable.
+        estimated_bloat_bytes:
+          type: integer
+          format: int64
+          description: >
+            Estimated bytes beyond a freshly built copy of this index,
+            from pg_stats (the reindex task's estimate; as fresh as the
+            table's last VACUUM/ANALYZE). Absent when no estimate can be
+            made: not a btree, a key column never analyzed, an index
+            never vacuumed. Under-reports on deduplicated low-cardinality
+            indexes, never over.
+        estimated_bloat_ratio:
+          type: number
+          format: double
+          description: >
+            Estimated actual / freshly-built size (1.0 = no bloat). The
+            reindex task rebuilds at >= 3.0 on an index of at least
+            8 MiB, or at >= 1 GiB of estimated_bloat_bytes with a ratio
+            of at least 1.5; the
+            index_bloat finding fires on the same predicate. Absent under
+            the same conditions as estimated_bloat_bytes.
 
     DatabaseFinding:
       type: object

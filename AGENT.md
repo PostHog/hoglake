@@ -966,7 +966,7 @@ ran on the local stack and what it showed.
   (`api/RequestDispatchIntegrationTest`), and any future change to
   request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, retirement, metrics sampler)
+  expiry, cleanup, compaction, retirement, reindex, metrics sampler)
   registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
@@ -1131,6 +1131,99 @@ ran on the local stack and what it showed.
     expiry's below-floor sweep — but a dropped table's rows sit in
     `hog_data_file` until it runs, which is what V19's partial index and
     the gauges' `hog_table` join both exist to survive.
+  - **Reindex** (`MaintenanceTask.REINDEX`, loop `reindex`,
+    `ReindexService`, #268) is the daily index-bloat check: autovacuum
+    never shrinks an index, and on this schema bloat arrives in steps
+    (the 13.9M-row prod-us retirement left `hog_data_file` with 14.8 GB of
+    indexes over 1.48M rows). It estimates every valid btree index on a
+    hog_* table from `pg_stats` (the check_postgres / ioguix arithmetic,
+    `ReindexService.ESTIMATE_SQL`: catalog reads only) and rebuilds at
+    most ONE — the largest estimated excess over threshold — with
+    `REINDEX INDEX CONCURRENTLY`, on its own connection, under NO commit
+    lock, with that session's `statement_timeout` raised to an hour and
+    restored after. Threshold: ratio >= 3.0 on an index of at least 8 MiB,
+    or >= 1 GiB of excess at a ratio of at least 1.5 (a random-key btree
+    sits at ~1.35 on its own). Constraint-backing indexes are eligible
+    (PG >= 12 rebuilds them in place); on equal excess a non-constraint
+    one goes first. EXCLUDED, with the next candidate going instead: an
+    index expected to rebuild past 16 GiB (`MAX_REBUILD_EXPECTED_BYTES`;
+    `too_large` — a concurrent rebuild writes ~0.9x its size in WAL and
+    ~1x in temp files while the old copy still exists, so ~3x its size in
+    transient disk: `hog_file_column_stats_pkey` at ~15 GB expected is
+    admitted and needs ~45 GB of headroom that night; anything larger is
+    an operator's off-peak job) and one whose newest attempt failed
+    (`last_attempt_failed`). With every candidate excluded the row names
+    the first, with `expected_bytes`. TWO CONSEQUENCES, stated so nobody
+    infers them: a failed attempt is RETRIED once its row leaves the 7-day
+    ledger, so an index that reliably times out costs its rebuild —
+    ~3x its expected size in transient disk (~45 GB for the stats pkey)
+    and up to an hour of I/O — every week until a human looks; and an
+    over-cap index is NOT NAMED in the ledger while a smaller candidate is
+    over threshold — rows that rebuilt something carry `excluded` (how many
+    candidates were passed over), and the health page's `index_bloat`
+    finding names them. A rebuild that succeeded but whose read-back
+    failed stays an `ok` row with `post_step_error` and no `after_bytes`. Every number above is a constant, not a knob, and so is the
+    schedule: **due once a day at 03:00 UTC** (`RUN_AT_UTC`; configurable
+    later). `HOGLAKE_REINDEX_INTERVAL_MS` (**0 = off**) is only the POLL;
+    the chart turns it on for the maintenance Deployment alone, and its
+    one rebuild connection is priced in the pool budget. The gate
+    reads the LEDGER (newest `reindex` row's `started_at`), so a restart
+    does not repeat the day's run and a pod down at 03:00 runs on its
+    first poll that day; a `migration_pending` / `reindex_in_progress`
+    row does not close the day before 06:00 UTC (`RETRY_UNTIL_UTC`). GUARDS, each a `skipped_reason`:
+    `reindex_in_progress` (ANY index build in this database in
+    `pg_stat_progress_create_index` — not filtered on `command`, which is
+    NULL to a non-superuser for another role's backend),
+    `reindex_lock_held` (the instance-wide single-flight lock
+    `Locks.REINDEX_LOCK_CLASS` held by another session — this task's own
+    rebuild, so it closes the day rather than retrying), `migration_pending` (the migration advisory lock held, or a
+    failed Flyway history row) — both checked BEFORE invalid `*_ccnew` /
+    `*_ccold` leftovers of a failed rebuild are dropped, because an
+    in-flight build's copy is exactly such an index — then
+    `retirement_pending` (`RetirementService.ELIGIBLE_PREDICATE`
+    anywhere) and `purge_pending` (any catalog's latest expiry row has
+    `purge_remaining` at `ExpiryService.PURGE_REMAINING_CAP`, or is
+    truncated with the count unknown — routine lag is not a mass delete), which would re-bloat the index tomorrow and
+    are asked only when something IS over threshold, so a quiet day
+    stays a quiet row through a week-long retirement. A
+    failed REINDEX is a `failed` row carrying the attempt, never retried
+    in-run, and drops its own `_ccnew` at once (one cancelled in
+    validation is ready for writes). READING THE
+    LEDGER ROW: the run is instance-wide and the ledger per-catalog, so
+    one run is the SAME row on every catalog
+    (`MaintenanceRunStore.recordedAllCatalogs`, V25 adds the task to the
+    CHECK). `checked` / `over_threshold` / `invalid_dropped` are always
+    there; `index`, `table`, `before_bytes`, `after_bytes`, `duration_ms`
+    appear when a rebuild was attempted, `skipped_reason` when a guard
+    fired; a row with only the three counters and zeros is the quiet
+    steady state. `GET /v1/database/health` carries the same estimate
+    (`indexes[].estimated_bloat_bytes` / `_ratio`, finding
+    `index_bloat`), and `hoglake_index_bloat_bytes{table,index}` is the
+    gauge — published only by the pod running the loop (daily run plus
+    every metrics tick there), never by an API pod serving the health
+    page, so the series does not flap between pods. The estimate is as fresh as the table's last VACUUM/ANALYZE
+    and under-reports deduplicated indexes — `hog_data_file_changefeed` /
+    `_live` read ~0.17 fresh, so their bloat shows ~6x low and the ratio
+    rule needs ~18x real bloat there; it never over-reports for a missing
+    `pg_stats` row or a never-vacuumed index (no estimate instead). What a rebuild costs:
+    two heap passes of its table, its size in WAL, one pooled connection
+    for the duration, a held snapshot per phase (the health page's
+    `long_transaction` finding will name it while it runs), and no
+    autovacuum on that table until it ends (it cancels a running one). A
+    pod killed mid-rebuild leaves the backend running it with the session
+    lock; the killed run writes no row and the next poll records
+    `reindex_lock_held`, which closes the day (the orphan IS today's
+    rebuild).
+    DEPLOY NOTE: do not promote a release with a migration while a
+    rebuild runs (03:00 UTC onward, up to an hour). An `ALTER TABLE` on
+    the table being rebuilt hits its 5 s `lock_timeout` and the pod
+    crash-loops until the rebuild ends; a `CREATE INDEX CONCURRENTLY`
+    waits out the rebuild's snapshot and dies on the 120 s
+    `MIGRATION_LOCK_WAIT`. Check first:
+    `SELECT pid, command, phase, relid::regclass FROM
+    pg_stat_progress_create_index WHERE datid = (SELECT oid FROM
+    pg_database WHERE datname = current_database());` — `Database.migrate`
+    logs the same rows at WARN before Flyway runs.
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only
   through the integrating session; agents report needed changes rather

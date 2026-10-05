@@ -181,6 +181,14 @@ data class DatabaseIndex(
      * that breaks the schema.
      */
     val constraintBacking: Boolean,
+    /**
+     * Estimated bytes beyond a freshly built index (`ReindexService`'s
+     * pg_stats estimate); null when the estimate cannot be made — not a
+     * btree, a column never analyzed, an index never vacuumed.
+     */
+    val estimatedBloatBytes: Long? = null,
+    /** Estimated actual / freshly-built size; null under the same conditions. */
+    val estimatedBloatRatio: Double? = null,
 )
 
 enum class FindingSeverity { INFO, WARN, CRITICAL }

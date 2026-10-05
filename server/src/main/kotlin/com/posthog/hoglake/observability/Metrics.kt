@@ -499,6 +499,14 @@ object Metrics {
      */
     fun multipartAbortFailed() = increment("hoglake_multipart_abort_failures_total", 1.0)
 
+    /**
+     * hoglake_reindex_gauge_refresh_failures_total — metrics ticks whose
+     * `hoglake_index_bloat_bytes` refresh threw. Its own counter, not the
+     * metrics loop's: the refresh rides that loop's tick on the reindex pod
+     * but must neither fail it nor be skipped by its failure.
+     */
+    fun reindexGaugeRefreshFailure() = increment("hoglake_reindex_gauge_refresh_failures_total", 1.0)
+
     /** hoglake_background_loop_failures_total{loop} — iterations that threw (loop continued). */
     fun backgroundLoopFailure(loop: String) = increment("hoglake_background_loop_failures_total", 1.0, "loop", loop)
 

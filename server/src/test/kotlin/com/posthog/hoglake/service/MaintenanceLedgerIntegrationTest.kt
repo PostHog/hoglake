@@ -530,6 +530,7 @@ class MaintenanceLedgerIntegrationTest {
             // retirement moved from index 5 to 4 and the positional
             // reads below moved with it.
             MaintenanceTask.RETIREMENT,
+            MaintenanceTask.REINDEX,
         )
 
         val hydrator = status.tasks[0]
@@ -559,6 +560,11 @@ class MaintenanceLedgerIntegrationTest {
         assertThat(retirement.loopIntervalMs).isZero()
         assertThat(retirement.lastRun).isNull()
         assertThat(retirement.backlog).isEqualTo(MaintenanceBacklog.RetirementBacklog)
+
+        val reindex = status.tasks[5]
+        assertThat(reindex.loopIntervalMs).isZero()
+        assertThat(reindex.lastRun).isNull()
+        assertThat(reindex.backlog).isEqualTo(MaintenanceBacklog.ReindexBacklog)
         assertThat(status.tasks.map { it.task })
             .describedAs("#261 removed verify from the task list")
             .doesNotContain(MaintenanceTask.VERIFY)
@@ -729,6 +735,7 @@ class MaintenanceLedgerIntegrationTest {
             cleanupIntervalMs = 60_000,
             compactionIntervalMs = 0,
             retirementIntervalMs = 0,
+            reindexIntervalMs = 0,
             smallFileThresholdBytes = 512L * 1024 * 1024,
         )
 

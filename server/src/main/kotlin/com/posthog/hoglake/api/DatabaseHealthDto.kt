@@ -100,6 +100,9 @@ data class DatabaseIndexDto(
     val sizeBytes: Long,
     val scans: Long,
     val constraintBacking: Boolean,
+    /** Absent when the estimate cannot be made (see DatabaseIndex). */
+    val estimatedBloatBytes: Long?,
+    val estimatedBloatRatio: Double?,
 )
 
 data class DatabaseFindingDto(
@@ -198,6 +201,8 @@ fun DatabaseIndex.toDto() =
         sizeBytes = sizeBytes,
         scans = scans,
         constraintBacking = constraintBacking,
+        estimatedBloatBytes = estimatedBloatBytes,
+        estimatedBloatRatio = estimatedBloatRatio,
     )
 
 fun DatabaseFinding.toDto() =

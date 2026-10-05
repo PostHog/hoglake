@@ -39,6 +39,15 @@ object Locks {
     const val CATALOG_COMPACTION_PLAN_LOCK_CLASS: Int = 4740873
 
     /**
+     * Discriminator for the INSTANCE-WIDE reindex lock (#268): the low 32
+     * bits are always 0, because an index belongs to the database, not
+     * to a catalog. SESSION-scoped, held by the connection that issues
+     * the REINDEX for the whole run, so a second maintainer configured by
+     * mistake skips rather than rebuilds the same index beside it.
+     */
+    const val REINDEX_LOCK_CLASS: Int = 4740874
+
+    /**
      * Take the session lock inside a short transaction with a bounded wait.
      * The caller must release it on this handle after all plan claims commit.
      * A session lock permits packing outside a transaction.
@@ -200,6 +209,24 @@ object Locks {
             .bind(0, catalogId)
             .mapTo(Boolean::class.javaObjectType)
             .one()
+
+    /**
+     * Try to take the instance-wide reindex lock on [handle]'s SESSION;
+     * false at once when another maintainer holds it. The caller holds
+     * [handle] for the run and releases through [releaseReindexLock] in a
+     * `finally`; a killed pod's lock dies with its connection.
+     */
+    fun tryAcquireReindexLock(handle: Handle): Boolean =
+        handle.createQuery("SELECT pg_try_advisory_lock($REINDEX_LOCK_CLASS::bigint << 32)")
+            .mapTo(Boolean::class.javaObjectType)
+            .one()
+
+    /** Release what [tryAcquireReindexLock] took, on the same session. */
+    fun releaseReindexLock(handle: Handle) {
+        handle.createQuery("SELECT pg_advisory_unlock($REINDEX_LOCK_CLASS::bigint << 32)")
+            .mapTo(Boolean::class.javaObjectType)
+            .one()
+    }
 
     /** Release what [tryAcquireCatalogRetirementLock] took, on the same session. */
     fun releaseCatalogRetirementLock(
