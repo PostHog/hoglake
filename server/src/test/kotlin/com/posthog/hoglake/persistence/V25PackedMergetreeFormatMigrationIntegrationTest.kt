@@ -83,81 +83,31 @@ class V25PackedMergetreeFormatMigrationIntegrationTest {
                     catalogId,
                 )
 
-                h.execute(
-                    """
-                    INSERT INTO hog_upload
-                        (catalog_id, upload_id, owner, prefix, path, file_kind, file_format)
-                    VALUES (?, '00000000-0000-4000-8000-000000000001',
-                            '00000000-0000-4000-8000-000000000002', 's3://b/v25',
-                            's3://b/v25/trino-upload/claimed.packed', 'data',
-                            'clickhouse-mergetree-packed')
-                    """,
-                    catalogId,
-                )
                 assertThatThrownBy {
-                    h.execute(
+                    h.createUpdate(
                         """
-                        INSERT INTO hog_data_file
-                            (catalog_id, data_file_id, table_id, begin_snapshot, path,
-                             record_count, file_size_bytes, row_id_start)
-                        VALUES (?, 20, 1, 0,
-                                's3://b/v25/trino-upload/claimed.packed', 1, 10, 20)
+                        INSERT INTO hog_table
+                            (catalog_id, table_id, created_snapshot, file_format)
+                        VALUES (:catalog, 3, 0, 'orc')
                         """,
-                        catalogId,
                     )
+                        .bind("catalog", catalogId)
+                        .execute()
                 }.isInstanceOf(UnableToExecuteStatementException::class.java)
 
-                data class InvalidFile(val id: Long, val tableId: Long, val format: String, val path: String)
-                for ((id, tableId, format, path) in listOf(
-                    InvalidFile(3, 1, "clickhouse-mergetree-packed", "s3://b/v25/mixed.packed"),
-                    InvalidFile(4, 2, "parquet", "s3://b/v25/mixed.parquet"),
-                    InvalidFile(5, 1, "orc", "s3://b/v25/c.orc"),
-                )) {
-                    assertThatThrownBy {
-                        h.createUpdate(
-                            """
-                            INSERT INTO hog_data_file
-                                (catalog_id, data_file_id, table_id, begin_snapshot, path, file_format,
-                                 record_count, file_size_bytes, row_id_start)
-                            VALUES (:catalog, :id, :table, 0, :path, :format, 1, 10, :id)
-                            """,
-                        )
-                            .bind("catalog", catalogId)
-                            .bind("id", id)
-                            .bind("table", tableId)
-                            .bind("path", path)
-                            .bind("format", format)
-                            .execute()
-                    }.isInstanceOf(UnableToExecuteStatementException::class.java)
-                }
-                val forbiddenMutations =
-                    listOf(
-                        "UPDATE hog_column SET end_snapshot = 1 WHERE catalog_id = $catalogId AND table_id = 2",
-                        "INSERT INTO hog_partition_spec (catalog_id, table_id, spec_id, begin_snapshot) " +
-                            "VALUES ($catalogId, 2, 1, 1)",
-                        "UPDATE hog_data_file SET end_snapshot = 1 " +
-                            "WHERE catalog_id = $catalogId AND data_file_id = 2",
-                        "INSERT INTO hog_delete_file " +
-                            "(catalog_id, delete_file_id, table_id, data_file_id, begin_snapshot, path, " +
-                            "delete_count, file_size_bytes) VALUES " +
-                            "($catalogId, 10, 2, 2, 1, 's3://b/v25/dv.puffin', 1, 10)",
-                        "UPDATE hog_table_version SET properties = '{}'::jsonb " +
-                            "WHERE catalog_id = $catalogId AND table_id = 2 AND end_snapshot IS NULL",
+                assertThatThrownBy {
+                    h.createUpdate(
+                        """
+                        INSERT INTO hog_data_file
+                            (catalog_id, data_file_id, table_id, begin_snapshot, path, file_format,
+                             record_count, file_size_bytes, row_id_start)
+                        VALUES (:catalog, 3, 1, 0, 's3://b/v25/invalid.orc', 'orc', 1, 10, 3)
+                        """,
                     )
-                forbiddenMutations.forEach { sql ->
-                    assertThatThrownBy { h.execute(sql) }
-                        .isInstanceOf(UnableToExecuteStatementException::class.java)
-                }
-                h.execute(
-                    "UPDATE hog_table SET dropped_snapshot = 2 WHERE catalog_id = ? AND table_id = 2",
-                    catalogId,
-                )
-                assertThat(
-                    h.execute(
-                        "UPDATE hog_column SET end_snapshot = 2 WHERE catalog_id = ? AND table_id = 2",
-                        catalogId,
-                    ),
-                ).isEqualTo(1)
+                        .bind("catalog", catalogId)
+                        .execute()
+                }.isInstanceOf(UnableToExecuteStatementException::class.java)
+
                 assertThat(
                     h.createQuery(
                         """

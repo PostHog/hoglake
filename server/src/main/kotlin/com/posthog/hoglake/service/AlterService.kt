@@ -93,7 +93,7 @@ class AlterService(private val jdbi: Jdbi) {
                     TableMetadata.validateProperties(it.properties)
                     TableMetadata.requireFormatUnchanged(t.properties, it.properties)
                 }
-                if (com.posthog.hoglake.model.FileFormats.isPacked(t.properties)) {
+                if (t.fileFormat == com.posthog.hoglake.model.FileFormats.CLICKHOUSE_MERGETREE_PACKED) {
                     val unsupported =
                         ops.firstOrNull {
                             it is AlterOp.AddColumn || it is AlterOp.DropColumn ||

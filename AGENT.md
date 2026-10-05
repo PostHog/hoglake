@@ -421,6 +421,24 @@ there would break that gate on every build.
     therefore put the subclass arm FIRST — `ErrorMapping`,
     `Metrics.commitFailureResult` and `Audit.failureOutcome` all do, and
     each says so.
+13. **Table file format is immutable and homogeneous per table**, stored
+    authoritatively on `hog_table.file_format` (the single source of truth;
+    `write.format.default` is derived for clients at read time).
+    - Parquet is the default format across all tables.
+    - `clickhouse-mergetree-packed` is admitted for fixed-schema,
+      unpartitioned, unsorted append-only tables when the rollout gate
+      `HOGLAKE_PACKED_MERGETREE_ENABLED=true` is enabled.
+    - Packed tables do not support schema evolution (columns, partition specs,
+      or sort orders cannot be added, dropped, renamed, promoted, or commented),
+      deletion vectors, explicit row IDs, truncation, or Parquet compaction.
+    - Compaction and maintenance planners select Parquet files only. The
+      maintenance debt sampler excludes non-Parquet tables so packed tables
+      never leak permanent small-file debt into debt scores or metrics.
+    - The server never opens stored data files (Parquet or packed parts);
+      validation is enforced at registration/commit without I/O.
+    - **No rollback past V25 once a packed table exists**: pre-V25 binaries
+      lack format filters in their compaction candidate queries and will fail
+      if run against a database containing packed tables.
 
 ## Scale doctrine (read before touching a query, a loop or a lock)
 

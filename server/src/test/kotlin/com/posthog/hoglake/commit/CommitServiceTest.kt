@@ -640,7 +640,6 @@ class CommitServiceTest {
         val invalid =
             listOf(
                 valid.copy(fileFormat = FileFormats.PARQUET),
-                valid.copy(columnStats = null),
                 valid.copy(footerSize = 20),
                 valid.copy(splitOffsets = listOf(0)),
                 valid.copy(recordCount = 0),
@@ -655,6 +654,12 @@ class CommitServiceTest {
             }.isInstanceOf(HoglakeException.Validation::class.java)
             assertThat(dataFiles(fx.catalogId)).isEmpty()
         }
+        val receipt =
+            service.commit(
+                "cat",
+                CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(valid.copy(columnStats = null))))),
+            )
+        assertThat(receipt.snapshotId).isPositive()
     }
 
     @Test

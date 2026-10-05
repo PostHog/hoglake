@@ -241,17 +241,19 @@ is the one that grows fastest (hoglake#240).
 A table may set `write.format.default=clickhouse-mergetree-packed` at creation. Absence means
 `parquet`, and the effective value is immutable. Every registration must match its table format.
 The packed contract is deliberately narrow: one registered object contains the bytes of one
-ClickHouse `data.packed` part, `column_stats` must be present (an empty array means no bounds), and
+ClickHouse `data.packed` part, counts-only stats are sufficient (per-column bounds are not required), and
 `footer_size` plus Parquet `split_offsets` are forbidden.
 
 Creation is behind `HOGLAKE_PACKED_MERGETREE_ENABLED`, default `false`. The rollout order is:
 
 1. Deploy the migration and packed-aware server binary to every replica with the gate off.
-2. Verify no older API replica remains. Database fences protect existing packed tables, but the gate
-   prevents creation while the fleet is mixed.
+2. Verify no older API replica remains. The gate prevents packed table creation while the fleet is mixed.
 3. Set `HOGLAKE_PACKED_MERGETREE_ENABLED=true` on every replica that can receive table-creation
    requests and complete that rollout.
 4. Only then create packed tables and start packed writers.
+
+**No rollback past V25 once a packed table exists**: older server binaries do not filter on format in
+their compaction candidate queries and will fail if run against a catalog containing packed tables.
 
 Turning the gate off again prevents new packed tables; it does not make existing packed tables
 unreadable or change their immutable format.
@@ -267,12 +269,12 @@ ClickHouse metadata that escape that file are outside this format.
 
 Upload claims accept `file_format=clickhouse-mergetree-packed`, persist that selection, and mint a
 fresh `.packed` path. Publication verifies the claimed format and settles the claim in the same
-transaction as the file row. The table identity row also stores the immutable format, and a database
-foreign key prevents any server version from publishing a differently formatted data row. The
-Parquet hydrator filters
+transaction as the file row. The table identity row stores the immutable format on `hog_table.file_format`
+as the single source of truth, enforced strictly at the service layer. The Parquet hydrator filters
 to `file_format='parquet'`, and both compaction candidate selection and direct planned-group execution
-refuse packed inputs. Expiry, retirement, removal-queue fencing, snapshots, row-range allocation, and
-exact-path cleanup keep their existing one-row/one-object behavior.
+refuse packed inputs. The maintenance debt sampler excludes non-Parquet tables so packed tables never
+leak permanent small-file debt into debt scores or metrics. Expiry, retirement, removal-queue fencing,
+snapshots, row-range allocation, and exact-path cleanup keep their existing one-row/one-object behavior.
 
 The DuckDB extension and Hedgerow reject packed tables and files. The Python adapter is the only
 reader and writer in this repository. It materializes an exact snapshot's registered part list into

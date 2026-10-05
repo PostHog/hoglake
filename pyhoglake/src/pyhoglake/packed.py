@@ -78,11 +78,11 @@ _CLICKHOUSE_TYPES = {
     "binary": "String",
 }
 
-_DEFAULT_MAX_PART_BYTES = 8 * 1024**3
-_DEFAULT_MAX_SNAPSHOT_BYTES = 64 * 1024**3
-_DEFAULT_MAX_SNAPSHOT_PARTS = 10_000
-_DEFAULT_MAX_MEMORY_BYTES = 2 * 1024**3
-_DEFAULT_MAX_RESULT_BYTES = 8 * 1024**3
+_DEFAULT_MAX_PART_BYTES = 2 * 1024**3
+_DEFAULT_MAX_SNAPSHOT_BYTES = 8 * 1024**3
+_DEFAULT_MAX_SNAPSHOT_PARTS = 500
+_DEFAULT_MAX_MEMORY_BYTES = 1 * 1024**3
+_DEFAULT_MAX_RESULT_BYTES = 2 * 1024**3
 
 _ARROW_TYPES: dict[str, pa.DataType] = {
     "boolean": pa.bool_(),
@@ -308,7 +308,6 @@ class ClickHousePackedAdapter:
                     f"{self._max_part_bytes}",
                     status_code=None,
                 )
-            stats = _column_stats(aligned, info.columns)
             body = {
                 "owner": str(operation),
                 "prefix": (
@@ -334,7 +333,7 @@ class ClickHousePackedAdapter:
                 "file_format": CLICKHOUSE_MERGETREE_PACKED_FORMAT,
                 "record_count": aligned.num_rows,
                 "file_size_bytes": packed_size,
-                "column_stats": stats,
+                "column_stats": [],
             }
         return {
             "idempotency_key": str(operation),
@@ -497,13 +496,57 @@ class ClickHousePackedAdapter:
                 + " MODIFY SETTING table_readonly=1",
             )
             columns = ", ".join(_quote_identifier(field.name) for field in schema)
-            raw = self._run(
-                root,
+            query = (
                 f"SELECT {columns} FROM {_quote_identifier('packed_read')} "
-                "ORDER BY _part, _part_offset FORMAT ArrowStream",
+                "ORDER BY toUInt64(splitByChar('_', _part)[2]), _part_offset FORMAT ArrowStream"
             )
-        with pa.ipc.open_stream(raw) as reader:
-            result = reader.read_all()
+            command = [
+                *self._command,
+                "local",
+                "--path",
+                str(root),
+                "--background_schedule_pool_size",
+                str(self._max_threads),
+                "--max_threads",
+                str(self._max_threads),
+                "--max_memory_usage",
+                str(self._max_memory_bytes),
+                "--max_result_bytes",
+                str(self._max_result_bytes),
+                "--result_overflow_mode",
+                "throw",
+                "--output_format_arrow_string_as_string",
+                "0",
+                "--query",
+                query,
+            ]
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            except OSError as error:
+                raise HoglakeError(
+                    f"could not execute clickhouse local: {error}"
+                ) from error
+            try:
+                assert process.stdout is not None
+                with pa.ipc.open_stream(process.stdout) as reader:
+                    result = reader.read_all()
+                _, stderr = process.communicate(timeout=self._timeout)
+            except subprocess.TimeoutExpired as error:
+                process.kill()
+                process.communicate()
+                raise HoglakeError(
+                    f"clickhouse local exceeded the {self._timeout:g}s timeout"
+                ) from error
+            if process.returncode != 0:
+                detail = stderr.decode("utf-8", errors="replace").strip()
+                raise HoglakeError(
+                    "clickhouse local failed" + (f": {detail[:2000]}" if detail else "")
+                )
         try:
             result = result.cast(schema)
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as error:
@@ -594,6 +637,7 @@ class ClickHousePackedAdapter:
                 input=input_bytes,
                 capture_output=True,
                 check=False,
+                cwd=root,
                 timeout=self._timeout,
             )
         except subprocess.TimeoutExpired as error:

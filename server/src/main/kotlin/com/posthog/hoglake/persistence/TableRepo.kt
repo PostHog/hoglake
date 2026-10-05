@@ -24,6 +24,7 @@ data class TableRow(
     val name: String,
     val comment: String? = null,
     val properties: Map<String, String> = emptyMap(),
+    val fileFormat: String = FileFormats.PARQUET,
 )
 
 /** Rollup row from hog_table_stats. */
@@ -43,13 +44,27 @@ data class TableStatsRow(
 object TableRepo {
     private val tableRowMapper =
         RowMapper { rs, _ ->
+            val fileFormat =
+                try {
+                    rs.getString("file_format") ?: FileFormats.PARQUET
+                } catch (_: Exception) {
+                    FileFormats.PARQUET
+                }
+            val rawProperties = Pg.fromJson(rs.getString("properties"))!!.mapValues { (_, value) -> value as String }
+            val properties =
+                if (fileFormat != FileFormats.PARQUET) {
+                    rawProperties + (FileFormats.TABLE_PROPERTY to fileFormat)
+                } else {
+                    rawProperties - FileFormats.TABLE_PROPERTY
+                }
             TableRow(
                 tableId = rs.getLong("table_id"),
                 tableUuid = rs.getObject("table_uuid") as UUID,
                 namespaceId = rs.getLong("namespace_id"),
                 name = rs.getString("name"),
                 comment = rs.getString("comment"),
-                properties = Pg.fromJson(rs.getString("properties"))!!.mapValues { (_, value) -> value as String },
+                properties = properties,
+                fileFormat = fileFormat,
             )
         }
 
@@ -204,6 +219,7 @@ object TableRepo {
         comment: String? = null,
         properties: Map<String, String> = emptyMap(),
     ) {
+        val storedProperties = properties - FileFormats.TABLE_PROPERTY
         try {
             handle.createUpdate(
                 """
@@ -217,7 +233,7 @@ object TableRepo {
                 .bind("namespaceId", namespaceId)
                 .bind("name", name)
                 .bind("comment", comment)
-                .bind("properties", Pg.toJson(properties))
+                .bind("properties", Pg.toJson(storedProperties))
                 .execute()
         } catch (e: UnableToExecuteStatementException) {
             if (Pg.isUniqueViolation(e)) {
@@ -316,6 +332,27 @@ object TableRepo {
      * retirement gate (`dropped_snapshot <= earliest_snapshot_id`)
      * preserves until the floor has passed the drop.
      */
+    @Volatile
+    private var hasTableFormatColumn: Boolean? = null
+
+    private fun formatColumnExpr(handle: Handle): String {
+        if (hasTableFormatColumn == true) return "t.file_format"
+        val exists =
+            handle.createQuery(
+                """
+                SELECT EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'hog_table' AND column_name = 'file_format'
+                )
+                """,
+            ).mapTo(Boolean::class.java).one()
+        if (exists) {
+            hasTableFormatColumn = true
+            return "t.file_format"
+        }
+        return "'parquet' AS file_format"
+    }
+
     fun findAt(
         handle: Handle,
         catalogId: Long,
@@ -325,7 +362,8 @@ object TableRepo {
     ): TableRow? =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
+                   ${formatColumnExpr(handle)}
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -367,7 +405,8 @@ object TableRepo {
     ): TableRow? =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
+                   ${formatColumnExpr(handle)}
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -410,7 +449,8 @@ object TableRepo {
     ): List<TableRow> =
         handle.createQuery(
             """
-            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties
+            SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
+                   ${formatColumnExpr(handle)}
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id

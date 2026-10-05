@@ -1600,12 +1600,6 @@ class CommitService(
                         "packed MergeTree registration ${file.path} must contain at least one row and one byte",
                     )
                 }
-                if (file.columnStats == null) {
-                    throw HoglakeException.Validation(
-                        "packed MergeTree registration ${file.path} must provide column_stats; " +
-                            "use an empty array when no bounds are available",
-                    )
-                }
                 if (file.footerSize != null) {
                     throw HoglakeException.Validation(
                         "packed MergeTree registration ${file.path} must not provide footer_size",

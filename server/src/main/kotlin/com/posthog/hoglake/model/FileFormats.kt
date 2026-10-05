@@ -35,7 +35,7 @@ object FileFormats {
             ColType.BINARY,
         )
 
-    fun tableFormat(properties: Map<String, String>): String = properties[TABLE_PROPERTY] ?: PARQUET
+    fun tableFormat(properties: Map<String, String>): String = properties[TABLE_PROPERTY]?.lowercase() ?: PARQUET
 
     fun isPacked(properties: Map<String, String>): Boolean = tableFormat(properties) == CLICKHOUSE_MERGETREE_PACKED
 }

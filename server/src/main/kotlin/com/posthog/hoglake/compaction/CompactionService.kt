@@ -1341,7 +1341,7 @@ class CompactionService(
             namespace = ns.name,
             table = t.name,
             tableId = t.tableId,
-            fileFormat = FileFormats.tableFormat(t.properties),
+            fileFormat = t.fileFormat,
             columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
             sortFields =
                 SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
@@ -3242,33 +3242,7 @@ class CompactionService(
         val ctx =
             jdbi.inTransactionUnchecked { h ->
                 h.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-                val resolved = tableContext(h, catalog, namespace, table, defaults)
-                if (group.files.isNotEmpty()) {
-                    val actualFormats =
-                        h.createQuery(
-                            """
-                            SELECT data_file_id, file_format
-                              FROM hog_data_file
-                             WHERE catalog_id = :catalogId AND table_id = :tableId
-                               AND data_file_id IN (<ids>)
-                            """,
-                        )
-                            .bind("catalogId", resolved.catalogId)
-                            .bind("tableId", resolved.tableId)
-                            .bindList("ids", group.files.map { it.dataFileId })
-                            .map { rs, _ -> rs.getLong("data_file_id") to rs.getString("file_format") }
-                            .list()
-                            .toMap()
-                    group.files.firstOrNull {
-                        actualFormats[it.dataFileId] != FileFormats.PARQUET
-                    }?.let { file ->
-                        throw InvalidDataException(
-                            "compaction supports parquet inputs only; data_file_id ${file.dataFileId} " +
-                                "uses '${actualFormats[file.dataFileId] ?: "unknown"}'",
-                        )
-                    }
-                }
-                resolved
+                tableContext(h, catalog, namespace, table, defaults)
             }
         return compactGroup(ctx, group)
     }
@@ -3280,6 +3254,11 @@ class CompactionService(
         ctx: TableContext,
         group: CompactionGroup,
     ): GroupOutcome {
+        if (ctx.fileFormat != FileFormats.PARQUET) {
+            throw InvalidDataException(
+                "compaction supports parquet tables only; table '${ctx.table}' uses '${ctx.fileFormat}'",
+            )
+        }
         group.files.firstOrNull { it.fileFormat != FileFormats.PARQUET }?.let { file ->
             throw InvalidDataException(
                 "compaction supports parquet inputs only; data_file_id ${file.dataFileId} " +

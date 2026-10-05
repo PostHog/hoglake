@@ -430,7 +430,7 @@ def test_real_clickhouse_packed_append_and_snapshot_read(httpx_mock) -> None:
     assert registration["file_format"] == CLICKHOUSE_MERGETREE_PACKED_FORMAT
     assert "footer_size" not in registration
     assert "split_offsets" not in registration
-    assert len(registration["column_stats"]) == len(data.column_names)
+    assert registration["column_stats"] == []
     key = claimed.removeprefix("s3://")
     assert fake_s3.files[key]
 
@@ -502,6 +502,75 @@ def test_real_clickhouse_packed_append_and_snapshot_read(httpx_mock) -> None:
     )
     expected = pa.concat_tables([data, data])
     assert adapter.read(table, snapshot=7).equals(expected)
+    table._namespace._catalog._client.close()
+
+
+def test_real_clickhouse_packed_multi_part_numeric_ordering(httpx_mock) -> None:
+    executable = os.environ.get("PYHOGLAKE_CLICKHOUSE")
+    if not executable:
+        pytest.skip("set PYHOGLAKE_CLICKHOUSE to a clickhouse executable or wrapper")
+    fake_s3 = FakeS3()
+    table = _table(fake_s3)
+    adapter = ClickHousePackedAdapter(Path(executable), timeout=180)
+    table_url = f"{BASE}/v1/catalogs/cat/namespaces/ns1/tables/events"
+
+    schema = pa.schema([pa.field("id", pa.int64(), nullable=False)])
+    table_wire = _table_wire()
+    table_wire["columns"] = [
+        {"field_id": 1, "name": "id", "type": "long", "nullable": False, "ordinal": 0}
+    ]
+    table_wire["read_snapshot_id"] = 12
+
+    # Produce 12 independent single-row parts
+    scan_entries = []
+    expected_tables = []
+    for i in range(1, 13):
+        row_table = pa.table({"id": pa.array([i], pa.int64())}, schema=schema)
+        expected_tables.append(row_table)
+        claimed_uri = f"s3://bkt/lake/data/ns1/events/test/part_{i}.packed"
+
+        httpx_mock.add_response(
+            method="GET", url=f"{table_url}?totals=false", json=table_wire
+        )
+        httpx_mock.add_response(
+            method="PUT",
+            url=re.compile(f"{re.escape(BASE)}/v1/catalogs/cat/uploads/.*"),
+            json={"path": claimed_uri},
+        )
+        _ = adapter.prepare_append(table, row_table)
+        part_key = claimed_uri.removeprefix("s3://")
+        scan_entries.append(
+            {
+                "data_file": {
+                    "data_file_id": i,
+                    "path": claimed_uri,
+                    "file_format": CLICKHOUSE_MERGETREE_PACKED_FORMAT,
+                    "record_count": 1,
+                    "file_size_bytes": len(fake_s3.files[part_key]),
+                    "row_id_start": i - 1,
+                    "stats_state": "provided",
+                    "begin_snapshot": i,
+                }
+            }
+        )
+
+    read_wire = dict(table_wire)
+    read_wire["read_snapshot_id"] = 12
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{table_url}?snapshot=12&totals=false",
+        json=read_wire,
+    )
+    httpx_mock.add_response(
+        method="GET",
+        url=f"{table_url}/scan?snapshot=12",
+        json=scan_entries,
+    )
+
+    result = adapter.read(table, snapshot=12)
+    expected = pa.concat_tables(expected_tables)
+    assert result.column("id").to_pylist() == list(range(1, 13))
+    assert result.equals(expected)
     table._namespace._catalog._client.close()
 
 

@@ -355,6 +355,7 @@ class CatalogService(
         // Record the replacement edge with the row itself: the lineage a
         // consumer's offset release depends on must be a fact, not a
         // convention re-derived later (OffsetRepo.releaseSupersededOffsets).
+        val format = FileFormats.tableFormat(properties)
         val createdUuid =
             TableRepo.insertTable(
                 h,
@@ -363,7 +364,7 @@ class CatalogService(
                 alloc.snapshotId,
                 tableUuid,
                 replacementTableId,
-                FileFormats.tableFormat(properties),
+                format,
             )
         // nodeCount, not columns.size: a nested column needs one id per
         // NODE, not one per top-level column. Allocating by size would
@@ -379,11 +380,17 @@ class CatalogService(
             AlterService(
                 jdbi,
             ).installPartitionSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, partitionFields)
+        val effectiveProperties =
+            if (format != FileFormats.PARQUET) {
+                properties + (FileFormats.TABLE_PROPERTY to format)
+            } else {
+                properties - FileFormats.TABLE_PROPERTY
+            }
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
             comment = comment,
-            properties = properties,
+            properties = effectiveProperties,
             namespace = ns.name,
             name = name,
             columns = cols,
@@ -530,7 +537,7 @@ class CatalogService(
                         currentTableUuid = t.tableUuid,
                     )
                 }
-                if (com.posthog.hoglake.model.FileFormats.isPacked(t.properties)) {
+                if (t.fileFormat == FileFormats.CLICKHOUSE_MERGETREE_PACKED) {
                     throw HoglakeException.Validation("packed MergeTree tables do not support truncate")
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
