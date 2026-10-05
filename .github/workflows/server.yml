@@ -10,18 +10,37 @@ on:
       # vectors-only PR must run the server suite too.
       - "pyhoglake/tests/vectors/**"
       - ".github/workflows/server.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
   pull_request:
     branches: [main]
     paths:
       - "server/**"
       - "pyhoglake/tests/vectors/**"
       - ".github/workflows/server.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
 
 permissions:
   contents: read
 
 jobs:
+  python-live:
+    uses: ./.github/workflows/python-live.yml
+
+  # Keep the existing required check name and fail it when either suite fails.
   test:
+    if: always()
+    needs: [server-test, python-live]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both suites
+        env:
+          SERVER_RESULT: ${{ needs.server-test.result }}
+          LIVE_RESULT: ${{ needs.python-live.result }}
+        run: test "$SERVER_RESULT" = success && test "$LIVE_RESULT" = success
+
+  server-test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -152,9 +171,7 @@ jobs:
           [ "${ok:-}" = "1" ]
 
   deploy:
-    # GATED ON CI: a main push deploys only after both suites pass —
-    # a deliberate deviation from the millpond/duckgres convention of
-    # running CD in parallel with CI (decided 2026-09-11).
+    # The required test gate covers server tests, lint, and both live Python suites.
     needs: [test]
     # Forks must not push images or deployment dispatches.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'

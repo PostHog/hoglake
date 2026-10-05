@@ -11,6 +11,8 @@ on:
       - "server/src/main/resources/openapi/hoglake.yaml"
       - ".github/workflows/ci-python.yml"
       - ".github/workflows/pyhoglake-checks.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
   pull_request:
     branches: [main]
     paths:
@@ -20,6 +22,8 @@ on:
       - "server/src/main/resources/openapi/hoglake.yaml"
       - ".github/workflows/ci-python.yml"
       - ".github/workflows/pyhoglake-checks.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
 
 permissions:
   contents: read
@@ -29,6 +33,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # This direct job supplies the existing required check for Python-only changes.
+  test:
+    if: always()
+    needs: [pyhoglake, check]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Python checks and live suites
+        env:
+          CLIENT_RESULT: ${{ needs.pyhoglake.result }}
+          OTHER_RESULT: ${{ needs.check.result }}
+        run: test "$CLIENT_RESULT" = success && test "$OTHER_RESULT" = success
+
   pyhoglake:
     uses: ./.github/workflows/pyhoglake-checks.yml
 
@@ -64,8 +80,6 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
 
-      # Integration tests skip cleanly without a live server; this job
-      # is the unit/mocked layer. The live layer runs via `just dev` +
-      # full suites locally (AGENT.md pre-push checklist).
+      # The reusable pyhoglake checks run both clients against a live stack.
       - name: Tests
-        run: uv run pytest -q
+        run: uv run pytest -m "not integration" -q

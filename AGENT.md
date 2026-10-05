@@ -7,7 +7,20 @@ the pre-split commits).
 
 ## Pre-push checklist
 
-**Never push broken code.** Before every commit and push:
+**Do not push until all required tests have run on the exact changes being
+pushed.** This includes the server suite with Docker, Kotlin and Python lint,
+Python type checks, both Python unit suites, both live client suites, and the
+UI tests and build. Run additional component checks for affected code, such as
+the DuckDB extension's live tests.
+
+A skipped live suite, a missing service, a unit-only run, or checks from an
+older revision do not satisfy this rule. Wait for every command to finish and
+read its result. Any failure blocks a push, including a failure that also
+occurs on `main`. Fix it or report the exact failure and obtain explicit user
+authorization to push with that known failure. Do not exclude tests, add
+`xfail`, or accept a failing job to get a green result.
+
+Before every commit and push:
 
 (And before a PR that touches a maintenance loop, the commit path or a
 statement over the manifest tables: the six scale questions at the end
@@ -16,11 +29,13 @@ are answered in the PR body, the sixth being what ran on the local
 stack and what it showed.)
 
 ```bash
-cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
+(cd server && flox activate -- ./gradlew :test)       # Docker required
 just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
-just pyhoglake test  # pyhoglake suite
-just webui test      # vitest (no server needed)
-just hedgerow test   # unit; integration needs a live server
+just pyhoglake unit
+just hedgerow unit
+just live-python    # builds this checkout, starts isolated services, fails on skips
+just webui test
+just webui build
 ```
 
 `ruff` is **pinned** in both Python trees' dev groups and run through
@@ -42,8 +57,17 @@ without a server up verifies nothing — see
 (omitting `BUILD_EXTENSION_TEST_DEPS=full` makes vcpkg delete
 curl/openssl/zlib from the build tree).
 
-For the full end-to-end pass (client/hedgerow integration tests against
-a real server): `just server compose-up && just server run` in another
+`just live-python` is the required client/server check. It builds the server
+from this checkout, starts isolated PostgreSQL and MinIO services, and runs
+both clients' integration tests, including `qe_*.py`. It fails if either
+suite fails, skips a test, produces no tests, or has no readable report. It
+writes logs and JUnit reports to `.artifacts/live-python/` and removes its
+services on exit. The default ports are 15432 (PostgreSQL), 18080 (server),
+19000/19001 (MinIO). Override `HOGLAKE_PG_PORT`, `HOGLAKE_PORT`,
+`HOGLAKE_MINIO_PORT`, and `HOGLAKE_MINIO_CONSOLE_PORT` if those ports are in use.
+It does not replace the unit suites or the full server suite above.
+
+For manual investigation against a shared development server: `just server compose-up && just server run` in another
 terminal first — integration tests skip cleanly when no server is up,
 so a green run without one is NOT a full verification. Say which you
 ran. The server needs the compose MinIO's credentials in its env
@@ -112,11 +136,12 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
-| `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because the main ruleset REQUIRES a check by this name: as a job of the path-filtered `server.yml` it never ran for a webui- or Python-only PR, which then could not merge at all. (The ruleset's other required check, `test`, is satisfied by `server.yml` and `webui.yml` each naming a job `test`; a PR touching neither tree still has no `test` check and is blocked the same way) |
+| `server.yml` | `server/**`, codec vectors, live-test harness | required `test` gate over server tests, ktlint, and both live Python suites (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
+| `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because the main ruleset REQUIRES a check by this name: as a job of the path-filtered `server.yml` it never ran for a webui- or Python-only PR, which then could not merge at all. (The ruleset also requires `test`, supplied by the server, webui, and Python workflows. A PR outside their trigger paths still needs a separate required-check policy.) |
 | `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. All unit/mocked layer — live integration is local, per the pre-push checklist |
-| `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
+| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a direct `test` job fails if any dependency fails |
+| `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
+| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
