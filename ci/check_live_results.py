@@ -2,14 +2,16 @@
 
 import argparse
 import sys
-import xml.etree.ElementTree as ET
 from pathlib import Path
+
+from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 
 
 def check_report(path: Path) -> bool:
     try:
-        cases = list(ET.parse(path).getroot().iter("testcase"))
-    except (OSError, ET.ParseError) as error:
+        cases = list(ET.parse(path, forbid_dtd=True).getroot().iter("testcase"))
+    except (OSError, ET.ParseError, DefusedXmlException) as error:
         print(f"{path}: cannot read live-test results: {error}", file=sys.stderr)
         return False
     if not cases:

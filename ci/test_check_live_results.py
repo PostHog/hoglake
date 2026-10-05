@@ -44,6 +44,23 @@ class LiveResultsTest(unittest.TestCase):
                 result = self.run_checker(report)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
 
+    def test_dtd_and_entity_reports_are_rejected(self):
+        for declaration, name in (
+            ("<!DOCTYPE testsuite>", "live"),
+            ('<!DOCTYPE testsuite [<!ENTITY value "expanded">]>', "&value;"),
+            (
+                '<!DOCTYPE testsuite [<!ENTITY value SYSTEM "file:///unused">]>',
+                "&value;",
+            ),
+        ):
+            with self.subTest(declaration=declaration):
+                result = self.run_checker(
+                    f'{declaration}<testsuite><testcase name="{name}"/></testsuite>'
+                )
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("cannot read live-test results", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
     def test_a_passing_component_cannot_hide_a_skipped_component(self):
         result = self.run_checker(
             '<testsuite><testcase name="passed"/></testsuite>',
