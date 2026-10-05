@@ -202,6 +202,16 @@ class CatalogMetricsPlanIntegrationTest {
                        generate_series(1, $OTHER_TASK_ROWS) g
                 """,
             )
+            // PIN the ledger's `catalog_id` n_distinct at 1 rather than
+            // leave it to ANALYZE's sample: 30,000 rows out of ~501,000
+            // include one of `small`'s $SMALL_LEDGER_ROWS roughly one run
+            // in three, which makes n_distinct 2, rates `catalog_id` as
+            // selective and plans the one-step form through
+            // hog_maintenance_run_recent — and the BEFORE half below then
+            // fails to show the hazard it exists to show. The pinned value
+            // is the production shape the KDoc above describes, now
+            // guaranteed rather than probable.
+            h.execute("ALTER TABLE hog_maintenance_run ALTER COLUMN catalog_id SET (n_distinct = 1)")
             h.execute("VACUUM ANALYZE")
         }
     }
