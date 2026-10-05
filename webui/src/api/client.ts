@@ -393,6 +393,8 @@ export function listConsumers(catalog: string): Promise<ConsumerList> {
 
 export interface InstanceInfo {
   name?: string;
+  // Optional on older servers. Unknown themes use the default palette.
+  ui_theme?: string;
   // The running server's version. Optional here, not in the spec: a
   // server older than the field is exactly the case the badge exists to
   // make visible, so the type has to admit it.

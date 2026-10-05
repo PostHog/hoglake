@@ -224,7 +224,15 @@ class App private constructor(
         }
 
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
-    val catalogMetrics = CatalogMetrics(jdbi, meterRegistry)
+    val catalogMetrics =
+        CatalogMetrics(
+            jdbi,
+            meterRegistry,
+            // The five extended groups run where the maintenance summary
+            // is produced (the maintenance Deployment), so API replicas do
+            // not each republish the same instance-wide series.
+            extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,
+        )
 
     companion object {
         /**
@@ -317,6 +325,7 @@ class App private constructor(
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
+            uiTheme = cfg.uiTheme,
         )
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),

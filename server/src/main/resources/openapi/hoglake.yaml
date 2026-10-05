@@ -2635,6 +2635,15 @@ paths:
                 required: [version]
                 properties:
                   name: { type: string }
+                  ui_theme:
+                    type: string
+                    example: nord
+                    description: >
+                      Webui color theme from HOGLAKE_UI_THEME. Omitted
+                      when unset or blank. The webui applies the light
+                      or dark palette for its selected mode. Unknown
+                      values use the default palette. Supported values
+                      are listed in webui/README.md.
                   version:
                     type: string
                     description: >

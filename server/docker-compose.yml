@@ -65,6 +65,7 @@ services:
     image: hoglake-server:dev
     environment:
       HOGLAKE_INSTANCE_NAME: dev-compose
+      HOGLAKE_UI_THEME: ${HOGLAKE_UI_THEME:-}
       HOGLAKE_JDBC_URL: jdbc:postgresql://postgres:5432/hoglake
       HOGLAKE_DB_USER: hoglake
       HOGLAKE_DB_PASSWORD: hoglake
