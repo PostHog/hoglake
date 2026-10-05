@@ -161,10 +161,12 @@ def _make_config(
     )
 
 
-def _read_table_back(table, s3config: S3Config, columns: list[str]) -> pa.Table:
+def _read_table_back(
+    catalog, table, s3config: S3Config, columns: list[str]
+) -> pa.Table:
     fs = s3config.filesystem()
     parts = []
-    for f in table.files():
+    for f in table.files(snapshot=catalog.refresh().head_snapshot_id):
         parts.append(pq.read_table(f.path[len("s3://") :], filesystem=fs))
     if not parts:
         return pa.table({c: [] for c in columns})
@@ -207,7 +209,7 @@ def test_end_to_end_three_windows(
 
     # row-count + content equality, read back from the dest's own parquet
     expect = pa.concat_tables(batches).sort_by("id")
-    got = _read_table_back(dst, s3config, ["id", "team_id", "name"])
+    got = _read_table_back(dst_catalog, dst, s3config, ["id", "team_id", "name"])
     assert got.num_rows == 100
     assert got.equals(expect)
 
@@ -238,7 +240,7 @@ def test_filter_and_projection(
     assert result.rows_read == 60
     assert result.rows_appended == 20
 
-    got = _read_table_back(dst, s3config, ["id", "name"])
+    got = _read_table_back(dst_catalog, dst, s3config, ["id", "name"])
     expect_ids = [i for i in range(60) if i % 3 == 1]
     assert got.column("id").to_pylist() == expect_ids
     # content equality on the projected columns
@@ -272,7 +274,7 @@ def test_resume_from_offset_across_restart(
     assert r2.from_snapshot == r1.to_snapshot
     assert r2.rows_appended == 10
 
-    got = _read_table_back(dst, s3config, ["id", "team_id", "name"])
+    got = _read_table_back(dst_catalog, dst, s3config, ["id", "team_id", "name"])
     assert got.num_rows == 20  # no duplicates on clean handoff
     assert got.column("id").to_pylist() == list(range(20))
     assert daemon2.run_once().idle
@@ -336,12 +338,12 @@ def test_halt_on_delete(
     )
     daemon = Hedgerow(cfg)
 
-    src.append(_data(10, 0))
+    appended = src.append(_data(10, 0))
     assert daemon.run_once().rows_appended == 10
 
     # Register a deletion vector on the source data file. pyhoglake has no
     # public DV-write API in 0.1, so ship the raw commit payload.
-    (data_file,) = src.files()
+    (data_file,) = src.files(snapshot=appended.snapshot_id)
     read_snapshot = src_catalog.refresh().head_snapshot_id
     src_catalog._commit(
         {

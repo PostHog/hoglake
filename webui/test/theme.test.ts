@@ -3,9 +3,12 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
   applyColorTheme,
   applyTheme,
+  COLOR_THEME_COOKIE,
   COLOR_THEMES,
   initialTheme,
+  persistColorTheme,
   persistTheme,
+  resolveColorTheme,
 } from "../src/lib/theme";
 
 function mockMatchMedia(lightMatches: boolean) {
@@ -23,6 +26,7 @@ describe("theme", () => {
     delete document.documentElement.dataset.theme;
     delete document.documentElement.dataset.colorTheme;
     vi.unstubAllGlobals();
+    document.cookie = `${COLOR_THEME_COOKIE}=; path=/; max-age=0`;
   });
 
   it("defaults to dark when nothing is stored and the OS has no light preference", () => {
@@ -74,6 +78,36 @@ describe("theme", () => {
       expect(document.documentElement.dataset.colorTheme).toBeUndefined();
     },
   );
+});
+
+describe("color theme cookie", () => {
+  it("overrides the instance palette when it names one", () => {
+    document.cookie = `${COLOR_THEME_COOKIE}=Nord; path=/`;
+    expect(resolveColorTheme("dracula")).toBe("nord");
+    expect(resolveColorTheme(undefined)).toBe("nord");
+  });
+
+  it.each(["", "default", "missing", "__proto__", "%E2%9C%93"])("ignores %s and keeps the instance's choice", (value) => {
+    document.cookie = `${COLOR_THEME_COOKIE}=${value}; path=/`;
+    expect(resolveColorTheme("dracula")).toBe("dracula");
+    expect(resolveColorTheme(undefined)).toBeUndefined();
+  });
+
+  it("persists a palette and expires the cookie for anything else", () => {
+    persistColorTheme("Nord");
+    expect(document.cookie).toContain(`${COLOR_THEME_COOKIE}=nord`);
+    persistColorTheme(undefined);
+    expect(document.cookie).not.toContain(`${COLOR_THEME_COOKIE}=`);
+    persistColorTheme("nord");
+    persistColorTheme("missing");
+    expect(document.cookie).not.toContain(`${COLOR_THEME_COOKIE}=`);
+  });
+
+  it("does not read another cookie that shares the prefix", () => {
+    document.cookie = `${COLOR_THEME_COOKIE}-other=nord; path=/`;
+    expect(resolveColorTheme("dracula")).toBe("dracula");
+    document.cookie = `${COLOR_THEME_COOKIE}-other=; path=/; max-age=0`;
+  });
 });
 
 // Read the shipped CSS so a palette edit cannot bypass the contrast checks.
