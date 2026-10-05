@@ -37,6 +37,17 @@ data class UploadClaim(
  * re-checks `state` in its WHERE clause, so under READ COMMITTED an
  * update that waited on [register]'s row lock re-evaluates the predicate
  * against the committed row and declines to clobber a settled claim.
+ *
+ * And with no lock above them, the row locks need an order of their own:
+ * every statement here that locks more than one claim row ([renew],
+ * [abandon], [register]) takes them in `upload_id` order. A plain
+ * multi-row UPDATE locks rows in the order its plan reaches them, and
+ * that order is not stable: updates move rows, and two plans of one
+ * statement can visit them differently. Two renewals of one owner each
+ * held a row the other waited on, and Postgres aborted one as a
+ * deadlock, which the writer saw as a 500. Every writer of an operation
+ * renews the claims of the same owner when it finishes, so this is the
+ * common case, not a corner.
  */
 class UploadService(
     private val jdbi: Jdbi,
@@ -96,12 +107,7 @@ class UploadService(
             // row-lock wait (READ COMMITTED), so a claim that a concurrent
             // publication settled as 'registered' — or a sweep fenced as
             // 'abandoned' — is never revived by a renewal that read it first.
-            h.createUpdate(
-                """
-            UPDATE hog_upload SET expires_at = now() + interval '24 hours'
-            WHERE catalog_id = :catalog AND owner = :owner AND state = 'active'
-        """,
-            ).bind("catalog", catalogId).bind("owner", owner).execute()
+            h.createUpdate(RENEW_SQL).bind("catalog", catalogId).bind("owner", owner).execute()
         }
 
     fun abandon(
@@ -113,12 +119,8 @@ class UploadService(
             if (paths.size > 10000) throw HoglakeException.Validation("too many upload paths")
             // Registered claims are immutable: abort cannot retract a publication with an unknown response.
             // The state predicate is what enforces that without the commit lock (see [renew]).
-            h.createUpdate(
-                """
-            UPDATE hog_upload SET state = 'abandoned'
-            WHERE catalog_id = :catalog AND owner = :owner AND path = ANY(:paths) AND state = 'active'
-        """,
-            ).bind("catalog", catalogId).bind("owner", owner).bindArray("paths", String::class.java, paths).execute()
+            h.createUpdate(ABANDON_SQL)
+                .bind("catalog", catalogId).bind("owner", owner).bindArray("paths", String::class.java, paths).execute()
         }
 
     /** Explicit operator action only. No new background sweep is enabled by this feature. */
@@ -233,6 +235,55 @@ class UploadService(
             """
 
         /**
+         * [renew]: pushes out the expiry of the active claims of `:owner`.
+         * The sub-select locks them in `upload_id` order (see the class
+         * comment), re-checking `state` after any wait, and the UPDATE then
+         * changes only the rows it holds, probing the primary key.
+         *
+         * Binds `:catalog` and `:owner`. `internal` so
+         * `UploadLockPlanIntegrationTest` can EXPLAIN what production runs.
+         */
+        internal const val RENEW_SQL: String =
+            """
+            UPDATE hog_upload SET expires_at = now() + interval '24 hours'
+            WHERE catalog_id = :catalog AND state = 'active' AND upload_id = ANY(ARRAY(
+                SELECT upload_id FROM hog_upload
+                WHERE catalog_id = :catalog AND owner = :owner AND state = 'active'
+                ORDER BY upload_id
+                FOR UPDATE))
+            """
+
+        /**
+         * [abandon]: fences the active claims of `:owner` among `:paths`,
+         * locked in `upload_id` order like [RENEW_SQL].
+         *
+         * Binds `:catalog`, `:owner` and `:paths`.
+         */
+        internal const val ABANDON_SQL: String =
+            """
+            UPDATE hog_upload SET state = 'abandoned'
+            WHERE catalog_id = :catalog AND state = 'active' AND upload_id = ANY(ARRAY(
+                SELECT upload_id FROM hog_upload
+                WHERE catalog_id = :catalog AND owner = :owner AND path = ANY(:paths) AND state = 'active'
+                ORDER BY upload_id
+                FOR UPDATE))
+            """
+
+        /**
+         * [register]: reads and locks the claims of a publication's
+         * `:paths`, in `upload_id` order.
+         *
+         * Binds `:catalog` and `:paths`.
+         */
+        internal const val REGISTER_CLAIMS_SQL: String =
+            """
+            SELECT upload_id, owner, prefix, path, file_kind, state, expires_at
+            FROM hog_upload WHERE catalog_id = :catalog AND path = ANY(:paths)
+            ORDER BY upload_id
+            FOR UPDATE
+            """
+
+        /**
          * The reclaim insert for a fenced upload claim: queue the
          * abandoned object's path, unless the queue already owns it or a
          * file row still claims it. `internal` so
@@ -314,15 +365,13 @@ class UploadService(
             // rows itself. Without it, abort/expiry could flip a row to
             // 'abandoned' between the state check below and the UPDATE at
             // the end, and the UPDATE — keyed on upload_id alone — would
-            // silently revive it.
+            // silently revive it. In upload_id order, like every lock on
+            // these rows (see the class comment): renewals and aborts do not
+            // take the commit lock this transaction holds, so they can lock
+            // the same rows at the same time.
             val claims =
-                h.createQuery(
-                    """
-                SELECT upload_id, owner, prefix, path, file_kind, state, expires_at
-                FROM hog_upload WHERE catalog_id = :catalog AND path = ANY(:paths)
-                FOR UPDATE
-            """,
-                ).bind("catalog", catalogId).bindArray("paths", String::class.java, kinds.keys)
+                h.createQuery(REGISTER_CLAIMS_SQL)
+                    .bind("catalog", catalogId).bindArray("paths", String::class.java, kinds.keys)
                     .map(claimMapper).list()
             // Preserve the existing catalog contract: immutable objects still referenced
             // at a retained snapshot may be referenced again. Ownership never permits

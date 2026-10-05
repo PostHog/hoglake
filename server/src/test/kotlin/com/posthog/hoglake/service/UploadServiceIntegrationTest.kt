@@ -619,4 +619,168 @@ class UploadServiceIntegrationTest {
         assertThat(uploads.abandon(catalog, owner, listOf(claim.path))).isZero()
         assertThat(uploads.scheduleExpired(catalog)).isZero()
     }
+
+    // ---- claim rows are locked in upload_id order ---------------------------
+    //
+    // renew, abandon and register each lock several claim rows, and none of
+    // them holds the catalog commit lock. Each takes the rows in upload_id
+    // order: in any other order, two of them can each hold a row that the
+    // other waits on, and Postgres aborts one of them as a deadlock. Every
+    // writer of an operation renews the claims of the same owner when it
+    // finishes, so concurrent renewals of one owner are the common case.
+
+    @Test
+    fun `concurrent renewals and claims of one owner do not deadlock`() {
+        val catalog = catalog()
+        val owner = UUID.randomUUID()
+        repeat(200) { claim(catalog, owner) }
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(6)
+        try {
+            // Mostly renewals, with new claims among them, as the writers of one operation send them
+            val calls =
+                (0 until 600).map { call ->
+                    pool.submit<Any> { if (call % 4 == 0) claim(catalog, owner) else uploads.renew(catalog, owner) }
+                }
+            calls.forEach { it.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+        } finally {
+            pool.shutdownNow()
+        }
+        assertThat(uploads.renew(catalog, owner)).isEqualTo(350)
+    }
+
+    @Test
+    fun `renew locks the claim rows of its owner in upload_id order`() {
+        val catalog = catalog()
+        val claims = claimsInReverseIdOrder(catalog)
+        val owner = claims.first().owner
+        assertLocksInIdOrder(claims) { assertThat(uploads.renew(catalog, owner)).isEqualTo(claims.size) }
+    }
+
+    @Test
+    fun `abandon locks the claim rows of its paths in upload_id order`() {
+        val catalog = catalog()
+        val claims = claimsInReverseIdOrder(catalog)
+        val owner = claims.first().owner
+        assertLocksInIdOrder(claims) {
+            assertThat(uploads.abandon(catalog, owner, claims.map { it.path })).isEqualTo(claims.size)
+        }
+    }
+
+    @Test
+    fun `register locks the claim rows of a publication in upload_id order`() {
+        val catalog = catalog()
+        val claims = claimsInReverseIdOrder(catalog)
+        val owner = claims.first().owner
+        val request =
+            CommitRequest(
+                readSnapshot = catalogs.getCatalog(catalog).headSnapshotId,
+                appends =
+                    listOf(
+                        TableAppend(
+                            "test",
+                            "target",
+                            claims.map { FileRegistration(it.path, 1, 100, 20) },
+                            catalogs.getTable(catalog, "test", "target").tableUuid,
+                        ),
+                    ),
+                idempotencyKey = owner,
+            )
+        assertLocksInIdOrder(claims) { commits.commit(catalog, request) }
+    }
+
+    /**
+     * Ten claims of a new owner, written in DESCENDING upload_id order, so
+     * the last one has the lowest upload_id but is the last in the order a
+     * scan of the table or of the owner index returns them. Its path is
+     * random, so batches are drawn until it is not the first in path order
+     * either, the order of a scan of the path index. Each batch has its own
+     * owner, so the batches that are not used do not add claims to it.
+     */
+    private fun claimsInReverseIdOrder(catalog: String): List<UploadClaim> {
+        val catalogId = catalogs.getCatalog(catalog).catalogId
+        val dataPath = catalogs.getCatalog(catalog).dataPath
+        return generateSequence {
+            val owner = UUID.randomUUID()
+            val prefix = UUID.randomUUID().mostSignificantBits
+            (10L downTo 1L).map { uploads.claim(catalog, UUID(prefix, it), owner, dataPath, "data") }
+        }.first { batch ->
+            val firstByPath =
+                db.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        """
+                        SELECT upload_id FROM hog_upload WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
+                        ORDER BY path LIMIT 1
+                        """,
+                    ).bind("catalog", catalogId).bindArray("ids", UUID::class.java, batch.map { it.uploadId })
+                        .mapTo(UUID::class.java).one()
+                }
+            firstByPath != batch.last().uploadId
+        }
+    }
+
+    /**
+     * Holds the row of the claim with the lowest upload_id, the last of
+     * [claims], and runs [action] until it waits on that row. In upload_id
+     * order the held row comes first, so by then the action must hold no
+     * other claim row. An action that locks them in scan order holds some.
+     */
+    private fun assertLocksInIdOrder(
+        claims: List<UploadClaim>,
+        action: () -> Unit,
+    ) {
+        val held = claims.last()
+        val others = claims.dropLast(1).map { it.uploadId }
+        val holder = db.jdbi.open()
+        val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+        var running: java.util.concurrent.Future<*>? = null
+        try {
+            holder.begin()
+            holder.createQuery("SELECT state FROM hog_upload WHERE upload_id = :id FOR UPDATE")
+                .bind("id", held.uploadId).mapTo(String::class.java).one()
+            val holderPid = holder.createQuery("SELECT pg_backend_pid()").mapTo(Int::class.java).one()
+            running = pool.submit(action)
+            awaitBlockedBy(holderPid, running)
+            // SKIP LOCKED leaves out the rows that the action holds
+            val free =
+                db.jdbi.withHandleUnchecked { h ->
+                    h.createQuery(
+                        """
+                        SELECT count(*) FROM (
+                            SELECT 1 FROM hog_upload WHERE upload_id = ANY(:ids) FOR UPDATE SKIP LOCKED) AS free
+                        """,
+                    ).bindArray("ids", UUID::class.java, others).mapTo(Long::class.java).one()
+                }
+            assertThat(free).describedAs("claim rows the action does not hold").isEqualTo(others.size.toLong())
+            holder.rollback()
+            running.get(10, java.util.concurrent.TimeUnit.SECONDS)
+        } finally {
+            if (holder.isInTransaction) holder.rollback()
+            holder.close()
+            // After a failed assertion, let the action end before the next test starts
+            runCatching { running?.get(10, java.util.concurrent.TimeUnit.SECONDS) }
+            pool.shutdownNow()
+        }
+    }
+
+    /** Waits until a session waits on a lock that the session [holderPid] holds, or until [running] ends. */
+    private fun awaitBlockedBy(
+        holderPid: Int,
+        running: java.util.concurrent.Future<*>,
+    ) {
+        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
+        while (true) {
+            val blocked =
+                db.jdbi.withHandleUnchecked { h ->
+                    h.createQuery("SELECT count(*) FROM pg_stat_activity WHERE :holder = ANY(pg_blocking_pids(pid))")
+                        .bind("holder", holderPid).mapTo(Long::class.java).one()
+                }
+            if (blocked > 0) return
+            if (running.isDone) {
+                running.get()
+                error("the action ended without waiting on the held claim row")
+            }
+            check(System.nanoTime() < deadline) { "no session waits on the held claim row" }
+            Thread.sleep(10)
+        }
+    }
 }
