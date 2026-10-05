@@ -1493,6 +1493,11 @@ The catalog reports on itself instead of waiting for ops SQL:
 - **`GET /v1/info`** — instance identity: the operator-configured
   display name (`HOGLAKE_INSTANCE_NAME`, e.g. "GigaHog"), shown in the
   webui topbar so nobody mistakes prod for dev.
+  Set `HOGLAKE_UI_THEME=nord` on the server to select an instance color
+  theme. Restart the server and reload the UI to apply it. The response
+  includes `ui_theme` when set. The UI selects its light or dark palette
+  from the current display mode. Unset, blank, or unknown values keep the
+  default colors. See [supported themes](../webui/README.md#instance-color-theme).
 - **`GET /export`** — the DR manifest (snapshot range + live-file
   manifest + consumer offsets, consistent at head) is specified, not yet
   implemented — see that section below.

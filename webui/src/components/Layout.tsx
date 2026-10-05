@@ -3,13 +3,25 @@ import { useQuery } from "@tanstack/react-query";
 import { Link, Outlet, useParams } from "react-router-dom";
 import { checkHealth, getInstanceInfo } from "../api/client";
 import { formatBytes, formatCompactCount, formatCount } from "../lib/format";
-import { applyTheme, initialTheme, persistTheme, type Theme } from "../lib/theme";
+import {
+  applyColorTheme,
+  applyTheme,
+  initialTheme,
+  persistTheme,
+  type Theme,
+} from "../lib/theme";
 
 function ThemeToggle() {
   const [theme, setTheme] = useState<Theme>(initialTheme);
+  useEffect(() => applyTheme(theme), [theme]);
+  useEffect(() => {
+    const media = window.matchMedia?.("(prefers-color-scheme: light)");
+    const followSystem = () => setTheme(initialTheme());
+    media?.addEventListener?.("change", followSystem);
+    return () => media?.removeEventListener?.("change", followSystem);
+  }, []);
   const next: Theme = theme === "dark" ? "light" : "dark";
   const flip = () => {
-    applyTheme(next);
     persistTheme(next);
     setTheme(next);
   };
@@ -26,7 +38,7 @@ function ThemeToggle() {
   );
 }
 
-function useDocumentTitle() {
+function useInstanceAppearance() {
   // Shares the fetch-once ["instance-info"] key with the badges below, so
   // naming the tab costs no extra request.
   const { data } = useQuery({
@@ -36,6 +48,7 @@ function useDocumentTitle() {
     retry: false,
   });
   const name = data?.name;
+  useEffect(() => applyColorTheme(data?.ui_theme), [data?.ui_theme]);
   useEffect(() => {
     // The instance name leads: browser tabs truncate from the RIGHT, and
     // when several hoglake consoles are open the discriminator is the
@@ -196,7 +209,7 @@ function Footer() {
 }
 
 export function Layout() {
-  useDocumentTitle();
+  useInstanceAppearance();
   return (
     <div className="app">
       <header className="topbar">

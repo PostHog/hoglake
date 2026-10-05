@@ -316,6 +316,7 @@ class App private constructor(
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
+            uiTheme = cfg.uiTheme,
         )
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),

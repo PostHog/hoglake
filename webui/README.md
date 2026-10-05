@@ -140,6 +140,72 @@ the hoglake server at `http://localhost:8080`, so start the server first
 and the app fetches same-origin (no CORS involved). Point the proxy at a
 different server with `HOGLAKE_API=http://host:port npm run dev`.
 
+## Instance color theme
+
+Set `HOGLAKE_UI_THEME` on the **server**, beside `HOGLAKE_INSTANCE_NAME`:
+
+```sh
+HOGLAKE_INSTANCE_NAME=development HOGLAKE_UI_THEME=nord
+```
+
+Add these environment variables to the server process or its deployment
+configuration. Restart the server and reload the UI to apply a change.
+The UI reads `ui_theme` from `GET /v1/info`. No UI build is required.
+
+For the local container stack, run this command from the repository root:
+
+```sh
+HOGLAKE_UI_THEME=nord just up
+```
+
+Compose passes the value to the server container. Reload the UI after the
+server starts. Set the variable each time you run `just up`, or export it
+in your shell to retain the selection.
+
+Each theme has light and dark palettes. The UI follows the system display
+mode until you use the light/dark switch. It saves that mode in the browser.
+The configured color theme always comes from the server. The colored header
+border helps you identify the instance. Keep an instance name as a text label.
+
+Use one of these values (case is ignored). Each preview shows the actual UI
+background, text, accent, and status colors:
+
+| Value | Dark palette | Light palette |
+| --- | --- | --- |
+| `3024` | ![3024 dark palette](docs/themes/3024-dark.svg)<br>3024 Night | ![3024 light palette](docs/themes/3024-light.svg)<br>3024 Day |
+| `ayu` | ![ayu dark palette](docs/themes/ayu-dark.svg)<br>Ayu | ![ayu light palette](docs/themes/ayu-light.svg)<br>Ayu Light |
+| `catppuccin` | ![catppuccin dark palette](docs/themes/catppuccin-dark.svg)<br>Catppuccin Mocha | ![catppuccin light palette](docs/themes/catppuccin-light.svg)<br>Catppuccin Latte |
+| `dracula` | ![dracula dark palette](docs/themes/dracula-dark.svg)<br>Dracula | ![dracula light palette](docs/themes/dracula-light.svg)<br>Adapted light palette |
+| `everforest` | ![everforest dark palette](docs/themes/everforest-dark.svg)<br>Everforest Dark Med | ![everforest light palette](docs/themes/everforest-light.svg)<br>Everforest Light Med |
+| `github` | ![github dark palette](docs/themes/github-dark.svg)<br>GitHub Dark Default | ![github light palette](docs/themes/github-light.svg)<br>GitHub Light Default |
+| `gruvbox` | ![gruvbox dark palette](docs/themes/gruvbox-dark.svg)<br>Gruvbox Dark | ![gruvbox light palette](docs/themes/gruvbox-light.svg)<br>Gruvbox Light |
+| `iceberg` | ![iceberg dark palette](docs/themes/iceberg-dark.svg)<br>Iceberg Dark | ![iceberg light palette](docs/themes/iceberg-light.svg)<br>Iceberg Light |
+| `kanagawa` | ![kanagawa dark palette](docs/themes/kanagawa-dark.svg)<br>Kanagawa Wave | ![kanagawa light palette](docs/themes/kanagawa-light.svg)<br>Kanagawa Lotus |
+| `monokai` | ![monokai dark palette](docs/themes/monokai-dark.svg)<br>Monokai Pro | ![monokai light palette](docs/themes/monokai-light.svg)<br>Monokai Pro Light |
+| `night-owl` | ![night-owl dark palette](docs/themes/night-owl-dark.svg)<br>Night Owl | ![night-owl light palette](docs/themes/night-owl-light.svg)<br>Light Owl |
+| `nord` | ![nord dark palette](docs/themes/nord-dark.svg)<br>Nord | ![nord light palette](docs/themes/nord-light.svg)<br>Nord Light |
+| `oceanic-next` | ![oceanic-next dark palette](docs/themes/oceanic-next-dark.svg)<br>Oceanic Next | ![oceanic-next light palette](docs/themes/oceanic-next-light.svg)<br>Adapted light palette |
+| `one` | ![one dark palette](docs/themes/one-dark.svg)<br>Atom One Dark | ![one light palette](docs/themes/one-light.svg)<br>Atom One Light |
+| `rose-pine` | ![rose-pine dark palette](docs/themes/rose-pine-dark.svg)<br>Rose Pine | ![rose-pine light palette](docs/themes/rose-pine-light.svg)<br>Rose Pine Dawn |
+| `snazzy` | ![snazzy dark palette](docs/themes/snazzy-dark.svg)<br>Snazzy | ![snazzy light palette](docs/themes/snazzy-light.svg)<br>Adapted light palette |
+| `solarized` | ![solarized dark palette](docs/themes/solarized-dark.svg)<br>iTerm2 Solarized Dark | ![solarized light palette](docs/themes/solarized-light.svg)<br>iTerm2 Solarized Light |
+| `synthwave` | ![synthwave dark palette](docs/themes/synthwave-dark.svg)<br>Synthwave | ![synthwave light palette](docs/themes/synthwave-light.svg)<br>Adapted light palette |
+| `tokyo-night` | ![tokyo-night dark palette](docs/themes/tokyo-night-dark.svg)<br>TokyoNight Night | ![tokyo-night light palette](docs/themes/tokyo-night-light.svg)<br>TokyoNight Day |
+| `tomorrow` | ![tomorrow dark palette](docs/themes/tomorrow-dark.svg)<br>Tomorrow Night | ![tomorrow light palette](docs/themes/tomorrow-light.svg)<br>Tomorrow |
+
+The previews come from `src/color-themes.css`. After you change a palette,
+run `npm run docs:themes` from `webui/` to update the images.
+
+These themes come from [iTerm2 Color Schemes](https://iterm2colorschemes.com/).
+The site has no popularity ranking. This selection includes familiar theme
+families and a range of colors. UI surfaces use derived colors. Text colors
+have adjustments for contrast. The source revision is in `src/color-themes.css`.
+The [source license](public/third-party/iTerm2-Color-Schemes-LICENSE.txt)
+is included in the UI build.
+
+Unset, blank, `default`, and unknown values use the original Hoglake palette.
+The UI also uses that palette if `/v1/info` fails or the server predates this field.
+
 ## Test / build
 
 ```sh

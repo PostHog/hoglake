@@ -9,6 +9,8 @@ data class Config(
      * Empty = unnamed.
      */
     val instanceName: String = env("HOGLAKE_INSTANCE_NAME", ""),
+    /** Color theme for the webui. Empty keeps the default palette. */
+    val uiTheme: String = env("HOGLAKE_UI_THEME", ""),
     val jdbcUrl: String = env("HOGLAKE_JDBC_URL", "jdbc:postgresql://localhost:5432/hoglake"),
     val dbUser: String = env("HOGLAKE_DB_USER", "hoglake"),
     val dbPassword: String = env("HOGLAKE_DB_PASSWORD", "hoglake"),

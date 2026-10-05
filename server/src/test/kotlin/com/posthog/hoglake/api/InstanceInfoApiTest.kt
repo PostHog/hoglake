@@ -90,6 +90,26 @@ class InstanceInfoApiTest {
     }
 
     @Test
+    fun `configured UI theme reaches the info response`() {
+        val themed = App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0, uiTheme = "nord"), db.jdbi)
+        testApplication {
+            application { themed.module(this) }
+            val response = client.get("/v1/info")
+            assertThat(response.status).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(response)["ui_theme"].asText()).isEqualTo("nord")
+        }
+    }
+
+    @Test
+    fun `blank UI theme is omitted`() {
+        val unnamed = App.build(Config(hydratorIntervalMs = 0, metricsIntervalMs = 0, uiTheme = "  "), db.jdbi)
+        testApplication {
+            application { unnamed.module(this) }
+            assertThat(body(client.get("/v1/info")).has("ui_theme")).isFalse()
+        }
+    }
+
+    @Test
     fun `totals are absent before the first sample and sampled values after`() =
         api { client ->
             // The sampler loop is off (metricsIntervalMs = 0) and nothing
