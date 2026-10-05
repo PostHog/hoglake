@@ -127,14 +127,22 @@ class RetirementCostIntegrationTest {
                     .bind("catalogId", catalogId).bind("tableId", tableId).bind("n", n)
                     .mapTo(Long::class.javaObjectType).list()
             check(victims.size == n) { "the fixture ran out of rows: wanted $n, got ${victims.size}" }
-            h.createUpdate(RetirementService.DV_DELETE_SQL)
+            h.createQuery(RetirementService.DV_DELETE_SQL)
                 .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
                 .bindArray("victims", Long::class.javaObjectType, victims)
-                .execute()
-            h.createUpdate(RetirementService.DATA_DELETE_SQL)
-                .bind("catalogId", catalogId)
-                .bindArray("victims", Long::class.javaObjectType, victims)
-                .execute()
+                .mapTo(Long::class.java)
+                .first()
+            val deleted =
+                h.createQuery(RetirementService.DATA_DELETE_SQL)
+                    .bind("catalogId", catalogId)
+                    .bind("tableId", tableId)
+                    .bindArray("victims", Long::class.javaObjectType, victims)
+                    .mapTo(Long::class.java)
+                    .first()
+            // A measurement of a batch that deleted nothing would be the
+            // flattest of all.
+            check(deleted == n.toLong()) { "deleted $deleted of $n victims" }
             h.commit()
             val millis = (System.nanoTime() - start) / 1_000_000
             val wal =

@@ -14,6 +14,7 @@ import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.Pg
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -919,18 +920,8 @@ class RetirementService(
                 // this to live DVs would leave exactly the SUPERSEDED
                 // ones to be cascaded away un-queued, which is the same
                 // leak with a smaller population.
-                val dvs =
-                    h.createUpdate(DV_DELETE_SQL)
-                        .bind("catalogId", catalogId)
-                        .bindArray("victims", Long::class.javaObjectType, victims)
-                        .execute()
-                        .toLong()
-                val rows =
-                    h.createUpdate(DATA_DELETE_SQL)
-                        .bind("catalogId", catalogId)
-                        .bindArray("victims", Long::class.javaObjectType, victims)
-                        .execute()
-                        .toLong()
+                val dvs = guardedDelete(h, DV_DELETE_SQL, catalogId, candidate.tableId, victims)
+                val rows = guardedDelete(h, DATA_DELETE_SQL, catalogId, candidate.tableId, victims)
                 if (rows == 0L) BatchOutcome.Stuck else BatchOutcome.Retired(rows, dvs)
             }
         } catch (e: HoglakeException.CommitQueueTimeout) {
@@ -962,6 +953,37 @@ class RetirementService(
             }
         }
         return results
+    }
+
+    /**
+     * Run one of the two lock-held deletes and enforce the table guard
+     * (#264) on what it RETURNED: a deleted row whose `table_id` is not
+     * the candidate's throws, which rolls the batch's transaction back
+     * with it — nothing is deleted, nothing is queued, and the run
+     * fails loudly for the catalog rather than taking another table's
+     * row quietly. See [DV_DELETE_SQL] for why the guard is not a WHERE
+     * predicate. `internal` so the guard test runs THIS check, not a
+     * copy of it.
+     */
+    internal fun guardedDelete(
+        h: Handle,
+        sql: String,
+        catalogId: Long,
+        tableId: Long,
+        victims: List<Long>,
+    ): Long {
+        val (deleted, foreign) =
+            h.createQuery(sql)
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bindArray("victims", Long::class.javaObjectType, victims)
+                .map { rs, _ -> rs.getLong("deleted") to rs.getLong("foreign_rows") }
+                .one()
+        check(foreign == 0L) {
+            "retirement batch for table $tableId of catalog $catalogId reached $foreign row(s) of another " +
+                "table through data_file_id alone; rolling the batch back"
+        }
+        return deleted
     }
 
     internal companion object {
@@ -1170,16 +1192,51 @@ class RetirementService(
          * `(catalog_id, data_file_id)`) — the partial
          * `one_live_per_data_file` index could not serve a statement
          * that carries no `end_snapshot` predicate.
+         *
+         * THE TABLE GUARD (#264) IS IN THE RETURNING, NOT THE WHERE.
+         * The victims came from [VICTIM_SELECT_SQL] under this same
+         * lock and belong to the table by construction; the guard is
+         * for the day they do not — a caller's slip, an identity that
+         * is no longer `(catalog_id, data_file_id)` alone — and it
+         * works by RETURNING each deleted row's `table_id` and counting
+         * the ones that are not the candidate's. A non-zero count
+         * throws in `guardedDelete`, which rolls the batch back: the
+         * foreign row is not deleted, its object is not queued, and the
+         * catalog's run fails loudly. `RetirementServiceIntegrationTest`
+         * hands each arm a foreign id and asserts exactly that.
+         *
+         * Why not `AND table_id = :tableId`: that predicate hands the
+         * planner `hog_delete_file_changefeed (catalog_id, table_id,
+         * begin_snapshot)` as an alternative to the id probe — walk the
+         * dropped table's vectors, filter the 8,000-element array per
+         * row — and on the V20 fixture (40,000 vectors, a third of them
+         * the table's) it TOOK it: 2,441 buffers per batch, proportional
+         * to the table rather than to the batch, repeated for every
+         * batch of the table. The RETURNING form leaves the WHERE as it
+         * was, so the plan is the one `V20RetirementMigrationIntegrationTest`
+         * pins against a populated hog_delete_file: the driver is
+         * `hog_delete_file_data_lookup`, and nothing is filtered.
+         *
+         * A vector whose `table_id` DISAGREES with its data file's (a
+         * row `CommitService` refuses to write, and the schema does not
+         * forbid) trips this guard too, as a stuck batch an operator
+         * can see — rather than the alternative under a predicate,
+         * where the arm would skip it and [DATA_DELETE_SQL]'s cascade
+         * would then take it away un-queued.
          */
         internal const val DV_DELETE_SQL: String =
             """
             WITH doomed AS (
                 DELETE FROM hog_delete_file
                 WHERE catalog_id = :catalogId AND data_file_id = ANY(:victims)
-                RETURNING path
+                RETURNING path, table_id
+            ), queued AS (
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                SELECT :catalogId, path, 'delete', '$REASON' FROM doomed
+                RETURNING 1
             )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'delete', '$REASON' FROM doomed
+            SELECT count(*) AS deleted, count(*) FILTER (WHERE table_id <> :tableId) AS foreign_rows
+              FROM doomed
             """
 
         /**
@@ -1204,16 +1261,28 @@ class RetirementService(
          * than taking the schema's word for it: measured flat at 42 ms
          * per 2,000-row batch against an empty hog_delete_file and
          * 48 ms against 100,000 rows in 2,128 heap pages.
+         *
+         * The table guard is the same RETURNING-and-count as
+         * [DV_DELETE_SQL]'s (#264), for the same reason: a `table_id`
+         * predicate would offer `hog_data_file_changefeed` and both
+         * maintenance-scan indexes, all leading on `(catalog_id,
+         * table_id)`, as a per-batch walk of the table. The V20 plan
+         * test pins the driver to `hog_data_file_pkey` and asserts no
+         * row is filtered.
          */
         internal const val DATA_DELETE_SQL: String =
             """
             WITH doomed AS (
                 DELETE FROM hog_data_file
                 WHERE catalog_id = :catalogId AND data_file_id = ANY(:victims)
-                RETURNING path
+                RETURNING path, table_id
+            ), queued AS (
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                SELECT :catalogId, path, 'data', '$REASON' FROM doomed
+                RETURNING 1
             )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'data', '$REASON' FROM doomed
+            SELECT count(*) AS deleted, count(*) FILTER (WHERE table_id <> :tableId) AS foreign_rows
+              FROM doomed
             """
     }
 }

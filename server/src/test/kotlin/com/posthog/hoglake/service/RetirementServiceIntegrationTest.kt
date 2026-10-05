@@ -19,7 +19,9 @@ import com.posthog.hoglake.testing.PgTestSupport
 import io.micrometer.prometheusmetrics.PrometheusConfig
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.useTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
@@ -263,6 +265,12 @@ class RetirementServiceIntegrationTest {
             ).bind("c", catalogId).bind("n", tableName).mapTo(Long::class.java).one()
         }
 
+    private fun dvCount(catalogId: Long): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery("SELECT count(*) FROM hog_delete_file WHERE catalog_id = :c")
+                .bind("c", catalogId).mapTo(Long::class.java).one()
+        }
+
     private fun queued(catalogId: Long): List<Triple<String, String, String>> =
         jdbi.withHandleUnchecked { h ->
             h.createQuery(
@@ -451,6 +459,50 @@ class RetirementServiceIntegrationTest {
             h.execute("DROP FUNCTION IF EXISTS inject_$tag()")
             h.execute("DROP SEQUENCE IF EXISTS inject_$tag")
         }
+
+    // ---- the table guard (#264) --------------------------------------------
+
+    @Test
+    fun `a lock-held delete that reaches another table's row rolls the batch back`() {
+        // The statements are keyed on (catalog_id, data_file_id), the
+        // whole identity today; the guard rides on what they RETURN. Run
+        // each arm directly with the keeper table's id over a victim
+        // list that names the keeper's file beside a doomed one — ids
+        // the victim select would never have produced together — and
+        // the arm throws, the transaction rolls back, and NOTHING is
+        // deleted or queued. Through the service's own `guardedDelete`,
+        // so a MUTATION that weakens its check (not a copy of it here)
+        // lets the keeper's row go, with its object queued.
+        val catalog = "ret-guard"
+        val f = seed(catalog, files = 2, dvs = 1)
+        val keeper = keeperTableId(f.catalogId)
+        val keeperFile =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT data_file_id FROM hog_data_file WHERE catalog_id = :c AND table_id = :t",
+                ).bind("c", f.catalogId).bind("t", keeper).mapTo(Long::class.java).one()
+            }
+        val foreign = listOf(keeperFile, f.fileIds[0])
+
+        val retirement = service()
+
+        fun arm(sql: String) =
+            assertThatThrownBy {
+                jdbi.useTransactionUnchecked { h ->
+                    retirement.guardedDelete(h, sql, f.catalogId, keeper, foreign)
+                }
+            }.isInstanceOf(IllegalStateException::class.java).hasMessageContaining("of another table")
+
+        // The DV arm: fileIds[0]'s vector belongs to doomed, not keeper.
+        arm(RetirementService.DV_DELETE_SQL)
+        // The data arm: fileIds[0] itself.
+        arm(RetirementService.DATA_DELETE_SQL)
+
+        assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+        assertThat(liveFiles(f.catalogId, "doomed")).isEqualTo(2)
+        assertThat(dvCount(f.catalogId)).isEqualTo(1)
+        assertThat(queued(f.catalogId)).isEmpty()
+    }
 
     // ---- the gate ----------------------------------------------------------
 

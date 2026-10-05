@@ -136,6 +136,20 @@ class V20RetirementMigrationIntegrationTest {
                 FROM generate_series(1, :n) g
                 """,
             ).bind("c", catalogId).bind("other", otherCatalogId).bind("n", LIVE_FILES).execute()
+            // Deletion vectors on every fifth file, `table_id` copied
+            // from the file's, so the DV delete's plan is read against
+            // a POPULATED relation: with `table_id` in its predicate
+            // (#264) the changefeed index is a candidate the planner
+            // must be seen to reject.
+            h.execute(
+                """
+                INSERT INTO hog_delete_file (catalog_id, delete_file_id, table_id, data_file_id,
+                                             begin_snapshot, path, delete_count, file_size_bytes)
+                SELECT catalog_id, data_file_id, table_id, data_file_id, 2,
+                       's3://v20/dv/' || data_file_id || '.puffin', 1, 64
+                  FROM hog_data_file WHERE data_file_id % 5 = 0
+                """,
+            )
         }
 
     private fun analyze() =
@@ -192,6 +206,7 @@ class V20RetirementMigrationIntegrationTest {
         return explain { h ->
             h.createQuery("EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) $sql")
                 .bind("catalogId", catalogId)
+                .bind("tableId", droppedTableId)
                 .bindArray("victims", Long::class.javaObjectType, victims)
                 .mapTo(String::class.java).list().joinToString("\n")
         }
@@ -400,6 +415,13 @@ class V20RetirementMigrationIntegrationTest {
         assertThat(dataDeletePlan)
             .describedAs("a per-batch sequential scan is the shape this excludes:%n%s", dataDeletePlan)
             .doesNotContain("Seq Scan on hog_data_file")
+        // The table guard (#264) lives in the RETURNING, so the scan
+        // carries no filter at all: a predicate form would have, and a
+        // PK scan whose filter removed every row would satisfy the two
+        // assertions above.
+        assertThat(scanNode(dataDeletePlan, "hog_data_file").rowsRemovedByFilter ?: 0L)
+            .describedAs("the delete must not filter a victim the select chose:%n%s", dataDeletePlan)
+            .isZero()
 
         // The DV arm has no `end_snapshot` clause on purpose — a
         // superseded vector must go too, or the data-file cascade takes
@@ -407,13 +429,26 @@ class V20RetirementMigrationIntegrationTest {
         // `hog_delete_file_one_live_per_data_file` cannot serve it. It
         // does not have to: `hog_delete_file_data_lookup` (V2) is
         // non-partial on exactly `(catalog_id, data_file_id)`, which is
-        // both this statement's key and the FK cascade's.
-        // `RetirementCostIntegrationTest` is where that index choice is
-        // measured, against a populated relation; this fixture's
-        // hog_delete_file is empty, so its plan says nothing.
+        // both this statement's key and the FK cascade's. The table
+        // guard (#264) is in the RETURNING for this reason: as a
+        // `table_id` predicate it handed the planner
+        // `hog_delete_file_changefeed (catalog_id, table_id,
+        // begin_snapshot)` — a walk of the table's vectors filtering
+        // the id array per row — and on this fixture the planner took
+        // it. hog_delete_file is populated here so that the choice is
+        // observed, not assumed.
         assertThat(RetirementService.DV_DELETE_SQL)
             .contains("data_file_id = ANY(:victims)")
             .doesNotContain("end_snapshot")
+        assertThat(driverIndex(dvDeletePlan, "hog_delete_file"))
+            .describedAs("the DV delete must probe by data_file_id, not walk the table's vectors:%n%s", dvDeletePlan)
+            .isEqualTo("hog_delete_file_data_lookup")
+        assertThat(dvDeletePlan)
+            .describedAs("a per-batch sequential scan is the shape this excludes:%n%s", dvDeletePlan)
+            .doesNotContain("Seq Scan on hog_delete_file")
+        assertThat(scanNode(dvDeletePlan, "hog_delete_file").rowsRemovedByFilter ?: 0L)
+            .describedAs("the delete must not filter a vector of a chosen victim:%n%s", dvDeletePlan)
+            .isZero()
         println("[#193] retirement data-file delete plan:\n$dataDeletePlan")
         println("[#193] retirement DV delete plan:\n$dvDeletePlan")
     }
