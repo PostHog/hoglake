@@ -1,7 +1,7 @@
-/* hoglake console — dense, legible, fully tokenized stylesheet.
-   Dark is the default palette; [data-theme="light"] swaps the tokens
-   (set on <html> by lib/theme.ts before first paint). Never hardcode a
-   color outside these two blocks. */
+@import "./color-themes.css";
+
+/* Base palettes. Configured palettes in color-themes.css override these
+   tokens. data-theme selects light or dark mode for either palette. */
 
 :root {
   color-scheme: dark;
@@ -102,6 +102,10 @@ h3 {
   font-size: 15px;
   color: var(--text);
   letter-spacing: 0.02em;
+}
+
+:root[data-color-theme] .topbar {
+  border-top: 3px solid var(--accent);
 }
 .brand:hover {
   text-decoration: none;
@@ -319,7 +323,7 @@ td.nullable-mark {
   white-space: nowrap;
 }
 tr.has-deletes {
-  background: rgba(229, 116, 95, 0.06);
+  background: color-mix(in srgb, var(--bad) 6%, transparent);
 }
 
 /* -- stats header -------------------------------------------------------- */
@@ -671,7 +675,7 @@ button.ghost:hover:not(:disabled) {
   margin: 8px 0;
   border: 1px solid var(--bad);
   border-radius: 6px;
-  background: rgba(229, 116, 95, 0.08);
+  background: color-mix(in srgb, var(--bad) 8%, transparent);
   color: var(--text);
 }
 .error-status {
@@ -1034,7 +1038,7 @@ button.ghost:hover:not(:disabled) {
   margin: 8px 0;
   border: 1px solid var(--warn);
   border-radius: 6px;
-  background: rgba(229, 181, 103, 0.08);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
   color: var(--warn);
 }
 

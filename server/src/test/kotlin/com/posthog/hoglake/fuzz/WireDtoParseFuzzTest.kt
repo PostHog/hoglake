@@ -9,6 +9,7 @@ import com.posthog.hoglake.api.AlterTableRequestDto
 import com.posthog.hoglake.api.ClaimUploadDto
 import com.posthog.hoglake.api.CommitRequestDto
 import com.posthog.hoglake.api.CreateCatalogRequestDto
+import com.posthog.hoglake.api.InstanceInfoDto
 import com.posthog.hoglake.api.PrepareTableCreationDto
 import com.posthog.hoglake.api.PublishTableCreationDto
 import com.posthog.hoglake.api.UploadOwnerDto
@@ -119,6 +120,13 @@ class WireDtoParseFuzzTest {
 
         parseOrNull { mapper.readValue<CreateCatalogRequestDto>(data) }?.let { dto ->
             check(mapper.readValue<CreateCatalogRequestDto>(mapper.writeValueAsBytes(dto)) == dto)
+        }
+
+        // Instance settings must retain their values and wire field names.
+        parseOrNull { mapper.readValue<InstanceInfoDto>(data) }?.let { dto ->
+            val encoded = mapper.writeValueAsBytes(dto)
+            check(mapper.readValue<InstanceInfoDto>(encoded) == dto)
+            check(mapper.readTree(encoded)["ui_theme"]?.asText() == dto.uiTheme)
         }
 
         // Every commit-shaped endpoint added for guarded DML receives
