@@ -143,6 +143,7 @@ object Database {
         ds.connection.use { conn ->
             awaitMigrationLock(conn)
             try {
+                logInFlightIndexBuilds(conn)
                 flywayConfig(ds).load().migrate()
             } finally {
                 conn.createStatement().use { st ->
@@ -221,6 +222,57 @@ object Database {
                 nextLog = System.nanoTime() + MIGRATION_LOCK_LOG_EVERY.toNanos()
             }
             Thread.sleep(MIGRATION_LOCK_POLL.toMillis())
+        }
+    }
+
+    /**
+     * Index builds running in this database right now, one line each
+     * (`pid`, command, phase, table, index), for the boot log.
+     *
+     * A migration behind a running REINDEX CONCURRENTLY (the 03:00 UTC
+     * reindex task, or an operator's) fails in one of two loud-but-opaque
+     * ways: an `ALTER TABLE` on the same table hits its 5 s lock_timeout
+     * and the pod crash-loops for the rebuild's duration, or a concurrent
+     * index build waits out the rebuild's snapshot past
+     * [MIGRATION_LOCK_WAIT]. Neither error names the build. This line does,
+     * before Flyway runs. `pg_stat_progress_create_index` is cluster-wide,
+     * hence the database filter; best-effort, never fails the boot.
+     */
+    fun inFlightIndexBuilds(conn: java.sql.Connection): List<String> =
+        runCatching {
+            conn.createStatement().use { st ->
+                st.executeQuery(
+                    """
+                    SELECT p.pid, p.command, p.phase,
+                           p.relid::regclass::text AS tbl,
+                           NULLIF(p.index_relid, 0)::regclass::text AS idx
+                      FROM pg_stat_progress_create_index p
+                     WHERE p.datid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                    """.trimIndent(),
+                ).use { rs ->
+                    buildList {
+                        while (rs.next()) {
+                            add(
+                                "pid=${rs.getInt("pid")} command=${rs.getString("command")} " +
+                                    "phase=${rs.getString("phase")} table=${rs.getString("tbl")} " +
+                                    "index=${rs.getString("idx")}",
+                            )
+                        }
+                    }
+                }
+            }
+        }.getOrElse { e ->
+            log.warn(e) { "could not read pg_stat_progress_create_index before migrating" }
+            emptyList()
+        }
+
+    private fun logInFlightIndexBuilds(conn: java.sql.Connection) {
+        for (build in inFlightIndexBuilds(conn)) {
+            log.warn {
+                "an index build is in flight while migrating ($build): a migration that ALTERs its " +
+                    "table will hit lock_timeout and one that builds an index concurrently will wait " +
+                    "out its snapshot; see AGENT.md §Reindex for the deploy note"
+            }
         }
     }
 

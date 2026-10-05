@@ -500,6 +500,10 @@ export interface DatabaseIndex {
   size_bytes: Int64;
   scans: Int64;
   constraint_backing: boolean;
+  /** Estimated bytes beyond a fresh build; absent when not estimable. */
+  estimated_bloat_bytes?: Int64;
+  /** Estimated actual / fresh size; absent when not estimable. */
+  estimated_bloat_ratio?: number;
 }
 
 export type FindingSeverity = "info" | "warn" | "critical";

@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.DatabaseIndexHealth
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
 import com.posthog.hoglake.model.FindingSeverity
+import com.posthog.hoglake.model.IndexBloatEstimate
 import com.posthog.hoglake.model.ReplicationSlot
 import com.posthog.hoglake.persistence.DatabaseHealthRepo
 import org.jdbi.v3.core.Jdbi
@@ -29,7 +30,11 @@ import org.jdbi.v3.core.kotlin.inTransactionUnchecked
  * something already feels wrong, and a screen of yellow teaches people
  * to ignore it.
  */
-class DatabaseHealthService(private val jdbi: Jdbi) {
+class DatabaseHealthService(
+    private val jdbi: Jdbi,
+    /** The bloat estimate's owner; its gauge is refreshed by every report. */
+    private val reindex: ReindexService = ReindexService(jdbi),
+) {
     fun report(): DatabaseHealth =
         jdbi.inTransactionUnchecked { handle ->
             // One transaction, so every number is from one MVCC snapshot:
@@ -39,7 +44,17 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
             val server = DatabaseHealthRepo.server(handle)
             val activity = DatabaseHealthRepo.activity(handle)
             val tables = DatabaseHealthRepo.tables(handle)
-            val indexes = DatabaseHealthRepo.indexes(handle)
+            // The bloat estimate rides the same snapshot. It reads the
+            // catalog and pg_stats only (ReindexService.ESTIMATE_SQL),
+            // which keeps this page's no-hog_*-rows rule.
+            val estimates = reindex.estimate(handle).associateBy { it.table to it.index }
+            val indexes =
+                DatabaseHealthRepo.indexes(handle).map { index ->
+                    estimates[index.table to index.name]?.let {
+                        index.copy(estimatedBloatBytes = it.excessBytes, estimatedBloatRatio = it.ratio)
+                    } ?: index
+                }
+            val bloated = estimates.values.filter { ReindexService.overThreshold(it) }
             val commitLocks = DatabaseHealthRepo.commitLocks(handle)
             val slots = DatabaseHealthRepo.replicationSlots(handle)
             val prepared = DatabaseHealthRepo.preparedTransactions(handle)
@@ -52,7 +67,7 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                 tables = tables,
                 indexes = indexes,
                 findings =
-                    findings(server, activity, tables, indexes, commitLocks, slots, prepared, invalid),
+                    findings(server, activity, tables, indexes, commitLocks, slots, prepared, invalid, bloated),
                 blindSpots = BLIND_SPOTS,
             )
         }
@@ -66,8 +81,41 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
         slots: List<ReplicationSlot> = emptyList(),
         preparedTransactions: Pair<Int, Double?> = 0 to null,
         invalidIndexes: List<DatabaseIndexHealth> = emptyList(),
+        bloatedIndexes: List<IndexBloatEstimate> = emptyList(),
     ): List<DatabaseFinding> {
         val found = mutableListOf<DatabaseFinding>()
+
+        // THE SAME PREDICATE THE REINDEX TASK REBUILDS ON, passed in
+        // already filtered by ReindexService.overThreshold, so the page
+        // cannot call an index bloated that the task would leave alone or
+        // the reverse. WARN, not INFO: an over-threshold index is paid on
+        // every write to its table and walked by every scan that uses it,
+        // and nothing but a rebuild ever returns the space.
+        if (bloatedIndexes.isNotEmpty()) {
+            val worst = bloatedIndexes.sortedByDescending { it.excessBytes ?: 0L }
+            found +=
+                DatabaseFinding(
+                    FindingSeverity.WARN,
+                    "index_bloat",
+                    "${bloatedIndexes.size} index(es) are over the bloat threshold, " +
+                        "${bytes(worst.sumOf { it.excessBytes ?: 0L })} estimated excess",
+                    worst.joinToString("; ") {
+                        "${it.table}.${it.index}: ${bytes(it.sizeBytes)}, ~${bytes(it.excessBytes ?: 0L)} " +
+                            "excess (%.1fx)".format(it.ratio ?: 0.0)
+                    } + ". Estimated from pg_stats (check_postgres arithmetic) as of the last " +
+                        "VACUUM/ANALYZE; threshold ${ReindexService.RATIO_THRESHOLD}x, or " +
+                        "${bytes(ReindexService.EXCESS_BYTES_THRESHOLD)} excess at " +
+                        "${ReindexService.EXCESS_MIN_RATIO}x. Deduplicated indexes (many equal " +
+                        "keys) are under-reported.",
+                    "Autovacuum never shrinks an index. On this schema bloat arrives in steps — " +
+                        "a retirement, an expiry purge, a large compaction — and stays: every " +
+                        "commit writes into the bloated index and every probe descends it. The " +
+                        "reindex task rebuilds the largest one per day at 03:00 UTC " +
+                        "(REINDEX INDEX CONCURRENTLY, on the pod with " +
+                        "HOGLAKE_REINDEX_INTERVAL_MS set); its ledger rows say what it did or " +
+                        "why it skipped. Several here at once is a backlog of days, not a fault.",
+                )
+        }
 
         if (invalidIndexes.isNotEmpty()) {
             found +=

@@ -383,6 +383,64 @@ object RetirementGauges {
 }
 
 /**
+ * `hoglake_index_bloat_bytes{table,index}` — the estimated bytes each
+ * btree index on a hog_* table carries beyond a freshly built copy of
+ * itself (`ReindexService.ESTIMATE_SQL`).
+ *
+ * A GAUGE because autovacuum never shrinks an index: after a large
+ * retirement the excess arrives in one step and stays until a REINDEX,
+ * so "how much, per index, right now" is the whole question. Published
+ * ONLY on the pod running the reindex loop (`ReindexService.publishGauge`):
+ * by the daily run (twice when it rebuilds, so the rebuilt index reads
+ * its new size at once) and by every metrics-sampler tick there
+ * (`App.metricsTick`). An API pod serving `GET /v1/database/health`
+ * computes the same estimate but never publishes it, so the series has
+ * one source and does not flap between pods.
+ *
+ * THE ROW SET IS REPLACED, never merged: the estimate enumerates every
+ * index, so a dropped or renamed one leaves the series on the next
+ * publish rather than reporting its last value forever. An index whose
+ * estimate cannot be made publishes NaN — present, so a dashboard sees
+ * the index, and never a fabricated zero an alert would read as healthy.
+ */
+object IndexBloatGauges {
+    @Volatile
+    private var bound: Pair<MeterRegistry, MultiGauge>? = null
+
+    private fun gauge(): MultiGauge? {
+        val registry = Metrics.boundRegistry ?: return null
+        bound?.let { (boundRegistry, gauge) -> if (boundRegistry === registry) return gauge }
+        val gauge =
+            MultiGauge.builder("hoglake_index_bloat_bytes")
+                .description(
+                    "Estimated bytes a hog_* btree index carries beyond a freshly built copy (NaN = no estimate)",
+                )
+                .register(registry)
+        bound = registry to gauge
+        return gauge
+    }
+
+    /** Replace the published set with [estimates]. */
+    fun publish(estimates: List<com.posthog.hoglake.model.IndexBloatEstimate>) {
+        val gauge = gauge() ?: return
+        gauge.register(
+            estimates.map {
+                MultiGauge.Row.of(
+                    Tags.of("table", it.table, "index", it.index),
+                    it.excessBytes?.toDouble() ?: Double.NaN,
+                )
+            },
+            true,
+        )
+    }
+
+    /** Forget the registry binding (tests). */
+    fun clear() {
+        bound = null
+    }
+}
+
+/**
  * One catalog's live totals, as of the last metrics sample.
  *
  * Retained rather than recomputed: the sampler already produces these

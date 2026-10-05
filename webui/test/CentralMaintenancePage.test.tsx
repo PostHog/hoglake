@@ -288,4 +288,48 @@ describe("CentralMaintenancePage", () => {
       expect.stringContaining("HOGLAKE_RETIREMENT_QUEUE_CEILING"),
     );
   });
+
+  describe("reindex cell", () => {
+    const withReindex = (lastRun: Record<string, unknown>) => ({
+      catalogs: [
+        {
+          ...instanceMaintenanceStatusFixture.catalogs[0],
+          tasks: instanceMaintenanceStatusFixture.catalogs[0].tasks.map((t) =>
+            t.task === "reindex" && t.last_run ? { ...t, last_run: { ...t.last_run, ...lastRun } } : t,
+          ),
+        },
+      ],
+      has_more: false,
+    });
+    const named = {
+      checked: 67, over_threshold: 1, invalid_dropped: 0,
+      index: "hog_file_column_stats_pkey", table: "hog_file_column_stats",
+      expected_bytes: 20000000000,
+    };
+
+    it.each([
+      ["too_large", { result: { ...named, skipped_reason: "too_large" } },
+        "skipped: too_large (hog_file_column_stats_pkey)"],
+      ["last_attempt_failed", { result: { ...named, skipped_reason: "last_attempt_failed" } },
+        "skipped: last_attempt_failed (hog_file_column_stats_pkey)"],
+      ["a failed rebuild", {
+        status: "failed",
+        error: "canceling statement due to statement timeout",
+        result: { ...named, before_bytes: 26000000000 },
+      }, "failed: hog_file_column_stats_pkey"],
+    ])("renders %s as what it is, never as rebuilt, and warns", async (_name, lastRun, text) => {
+      mockCentral({ status: withReindex(lastRun) });
+      renderApp("/maintenance");
+      const cell = await screen.findByText(text as string);
+      expect(cell).toHaveClass("backlog-bad");
+      expect(screen.queryByText(/^rebuilt /)).not.toBeInTheDocument();
+    });
+
+    it("renders a rebuild quietly", async () => {
+      mockCentral();
+      renderApp("/maintenance");
+      const cell = await screen.findByText("rebuilt hog_data_file_path");
+      expect(cell).toHaveClass("subtle");
+    });
+  });
 });

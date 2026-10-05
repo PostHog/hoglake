@@ -54,7 +54,7 @@ class MaintenanceApiTest {
     // about the endpoint reporting THIS PROCESS's cadence and a 0 on
     // both sides could not tell "reported correctly" from "defaulted
     // on both sides".
-    private val cfg = Config(hydratorIntervalMs = 0, retirementIntervalMs = 120_000)
+    private val cfg = Config(hydratorIntervalMs = 0, retirementIntervalMs = 120_000, reindexIntervalMs = 300_000)
     private val app = App.build(cfg, db.jdbi)
     private val json = ObjectMapper()
 
@@ -112,6 +112,7 @@ class MaintenanceApiTest {
                         cleanupIntervalMs = 60_000,
                         compactionIntervalMs = 0,
                         retirementIntervalMs = cfg.retirementIntervalMs,
+                        reindexIntervalMs = cfg.reindexIntervalMs,
                         smallFileThresholdBytes = 512L * 1024 * 1024,
                     ),
                     DatabaseHealthService(db.jdbi),
@@ -484,6 +485,7 @@ class MaintenanceApiTest {
                     "cleanup",
                     "compaction",
                     "retirement",
+                    "reindex",
                 )
 
             val expiry = tasks.getValue("expiry")
@@ -524,6 +526,16 @@ class MaintenanceApiTest {
             // driver, and the route must 404 rather than quietly exist.
             assertThat(client.postJson("/v1/catalogs/mnt-status/maintenance/retire").status)
                 .isEqualTo(HttpStatusCode.NotFound)
+            // Reindex: the POLL interval this app was built with, and an
+            // empty backlog — bloat is a property of the database, which
+            // the health page reports, not of this catalog.
+            val reindex = tasks.getValue("reindex")
+            assertThat(reindex["loop_interval_ms"].asLong()).isEqualTo(cfg.reindexIntervalMs)
+            assertThat(cfg.reindexIntervalMs)
+                .describedAs("a value of 0 could not tell a wired interval from a defaulted one")
+                .isNotZero()
+            assertThat(reindex["last_run"].isNull).isTrue()
+            assertThat(reindex["backlog"].isEmpty).isTrue()
 
             // No sampler has run: unknown backlogs must not masquerade as zero.
             assertThat(tasks.getValue("cleanup")["backlog"].has("queued_removals")).isFalse()
@@ -624,7 +636,7 @@ class MaintenanceApiTest {
             val byName = status["catalogs"].associateBy { it["catalog"].asText() }
             val a = byName.getValue("mnt-inst-a")
             assertThat(a["tasks"].map { it["task"].asText() })
-                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "retirement")
+                .containsExactly("hydrator", "expiry", "cleanup", "compaction", "retirement", "reindex")
             // The one expire run is visible, carrying its catalog name.
             assertThat(a["tasks"].first { it["task"].asText() == "expiry" }["last_run"]["catalog"].asText())
                 .isEqualTo("mnt-inst-a")

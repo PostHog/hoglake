@@ -150,6 +150,18 @@ const INT64_FIELDS = new Set([
   "rows_retired",
   "tables_remaining",
   "failed_groups",
+  // Reindex results (ReindexResult) and the health page's per-index
+  // estimate. `checked` and `over_threshold` are names no other schema
+  // uses; the byte counts are compared as BigInt in the console.
+  "checked",
+  "over_threshold",
+  "before_bytes",
+  "expected_bytes",
+  "excluded",
+  "after_bytes",
+  "duration_ms",
+  "invalid_dropped",
+  "estimated_bloat_bytes",
   "claimed_elsewhere",
   "candidates_fetched",
   "buckets_considered",
