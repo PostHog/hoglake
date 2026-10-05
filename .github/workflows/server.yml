@@ -43,6 +43,25 @@ jobs:
               # server suite too.
               - "pyhoglake/tests/vectors/**"
               - ".github/workflows/server.yml"
+              - ".github/workflows/python-live.yml"
+              - "ci/**"
+
+  python-live:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    uses: ./.github/workflows/python-live.yml
+
+  # Deployment requires both suites. Run this gate only for server changes.
+  server-checks:
+    if: always() && needs.changes.outputs.server == 'true'
+    needs: [changes, server-test, python-live]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both suites
+        env:
+          SERVER_RESULT: ${{ needs.server-test.result }}
+          LIVE_RESULT: ${{ needs.python-live.result }}
+        run: test "$SERVER_RESULT" = success && test "$LIVE_RESULT" = success
 
   server-test:
     needs: changes
@@ -180,12 +199,9 @@ jobs:
           [ "${ok:-}" = "1" ]
 
   deploy:
-    # GATED ON CI: a main push deploys only after both suites pass —
-    # a deliberate deviation from the millpond/duckgres convention of
-    # running CD in parallel with CI (decided 2026-09-11). A main push
-    # that touched nothing of the server's skips server-test, and this
-    # job with it: `success()` is implied, and a skipped need is not.
-    needs: [server-test]
+    # Server deployment requires the server suite and both live client suites.
+    # Unrelated changes skip server-checks and this job.
+    needs: [server-checks]
     # Forks must not push images or deployment dispatches.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest

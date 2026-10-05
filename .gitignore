@@ -56,3 +56,6 @@ dist/
 # Editors
 .idea/
 .vscode/
+
+# Local and CI test reports
+.artifacts/

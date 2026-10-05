@@ -10,7 +10,7 @@ mod bench
 default:
     @just --list
 
-# Full verification: server then client suites (client integration skips unless a server is up; `just dev` first for end-to-end)
+# Server and pyhoglake tests. Also run `just live-python` for required live checks.
 test-all:
     just server test
     just pyhoglake test
@@ -44,3 +44,8 @@ down:
 # Tear down AND wipe all state (drops the named volumes).
 down-volumes:
     docker compose -f server/docker-compose.yml --profile full down -v
+
+# Required live client tests, with an isolated stack built from this checkout.
+# Logs and JUnit reports go to .artifacts/live-python/. No skipped tests allowed.
+live-python:
+    cd server && flox activate -- bash ../ci/live-python.sh
