@@ -164,8 +164,29 @@ in your shell to retain the selection.
 
 Each theme has light and dark palettes. The UI follows the system display
 mode until you use the light/dark switch. It saves that mode in the browser.
-The configured color theme always comes from the server. The colored header
-border helps you identify the instance. Keep an instance name as a text label.
+The color theme comes from the server unless the browser overrides it (below).
+The colored header border helps you identify the instance. Keep an instance
+name as a text label.
+
+### Per-browser override
+
+The **color theme** picker in the top bar (beside the light/dark switch)
+chooses a palette for that browser only and previews it as you move
+through the list. "instance" returns to the server's choice. The pick is
+a `hoglake-color-theme` cookie, which you can also set from the devtools
+console on the console's origin:
+
+```js
+document.cookie = "hoglake-color-theme=nord; path=/; max-age=31536000";
+```
+
+A value that is not a theme name (`default`, a typo) is ignored and the
+server's `ui_theme` applies. Reload after changing it. To go back to the
+instance theme, expire the cookie or set it to `default`:
+
+```js
+document.cookie = "hoglake-color-theme=; path=/; max-age=0";
+```
 
 Use one of these values (case is ignored). Each preview shows the actual UI
 background, text, accent, and status colors:
