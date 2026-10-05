@@ -3,25 +3,50 @@ name: Server
 on:
   push:
     branches: [main]
-    paths:
-      - "server/**"
-      # The Kotlin↔Python codec bit-compatibility gate reads the shared
-      # vector file from the Python tree (QeBoundsVectorsTest) — a
-      # vectors-only PR must run the server suite too.
-      - "pyhoglake/tests/vectors/**"
-      - ".github/workflows/server.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "server/**"
-      - "pyhoglake/tests/vectors/**"
-      - ".github/workflows/server.yml"
 
 permissions:
   contents: read
 
 jobs:
-  test:
+  # EVERY PR AND MAIN PUSH RUNS THIS WORKFLOW; the path filter lives in
+  # this job, not on the trigger. The main ruleset requires `server-test`
+  # on every PR, and a required check has to be PRODUCED on every PR: a
+  # workflow that path-filters itself out leaves the check "expected"
+  # forever and the PR cannot merge (#301 moved the migration gate out
+  # of this file for exactly that; a Python-only PR was left with no
+  # `test` at all). A job skipped by `if:` reports `skipped`, which the
+  # ruleset accepts. So this job decides, in seconds, and the heavy
+  # jobs condition on its answer.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+        id: filter
+        with:
+          filters: |
+            server:
+              - "server/**"
+              # The Kotlin↔Python codec bit-compatibility gate reads the
+              # shared vector file from the Python tree
+              # (QeBoundsVectorsTest) — a vectors-only PR must run the
+              # server suite too.
+              - "pyhoglake/tests/vectors/**"
+              - ".github/workflows/server.yml"
+
+  server-test:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -54,6 +79,8 @@ jobs:
     # runner. Deliberately NOT in deploy's `needs` and not a required
     # check: a broken fork build or a flaky ~1GB pull must never wedge
     # hoglake CD (that failure mode killed the original job).
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     concurrency:
@@ -102,7 +129,8 @@ jobs:
     # The deployable image must assemble and BOOT from every PR —
     # build-only checks miss runtime breakage (read-only-rootfs and
     # boot-order findings both got past a build-only gate in review).
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -154,8 +182,10 @@ jobs:
   deploy:
     # GATED ON CI: a main push deploys only after both suites pass —
     # a deliberate deviation from the millpond/duckgres convention of
-    # running CD in parallel with CI (decided 2026-09-11).
-    needs: [test]
+    # running CD in parallel with CI (decided 2026-09-11). A main push
+    # that touched nothing of the server's skips server-test, and this
+    # job with it: `success()` is implied, and a skipped need is not.
+    needs: [server-test]
     # Forks must not push images or deployment dispatches.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest
