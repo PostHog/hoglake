@@ -492,6 +492,21 @@ button.theme-toggle:hover {
   color: var(--text);
   border-color: var(--text-dim);
 }
+/* Sits beside theme-toggle and takes its quiet look rather than the
+   140px form-control default: it is a preference, not a page filter. */
+select.color-theme-picker {
+  min-width: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 1px 4px;
+  line-height: 1.4;
+}
+select.color-theme-picker:hover,
+select.color-theme-picker:focus {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
 
 .consumer-group {
   margin-bottom: 20px;
