@@ -46,10 +46,11 @@ python3 -m unittest discover -s "$repo_dir/ci" -p 'test_*.py'
 ) 2>&1 | tee "$report_dir/build.log"
 "${compose[@]}" up -d --wait --wait-timeout 90 postgres minio
 
+# The deferred-stats integration test requires the hydrator loop.
 env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
     HOGLAKE_DB_USER=hoglake HOGLAKE_DB_PASSWORD=hoglake \
     HOGLAKE_INSTANCE_NAME="$project" \
-    HOGLAKE_HYDRATOR_INTERVAL_MS=0 HOGLAKE_EXPIRY_INTERVAL_MS=0 \
+    HOGLAKE_HYDRATOR_INTERVAL_MS=1000 HOGLAKE_EXPIRY_INTERVAL_MS=0 \
     HOGLAKE_CLEANUP_INTERVAL_MS=0 HOGLAKE_COMPACTION_INTERVAL_MS=0 \
     HOGLAKE_RETIREMENT_INTERVAL_MS=0 HOGLAKE_REINDEX_INTERVAL_MS=0 \
     HOGLAKE_METRICS_INTERVAL_MS=0 HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS=0 \

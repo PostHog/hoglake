@@ -93,8 +93,9 @@ def test_buffered_cli_restart_publishes_native_variant(live_server_url, tmp_path
             }
             for i, (team, month) in enumerate([(1, 1), (1, 2), (2, 1)])
         ]
-        source.append(pa.Table.from_pylist(rows, schema=schema))
-        source_files = source.scan_plan()
+        appended = source.append(pa.Table.from_pylist(rows, schema=schema))
+        source_files = source.scan_plan(snapshot=appended.snapshot_id)
+        assert len(source_files) == 1
         settings = {
             "endpoint": S3_ENDPOINT,
             "access_key": S3_ACCESS_KEY,
@@ -162,7 +163,10 @@ raise SystemExit(main(sys.argv[1:]))
         assert info_at_head(destination_catalog, destination).record_count == 1
         run_cli()  # exact receipt retry, then remaining ready partitions
         assert info_at_head(destination_catalog, destination).record_count == 3
-        published = destination.scan_plan()
+        published = destination.scan_plan(
+            snapshot=destination_catalog.refresh().head_snapshot_id
+        )
+        assert len(published) == len(rows)
         run_cli()  # another restart cannot duplicate the publication
         assert info_at_head(destination_catalog, destination).record_count == 3
         assert (
