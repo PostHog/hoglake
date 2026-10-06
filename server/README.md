@@ -236,6 +236,52 @@ here scales with that number — the hydrator's sweep, the expiry and
 retirement arithmetic, and the commit receipt, whose stored request body
 is the one that grows fastest (hoglake#240).
 
+### Packed MergeTree format
+
+A table may set `write.format.default=clickhouse-mergetree-packed` at creation. Absence means
+`parquet`, and the effective value is immutable. Every registration must match its table format.
+The packed contract is deliberately narrow: one registered object contains the bytes of one
+ClickHouse `data.packed` part, counts-only stats are sufficient (per-column bounds are not required), and
+`footer_size` plus Parquet `split_offsets` are forbidden.
+
+Creation is behind `HOGLAKE_PACKED_MERGETREE_ENABLED`, default `false`. The rollout order is:
+
+1. Deploy the migration and packed-aware server binary to every replica with the gate off.
+2. Verify no older API replica remains. The gate prevents packed table creation while the fleet is mixed.
+3. Set `HOGLAKE_PACKED_MERGETREE_ENABLED=true` on every replica that can receive table-creation
+   requests and complete that rollout.
+4. Only then create packed tables and start packed writers.
+
+**No rollback past V26 once a packed table exists**: older server binaries do not filter on format in
+their compaction candidate queries and will fail if run against a catalog containing packed tables.
+
+Turning the gate off again prevents new packed tables; it does not make existing packed tables
+unreadable or change their immutable format.
+
+Packed tables are append-only, unpartitioned, unsorted, and fixed-schema. They admit only the
+scalar types covered by the Python `ClickHousePackedAdapter`: boolean, signed and unsigned integers,
+float, double, string, binary, date, and timestamp variants, within the configured ClickHouse
+version's `Date32` and `DateTime64` value ranges. Column add, drop, rename, promotion, column-comment
+changes, partition or sort changes, truncate, and deletion-vector commits are refused. Table comments,
+unrelated table properties, table rename, and drop remain valid.
+The Python adapter exports only a part directory containing exactly `data.packed`; projections and
+ClickHouse metadata that escape that file are outside this format.
+
+Upload claims accept `file_format=clickhouse-mergetree-packed`, persist that selection, and mint a
+fresh `.packed` path. Publication verifies the claimed format and settles the claim in the same
+transaction as the file row. The table identity row stores the immutable format on `hog_table.file_format`
+as the single source of truth, enforced strictly at the service layer. The Parquet hydrator filters
+to `file_format='parquet'`, and both compaction candidate selection and direct planned-group execution
+refuse packed inputs. The maintenance debt sampler excludes non-Parquet tables so packed tables never
+leak permanent small-file debt into debt scores or metrics. Expiry, retirement, removal-queue fencing,
+snapshots, row-range allocation, and exact-path cleanup keep their existing one-row/one-object behavior.
+
+The DuckDB extension and Hedgerow reject packed tables and files. The Python adapter is the only
+reader and writer in this repository. It materializes an exact snapshot's registered part list into
+an isolated `clickhouse local` table and enables `table_readonly` after attachment. This is a local
+correctness adapter, not evidence of remote-read performance, cross-version ClickHouse compatibility,
+or support in Trino or the planned Iceberg facade.
+
 ### Row lineage
 
 Every append gets a contiguous row-id range per file

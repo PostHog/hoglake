@@ -89,6 +89,26 @@ class AlterService(private val jdbi: Jdbi) {
                         currentTableUuid = t.tableUuid,
                     )
                 }
+                ops.filterIsInstance<AlterOp.SetProperties>().forEach {
+                    TableMetadata.validateProperties(it.properties)
+                    TableMetadata.requireFormatUnchanged(t.properties, it.properties)
+                }
+                if (t.fileFormat != com.posthog.hoglake.model.FileFormats.PARQUET) {
+                    // An allow-list, so an AlterOp added later fails closed on a
+                    // fixed-schema table instead of silently rewriting its columns
+                    // or specs.
+                    val unsupported =
+                        ops.firstOrNull {
+                            it !is AlterOp.RenameTable && it !is AlterOp.SetTableComment &&
+                                it !is AlterOp.SetProperties
+                        }
+                    if (unsupported != null) {
+                        throw HoglakeException.Validation(
+                            "packed MergeTree tables have a fixed schema and do not support " +
+                                (unsupported::class.simpleName ?: "this alter operation"),
+                        )
+                    }
+                }
                 if (readSnapshot != null) {
                     val head = CatalogRepo.findByName(h, catalog)!!
                     if (readSnapshot < 0 || readSnapshot > head.headSnapshotId) {
@@ -249,7 +269,7 @@ class AlterService(private val jdbi: Jdbi) {
         }
         is AlterOp.SetProperties -> {
             TableMetadata.validateProperties(op.properties)
-            state.properties = op.properties.toMap()
+            state.properties = com.posthog.hoglake.model.FileFormats.canonicalProperties(op.properties)
             rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
         }
     }

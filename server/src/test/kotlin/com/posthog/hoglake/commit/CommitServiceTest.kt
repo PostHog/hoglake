@@ -3,6 +3,7 @@ package com.posthog.hoglake.commit
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
@@ -327,6 +328,33 @@ class CommitServiceTest {
             snapshotId
         }
 
+    private fun setTableFormat(
+        fixture: Fixture,
+        tableId: Long,
+        format: String,
+    ) {
+        jdbi.useHandle<Exception> { h ->
+            h.createUpdate(
+                "UPDATE hog_table SET file_format = :format WHERE catalog_id = :catalogId AND table_id = :tableId",
+            )
+                .bind("format", format)
+                .bind("catalogId", fixture.catalogId)
+                .bind("tableId", tableId)
+                .execute()
+            h.createUpdate(
+                """
+                UPDATE hog_table_version
+                   SET properties = CAST(:properties AS jsonb)
+                 WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
+                """,
+            )
+                .bind("properties", "{\"${FileFormats.TABLE_PROPERTY}\":\"$format\"}")
+                .bind("catalogId", fixture.catalogId)
+                .bind("tableId", tableId)
+                .execute()
+        }
+    }
+
     private fun file(
         path: String,
         records: Long,
@@ -565,6 +593,129 @@ class CommitServiceTest {
         assertThat(files).hasSize(1)
         assertThat(files[0].statsState).isEqualTo("pending")
         assertThat(statsRowCount(fx.catalogId)).isEqualTo(0)
+    }
+
+    @Test
+    fun `packed registration persists its format with provided stats`() {
+        val fx = seed()
+        val (tableId, _) = fx.tables.getValue("events")
+        setTableFormat(fx, tableId, FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        val packed =
+            FileRegistration(
+                path = "s3://b/data/part.packed",
+                recordCount = 9,
+                fileSizeBytes = 100,
+                columnStats = emptyList(),
+                fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+            )
+        // column_stats is optional for packed (counts only). The hydrator never
+        // claims a packed file, so a 'pending' row would stay pending forever.
+        val withoutStats = packed.copy(path = "s3://b/data/part2.packed", columnStats = null)
+
+        service.commit(
+            "cat",
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(packed, withoutStats)))),
+        )
+
+        jdbi.useHandle<Exception> { h ->
+            assertThat(
+                h.createQuery(
+                    "SELECT file_format || '/' || stats_state FROM hog_data_file " +
+                        "WHERE catalog_id = :catalogId ORDER BY path",
+                )
+                    .bind("catalogId", fx.catalogId)
+                    .mapTo(String::class.java)
+                    .list(),
+            ).containsExactly(
+                "${FileFormats.CLICKHOUSE_MERGETREE_PACKED}/provided",
+                "${FileFormats.CLICKHOUSE_MERGETREE_PACKED}/provided",
+            )
+        }
+    }
+
+    @Test
+    fun `packed registration rejects parquet metadata and mismatched formats`() {
+        val fx = seed()
+        val (tableId, _) = fx.tables.getValue("events")
+        setTableFormat(fx, tableId, FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        val valid =
+            FileRegistration(
+                path = "s3://b/data/part.packed",
+                recordCount = 1,
+                fileSizeBytes = 100,
+                columnStats = emptyList(),
+                fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+            )
+        val invalid =
+            listOf(
+                valid.copy(fileFormat = FileFormats.PARQUET),
+                valid.copy(footerSize = 20),
+                valid.copy(splitOffsets = listOf(0)),
+                valid.copy(recordCount = 0),
+                valid.copy(fileSizeBytes = 0),
+            )
+        for (registration in invalid) {
+            assertThatThrownBy {
+                service.commit(
+                    "cat",
+                    CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(registration)))),
+                )
+            }.isInstanceOf(HoglakeException.Validation::class.java)
+            assertThat(dataFiles(fx.catalogId)).isEmpty()
+        }
+        val receipt =
+            service.commit(
+                "cat",
+                CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(valid.copy(columnStats = null))))),
+            )
+        assertThat(receipt.snapshotId).isPositive()
+    }
+
+    @Test
+    fun `packed tables reject deletion vectors`() {
+        val fx = seed()
+        val (tableId, _) = fx.tables.getValue("events")
+        setTableFormat(fx, tableId, FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        val append =
+            service.commit(
+                "cat",
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "events",
+                                listOf(
+                                    FileRegistration(
+                                        "s3://b/data/part.packed",
+                                        3,
+                                        100,
+                                        columnStats = emptyList(),
+                                        fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                                    ),
+                                ),
+                            ),
+                        ),
+                ),
+            )
+
+        assertThatThrownBy {
+            service.commit(
+                "cat",
+                CommitRequest(
+                    readSnapshot = append.snapshotId,
+                    deletes =
+                        listOf(
+                            TableDeletes(
+                                "ns",
+                                "events",
+                                listOf(DeleteFileRegistration(1, "s3://b/data/delete.puffin", 1, 10)),
+                            ),
+                        ),
+                ),
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("does not support deletion vectors")
     }
 
     @Test

@@ -1,5 +1,6 @@
 package com.posthog.hoglake.service
 
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.persistence.CatalogRepo
 import org.jdbi.v3.core.Handle
@@ -9,12 +10,19 @@ import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Instant
 import java.util.UUID
 
+internal data class UploadRegistration(
+    val path: String,
+    val fileKind: String,
+    val fileFormat: String? = null,
+)
+
 data class UploadClaim(
     val uploadId: UUID,
     val owner: UUID,
     val prefix: String,
     val path: String,
     val fileKind: String,
+    val fileFormat: String?,
     val state: String,
     val expiresAt: Instant,
 )
@@ -67,12 +75,32 @@ class UploadService(
         owner: UUID,
         prefix: String,
         kind: String,
+        fileFormat: String? = null,
     ): UploadClaim =
         inCatalog(catalog, "upload_claim") { h, catalogId ->
             if (kind !in setOf("data", "delete")) throw HoglakeException.Validation("invalid upload file_kind")
+            val effectiveFormat =
+                if (kind == "data") {
+                    fileFormat ?: FileFormats.PARQUET
+                } else {
+                    if (fileFormat != null) {
+                        throw HoglakeException.Validation("file_format is valid only for data uploads")
+                    }
+                    null
+                }
+            if (effectiveFormat != null && effectiveFormat !in FileFormats.allowed) {
+                throw HoglakeException.Validation("invalid upload file_format '$effectiveFormat'")
+            }
+            val suffix =
+                when (effectiveFormat) {
+                    FileFormats.PARQUET -> "parquet"
+                    FileFormats.CLICKHOUSE_MERGETREE_PACKED -> "packed"
+                    null -> "puffin"
+                    else -> error("validated upload format $effectiveFormat")
+                }
             val normalized = prefix.trimEnd('/')
             val cat = CatalogRepo.require(h, catalog)
-            val path = "$normalized/trino-upload/${UUID.randomUUID()}.${if (kind == "data") "parquet" else "puffin"}"
+            val path = "$normalized/trino-upload/${UUID.randomUUID()}.$suffix"
             val root = cat.dataPath.trimEnd('/') + "/"
             if (!path.startsWith(root) || path.any { it.isWhitespace() || it.isISOControl() } ||
                 path.removePrefix(root).split('/').any { it.isEmpty() || it == "." || it == ".." }
@@ -85,14 +113,21 @@ class UploadService(
             // changed the definition.
             h.createUpdate(
                 """
-                INSERT INTO hog_upload (catalog_id, upload_id, owner, prefix, path, file_kind)
-                VALUES (:catalog, :id, :owner, :prefix, :path, :kind)
+                INSERT INTO hog_upload
+                    (catalog_id, upload_id, owner, prefix, path, file_kind, file_format)
+                VALUES
+                    (:catalog, :id, :owner, :prefix, :path, :kind, :fileFormat)
                 ON CONFLICT (catalog_id, upload_id) DO NOTHING
             """,
             ).bind("catalog", catalogId).bind("id", id).bind("owner", owner)
-                .bind("prefix", normalized).bind("path", path).bind("kind", kind).execute()
+                .bind("prefix", normalized).bind("path", path).bind("kind", kind)
+                .bind("fileFormat", effectiveFormat).execute()
             val claim = load(h, catalogId, id)
-            if (claim.owner != owner || claim.prefix != normalized || claim.fileKind != kind) {
+            val claimedFormat =
+                claim.fileFormat ?: if (claim.fileKind == "data") FileFormats.PARQUET else null
+            if (claim.owner != owner || claim.prefix != normalized || claim.fileKind != kind ||
+                claimedFormat != effectiveFormat || !claim.path.endsWith(".$suffix")
+            ) {
                 throw HoglakeException.CommitConflict("upload identity was reused with a different definition")
             }
             claim
@@ -344,7 +379,7 @@ class UploadService(
          */
         internal const val REGISTER_CLAIMS_SQL: String =
             """
-            SELECT upload_id, owner, prefix, path, file_kind, state, expires_at
+            SELECT upload_id, owner, prefix, path, file_kind, file_format, state, expires_at
             FROM hog_upload WHERE catalog_id = :catalog AND path = ANY(:paths)
             ORDER BY upload_id
             FOR UPDATE
@@ -398,6 +433,7 @@ class UploadService(
                     rs.getString("prefix"),
                     rs.getString("path"),
                     rs.getString("file_kind"),
+                    rs.getString("file_format"),
                     rs.getString("state"),
                     rs.getTimestamp("expires_at").toInstant(),
                 )
@@ -410,7 +446,7 @@ class UploadService(
         ): UploadClaim =
             h.createQuery(
                 """
-            SELECT upload_id, owner, prefix, path, file_kind, state, expires_at FROM hog_upload
+            SELECT upload_id, owner, prefix, path, file_kind, file_format, state, expires_at FROM hog_upload
             WHERE catalog_id = :catalog AND upload_id = :id
         """,
             ).bind("catalog", catalogId).bind("id", id).map(claimMapper).one()
@@ -420,12 +456,14 @@ class UploadService(
             h: Handle,
             catalogId: Long,
             owner: UUID?,
-            files: List<Pair<String, String>>,
+            files: List<UploadRegistration>,
         ) {
             if (files.isEmpty()) return
-            val kinds = files.toMap()
-            if (files.any { (path, kind) -> kinds[path] != kind }) {
-                throw HoglakeException.Validation("one upload path cannot hold both data and deletion vectors")
+            val byPath = files.associateBy { it.path }
+            if (files.any { byPath[it.path] != it }) {
+                throw HoglakeException.Validation(
+                    "one upload path cannot hold different file kinds or formats",
+                )
             }
             // FOR UPDATE: the claim transitions no longer serialize on the
             // catalog commit lock, so this read-then-settle pair holds the
@@ -438,7 +476,7 @@ class UploadService(
             // the same rows at the same time.
             val claims =
                 h.createQuery(REGISTER_CLAIMS_SQL)
-                    .bind("catalog", catalogId).bindArray("paths", String::class.java, kinds.keys)
+                    .bind("catalog", catalogId).bindArray("paths", String::class.java, byPath.keys)
                     .map(claimMapper).list()
             // Preserve the existing catalog contract: immutable objects still referenced
             // at a retained snapshot may be referenced again. Ownership never permits
@@ -446,10 +484,10 @@ class UploadService(
             val retained =
                 h.createQuery(
                     """
-                SELECT path, 'data' AS file_kind FROM hog_data_file
+                SELECT path, 'data' AS file_kind, file_format FROM hog_data_file
                 WHERE catalog_id = :catalog AND path = ANY(:paths)
                 UNION
-                SELECT path, 'delete' AS file_kind FROM hog_delete_file
+                SELECT path, 'delete' AS file_kind, NULL::text AS file_format FROM hog_delete_file
                 WHERE catalog_id = :catalog AND path = ANY(:paths)
             """,
                 ).bind("catalog", catalogId).bindArray(
@@ -457,14 +495,24 @@ class UploadService(
                     String::class.java,
                     claims.filter { it.state == "registered" }.map { it.path },
                 )
-                    .map { rs, _ -> rs.getString("path") to rs.getString("file_kind") }.list().toSet()
+                    .map { rs, _ ->
+                        UploadRegistration(
+                            rs.getString("path"),
+                            rs.getString("file_kind"),
+                            rs.getString("file_format"),
+                        )
+                    }
+                    .list()
+                    .toSet()
             for (claim in claims) {
-                if (claim.state == "registered" && claim.fileKind == kinds[claim.path] &&
-                    (claim.path to claim.fileKind) in retained
-                ) {
+                val requested = byPath.getValue(claim.path)
+                val claimedFormat =
+                    claim.fileFormat ?: if (claim.fileKind == "data") FileFormats.PARQUET else null
+                val claimed = UploadRegistration(claim.path, claim.fileKind, claimedFormat)
+                if (claim.state == "registered" && claimed == requested && claimed in retained) {
                     continue
                 }
-                if (claim.state != "active" || claim.owner != owner || claim.fileKind != kinds[claim.path]) {
+                if (claim.state != "active" || claim.owner != owner || claimed != requested) {
                     throw HoglakeException.CommitConflict(
                         "upload is fenced, already registered, or belongs to another operation",
                     )

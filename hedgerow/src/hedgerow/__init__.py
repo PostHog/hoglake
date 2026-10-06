@@ -28,6 +28,7 @@ from .halts import (
     PersistentFailureError,
     SchemaMismatchError,
     SplitBrainError,
+    UnsupportedFormatError,
 )
 from .projection import ProjectionPlan, validate_projection
 from .window import Window, plan_window
@@ -55,6 +56,7 @@ __all__ = [
     "SchemaMismatchError",
     "SourceConfig",
     "SplitBrainError",
+    "UnsupportedFormatError",
     "Window",
     "__version__",
     "load_config",

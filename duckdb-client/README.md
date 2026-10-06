@@ -112,3 +112,10 @@ They cover DDL between file preparation and commit, table recreation,
 eager DDL, multi-table atomicity, and retries that preserve the request.
 Run against a server with `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS=true`
 to verify that partitioned INSERTs satisfy the strict server setting.
+
+## Data formats
+
+The extension reads and writes Parquet tables only.
+It refuses tables with `write.format.default=clickhouse-mergetree-packed`, including empty tables, before scanning or writing objects.
+Scan plans also validate each file format before passing paths to the Parquet reader.
+Use the Python ClickHouse packed adapter for these tables.

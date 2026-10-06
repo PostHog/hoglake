@@ -178,7 +178,11 @@ data class ColumnDefDto(
         )
 }
 
-data class CreateTableRequestDto(val name: String, val columns: List<ColumnDefDto>)
+data class CreateTableRequestDto(
+    val name: String,
+    val columns: List<ColumnDefDto>,
+    val properties: Map<String, String> = emptyMap(),
+)
 
 data class ColumnDto(
     val name: String,
@@ -383,6 +387,8 @@ data class FileRegistrationDto(
     val partitionValues: List<String?>? = null,
     /** Optional row-group start offsets from a footer-shipping writer; validated at commit. */
     val splitOffsets: List<Long>? = null,
+    /** Defaults to parquet so older writers and stored payloads keep their existing meaning. */
+    val fileFormat: String = com.posthog.hoglake.model.FileFormats.PARQUET,
 ) {
     fun toModel() =
         FileRegistration(
@@ -393,6 +399,7 @@ data class FileRegistrationDto(
             columnStats = columnStats?.map { it.toModel() },
             partitionValues = partitionValues,
             splitOffsets = splitOffsets,
+            fileFormat = fileFormat,
         )
 }
 

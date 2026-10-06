@@ -152,7 +152,7 @@ for this table. A nonzero lag can be entirely other tables' commits
 (the next cycle drains it as an empty window); use it as a
 staleness/liveness signal, not a volume estimate.
 
-## Runbook: the seven halt conditions
+## Runbook: the eight halt conditions
 
 hedgerow HALTS (exits nonzero, no retry) when continuing would be wrong.
 A supervisor must NOT blindly restart these — the same condition will
@@ -259,6 +259,13 @@ offset never moved. Recovery: fix the underlying cause (the halt names
 the last error), expect up to `1 + max_window_replays` copies of the
 window's rows in the destination worst-case, and restart — the window
 replays once more from the committed offset.
+
+### 8. Unsupported data format (exit 10)
+
+Both replication modes require Parquet source and destination tables.
+Packed MergeTree tables (`write.format.default=clickhouse-mergetree-packed`) are refused, including empty tables.
+Each change window is checked before any file is read, rows are appended, or offsets are advanced.
+Use a Parquet destination or the Python ClickHouse packed adapter instead.
 
 ## Development
 

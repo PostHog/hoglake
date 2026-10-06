@@ -125,6 +125,7 @@ CREATE TABLE hog_table (
     created_snapshot bigint NOT NULL,
     dropped_snapshot bigint,
     next_field_id bigint NOT NULL DEFAULT 1,
+    file_format text NOT NULL DEFAULT 'parquet',
     -- The replacement edge (V14): the incarnation THIS row replaced, set
     -- by CatalogService.createTable when it publishes an atomic
     -- replacement. Recorded rather than derived from
@@ -150,6 +151,8 @@ CREATE TABLE hog_table (
     retirement_eligible_at timestamptz,
     PRIMARY KEY (catalog_id, table_id),
     UNIQUE (catalog_id, table_uuid),
+    CONSTRAINT hog_table_file_format_check
+        CHECK (file_format IN ('parquet', 'clickhouse-mergetree-packed')),
     -- The edge has no FK, so this is its only structural defence: a
     -- self-edge would be a 1-cycle for the recursive walk that follows it.
     CONSTRAINT hog_table_no_self_replacement CHECK (replaced_table_id <> table_id)
@@ -284,8 +287,7 @@ CREATE TABLE hog_data_file (
     begin_snapshot  bigint NOT NULL,
     end_snapshot    bigint,
     path            text   NOT NULL,   -- absolute object-store URI; no relative chains
-    file_format     text   NOT NULL DEFAULT 'parquet'
-                    CHECK (file_format IN ('parquet')),
+    file_format     text   NOT NULL DEFAULT 'parquet',
     record_count    bigint NOT NULL CHECK (record_count >= 0),
     file_size_bytes bigint NOT NULL CHECK (file_size_bytes >= 0),
     footer_size     bigint,
@@ -326,6 +328,10 @@ CREATE TABLE hog_data_file (
     FOREIGN KEY (catalog_id, table_id) REFERENCES hog_table ON DELETE CASCADE,
     CHECK (end_snapshot IS NULL OR end_snapshot > begin_snapshot)
 );
+ALTER TABLE hog_data_file
+    ADD CONSTRAINT hog_data_file_file_format_check
+    CHECK (file_format IN ('parquet', 'clickhouse-mergetree-packed'))
+    NOT VALID;
 CREATE INDEX hog_data_file_live
     ON hog_data_file (catalog_id, table_id, begin_snapshot)
     WHERE end_snapshot IS NULL;
@@ -770,6 +776,9 @@ CREATE TABLE hog_upload (
     prefix text NOT NULL,
     path text NOT NULL,
     file_kind text NOT NULL CHECK (file_kind IN ('data', 'delete')),
+    -- NULL on claims minted by replicas that predate format-aware claims.
+    -- Registration interprets a NULL data format as legacy Parquet only.
+    file_format text,
     state text NOT NULL DEFAULT 'active' CHECK (state IN ('active', 'registered', 'abandoned')),
     expires_at timestamptz NOT NULL DEFAULT now() + interval '24 hours',
     last_scheduled_at timestamptz,

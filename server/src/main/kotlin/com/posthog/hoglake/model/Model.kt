@@ -1120,6 +1120,12 @@ data class FileRegistration(
      */
     @get:JsonInclude(JsonInclude.Include.NON_NULL)
     val splitOffsets: List<Long>? = null,
+    /** Physical storage format. Omitted legacy payloads decode as parquet. */
+    @get:JsonInclude(
+        value = JsonInclude.Include.CUSTOM,
+        valueFilter = ParquetFileFormatFilter::class,
+    )
+    val fileFormat: String = FileFormats.PARQUET,
 )
 
 data class TableAppend(

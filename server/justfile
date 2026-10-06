@@ -44,9 +44,10 @@ compose-down:
     docker compose down
 
 # Run the server against the compose stack (MinIO on the default 9000;
-# export HOGLAKE_S3_ENDPOINT etc. to point elsewhere)
+# export HOGLAKE_S3_ENDPOINT etc. to point elsewhere). A single dev replica
+# opens the packed rollout gate, which the live client suites need.
 run:
-    {{_gradle}} run --console=plain
+    HOGLAKE_PACKED_MERGETREE_ENABLED="${HOGLAKE_PACKED_MERGETREE_ENABLED:-true}" {{_gradle}} run --console=plain
 
 clean:
     {{_gradle}} clean --console=plain

@@ -3,6 +3,8 @@ package com.posthog.hoglake
 import com.fasterxml.jackson.databind.exc.InvalidNullException
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException
 import com.fasterxml.jackson.module.kotlin.readValue
+import com.posthog.hoglake.model.FileFormats
+import com.posthog.hoglake.model.FileRegistration
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
@@ -53,6 +55,28 @@ class WireJsonTest {
         assertThatThrownBy { wireObjectMapper().readValue<Probe>(withUnknown) }
             .isInstanceOf(UnrecognizedPropertyException::class.java)
         assertThat(storedPayloadObjectMapper().readValue<Probe>(withUnknown).someName).isEqualTo("x")
+    }
+
+    @Test
+    fun `default file format stays absent from stored payloads`() {
+        val legacy = wireObjectMapper().writeValueAsString(FileRegistration("s3://b/a.parquet", 1, 10))
+        assertThat(legacy).doesNotContain("file_format")
+        val packed =
+            wireObjectMapper().writeValueAsString(
+                FileRegistration(
+                    "s3://b/a.packed",
+                    1,
+                    10,
+                    columnStats = emptyList(),
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                ),
+            )
+        assertThat(packed).contains("\"file_format\":\"clickhouse-mergetree-packed\"")
+        assertThat(
+            storedPayloadObjectMapper().readValue<FileRegistration>(
+                """{"path":"s3://b/a.parquet","record_count":1,"file_size_bytes":10,"future":true}""",
+            ).fileFormat,
+        ).isEqualTo(FileFormats.PARQUET)
     }
 
     @Test

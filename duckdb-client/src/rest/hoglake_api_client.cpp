@@ -187,6 +187,13 @@ HoglakeTableInfo ParseTableInfo(yyjson_val *obj) {
 	info.name = GetString(obj, "name");
 	info.namespace_name = GetString(obj, "namespace");
 	info.table_uuid = GetString(obj, "table_uuid");
+	auto properties = yyjson_obj_get(obj, "properties");
+	if (properties && !yyjson_is_null(properties)) {
+		if (!yyjson_is_obj(properties)) {
+			throw InvalidInputException("hoglake: expected object for table properties");
+		}
+		info.file_format = GetString(properties, "write.format.default", "parquet");
+	}
 	// Table-schema numerics were the one struct the R3 sweep missed:
 	// record_count feeds NumericCast in GetStorageInfo.
 	//

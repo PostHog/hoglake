@@ -189,6 +189,12 @@ void HoglakeMultiFileList::LoadFileList() const {
 	auto &table = read_info.table;
 	auto ns = table.ParentSchema().name.GetIdentifierName();
 	files = transaction->Api().PlanScan(ns, read_info.table_name, read_info.travel);
+	for (const auto &file : files) {
+		if (file.data_file.file_format != "parquet") {
+			throw NotImplementedException("hoglake: DuckDB cannot read data format '%s'; use a ClickHouse reader",
+			                              file.data_file.file_format);
+		}
+	}
 	read_file_list = true;
 }
 

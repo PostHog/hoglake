@@ -11,7 +11,12 @@ import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
 import java.util.UUID
 
-data class ClaimUploadDto(val owner: UUID, val prefix: String, val fileKind: String)
+data class ClaimUploadDto(
+    val owner: UUID,
+    val prefix: String,
+    val fileKind: String,
+    val fileFormat: String? = null,
+)
 
 data class UploadOwnerDto(val owner: UUID)
 
@@ -28,7 +33,16 @@ fun Application.installUploadRoutes(uploads: UploadService) {
                     } catch (_: IllegalArgumentException) {
                         throw BadRequestException("invalid upload UUID")
                     }
-                call.respond(uploads.claim(call.parameters["catalog"]!!, id, req.owner, req.prefix, req.fileKind))
+                call.respond(
+                    uploads.claim(
+                        call.parameters["catalog"]!!,
+                        id,
+                        req.owner,
+                        req.prefix,
+                        req.fileKind,
+                        req.fileFormat,
+                    ),
+                )
             }
             post("/renew") {
                 val req = call.receive<UploadOwnerDto>()

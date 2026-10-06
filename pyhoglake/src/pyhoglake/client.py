@@ -1,8 +1,8 @@
 """The hoglake client: a thin wrapper over the control-plane REST API.
 
-Data never flows through the server: ``Table.append`` writes parquet to
-object storage itself (pyarrow S3FileSystem) and registers the file with
-footer-derived stats via the commit endpoint (footer-shipping commits).
+Data never flows through the server: ``Table.append`` writes Parquet to
+object storage itself and registers footer-derived stats. Packed MergeTree
+tables use the separate :mod:`pyhoglake.packed` adapter.
 """
 
 from __future__ import annotations
@@ -38,6 +38,7 @@ from .errors import (
     ReconciliationRequiredError,
     ValidationError,
 )
+from .formats import require_parquet
 from .models import (
     AppendedFile,
     AppendResult,
@@ -847,17 +848,29 @@ class Catalog:
         _uuid.UUID(payload["idempotency_key"])
         return self._commit(payload, prepared=True, table=table)
 
+    def _commit_uploads(
+        self, payload: dict[str, Any], *, table: Table | None = None
+    ) -> CommitResult:
+        """Publish an exact request whose object paths have durable upload claims."""
+        if not payload.get("idempotency_key") or payload.get("read_snapshot") is None:
+            raise ValueError(
+                "claimed upload commits require idempotency_key and read_snapshot"
+            )
+        _uuid.UUID(payload["idempotency_key"])
+        return self._commit(payload, table=table, endpoint="/commit/uploads")
+
     def _commit(
         self,
         payload: dict[str, Any],
         *,
         prepared: bool = False,
         table: Table | None = None,
+        endpoint: str | None = None,
     ) -> CommitResult:
         try:
             body = self._client._request(
                 "POST",
-                self._path("/commit/prepared" if prepared else "/commit"),
+                self._path(endpoint or ("/commit/prepared" if prepared else "/commit")),
                 json=payload,
                 conflict=CommitConflictError,
             )
@@ -969,12 +982,24 @@ class Namespace:
 
     # -- tables ------------------------------------------------------------
 
-    def create_table(self, name: str, schema: pa.Schema) -> Table:
+    def create_table(
+        self,
+        name: str,
+        schema: pa.Schema,
+        *,
+        properties: Mapping[str, str] | None = None,
+    ) -> Table:
         _check_reserved_columns(schema)
+        request: dict[str, Any] = {
+            "name": name,
+            "columns": schema_to_column_defs(schema),
+        }
+        if properties is not None:
+            request["properties"] = dict(properties)
         body = self._catalog._client._request(
             "POST",
             self._path("/tables"),
-            json={"name": name, "columns": schema_to_column_defs(schema)},
+            json=request,
         )
         return Table(self, TableInfo.from_wire(body))
 
@@ -1110,7 +1135,7 @@ class Table:
 
     @property
     def properties(self) -> dict[str, str] | None:
-        """The table's user properties; None when none are set."""
+        """The table's versioned properties; None when none are set."""
         return self._info.properties
 
     def _path(self, suffix: str = "") -> str:
@@ -1362,6 +1387,7 @@ class Table:
         """
         catalog = self._namespace._catalog
         client = catalog._client
+        require_parquet(self._info.properties, "Table.append")
 
         # Reserved-prefix fast-fail before ANY request or upload: a user
         # `_hog*` field could otherwise reach parquet on a pre-reservation
@@ -1676,6 +1702,7 @@ class Table:
         loop this replaced interleaved them), so a refusal orphans
         nothing and the fan-out is handed work already known to be good.
         """
+        require_parquet(self._info.properties, "Table.prepare_append_files")
         uploaded: list[str] = []
         try:
             _uuid.UUID(idempotency_key)
@@ -1696,6 +1723,7 @@ class Table:
                 # _prepared_read).
                 read_snapshot = catalog.refresh().head_snapshot_id
                 info = self._check_incarnation(expected)
+            require_parquet(info.properties, "Table.prepare_append_files")
             if expected_table_info is not None and (
                 info.columns,
                 info.partition_spec,

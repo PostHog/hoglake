@@ -1,10 +1,11 @@
 # pyhoglake
 
 Python client for [hoglake](https://github.com/PostHog/hoglake#readme), the Postgres-native
-lakehouse-catalog control plane. A **thin API wrapper**: no embedded
-engine, no SQL, no direct catalog-database access — ever. The client
-writes parquet to object storage itself and registers it with the
-control plane via footer-shipping commits.
+lakehouse-catalog control plane. A **thin API wrapper**: no direct
+catalog-database access. The standard writer path writes Parquet to
+object storage and registers it with the control plane via footer-shipping
+commits. The optional packed MergeTree adapter invokes a configured
+`clickhouse local` executable; ClickHouse remains outside the library.
 
 ## Install
 
@@ -114,6 +115,64 @@ for s in catalog.snapshots(before=head + 1):
     # (mutually exclusive
     # with non-zero after)
 ```
+
+## Packed MergeTree adapter
+
+`ClickHousePackedAdapter` is the explicit writer and reader for tables created with
+`write.format.default=clickhouse-mergetree-packed`. The server must first complete the rollout
+sequence in `server/README.md` and enable `HOGLAKE_PACKED_MERGETREE_ENABLED=true`:
+
+```python
+import pyarrow as pa
+from pyhoglake import ClickHousePackedAdapter
+
+packed = ns.create_table(
+    "packed_events",
+    pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            pa.field("name", pa.string()),
+        ]
+    ),
+    properties={"write.format.default": "clickhouse-mergetree-packed"},
+)
+adapter = ClickHousePackedAdapter("/usr/local/bin/clickhouse")
+adapter.append(packed, pa.table({"id": [1, 2], "name": ["a", "b"]}))
+rows = adapter.read(packed, snapshot=catalog.refresh().head_snapshot_id)
+```
+
+For durable publication, call `prepare_append`, persist the returned JSON payload, then call
+`commit_prepared` with that exact payload. Do not call `prepare_append` again with the same
+idempotency key; replay `commit_prepared` with the persisted payload. Preparation creates one
+MergeTree part in an isolated local directory, refuses any layout except one `data.packed` file,
+claims a fresh `.packed` object
+path from Hoglake, uploads it, and registers it with counts only (`column_stats: []`; packed
+files carry no per-column bounds). An `idempotency_key` must be a UUID and is sent in canonical
+form (`str(uuid.UUID(key))`). `append(idempotency_key=...)` is not a retry handle: calling it again
+uploads a second object under a fresh claim, which the server refuses as a different request under
+the same key. Retry through the persisted `prepare_append` payload instead.
+`abandon_prepared` fences a payload that is known not to have committed. Do not abandon after an
+unknown commit outcome; replay the exact payload instead.
+
+Reads request one exact Hoglake scan plan, download only those registered objects, attach them to an
+isolated local table, enable ClickHouse `table_readonly`, and return an Arrow table. They never list
+or scan an object-storage prefix. The adapter currently supports boolean, signed and unsigned integer,
+float, double, string, binary, date, and second/millisecond/microsecond/nanosecond timestamp columns.
+Date and timestamp values must also fit the configured ClickHouse version's `Date32`/`DateTime64`
+ranges; the adapter does not widen those engine domains. Column names starting with `_` are
+refused, because a real column shadows a ClickHouse virtual column (`_part`, `_part_offset`, ...)
+that reads depend on for ordering. Schemas are fixed. Partition specs, sort
+orders, deletion vectors, explicit row IDs, packed-part
+compaction, and mixed-format tables are refused. The writer and reader should use the same ClickHouse
+version; no cross-version compatibility or remote-read performance claim is made.
+
+Rows come back in scan-plan order and, within a part, in insertion order. Each part is read and
+sorted on its own, so memory is bounded by the largest part rather than the snapshot. The adapter
+also bounds each part (1 GiB), part count (500) and total registered bytes (2 GiB) in a read,
+ClickHouse memory (4 GiB), result bytes (2 GiB), worker threads, and process time. One append is
+always exactly one part. Constructor arguments can lower or raise those limits for a
+known workload. The ordinary `Table.append` and `prepare_append_*` methods remain Parquet-only and
+reject packed tables before writing an object.
 
 ## Configuration
 

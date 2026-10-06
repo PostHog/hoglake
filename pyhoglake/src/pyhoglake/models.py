@@ -346,7 +346,7 @@ class TableInfo:
     snapshot_id: int | None = None
     #: Versioned table comment; None when the table has none.
     comment: str | None = None
-    #: Inert user metadata; None when no properties are set.
+    #: Versioned table properties; None when no properties are set.
     properties: dict[str, str] | None = None
     #: The snapshot the three totals above are exact AS OF, when they are
     #: a SAMPLE; None when they are exact (a time-travel read, a DDL
@@ -460,6 +460,7 @@ class DataFile:
     footer_size: int | None = None
     spec_id: int | None = None
     partition_values: tuple[str | None, ...] | None = None
+    explicit_row_ids: bool = False
 
     @classmethod
     def from_wire(cls, d: dict[str, Any]) -> DataFile:

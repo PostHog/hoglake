@@ -256,11 +256,15 @@ class MaintenanceSummarySampler(
                 // mutable set in it would throw away every in-flight
                 // scan on the deploy that added it — and the set would
                 // be stale by construction anyway.
-                val dropped =
+                // Exclude dropped tables and non-Parquet (packed) tables from
+                // compaction debt and tier summarization. Packed tables are
+                // never compacted and must not leak permanent small-file debt.
+                val excluded =
                     h.createQuery(
                         """
                     SELECT table_id FROM hog_table
-                    WHERE catalog_id = :id AND dropped_snapshot IS NOT NULL
+                    WHERE catalog_id = :id
+                      AND (dropped_snapshot IS NOT NULL OR file_format IS DISTINCT FROM 'parquet')
                     """,
                     ).bind("id", job.catalogId).mapTo(Long::class.javaObjectType).list().toSet()
                 val rows =
@@ -323,15 +327,15 @@ class MaintenanceSummarySampler(
                 // dropped table per generation is the price of an O(1)
                 // skip; paging the table instead costs one of them per
                 // 10,000 ROWS.
-                val leadsInDroppedTable = rows.firstOrNull()?.takeIf { it.table in dropped }
-                if (leadsInDroppedTable != null) {
-                    scan.table = leadsInDroppedTable.table
+                val leadsInExcludedTable = rows.firstOrNull()?.takeIf { it.table in excluded }
+                if (leadsInExcludedTable != null) {
+                    scan.table = leadsInExcludedTable.table
                     scan.size = Long.MAX_VALUE
                     scan.file = Long.MAX_VALUE
                     checkpoint(h, job.catalogId, generation, scan)
                     return@inTransactionUnchecked true
                 }
-                accumulate(h, job.catalogId, generation, scan, rows.filter { it.table !in dropped })
+                accumulate(h, job.catalogId, generation, scan, rows.filter { it.table !in excluded })
                 rows.lastOrNull()?.let {
                     scan.table = it.table
                     scan.size = it.size

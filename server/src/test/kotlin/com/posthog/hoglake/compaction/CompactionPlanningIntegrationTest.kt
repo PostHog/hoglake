@@ -7,6 +7,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.MaintenanceBacklog
 import com.posthog.hoglake.model.MaintenanceTask
@@ -21,6 +22,7 @@ import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.PartitionStatsService
 import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
@@ -43,7 +45,7 @@ import java.util.concurrent.atomic.AtomicInteger
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class CompactionPlanningIntegrationTest {
     private val db = PgTestSupport.freshDatabase()
-    private val catalogs = CatalogService(db.jdbi)
+    private val catalogs = CatalogService(db.jdbi, packedMergeTreeEnabled = true)
     private val commits = CommitService(db.jdbi)
     private val alter = AlterService(db.jdbi)
     private val counter = AtomicInteger(0)
@@ -66,7 +68,10 @@ class CompactionPlanningIntegrationTest {
         db.close()
     }
 
-    private fun fixture(columns: List<ColumnDef> = listOf(ColumnDef("id", ColType.LONG))): String {
+    private fun fixture(
+        columns: List<ColumnDef> = listOf(ColumnDef("id", ColType.LONG)),
+        properties: Map<String, String> = emptyMap(),
+    ): String {
         val cat = "plan-cat-${counter.incrementAndGet()}"
         db.jdbi.useHandleUnchecked { h ->
             // Raw insert: this suite tests compaction planning, not catalog validation.
@@ -82,7 +87,7 @@ class CompactionPlanningIntegrationTest {
             )
         }
         catalogs.createNamespace(cat, "ns")
-        catalogs.createTable(cat, "ns", "t", columns)
+        catalogs.createTable(cat, "ns", "t", columns, properties)
         return cat
     }
 
@@ -121,6 +126,150 @@ class CompactionPlanningIntegrationTest {
         assertThat(plan.groups.single().files.map { it.path })
             .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/b.parquet")
         assertThat(plan.groups.single().totalBytes).isEqualTo(1200)
+    }
+
+    @Test
+    fun `packed files are excluded from planning and direct execution`() {
+        val cat =
+            fixture(
+                properties =
+                    mapOf(
+                        FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                    ),
+            )
+        val registrations =
+            listOf("a", "b").map { name ->
+                FileRegistration(
+                    path = "s3://bucket/x/$name.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 100,
+                    columnStats = emptyList(),
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }
+        append(cat, *registrations.toTypedArray())
+        assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+
+        val files =
+            db.jdbi.withHandle<List<CompactionCandidate>, Exception> { h ->
+                h.createQuery(
+                    """
+                    SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes, f.row_id_start
+                      FROM hog_data_file f
+                      JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                     WHERE c.name = :cat
+                     ORDER BY f.data_file_id
+                    """,
+                )
+                    .bind("cat", cat)
+                    .map { rs, _ ->
+                        CompactionCandidate(
+                            dataFileId = rs.getLong("data_file_id"),
+                            path = rs.getString("path"),
+                            recordCount = rs.getLong("record_count"),
+                            fileSizeBytes = rs.getLong("file_size_bytes"),
+                            footerSize = null,
+                            rowIdStart = rs.getLong("row_id_start"),
+                        )
+                    }
+                    .list()
+            }
+        assertThatThrownBy {
+            svc.compactPlannedGroup(cat, "ns", "t", CompactionGroup(files, null, null))
+        }.isInstanceOf(InvalidDataException::class.java)
+            .hasMessageContaining(FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+    }
+
+    private fun setFileFormat(
+        cat: String,
+        path: String,
+        format: String,
+    ) = db.jdbi.useHandleUnchecked { h ->
+        // Raw update: neither state is producible through the service, which is
+        // the point — each test removes one of the two exclusions' cover.
+        h.createUpdate(
+            """
+            UPDATE hog_data_file f SET file_format = :format
+              FROM hog_catalog c
+             WHERE c.catalog_id = f.catalog_id AND c.name = :cat AND f.path = :path
+            """,
+        ).bind("format", format).bind("cat", cat).bind("path", path).execute()
+    }
+
+    @Test
+    fun `the candidate query alone excludes a packed row from a parquet table`() {
+        // Pins the SQL `file_format = 'parquet'` predicate: the table-level
+        // early return cannot see this row, the table is Parquet.
+        val cat = fixture()
+        append(cat, file("a", 300), file("b", 300), file("c", 300))
+        setFileFormat(cat, "s3://bucket/x/b.parquet", FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        assertThat(plan.groups).hasSize(1)
+        assertThat(plan.groups.single().files.map { it.path })
+            .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/c.parquet")
+    }
+
+    @Test
+    fun `a packed table is refused from metadata before the candidate query`() {
+        // Pins the table-format early return: these rows claim Parquet, so the
+        // SQL predicate alone would plan them.
+        val cat =
+            fixture(
+                properties = mapOf(FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED),
+            )
+        append(
+            cat,
+            *listOf("a", "b", "c").map {
+                FileRegistration(
+                    path = "s3://bucket/x/$it.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 300,
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }.toTypedArray(),
+        )
+        listOf("a", "b", "c").forEach { setFileFormat(cat, "s3://bucket/x/$it.packed", FileFormats.PARQUET) }
+        assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+    }
+
+    @Test
+    fun `packed files are not counted as compaction debt by the sampler`() {
+        // Packed tables are never compacted, so their small files are not debt:
+        // counting them would publish a permanent backlog on /maintenance/status,
+        // the debt page and the small-file gauges (all read the sampler's tiers).
+        val cat =
+            fixture(
+                properties = mapOf(FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED),
+            )
+        append(
+            cat,
+            *(0..4).map {
+                FileRegistration(
+                    path = "s3://bucket/x/p$it.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 16,
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }.toTypedArray(),
+        )
+        // Page size 1 drives the excluded-table skip, 10,000 the in-page filter.
+        for (batch in listOf(1, 10_000)) {
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_maintenance_summary SET generation = generation + 1, " +
+                        "scan_state = NULL, sample = NULL, sampled_at = NULL, next_batch_at = now()",
+                )
+            }
+            val sampler =
+                MaintenanceSummarySampler(db.jdbi, 1024, cfg.minInputFiles, cfg.maxInputFiles, 3600)
+            var steps = 0
+            while (sampler.runOnce(batch)) check(++steps < 100_000)
+            val sample =
+                db.jdbi.withHandleUnchecked { h ->
+                    MaintenanceSummarySampler.read(h, listOf(catalogId(cat))).values.single()
+                }
+            assertThat(sample.sample.smallFiles).describedAs("page size %d", batch).isZero()
+        }
     }
 
     @Test

@@ -8,6 +8,7 @@ import com.posthog.hoglake.model.CommitResult
 import com.posthog.hoglake.model.ConsumerOffset
 import com.posthog.hoglake.model.DataFile
 import com.posthog.hoglake.model.FileColumnStats
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileOrderingBounds
 import com.posthog.hoglake.model.FileStats
 import com.posthog.hoglake.model.HoglakeException
@@ -53,7 +54,10 @@ import java.util.UUID
  * Reads honor the versioned-row rule: visible at S iff
  * begin_snapshot <= S AND (end_snapshot IS NULL OR S < end_snapshot).
  */
-class CatalogService(private val jdbi: Jdbi) {
+class CatalogService(
+    private val jdbi: Jdbi,
+    private val packedMergeTreeEnabled: Boolean = false,
+) {
     companion object {
         /**
          * Ceiling on a catalog's `data_path`.
@@ -276,6 +280,7 @@ class CatalogService(private val jdbi: Jdbi) {
         namespace: String,
         name: String,
         columns: List<ColumnDef>,
+        properties: Map<String, String> = emptyMap(),
     ): TableInfo =
         Audit.audited(
             "table_create",
@@ -283,7 +288,10 @@ class CatalogService(private val jdbi: Jdbi) {
             "$namespace.$name",
             detail = { "columns=${columns.size}" },
         ) {
-            jdbi.inTransactionUnchecked { h -> createTable(h, catalog, namespace, name, columns) }
+            jdbi.inTransactionUnchecked {
+                    h ->
+                createTable(h, catalog, namespace, name, columns, properties = properties)
+            }
         }
 
     /** Caller may compose creation with file registration in the same transaction. */
@@ -302,6 +310,7 @@ class CatalogService(private val jdbi: Jdbi) {
     ): TableInfo {
         TableMetadata.validateComment(comment)
         TableMetadata.validateProperties(properties)
+        validateTableFormatDefinition(properties, columns, partitionFields, sortFields)
         validateTableDefinition(name, columns)
         val cols = initialColumns(columns)
         // Publication catches definition validation and records a rejected receipt.
@@ -346,8 +355,17 @@ class CatalogService(private val jdbi: Jdbi) {
         // Record the replacement edge with the row itself: the lineage a
         // consumer's offset release depends on must be a fact, not a
         // convention re-derived later (OffsetRepo.releaseSupersededOffsets).
+        val format = FileFormats.tableFormat(properties)
         val createdUuid =
-            TableRepo.insertTable(h, cat.catalogId, tableId, alloc.snapshotId, tableUuid, replacementTableId)
+            TableRepo.insertTable(
+                h,
+                cat.catalogId,
+                tableId,
+                alloc.snapshotId,
+                tableUuid,
+                replacementTableId,
+                format,
+            )
         // nodeCount, not columns.size: a nested column needs one id per
         // NODE, not one per top-level column. Allocating by size would
         // hand back a range too short and every subtree after the first
@@ -362,11 +380,12 @@ class CatalogService(private val jdbi: Jdbi) {
             AlterService(
                 jdbi,
             ).installPartitionSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, partitionFields)
+        val effectiveProperties = FileFormats.canonicalProperties(properties)
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
             comment = comment,
-            properties = properties,
+            properties = effectiveProperties,
             namespace = ns.name,
             name = name,
             columns = cols,
@@ -389,6 +408,22 @@ class CatalogService(private val jdbi: Jdbi) {
             fileSizeBytes = 0,
             snapshotId = alloc.snapshotId,
         )
+    }
+
+    internal fun validateTableFormatDefinition(
+        properties: Map<String, String>,
+        columns: List<ColumnDef>,
+        partitionFields: List<PartitionFieldDef>,
+        sortFields: List<SortFieldDef>,
+    ) {
+        if (FileFormats.isPacked(properties) && !packedMergeTreeEnabled) {
+            throw HoglakeException.Validation(
+                "packed MergeTree table creation is disabled; enable " +
+                    "HOGLAKE_PACKED_MERGETREE_ENABLED only after every server replica " +
+                    "supports the packed format contract",
+            )
+        }
+        TableMetadata.validateDefinitionForFormat(properties, columns, partitionFields, sortFields)
     }
 
     internal fun validateTableDefinition(
@@ -496,6 +531,9 @@ class CatalogService(private val jdbi: Jdbi) {
                         expectedTableUuid = expectedTableUuid,
                         currentTableUuid = t.tableUuid,
                     )
+                }
+                if (t.fileFormat == FileFormats.CLICKHOUSE_MERGETREE_PACKED) {
+                    throw HoglakeException.Validation("packed MergeTree tables do not support truncate")
                 }
                 val alloc = CatalogRepo.allocateSnapshot(h, cat.catalogId)
                 SnapshotRepo.insert(h, cat.catalogId, alloc.snapshotId, alloc.schemaVersion)

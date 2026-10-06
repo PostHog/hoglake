@@ -29,8 +29,8 @@ object ConfigBootProbe {
     @JvmStatic
     fun main(args: Array<String>) {
         try {
-            Config()
-            println("CONSTRUCTED")
+            val config = Config()
+            println("CONSTRUCTED packedMergeTreeEnabled=${config.packedMergeTreeEnabled}")
         } catch (e: IllegalArgumentException) {
             println("REFUSED: ${e.message}")
             // Not `exitProcess(2)`: the point is an exit code the parent

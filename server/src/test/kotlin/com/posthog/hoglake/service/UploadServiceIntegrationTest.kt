@@ -4,6 +4,7 @@ import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.TableAppend
@@ -151,6 +152,51 @@ class UploadServiceIntegrationTest {
         expire(claim)
         assertThat(uploads.scheduleExpired(catalog)).isEqualTo(1)
         assertThat(uploads.renew(catalog, owner)).isZero()
+    }
+
+    @Test
+    fun `data claims select a format-specific immutable path`() {
+        val catalog = catalog()
+        val owner = UUID.randomUUID()
+        val prefix = catalogs.getCatalog(catalog).dataPath
+        val uploadId = UUID.randomUUID()
+        val packed =
+            uploads.claim(
+                catalog,
+                uploadId,
+                owner,
+                prefix,
+                "data",
+                FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+            )
+        assertThat(packed.path).endsWith(".packed")
+        assertThat(
+            uploads.claim(
+                catalog,
+                uploadId,
+                owner,
+                prefix,
+                "data",
+                FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+            ),
+        ).isEqualTo(packed)
+        assertThatThrownBy {
+            uploads.claim(catalog, uploadId, owner, prefix, "data", FileFormats.PARQUET)
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+        assertThatThrownBy {
+            commits.commit(catalog, request(catalog, owner, packed))
+        }.isInstanceOf(HoglakeException.CommitConflict::class.java)
+            .hasMessageContaining("upload is fenced")
+        assertThatThrownBy {
+            uploads.claim(
+                catalog,
+                UUID.randomUUID(),
+                owner,
+                prefix,
+                "delete",
+                FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+            )
+        }.isInstanceOf(HoglakeException.Validation::class.java)
     }
 
     @Test

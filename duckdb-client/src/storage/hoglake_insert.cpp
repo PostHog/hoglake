@@ -227,6 +227,10 @@ PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlan
 	plan_transaction.RequireDMLAllowed(table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name,
 	                                   false /* is_delete */);
 	auto &wire = table.GetWireInfo();
+	if (wire.file_format != "parquet") {
+		throw NotImplementedException("hoglake: DuckDB cannot write data format '%s'; use a ClickHouse writer",
+		                              wire.file_format);
+	}
 
 	auto columns = wire.columns;
 	std::sort(columns.begin(), columns.end(),

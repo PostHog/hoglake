@@ -3,6 +3,7 @@ package com.posthog.hoglake.service
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.NullOrder
@@ -45,6 +46,28 @@ class TableCreationIntegrationTest {
     }
 
     private fun file(operation: TableCreation) = FileRegistration(operation.writePath + "part.parquet", 7, 100, 20)
+
+    @Test
+    fun `atomic packed creation obeys the rollout gate`() {
+        val catalog = catalog()
+        val packed =
+            definition.copy(
+                properties =
+                    mapOf(
+                        FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                    ),
+            )
+        assertThatThrownBy { creations.prepare(catalog, UUID.randomUUID(), packed) }
+            .isInstanceOf(HoglakeException.Validation::class.java)
+            .hasMessageContaining("HOGLAKE_PACKED_MERGETREE_ENABLED")
+
+        val enabledCatalogs = CatalogService(db.jdbi, packedMergeTreeEnabled = true)
+        val enabledCreations = TableCreationService(db.jdbi, enabledCatalogs, CommitService(db.jdbi))
+        val prepared = enabledCreations.prepare(catalog, UUID.randomUUID(), packed)
+        assertThat(prepared.definition.properties)
+            .containsEntry(FileFormats.TABLE_PROPERTY, FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        enabledCreations.abort(catalog, prepared.operationId)
+    }
 
     @Test
     fun `metadata survives creation replay versioned edits rename and replacement`() {

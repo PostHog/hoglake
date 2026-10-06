@@ -4,6 +4,7 @@ import com.posthog.hoglake.Database
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.service.CleanupService
 import com.posthog.hoglake.service.RemovalStore
+import com.posthog.hoglake.service.UploadRegistration
 import com.posthog.hoglake.service.UploadService
 import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.TestImages
@@ -273,6 +274,10 @@ class V17FilePathIndexMigrationIntegrationTest {
         // read off disk rather than restated here, and idempotent, so the
         // `Database.migrate` below re-applies it for free.
         PgTestSupport.applyMigrationFile(db, "V21__cleanup_claim.sql")
+        // Current UploadService reads the format-aware claim column introduced
+        // by V26. Apply that idempotent file out of order for the same reason:
+        // this test measures V17's indexes through today's production query.
+        PgTestSupport.applyMigrationFile(db, "V26__packed_mergetree_format.sql")
 
         // The statements, off the services that issue them.
         referenceCheckSql = captureReferenceCheck()
@@ -504,7 +509,12 @@ class V17FilePathIndexMigrationIntegrationTest {
                 jdbi.useHandleUnchecked { h ->
                     h.begin()
                     try {
-                        UploadService.register(h, catalogId, OWNER, livePaths.map { it to "data" })
+                        UploadService.register(
+                            h,
+                            catalogId,
+                            OWNER,
+                            livePaths.map { UploadRegistration(it, "data", "parquet") },
+                        )
                     } finally {
                         h.rollback()
                     }

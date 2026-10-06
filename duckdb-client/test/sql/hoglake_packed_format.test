@@ -1,0 +1,38 @@
+# Packed MergeTree is explicit unsupported input for this Parquet-only extension.
+require-env HOGLAKE_URL
+
+require hoglake
+
+require parquet
+
+require httpfs
+
+require-env DUCKEXT_S3_ENDPOINT
+
+statement ok
+CREATE SECRET duckext_minio (TYPE s3, KEY_ID 'hoglake', SECRET 'hoglake123',
+                              ENDPOINT '{DUCKEXT_S3_ENDPOINT}', USE_SSL false,
+                              URL_STYLE 'path')
+
+statement ok
+ATTACH 'hoglake:duckext-packed' AS lake (ENDPOINT '{HOGLAKE_URL}')
+
+statement error
+SELECT * FROM lake.ns1.packed_empty
+----
+<REGEX>:.*DuckDB cannot read data format 'clickhouse-mergetree-packed'.*
+
+statement error
+INSERT INTO lake.ns1.packed_empty VALUES (1)
+----
+<REGEX>:.*DuckDB cannot write data format 'clickhouse-mergetree-packed'.*
+
+statement error
+SELECT count(*) FROM lake.ns1.packed_registered
+----
+<REGEX>:.*DuckDB cannot read data format 'clickhouse-mergetree-packed'.*
+
+query I
+SELECT 42
+----
+42

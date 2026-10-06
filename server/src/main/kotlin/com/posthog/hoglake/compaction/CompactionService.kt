@@ -9,6 +9,7 @@ import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnStats
 import com.posthog.hoglake.model.CompactionResult
+import com.posthog.hoglake.model.FileFormats
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
@@ -836,6 +837,8 @@ data class CompactionCandidate(
      */
     val footerSize: Long?,
     val rowIdStart: Long,
+    /** Physical format. Parquet is the only format this rewriter can open. */
+    val fileFormat: String = FileFormats.PARQUET,
     /**
      * `hog_data_file.explicit_row_ids` — true when this file is a
      * COMPACTION OUTPUT and carries its row ids in a physical
@@ -1077,6 +1080,8 @@ class CompactionService(
         val namespace: String,
         val table: String,
         val tableId: Long,
+        /** Effective table file format. Only Parquet tables enter the candidate query. */
+        val fileFormat: String,
         /** Live columns at the planning head — BINDING for the rewrite shape. */
         val columns: List<Column>,
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
@@ -1336,6 +1341,7 @@ class CompactionService(
             namespace = ns.name,
             table = t.name,
             tableId = t.tableId,
+            fileFormat = t.fileFormat,
             columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
             sortFields =
                 SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
@@ -1498,6 +1504,12 @@ class CompactionService(
             available: Long = 0,
             truncated: Boolean = false,
         ) = CandidateFetch(ctx, budget, rowCapacity, emptyMap(), 0, 0, available, truncated)
+        // A format predicate alone would scan every row of a homogeneous packed table
+        // looking for a Parquet match that cannot exist. Refuse from table metadata
+        // before any statement touches the manifest; the row predicate remains as a
+        // defense against malformed mixed-format state.
+        if (ctx.fileFormat != FileFormats.PARQUET) return empty()
+
         // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
         // work that could drop payloads or repeatedly fail the maintenance loop.
         // allNodes, not the top level: a variant nested inside a struct
@@ -1911,17 +1923,18 @@ class CompactionService(
                 ""
             }
         return """
-            SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
+            SELECT f.data_file_id, f.path, f.file_format, f.record_count, f.file_size_bytes,
                    f.footer_size, f.row_id_start, f.explicit_row_ids,
                    f.spec_id,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count$valuesProjection
               FROM (
-                    SELECT f0.catalog_id, f0.data_file_id, f0.path, f0.record_count,
+                    SELECT f0.catalog_id, f0.data_file_id, f0.path, f0.file_format, f0.record_count,
                            f0.file_size_bytes, f0.footer_size, f0.row_id_start,
                            f0.explicit_row_ids, f0.spec_id
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
+                       AND f0.file_format = 'parquet'
                        AND f0.file_size_bytes < :targetBytes$rowBound$armSql$innerOrder
                      LIMIT :scanLimit
                    ) f
@@ -2076,6 +2089,7 @@ class CompactionService(
             fileSizeBytes = rs.getLong("file_size_bytes"),
             footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
             rowIdStart = rs.getLong("row_id_start"),
+            fileFormat = rs.getString("file_format"),
             explicitRowIds = rs.getBoolean("explicit_row_ids"),
             dv =
                 rs.getObject("dv_id")?.let {
@@ -3240,6 +3254,17 @@ class CompactionService(
         ctx: TableContext,
         group: CompactionGroup,
     ): GroupOutcome {
+        if (ctx.fileFormat != FileFormats.PARQUET) {
+            throw InvalidDataException(
+                "compaction supports parquet tables only; table '${ctx.table}' uses '${ctx.fileFormat}'",
+            )
+        }
+        group.files.firstOrNull { it.fileFormat != FileFormats.PARQUET }?.let { file ->
+            throw InvalidDataException(
+                "compaction supports parquet inputs only; data_file_id ${file.dataFileId} " +
+                    "uses '${file.fileFormat}'",
+            )
+        }
         val inputs =
             group.files.map { f ->
                 // Read the object IN PLACE. This used to fetch the

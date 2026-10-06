@@ -62,7 +62,7 @@ object HogSchemaColumns {
             "hog_table" to
                 setOf(
                     "catalog_id", "table_id", "table_uuid", "created_snapshot",
-                    "dropped_snapshot", "next_field_id",
+                    "dropped_snapshot", "next_field_id", "file_format",
                     // V14: the recorded replacement edge, written by
                     // TableRepo.insertTable and read by
                     // OffsetRepo.releaseSupersededOffsets.
@@ -156,7 +156,7 @@ object HogSchemaColumns {
                 ),
             "hog_upload" to
                 setOf(
-                    "catalog_id", "upload_id", "owner", "prefix", "path", "file_kind", "state",
+                    "catalog_id", "upload_id", "owner", "prefix", "path", "file_kind", "file_format", "state",
                     "expires_at", "last_scheduled_at",
                 ),
             // CleanupService (claim + drain + ledger), ExpiryService queue

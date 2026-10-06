@@ -1882,8 +1882,9 @@ paths:
       summary: Claim a fresh object path before uploading
       description: >
         Requires claimed-uploads-v1. Generates a unique server path under prefix,
-        which must be inside catalog data_path. Replaying upload ID requires the
-        same owner, prefix and kind and returns the same path and current state.
+        which must be inside catalog data_path. Data claims may select Parquet or
+        packed MergeTree; omission means Parquet. Replaying upload ID requires the
+        same owner, prefix, kind and format and returns the same path and current state.
         Owner is the durable commit key or table-creation operation ID. Lease is
         24 hours. Active claims protect objects even if erroneously queued.
         Registered and abandoned states are permanent fences against path reuse.
@@ -1901,6 +1902,10 @@ paths:
                 owner: { type: string, format: uuid }
                 prefix: { type: string }
                 file_kind: { type: string, enum: [data, delete] }
+                file_format:
+                  type: string
+                  enum: [parquet, clickhouse-mergetree-packed]
+                  description: Data uploads only; omission means parquet.
       responses:
         "200":
           description: Durable claim (replay may return a terminal state)
@@ -1915,6 +1920,10 @@ paths:
                   prefix: { type: string }
                   path: { type: string }
                   file_kind: { type: string, enum: [data, delete] }
+                  file_format:
+                    type: string
+                    enum: [parquet, clickhouse-mergetree-packed]
+                    description: Present on format-aware data claims; absent on delete and legacy claims.
                   state: { type: string, enum: [active, registered, abandoned] }
                   expires_at: { type: string, format: date-time }
         "409": { description: Upload identity reused with different intent }
@@ -2971,9 +2980,15 @@ components:
       type: object
       maxProperties: 100
       description: >
-        Inert user metadata. Replaced as a whole by set_properties; an empty object clears it.
-        Keys are lowercase ASCII identifiers; hoglake. and trino. prefixes and
-        partitioning, sorted_by, location, format, comment are reserved. No NUL in values.
+        Versioned table properties. Replaced as a whole by set_properties; an empty object clears it.
+        `write.format.default` selects `parquet` (also the default when absent) or
+        `clickhouse-mergetree-packed` and is immutable after table creation. Creating the packed
+        value requires the server rollout gate `HOGLAKE_PACKED_MERGETREE_ENABLED=true`; the
+        default-disabled gate returns 422 until the fleet is explicitly enabled. Packed tables
+        are append-only, unpartitioned, unsorted, fixed-schema tables over the documented
+        scalar subset. Other keys are inert user metadata. Keys are lowercase ASCII
+        identifiers; hoglake. and trino. prefixes and partitioning, sorted_by, location,
+        format, comment are reserved. No NUL in values.
       propertyNames: { pattern: "^[a-z][a-z0-9_.-]{0,127}$" }
       additionalProperties: { type: string, maxLength: 4096 }
 
@@ -3156,6 +3171,7 @@ components:
           type: array
           minItems: 1
           items: { $ref: "#/components/schemas/ColumnDef" }
+        properties: { $ref: "#/components/schemas/CustomProperties" }
 
     TableSummary:
       type: object
@@ -3391,6 +3407,17 @@ components:
       required: [path, record_count, file_size_bytes]
       properties:
         path: { type: string, description: Absolute object-store URI }
+        file_format:
+          type: string
+          enum: [parquet, clickhouse-mergetree-packed]
+          default: parquet
+          description: >
+            Physical object format. It must match the table's effective
+            `write.format.default`; omission keeps the legacy Parquet meaning.
+            Packed registrations carry counts only: `column_stats` is optional (an
+            empty array or omission are equivalent) and the file is recorded with
+            `stats_state: provided`, never hydrated. They forbid `footer_size` and
+            `split_offsets`.
         record_count: { type: integer, format: int64 }
         file_size_bytes: { type: integer, format: int64 }
         footer_size: { type: integer, format: int64 }
@@ -3758,7 +3785,9 @@ components:
       properties:
         data_file_id: { type: integer, format: int64 }
         path: { type: string }
-        file_format: { type: string }
+        file_format:
+          type: string
+          enum: [parquet, clickhouse-mergetree-packed]
         record_count: { type: integer, format: int64 }
         file_size_bytes: { type: integer, format: int64 }
         footer_size: { type: integer, format: int64 }

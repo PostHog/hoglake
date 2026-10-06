@@ -16,7 +16,11 @@ from pyhoglake.models import (
 
 from hedgerow.discovery import discover_window
 from hedgerow.events import EventTransform
-from hedgerow.halts import DataIntegrityError, SchemaMismatchError
+from hedgerow.halts import (
+    DataIntegrityError,
+    SchemaMismatchError,
+    UnsupportedFormatError,
+)
 from hedgerow.pending import PendingStore
 
 
@@ -239,3 +243,38 @@ def test_json_conversion_must_be_explicit_and_type_checked():
     EventTransform(source, dest, json_columns=("properties",))
     with pytest.raises(SchemaMismatchError, match="JSON mapping"):
         EventTransform(source, dest, json_columns=("event",))
+
+
+def test_discovery_refuses_non_parquet_before_reading_window(tmp_path) -> None:
+    files = (
+        DataFile(1, "s3://example/raw.parquet", "parquet", 3, 100, 0, "provided", 1),
+        DataFile(
+            2,
+            "s3://example/data.packed",
+            "clickhouse-mergetree-packed",
+            3,
+            100,
+            3,
+            "provided",
+            1,
+        ),
+    )
+    plan = ChangesPlan("source", 0, 1, files)
+    store = PendingStore(str(tmp_path / "pending.sqlite"), {})
+
+    def unexpected_open(path: str) -> pq.ParquetFile:
+        pytest.fail(f"Opened {path} before validating all formats")
+
+    try:
+        with pytest.raises(UnsupportedFormatError, match="clickhouse-mergetree-packed"):
+            discover_window(
+                store,
+                plan,
+                "source",
+                {1: datetime(2026, 1, 1, tzinfo=UTC)},
+                layout(),
+                unexpected_open,
+            )
+        assert store.discovered == 0
+    finally:
+        store.close()

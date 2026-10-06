@@ -22,6 +22,7 @@ from .duckdb_writer import (
     write_duckdb_event_partition,
 )
 from .events import EventTransform
+from .formats import require_parquet
 from .halts import (
     DataIntegrityError,
     DeletesPresentError,
@@ -146,6 +147,10 @@ class BufferedIngestion:
         self.max_snapshot_window = max_snapshot_window
         self.source_info = source.info()
         self.destination_info = destination.info()
+        for info in (self.source_info, self.destination_info):
+            require_parquet(
+                (info.properties or {}).get("write.format.default", "parquet")
+            )
         self.transform = EventTransform(
             self.source_info.columns,
             self.destination_info,
@@ -183,6 +188,9 @@ class BufferedIngestion:
             (self.destination, self.destination_info),
         ):
             current = table.info()
+            require_parquet(
+                (current.properties or {}).get("write.format.default", "parquet")
+            )
             if current.table_uuid != pinned.table_uuid:
                 raise IncarnationChangedError("buffered ingestion table was recreated")
             if (current.columns, current.partition_spec, current.sort_spec) != (

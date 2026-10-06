@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 from pyhoglake.models import ChangesPlan
 
 from .events import EventTransform
+from .formats import require_parquet
 from .halts import DataIntegrityError, DeletesPresentError, IncarnationChangedError
 from .pending import Fragment, PendingStore, SourceFile
 
@@ -54,6 +55,8 @@ def discover_window(
         raise DeletesPresentError(
             "raw source has deletion vectors; refusing to skip or reinterpret pending input"
         )
+    for file in plan.files:
+        require_parquet(file.file_format)
     fragments = []
     source_files = []
     source_bytes = selected_bytes = 0
