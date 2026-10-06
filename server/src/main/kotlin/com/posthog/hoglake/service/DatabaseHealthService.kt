@@ -265,8 +265,10 @@ class DatabaseHealthService(
                         "${activity.waiting} session(s) blocked on locks",
                         "The longest lock wait is ${duration(seconds)}.",
                         "Commits to one catalog serialize on a per-catalog advisory lock by " +
-                            "design, so brief waits are the system working. Sustained ones " +
-                            "mean the tail is not draining as fast as writers arrive.",
+                            "design, and the renewals and aborts of one operation's upload " +
+                            "claims queue on its claim rows, so brief waits are the system " +
+                            "working. Sustained ones mean one of those queues is not draining " +
+                            "as fast as writers arrive.",
                     )
             }
         }
@@ -418,8 +420,9 @@ class DatabaseHealthService(
                     "${server.deadlocks} deadlock(s) recorded",
                     "Cumulative since the last statistics reset.",
                     "Writers to one catalog are serialized by a single advisory lock taken " +
-                        "up front, which is a lock order by construction. A deadlock means " +
-                        "something took locks outside that discipline.",
+                        "up front, which is a lock order by construction, and upload claims, " +
+                        "which take no commit lock, lock their rows in upload_id order. A " +
+                        "deadlock means something took locks outside that discipline.",
                 )
         }
 

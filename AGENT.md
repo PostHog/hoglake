@@ -957,7 +957,11 @@ ran on the local stack and what it showed.
   first wins without any global lock; the predicate that selects
   candidates is the predicate that fences them, verbatim, or a renewal
   in the window is clobbered. Sweeps settle one row per transaction so a
-  commit never queues behind a sweep while holding the commit lock.
+  commit never queues behind a sweep while holding the commit lock. With
+  no lock above them, claim rows need an order of their own: a statement
+  that locks more than one takes them in `upload_id` order, and updates
+  them in a second statement (UploadService's class comment). Concurrent
+  renewals of one owner deadlocked before they did.
 - **A new guard never edits an existing test out of its way.** When a
   new refusal reds a test, that test either asserts the refusal or has
   its fixture changed to satisfy the guard legitimately, with the reason

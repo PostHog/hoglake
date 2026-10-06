@@ -33,10 +33,11 @@ data class UploadClaim(
  * of a publication — runs inside the commit transaction and takes the
  * claim rows FOR UPDATE.
  *
- * What replaces the lock is row-level semantics: every UPDATE here
- * re-checks `state` in its WHERE clause, so under READ COMMITTED an
- * update that waited on [register]'s row lock re-evaluates the predicate
- * against the committed row and declines to clobber a settled claim.
+ * What replaces the lock is row-level semantics: every transition
+ * re-checks `state` in the statement that takes the claim's row lock, so
+ * under READ COMMITTED one that waited on [register]'s row lock
+ * re-evaluates the predicate against the committed row and declines to
+ * clobber a settled claim.
  *
  * And with no lock above them, the row locks need an order of their own:
  * every statement here that locks more than one claim row ([renew],
@@ -101,14 +102,7 @@ class UploadService(
     fun renew(
         catalog: String,
         owner: UUID,
-    ): Int =
-        inCatalog(catalog, "upload_renew") { h, catalogId ->
-            // state = 'active' is the fence, and it is re-evaluated after any
-            // row-lock wait (READ COMMITTED), so a claim that a concurrent
-            // publication settled as 'registered' — or a sweep fenced as
-            // 'abandoned' — is never revived by a renewal that read it first.
-            h.createUpdate(RENEW_SQL).bind("catalog", catalogId).bind("owner", owner).execute()
-        }
+    ): Int = inCatalog(catalog, "upload_renew") { h, catalogId -> renewClaims(h, catalogId, owner) }
 
     fun abandon(
         catalog: String,
@@ -118,9 +112,12 @@ class UploadService(
         inCatalog(catalog, "upload_abandon") { h, catalogId ->
             if (paths.size > 10000) throw HoglakeException.Validation("too many upload paths")
             // Registered claims are immutable: abort cannot retract a publication with an unknown response.
-            // The state predicate is what enforces that without the commit lock (see [renew]).
-            h.createUpdate(ABANDON_SQL)
-                .bind("catalog", catalogId).bind("owner", owner).bindArray("paths", String::class.java, paths).execute()
+            // The state predicate is what enforces that without the commit lock (see [renewClaims]).
+            val ids =
+                h.createQuery(LOCK_OWNER_PATHS_SQL)
+                    .bind("catalog", catalogId).bind("owner", owner).bindArray("paths", String::class.java, paths)
+                    .mapTo(UUID::class.java).list()
+            updateLocked(h, catalogId, ABANDON_SQL, ids)
         }
 
     /** Explicit operator action only. No new background sweep is enabled by this feature. */
@@ -235,38 +232,108 @@ class UploadService(
             """
 
         /**
-         * [renew]: pushes out the expiry of the active claims of `:owner`.
-         * The sub-select locks them in `upload_id` order (see the class
-         * comment), re-checking `state` after any wait, and the UPDATE then
-         * changes only the rows it holds, probing the primary key.
+         * [renew], in the transaction of [h]: pushes out the expiry of the
+         * active claims of [owner], and returns how many it renewed.
          *
-         * Binds `:catalog` and `:owner`. `internal` so
-         * `UploadLockPlanIntegrationTest` can EXPLAIN what production runs.
+         * [LOCK_OWNER_CLAIMS_SQL] locks them in `upload_id` order (see the
+         * class comment). Its `state = 'active'` is the fence, re-evaluated
+         * after any row-lock wait (READ COMMITTED), so a claim that a
+         * concurrent publication settled as 'registered' — or a sweep fenced
+         * as 'abandoned' — is never revived by a renewal that read it first.
+         * [RENEW_SQL] then updates the rows this transaction holds. `internal`
+         * so a test can place a renewal between two steps of another
+         * transition.
+         */
+        internal fun renewClaims(
+            h: Handle,
+            catalogId: Long,
+            owner: UUID,
+        ): Int {
+            val ids =
+                h.createQuery(LOCK_OWNER_CLAIMS_SQL).bind("catalog", catalogId).bind("owner", owner)
+                    .mapTo(UUID::class.java).list()
+            return updateLocked(h, catalogId, RENEW_SQL, ids)
+        }
+
+        /**
+         * Runs [sql], an UPDATE of claim rows by `:ids`, over the [ids] this
+         * transaction has locked. A statement of its own, after the lock:
+         * its snapshot is taken after the rows were locked, so it reads them
+         * as they are and re-checks nothing. In the statement that locks
+         * them, a renewal that waited behind another one would re-check every
+         * row that the first had rewritten against the whole id array, which
+         * Postgres does not hash when a sub-select makes it: quadratic in the
+         * owner's claims (eight renewals of 40,000 claims took 13-15 s, and
+         * take 5-7 s this way).
+         */
+        private fun updateLocked(
+            h: Handle,
+            catalogId: Long,
+            sql: String,
+            ids: List<UUID>,
+        ): Int {
+            if (ids.isEmpty()) return 0
+            return h.createUpdate(sql).bind("catalog", catalogId).bindArray("ids", UUID::class.java, ids).execute()
+        }
+
+        /**
+         * [renewClaims]: locks the active claims of `:owner` in `upload_id`
+         * order and returns their ids. `FOR NO KEY UPDATE`, the lock that the
+         * UPDATE that follows takes.
+         *
+         * Binds `:catalog` and `:owner`. `internal`, like the other
+         * statements here, so `UploadLockPlanIntegrationTest` can EXPLAIN
+         * what production runs.
+         */
+        internal const val LOCK_OWNER_CLAIMS_SQL: String =
+            """
+            SELECT upload_id FROM hog_upload
+            WHERE catalog_id = :catalog AND owner = :owner AND state = 'active'
+            ORDER BY upload_id
+            FOR NO KEY UPDATE
+            """
+
+        /**
+         * [abandon]: locks the active claims of `:owner` among `:paths`, like
+         * [LOCK_OWNER_CLAIMS_SQL].
+         *
+         * Binds `:catalog`, `:owner` and `:paths`.
+         */
+        internal const val LOCK_OWNER_PATHS_SQL: String =
+            """
+            SELECT upload_id FROM hog_upload
+            WHERE catalog_id = :catalog AND owner = :owner AND path = ANY(:paths) AND state = 'active'
+            ORDER BY upload_id
+            FOR NO KEY UPDATE
+            """
+
+        /**
+         * [renewClaims]: pushes out the expiry of the locked claims `:ids`.
+         * No `state` predicate: the lock re-checked it, and the rows cannot
+         * change while this transaction holds them. A `state` predicate here
+         * would also make the partial indexes eligible, and with statistics
+         * taken while no claim was active, the planner then drives the UPDATE
+         * from `hog_upload_owner` on `catalog_id` alone and filters every
+         * active claim of the catalog against the ids. Without one, the
+         * primary key is the only index on both columns.
+         *
+         * Binds `:catalog` and `:ids`.
          */
         internal const val RENEW_SQL: String =
             """
             UPDATE hog_upload SET expires_at = now() + interval '24 hours'
-            WHERE catalog_id = :catalog AND state = 'active' AND upload_id = ANY(ARRAY(
-                SELECT upload_id FROM hog_upload
-                WHERE catalog_id = :catalog AND owner = :owner AND state = 'active'
-                ORDER BY upload_id
-                FOR UPDATE))
+            WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
             """
 
         /**
-         * [abandon]: fences the active claims of `:owner` among `:paths`,
-         * locked in `upload_id` order like [RENEW_SQL].
+         * [abandon]: fences the locked claims `:ids`, like [RENEW_SQL].
          *
-         * Binds `:catalog`, `:owner` and `:paths`.
+         * Binds `:catalog` and `:ids`.
          */
         internal const val ABANDON_SQL: String =
             """
             UPDATE hog_upload SET state = 'abandoned'
-            WHERE catalog_id = :catalog AND state = 'active' AND upload_id = ANY(ARRAY(
-                SELECT upload_id FROM hog_upload
-                WHERE catalog_id = :catalog AND owner = :owner AND path = ANY(:paths) AND state = 'active'
-                ORDER BY upload_id
-                FOR UPDATE))
+            WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
             """
 
         /**

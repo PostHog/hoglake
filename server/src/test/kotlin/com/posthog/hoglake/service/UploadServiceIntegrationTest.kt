@@ -11,24 +11,29 @@ import com.posthog.hoglake.testing.PgTestSupport
 import com.posthog.hoglake.testing.tableWithExactTotals
 import org.assertj.core.api.Assertions.assertThat
 import org.assertj.core.api.Assertions.assertThatThrownBy
+import org.awaitility.Awaitility.await
+import org.awaitility.core.ThrowingRunnable
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.TestInstance
+import java.time.Duration
 import java.util.UUID
 
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class UploadServiceIntegrationTest {
-    // holdsTransactions: three tests here PARK a transaction — one
+    // holdsTransactions: six tests here PARK a transaction — one
     // handle takes the `hog_upload` row lock and holds it across a
     // latch while another thread proves it blocks, which is the whole
-    // subject (invariant 4: that row lock is the serializer the removed
-    // commit lock was standing in for). The suite's
-    // idle-in-transaction guard would kill the parked connection, so
-    // this fixture opts out of it.
+    // subject. Three prove that row lock is the serializer the removed
+    // commit lock was standing in for (invariant 4), and three that
+    // renew, abandon and register take the claim rows in upload_id order
+    // (the holder waits up to 10 s for the statement to queue). The
+    // suite's idle-in-transaction guard would kill the parked
+    // connection, so this fixture opts out of it.
     private val db = PgTestSupport.freshDatabase(holdsTransactions = true)
     private val catalogs = CatalogService(db.jdbi)
     private val uploads = UploadService(db.jdbi)
@@ -54,7 +59,7 @@ class UploadServiceIntegrationTest {
     private fun request(
         catalog: String,
         owner: UUID,
-        claim: UploadClaim,
+        vararg claims: UploadClaim,
     ) = CommitRequest(
         readSnapshot = catalogs.getCatalog(catalog).headSnapshotId,
         appends =
@@ -62,7 +67,7 @@ class UploadServiceIntegrationTest {
                 TableAppend(
                     "test",
                     "target",
-                    listOf(FileRegistration(claim.path, 1, 100, 20)),
+                    claims.map { FileRegistration(it.path, 1, 100, 20) },
                     catalogs.getTable(catalog, "test", "target").tableUuid,
                 ),
             ),
@@ -305,15 +310,10 @@ class UploadServiceIntegrationTest {
             assertThatThrownBy { sweep.get(2, java.util.concurrent.TimeUnit.SECONDS) }
                 .isInstanceOf(java.util.concurrent.TimeoutException::class.java)
 
-            // The renewal commits inside that window. This is the statement
-            // renew() issues; running it here is the only way to place it
-            // between the sweep's two steps deterministically.
-            holder.createUpdate(
-                """
-                UPDATE hog_upload SET expires_at = now() + interval '24 hours'
-                WHERE upload_id = :id AND state = 'active'
-                """,
-            ).bind("id", claim.uploadId).execute()
+            // The renewal commits inside that window. This is what renew()
+            // runs, in the holder's transaction, which is the only way to
+            // place it between the sweep's two steps deterministically.
+            assertThat(UploadService.renewClaims(holder, catalogs.getCatalog(catalog).catalogId, owner)).isEqualTo(1)
             holder.commit()
 
             // READ COMMITTED re-evaluates the fence's WHERE after the wait.
@@ -622,12 +622,10 @@ class UploadServiceIntegrationTest {
 
     // ---- claim rows are locked in upload_id order ---------------------------
     //
-    // renew, abandon and register each lock several claim rows, and none of
-    // them holds the catalog commit lock. Each takes the rows in upload_id
-    // order: in any other order, two of them can each hold a row that the
-    // other waits on, and Postgres aborts one of them as a deadlock. Every
-    // writer of an operation renews the claims of the same owner when it
-    // finishes, so concurrent renewals of one owner are the common case.
+    // renew, abandon and register each lock several claim rows. renew and
+    // abandon take no commit lock, so the commit lock that register holds
+    // does not order them, and each takes the rows in upload_id order
+    // instead (see UploadService's class comment).
 
     @Test
     fun `concurrent renewals and claims of one owner do not deadlock`() {
@@ -670,31 +668,49 @@ class UploadServiceIntegrationTest {
     fun `register locks the claim rows of a publication in upload_id order`() {
         val catalog = catalog()
         val claims = claimsInReverseIdOrder(catalog)
-        val owner = claims.first().owner
-        val request =
-            CommitRequest(
-                readSnapshot = catalogs.getCatalog(catalog).headSnapshotId,
-                appends =
-                    listOf(
-                        TableAppend(
-                            "test",
-                            "target",
-                            claims.map { FileRegistration(it.path, 1, 100, 20) },
-                            catalogs.getTable(catalog, "test", "target").tableUuid,
-                        ),
-                    ),
-                idempotencyKey = owner,
-            )
+        val request = request(catalog, claims.first().owner, *claims.toTypedArray())
         assertLocksInIdOrder(claims) { commits.commit(catalog, request) }
+    }
+
+    @Test
+    fun `an abort that waits on a publication leaves the registered claim alone`() {
+        val catalog = catalog()
+        val owner = UUID.randomUUID()
+        val claim = claim(catalog, owner)
+        val holder = db.jdbi.open()
+        val pool = java.util.concurrent.Executors.newSingleThreadExecutor()
+        try {
+            // Stand in for a publication that registers the claim
+            holder.begin()
+            holder.createUpdate("UPDATE hog_upload SET state = 'registered' WHERE upload_id = :id")
+                .bind("id", claim.uploadId).execute()
+            val abort = pool.submit<Int> { uploads.abandon(catalog, owner, listOf(claim.path)) }
+            // The abort's UPDATE does not check the state: the statement that
+            // locks the claim must wait for the publication, and check it then
+            assertThatThrownBy { abort.get(2, java.util.concurrent.TimeUnit.SECONDS) }
+                .isInstanceOf(java.util.concurrent.TimeoutException::class.java)
+            holder.commit()
+
+            assertThat(abort.get(10, java.util.concurrent.TimeUnit.SECONDS)).isZero()
+            assertThat(uploads.claim(catalog, claim.uploadId, owner, claim.prefix, "data").state)
+                .isEqualTo("registered")
+        } finally {
+            pool.shutdownNow()
+            if (holder.isInTransaction) holder.rollback()
+            holder.close()
+        }
     }
 
     /**
      * Ten claims of a new owner, written in DESCENDING upload_id order, so
-     * the last one has the lowest upload_id but is the last in the order a
-     * scan of the table or of the owner index returns them. Its path is
-     * random, so batches are drawn until it is not the first in path order
-     * either, the order of a scan of the path index. Each batch has its own
-     * owner, so the batches that are not used do not add claims to it.
+     * that the last one has the lowest upload_id. A statement that locks
+     * them in scan order must reach some other claim before that one, so
+     * batches are drawn until it is first neither in path order (a scan of
+     * the path index) nor in ctid order (a scan of the table or of the owner
+     * index). Writing it last usually makes it last in ctid order, but not
+     * always: an insert can reuse a line pointer or a page that pruning or
+     * vacuum freed earlier in the table. Each batch has its own owner, so
+     * the batches that are not used do not add claims to it.
      */
     private fun claimsInReverseIdOrder(catalog: String): List<UploadClaim> {
         val catalogId = catalogs.getCatalog(catalog).catalogId
@@ -704,17 +720,21 @@ class UploadServiceIntegrationTest {
             val prefix = UUID.randomUUID().mostSignificantBits
             (10L downTo 1L).map { uploads.claim(catalog, UUID(prefix, it), owner, dataPath, "data") }
         }.first { batch ->
-            val firstByPath =
+            val lowestComesFirst =
                 db.jdbi.withHandleUnchecked { h ->
                     h.createQuery(
                         """
-                        SELECT upload_id FROM hog_upload WHERE catalog_id = :catalog AND upload_id = ANY(:ids)
-                        ORDER BY path LIMIT 1
+                        WITH batch AS (
+                            SELECT upload_id, path, ctid AS position FROM hog_upload
+                            WHERE catalog_id = :catalog AND upload_id = ANY(:ids))
+                        SELECT :lowest IN (
+                            (SELECT upload_id FROM batch ORDER BY path LIMIT 1),
+                            (SELECT upload_id FROM batch ORDER BY position LIMIT 1))
                         """,
                     ).bind("catalog", catalogId).bindArray("ids", UUID::class.java, batch.map { it.uploadId })
-                        .mapTo(UUID::class.java).one()
+                        .bind("lowest", batch.last().uploadId).mapTo(Boolean::class.java).one()
                 }
-            firstByPath != batch.last().uploadId
+            !lowestComesFirst
         }
     }
 
@@ -762,25 +782,25 @@ class UploadServiceIntegrationTest {
         }
     }
 
-    /** Waits until a session waits on a lock that the session [holderPid] holds, or until [running] ends. */
+    /** Waits until a session waits on a lock that the session [holderPid] holds, failing if [running] ends first. */
     private fun awaitBlockedBy(
         holderPid: Int,
         running: java.util.concurrent.Future<*>,
     ) {
-        val deadline = System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
-        while (true) {
-            val blocked =
+        await().atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(10))
+            .failFast(
+                ThrowingRunnable {
+                    if (running.isDone) {
+                        // Its own failure, if it failed
+                        running.get()
+                        error("the action ended without waiting on the held claim row")
+                    }
+                },
+            ).until {
                 db.jdbi.withHandleUnchecked { h ->
                     h.createQuery("SELECT count(*) FROM pg_stat_activity WHERE :holder = ANY(pg_blocking_pids(pid))")
                         .bind("holder", holderPid).mapTo(Long::class.java).one()
-                }
-            if (blocked > 0) return
-            if (running.isDone) {
-                running.get()
-                error("the action ended without waiting on the held claim row")
+                } > 0
             }
-            check(System.nanoTime() < deadline) { "no session waits on the held claim row" }
-            Thread.sleep(10)
-        }
     }
 }
