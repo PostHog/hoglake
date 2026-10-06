@@ -5331,7 +5331,7 @@ components:
 
     DatabaseFinding:
       type: object
-      required: [severity, code, title, detail, hoglake_impact]
+      required: [severity, code, title, detail, hoglake_impact, resolution]
       properties:
         severity: { type: string, enum: [info, warn, critical] }
         code: { type: string }
@@ -5340,6 +5340,24 @@ components:
         hoglake_impact:
           type: string
           description: What it means for this schema and its commit path.
+        resolution:
+          $ref: "#/components/schemas/FindingResolution"
+
+    FindingResolution:
+      type: object
+      description: >-
+        What happens next about a finding, and by whom. `maintenance` means
+        one of hoglake's own tasks closes it on its own schedule and `task`
+        names it; `operator` means nothing in hoglake will and `text` says
+        what to do; `watch` means no action, and `text` says what would
+        change that.
+      required: [kind, text]
+      properties:
+        kind: { type: string, enum: [maintenance, operator, watch] }
+        task:
+          type: string
+          description: The maintenance task's wire name when `kind` is `maintenance`; absent otherwise.
+        text: { type: string }
 
     MaintenanceStatus:
       type: object

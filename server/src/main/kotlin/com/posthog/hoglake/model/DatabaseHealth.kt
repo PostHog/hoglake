@@ -194,10 +194,44 @@ data class DatabaseIndex(
 enum class FindingSeverity { INFO, WARN, CRITICAL }
 
 /**
- * One interpreted observation. [detail] says what was measured and
+ * Who closes a finding. MAINTENANCE: one of hoglake's own loops does,
+ * on its own schedule, and [FindingResolution.task] names it; the
+ * reader has nothing to do but wait and watch that task's ledger.
+ * OPERATOR: nothing in hoglake will; the text says what to do.
+ * WATCH: no action, by design or because the number is informational;
+ * the text says what would change that.
+ */
+enum class ResolutionKind {
+    MAINTENANCE,
+    OPERATOR,
+    WATCH,
+    ;
+
+    val wire: String get() = name.lowercase()
+}
+
+/** What happens next about a finding, so a reader never has to guess. */
+data class FindingResolution(
+    val kind: ResolutionKind,
+    /** The maintenance task that closes it, exactly when [kind] is MAINTENANCE. */
+    val task: MaintenanceTask? = null,
+    val text: String,
+) {
+    init {
+        require((kind == ResolutionKind.MAINTENANCE) == (task != null)) {
+            "a resolution names a task exactly when maintenance owns it (kind=$kind, task=$task)"
+        }
+    }
+}
+
+/**
+ * One interpreted observation. [detail] says what was measured,
  * [hoglakeImpact] why it matters for THIS schema — a generic Postgres
  * dashboard can produce the first half; the second is the reason this
- * endpoint exists rather than a link to one.
+ * endpoint exists rather than a link to one — and [resolution] what
+ * happens next, and by whom: a page that says "12 indexes are bloated"
+ * without "the reindex task takes one a day" sends an operator to a
+ * runbook for work that is already scheduled.
  */
 data class DatabaseFinding(
     val severity: FindingSeverity,
@@ -205,4 +239,5 @@ data class DatabaseFinding(
     val title: String,
     val detail: String,
     val hoglakeImpact: String,
+    val resolution: FindingResolution,
 )
