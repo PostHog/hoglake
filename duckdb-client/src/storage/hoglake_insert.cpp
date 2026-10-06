@@ -4,6 +4,7 @@
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/exception/binder_exception.hpp"
+#include "duckdb/common/exception/transaction_exception.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/execution/physical_plan_generator.hpp"
 #include "duckdb/execution/operator/persistent/physical_copy_to_file.hpp"
@@ -189,7 +190,7 @@ SinkFinalizeType HoglakeInsert::Finalize(Pipeline &pipeline, Event &event, Clien
 	auto ns = gstate.table.ParentSchema().name.GetIdentifierName();
 	// the wire name is the server's exact (case-preserved) table name
 	transaction.AddAppend(ns, gstate.table.GetWireInfo().name, gstate.table.GetTableUUID(),
-	                      std::move(gstate.written_files));
+	                      gstate.table.GetReadTravel().snapshot.GetIndex(), std::move(gstate.written_files));
 	return SinkFinalizeType::READY;
 }
 
@@ -218,6 +219,9 @@ PhysicalOperator &HoglakeInsert::PlanInsert(ClientContext &context, PhysicalPlan
 	auto &catalog = table.ParentCatalog().Cast<HoglakeCatalog>();
 	if (table.IsTravelPinned()) {
 		throw BinderException("hoglake: cannot INSERT into a table pinned with AT (VERSION/TIMESTAMP)");
+	}
+	if (!table.GetReadTravel().snapshot.IsValid()) {
+		throw TransactionException("hoglake: INSERT requires a table preparation snapshot");
 	}
 	auto &plan_transaction = HoglakeTransaction::Get(context, table.ParentCatalog());
 	plan_transaction.RequireDMLAllowed(table.ParentSchema().name.GetIdentifierName(), table.GetWireInfo().name,
