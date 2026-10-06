@@ -377,8 +377,8 @@ class RetirementService(
         /** The batch's own statement bound fired; nothing was written. */
         data object Timeout : BatchOutcome
 
-        /** Rows were selected and none deleted — impossible on a healthy catalog. */
-        data object Stuck : BatchOutcome
+        /** A batch could not safely retire this table; continue with the next one. */
+        data class Stuck(val reason: String) : BatchOutcome
 
         /** The floor, re-read under the lock, no longer covers the drop. */
         data object NotEligible : BatchOutcome
@@ -386,6 +386,9 @@ class RetirementService(
         /** The commit lock could not be had inside the admission bound. */
         data object Convoyed : BatchOutcome
     }
+
+    /** Only this invariant failure becomes a skipped table after the transaction rolls back. */
+    private class TableGuardViolation(val detail: String) : IllegalStateException(detail)
 
     private fun sweep(catalog: String): RetirementResult {
         val catalogId = jdbi.withHandleUnchecked { h -> CatalogRepo.require(h, catalog).catalogId }
@@ -636,7 +639,7 @@ class RetirementService(
                         if (pauseMs > 0) sleep(pauseMs)
                     }
 
-                    BatchOutcome.Stuck -> {
+                    is BatchOutcome.Stuck -> {
                         stuck++
                         // ANY NON-TIMEOUT TERMINAL OUTCOME ENDS THE
                         // STREAK, not only a committed batch. A table
@@ -648,12 +651,12 @@ class RetirementService(
                         RetirementGauges.recovered(catalog, candidate.tableId)
                         log.error {
                             "retirement batch on catalog '$catalog' table ${candidate.tableId} " +
-                                "selected rows and deleted none; ending the run for this table " +
-                                "rather than spinning. The victim select and the DELETEs name the " +
-                                "same primary keys, so this is a concurrent writer on a dropped " +
-                                "table or a broken cascade"
+                                "could not retire safely: ${outcome.reason}; leaving this table " +
+                                "for operator repair and continuing with the next table"
                         }
                         done = true
+                        // A failed batch held the commit lock even when its work rolled back.
+                        if (pauseMs > 0) sleep(pauseMs)
                     }
 
                     BatchOutcome.NotEligible -> {
@@ -922,8 +925,15 @@ class RetirementService(
                 // leak with a smaller population.
                 val dvs = guardedDelete(h, DV_DELETE_SQL, catalogId, candidate.tableId, victims)
                 val rows = guardedDelete(h, DATA_DELETE_SQL, catalogId, candidate.tableId, victims)
-                if (rows == 0L) BatchOutcome.Stuck else BatchOutcome.Retired(rows, dvs)
+                if (rows == 0L) {
+                    BatchOutcome.Stuck("selected rows and deleted none; possible concurrent writer or broken cascade")
+                } else {
+                    BatchOutcome.Retired(rows, dvs)
+                }
             }
+        } catch (e: TableGuardViolation) {
+            // The transaction has rolled back both deletes and queue inserts.
+            BatchOutcome.Stuck(e.detail)
         } catch (e: HoglakeException.CommitQueueTimeout) {
             BatchOutcome.Convoyed
         } catch (e: UnableToExecuteStatementException) {
@@ -959,9 +969,9 @@ class RetirementService(
      * Run one of the two lock-held deletes and enforce the table guard
      * (#264) on what it RETURNED: a deleted row whose `table_id` is not
      * the candidate's throws, which rolls the batch's transaction back
-     * with it — nothing is deleted, nothing is queued, and the run
-     * fails loudly for the catalog rather than taking another table's
-     * row quietly. See [DV_DELETE_SQL] for why the guard is not a WHERE
+     * with it. Nothing is deleted or queued by that batch. The caller
+     * records the table as skipped, logs the reason, and continues with
+     * the next table. See [DV_DELETE_SQL] for why the guard is not a WHERE
      * predicate. `internal` so the guard test runs THIS check, not a
      * copy of it.
      */
@@ -979,9 +989,11 @@ class RetirementService(
                 .bindArray("victims", Long::class.javaObjectType, victims)
                 .map { rs, _ -> rs.getLong("deleted") to rs.getLong("foreign_rows") }
                 .one()
-        check(foreign == 0L) {
-            "retirement batch for table $tableId of catalog $catalogId reached $foreign row(s) of another " +
-                "table through data_file_id alone; rolling the batch back"
+        if (foreign != 0L) {
+            throw TableGuardViolation(
+                "retirement batch for table $tableId of catalog $catalogId reached $foreign row(s) of another " +
+                    "table through data_file_id alone; rolled the batch back",
+            )
         }
         return deleted
     }
@@ -1202,8 +1214,9 @@ class RetirementService(
          * the ones that are not the candidate's. A non-zero count
          * throws in `guardedDelete`, which rolls the batch back: the
          * foreign row is not deleted, its object is not queued, and the
-         * catalog's run fails loudly. `RetirementServiceIntegrationTest`
-         * hands each arm a foreign id and asserts exactly that.
+         * table is logged as stuck, and the run continues with the next
+         * table. `RetirementServiceIntegrationTest` checks the rollback,
+         * continued progress, and the recorded skipped-table count.
          *
          * Why not `AND table_id = :tableId`: that predicate hands the
          * planner `hog_delete_file_changefeed (catalog_id, table_id,

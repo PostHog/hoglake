@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.MaintenanceRunStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RetirementResult
@@ -502,6 +503,77 @@ class RetirementServiceIntegrationTest {
         assertThat(liveFiles(f.catalogId, "doomed")).isEqualTo(2)
         assertThat(dvCount(f.catalogId)).isEqualTo(1)
         assertThat(queued(f.catalogId)).isEmpty()
+    }
+
+    @Test
+    fun `a table guard failure rolls back its batch and lets later tables retire`() {
+        val catalog = "ret-guard-continue"
+        val f = seed(catalog, files = 2, dvs = 2)
+        val doomed = doomedTableId(f.catalogId)
+        val keeper = keeperTableId(f.catalogId)
+        // The schema permits this mismatch. The guard must reject it after
+        // the DELETE, then roll back both the rows and their queued paths.
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_delete_file SET table_id = :keeper " +
+                    "WHERE catalog_id = :c AND data_file_id = :file",
+            ).bind("keeper", keeper).bind("c", f.catalogId).bind("file", f.fileIds.first()).execute()
+        }
+        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        setFloor(f.catalogId, drop)
+        val sleeps = mutableListOf<Long>()
+        val svc = service(batch = 2, sleeps = sleeps)
+        val healthyPaths = mutableListOf<String>()
+        repeat(2) { run ->
+            val healthy = "healthy_$run"
+            extraDroppedTable(catalog, f.catalogId, healthy, idBase = 700_000 + run * 100)
+            healthyPaths += "s3://bucket/$catalog/$healthy/bulk-1.parquet"
+
+            sleeps.clear()
+            val result = svc.runOnce(catalog)
+            assertThat(sleeps).containsExactly(750L, 750L)
+            assertThat(result.skippedTables).isEqualTo(1)
+            assertThat(result.tables).isEqualTo(1)
+            assertThat(result.rowsRetired).isEqualTo(1)
+            assertThat(result.dvsRetired).isZero()
+            assertThat(result.pathsQueued).isEqualTo(1)
+            assertThat(result.batches).isEqualTo(1)
+            assertThat(result.timeouts).isZero()
+            assertThat(liveFiles(f.catalogId, "doomed")).isEqualTo(2)
+            assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+            assertThat(liveFiles(f.catalogId, healthy)).isZero()
+            assertThat(dvCount(f.catalogId)).isEqualTo(2)
+            assertThat(queued(f.catalogId)).containsExactlyInAnyOrderElementsOf(
+                healthyPaths.map { Triple(it, "data", "table_drop_gc") },
+            )
+            val last =
+                jdbi.withHandleUnchecked { h ->
+                    MaintenanceRunStore(jdbi).lastByTask(h, f.catalogId)[MaintenanceTask.RETIREMENT]
+                }
+            assertThat(last).isNotNull
+            assertThat(last!!.status).isEqualTo(MaintenanceRunStatus.OK)
+            assertThat(last.resultJson).contains("\"skipped_tables\": 1", "\"rows_retired\": 1")
+        }
+
+        // After repair, the same service can retire the failed table.
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_delete_file SET table_id = :doomed " +
+                    "WHERE catalog_id = :c AND data_file_id = :file",
+            ).bind("doomed", doomed).bind("c", f.catalogId).bind("file", f.fileIds.first()).execute()
+        }
+        val recovered = svc.runOnce(catalog)
+        assertThat(recovered.skippedTables).isZero()
+        assertThat(recovered.rowsRetired).isEqualTo(2)
+        assertThat(recovered.dvsRetired).isEqualTo(2)
+        assertThat(recovered.pathsQueued).isEqualTo(4)
+        assertThat(liveFiles(f.catalogId, "doomed")).isZero()
+        assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+        assertThat(dvCount(f.catalogId)).isZero()
+        assertThat(queued(f.catalogId)).containsExactlyInAnyOrderElementsOf(
+            (healthyPaths + f.dataPaths).map { Triple(it, "data", "table_drop_gc") } +
+                f.dvPaths.map { Triple(it, "delete", "table_drop_gc") },
+        )
     }
 
     // ---- the gate ----------------------------------------------------------

@@ -4817,11 +4817,11 @@ components:
           type: integer
           format: int64
           description: >
-            Tables whose batch selected rows and deleted none, which
-            ends the run for that table. The select and the deletes name
-            the same primary keys, so this cannot happen on a healthy
-            catalog; the counter exists so the loop stops instead of
-            spinning.
+            Tables skipped because a batch deleted none of its selected
+            rows or reached a row belonging to another table. A table-guard
+            failure rolls back the batch, including removal-queue inserts.
+            The run logs the reason and continues with the next table.
+            These failures require operator repair.
         skipped_queue_full:
           type: integer
           format: int64
