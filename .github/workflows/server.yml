@@ -51,17 +51,27 @@ jobs:
     if: needs.changes.outputs.server == 'true'
     uses: ./.github/workflows/python-live.yml
 
-  # Deployment requires both suites. Run this gate only for server changes.
+  # Deployment requires both suites. Run this gate only for server
+  # changes. THIS is the check the ruleset requires, not `server-test`:
+  # requiring the leaf let #304 merge with python-live red (two hours
+  # of red main until #306). A required gate is what makes a gate.
+  # Runs (and fails) when `changes` itself failed: a skipped gate
+  # passes the ruleset, so a broken filter must not read as "nothing
+  # to check".
   server-checks:
-    if: always() && needs.changes.outputs.server == 'true'
+    if: always() && (needs.changes.result != 'success' || needs.changes.outputs.server == 'true')
     needs: [changes, server-test, python-live]
     runs-on: ubuntu-latest
     steps:
       - name: Require both suites
         env:
+          CHANGES_RESULT: ${{ needs.changes.result }}
           SERVER_RESULT: ${{ needs.server-test.result }}
           LIVE_RESULT: ${{ needs.python-live.result }}
-        run: test "$SERVER_RESULT" = success && test "$LIVE_RESULT" = success
+        run: |
+          test "$CHANGES_RESULT" = success &&
+            test "$SERVER_RESULT" = success &&
+            test "$LIVE_RESULT" = success
 
   server-test:
     needs: changes
