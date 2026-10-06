@@ -1990,11 +1990,14 @@ output file, so `claim`/`renew`/`abandon`/`schedule-expired` taking the per-cata
 commit lock — unbounded, with no admission timeout — meant paying the catalog's
 whole write-throughput bottleneck once per file, for nothing: claim paths are
 server-generated random UUIDs and the claim INSERT is `ON CONFLICT DO NOTHING`.
-Row-level semantics replace it. Every UPDATE re-checks the claim's state in its
-WHERE clause, so under READ COMMITTED an update that waited on a publication's
-row lock re-evaluates against the committed row and cannot clobber a settled
-claim, and `UploadService.register` — which runs inside the commit transaction —
-takes the claim rows `FOR UPDATE`. The expired-upload sweep's fence re-checks the
+Row-level semantics replace it. Every transition re-checks the claim's state in
+the statement that takes its row lock, so under READ COMMITTED one that waited on
+a publication's row lock re-evaluates against the committed row and cannot
+clobber a settled claim, and `UploadService.register` — which runs inside the
+commit transaction — takes the claim rows `FOR UPDATE`. With no lock above them,
+`renew`, `abandon` and `register` take the claim rows they lock in `upload_id`
+order: concurrent renewals of one owner, one per writer of an operation,
+deadlocked before they did. The expired-upload sweep's fence re-checks the
 *whole* candidate predicate, not just "not registered", so a renewal that landed
 between candidate selection and the fence wins, as `renewUploads` promises; it
 fences each candidate in **its own short transaction**, because a publication
