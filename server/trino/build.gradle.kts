@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.3.10-dev"
+version = "1.3.11-dev"
 
 repositories {
     mavenCentral()
@@ -15,7 +15,7 @@ val testcontainersVersion = "1.21.4"
 val ktorVersion = "3.5.2"
 
 dependencies {
-    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.2")
+    testImplementation("com.fasterxml.jackson.core:jackson-databind:2.22.3")
     testImplementation("org.junit.jupiter:junit-jupiter:6.1.3")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
     testImplementation("org.assertj:assertj-core:3.27.7")
@@ -28,7 +28,7 @@ dependencies {
     testImplementation("io.ktor:ktor-server-core:$ktorVersion")
     testImplementation("io.ktor:ktor-server-netty:$ktorVersion")
     testImplementation("com.zaxxer:HikariCP:7.1.0")
-    testImplementation("org.jdbi:jdbi3-core:3.54.0")
+    testImplementation("org.jdbi:jdbi3-core:3.55.0")
     testImplementation("org.testcontainers:testcontainers:$testcontainersVersion")
     testImplementation("org.testcontainers:junit-jupiter:$testcontainersVersion")
     testImplementation("org.testcontainers:postgresql:$testcontainersVersion")
@@ -41,7 +41,7 @@ dependencies {
     // root hydrator tests use).
     testImplementation("dev.hardwood:hardwood-core:1.1.0.Beta1")
     // Bucket creation + parquet/deletion-vector upload to MinIO.
-    testImplementation("software.amazon.awssdk:s3:2.54.17")
+    testImplementation("software.amazon.awssdk:s3:2.55.6")
     // Real puffin deletion vectors for the DV read tests: the portable
     // 64-bit roaring serialization IS the Java library's format, so the
     // harness writes the same bytes the server and DuckDB client do.
