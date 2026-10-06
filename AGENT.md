@@ -136,10 +136,10 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-test`, see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
+| `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
@@ -153,8 +153,8 @@ Python results are visible on the PR but are not required for merge.
 
 **Required checks run on every PR, by construction.** The main
 ruleset ("Require to be up to date", repository-level) requires
-`migration-chain`, `server-test` and `webui-test`, with the
-up-to-date policy on. A required check has to be PRODUCED on every PR:
+`migration-chain`, `server-checks`, `python-checks` and `webui-test`,
+with the up-to-date policy on. A required check has to be PRODUCED on every PR:
 a workflow that path-filters itself out of a PR leaves its check
 "expected" forever and the PR cannot merge — #299 (webui-only) sat
 BLOCKED with every check green until #301 moved the migration gate out
@@ -169,6 +169,18 @@ a PR touching both trees, and which one the ruleset read was not
 defined. Renaming a required job means editing the ruleset in the
 same breath (`gh api repos/PostHog/hoglake/rulesets/24498452`), or
 every PR is blocked on a name nothing produces.
+
+**Require the gate, not the leaf.** Where a workflow has a gate job
+that fans in several suites (`server-checks` over `server-test` and
+`python-live`; `python-checks` over the pyhoglake checks, the live
+client suites and the hedgerow/bench checks), the ruleset requires
+the GATE. Requiring a leaf let #304 wire the live Python suites into
+three workflows as a deploy gate and merge while that gate was red —
+the suites had been failing for days outside CI, which is what #304
+set out to fix — and main was red for two hours until #306 repaired
+them. Two rules fall out: a PR that adds a gate merges green on that
+gate, and no suite in this repo lives outside CI (a suite that only
+runs locally rots; the live suites did for four releases).
 
 CD is the charts state-file mechanism (same as duckgres, millpond,
 viaduck): a push to main touching `server/**` or `webui/**` runs the
