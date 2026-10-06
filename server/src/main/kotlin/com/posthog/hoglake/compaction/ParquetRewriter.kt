@@ -1,5 +1,6 @@
 package com.posthog.hoglake.compaction
 
+import com.posthog.hoglake.ParquetReaders
 import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
@@ -819,7 +820,7 @@ object ParquetRewriter {
             // EXACTLY the old shape, with no executor and no thread hop:
             // the default is 1 for the unit tests and for any caller that
             // did not ask, and "off" must mean off.
-            for (input in inputs) ParquetFileReader.open(input.source).use { body(input, it) }
+            for (input in inputs) ParquetReaders.open(input.source).use { body(input, it) }
             return
         }
         val pool =
@@ -841,7 +842,7 @@ object ParquetRewriter {
                     pending.addLast(
                         pool.submit(
                             Callable {
-                                val opened = ParquetFileReader.open(next.source)
+                                val opened = ParquetReaders.open(next.source)
                                 if (abandoned.get()) {
                                     runCatching { opened.close() }
                                     null
