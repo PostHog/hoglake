@@ -14,6 +14,7 @@ import com.posthog.hoglake.persistence.Locks
 import com.posthog.hoglake.persistence.MaintenanceRunStore
 import com.posthog.hoglake.persistence.Pg
 import io.github.oshai.kotlinlogging.KotlinLogging
+import org.jdbi.v3.core.Handle
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
@@ -376,8 +377,8 @@ class RetirementService(
         /** The batch's own statement bound fired; nothing was written. */
         data object Timeout : BatchOutcome
 
-        /** Rows were selected and none deleted — impossible on a healthy catalog. */
-        data object Stuck : BatchOutcome
+        /** A batch could not safely retire this table; continue with the next one. */
+        data class Stuck(val reason: String) : BatchOutcome
 
         /** The floor, re-read under the lock, no longer covers the drop. */
         data object NotEligible : BatchOutcome
@@ -385,6 +386,9 @@ class RetirementService(
         /** The commit lock could not be had inside the admission bound. */
         data object Convoyed : BatchOutcome
     }
+
+    /** Only this invariant failure becomes a skipped table after the transaction rolls back. */
+    private class TableGuardViolation(val detail: String) : IllegalStateException(detail)
 
     private fun sweep(catalog: String): RetirementResult {
         val catalogId = jdbi.withHandleUnchecked { h -> CatalogRepo.require(h, catalog).catalogId }
@@ -635,7 +639,7 @@ class RetirementService(
                         if (pauseMs > 0) sleep(pauseMs)
                     }
 
-                    BatchOutcome.Stuck -> {
+                    is BatchOutcome.Stuck -> {
                         stuck++
                         // ANY NON-TIMEOUT TERMINAL OUTCOME ENDS THE
                         // STREAK, not only a committed batch. A table
@@ -647,12 +651,12 @@ class RetirementService(
                         RetirementGauges.recovered(catalog, candidate.tableId)
                         log.error {
                             "retirement batch on catalog '$catalog' table ${candidate.tableId} " +
-                                "selected rows and deleted none; ending the run for this table " +
-                                "rather than spinning. The victim select and the DELETEs name the " +
-                                "same primary keys, so this is a concurrent writer on a dropped " +
-                                "table or a broken cascade"
+                                "could not retire safely: ${outcome.reason}; leaving this table " +
+                                "for operator repair and continuing with the next table"
                         }
                         done = true
+                        // A failed batch held the commit lock even when its work rolled back.
+                        if (pauseMs > 0) sleep(pauseMs)
                     }
 
                     BatchOutcome.NotEligible -> {
@@ -919,20 +923,17 @@ class RetirementService(
                 // this to live DVs would leave exactly the SUPERSEDED
                 // ones to be cascaded away un-queued, which is the same
                 // leak with a smaller population.
-                val dvs =
-                    h.createUpdate(DV_DELETE_SQL)
-                        .bind("catalogId", catalogId)
-                        .bindArray("victims", Long::class.javaObjectType, victims)
-                        .execute()
-                        .toLong()
-                val rows =
-                    h.createUpdate(DATA_DELETE_SQL)
-                        .bind("catalogId", catalogId)
-                        .bindArray("victims", Long::class.javaObjectType, victims)
-                        .execute()
-                        .toLong()
-                if (rows == 0L) BatchOutcome.Stuck else BatchOutcome.Retired(rows, dvs)
+                val dvs = guardedDelete(h, DV_DELETE_SQL, catalogId, candidate.tableId, victims)
+                val rows = guardedDelete(h, DATA_DELETE_SQL, catalogId, candidate.tableId, victims)
+                if (rows == 0L) {
+                    BatchOutcome.Stuck("selected rows and deleted none; possible concurrent writer or broken cascade")
+                } else {
+                    BatchOutcome.Retired(rows, dvs)
+                }
             }
+        } catch (e: TableGuardViolation) {
+            // The transaction has rolled back both deletes and queue inserts.
+            BatchOutcome.Stuck(e.detail)
         } catch (e: HoglakeException.CommitQueueTimeout) {
             BatchOutcome.Convoyed
         } catch (e: UnableToExecuteStatementException) {
@@ -962,6 +963,39 @@ class RetirementService(
             }
         }
         return results
+    }
+
+    /**
+     * Run one of the two lock-held deletes and enforce the table guard
+     * (#264) on what it RETURNED: a deleted row whose `table_id` is not
+     * the candidate's throws, which rolls the batch's transaction back
+     * with it. Nothing is deleted or queued by that batch. The caller
+     * records the table as skipped, logs the reason, and continues with
+     * the next table. See [DV_DELETE_SQL] for why the guard is not a WHERE
+     * predicate. `internal` so the guard test runs THIS check, not a
+     * copy of it.
+     */
+    internal fun guardedDelete(
+        h: Handle,
+        sql: String,
+        catalogId: Long,
+        tableId: Long,
+        victims: List<Long>,
+    ): Long {
+        val (deleted, foreign) =
+            h.createQuery(sql)
+                .bind("catalogId", catalogId)
+                .bind("tableId", tableId)
+                .bindArray("victims", Long::class.javaObjectType, victims)
+                .map { rs, _ -> rs.getLong("deleted") to rs.getLong("foreign_rows") }
+                .one()
+        if (foreign != 0L) {
+            throw TableGuardViolation(
+                "retirement batch for table $tableId of catalog $catalogId reached $foreign row(s) of another " +
+                    "table through data_file_id alone; rolled the batch back",
+            )
+        }
+        return deleted
     }
 
     internal companion object {
@@ -1026,9 +1060,15 @@ class RetirementService(
          * pruned on a stricter predicate retires a series the loop is
          * still working, and one pruned on a looser predicate keeps a
          * series for a table the loop will never reach. It is bound to
-         * `t`/`c` (the candidate query's aliases) and to `:catalogId`.
+         * `t`/`c` (the candidate query's aliases) only; the catalog filter
+         * is each statement's own.
+         *
+         * `internal` for a THIRD reader with the same need not to
+         * disagree: `ReindexService`'s `retirement_pending` guard asks
+         * "is there retirement work anywhere", and an index rebuilt while
+         * this loop still has rows to delete is rebuilt for nothing.
          */
-        private const val ELIGIBLE_PREDICATE: String =
+        internal const val ELIGIBLE_PREDICATE: String =
             """t.dropped_snapshot IS NOT NULL
               AND t.dropped_snapshot <= c.earliest_snapshot_id
               AND EXISTS (
@@ -1164,16 +1204,52 @@ class RetirementService(
          * `(catalog_id, data_file_id)`) — the partial
          * `one_live_per_data_file` index could not serve a statement
          * that carries no `end_snapshot` predicate.
+         *
+         * THE TABLE GUARD (#264) IS IN THE RETURNING, NOT THE WHERE.
+         * The victims came from [VICTIM_SELECT_SQL] under this same
+         * lock and belong to the table by construction; the guard is
+         * for the day they do not — a caller's slip, an identity that
+         * is no longer `(catalog_id, data_file_id)` alone — and it
+         * works by RETURNING each deleted row's `table_id` and counting
+         * the ones that are not the candidate's. A non-zero count
+         * throws in `guardedDelete`, which rolls the batch back: the
+         * foreign row is not deleted, its object is not queued, and the
+         * table is logged as stuck, and the run continues with the next
+         * table. `RetirementServiceIntegrationTest` checks the rollback,
+         * continued progress, and the recorded skipped-table count.
+         *
+         * Why not `AND table_id = :tableId`: that predicate hands the
+         * planner `hog_delete_file_changefeed (catalog_id, table_id,
+         * begin_snapshot)` as an alternative to the id probe — walk the
+         * dropped table's vectors, filter the 8,000-element array per
+         * row — and on the V20 fixture (40,000 vectors, a third of them
+         * the table's) it TOOK it: 2,441 buffers per batch, proportional
+         * to the table rather than to the batch, repeated for every
+         * batch of the table. The RETURNING form leaves the WHERE as it
+         * was, so the plan is the one `V20RetirementMigrationIntegrationTest`
+         * pins against a populated hog_delete_file: the driver is
+         * `hog_delete_file_data_lookup`, and nothing is filtered.
+         *
+         * A vector whose `table_id` DISAGREES with its data file's (a
+         * row `CommitService` refuses to write, and the schema does not
+         * forbid) trips this guard too, as a stuck batch an operator
+         * can see — rather than the alternative under a predicate,
+         * where the arm would skip it and [DATA_DELETE_SQL]'s cascade
+         * would then take it away un-queued.
          */
         internal const val DV_DELETE_SQL: String =
             """
             WITH doomed AS (
                 DELETE FROM hog_delete_file
                 WHERE catalog_id = :catalogId AND data_file_id = ANY(:victims)
-                RETURNING path
+                RETURNING path, table_id
+            ), queued AS (
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                SELECT :catalogId, path, 'delete', '$REASON' FROM doomed
+                RETURNING 1
             )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'delete', '$REASON' FROM doomed
+            SELECT count(*) AS deleted, count(*) FILTER (WHERE table_id <> :tableId) AS foreign_rows
+              FROM doomed
             """
 
         /**
@@ -1198,16 +1274,28 @@ class RetirementService(
          * than taking the schema's word for it: measured flat at 42 ms
          * per 2,000-row batch against an empty hog_delete_file and
          * 48 ms against 100,000 rows in 2,128 heap pages.
+         *
+         * The table guard is the same RETURNING-and-count as
+         * [DV_DELETE_SQL]'s (#264), for the same reason: a `table_id`
+         * predicate would offer `hog_data_file_changefeed` and both
+         * maintenance-scan indexes, all leading on `(catalog_id,
+         * table_id)`, as a per-batch walk of the table. The V20 plan
+         * test pins the driver to `hog_data_file_pkey` and asserts no
+         * row is filtered.
          */
         internal const val DATA_DELETE_SQL: String =
             """
             WITH doomed AS (
                 DELETE FROM hog_data_file
                 WHERE catalog_id = :catalogId AND data_file_id = ANY(:victims)
-                RETURNING path
+                RETURNING path, table_id
+            ), queued AS (
+                INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
+                SELECT :catalogId, path, 'data', '$REASON' FROM doomed
+                RETURNING 1
             )
-            INSERT INTO hog_file_removal (catalog_id, path, file_kind, reason)
-            SELECT :catalogId, path, 'data', '$REASON' FROM doomed
+            SELECT count(*) AS deleted, count(*) FILTER (WHERE table_id <> :tableId) AS foreign_rows
+              FROM doomed
             """
     }
 }

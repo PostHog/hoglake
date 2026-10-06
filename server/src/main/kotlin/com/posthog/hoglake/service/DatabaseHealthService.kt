@@ -8,8 +8,12 @@ import com.posthog.hoglake.model.DatabaseIndex
 import com.posthog.hoglake.model.DatabaseIndexHealth
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
+import com.posthog.hoglake.model.FindingResolution
 import com.posthog.hoglake.model.FindingSeverity
+import com.posthog.hoglake.model.IndexBloatEstimate
+import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.ReplicationSlot
+import com.posthog.hoglake.model.ResolutionKind
 import com.posthog.hoglake.persistence.DatabaseHealthRepo
 import org.jdbi.v3.core.Jdbi
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -29,7 +33,11 @@ import org.jdbi.v3.core.kotlin.inTransactionUnchecked
  * something already feels wrong, and a screen of yellow teaches people
  * to ignore it.
  */
-class DatabaseHealthService(private val jdbi: Jdbi) {
+class DatabaseHealthService(
+    private val jdbi: Jdbi,
+    /** The bloat estimate's owner; its gauge is refreshed by every report. */
+    private val reindex: ReindexService = ReindexService(jdbi),
+) {
     fun report(): DatabaseHealth =
         jdbi.inTransactionUnchecked { handle ->
             // One transaction, so every number is from one MVCC snapshot:
@@ -39,11 +47,22 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
             val server = DatabaseHealthRepo.server(handle)
             val activity = DatabaseHealthRepo.activity(handle)
             val tables = DatabaseHealthRepo.tables(handle)
-            val indexes = DatabaseHealthRepo.indexes(handle)
+            // The bloat estimate rides the same snapshot. It reads the
+            // catalog and pg_stats only (ReindexService.ESTIMATE_SQL),
+            // which keeps this page's no-hog_*-rows rule.
+            val estimates = reindex.estimate(handle).associateBy { it.table to it.index }
+            val indexes =
+                DatabaseHealthRepo.indexes(handle).map { index ->
+                    estimates[index.table to index.name]?.let {
+                        index.copy(estimatedBloatBytes = it.excessBytes, estimatedBloatRatio = it.ratio)
+                    } ?: index
+                }
+            val bloated = estimates.values.filter { ReindexService.overThreshold(it) }
             val commitLocks = DatabaseHealthRepo.commitLocks(handle)
             val slots = DatabaseHealthRepo.replicationSlots(handle)
             val prepared = DatabaseHealthRepo.preparedTransactions(handle)
             val invalid = DatabaseHealthRepo.invalidIndexes(handle)
+            val reindexLoopSeen = DatabaseHealthRepo.reindexLoopSeen(handle)
             DatabaseHealth(
                 server = server,
                 activity = activity,
@@ -52,7 +71,10 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                 tables = tables,
                 indexes = indexes,
                 findings =
-                    findings(server, activity, tables, indexes, commitLocks, slots, prepared, invalid),
+                    findings(
+                        server, activity, tables, indexes, commitLocks, slots, prepared, invalid, bloated,
+                        reindexLoopSeen,
+                    ),
                 blindSpots = BLIND_SPOTS,
             )
         }
@@ -66,10 +88,79 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
         slots: List<ReplicationSlot> = emptyList(),
         preparedTransactions: Pair<Int, Double?> = 0 to null,
         invalidIndexes: List<DatabaseIndexHealth> = emptyList(),
+        bloatedIndexes: List<IndexBloatEstimate> = emptyList(),
+        /** The reindex loop has recorded a run lately; see [DatabaseHealthRepo.reindexLoopSeen]. */
+        reindexLoopSeen: Boolean = false,
     ): List<DatabaseFinding> {
         val found = mutableListOf<DatabaseFinding>()
+        // A finding the reindex task would close is only maintenance's
+        // if the loop is actually running somewhere; otherwise the honest
+        // badge is the operator's, with the knob to set.
+        val noReindexLoop =
+            "No reindex loop has recorded a run in two days: set HOGLAKE_REINDEX_INTERVAL_MS on the " +
+                "maintenance pod, or rebuild by hand off-peak with REINDEX INDEX CONCURRENTLY."
+
+        // THE SAME PREDICATE THE REINDEX TASK REBUILDS ON, passed in
+        // already filtered by ReindexService.overThreshold, so the page
+        // cannot call an index bloated that the task would leave alone or
+        // the reverse. WARN, not INFO: an over-threshold index is paid on
+        // every write to its table and walked by every scan that uses it,
+        // and nothing but a rebuild ever returns the space.
+        if (bloatedIndexes.isNotEmpty()) {
+            val worst = bloatedIndexes.sortedByDescending { it.excessBytes ?: 0L }
+            // The task's own cap: an index expected to rebuild past it is
+            // never rebuilt by the task (ReindexService TOO_LARGE), so the
+            // page must not promise it.
+            val overCap = worst.filter { (it.expectedBytes ?: 0L) > ReindexService.MAX_REBUILD_EXPECTED_BYTES }
+            val rebuildable = worst.size - overCap.size
+            val overCapText =
+                if (overCap.isEmpty()) {
+                    ""
+                } else {
+                    " ${overCap.joinToString(", ") { it.index }} would rebuild past the task's " +
+                        "${bytes(ReindexService.MAX_REBUILD_EXPECTED_BYTES)} cap and is yours to rebuild " +
+                        "by hand off-peak."
+                }
+            found +=
+                DatabaseFinding(
+                    FindingSeverity.WARN,
+                    "index_bloat",
+                    "${bloatedIndexes.size} index(es) are over the bloat threshold, " +
+                        "${bytes(worst.sumOf { it.excessBytes ?: 0L })} estimated excess",
+                    worst.joinToString("; ") {
+                        "${it.table}.${it.index}: ${bytes(it.sizeBytes)}, ~${bytes(it.excessBytes ?: 0L)} " +
+                            "excess (%.1fx)".format(it.ratio ?: 0.0)
+                    } + ". Estimated from pg_stats (check_postgres arithmetic) as of the last " +
+                        "VACUUM/ANALYZE; threshold ${ReindexService.RATIO_THRESHOLD}x, or " +
+                        "${bytes(ReindexService.EXCESS_BYTES_THRESHOLD)} excess at " +
+                        "${ReindexService.EXCESS_MIN_RATIO}x. Deduplicated indexes (many equal " +
+                        "keys) are under-reported.",
+                    "Autovacuum never shrinks an index. On this schema bloat arrives in steps — " +
+                        "a retirement, an expiry purge, a large compaction — and stays: every " +
+                        "commit writes into the bloated index and every probe descends it. " +
+                        "Several here at once is a backlog of days, not a fault.",
+                    resolution =
+                        when {
+                            !reindexLoopSeen -> operator(noReindexLoop + overCapText)
+                            rebuildable == 0 -> operator(overCapText.trim())
+                            else ->
+                                maintenance(
+                                    MaintenanceTask.REINDEX,
+                                    "The reindex task rebuilds the index with the largest excess once a day at " +
+                                        "03:00 UTC, roughly one a day, longer while a retirement or expiry purge " +
+                                        "is pending and a week after a failed attempt; its ledger rows say which. " +
+                                        "Nothing to do for the $rebuildable within its cap.$overCapText",
+                                )
+                        },
+                )
+        }
 
         if (invalidIndexes.isNotEmpty()) {
+            // The reindex task drops only what a concurrent build leaves
+            // behind (ReindexService.LEFTOVERS_SQL): *_ccnew / *_ccold on a
+            // hog_* table. Anything else invalid is nobody's but the
+            // operator's, so the badge follows the names, not the hope.
+            val leftovers = invalidIndexes.all { LEFTOVER_INDEX.containsMatchIn(it.name) }
             found +=
                 DatabaseFinding(
                     FindingSeverity.WARN,
@@ -83,7 +174,24 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "forever — it never appears as a slow query. Note the two failure " +
                         "modes chain: a CONCURRENTLY build is blocked by exactly the " +
                         "idle-in-transaction sessions this page also reports, so the corpse " +
-                        "is often downstream of a finding above. REINDEX or drop and rebuild.",
+                        "is often downstream of a finding above.",
+                    resolution =
+                        when {
+                            leftovers && reindexLoopSeen ->
+                                maintenance(
+                                    MaintenanceTask.REINDEX,
+                                    "Every name here is a concurrent build's leftover (*_ccnew, *_ccold), " +
+                                        "which the reindex task drops before its next daily run. One that is a " +
+                                        "rebuild in flight right now disappears on its own within the hour.",
+                                )
+                            leftovers ->
+                                operator(noReindexLoop.replace("rebuild by hand", "drop the leftovers by hand"))
+                            else ->
+                                operator(
+                                    "Not a concurrent build's leftover, so no task will touch it: REINDEX INDEX " +
+                                        "CONCURRENTLY it, or drop and recreate it, by hand.",
+                                )
+                        },
                 )
         }
 
@@ -99,7 +207,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "instance that volume is not visible from SQL — so this row is the " +
                         "warning you get. RDS Blue/Green upgrades work by logical " +
                         "replication and have left slots behind; the CDC WAL tap will " +
-                        "create them deliberately. Drop the slot if nothing is consuming it.",
+                        "create them deliberately.",
+                    resolution =
+                        operator(
+                            "Drop the slot if nothing consumes it (pg_drop_replication_slot); hoglake creates no " +
+                                "replication slots today, so no task here will.",
+                        ),
                 )
         }
 
@@ -115,8 +228,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "horizons exactly as an open transaction does, but survives a " +
                         "restart and appears in none of the session counts above — so it " +
                         "starves vacuum invisibly to every other finding here. hoglake " +
-                        "never uses two-phase commit, so any row is an orphan: COMMIT " +
-                        "PREPARED or ROLLBACK PREPARED it.",
+                        "never uses two-phase commit, so any row is an orphan.",
+                    resolution =
+                        operator(
+                            "COMMIT PREPARED or ROLLBACK PREPARED each one by hand; hoglake never prepares a " +
+                                "transaction, so nothing here will resolve them.",
+                        ),
                 )
         }
 
@@ -136,6 +253,13 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "clients see admission timeouts (503) rather than anything " +
                             "pointing at the database. A commit tail is milliseconds; this " +
                             "is not one.",
+                        resolution =
+                            operator(
+                                "Find pid ${holder.pid} in pg_stat_activity. A retirement or expiry batch holds " +
+                                    "this lock for at most about 15 s by construction and a compaction commit " +
+                                    "tail's statements are each bounded at 60 s, so a holder past a minute is " +
+                                    "wedged and is pg_terminate_backend's; a shorter one is a sweep working.",
+                            ),
                     )
             }
         }
@@ -151,6 +275,11 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "end_snapshot update produce, and nothing advances the frozen-xid " +
                         "horizon. Both failures are unbounded and neither is visible until " +
                         "the manifest has already bloated.",
+                    resolution =
+                        operator(
+                            "Turn autovacuum back on at the instance (the RDS parameter group). No hoglake task " +
+                                "stands in for it.",
+                        ),
                 )
         }
 
@@ -167,6 +296,18 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "rate directly. At the limit Postgres forces an anti-wraparound " +
                         "vacuum that reads every page of the manifest tables, competing " +
                         "with the commit tail exactly when the write rate is highest.",
+                    resolution =
+                        if (xidUsed >= XID_CRITICAL) {
+                            operator(
+                                "Past the point of waiting: run VACUUM FREEZE on the manifest tables at a " +
+                                    "quiet hour before Postgres forces an anti-wraparound vacuum at a busy one.",
+                            )
+                        } else {
+                            watch(
+                                "Autovacuum's freeze pass advances the horizon on its own as the age climbs; " +
+                                    "this reads as a trend. It becomes an action at the critical line.",
+                            )
+                        },
                 )
         }
 
@@ -188,6 +329,13 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "Every snapshot expiry deletes and every compaction supersession " +
                             "stays unreclaimable until it ends, so the manifest grows while " +
                             "maintenance reports success.",
+                        resolution =
+                            operator(
+                                "hoglake's own sessions are ended by their idle-in-transaction bound after 30 s, so " +
+                                    "one " +
+                                    "older than that is another client's: find it in pg_stat_activity and terminate " +
+                                    "it.",
+                            ),
                     )
             }
         }
@@ -204,6 +352,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "lock and every other writer to the catalog is queued behind it " +
                             "— which surfaces to clients as commit-admission 503s rather " +
                             "than as anything pointing here.",
+                        resolution =
+                            operator(
+                                "Find it in pg_stat_activity. An idle one of hoglake's is ended by its 30 s " +
+                                    "bound; a foreign idle one, or one still running that is not hoglake's, is " +
+                                    "pg_terminate_backend's. One of hoglake's still running is a statement to read.",
+                            ),
                     )
             }
         }
@@ -217,8 +371,15 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "${activity.waiting} session(s) blocked on locks",
                         "The longest lock wait is ${duration(seconds)}.",
                         "Commits to one catalog serialize on a per-catalog advisory lock by " +
-                            "design, so brief waits are the system working. Sustained ones " +
-                            "mean the tail is not draining as fast as writers arrive.",
+                            "design, and the renewals and aborts of one operation's upload " +
+                            "claims queue on its claim rows, so brief waits are the system " +
+                            "working. Sustained ones mean one of those queues is not draining " +
+                            "as fast as writers arrive.",
+                        resolution =
+                            watch(
+                                "A wait this long points at a commit-lock holder or an upload-claim renewal " +
+                                    "queue, which the findings above name when present; it clears when they do.",
+                            ),
                     )
             }
         }
@@ -235,6 +396,21 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "${bytes(table.totalBytes)}. Last autovacuum: " +
                             "${table.lastAutovacuum ?: "never"}.",
                         deadTupleImpact(table.name),
+                        resolution =
+                            if (ratio >= DEAD_TUPLE_CRITICAL) {
+                                operator(
+                                    "Autovacuum is not keeping up on this table: VACUUM it by hand, then set " +
+                                        "its per-table autovacuum thresholds lower (ALTER TABLE ... SET " +
+                                        "(autovacuum_vacuum_scale_factor = ...)); the index side is the " +
+                                        "index_bloat finding's, once an index crosses its threshold.",
+                                )
+                            } else {
+                                watch(
+                                    "Autovacuum reclaims the heap side when the table crosses its threshold. " +
+                                        "The index side is the index_bloat finding's, which the reindex task " +
+                                        "takes once an index crosses its threshold.",
+                                )
+                            },
                     )
             }
         }
@@ -253,6 +429,10 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "The planner is costing manifest scans from defaults. This is how a " +
                             "commit path that should be index probes turns into sequential " +
                             "scans under load.",
+                        resolution =
+                            operator(
+                                "Run ANALYZE on the table once; autoanalyze keeps it current from then on.",
+                            ),
                     )
             }
         }
@@ -270,6 +450,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "Every read on the commit and scan paths is meant to be an index " +
                             "probe scoped to one catalog or table. Sequential scans here are " +
                             "the shape of a cost that grows with the whole catalog.",
+                        resolution =
+                            operator(
+                                "Find the statement in pg_stat_statements if it is installed, else in the slow " +
+                                    "query log. Stale statistics are an ANALYZE by hand; a missing index on a " +
+                                    "hog_* table is a migration, so file it.",
+                            ),
                     )
             }
         }
@@ -308,6 +494,11 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "digest), and do they have a retention? A body written per commit " +
                             "and never deleted is the growth curve this finding exists to " +
                             "make visible before the volume does.",
+                        resolution =
+                            watch(
+                                "No task touches these bodies. Decide whether they need keeping; a retention " +
+                                    "for them is a change to the writer, not a task.",
+                            ),
                     )
             }
         }
@@ -329,6 +520,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                         "covers a representative period before dropping anything — a " +
                         "changefeed or maintenance index may only be read by a job that " +
                         "has not run yet.",
+                    resolution =
+                        watch(
+                            "Wait until the counters have covered a representative period, including a " +
+                                "full maintenance cycle; an index still unread then is a schema change to " +
+                                "file, since hog_* indexes are migration-owned.",
+                        ),
                 )
         }
 
@@ -345,6 +542,11 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "they stop fitting in shared_buffers, every commit pays disk " +
                             "latency inside the advisory lock, so the serialized section " +
                             "gets longer for every writer at once.",
+                        resolution =
+                            operator(
+                                "An instance-size decision: more shared_buffers, or a smaller hot set through expiry " +
+                                    "and retirement, which run on their own.",
+                            ),
                     )
             }
         }
@@ -359,6 +561,12 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                     "${server.connectionsUsed} of ${server.connectionsMax}.",
                     "Exhaustion locks out maintenance sweeps and the health of the instance " +
                         "becomes unobservable at the moment it matters.",
+                    resolution =
+                        operator(
+                            "Raise max_connections at the instance, or lower HOGLAKE_DB_POOL_SIZE (each pod " +
+                                "holds that many plus one for /healthz, and the maintenance pod's draws set " +
+                                "a floor the server refuses to boot under).",
+                        ),
                 )
         }
 
@@ -370,8 +578,15 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                     "${server.deadlocks} deadlock(s) recorded",
                     "Cumulative since the last statistics reset.",
                     "Writers to one catalog are serialized by a single advisory lock taken " +
-                        "up front, which is a lock order by construction. A deadlock means " +
-                        "something took locks outside that discipline.",
+                        "up front, which is a lock order by construction, and upload claims, " +
+                        "which take no commit lock, lock their rows in upload_id order. A " +
+                        "deadlock means something took locks outside that discipline.",
+                    resolution =
+                        operator(
+                            "Find the pair in the Postgres log. Every statement hoglake issues takes locks " +
+                                "in the documented order, so a deadlock between two of them is a bug to file " +
+                                "with both statements; one involving a foreign session is that session's.",
+                        ),
                 )
         }
 
@@ -392,6 +607,10 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                             "timer expires. A commit-heavy catalog on a default max_wal_size " +
                             "does this, and each one is an I/O burst competing with the " +
                             "commit tail it was caused by.",
+                        resolution =
+                            operator(
+                                "Raise max_wal_size at the instance so the timer, not WAL volume, drives checkpoints.",
+                            ),
                     )
             }
         }
@@ -407,6 +626,13 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
                     "Sorts and hashes exceeding work_mem spill. Maintenance sweeps over " +
                         "large manifests are the usual cause here, and the spill is on the " +
                         "same volume the WAL is on.",
+                    resolution =
+                        watch(
+                            "Expected from maintenance sweeps over large manifests, and from the reindex " +
+                                "task, whose rebuild spills about the new index's size. Nothing to do unless " +
+                                "the volume is a concern; the lever is work_mem on the hoglake role (ALTER " +
+                                "ROLE ... SET work_mem), there being no per-pod setting.",
+                        ),
                 )
         }
 
@@ -531,7 +757,22 @@ class DatabaseHealthService(private val jdbi: Jdbi) {
         const val CHECKPOINT_REQUESTED_WARN = 0.5
         const val CHECKPOINT_FLOOR = 20L
 
+        /** What ReindexService.LEFTOVERS_SQL drops: a concurrent build's corpse. */
+        internal val LEFTOVER_INDEX = Regex("_cc(new|old)[0-9]*$")
+
         /** Informational only, so the floor is about signal, not severity. */
         const val TEMP_FILE_FLOOR = 100L
     }
 }
+
+/** A finding one of hoglake's loops closes on its own schedule. */
+private fun maintenance(
+    task: MaintenanceTask,
+    text: String,
+) = FindingResolution(ResolutionKind.MAINTENANCE, task, text)
+
+/** A finding nothing in hoglake will close; [text] says what to do. */
+private fun operator(text: String) = FindingResolution(ResolutionKind.OPERATOR, null, text)
+
+/** A finding with no action; [text] says what would change that. */
+private fun watch(text: String) = FindingResolution(ResolutionKind.WATCH, null, text)

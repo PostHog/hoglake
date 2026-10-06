@@ -275,9 +275,9 @@ class V17FilePathIndexMigrationIntegrationTest {
         // `Database.migrate` below re-applies it for free.
         PgTestSupport.applyMigrationFile(db, "V21__cleanup_claim.sql")
         // Current UploadService reads the format-aware claim column introduced
-        // by V25. Apply that idempotent file out of order for the same reason:
+        // by V26. Apply that idempotent file out of order for the same reason:
         // this test measures V17's indexes through today's production query.
-        PgTestSupport.applyMigrationFile(db, "V25__packed_mergetree_format.sql")
+        PgTestSupport.applyMigrationFile(db, "V26__packed_mergetree_format.sql")
 
         // The statements, off the services that issue them.
         referenceCheckSql = captureReferenceCheck()

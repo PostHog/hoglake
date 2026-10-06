@@ -35,6 +35,7 @@ import com.posthog.hoglake.service.MaintenanceSummarySampler
 import com.posthog.hoglake.service.OptionsService
 import com.posthog.hoglake.service.PartitionListingService
 import com.posthog.hoglake.service.PartitionStatsService
+import com.posthog.hoglake.service.ReindexService
 import com.posthog.hoglake.service.RemovalStore
 import com.posthog.hoglake.service.RetirementService
 import com.posthog.hoglake.service.ScanService
@@ -144,6 +145,13 @@ class App private constructor(
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
         )
 
+    /**
+     * The daily index-bloat check + REINDEX (#268). Built on every pod:
+     * the health page uses its estimate. The loop, and the
+     * `hoglake_index_bloat_bytes` gauge, belong to the pod that runs it.
+     */
+    private val reindexService = ReindexService(jdbi, publishGauge = cfg.reindexIntervalMs > 0)
+
     /** Shared read/put store: hydrator footer reads + compaction rewrites. */
     private val objectStore = ObjectStore(cfg)
 
@@ -183,6 +191,7 @@ class App private constructor(
             cleanupIntervalMs = cfg.cleanupIntervalMs,
             compactionIntervalMs = cfg.compactionIntervalMs,
             retirementIntervalMs = cfg.retirementIntervalMs,
+            reindexIntervalMs = cfg.reindexIntervalMs,
             smallFileThresholdBytes = cfg.compactionTargetBytes,
             minInputFiles = cfg.compactionMinInputFiles,
             maxInputFiles = cfg.compactionMaxInputFiles,
@@ -215,7 +224,15 @@ class App private constructor(
         }
 
     /** Catalog-health gauge sampler; tests drive [CatalogMetrics.sampleOnce] directly. */
-    val catalogMetrics = CatalogMetrics(jdbi, meterRegistry)
+    val catalogMetrics =
+        CatalogMetrics(
+            jdbi,
+            meterRegistry,
+            // The five extended groups run where the maintenance summary
+            // is produced (the maintenance Deployment), so API replicas do
+            // not each republish the same instance-wide series.
+            extendedGroups = cfg.maintenanceSummaryIntervalMs > 0,
+        )
 
     companion object {
         /**
@@ -308,6 +325,7 @@ class App private constructor(
             cfg.instanceName,
             instanceTotals = { catalogMetrics.latestTotals },
             catalogTotals = { catalogMetrics.latestByCatalog },
+            uiTheme = cfg.uiTheme,
         )
         app.installTableCreationRoutes(
             TableCreationService(jdbi, catalogService, commitService, cfg.commitLockTimeoutMs),
@@ -325,7 +343,7 @@ class App private constructor(
             compactionService,
             hydrator,
             maintenanceStatusService,
-            DatabaseHealthService(jdbi),
+            DatabaseHealthService(jdbi, reindexService),
         )
         app.installPartitionStatsRoutes(partitionStatsService)
         app.installPartitionListingRoutes(partitionListingService)
@@ -362,11 +380,31 @@ class App private constructor(
         loops.register("retirement", cfg.retirementIntervalMs) {
             retirementService.runOnceAllCatalogs()
         }
-        loops.register("metrics", cfg.metricsIntervalMs) { catalogMetrics.sampleOnce() }
+        // Default 0 = off, like retirement: ONE workload rebuilds indexes.
+        // The interval is a POLL; the run is once a day at 03:00 UTC,
+        // gated on the run ledger inside pollOnce (ReindexService).
+        loops.register("reindex", cfg.reindexIntervalMs) { reindexService.pollOnce() }
+        loops.register("metrics", cfg.metricsIntervalMs) { metricsTick() }
         return AutoCloseable {
             loops.close()
             removalStore.close()
             objectStore.close()
+        }
+    }
+
+    /**
+     * One metrics-loop iteration. The bloat gauge rides it on the reindex
+     * pod only (a no-op elsewhere): ~4 ms of catalog reads, so the series
+     * follows VACUUM/ANALYZE between the daily runs. In a `finally`, so a
+     * failed sample does not skip it; `refreshGauge` never throws, so its
+     * failure neither fails this tick nor counts as a metrics-loop failure
+     * (it has `hoglake_reindex_gauge_refresh_failures_total`).
+     */
+    internal fun metricsTick() {
+        try {
+            catalogMetrics.sampleOnce()
+        } finally {
+            reindexService.refreshGauge()
         }
     }
 

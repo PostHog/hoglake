@@ -608,19 +608,28 @@ class CommitServiceTest {
                 columnStats = emptyList(),
                 fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
             )
+        // column_stats is optional for packed (counts only). The hydrator never
+        // claims a packed file, so a 'pending' row would stay pending forever.
+        val withoutStats = packed.copy(path = "s3://b/data/part2.packed", columnStats = null)
 
         service.commit(
             "cat",
-            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(packed)))),
+            CommitRequest(appends = listOf(TableAppend("ns", "events", listOf(packed, withoutStats)))),
         )
 
         jdbi.useHandle<Exception> { h ->
             assertThat(
-                h.createQuery("SELECT file_format FROM hog_data_file WHERE catalog_id = :catalogId")
+                h.createQuery(
+                    "SELECT file_format || '/' || stats_state FROM hog_data_file " +
+                        "WHERE catalog_id = :catalogId ORDER BY path",
+                )
                     .bind("catalogId", fx.catalogId)
                     .mapTo(String::class.java)
-                    .one(),
-            ).isEqualTo(FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+                    .list(),
+            ).containsExactly(
+                "${FileFormats.CLICKHOUSE_MERGETREE_PACKED}/provided",
+                "${FileFormats.CLICKHOUSE_MERGETREE_PACKED}/provided",
+            )
         }
     }
 

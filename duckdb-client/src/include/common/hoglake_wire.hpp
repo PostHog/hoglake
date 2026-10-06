@@ -205,8 +205,7 @@ struct HoglakeTableDeletes {
 	vector<HoglakeDeleteFileRegistration> files;
 };
 
-//! CommitRequest (client -> server). read_snapshot is REQUIRED when
-//! deletes are present (deletes always conflict-check).
+//! CommitRequest (client -> server). The extension guards both appends and deletes.
 struct HoglakeCommitRequest {
 	//! invalid = blind append (no conflict window)
 	optional_idx read_snapshot;

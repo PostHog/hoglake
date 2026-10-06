@@ -393,6 +393,8 @@ export function listConsumers(catalog: string): Promise<ConsumerList> {
 
 export interface InstanceInfo {
   name?: string;
+  // Optional on older servers. Unknown themes use the default palette.
+  ui_theme?: string;
   // The running server's version. Optional here, not in the spec: a
   // server older than the field is exactly the case the badge exists to
   // make visible, so the type has to admit it.
@@ -500,9 +502,23 @@ export interface DatabaseIndex {
   size_bytes: Int64;
   scans: Int64;
   constraint_backing: boolean;
+  /** Estimated bytes beyond a fresh build; absent when not estimable. */
+  estimated_bloat_bytes?: Int64;
+  /** Estimated actual / fresh size; absent when not estimable. */
+  estimated_bloat_ratio?: number;
 }
 
 export type FindingSeverity = "info" | "warn" | "critical";
+
+export type ResolutionKind = "maintenance" | "operator" | "watch";
+
+/** What happens next about a finding, and by whom. */
+export interface FindingResolution {
+  kind: ResolutionKind;
+  /** The maintenance task's wire name when `kind` is `maintenance`. */
+  task?: string;
+  text: string;
+}
 
 export interface DatabaseFinding {
   severity: FindingSeverity;
@@ -510,6 +526,8 @@ export interface DatabaseFinding {
   title: string;
   detail: string;
   hoglake_impact: string;
+  /** Absent from a server that predates it; the console renders the finding without. */
+  resolution?: FindingResolution;
 }
 
 export interface DatabaseHealth {

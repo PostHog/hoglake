@@ -7,7 +7,10 @@ import com.posthog.hoglake.model.DatabaseIndexHealth
 import com.posthog.hoglake.model.DatabaseServer
 import com.posthog.hoglake.model.DatabaseTable
 import com.posthog.hoglake.model.FindingSeverity
+import com.posthog.hoglake.model.IndexBloatEstimate
+import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.ReplicationSlot
+import com.posthog.hoglake.model.ResolutionKind
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.Test
 import java.time.Instant
@@ -34,6 +37,9 @@ class DatabaseHealthFindingsTest {
         cacheHit: Double? = 0.999,
         connectionsUsed: Int = 10,
         deadlocks: Long = 0,
+        tempFiles: Long = 0,
+        checkpointsTimed: Long = 100,
+        checkpointsRequested: Long = 1,
     ) = DatabaseServer(
         version = "16.13",
         database = "hoglake",
@@ -48,10 +54,10 @@ class DatabaseHealthFindingsTest {
         xidAge = xidAge,
         xidFreezeMaxAge = 200_000_000,
         autovacuumEnabled = autovacuum,
-        tempFiles = 0,
-        tempBytes = 0,
-        checkpointsTimed = 100,
-        checkpointsRequested = 1,
+        tempFiles = tempFiles,
+        tempBytes = tempFiles * (1L shl 20),
+        checkpointsTimed = checkpointsTimed,
+        checkpointsRequested = checkpointsRequested,
     )
 
     private fun activity(
@@ -103,6 +109,22 @@ class DatabaseHealthFindingsTest {
         constraintBacking: Boolean = false,
     ) = DatabaseIndex("hog_data_file", name, bytes, scans, constraintBacking)
 
+    private fun findingsOf(
+        server: DatabaseServer = server(),
+        activity: DatabaseActivity = activity(),
+        tables: List<DatabaseTable> = listOf(table()),
+        indexes: List<DatabaseIndex> = listOf(index()),
+        commitLocks: List<CommitLockHolder> = emptyList(),
+        slots: List<ReplicationSlot> = emptyList(),
+        prepared: Pair<Int, Double?> = 0 to null,
+        invalidIndexes: List<DatabaseIndexHealth> = emptyList(),
+        bloatedIndexes: List<IndexBloatEstimate> = emptyList(),
+        reindexLoopSeen: Boolean = false,
+    ) = service.findings(
+        server, activity, tables, indexes, commitLocks, slots, prepared, invalidIndexes, bloatedIndexes,
+        reindexLoopSeen,
+    )
+
     private fun codes(
         server: DatabaseServer = server(),
         activity: DatabaseActivity = activity(),
@@ -112,8 +134,7 @@ class DatabaseHealthFindingsTest {
         slots: List<ReplicationSlot> = emptyList(),
         prepared: Pair<Int, Double?> = 0 to null,
         invalidIndexes: List<DatabaseIndexHealth> = emptyList(),
-    ) = service.findings(server, activity, tables, indexes, commitLocks, slots, prepared, invalidIndexes)
-        .map { it.code }
+    ) = findingsOf(server, activity, tables, indexes, commitLocks, slots, prepared, invalidIndexes).map { it.code }
 
     @Test
     fun `a healthy instance produces no findings`() {
@@ -403,11 +424,52 @@ class DatabaseHealthFindingsTest {
         assertThat(findings.first().severity).isEqualTo(FindingSeverity.CRITICAL)
     }
 
+    /**
+     * Every code the service can emit, fired at once, with the resolution
+     * kind each one must carry. A swapped kind anywhere (a "no action"
+     * badge on an orphaned prepared transaction, a "maintenance" badge on
+     * an index no task will rebuild) is a wrong answer on the one surface
+     * the field exists for, so the map is the whole vocabulary, not a
+     * sample. Severity-dependent kinds are pinned at their WARN branch
+     * here and at CRITICAL in their own cases below.
+     */
     @Test
-    fun `every finding explains itself`() {
+    fun `every finding explains itself, and says who closes it`() {
+        val expectedKind =
+            mapOf(
+                "index_bloat" to ResolutionKind.MAINTENANCE,
+                "invalid_indexes" to ResolutionKind.MAINTENANCE,
+                "inactive_replication_slot" to ResolutionKind.OPERATOR,
+                "prepared_transactions" to ResolutionKind.OPERATOR,
+                "commit_lock_held" to ResolutionKind.OPERATOR,
+                "autovacuum_disabled" to ResolutionKind.OPERATOR,
+                "xid_wraparound" to ResolutionKind.WATCH,
+                "idle_in_transaction" to ResolutionKind.OPERATOR,
+                "long_transaction" to ResolutionKind.OPERATOR,
+                "lock_wait" to ResolutionKind.WATCH,
+                "dead_tuples" to ResolutionKind.WATCH,
+                "never_analyzed" to ResolutionKind.OPERATOR,
+                "sequential_scans" to ResolutionKind.OPERATOR,
+                "toast_dominant" to ResolutionKind.WATCH,
+                "unused_indexes" to ResolutionKind.WATCH,
+                "cache_hit_ratio" to ResolutionKind.OPERATOR,
+                "connection_saturation" to ResolutionKind.OPERATOR,
+                "deadlocks" to ResolutionKind.OPERATOR,
+                "checkpoints_requested" to ResolutionKind.OPERATOR,
+                "temp_files" to ResolutionKind.WATCH,
+            )
         val findings =
             service.findings(
-                server(autovacuum = false, xidAge = 190_000_000, cacheHit = 0.5, connectionsUsed = 99, deadlocks = 2),
+                server(
+                    autovacuum = false,
+                    xidAge = 110_000_000,
+                    cacheHit = 0.5,
+                    connectionsUsed = 99,
+                    deadlocks = 2,
+                    tempFiles = 500,
+                    checkpointsTimed = 10,
+                    checkpointsRequested = 40,
+                ),
                 activity(
                     idleInTransaction = 2,
                     longestTransaction = 9000.0,
@@ -415,16 +477,158 @@ class DatabaseHealthFindingsTest {
                     waiting = 4,
                     longestWait = 60.0,
                 ),
-                listOf(table(live = 100_000, dead = 900_000, analyzed = null, seqScans = 5000, indexScans = 1)),
+                listOf(
+                    table(live = 1_000_000, dead = 250_000, analyzed = null, seqScans = 5000, indexScans = 1),
+                    table(name = "hog_commit_receipt", bytes = 100L shl 20, toast = 60L shl 30),
+                ),
                 listOf(index(scans = 0)),
+                commitLocks = listOf(CommitLockHolder(1, "prod", 4242, true, 12.0, 3)),
+                slots = listOf(ReplicationSlot("bluegreen", "logical", false, 2L shl 30)),
+                preparedTransactions = 1 to 600.0,
+                invalidIndexes = listOf(DatabaseIndexHealth("hog_data_file", "hog_data_file_path_ccnew", false, true)),
+                bloatedIndexes =
+                    listOf(IndexBloatEstimate("hog_data_file", "hog_data_file_path", 6L shl 30, 1L shl 30, false)),
+                reindexLoopSeen = true,
             )
-        assertThat(findings).isNotEmpty()
         assertThat(findings.map { it.code }).doesNotHaveDuplicates()
+        assertThat(findings.map { it.code }).containsExactlyInAnyOrderElementsOf(expectedKind.keys)
         for (finding in findings) {
             assertThat(finding.title).describedAs("title of ${finding.code}").isNotBlank()
             assertThat(finding.detail).describedAs("detail of ${finding.code}").isNotBlank()
             assertThat(finding.hoglakeImpact).describedAs("impact of ${finding.code}").isNotBlank()
+            assertThat(finding.resolution.text).describedAs("resolution of ${finding.code}").isNotBlank()
+            assertThat(finding.resolution.kind)
+                .describedAs("who closes ${finding.code}")
+                .isEqualTo(expectedKind.getValue(finding.code))
+            // The resolution is the third part, not the impact repeated:
+            // the two must not share a sentence.
+            val impactSentences =
+                finding.hoglakeImpact.split(
+                    ". ",
+                ).map { it.trim().trimEnd('.') }.filter { it.length > 20 }
+            assertThat(impactSentences.none { finding.resolution.text.contains(it) })
+                .describedAs("resolution of ${finding.code} repeats its impact text")
+                .isTrue()
         }
+    }
+
+    @Test
+    fun `a critical xid age or dead-tuple ratio is an operator's, not a watch`() {
+        val xid = findingsOf(server = server(xidAge = 170_000_000)).single { it.code == "xid_wraparound" }
+        assertThat(xid.severity).isEqualTo(FindingSeverity.CRITICAL)
+        assertThat(xid.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(xid.resolution.text).contains("VACUUM FREEZE")
+        val dead =
+            findingsOf(
+                tables = listOf(table(live = 1_000_000, dead = 900_000)),
+            ).single { it.code == "dead_tuples" }
+        assertThat(dead.severity).isEqualTo(FindingSeverity.CRITICAL)
+        assertThat(dead.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(dead.resolution.text).contains("VACUUM it by hand")
+    }
+
+    @Test
+    fun `invalid indexes are maintenance's only when every one is a leftover and the loop runs`() {
+        val leftover = DatabaseIndexHealth("hog_data_file", "hog_data_file_path_ccnew", false, true)
+        val other = DatabaseIndexHealth("hog_data_file", "hog_data_file_live", false, true)
+        val owned =
+            findingsOf(
+                invalidIndexes = listOf(leftover),
+                reindexLoopSeen = true,
+            ).single { it.code == "invalid_indexes" }
+        assertThat(owned.resolution.kind).isEqualTo(ResolutionKind.MAINTENANCE)
+        assertThat(owned.resolution.task).isEqualTo(MaintenanceTask.REINDEX)
+        // A leftover with no loop to drop it: the operator's, and the knob is named.
+        val noLoop =
+            findingsOf(
+                invalidIndexes = listOf(leftover),
+                reindexLoopSeen = false,
+            ).single { it.code == "invalid_indexes" }
+        assertThat(noLoop.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(noLoop.resolution.text).contains("HOGLAKE_REINDEX_INTERVAL_MS")
+        // One that is not a leftover among the names: no task touches it.
+        val mixed =
+            findingsOf(
+                invalidIndexes = listOf(leftover, other),
+                reindexLoopSeen = true,
+            ).single { it.code == "invalid_indexes" }
+        assertThat(mixed.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(mixed.resolution.text).contains("REINDEX INDEX CONCURRENTLY")
+    }
+
+    /**
+     * `index_bloat`: the finding takes the list ALREADY filtered by the
+     * reindex task's own predicate, so what it can get wrong is firing on
+     * an empty list or saying nothing useful about a full one.
+     */
+    @Test
+    fun `over-threshold indexes are reported with their excess, and none is silent`() {
+        val bloated =
+            listOf(
+                com.posthog.hoglake.model.IndexBloatEstimate(
+                    "hog_file_column_stats",
+                    "hog_file_column_stats_pkey",
+                    sizeBytes = 26L shl 30,
+                    expectedBytes = 2L shl 30,
+                    constraintBacking = true,
+                ),
+                com.posthog.hoglake.model.IndexBloatEstimate(
+                    "hog_data_file",
+                    "hog_data_file_path",
+                    sizeBytes = 6L shl 30,
+                    expectedBytes = 1L shl 30,
+                    constraintBacking = false,
+                ),
+            )
+        val finding =
+            findingsOf(bloatedIndexes = bloated, reindexLoopSeen = true).single { it.code == "index_bloat" }
+        assertThat(finding.severity).isEqualTo(FindingSeverity.WARN)
+        assertThat(finding.title).contains("2 index(es)").contains("29.0 GiB")
+        // Worst first, so the index tomorrow's run rebuilds leads the line.
+        assertThat(finding.detail.indexOf("hog_file_column_stats_pkey"))
+            .isLessThan(finding.detail.indexOf("hog_data_file_path"))
+        // The reindex task owns this one while its loop is running, and
+        // says so with its cadence rather than a promise per index.
+        assertThat(finding.resolution.kind).isEqualTo(ResolutionKind.MAINTENANCE)
+        assertThat(finding.resolution.task).isEqualTo(MaintenanceTask.REINDEX)
+        assertThat(finding.resolution.text).contains("03:00 UTC").contains("2 within its cap")
+        assertThat(finding.hoglakeImpact).doesNotContain("03:00 UTC")
+
+        // No loop has run lately: the page cannot promise a rebuild, so the
+        // badge is the operator's and names the knob. MUTATION: ignore
+        // reindexLoopSeen and this reads maintenance.
+        val unattended = findingsOf(bloatedIndexes = bloated).single { it.code == "index_bloat" }
+        assertThat(unattended.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(unattended.resolution.text).contains("HOGLAKE_REINDEX_INTERVAL_MS")
+
+        // An index past the task's rebuild cap is never the task's: it is
+        // named as the operator's, beside the ones the task will take.
+        val huge =
+            com.posthog.hoglake.model.IndexBloatEstimate(
+                "hog_file_column_stats",
+                "hog_file_column_stats_pkey",
+                sizeBytes = 60L shl 30,
+                expectedBytes = 20L shl 30,
+                constraintBacking = true,
+            )
+        val split =
+            findingsOf(
+                bloatedIndexes = listOf(huge, bloated[1]),
+                reindexLoopSeen = true,
+            ).single { it.code == "index_bloat" }
+        assertThat(split.resolution.kind).isEqualTo(ResolutionKind.MAINTENANCE)
+        assertThat(
+            split.resolution.text,
+        ).contains("1 within its cap").contains("hog_file_column_stats_pkey").contains("by hand")
+        val onlyHuge =
+            findingsOf(
+                bloatedIndexes = listOf(huge),
+                reindexLoopSeen = true,
+            ).single { it.code == "index_bloat" }
+        assertThat(onlyHuge.resolution.kind).isEqualTo(ResolutionKind.OPERATOR)
+        assertThat(onlyHuge.resolution.text).contains("16.0 GiB cap")
+        // MUTATION: invert the isNotEmpty() guard and the healthy baseline reds.
+        assertThat(codes()).doesNotContain("index_bloat")
     }
 
     /**

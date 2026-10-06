@@ -136,6 +136,76 @@ class MaintenanceRunStore(private val jdbi: Jdbi) {
         }
     }
 
+    /**
+     * [recorded] for an INSTANCE-WIDE task: one identical row per catalog.
+     *
+     * The reindex task's unit of work is a database index, which belongs
+     * to no catalog, while `hog_maintenance_run.catalog_id` is NOT NULL
+     * and every read path (per-catalog status and history, the central
+     * matrix) is keyed by catalog. Recording the run against every catalog
+     * keeps all of those surfaces showing it with no read-path change, at
+     * the cost of N rows per run — one run a day, so N rows a day, purged
+     * per catalog with the rest of the ledger. With no catalog at all
+     * nothing is recorded, which is why the caller checks first.
+     *
+     * [clock] stamps `started_at`/`finished_at`, injected because the
+     * reindex gate reads `started_at` back to decide whether today's run
+     * has happened, and a test of that gate drives a fake clock.
+     */
+    fun <T> recordedAllCatalogs(
+        task: MaintenanceTask,
+        trigger: MaintenanceTrigger,
+        clock: () -> Instant = Instant::now,
+        body: () -> T,
+    ): T {
+        val startedAt = clock()
+        try {
+            val result = body()
+            recordAllCatalogs(task, trigger, startedAt, clock(), MaintenanceRunStatus.OK, null, result)
+            return result
+        } catch (e: Throwable) {
+            recordAllCatalogs(
+                task,
+                trigger,
+                startedAt,
+                clock(),
+                MaintenanceRunStatus.FAILED,
+                errorText(e),
+                (e as? PartialResult)?.partial,
+            )
+            throw e
+        }
+    }
+
+    private fun recordAllCatalogs(
+        task: MaintenanceTask,
+        trigger: MaintenanceTrigger,
+        startedAt: Instant,
+        finishedAt: Instant,
+        status: MaintenanceRunStatus,
+        error: String?,
+        result: Any?,
+    ) {
+        runCatching {
+            val resultJson = result?.let { RESULT_JSON.writeValueAsString(it) }
+            jdbi.useHandleUnchecked { h ->
+                h.createUpdate(
+                    """
+                    INSERT INTO hog_maintenance_run
+                        (catalog_id, task, run_trigger, started_at, finished_at, status, error, result)
+                    SELECT catalog_id, :task, :trigger, :startedAt, :finishedAt, :status, :error,
+                           CAST(:result AS jsonb)
+                      FROM hog_catalog
+                    """,
+                )
+                    .bindLedgerFields(task, trigger, startedAt, finishedAt, status, error, resultJson)
+                    .execute()
+            }
+        }.onFailure { e ->
+            log.warn(e) { "maintenance ledger: failed to record instance-wide $task run" }
+        }
+    }
+
     /** Insert one row keyed by catalog ID (the hydrator sweep's per-catalog fan-out). */
     fun recordSweepById(
         catalogId: Long,

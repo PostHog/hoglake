@@ -288,6 +288,26 @@ object DatabaseHealthRepo {
         }.one()
 
     /**
+     * Whether the reindex LOOP has recorded a run in the last two days,
+     * on any pod. The health page cannot see another pod's config
+     * (`HOGLAKE_REINDEX_INTERVAL_MS` defaults to off, and the API pod
+     * answering this request is not the pod that would run it), so the
+     * ledger is the only honest answer to "will maintenance take care
+     * of this". Two days: the task runs once a day and a missed day is
+     * a skip row, still a run.
+     */
+    fun reindexLoopSeen(handle: Handle): Boolean =
+        handle.createQuery(
+            """
+            SELECT EXISTS (
+                SELECT 1 FROM hog_maintenance_run
+                 WHERE task = 'reindex' AND run_trigger = 'loop'
+                   AND started_at > now() - interval '2 days'
+            )
+            """,
+        ).mapTo(Boolean::class.java).one()
+
+    /**
      * Indexes Postgres will not use: `indisvalid = false` is what a
      * failed or interrupted CREATE INDEX CONCURRENTLY leaves behind.
      * Read from pg_index rather than the statistics views, because a

@@ -624,7 +624,8 @@ CREATE TABLE hog_maintenance_run (
     run_id      bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     catalog_id  bigint NOT NULL REFERENCES hog_catalog ON DELETE CASCADE,
     task        text   NOT NULL CHECK (task IN ('hydrator', 'expiry', 'cleanup',
-                                                'compaction', 'verify', 'retirement')),
+                                                'compaction', 'verify', 'retirement',
+                                                'reindex')),
     -- 'loop' = a BackgroundLoops sweep; 'manual' = a /maintenance/*
     -- trigger (for task 'hydrator', manual rows are rehydrate calls).
     run_trigger text   NOT NULL CHECK (run_trigger IN ('loop', 'manual')),
@@ -639,7 +640,8 @@ CREATE TABLE hog_maintenance_run (
     -- /maintenance/* response body (expiry -> ExpiryResult, cleanup ->
     -- CleanupResult, compaction -> CompactionResult, verify ->
     -- VerifyReport; hydrator loop rows carry per-catalog sweep counts,
-    -- manual hydrator rows carry RehydrateResult).
+    -- manual hydrator rows carry RehydrateResult; reindex -> ReindexResult,
+    -- one identical row per catalog because the run is instance-wide).
     result      jsonb,
     CHECK (finished_at >= started_at),
     CHECK ((status = 'failed') = (error IS NOT NULL))

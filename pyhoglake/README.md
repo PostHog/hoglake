@@ -31,7 +31,9 @@ flox activate -- uv run pytest -m "not integration" # unit only
 Integration tests need a live server (`HOGLAKE_URL`, default
 `http://localhost:8080`) and S3 credentials (`HOGLAKE_S3_ENDPOINT`,
 `HOGLAKE_S3_ACCESS_KEY`, `HOGLAKE_S3_SECRET_KEY`); they skip cleanly
-when the server is unreachable.
+when the server is unreachable. For a complete check, run `just live-python`
+from the repository root. It starts an isolated stack, enables the hydrator
+at a one-second interval for the deferred-stats test, and rejects skipped tests.
 
 ## Quickstart — the append path end to end
 
@@ -77,7 +79,7 @@ result = table.append(
 print(result.snapshot_id)
 
 # reads are metadata-only planning; you fetch the parquet yourself
-for f in table.files():
+for f in table.files(snapshot=result.snapshot_id):
     print(f.path, f.record_count, f.stats_state, f.row_id_start)
 
 # changefeed + consumer offsets
@@ -85,6 +87,13 @@ plan = table.changes(from_snapshot=0)
 catalog.commit_offset("my-consumer", table.table_uuid, plan.to_snapshot)
 catalog.offset("my-consumer", table.table_uuid)  # one offset; None if unset
 ```
+
+`create_table()` and `alter()` keep their DDL snapshot on the table handle.
+Without an explicit snapshot, `files()` and `scan_plan()` read that snapshot.
+After an append, pass the returned `snapshot_id`, as above. To inspect later
+writes from another process, pass `catalog.refresh().head_snapshot_id`.
+Calling `info()` or passing `snapshot=None` does not clear the DDL snapshot.
+A new handle from `ns.table(name)` has no DDL snapshot and reads the current head.
 
 More surface:
 

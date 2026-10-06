@@ -1,6 +1,6 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
-import { afterEach } from "vitest";
+import { afterEach, vi } from "vitest";
 
 // Node's experimental localStorage global (inert without
 // --localstorage-file) preempts jsdom's implementation, leaving
@@ -21,6 +21,12 @@ if (typeof window !== "undefined" && !window.localStorage) {
     },
   });
 }
+
+vi.mock("uplot", async () => {
+  const { FakeUPlot } = await import("./uplotMock");
+  return { default: FakeUPlot };
+});
+vi.mock("uplot/dist/uPlot.min.css", () => ({}));
 
 afterEach(() => {
   cleanup();

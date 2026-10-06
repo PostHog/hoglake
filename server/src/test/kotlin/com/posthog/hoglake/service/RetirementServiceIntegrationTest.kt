@@ -6,6 +6,7 @@ import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.DeleteFileRegistration
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.MaintenanceRunStatus
 import com.posthog.hoglake.model.MaintenanceTask
 import com.posthog.hoglake.model.MaintenanceTrigger
 import com.posthog.hoglake.model.RetirementResult
@@ -19,7 +20,9 @@ import com.posthog.hoglake.testing.PgTestSupport
 import io.micrometer.prometheusmetrics.PrometheusConfig
 import io.micrometer.prometheusmetrics.PrometheusMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.useTransactionUnchecked
 import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.AfterEach
@@ -263,6 +266,12 @@ class RetirementServiceIntegrationTest {
             ).bind("c", catalogId).bind("n", tableName).mapTo(Long::class.java).one()
         }
 
+    private fun dvCount(catalogId: Long): Long =
+        jdbi.withHandleUnchecked { h ->
+            h.createQuery("SELECT count(*) FROM hog_delete_file WHERE catalog_id = :c")
+                .bind("c", catalogId).mapTo(Long::class.java).one()
+        }
+
     private fun queued(catalogId: Long): List<Triple<String, String, String>> =
         jdbi.withHandleUnchecked { h ->
             h.createQuery(
@@ -451,6 +460,121 @@ class RetirementServiceIntegrationTest {
             h.execute("DROP FUNCTION IF EXISTS inject_$tag()")
             h.execute("DROP SEQUENCE IF EXISTS inject_$tag")
         }
+
+    // ---- the table guard (#264) --------------------------------------------
+
+    @Test
+    fun `a lock-held delete that reaches another table's row rolls the batch back`() {
+        // The statements are keyed on (catalog_id, data_file_id), the
+        // whole identity today; the guard rides on what they RETURN. Run
+        // each arm directly with the keeper table's id over a victim
+        // list that names the keeper's file beside a doomed one — ids
+        // the victim select would never have produced together — and
+        // the arm throws, the transaction rolls back, and NOTHING is
+        // deleted or queued. Through the service's own `guardedDelete`,
+        // so a MUTATION that weakens its check (not a copy of it here)
+        // lets the keeper's row go, with its object queued.
+        val catalog = "ret-guard"
+        val f = seed(catalog, files = 2, dvs = 1)
+        val keeper = keeperTableId(f.catalogId)
+        val keeperFile =
+            jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT data_file_id FROM hog_data_file WHERE catalog_id = :c AND table_id = :t",
+                ).bind("c", f.catalogId).bind("t", keeper).mapTo(Long::class.java).one()
+            }
+        val foreign = listOf(keeperFile, f.fileIds[0])
+
+        val retirement = service()
+
+        fun arm(sql: String) =
+            assertThatThrownBy {
+                jdbi.useTransactionUnchecked { h ->
+                    retirement.guardedDelete(h, sql, f.catalogId, keeper, foreign)
+                }
+            }.isInstanceOf(IllegalStateException::class.java).hasMessageContaining("of another table")
+
+        // The DV arm: fileIds[0]'s vector belongs to doomed, not keeper.
+        arm(RetirementService.DV_DELETE_SQL)
+        // The data arm: fileIds[0] itself.
+        arm(RetirementService.DATA_DELETE_SQL)
+
+        assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+        assertThat(liveFiles(f.catalogId, "doomed")).isEqualTo(2)
+        assertThat(dvCount(f.catalogId)).isEqualTo(1)
+        assertThat(queued(f.catalogId)).isEmpty()
+    }
+
+    @Test
+    fun `a table guard failure rolls back its batch and lets later tables retire`() {
+        val catalog = "ret-guard-continue"
+        val f = seed(catalog, files = 2, dvs = 2)
+        val doomed = doomedTableId(f.catalogId)
+        val keeper = keeperTableId(f.catalogId)
+        // The schema permits this mismatch. The guard must reject it after
+        // the DELETE, then roll back both the rows and their queued paths.
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_delete_file SET table_id = :keeper " +
+                    "WHERE catalog_id = :c AND data_file_id = :file",
+            ).bind("keeper", keeper).bind("c", f.catalogId).bind("file", f.fileIds.first()).execute()
+        }
+        val drop = catalogs.dropTable(catalog, "ns", "doomed").snapshotId
+        setFloor(f.catalogId, drop)
+        val sleeps = mutableListOf<Long>()
+        val svc = service(batch = 2, sleeps = sleeps)
+        val healthyPaths = mutableListOf<String>()
+        repeat(2) { run ->
+            val healthy = "healthy_$run"
+            extraDroppedTable(catalog, f.catalogId, healthy, idBase = 700_000 + run * 100)
+            healthyPaths += "s3://bucket/$catalog/$healthy/bulk-1.parquet"
+
+            sleeps.clear()
+            val result = svc.runOnce(catalog)
+            assertThat(sleeps).containsExactly(750L, 750L)
+            assertThat(result.skippedTables).isEqualTo(1)
+            assertThat(result.tables).isEqualTo(1)
+            assertThat(result.rowsRetired).isEqualTo(1)
+            assertThat(result.dvsRetired).isZero()
+            assertThat(result.pathsQueued).isEqualTo(1)
+            assertThat(result.batches).isEqualTo(1)
+            assertThat(result.timeouts).isZero()
+            assertThat(liveFiles(f.catalogId, "doomed")).isEqualTo(2)
+            assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+            assertThat(liveFiles(f.catalogId, healthy)).isZero()
+            assertThat(dvCount(f.catalogId)).isEqualTo(2)
+            assertThat(queued(f.catalogId)).containsExactlyInAnyOrderElementsOf(
+                healthyPaths.map { Triple(it, "data", "table_drop_gc") },
+            )
+            val last =
+                jdbi.withHandleUnchecked { h ->
+                    MaintenanceRunStore(jdbi).lastByTask(h, f.catalogId)[MaintenanceTask.RETIREMENT]
+                }
+            assertThat(last).isNotNull
+            assertThat(last!!.status).isEqualTo(MaintenanceRunStatus.OK)
+            assertThat(last.resultJson).contains("\"skipped_tables\": 1", "\"rows_retired\": 1")
+        }
+
+        // After repair, the same service can retire the failed table.
+        jdbi.useHandleUnchecked { h ->
+            h.createUpdate(
+                "UPDATE hog_delete_file SET table_id = :doomed " +
+                    "WHERE catalog_id = :c AND data_file_id = :file",
+            ).bind("doomed", doomed).bind("c", f.catalogId).bind("file", f.fileIds.first()).execute()
+        }
+        val recovered = svc.runOnce(catalog)
+        assertThat(recovered.skippedTables).isZero()
+        assertThat(recovered.rowsRetired).isEqualTo(2)
+        assertThat(recovered.dvsRetired).isEqualTo(2)
+        assertThat(recovered.pathsQueued).isEqualTo(4)
+        assertThat(liveFiles(f.catalogId, "doomed")).isZero()
+        assertThat(liveFiles(f.catalogId, "keeper")).isEqualTo(1)
+        assertThat(dvCount(f.catalogId)).isZero()
+        assertThat(queued(f.catalogId)).containsExactlyInAnyOrderElementsOf(
+            (healthyPaths + f.dataPaths).map { Triple(it, "data", "table_drop_gc") } +
+                f.dvPaths.map { Triple(it, "delete", "table_drop_gc") },
+        )
+    }
 
     // ---- the gate ----------------------------------------------------------
 

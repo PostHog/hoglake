@@ -1156,7 +1156,17 @@ class CommitService(
                     .bind("fileSizeBytes", file.fileSizeBytes)
                     .bind("footerSize", file.footerSize)
                     .bind("rowIdStart", rowId)
-                    .bind("statsState", if (file.columnStats != null) "provided" else "pending")
+                    // A packed part is never hydrated (the hydrator reads Parquet footers
+                    // only), so it has no 'pending' state to leave: counts-only stats are
+                    // complete at registration, with or without column_stats.
+                    .bind(
+                        "statsState",
+                        if (file.columnStats != null || file.fileFormat != FileFormats.PARQUET) {
+                            "provided"
+                        } else {
+                            "pending"
+                        },
+                    )
                     .bind("specId", append.spec?.specId)
                     .bindBigintArrayOrNull("splitOffsets", file.splitOffsets)
                     .add()

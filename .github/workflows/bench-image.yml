@@ -22,17 +22,24 @@ on:
       - "bench/**"
       - "pyhoglake/**"
       - ".github/workflows/bench-image.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
   pull_request:
     branches: [main]
     paths:
       - "bench/**"
       - "pyhoglake/**"
       - ".github/workflows/bench-image.yml"
+      - ".github/workflows/python-live.yml"
+      - "ci/**"
 
 permissions:
   contents: read
 
 jobs:
+  python-live:
+    uses: ./.github/workflows/python-live.yml
+
   # Build and exercise the image on every PR and every main push. The
   # unit layer for bench and pyhoglake is ci-python.yml (same trigger
   # paths); this job's job is the IMAGE — that it assembles, that the
@@ -102,7 +109,7 @@ jobs:
   publish:
     # Gated on the image smoke above, the same shape as server.yml's
     # deploy job: a red main push never publishes.
-    needs: [image]
+    needs: [image, python-live]
     # Forks must not push images.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest

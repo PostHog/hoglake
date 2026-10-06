@@ -53,3 +53,28 @@ export function useStoredPref<T extends string>(
     },
   ];
 }
+
+/**
+ * A JSON string list in localStorage, for an open set (the pinned metric
+ * families). Anything that is not an array of strings reads as empty.
+ */
+export function readStringList(key: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) && parsed.every((x) => typeof x === "string")
+      ? (parsed as string[])
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function writeStringList(key: string, value: string[]): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // persistence is best-effort
+  }
+}

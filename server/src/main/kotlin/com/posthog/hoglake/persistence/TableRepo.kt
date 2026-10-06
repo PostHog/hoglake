@@ -44,12 +44,7 @@ data class TableStatsRow(
 object TableRepo {
     private val tableRowMapper =
         RowMapper { rs, _ ->
-            val fileFormat =
-                try {
-                    rs.getString("file_format") ?: FileFormats.PARQUET
-                } catch (_: Exception) {
-                    FileFormats.PARQUET
-                }
+            val fileFormat = rs.getString("file_format")
             val rawProperties = Pg.fromJson(rs.getString("properties"))!!.mapValues { (_, value) -> value as String }
             val properties =
                 if (fileFormat != FileFormats.PARQUET) {
@@ -332,27 +327,6 @@ object TableRepo {
      * retirement gate (`dropped_snapshot <= earliest_snapshot_id`)
      * preserves until the floor has passed the drop.
      */
-    @Volatile
-    private var hasTableFormatColumn: Boolean? = null
-
-    private fun formatColumnExpr(handle: Handle): String {
-        if (hasTableFormatColumn == true) return "t.file_format"
-        val exists =
-            handle.createQuery(
-                """
-                SELECT EXISTS (
-                    SELECT 1 FROM information_schema.columns
-                    WHERE table_name = 'hog_table' AND column_name = 'file_format'
-                )
-                """,
-            ).mapTo(Boolean::class.java).one()
-        if (exists) {
-            hasTableFormatColumn = true
-            return "t.file_format"
-        }
-        return "'parquet' AS file_format"
-    }
-
     fun findAt(
         handle: Handle,
         catalogId: Long,
@@ -363,7 +337,7 @@ object TableRepo {
         handle.createQuery(
             """
             SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
-                   ${formatColumnExpr(handle)}
+                   t.file_format
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -406,7 +380,7 @@ object TableRepo {
         handle.createQuery(
             """
             SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
-                   ${formatColumnExpr(handle)}
+                   t.file_format
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id
@@ -450,7 +424,7 @@ object TableRepo {
         handle.createQuery(
             """
             SELECT t.table_id, t.table_uuid, tv.namespace_id, tv.name, tv.comment, tv.properties,
-                   ${formatColumnExpr(handle)}
+                   t.file_format
             FROM hog_table_version tv
             JOIN hog_table t
               ON t.catalog_id = tv.catalog_id AND t.table_id = tv.table_id

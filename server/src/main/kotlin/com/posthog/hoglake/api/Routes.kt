@@ -39,6 +39,7 @@ fun Application.installApiRoutes(
     instanceName: String = "",
     instanceTotals: () -> InstanceTotals? = { null },
     catalogTotals: () -> Map<String, CatalogTotals> = { emptyMap() },
+    uiTheme: String = "",
 ) {
     routing {
         get("/v1/info") {
@@ -50,6 +51,7 @@ fun Application.installApiRoutes(
             call.respond(
                 InstanceInfoDto(
                     name = instanceName.ifBlank { null },
+                    uiTheme = uiTheme.trim().ifBlank { null },
                     version = BuildInfo.version,
                     build = BuildInfo.buildStamp,
                     totalRows = totals?.totalRows,

@@ -252,7 +252,7 @@ Creation is behind `HOGLAKE_PACKED_MERGETREE_ENABLED`, default `false`. The roll
    requests and complete that rollout.
 4. Only then create packed tables and start packed writers.
 
-**No rollback past V25 once a packed table exists**: older server binaries do not filter on format in
+**No rollback past V26 once a packed table exists**: older server binaries do not filter on format in
 their compaction candidate queries and will fail if run against a catalog containing packed tables.
 
 Turning the gate off again prevents new packed tables; it does not make existing packed tables
@@ -1539,6 +1539,11 @@ The catalog reports on itself instead of waiting for ops SQL:
 - **`GET /v1/info`** — instance identity: the operator-configured
   display name (`HOGLAKE_INSTANCE_NAME`, e.g. "GigaHog"), shown in the
   webui topbar so nobody mistakes prod for dev.
+  Set `HOGLAKE_UI_THEME=nord` on the server to select an instance color
+  theme. Restart the server and reload the UI to apply it. The response
+  includes `ui_theme` when set. The UI selects its light or dark palette
+  from the current display mode. Unset, blank, or unknown values keep the
+  default colors. See [supported themes](../webui/README.md#instance-color-theme).
 - **`GET /export`** — the DR manifest (snapshot range + live-file
   manifest + consumer offsets, consistent at head) is specified, not yet
   implemented — see that section below.
@@ -1549,12 +1554,72 @@ Three surfaces, none of which ever writes to the catalog or rides a
 transaction (`observability/`):
 
 - **`/metrics`** (Prometheus): per-catalog health gauges sampled by a
-  background loop in one batched query pass — head snapshot and age,
+  background loop in GROUPS. The CORE group (one batched per-catalog
+  query plus one consumer-offset query) runs on every pod that samples
+  (`HOGLAKE_METRICS_INTERVAL_MS > 0`, since `/v1/info` and the catalogs
+  listing are served from it) — head snapshot and age,
   expiry floor, removal-queue depth (undrained entries only),
   pending-stats AND failed-stats counts
   (`hoglake_stats_failed_files`), live id-less-file count
   (`hoglake_missing_field_id_files`), live table
-  count, per-consumer lag (cardinality-capped). #261 removed
+  count, per-consumer lag (cardinality-capped), and
+  `hoglake_live_files{catalog}` (live data files, dropped tables
+  excluded; one more FILTER on the same manifest pass that yields
+  `hoglake_live_rows`/`_bytes`, so the three agree at one instant).
+  The five EXTENDED groups — the gauges that replaced the DuckLake
+  catalog-metrics cron's (millpond `tools/ducklake_metrics.py`) — run
+  ONLY where `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS > 0`, i.e. on the
+  maintenance pod, so API replicas do not each publish the same
+  instance-wide series (a `sum by (table)` would otherwise multiply by
+  the replica count):
+  - Per table, `{catalog, namespace, table}` (separate labels, as on
+    `hoglake_blind_partitioned_appends_total`), read off the
+    maintenance sampler's PUBLISHED generation (the generation
+    `/maintenance/status` and the partitions endpoints read — never the
+    manifest): `hoglake_table_files`, `_small_files`, `_bytes`,
+    `_small_bytes` (small = under the compaction target),
+    `hoglake_table_rows` (absent while the generation's row measure is
+    incomplete), `hoglake_table_delete_files` (files carrying a DV),
+    `hoglake_table_partitions` (partitions with files) and
+    `hoglake_table_largest_partition_files` (the cheap stand-in for
+    DuckLake's files-per-partition top-20). Live tables the generation
+    covers only: dropped tables leave immediately, a renamed table
+    publishes under its new name, a table created after the scan began
+    appears with the next generation, a catalog with no published
+    generation publishes none, and every value is as old as the
+    generation (tens of minutes on prod-us). Capped at 500 tables per
+    catalog, largest by files first;
+    `hoglake_table_series_truncated{catalog}` is how many were cut.
+  - `hoglake_live_delete_files{catalog}` / `hoglake_live_delete_bytes`
+    — live deletion vectors on live tables (the head-time count of what
+    the tier's `dv_count` sums).
+  - `hoglake_earliest_snapshot_age_seconds{catalog}` — age of the
+    earliest retained snapshot (the first at or above the floor);
+    `hoglake_dropped_tables_pending_retirement{catalog}` — dropped tables
+    still holding live file rows, a LOWER BOUND over the newest 10,000
+    dropped tables: an older pending drop is not counted, so it can
+    read 0 with work pending on a catalog with more drops than that.
+  - `hoglake_relation_bytes{relation, kind=heap|index|toast}`,
+    `hoglake_relation_live_tuples{relation}`,
+    `hoglake_relation_dead_tuples{relation}` — instance-wide, every
+    `hog_*` relation, from the same function `GET /v1/database/health`
+    calls.
+  - `hoglake_maintenance_last_run_epoch{catalog, task, status=ok|failed}`
+    (finish time of the latest run with that status among the task's
+    last 1,000 ledger rows; when a status scrolls out of that window
+    the last value this process saw is republished, so
+    `status="ok"` keeps ageing through a long failure streak — a
+    restart forgets it) and
+    `hoglake_maintenance_last_run_duration_seconds{catalog, task}`.
+  Each group is its own statement and fails on its own: one
+  that throws keeps its gauges at their last values, the others still
+  publish, and the sample counts one `hoglake_metrics_sample_errors_total`
+  plus one `hoglake_metrics_group_failures_total{group}` per failed group
+  (`catalogs`, `tables`, `delete_files`, `lifecycle`, `relations`,
+  `maintenance_runs`; all six registered at 0, so a first failure is a
+  visible step). `hoglake_metrics_last_sample_epoch` is LIVENESS:
+  it advances whenever the core `catalogs` group succeeds, whatever the
+  others did, so alert on the per-group counter for those. #261 removed
   `hoglake_verify_violations{catalog, check}` and
   `hoglake_verify_errors_total{catalog}` with the verify subsystem —
   a dashboard or alert still keyed on either would now have a series
@@ -1642,9 +1707,16 @@ transaction (`observability/`):
   paths, identifiers, author strings) and only durations and counts may
   cross the wire. Each finding is a `severity` (`INFO`, `WARN` or
   `CRITICAL`, sorted worst-first) plus a stable `code`, a `detail` of
-  what was measured and a `hoglake_impact` saying why it matters HERE —
+  what was measured, a `hoglake_impact` saying why it matters HERE —
   the second half is the reason this endpoint exists rather than a link
-  to a generic Postgres dashboard. The CRITICAL-capable codes are
+  to a generic Postgres dashboard — and a `resolution` saying what
+  happens next and by whom: `kind` is `maintenance` (one of hoglake's
+  own loops closes it on its schedule, and `task` names it, e.g.
+  `reindex` for bloated indexes while that loop has recorded a run in
+  the last two days), `operator` (nothing in hoglake will; `text` says
+  what to do) or `watch` (no action; `text` says what would change
+  that). A finding's kind can follow its severity: `xid_wraparound` and
+  `dead_tuples` are a watch at WARN and an operator's at CRITICAL. The CRITICAL-capable codes are
   `invalid_indexes`, `inactive_replication_slot`,
   `prepared_transactions`, `commit_lock_held`, `autovacuum_disabled`,
   `xid_wraparound` and `idle_in_transaction` (which escalates from WARN
@@ -1971,11 +2043,14 @@ output file, so `claim`/`renew`/`abandon`/`schedule-expired` taking the per-cata
 commit lock — unbounded, with no admission timeout — meant paying the catalog's
 whole write-throughput bottleneck once per file, for nothing: claim paths are
 server-generated random UUIDs and the claim INSERT is `ON CONFLICT DO NOTHING`.
-Row-level semantics replace it. Every UPDATE re-checks the claim's state in its
-WHERE clause, so under READ COMMITTED an update that waited on a publication's
-row lock re-evaluates against the committed row and cannot clobber a settled
-claim, and `UploadService.register` — which runs inside the commit transaction —
-takes the claim rows `FOR UPDATE`. The expired-upload sweep's fence re-checks the
+Row-level semantics replace it. Every transition re-checks the claim's state in
+the statement that takes its row lock, so under READ COMMITTED one that waited on
+a publication's row lock re-evaluates against the committed row and cannot
+clobber a settled claim, and `UploadService.register` — which runs inside the
+commit transaction — takes the claim rows `FOR UPDATE`. With no lock above them,
+`renew`, `abandon` and `register` take the claim rows they lock in `upload_id`
+order: concurrent renewals of one owner, one per writer of an operation,
+deadlocked before they did. The expired-upload sweep's fence re-checks the
 *whole* candidate predicate, not just "not registered", so a renewal that landed
 between candidate selection and the fence wins, as `renewUploads` promises; it
 fences each candidate in **its own short transaction**, because a publication

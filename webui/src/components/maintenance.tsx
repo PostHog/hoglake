@@ -248,6 +248,21 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         r.tables_remaining,
       ].some(positive);
     }
+    case "reindex": {
+      const r = run.result;
+      if (!r) return false;
+      // The daily check that found nothing to rebuild: the steady state,
+      // and one row per catalog per day. Loud: anything over threshold
+      // (which every rebuild, and every retirement/purge skip, implies),
+      // a dropped leftover, and a skip on its own — reindex_in_progress
+      // and migration_pending are checked before the estimate matters, so
+      // they can fire with nothing over threshold and still say why the
+      // leftovers were left alone.
+      return (
+        r.skipped_reason === undefined &&
+        ![r.over_threshold, r.invalid_dropped].some(positive)
+      );
+    }
   }
 }
 
@@ -445,6 +460,43 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
         </>
       );
     }
+    case "reindex": {
+      const r = run.result;
+      if (!r) return <span className="empty">—</span>;
+      return (
+        <>
+          {r.index !== undefined && r.skipped_reason !== undefined ? (
+            // An EXCLUDED candidate: named so an operator knows which index
+            // is waiting for a hand-run rebuild, and how big it will be.
+            <span className="mono backlog-bad" title={r.table ? `on ${r.table}` : undefined}>
+              skipped: {r.skipped_reason} ({r.index}, {formatBytes(r.expected_bytes)} expected)
+            </span>
+          ) : r.index !== undefined ? (
+            <span className="mono" title={r.table ? `on ${r.table}` : undefined}>
+              {r.index} {formatBytes(r.before_bytes)}→{formatBytes(r.after_bytes)}
+            </span>
+          ) : r.skipped_reason !== undefined ? (
+            <span className="mono">skipped: {r.skipped_reason}</span>
+          ) : (
+            <span className="mono">nothing over threshold ({formatCount(r.checked)} checked)</span>
+          )}
+          {r.index !== undefined && r.duration_ms !== undefined && (
+            <span className="subtle mono">{formatSeconds(Number(r.duration_ms) / 1000)}</span>
+          )}
+          {(r.index !== undefined || r.skipped_reason !== undefined) && (
+            <span className="subtle mono">
+              {formatCount(r.over_threshold)} over threshold of {formatCount(r.checked)}
+            </span>
+          )}
+          {positive(r.invalid_dropped) && (
+            <span className="badge badge-warn" title={REINDEX_LEFTOVER_TITLE}>
+              dropped {formatCount(r.invalid_dropped)} failed-rebuild leftover
+              {r.invalid_dropped === "1" ? "" : "s"}
+            </span>
+          )}
+        </>
+      );
+    }
   }
 }
 
@@ -476,6 +528,7 @@ export const RUN_TASK_FILTERS = [
   "compaction",
   "verify",
   "retirement",
+  "reindex",
 ] as const;
 export type RunTaskFilter = (typeof RUN_TASK_FILTERS)[number];
 
@@ -498,6 +551,15 @@ const HEAP_BUDGET_TITLE =
   "the table still compacts, and no data is lost or wrong. To clear it, " +
   "raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES on a pod with enough " +
   "memory, or remove the table's sort order.";
+
+// For an operator who sees the badge and does not know where a leftover
+// comes from.
+const REINDEX_LEFTOVER_TITLE =
+  "A REINDEX INDEX CONCURRENTLY that fails or is cancelled leaves an " +
+  "invalid copy of the index behind (named …_ccnew or …_ccold). Every " +
+  "write to the table keeps maintaining it and no query reads it. The " +
+  "reindex task drops these before each run, so a count here means an " +
+  "earlier rebuild failed — its own failed run is further down the list.";
 
 // For an operator who sees "7 page halvings" and does not know the
 // mechanism. The count is pages, not rows.

@@ -33,6 +33,8 @@ const TASKS: MaintenanceTaskStatus["task"][] = [
   // Retirement feeds cleanup, so it sits at the end rather than beside
   // it.
   "retirement",
+  // Instance-wide: the same daily run on every row.
+  "reindex",
 ];
 
 /**
@@ -116,6 +118,38 @@ function taskCell(t: MaintenanceTaskStatus): {
           : "Paced deletion of dropped tables' file rows. Only runs once a " +
             "drop has sunk to the catalog's expiry floor, so a catalog with " +
             "no snapshot retention never retires anything.",
+      };
+    }
+    case "reindex": {
+      // The last run's headline, as for retirement: no backlog number
+      // exists here (bloat is the database's, on the database page).
+      const last = t.last_run;
+      const result = last && last.task === "reindex" ? last.result : null;
+      // ORDER MATTERS: a too_large / last_attempt_failed skip and a failed
+      // rebuild all carry `index` too, so the skip and the failure are
+      // asked first or every one of them would read "rebuilt X".
+      const failed = last?.status === "failed";
+      const excluded =
+        result?.skipped_reason === "too_large" || result?.skipped_reason === "last_attempt_failed";
+      return {
+        number: !last
+          ? ""
+          : result?.skipped_reason !== undefined
+            ? `skipped: ${result.skipped_reason}${result.index ? ` (${result.index})` : ""}`
+            : failed
+              ? `failed: ${result?.index ?? "rebuild"}`
+              : result?.index !== undefined
+                ? `rebuilt ${result.index}`
+                : result
+                  ? "nothing over threshold"
+                  : "",
+        // A failed rebuild and an excluded candidate both wait for a human;
+        // a guard skip (retirement, purge, migration) is the system working.
+        warn: failed || excluded,
+        title:
+          "Daily index-bloat check at 03:00 UTC: rebuilds at most one index " +
+          "over threshold (REINDEX INDEX CONCURRENTLY). Instance-wide, so " +
+          "every catalog shows the same run.",
       };
     }
   }

@@ -7,7 +7,20 @@ the pre-split commits).
 
 ## Pre-push checklist
 
-**Never push broken code.** Before every commit and push:
+**Do not push until all required tests have run on the exact changes being
+pushed.** This includes the server suite with Docker, Kotlin and Python lint,
+Python type checks, both Python unit suites, both live client suites, and the
+UI tests and build. Run additional component checks for affected code, such as
+the DuckDB extension's live tests.
+
+A skipped live suite, a missing service, a unit-only run, or checks from an
+older revision do not satisfy this rule. Wait for every command to finish and
+read its result. Any failure blocks a push, including a failure that also
+occurs on `main`. Fix it or report the exact failure and obtain explicit user
+authorization to push with that known failure. Do not exclude tests, add
+`xfail`, or accept a failing job to get a green result.
+
+Before every commit and push:
 
 (And before a PR that touches a maintenance loop, the commit path or a
 statement over the manifest tables: the six scale questions at the end
@@ -16,11 +29,13 @@ are answered in the PR body, the sixth being what ran on the local
 stack and what it showed.)
 
 ```bash
-cd server && flox activate -- ./gradlew :test         # server suite via the wrapper (Docker required)
+(cd server && flox activate -- ./gradlew :test)       # Docker required
 just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
-just pyhoglake test  # pyhoglake suite
-just webui test      # vitest (no server needed)
-just hedgerow test   # unit; integration needs a live server
+just pyhoglake unit
+just hedgerow unit
+just live-python    # builds this checkout, starts isolated services, fails on skips
+just webui test
+just webui build
 ```
 
 `ruff` is **pinned** in both Python trees' dev groups and run through
@@ -42,8 +57,17 @@ without a server up verifies nothing — see
 (omitting `BUILD_EXTENSION_TEST_DEPS=full` makes vcpkg delete
 curl/openssl/zlib from the build tree).
 
-For the full end-to-end pass (client/hedgerow integration tests against
-a real server): `just server compose-up && just server run` in another
+`just live-python` is the required client/server check. It builds the server
+from this checkout, starts isolated PostgreSQL and MinIO services, and runs
+both clients' integration tests, including `qe_*.py`. It fails if either
+suite fails, skips a test, produces no tests, or has no readable report. It
+writes logs and JUnit reports to `.artifacts/live-python/` and removes its
+services on exit. The default ports are 15432 (PostgreSQL), 18080 (server),
+19000/19001 (MinIO). Override `HOGLAKE_PG_PORT`, `HOGLAKE_PORT`,
+`HOGLAKE_MINIO_PORT`, and `HOGLAKE_MINIO_CONSOLE_PORT` if those ports are in use.
+It does not replace the unit suites or the full server suite above.
+
+For manual investigation against a shared development server: `just server compose-up && just server run` in another
 terminal first — integration tests skip cleanly when no server is up,
 so a green run without one is NOT a full verification. Say which you
 ran. The server needs the compose MinIO's credentials in its env
@@ -112,14 +136,51 @@ path-scoped per component, posthog-monorepo style:
 
 | Workflow | Paths | Runs |
 |---|---|---|
-| `server.yml` | `server/**`, codec vectors | test + ktlint (Docker/Testcontainers; schema-equivalence gate included), PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
-| `webui.yml` | `webui/**`, OpenAPI spec | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | `pyhoglake/**` `hedgerow/**` `bench/**` | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. All unit/mocked layer — live integration is local, per the pre-push checklist |
-| `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
+| `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
+| `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
+| `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
+| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
 | `dependency-review.yml` | PRs | vulnerability gate (license allow-list deferred until the three-ecosystem atom set settles) |
+
+Live Python failures block deployment and publishing. The current merge
+rules require `migration-chain`, `server-test`, and `webui-test`; the live
+Python results are visible on the PR but are not required for merge.
+
+**Required checks run on every PR, by construction.** The main
+ruleset ("Require to be up to date", repository-level) requires
+`migration-chain`, `server-checks`, `python-checks` and `webui-test`,
+with the up-to-date policy on. A required check has to be PRODUCED on every PR:
+a workflow that path-filters itself out of a PR leaves its check
+"expected" forever and the PR cannot merge — #299 (webui-only) sat
+BLOCKED with every check green until #301 moved the migration gate out
+of `server.yml`, and a Python-only PR had no `test` at all. So no
+required workflow carries a trigger-level path filter; each has a
+`changes` job (dorny/paths-filter, pinned) and the heavy jobs carry
+`if: needs.changes.outputs.<tree> == 'true'`. A job skipped that way
+reports `skipped`, which the ruleset accepts; a workflow that never
+ran reports nothing. The three names are distinct on purpose: two
+workflows both naming a job `test` produced two `test` check runs on
+a PR touching both trees, and which one the ruleset read was not
+defined. Renaming a required job means editing the ruleset in the
+same breath (`gh api repos/PostHog/hoglake/rulesets/24498452`), or
+every PR is blocked on a name nothing produces.
+
+**Require the gate, not the leaf.** Where a workflow has a gate job
+that fans in several suites (`server-checks` over `server-test` and
+`python-live`; `python-checks` over the pyhoglake checks, the live
+client suites and the hedgerow/bench checks), the ruleset requires
+the GATE. Requiring a leaf let #304 wire the live Python suites into
+three workflows as a deploy gate and merge while that gate was red —
+the suites had been failing for days outside CI, which is what #304
+set out to fix — and main was red for two hours until #306 repaired
+them. Two rules fall out: a PR that adds a gate merges green on that
+gate, and no suite in this repo lives outside CI (a suite that only
+runs locally rots; the live suites did for four releases).
 
 CD is the charts state-file mechanism (same as duckgres, millpond,
 viaduck): a push to main touching `server/**` or `webui/**` runs the
@@ -434,9 +495,22 @@ there would break that gate on every build.
     - Compaction and maintenance planners select Parquet files only. The
       maintenance debt sampler excludes non-Parquet tables so packed tables
       never leak permanent small-file debt into debt scores or metrics.
-    - The server never opens stored data files (Parquet or packed parts);
-      validation is enforced at registration/commit without I/O.
-    - **No rollback past V25 once a packed table exists**: pre-V25 binaries
+    - The server never opens a packed part. Registration validates packed
+      files from metadata only (non-zero rows and bytes, no `footer_size`,
+      no `split_offsets`, file format equal to the table format). The two
+      server surfaces that DO open Parquet — the stats hydrator and
+      compaction (invariant 2) — select `file_format = 'parquet'` only, so a
+      packed object can never reach a Parquet reader server-side.
+    - Packed stats are counts only: `column_stats` is optional and a packed
+      row is always `stats_state = 'provided'` (the hydrator never claims
+      it, so `pending` would be permanent). Packed files carry positional
+      row-id ranges like any other file and never `explicit_row_ids`.
+    - Every client and engine must refuse a format it cannot read, typed,
+      before handing the object to a reader: DuckDB (`duckdb-client/`),
+      Hedgerow and Trino (`plugin/trino-hoglake`) refuse packed tables and
+      per-file non-Parquet formats in scan plans; `pyhoglake.packed` is the
+      only reader.
+    - **No rollback past V26 once a packed table exists**: pre-V26 binaries
       lack format filters in their compaction candidate queries and will fail
       if run against a database containing packed tables.
 
@@ -914,7 +988,11 @@ ran on the local stack and what it showed.
   first wins without any global lock; the predicate that selects
   candidates is the predicate that fences them, verbatim, or a renewal
   in the window is clobbered. Sweeps settle one row per transaction so a
-  commit never queues behind a sweep while holding the commit lock.
+  commit never queues behind a sweep while holding the commit lock. With
+  no lock above them, claim rows need an order of their own: a statement
+  that locks more than one takes them in `upload_id` order, and updates
+  them in a second statement (UploadService's class comment). Concurrent
+  renewals of one owner deadlocked before they did.
 - **A new guard never edits an existing test out of its way.** When a
   new refusal reds a test, that test either asserts the refusal or has
   its fixture changed to satisfy the guard legitimately, with the reason
@@ -984,7 +1062,7 @@ ran on the local stack and what it showed.
   (`api/RequestDispatchIntegrationTest`), and any future change to
   request dispatch belongs there too.
 - **Background loops are coroutines**: every periodic job (hydrator,
-  expiry, cleanup, compaction, retirement, metrics sampler)
+  expiry, cleanup, compaction, retirement, reindex, metrics sampler)
   registers with
   `BackgroundLoops` (one supervisor scope owned by
   `App.startBackground()`) — never a raw daemon thread. Contracts:
@@ -1149,6 +1227,99 @@ ran on the local stack and what it showed.
     expiry's below-floor sweep — but a dropped table's rows sit in
     `hog_data_file` until it runs, which is what V19's partial index and
     the gauges' `hog_table` join both exist to survive.
+  - **Reindex** (`MaintenanceTask.REINDEX`, loop `reindex`,
+    `ReindexService`, #268) is the daily index-bloat check: autovacuum
+    never shrinks an index, and on this schema bloat arrives in steps
+    (the 13.9M-row prod-us retirement left `hog_data_file` with 14.8 GB of
+    indexes over 1.48M rows). It estimates every valid btree index on a
+    hog_* table from `pg_stats` (the check_postgres / ioguix arithmetic,
+    `ReindexService.ESTIMATE_SQL`: catalog reads only) and rebuilds at
+    most ONE — the largest estimated excess over threshold — with
+    `REINDEX INDEX CONCURRENTLY`, on its own connection, under NO commit
+    lock, with that session's `statement_timeout` raised to an hour and
+    restored after. Threshold: ratio >= 3.0 on an index of at least 8 MiB,
+    or >= 1 GiB of excess at a ratio of at least 1.5 (a random-key btree
+    sits at ~1.35 on its own). Constraint-backing indexes are eligible
+    (PG >= 12 rebuilds them in place); on equal excess a non-constraint
+    one goes first. EXCLUDED, with the next candidate going instead: an
+    index expected to rebuild past 16 GiB (`MAX_REBUILD_EXPECTED_BYTES`;
+    `too_large` — a concurrent rebuild writes ~0.9x its size in WAL and
+    ~1x in temp files while the old copy still exists, so ~3x its size in
+    transient disk: `hog_file_column_stats_pkey` at ~15 GB expected is
+    admitted and needs ~45 GB of headroom that night; anything larger is
+    an operator's off-peak job) and one whose newest attempt failed
+    (`last_attempt_failed`). With every candidate excluded the row names
+    the first, with `expected_bytes`. TWO CONSEQUENCES, stated so nobody
+    infers them: a failed attempt is RETRIED once its row leaves the 7-day
+    ledger, so an index that reliably times out costs its rebuild —
+    ~3x its expected size in transient disk (~45 GB for the stats pkey)
+    and up to an hour of I/O — every week until a human looks; and an
+    over-cap index is NOT NAMED in the ledger while a smaller candidate is
+    over threshold — rows that rebuilt something carry `excluded` (how many
+    candidates were passed over), and the health page's `index_bloat`
+    finding names them. A rebuild that succeeded but whose read-back
+    failed stays an `ok` row with `post_step_error` and no `after_bytes`. Every number above is a constant, not a knob, and so is the
+    schedule: **due once a day at 03:00 UTC** (`RUN_AT_UTC`; configurable
+    later). `HOGLAKE_REINDEX_INTERVAL_MS` (**0 = off**) is only the POLL;
+    the chart turns it on for the maintenance Deployment alone, and its
+    one rebuild connection is priced in the pool budget. The gate
+    reads the LEDGER (newest `reindex` row's `started_at`), so a restart
+    does not repeat the day's run and a pod down at 03:00 runs on its
+    first poll that day; a `migration_pending` / `reindex_in_progress`
+    row does not close the day before 06:00 UTC (`RETRY_UNTIL_UTC`). GUARDS, each a `skipped_reason`:
+    `reindex_in_progress` (ANY index build in this database in
+    `pg_stat_progress_create_index` — not filtered on `command`, which is
+    NULL to a non-superuser for another role's backend),
+    `reindex_lock_held` (the instance-wide single-flight lock
+    `Locks.REINDEX_LOCK_CLASS` held by another session — this task's own
+    rebuild, so it closes the day rather than retrying), `migration_pending` (the migration advisory lock held, or a
+    failed Flyway history row) — both checked BEFORE invalid `*_ccnew` /
+    `*_ccold` leftovers of a failed rebuild are dropped, because an
+    in-flight build's copy is exactly such an index — then
+    `retirement_pending` (`RetirementService.ELIGIBLE_PREDICATE`
+    anywhere) and `purge_pending` (any catalog's latest expiry row has
+    `purge_remaining` at `ExpiryService.PURGE_REMAINING_CAP`, or is
+    truncated with the count unknown — routine lag is not a mass delete), which would re-bloat the index tomorrow and
+    are asked only when something IS over threshold, so a quiet day
+    stays a quiet row through a week-long retirement. A
+    failed REINDEX is a `failed` row carrying the attempt, never retried
+    in-run, and drops its own `_ccnew` at once (one cancelled in
+    validation is ready for writes). READING THE
+    LEDGER ROW: the run is instance-wide and the ledger per-catalog, so
+    one run is the SAME row on every catalog
+    (`MaintenanceRunStore.recordedAllCatalogs`, V25 adds the task to the
+    CHECK). `checked` / `over_threshold` / `invalid_dropped` are always
+    there; `index`, `table`, `before_bytes`, `after_bytes`, `duration_ms`
+    appear when a rebuild was attempted, `skipped_reason` when a guard
+    fired; a row with only the three counters and zeros is the quiet
+    steady state. `GET /v1/database/health` carries the same estimate
+    (`indexes[].estimated_bloat_bytes` / `_ratio`, finding
+    `index_bloat`), and `hoglake_index_bloat_bytes{table,index}` is the
+    gauge — published only by the pod running the loop (daily run plus
+    every metrics tick there), never by an API pod serving the health
+    page, so the series does not flap between pods. The estimate is as fresh as the table's last VACUUM/ANALYZE
+    and under-reports deduplicated indexes — `hog_data_file_changefeed` /
+    `_live` read ~0.17 fresh, so their bloat shows ~6x low and the ratio
+    rule needs ~18x real bloat there; it never over-reports for a missing
+    `pg_stats` row or a never-vacuumed index (no estimate instead). What a rebuild costs:
+    two heap passes of its table, its size in WAL, one pooled connection
+    for the duration, a held snapshot per phase (the health page's
+    `long_transaction` finding will name it while it runs), and no
+    autovacuum on that table until it ends (it cancels a running one). A
+    pod killed mid-rebuild leaves the backend running it with the session
+    lock; the killed run writes no row and the next poll records
+    `reindex_lock_held`, which closes the day (the orphan IS today's
+    rebuild).
+    DEPLOY NOTE: do not promote a release with a migration while a
+    rebuild runs (03:00 UTC onward, up to an hour). An `ALTER TABLE` on
+    the table being rebuilt hits its 5 s `lock_timeout` and the pod
+    crash-loops until the rebuild ends; a `CREATE INDEX CONCURRENTLY`
+    waits out the rebuild's snapshot and dies on the 120 s
+    `MIGRATION_LOCK_WAIT`. Check first:
+    `SELECT pid, command, phase, relid::regclass FROM
+    pg_stat_progress_create_index WHERE datid = (SELECT oid FROM
+    pg_database WHERE datname = current_database());` — `Database.migrate`
+    logs the same rows at WARN before Flyway runs.
 - **Multi-agent work**: partition by package/file ownership; frozen
   shared files (build files, Model.kt, migrations, spec) change only
   through the integrating session; agents report needed changes rather

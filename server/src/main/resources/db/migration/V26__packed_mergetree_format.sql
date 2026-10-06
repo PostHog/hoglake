@@ -40,6 +40,6 @@ BEGIN
            AND lower(properties ->> 'write.format.default') <> 'parquet'
     ) THEN
         RAISE EXCEPTION
-            'retained table metadata already uses reserved property write.format.default; remove it before V25';
+            'retained table metadata already uses reserved property write.format.default; remove it before V26';
     END IF;
 END $$;

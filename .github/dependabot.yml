@@ -23,6 +23,15 @@ updates:
     groups:
       gradle-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # Ktor 3.6.0's test engine deadlocks a testApplication response
+      # over 1 MiB (KTOR-9968, ktorio/ktor#5918): the writer became a
+      # child of the per-request job the engine awaits before the client
+      # may read. ScanColumnStatsCapApiTest serves a million column-stat
+      # entries and hung the whole suite (#298). The fix is unreleased;
+      # this pins out 3.6.0 ONLY, so 3.6.1 arrives on its own.
+      - dependency-name: "io.ktor:*"
+        versions: ["3.6.0"]
 
   - package-ecosystem: npm
     directory: /webui

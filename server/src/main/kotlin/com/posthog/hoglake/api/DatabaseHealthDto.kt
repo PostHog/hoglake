@@ -100,6 +100,9 @@ data class DatabaseIndexDto(
     val sizeBytes: Long,
     val scans: Long,
     val constraintBacking: Boolean,
+    /** Absent when the estimate cannot be made (see DatabaseIndex). */
+    val estimatedBloatBytes: Long?,
+    val estimatedBloatRatio: Double?,
 )
 
 data class DatabaseFindingDto(
@@ -108,6 +111,15 @@ data class DatabaseFindingDto(
     val title: String,
     val detail: String,
     val hoglakeImpact: String,
+    val resolution: FindingResolutionDto,
+)
+
+data class FindingResolutionDto(
+    /** `maintenance`, `operator` or `watch`. */
+    val kind: String,
+    /** The task's wire name when [kind] is `maintenance`; absent otherwise. */
+    val task: String?,
+    val text: String,
 )
 
 fun DatabaseHealth.toDto() =
@@ -198,6 +210,8 @@ fun DatabaseIndex.toDto() =
         sizeBytes = sizeBytes,
         scans = scans,
         constraintBacking = constraintBacking,
+        estimatedBloatBytes = estimatedBloatBytes,
+        estimatedBloatRatio = estimatedBloatRatio,
     )
 
 fun DatabaseFinding.toDto() =
@@ -207,4 +221,10 @@ fun DatabaseFinding.toDto() =
         title = title,
         detail = detail,
         hoglakeImpact = hoglakeImpact,
+        resolution =
+            FindingResolutionDto(
+                kind = resolution.kind.name.lowercase(),
+                task = resolution.task?.wire,
+                text = resolution.text,
+            ),
     )

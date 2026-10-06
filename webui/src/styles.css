@@ -1,7 +1,7 @@
-/* hoglake console — dense, legible, fully tokenized stylesheet.
-   Dark is the default palette; [data-theme="light"] swaps the tokens
-   (set on <html> by lib/theme.ts before first paint). Never hardcode a
-   color outside these two blocks. */
+@import "./color-themes.css";
+
+/* Base palettes. Configured palettes in color-themes.css override these
+   tokens. data-theme selects light or dark mode for either palette. */
 
 :root {
   color-scheme: dark;
@@ -102,6 +102,10 @@ h3 {
   font-size: 15px;
   color: var(--text);
   letter-spacing: 0.02em;
+}
+
+:root[data-color-theme] .topbar {
+  border-top: 3px solid var(--accent);
 }
 .brand:hover {
   text-decoration: none;
@@ -319,7 +323,7 @@ td.nullable-mark {
   white-space: nowrap;
 }
 tr.has-deletes {
-  background: rgba(229, 116, 95, 0.06);
+  background: color-mix(in srgb, var(--bad) 6%, transparent);
 }
 
 /* -- stats header -------------------------------------------------------- */
@@ -485,6 +489,21 @@ button.theme-toggle {
   line-height: 1.4;
 }
 button.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+/* Sits beside theme-toggle and takes its quiet look rather than the
+   140px form-control default: it is a preference, not a page filter. */
+select.color-theme-picker {
+  min-width: 0;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  padding: 1px 4px;
+  line-height: 1.4;
+}
+select.color-theme-picker:hover,
+select.color-theme-picker:focus {
   color: var(--text);
   border-color: var(--text-dim);
 }
@@ -671,7 +690,7 @@ button.ghost:hover:not(:disabled) {
   margin: 8px 0;
   border: 1px solid var(--bad);
   border-radius: 6px;
-  background: rgba(229, 116, 95, 0.08);
+  background: color-mix(in srgb, var(--bad) 8%, transparent);
   color: var(--text);
 }
 .error-status {
@@ -946,6 +965,107 @@ button.ghost:hover:not(:disabled) {
 .metrics-fetched-at {
   padding-bottom: 7px;
 }
+.metrics-pinned {
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+  border-bottom: 1px dashed var(--border);
+}
+/* Pin: the same quiet look as theme-toggle, lit when set. */
+button.pin-toggle {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-weight: 400;
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 1.4;
+}
+button.pin-toggle:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+button.pin-toggle.pinned {
+  color: var(--warn);
+}
+.series-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+button.hbars-more {
+  align-self: flex-start;
+  margin-top: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 12px;
+  border-radius: 4px;
+  padding: 1px 8px;
+}
+button.hbars-more:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.card-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+.card-actions button.pin-toggle {
+  margin-left: 0;
+}
+/* One family, full viewport: fixed over the page, scrolls on its own. */
+.metric-focus {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: var(--bg);
+  padding: 12px 24px 24px;
+  overflow: auto;
+}
+.metric-focus .metric-family {
+  margin: 0;
+}
+.metric-focus .stat-tile {
+  display: block;
+  min-width: 0;
+  margin-right: 0;
+}
+.metric-focus .stat-tile .metric-history {
+  min-width: 0;
+}
+.metric-focus-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.stat-tile-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+/* The uPlot host: full width of the card; the axis text takes the theme. */
+.metric-history {
+  margin: 6px 0 10px;
+}
+.metric-history-note {
+  margin: 2px 0 0;
+  font-size: 11px;
+}
+.timeseries .u-legend {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.timeseries .u-legend .u-series > * {
+  padding: 2px 6px;
+}
+.stat-tile .metric-history {
+  min-width: 320px;
+}
 
 /* Stat tile: a scalar family's single value, big. */
 .stat-tile {
@@ -1034,7 +1154,7 @@ button.ghost:hover:not(:disabled) {
   margin: 8px 0;
   border: 1px solid var(--warn);
   border-radius: 6px;
-  background: rgba(229, 181, 103, 0.08);
+  background: color-mix(in srgb, var(--warn) 8%, transparent);
   color: var(--warn);
 }
 
@@ -1183,6 +1303,25 @@ button.expand-toggle[aria-expanded="true"] .expand-chevron {
   color: var(--text-dim);
   border-top: 1px dotted var(--border);
   padding-top: 6px;
+}
+/* What happens next: the badge says who, the sentence says what. A
+   maintenance-owned finding reads calm (ok), an operator's reads as a
+   to-do (warn), a watch reads like the impact text it follows. */
+.db-finding-resolution {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+.badge.resolution-maintenance {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.badge.resolution-operator {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.badge.resolution-watch {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
 }
 .severity-info {
   color: var(--text-dim);

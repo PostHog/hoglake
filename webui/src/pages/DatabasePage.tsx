@@ -4,6 +4,7 @@ import {
   getDatabaseHealth,
   type CommitLockHolder,
   type DatabaseFinding,
+  type FindingResolution,
   type DatabaseIndex,
   type DatabaseTable,
   type ReplicationSlot,
@@ -49,6 +50,26 @@ function Stat({
   );
 }
 
+/**
+ * What happens next, led by who does it: a reader should never have
+ * to work out whether "12 indexes are bloated" is their job or the
+ * reindex task's tomorrow at 03:00.
+ */
+function Resolution({ resolution }: { resolution: FindingResolution }) {
+  // Terse like every other badge on the page; the sentence does the talking.
+  const lead =
+    resolution.kind === "maintenance"
+      ? `${resolution.task ?? "maintenance"} task handles it`
+      : resolution.kind === "operator"
+        ? "operator"
+        : "no action";
+  return (
+    <p className="db-finding-resolution">
+      <span className={`badge resolution-${resolution.kind}`}>{lead}</span> {resolution.text}
+    </p>
+  );
+}
+
 function Findings({ findings }: { findings: DatabaseFinding[] }) {
   if (findings.length === 0) {
     return (
@@ -70,6 +91,8 @@ function Findings({ findings }: { findings: DatabaseFinding[] }) {
           {/* The reason this page exists rather than a link to a generic
               Postgres dashboard: what the number means for this schema. */}
           <p className="db-finding-impact">{f.hoglake_impact}</p>
+          {/* A server from before the field simply has no third part. */}
+          {f.resolution && <Resolution resolution={f.resolution} />}
         </li>
       ))}
     </ul>
@@ -298,12 +321,13 @@ function Tables({ tables }: { tables: DatabaseTable[] }) {
   );
 }
 
-type IndexSortKey = "name" | "table" | "size" | "scans" | "role";
+type IndexSortKey = "name" | "table" | "size" | "bloat" | "scans" | "role";
 
 const INDEX_COMPARATORS: Record<IndexSortKey, ColumnSort<DatabaseIndex>> = {
   name: textColumn((i) => i.name),
   table: textColumn((i) => i.table),
   size: int64Column((i) => i.size_bytes),
+  bloat: int64Column((i) => i.estimated_bloat_bytes),
   scans: int64Column((i) => i.scans),
   role: {
     compare: (a, b) =>
@@ -324,6 +348,13 @@ function Indexes({ indexes }: { indexes: DatabaseIndex[] }) {
           <SortableTh label="table" sortKey="table" sort={sort} onSort={onSort} />
           <SortableTh label="size" sortKey="size" sort={sort} onSort={onSort} numeric />
           <SortableTh
+            label="bloat (est.)"
+            sortKey="bloat"
+            sort={sort}
+            onSort={onSort}
+            numeric
+          />
+          <SortableTh
             label="scans"
             sortKey="scans"
             sort={sort}
@@ -339,6 +370,23 @@ function Indexes({ indexes }: { indexes: DatabaseIndex[] }) {
             <td className="mono">{i.name}</td>
             <td className="mono">{i.table}</td>
             <td className="num">{formatBytes(i.size_bytes)}</td>
+            {/* The server's pg_stats estimate; the index_bloat finding
+                above carries the threshold verdict, so the tone here is
+                only a hint at the ratio the reindex task rebuilds at. */}
+            <td
+              className={`num${
+                i.estimated_bloat_ratio !== undefined && i.estimated_bloat_ratio >= 3
+                  ? " db-cell-warn"
+                  : ""
+              }`}
+              title={
+                i.estimated_bloat_ratio !== undefined
+                  ? `${i.estimated_bloat_ratio.toFixed(1)}x the size of a fresh build`
+                  : "no estimate (not a btree, or not yet analyzed)"
+              }
+            >
+              {i.estimated_bloat_bytes !== undefined ? formatBytes(i.estimated_bloat_bytes) : "—"}
+            </td>
             <td className={`num${String(i.scans) === "0" ? " db-cell-warn" : ""}`}>
               {formatCount(i.scans)}
             </td>

@@ -180,6 +180,98 @@ class CompactionPlanningIntegrationTest {
             .hasMessageContaining(FileFormats.CLICKHOUSE_MERGETREE_PACKED)
     }
 
+    private fun setFileFormat(
+        cat: String,
+        path: String,
+        format: String,
+    ) = db.jdbi.useHandleUnchecked { h ->
+        // Raw update: neither state is producible through the service, which is
+        // the point — each test removes one of the two exclusions' cover.
+        h.createUpdate(
+            """
+            UPDATE hog_data_file f SET file_format = :format
+              FROM hog_catalog c
+             WHERE c.catalog_id = f.catalog_id AND c.name = :cat AND f.path = :path
+            """,
+        ).bind("format", format).bind("cat", cat).bind("path", path).execute()
+    }
+
+    @Test
+    fun `the candidate query alone excludes a packed row from a parquet table`() {
+        // Pins the SQL `file_format = 'parquet'` predicate: the table-level
+        // early return cannot see this row, the table is Parquet.
+        val cat = fixture()
+        append(cat, file("a", 300), file("b", 300), file("c", 300))
+        setFileFormat(cat, "s3://bucket/x/b.parquet", FileFormats.CLICKHOUSE_MERGETREE_PACKED)
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        assertThat(plan.groups).hasSize(1)
+        assertThat(plan.groups.single().files.map { it.path })
+            .containsExactly("s3://bucket/x/a.parquet", "s3://bucket/x/c.parquet")
+    }
+
+    @Test
+    fun `a packed table is refused from metadata before the candidate query`() {
+        // Pins the table-format early return: these rows claim Parquet, so the
+        // SQL predicate alone would plan them.
+        val cat =
+            fixture(
+                properties = mapOf(FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED),
+            )
+        append(
+            cat,
+            *listOf("a", "b", "c").map {
+                FileRegistration(
+                    path = "s3://bucket/x/$it.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 300,
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }.toTypedArray(),
+        )
+        listOf("a", "b", "c").forEach { setFileFormat(cat, "s3://bucket/x/$it.packed", FileFormats.PARQUET) }
+        assertThat(svc.planTable(cat, "ns", "t", cfg).groups).isEmpty()
+    }
+
+    @Test
+    fun `packed files are not counted as compaction debt by the sampler`() {
+        // Packed tables are never compacted, so their small files are not debt:
+        // counting them would publish a permanent backlog on /maintenance/status,
+        // the debt page and the small-file gauges (all read the sampler's tiers).
+        val cat =
+            fixture(
+                properties = mapOf(FileFormats.TABLE_PROPERTY to FileFormats.CLICKHOUSE_MERGETREE_PACKED),
+            )
+        append(
+            cat,
+            *(0..4).map {
+                FileRegistration(
+                    path = "s3://bucket/x/p$it.packed",
+                    recordCount = 10,
+                    fileSizeBytes = 16,
+                    fileFormat = FileFormats.CLICKHOUSE_MERGETREE_PACKED,
+                )
+            }.toTypedArray(),
+        )
+        // Page size 1 drives the excluded-table skip, 10,000 the in-page filter.
+        for (batch in listOf(1, 10_000)) {
+            db.jdbi.useHandleUnchecked { h ->
+                h.execute(
+                    "UPDATE hog_maintenance_summary SET generation = generation + 1, " +
+                        "scan_state = NULL, sample = NULL, sampled_at = NULL, next_batch_at = now()",
+                )
+            }
+            val sampler =
+                MaintenanceSummarySampler(db.jdbi, 1024, cfg.minInputFiles, cfg.maxInputFiles, 3600)
+            var steps = 0
+            while (sampler.runOnce(batch)) check(++steps < 100_000)
+            val sample =
+                db.jdbi.withHandleUnchecked { h ->
+                    MaintenanceSummarySampler.read(h, listOf(catalogId(cat))).values.single()
+                }
+            assertThat(sample.sample.smallFiles).describedAs("page size %d", batch).isZero()
+        }
+    }
+
     @Test
     fun `a run keeps packing groups until the remainder is too short`() {
         val cat = fixture()
@@ -471,6 +563,7 @@ class CompactionPlanningIntegrationTest {
                 cleanupIntervalMs = 0,
                 compactionIntervalMs = 0,
                 retirementIntervalMs = 0,
+                reindexIntervalMs = 0,
                 smallFileThresholdBytes = 1024,
                 minInputFiles = policy.minInputFiles,
                 maxInputFiles = policy.maxInputFiles,

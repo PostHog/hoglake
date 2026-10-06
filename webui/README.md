@@ -140,6 +140,114 @@ the hoglake server at `http://localhost:8080`, so start the server first
 and the app fetches same-origin (no CORS involved). Point the proxy at a
 different server with `HOGLAKE_API=http://host:port npm run dev`.
 
+## Instance color theme
+
+Set `HOGLAKE_UI_THEME` on the **server**, beside `HOGLAKE_INSTANCE_NAME`:
+
+```sh
+HOGLAKE_INSTANCE_NAME=development HOGLAKE_UI_THEME=nord
+```
+
+Add these environment variables to the server process or its deployment
+configuration. Restart the server and reload the UI to apply a change.
+The UI reads `ui_theme` from `GET /v1/info`. No UI build is required.
+
+For the local container stack, run this command from the repository root:
+
+```sh
+HOGLAKE_UI_THEME=nord just up
+```
+
+Compose passes the value to the server container. Reload the UI after the
+server starts. Set the variable each time you run `just up`, or export it
+in your shell to retain the selection.
+
+Each theme has light and dark palettes. The UI follows the system display
+mode until you use the light/dark switch. It saves that mode in the browser.
+The color theme comes from the server unless the browser overrides it (below).
+The colored header border helps you identify the instance. Keep an instance
+name as a text label.
+
+### Per-browser override
+
+The **color theme** picker in the top bar (beside the light/dark switch)
+chooses a palette for that browser only and previews it as you move
+through the list. "instance" returns to the server's choice. The pick is
+a `hoglake-color-theme` cookie, which you can also set from the devtools
+console on the console's origin:
+
+```js
+document.cookie = "hoglake-color-theme=nord; path=/; max-age=31536000";
+```
+
+A value that is not a theme name (`default`, a typo) is ignored and the
+server's `ui_theme` applies. Reload after changing it. To go back to the
+instance theme, expire the cookie or set it to `default`:
+
+```js
+document.cookie = "hoglake-color-theme=; path=/; max-age=0";
+```
+
+Use one of these values (case is ignored). Each preview shows the actual UI
+background, text, accent, and status colors:
+
+| Value | Dark palette | Light palette |
+| --- | --- | --- |
+| `3024` | ![3024 dark palette](docs/themes/3024-dark.svg)<br>3024 Night | ![3024 light palette](docs/themes/3024-light.svg)<br>3024 Day |
+| `ayu` | ![ayu dark palette](docs/themes/ayu-dark.svg)<br>Ayu | ![ayu light palette](docs/themes/ayu-light.svg)<br>Ayu Light |
+| `catppuccin` | ![catppuccin dark palette](docs/themes/catppuccin-dark.svg)<br>Catppuccin Mocha | ![catppuccin light palette](docs/themes/catppuccin-light.svg)<br>Catppuccin Latte |
+| `dracula` | ![dracula dark palette](docs/themes/dracula-dark.svg)<br>Dracula | ![dracula light palette](docs/themes/dracula-light.svg)<br>Adapted light palette |
+| `everforest` | ![everforest dark palette](docs/themes/everforest-dark.svg)<br>Everforest Dark Med | ![everforest light palette](docs/themes/everforest-light.svg)<br>Everforest Light Med |
+| `github` | ![github dark palette](docs/themes/github-dark.svg)<br>GitHub Dark Default | ![github light palette](docs/themes/github-light.svg)<br>GitHub Light Default |
+| `gruvbox` | ![gruvbox dark palette](docs/themes/gruvbox-dark.svg)<br>Gruvbox Dark | ![gruvbox light palette](docs/themes/gruvbox-light.svg)<br>Gruvbox Light |
+| `iceberg` | ![iceberg dark palette](docs/themes/iceberg-dark.svg)<br>Iceberg Dark | ![iceberg light palette](docs/themes/iceberg-light.svg)<br>Iceberg Light |
+| `kanagawa` | ![kanagawa dark palette](docs/themes/kanagawa-dark.svg)<br>Kanagawa Wave | ![kanagawa light palette](docs/themes/kanagawa-light.svg)<br>Kanagawa Lotus |
+| `monokai` | ![monokai dark palette](docs/themes/monokai-dark.svg)<br>Monokai Pro | ![monokai light palette](docs/themes/monokai-light.svg)<br>Monokai Pro Light |
+| `night-owl` | ![night-owl dark palette](docs/themes/night-owl-dark.svg)<br>Night Owl | ![night-owl light palette](docs/themes/night-owl-light.svg)<br>Light Owl |
+| `nord` | ![nord dark palette](docs/themes/nord-dark.svg)<br>Nord | ![nord light palette](docs/themes/nord-light.svg)<br>Nord Light |
+| `oceanic-next` | ![oceanic-next dark palette](docs/themes/oceanic-next-dark.svg)<br>Oceanic Next | ![oceanic-next light palette](docs/themes/oceanic-next-light.svg)<br>Adapted light palette |
+| `one` | ![one dark palette](docs/themes/one-dark.svg)<br>Atom One Dark | ![one light palette](docs/themes/one-light.svg)<br>Atom One Light |
+| `rose-pine` | ![rose-pine dark palette](docs/themes/rose-pine-dark.svg)<br>Rose Pine | ![rose-pine light palette](docs/themes/rose-pine-light.svg)<br>Rose Pine Dawn |
+| `snazzy` | ![snazzy dark palette](docs/themes/snazzy-dark.svg)<br>Snazzy | ![snazzy light palette](docs/themes/snazzy-light.svg)<br>Adapted light palette |
+| `solarized` | ![solarized dark palette](docs/themes/solarized-dark.svg)<br>iTerm2 Solarized Dark | ![solarized light palette](docs/themes/solarized-light.svg)<br>iTerm2 Solarized Light |
+| `synthwave` | ![synthwave dark palette](docs/themes/synthwave-dark.svg)<br>Synthwave | ![synthwave light palette](docs/themes/synthwave-light.svg)<br>Adapted light palette |
+| `tokyo-night` | ![tokyo-night dark palette](docs/themes/tokyo-night-dark.svg)<br>TokyoNight Night | ![tokyo-night light palette](docs/themes/tokyo-night-light.svg)<br>TokyoNight Day |
+| `tomorrow` | ![tomorrow dark palette](docs/themes/tomorrow-dark.svg)<br>Tomorrow Night | ![tomorrow light palette](docs/themes/tomorrow-light.svg)<br>Tomorrow |
+
+The previews come from `src/color-themes.css`. After you change a palette,
+run `npm run docs:themes` from `webui/` to update the images.
+
+These themes come from [iTerm2 Color Schemes](https://iterm2colorschemes.com/).
+The site has no popularity ranking. This selection includes familiar theme
+families and a range of colors. UI surfaces use derived colors. Text colors
+have adjustments for contrast. The source revision is in `src/color-themes.css`.
+The [source license](public/third-party/iTerm2-Color-Schemes-LICENSE.txt)
+is included in the UI build.
+
+Unset, blank, `default`, and unknown values use the original Hoglake palette.
+The UI also uses that palette if `/v1/info` fails or the server predates this field.
+
+## Metrics page
+
+The Metrics page polls `GET /metrics` on an interval (15 s by default;
+5, 30 and 60 s are offered, and the choice is remembered in the
+browser) and keeps a bounded history per series in memory, for as long
+as the tab is open. Each family draws its history above its snapshot:
+gauges as values, counters as per-second rates, histograms as p50 and
+p99 of each interval's observations, summaries as their quantiles. A
+family with many label sets draws its 12 largest and says how many it
+left out. The snapshot's per-series detail (bars, bucket strips,
+quantiles) sits closed under a "show N series" button, since on a
+large instance a family can carry hundreds of label sets. The window
+is 960 polls (4 h at 15 s). Nothing is stored server-side, and a
+reload starts the history over.
+
+The star on a family pins it: pinned families sit at the top in pin
+order, whatever the filter says, and the pins are remembered in the
+browser. Charts are drawn with [uPlot](https://github.com/leeoniya/uPlot);
+`src/lib/metricsHistory.ts` holds the ring buffers and the rate and
+quantile math, and `test/metricsHistory.test.ts` covers them.
+
 ## Test / build
 
 ```sh

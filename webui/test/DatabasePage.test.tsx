@@ -112,6 +112,64 @@ function mount(body: Record<string, unknown>) {
 }
 
 describe("database page", () => {
+  it("says who closes a finding: maintenance with its task, or an operator", async () => {
+    mount(
+      health({
+        findings: [
+          {
+            severity: "warn",
+            code: "index_bloat",
+            title: "12 index(es) are over the bloat threshold",
+            detail: "hog_data_file.hog_data_file_path: 8.0 GiB.",
+            hoglake_impact: "Autovacuum never shrinks an index.",
+            resolution: {
+              kind: "maintenance",
+              task: "reindex",
+              text: "The reindex task rebuilds the largest once a day at 03:00 UTC.",
+            },
+          },
+          {
+            severity: "critical",
+            code: "prepared_transactions",
+            title: "1 orphaned prepared transaction(s)",
+            detail: "Oldest prepared 2 h ago.",
+            hoglake_impact: "A prepared transaction pins the vacuum horizon.",
+            resolution: {
+              kind: "operator",
+              text: "COMMIT PREPARED or ROLLBACK PREPARED each one by hand.",
+            },
+          },
+        ],
+      }),
+    );
+    const bloat = (await screen.findByText("12 index(es) are over the bloat threshold")).closest("li")!;
+    const maint = within(bloat).getByText("reindex task handles it");
+    expect(maint).toHaveClass("badge", "resolution-maintenance");
+    expect(within(bloat).getByText(/once a day at 03:00 UTC/)).toBeInTheDocument();
+    const prepared = screen.getByText("1 orphaned prepared transaction(s)").closest("li")!;
+    expect(within(prepared).getByText("operator")).toHaveClass("resolution-operator");
+    expect(within(prepared).getByText(/ROLLBACK PREPARED each one by hand/)).toBeInTheDocument();
+  });
+
+  it("renders a finding from a server that predates resolutions", async () => {
+    mount(
+      health({
+        findings: [
+          {
+            severity: "warn",
+            code: "deadlocks",
+            title: "3 deadlock(s) recorded",
+            detail: "Cumulative since the last statistics reset.",
+            hoglake_impact: "Something took locks outside the discipline.",
+          } as never,
+        ],
+      }),
+    );
+    expect(await screen.findByText("3 deadlock(s) recorded")).toBeInTheDocument();
+    expect(screen.getByText(/outside the discipline/)).toBeInTheDocument();
+    expect(screen.queryByText(/no action|operator|task handles it/)).not.toBeInTheDocument();
+  });
+
   it("shows a finding with both the measurement and the hoglake reading", async () => {
     mount(
       health({
@@ -123,6 +181,10 @@ describe("database page", () => {
             detail: "800000 dead against 2000000 live.",
             hoglake_impact:
               "The live-file index is partial WHERE end_snapshot IS NULL.",
+            resolution: {
+              kind: "watch",
+              text: "Autovacuum reclaims the heap side when the table crosses its threshold.",
+            },
           },
         ],
       }),
@@ -131,6 +193,9 @@ describe("database page", () => {
     expect(
       await screen.findByText("hog_data_file is 29% dead tuples"),
     ).toBeInTheDocument();
+    // The third part: what happens next, and by whom.
+    expect(screen.getByText("no action")).toHaveClass("resolution-watch");
+    expect(screen.getByText(/Autovacuum reclaims the heap side/)).toBeInTheDocument();
     // Both halves render: the measurement alone is a generic dashboard.
     expect(screen.getByText(/800000 dead against/)).toBeInTheDocument();
     expect(

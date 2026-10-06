@@ -859,6 +859,7 @@ data class InstanceInfoDto(
     val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
+    val uiTheme: String? = null,
 )
 
 /** One row of the catalog-wide consumer listing (GET /consumers). */

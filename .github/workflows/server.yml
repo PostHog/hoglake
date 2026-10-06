@@ -3,97 +3,79 @@ name: Server
 on:
   push:
     branches: [main]
-    paths:
-      - "server/**"
-      # The Kotlin↔Python codec bit-compatibility gate reads the shared
-      # vector file from the Python tree (QeBoundsVectorsTest) — a
-      # vectors-only PR must run the server suite too.
-      - "pyhoglake/tests/vectors/**"
-      - ".github/workflows/server.yml"
   pull_request:
     branches: [main]
-    paths:
-      - "server/**"
-      - "pyhoglake/tests/vectors/**"
-      - ".github/workflows/server.yml"
 
 permissions:
   contents: read
 
 jobs:
-  # Flyway detects a duplicate migration version only at runtime, and a
-  # PR's checks run against the merge result AT PUSH TIME — a migration
-  # that lands on main after this PR's last CI run makes the green
-  # checks stale (PR #65 collided with #66's V4 exactly this way, with
-  # every check passing). This job fetches main FRESH at run time and
-  # checks the union, so a re-run — or a merge-queue run — catches the
-  # collision. Residual gap: nothing forces the re-run; "require
-  # branches to be up to date before merging" closes it fully.
-  migration-chain:
+  # EVERY PR AND MAIN PUSH RUNS THIS WORKFLOW; the path filter lives in
+  # this job, not on the trigger. The main ruleset requires `server-test`
+  # on every PR, and a required check has to be PRODUCED on every PR: a
+  # workflow that path-filters itself out leaves the check "expected"
+  # forever and the PR cannot merge (#301 moved the migration gate out
+  # of this file for exactly that; a Python-only PR was left with no
+  # `test` at all). A job skipped by `if:` reports `skipped`, which the
+  # ruleset accepts. So this job decides, in seconds, and the heavy
+  # jobs condition on its answer.
+  changes:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      server: ${{ steps.filter.outputs.server }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            server:
+              - "server/**"
+              # The Kotlin↔Python codec bit-compatibility gate reads the
+              # shared vector file from the Python tree
+              # (QeBoundsVectorsTest) — a vectors-only PR must run the
+              # server suite too.
+              - "pyhoglake/tests/vectors/**"
+              - ".github/workflows/server.yml"
+              - ".github/workflows/python-live.yml"
+              - "ci/**"
 
-      - name: No duplicate versions, no edits to shipped migrations
+  python-live:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
+    uses: ./.github/workflows/python-live.yml
+
+  # Deployment requires both suites. Run this gate only for server
+  # changes. THIS is the check the ruleset requires, not `server-test`:
+  # requiring the leaf let #304 merge with python-live red (two hours
+  # of red main until #306). A required gate is what makes a gate.
+  # Runs (and fails) when `changes` itself failed: a skipped gate
+  # passes the ruleset, so a broken filter must not read as "nothing
+  # to check".
+  server-checks:
+    if: always() && (needs.changes.result != 'success' || needs.changes.outputs.server == 'true')
+    needs: [changes, server-test, python-live]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require both suites
         env:
-          OVERRIDE: ${{ contains(github.event.pull_request.labels.*.name, 'migration-chain-override') }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          SERVER_RESULT: ${{ needs.server-test.result }}
+          LIVE_RESULT: ${{ needs.python-live.result }}
         run: |
-          git fetch --no-tags --depth=1 origin main
-          MIG=server/src/main/resources/db/migration
+          test "$CHANGES_RESULT" = success &&
+            test "$SERVER_RESULT" = success &&
+            test "$LIVE_RESULT" = success
 
-          # Append-only: every migration file on CURRENT main must be
-          # byte-identical here. Only additions are allowed. The
-          # `migration-chain-override` label skips this half for a PR
-          # that repairs a chain no database can have applied (two
-          # PRs each added the same version; the second to merge left
-          # main unable to boot, and its file had to be renumbered).
-          # The duplicate-version half below never skips.
-          bad=$(git diff --name-status origin/main HEAD -- "$MIG" | grep -v '^A' || true)
-          if [ -n "$bad" ] && [ "$OVERRIDE" != "true" ]; then
-            echo "::error::Migration chain is append-only; changed or removed vs latest main:"
-            echo "$bad"
-            echo "::error::A repair of an unapplied chain may carry the migration-chain-override label."
-            exit 1
-          elif [ -n "$bad" ]; then
-            echo "::warning::migration-chain-override label present; append-only check skipped for:"
-            echo "$bad"
-          fi
-
-          # Version collision: one basename per V<number> across the
-          # union of latest main and this branch. A file this branch
-          # removes from main (only possible under the override) leaves
-          # the union, or a repair of a duplicate on main could never
-          # pass its own check.
-          removed=$(git diff --name-only --no-renames --diff-filter=D origin/main HEAD -- "$MIG" | sed 's:.*/::')
-          { git ls-tree -r --name-only origin/main -- "$MIG" | sed 's:.*/::' | grep -v -x -F -f <(printf '%s\n' "$removed")
-            git ls-files -- "$MIG" | sed 's:.*/::'; } |
-            grep -E '^V[0-9]+__[^/]+\.sql$' | sort -u |
-            sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
-            awk '$1 == prev { printf "::error::Duplicate migration version V%s: %s and %s\n", $1, last, $2; dup = 1 }
-                 { prev = $1; last = $2 }
-                 END { exit dup }'
-
-          # Ordering: a new migration must be numbered ABOVE everything
-          # already on main. Flyway (outOfOrder=false, our setting)
-          # refuses a pending version below an applied one, so a branch
-          # that merges "under" main's max wedges every deployed
-          # database at startup — dev auto-deploys, so that wedge is
-          # immediate. (#65 landed V6 while V5 was still on a branch;
-          # this check would have forced the branch to renumber.)
-          main_max=$(git ls-tree -r --name-only origin/main -- "$MIG" |
-            grep -E '/V[0-9]+__[^/]+\.sql$' | sed -E 's:.*/V([0-9]+)__.*:\1:' | sort -n | tail -1)
-          comm -13 \
-            <(git ls-tree -r --name-only origin/main -- "$MIG" | grep -E '\.sql$' | sed 's:.*/::' | sort) \
-            <(git ls-files -- "$MIG" | grep -E '\.sql$' | sed 's:.*/::' | sort) |
-            grep -E '^V[0-9]+__' | sed -E 's/^V([0-9]+)__.*/\1 &/' | sort -n |
-            awk -v max="$main_max" '
-              $1 <= max { printf "::error::Migration %s is numbered at or below main'\''s newest (V%s); renumber above it\n", $2, max; bad = 1 }
-              END { exit bad }'
-
-  test:
+  server-test:
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     concurrency:
@@ -126,6 +108,8 @@ jobs:
     # runner. Deliberately NOT in deploy's `needs` and not a required
     # check: a broken fork build or a flaky ~1GB pull must never wedge
     # hoglake CD (that failure mode killed the original job).
+    needs: changes
+    if: needs.changes.outputs.server == 'true'
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     concurrency:
@@ -174,7 +158,8 @@ jobs:
     # The deployable image must assemble and BOOT from every PR —
     # build-only checks miss runtime breakage (read-only-rootfs and
     # boot-order findings both got past a build-only gate in review).
-    if: github.event_name == 'pull_request'
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.server == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     services:
@@ -191,7 +176,7 @@ jobs:
         ports:
           - 127.0.0.1:5432:5432
         options: >-
-          --health-cmd "pg_isready -U hoglake" --health-interval 5s
+          --health-cmd "pg_isready -h 127.0.0.1 -U hoglake" --health-interval 5s
           --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -224,10 +209,9 @@ jobs:
           [ "${ok:-}" = "1" ]
 
   deploy:
-    # GATED ON CI: a main push deploys only after both suites pass —
-    # a deliberate deviation from the millpond/duckgres convention of
-    # running CD in parallel with CI (decided 2026-09-11).
-    needs: [test]
+    # Server deployment requires the server suite and both live client suites.
+    # Unrelated changes skip server-checks and this job.
+    needs: [server-checks]
     # Forks must not push images or deployment dispatches.
     if: github.event_name == 'push' && github.repository == 'PostHog/hoglake'
     runs-on: ubuntu-latest

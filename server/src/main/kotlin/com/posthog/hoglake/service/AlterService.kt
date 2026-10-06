@@ -93,13 +93,14 @@ class AlterService(private val jdbi: Jdbi) {
                     TableMetadata.validateProperties(it.properties)
                     TableMetadata.requireFormatUnchanged(t.properties, it.properties)
                 }
-                if (t.fileFormat == com.posthog.hoglake.model.FileFormats.CLICKHOUSE_MERGETREE_PACKED) {
+                if (t.fileFormat != com.posthog.hoglake.model.FileFormats.PARQUET) {
+                    // An allow-list, so an AlterOp added later fails closed on a
+                    // fixed-schema table instead of silently rewriting its columns
+                    // or specs.
                     val unsupported =
                         ops.firstOrNull {
-                            it is AlterOp.AddColumn || it is AlterOp.DropColumn ||
-                                it is AlterOp.RenameColumn || it is AlterOp.PromoteColumn ||
-                                it is AlterOp.SetPartitionSpec || it is AlterOp.SetSortOrder ||
-                                it is AlterOp.SetColumnComment
+                            it !is AlterOp.RenameTable && it !is AlterOp.SetTableComment &&
+                                it !is AlterOp.SetProperties
                         }
                     if (unsupported != null) {
                         throw HoglakeException.Validation(
@@ -268,7 +269,7 @@ class AlterService(private val jdbi: Jdbi) {
         }
         is AlterOp.SetProperties -> {
             TableMetadata.validateProperties(op.properties)
-            state.properties = op.properties.toMap()
+            state.properties = com.posthog.hoglake.model.FileFormats.canonicalProperties(op.properties)
             rewriteMetadata(h, catalogId, tableId, namespaceId, snapshot, state)
         }
     }

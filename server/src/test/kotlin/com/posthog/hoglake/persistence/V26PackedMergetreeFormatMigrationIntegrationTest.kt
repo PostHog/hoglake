@@ -9,10 +9,10 @@ import org.junit.jupiter.api.Tag
 import org.junit.jupiter.api.Test
 
 @Tag("integration")
-class V25PackedMergetreeFormatMigrationIntegrationTest {
+class V26PackedMergetreeFormatMigrationIntegrationTest {
     @Test
     fun `existing parquet rows remain valid and packed rows are admitted`() {
-        PgTestSupport.freshDatabaseAt("24").use { db ->
+        PgTestSupport.freshDatabaseAt("25").use { db ->
             val catalogId =
                 db.jdbi.withHandle<Long, Exception> { h ->
                     h.createQuery(
@@ -94,6 +94,7 @@ class V25PackedMergetreeFormatMigrationIntegrationTest {
                         .bind("catalog", catalogId)
                         .execute()
                 }.isInstanceOf(UnableToExecuteStatementException::class.java)
+                    .hasMessageContaining("hog_table_file_format_check")
 
                 assertThatThrownBy {
                     h.createUpdate(
@@ -107,6 +108,7 @@ class V25PackedMergetreeFormatMigrationIntegrationTest {
                         .bind("catalog", catalogId)
                         .execute()
                 }.isInstanceOf(UnableToExecuteStatementException::class.java)
+                    .hasMessageContaining("hog_data_file_file_format_check")
 
                 assertThat(
                     h.createQuery(
@@ -122,7 +124,7 @@ class V25PackedMergetreeFormatMigrationIntegrationTest {
 
     @Test
     fun `a preexisting use of the reserved property blocks migration`() {
-        PgTestSupport.freshDatabaseAt("24").use { db ->
+        PgTestSupport.freshDatabaseAt("25").use { db ->
             db.jdbi.useHandle<Exception> { h ->
                 val catalogId =
                     h.createQuery(

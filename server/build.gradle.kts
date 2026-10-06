@@ -5,14 +5,14 @@ plugins {
 }
 
 group = "com.posthog.hoglake"
-version = "1.3.9-dev"
+version = "1.3.11-dev"
 
 repositories {
     mavenCentral()
 }
 
 val ktorVersion = "3.5.2"
-val jdbiVersion = "3.54.0"
+val jdbiVersion = "3.55.0"
 // Current stable, looked up on Maven Central rather than recalled (the
 // 11.8.2 this replaced was 16 months old). Anything before ~11.10 warns
 // "PostgreSQL 18.6 is newer than this version of Flyway ... latest
@@ -25,10 +25,10 @@ val jdbiVersion = "3.54.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.7.0"
+val flywayVersion = "13.8.1"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.54.17"
+val awsSdkVersion = "2.55.7"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the
@@ -42,8 +42,8 @@ dependencies {
     implementation("io.ktor:ktor-serialization-jackson:$ktorVersion")
     implementation("io.ktor:ktor-server-status-pages:$ktorVersion")
     implementation("io.ktor:ktor-server-call-logging:$ktorVersion")
-    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.22.2")
-    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.2")
+    implementation("com.fasterxml.jackson.module:jackson-module-kotlin:2.22.3")
+    implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.22.3")
 
     // Persistence
     implementation("org.postgresql:postgresql:42.7.13")
@@ -102,7 +102,7 @@ dependencies {
     implementation("org.roaringbitmap:RoaringBitmap:1.6.23")
 
     // Logging + observability
-    implementation("ch.qos.logback:logback-classic:1.6.3")
+    implementation("ch.qos.logback:logback-classic:1.6.4")
     implementation("io.github.oshai:kotlin-logging-jvm:8.0.4")
     implementation("net.logstash.logback:logstash-logback-encoder:8.1")
     implementation("io.ktor:ktor-server-metrics-micrometer:$ktorVersion")

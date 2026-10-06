@@ -168,6 +168,53 @@ class ApiIntegrationTest {
                 )
             assertThat(commentAlter.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
             assertThat(body(commentAlter)["detail"].asText()).contains("SetColumnComment")
+            // The layout ops are refused even though no hog_column row moves: a
+            // packed table's layout is fixed. Each one separately, so dropping
+            // any single arm of the allow-list reds.
+            for (
+            (op, name) in
+            listOf(
+                """{"op":"set_sort_order","sort_fields":[
+                       {"source_field_id":1,"direction":"asc","null_order":"nulls_last"}]}""" to
+                    "SetSortOrder",
+                """{"op":"set_partition_spec","fields":[
+                       {"source_field_id":1,"transform":"identity"}]}""" to "SetPartitionSpec",
+                """{"op":"rename_column","from":"id","to":"ident"}""" to "RenameColumn",
+                """{"op":"drop_column","name":"id"}""" to "DropColumn",
+            )
+            ) {
+                val refused =
+                    client.postJson(
+                        "/v1/catalogs/packed/namespaces/analytics/tables/events/alter",
+                        """{"ops":[$op]}""",
+                    )
+                assertThat(refused.status).describedAs(op).isEqualTo(HttpStatusCode.UnprocessableEntity)
+                assertThat(body(refused)["detail"].asText()).contains(name)
+            }
+            // The table format is immutable through set_properties. Without the
+            // service check this would succeed as a silent no-op (the format is
+            // derived from hog_table.file_format, not the stored properties).
+            val reformat =
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces/analytics/tables/events/alter",
+                    """{"ops":[{"op":"set_properties","properties":{"write.format.default":"parquet"}}]}""",
+                )
+            assertThat(reformat.status).isEqualTo(HttpStatusCode.UnprocessableEntity)
+            assertThat(body(reformat)["detail"].asText()).contains("immutable")
+            // Metadata-only ops stay allowed, and a read-modify-write of the
+            // properties keeps the (derived) format.
+            val metadata =
+                client.postJson(
+                    "/v1/catalogs/packed/namespaces/analytics/tables/events/alter",
+                    """{"ops":[
+                       {"op":"set_table_comment","comment":"packed events"},
+                       {"op":"set_properties","properties":{
+                          "write.format.default":"CLICKHOUSE-MERGETREE-PACKED","owner":"team"}}]}""",
+                )
+            assertThat(metadata.status).describedAs(metadata.bodyAsText()).isEqualTo(HttpStatusCode.OK)
+            assertThat(body(metadata)["properties"]["write.format.default"].asText())
+                .isEqualTo("clickhouse-mergetree-packed")
+            assertThat(body(metadata)["properties"]["owner"].asText()).isEqualTo("team")
             val tableUuid = body(created)["table_uuid"].asText()
             val truncate =
                 client.post(

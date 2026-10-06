@@ -1737,11 +1737,11 @@ data class RetirementResult(
      */
     val timeouts: Long,
     /**
-     * Tables whose batch selected rows and deleted none, which ends the
-     * run for that table. Structurally impossible on a healthy catalog
-     * — the select and the delete name the same primary keys — so a
-     * nonzero here is a concurrent writer or a broken cascade, and the
-     * point of the counter is that the loop stops rather than spins.
+     * Tables skipped because a batch deleted none of its selected rows
+     * or reached a row belonging to another table. A table-guard failure
+     * rolls back the batch, including its removal-queue inserts. The run
+     * logs the reason and continues with the next table. These failures
+     * require operator repair; the loop does not retry them in this run.
      */
     val skippedTables: Long,
     /**
@@ -1789,6 +1789,170 @@ data class RetirementResult(
      */
     val tablesRemaining: Long,
 )
+
+/**
+ * Why a reindex run did not REINDEX anything although something may have
+ * been over threshold. A small fixed vocabulary, stored as its [wire]
+ * spelling in [ReindexResult.skippedReason].
+ */
+enum class ReindexSkip {
+    /**
+     * A dropped table's rows are eligible for retirement in some catalog
+     * (`RetirementService.ELIGIBLE_PREDICATE`). Retirement is what MAKES
+     * the bloat — 13.9M deleted manifest rows on prod-us — so an index
+     * rebuilt mid-retirement is rebuilt again tomorrow.
+     */
+    RETIREMENT_PENDING,
+
+    /**
+     * Some catalog's latest expiry run left `purge_remaining` at
+     * `ExpiryService.PURGE_REMAINING_CAP`, or was truncated with the count
+     * unknown: a mass below-floor delete is still under way, the same
+     * argument as [RETIREMENT_PENDING]. Routine lag does not count.
+     */
+    PURGE_PENDING,
+
+    /**
+     * A replica holds the migration advisory lock, or Flyway's history
+     * has a failed row. A migration's own `CREATE INDEX CONCURRENTLY` and
+     * a REINDEX CONCURRENTLY wait out each other's snapshots, and a
+     * half-applied migration is an operator's to repair first.
+     */
+    MIGRATION_PENDING,
+
+    /**
+     * `pg_stat_progress_create_index` shows a REINDEX in this database,
+     * or another maintainer holds the reindex single-flight lock. Two
+     * concurrent rebuilds compete for the same I/O and one of them would
+     * queue on the other's table lock for its whole duration.
+     */
+    REINDEX_IN_PROGRESS,
+
+    /**
+     * Another session holds the reindex single-flight lock
+     * (`Locks.REINDEX_LOCK_CLASS`). Not merged into [REINDEX_IN_PROGRESS]
+     * because the two ask for opposite gates: the holder is THIS task's
+     * own rebuild — a second pod configured by mistake, or the orphaned
+     * backend of a pod killed mid-rebuild, which runs on until it ends —
+     * so today's rebuild is already happening, and retrying until 06:00
+     * would rebuild a second index the same day (or the same one again
+     * if the orphan timed out without writing an attempt row). This one
+     * CLOSES the day; [REINDEX_IN_PROGRESS] is retried.
+     */
+    REINDEX_LOCK_HELD,
+
+    /**
+     * Every over-threshold candidate is excluded, and the first of them is
+     * expected to rebuild to more than `ReindexService.MAX_REBUILD_EXPECTED_BYTES`
+     * (16 GiB): its WAL, temp spill and second copy are an operator's call,
+     * off-peak. The row names the index and its `expected_bytes`.
+     */
+    TOO_LARGE,
+
+    /**
+     * Every candidate is excluded, and the first of them failed its newest
+     * rebuild attempt. Retrying daily would repeat the same hour of I/O
+     * and the same failure; the exclusion lasts until that attempt's row
+     * leaves the ledger (7 days) or a human rebuilds it.
+     */
+    LAST_ATTEMPT_FAILED,
+    ;
+
+    val wire: String get() = name.lowercase()
+}
+
+/**
+ * One reindex run's outcome (#268): the daily index-bloat check and at
+ * most one `REINDEX INDEX CONCURRENTLY`.
+ *
+ * The run is INSTANCE-WIDE — an index belongs to the database, not to a
+ * catalog — and the ledger is per-catalog, so the same payload is
+ * recorded once per catalog (`MaintenanceRunStore.recordedAllCatalogs`).
+ *
+ * Nullable fields are ABSENT on the wire when null (the ledger's
+ * serializer drops nulls), so a run that rebuilt nothing carries only
+ * the three counters.
+ */
+data class ReindexResult(
+    /** Valid btree indexes on hog_* tables the estimate looked at. */
+    val checked: Long,
+    /**
+     * Indexes whose estimate crossed the threshold
+     * (`ReindexService.overThreshold`). Counted before the guards, so a
+     * skipped run still says how much was waiting.
+     */
+    val overThreshold: Long,
+    /**
+     * The index rebuilt, whose rebuild failed, or — with `too_large` /
+     * `last_attempt_failed` — the excluded one that would have gone first.
+     * Null otherwise.
+     */
+    val index: String? = null,
+    /** [index]'s table. */
+    val table: String? = null,
+    /**
+     * [index]'s estimated freshly-built size, the figure the
+     * `too_large` cap is compared with. Present whenever [index] is.
+     */
+    val expectedBytes: Long? = null,
+    /** `pg_relation_size` of [index] immediately before the rebuild. */
+    val beforeBytes: Long? = null,
+    /** `pg_relation_size` of [index] after the rebuild; null on a failed one. */
+    val afterBytes: Long? = null,
+    /** Wall clock of the REINDEX statement alone, in ms. */
+    val durationMs: Long? = null,
+    /**
+     * Set when the REINDEX SUCCEEDED but reading the result back (the
+     * post-rebuild estimate, `pg_relation_size`) failed: the row stays
+     * `ok` — the rebuild happened, and a failed row would exclude the
+     * index tomorrow — with [afterBytes] null and this error text. Not the
+     * row's `error`: the ledger's CHECK ties `error` to `status =
+     * 'failed'`.
+     */
+    val postStepError: String? = null,
+    /**
+     * Candidates over threshold that this run passed over (too large, or
+     * last attempt failed) on its way to the one it rebuilt. Set only on
+     * a run that rebuilt something; an over-cap index is otherwise
+     * invisible in the ledger while a smaller one keeps being rebuilt.
+     */
+    val excluded: Long? = null,
+    /** One of [ReindexSkip]'s wire values, or null when no guard fired. */
+    val skippedReason: String? = null,
+    /**
+     * Invalid `*_ccnew` / `*_ccold` leftovers of a failed REINDEX
+     * CONCURRENTLY dropped before the run. Each one is maintained on
+     * every write to its table and read by nothing.
+     */
+    val invalidDropped: Long = 0,
+)
+
+/**
+ * One btree index's bloat estimate, from `ReindexService.ESTIMATE_SQL`
+ * (the check_postgres / ioguix pg_stats arithmetic).
+ *
+ * [expectedBytes] is null when the estimate cannot be made — a column of
+ * the index has no `pg_stats` row (never analyzed), or the index's
+ * `reltuples` is -1 (never vacuumed). A missing column width would
+ * otherwise shrink the expected size and INFLATE the bloat, which is the
+ * direction that triggers a rebuild.
+ */
+data class IndexBloatEstimate(
+    val table: String,
+    val index: String,
+    /** `relpages x block_size`: the size the estimate's `reltuples` is consistent with. */
+    val sizeBytes: Long,
+    val expectedBytes: Long?,
+    val constraintBacking: Boolean,
+) {
+    /** Bytes beyond the freshly-built size; never negative. */
+    val excessBytes: Long?
+        get() = expectedBytes?.let { maxOf(0L, sizeBytes - it) }
+
+    /** Actual over expected; 1.0 is a freshly built index. */
+    val ratio: Double?
+        get() = expectedBytes?.takeIf { it > 0 }?.let { sizeBytes.toDouble() / it }
+}
 
 // ---- the maintenance run ledger (hog_maintenance_run) ---------------------
 
@@ -1846,6 +2010,14 @@ enum class MaintenanceTask(
     // to be distinguishable from a catalog nobody is sweeping, and only
     // a row per sweep can do that.
     RETIREMENT(hasLoop = true, loopRecordsEverySweep = true),
+
+    // The daily index-bloat check (#268). Its loop POLLS on
+    // HOGLAKE_REINDEX_INTERVAL_MS and records only when the 03:00 UTC
+    // run is due, so the polls are not recorded — but every RUN is, and
+    // the gap between runs is the cadence an operator wants to read
+    // (~24 h). True, because silence here does mean nothing is running
+    // the task.
+    REINDEX(hasLoop = true, loopRecordsEverySweep = true),
     ;
 
     val wire: String get() = name.lowercase()
@@ -1954,6 +2126,15 @@ sealed interface MaintenanceBacklog {
      * #261 removed it.
      */
     data object RetirementBacklog : MaintenanceBacklog
+
+    /**
+     * No backlog number either, for the opposite reason: the honest one
+     * — indexes over the bloat threshold — is a cheap catalog read, but
+     * it is a property of the DATABASE, not of this catalog, and the
+     * health page (`GET /v1/database/health`, `indexes[].estimated_bloat_*`
+     * and the `index_bloat` finding) is where it lives.
+     */
+    data object ReindexBacklog : MaintenanceBacklog
 }
 
 /**

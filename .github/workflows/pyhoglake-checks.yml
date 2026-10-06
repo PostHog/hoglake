@@ -11,6 +11,9 @@ permissions:
   contents: read
 
 jobs:
+  python-live:
+    uses: ./.github/workflows/python-live.yml
+
   lint:
     name: Lint and type check
     runs-on: ubuntu-latest
@@ -23,14 +26,14 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - run: uv sync --locked
 
       - name: Ruff
         run: |
-          uv run ruff check .
-          uv run ruff format --check .
+          uv run ruff check . ../ci
+          uv run ruff format --check . ../ci
 
       - name: Mypy
         run: uv run mypy
@@ -53,13 +56,13 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - run: uv sync --locked
 
-      # Integration tests skip without a live server (unit/mocked layer).
+      # Live integration runs in python-live; this matrix checks the unit layer.
       - name: Tests
-        run: uv run pytest -q
+        run: uv run pytest -m "not integration" -q
 
   packed-clickhouse:
     name: Packed ClickHouse round trip
@@ -121,7 +124,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
 
       - name: Tag must match the package version
         if: github.ref_type == 'tag'

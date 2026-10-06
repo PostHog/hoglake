@@ -670,7 +670,8 @@ export type MaintenanceTask =
   | "cleanup"
   | "compaction"
   | "verify"
-  | "retirement";
+  | "retirement"
+  | "reindex";
 
 export type MaintenanceTrigger = "loop" | "manual";
 
@@ -966,6 +967,50 @@ export interface RetirementResult {
   tables_remaining: Int64;
 }
 
+/**
+ * Why a reindex run rebuilt nothing although it ran (hoglake.yaml,
+ * ReindexResult.skipped_reason).
+ */
+export type ReindexSkip =
+  | "retirement_pending"
+  | "purge_pending"
+  | "migration_pending"
+  | "reindex_in_progress"
+  | "reindex_lock_held"
+  | "too_large"
+  | "last_attempt_failed";
+
+/**
+ * One run of the daily index-bloat check: every hog_* btree index
+ * estimated, at most one rebuilt with REINDEX INDEX CONCURRENTLY.
+ * Instance-wide, so the same payload is on every catalog's row of a run.
+ * Null fields are ABSENT: a run that rebuilt nothing carries only the three
+ * counters.
+ */
+export interface ReindexResult {
+  checked: Int64;
+  over_threshold: Int64;
+  /**
+   * The index rebuilt, whose rebuild failed, or (too_large /
+   * last_attempt_failed) the excluded one that would have gone first.
+   */
+  index?: string;
+  table?: string;
+  /** The named index's estimated fresh size; present whenever index is. */
+  expected_bytes?: Int64;
+  before_bytes?: Int64;
+  /** Absent on a failed rebuild. */
+  after_bytes?: Int64;
+  duration_ms?: Int64;
+  skipped_reason?: ReindexSkip;
+  /** The rebuild succeeded but reading it back failed (row stays ok). */
+  post_step_error?: string;
+  /** Candidates passed over (too large / last attempt failed) by a run that rebuilt. */
+  excluded?: Int64;
+  /** Invalid leftovers of a failed REINDEX CONCURRENTLY dropped first. */
+  invalid_dropped: Int64;
+}
+
 interface MaintenanceRunBase {
   run_id: Int64;
   /** The catalog the run acted on (the ledger is per-catalog). */
@@ -988,7 +1033,8 @@ export type MaintenanceRun =
   | (MaintenanceRunBase & { task: "compaction"; result: CompactionResult | null })
   // Historical rows only — see MaintenanceTask.
   | (MaintenanceRunBase & { task: "verify"; result: VerifyReport | null })
-  | (MaintenanceRunBase & { task: "retirement"; result: RetirementResult | null });
+  | (MaintenanceRunBase & { task: "retirement"; result: RetirementResult | null })
+  | (MaintenanceRunBase & { task: "reindex"; result: ReindexResult | null });
 
 export interface HydratorBacklog {
   pending_files?: Int64;
@@ -1024,6 +1070,9 @@ export interface CompactionBacklog {
  * same). Read the run ledger's rows_retired / tables_remaining instead.
  */
 export type RetirementBacklog = Record<string, never>;
+
+/** Always empty: index bloat is the database's, reported by /database/health. */
+export type ReindexBacklog = Record<string, never>;
 
 /** Ledger-derived, so fleet-wide — see `loop` below. */
 export interface LoopObservation {
@@ -1065,7 +1114,8 @@ export type MaintenanceTaskStatus =
   | (MaintenanceTaskStatusBase & { task: "expiry"; backlog: ExpiryBacklog })
   | (MaintenanceTaskStatusBase & { task: "cleanup"; backlog: CleanupBacklog })
   | (MaintenanceTaskStatusBase & { task: "compaction"; backlog: CompactionBacklog })
-  | (MaintenanceTaskStatusBase & { task: "retirement"; backlog: RetirementBacklog });
+  | (MaintenanceTaskStatusBase & { task: "retirement"; backlog: RetirementBacklog })
+  | (MaintenanceTaskStatusBase & { task: "reindex"; backlog: ReindexBacklog });
 
 export interface MaintenanceStatus {
   catalog: string;

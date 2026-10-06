@@ -380,12 +380,7 @@ class CatalogService(
             AlterService(
                 jdbi,
             ).installPartitionSpec(h, cat.catalogId, tableId, alloc.snapshotId, cols, partitionFields)
-        val effectiveProperties =
-            if (format != FileFormats.PARQUET) {
-                properties + (FileFormats.TABLE_PROPERTY to format)
-            } else {
-                properties - FileFormats.TABLE_PROPERTY
-            }
+        val effectiveProperties = FileFormats.canonicalProperties(properties)
         return TableInfo(
             tableId = tableId,
             tableUuid = createdUuid,
