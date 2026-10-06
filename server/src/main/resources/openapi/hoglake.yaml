@@ -3033,6 +3033,8 @@ components:
             requires native Parquet VARIANT(1), with its field ID on the group.
             VARIANT has no whole-column statistics and cannot be a partition or
             sort source. Scalar compaction skips tables containing VARIANT.
+            A top-level VARIANT may declare the shredded layout of the files
+            written to it in `type_params.shredding`.
 
             Stats bounds for a column are stored — and returned — in the
             Iceberg single-value binary serialization of the MAPPED
@@ -3073,6 +3075,47 @@ components:
         type_params:
           type: object
           additionalProperties: true
+          description: >
+            A scalar type's parameters. A container (list, struct, map)
+            has none, and sending any, even `{}`, is a 422. `decimal`
+            takes `precision` (1 to 38) and `scale` (0 to the precision).
+
+            A TOP-LEVEL `variant` takes `shredding`, the shredded layout
+            that a writer which shreds VARIANT values (the Trino
+            connector) gives the column in its Parquet files: which
+            object fields and array elements get Parquet columns of
+            their own, and the Variant type of each. Readers use the
+            layout each file's footer records, so a declaration never
+            changes a read, and files written before it or without it
+            stay as they are. A declaration is a tree of JSON objects,
+            each with a `type`: `object`, with a non-empty `fields`
+            list, each field naming a variant key in `name` that no
+            other field of the object has, compared case-insensitively;
+            `array`, with an `element`; `variant`, shredded without a
+            type into a value column of its own; or a Variant primitive
+            type of the Parquet shredding specification: boolean, int8,
+            int16, int32, int64, float, double, date, time, timestamp,
+            timestamp_ns, timestamptz, timestamptz_ns, binary, string,
+            uuid, or decimal4, decimal8 or decimal16 with an integer
+            `precision` (at most 9, 18 and 38) and an integer `scale` (0
+            to the precision). A node has no other keys, objects and
+            arrays nest at most 16 deep, and a declaration has at most
+            1000 fields. For example, `{"shredding": {"type": "object",
+            "fields": [{"name": "$browser", "type": "string"}, {"name":
+            "price", "type": "decimal8", "precision": 18, "scale": 2}]}}`.
+            `"shredding": null` declares nothing. A declaration is fixed
+            when its column is defined: no alter op changes it, so a
+            different layout is a new column.
+
+            Each of these is a 422 naming the column, and inside a
+            declaration the path of the node at fault (`$.price`,
+            `$.tags[*]`): a declaration that breaks a rule above; a
+            declaration on a variant nested in a struct, list or map,
+            whose shredded values no writer can produce; a `shredding`
+            key on a column of another type; and any other key on a
+            variant. A two-phase creation prepared before these checks
+            existed is re-checked when it is published, and becomes
+            `rejected` with reason `definition_invalid`.
         nullable: { type: boolean, default: true }
         children:
           type: array

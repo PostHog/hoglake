@@ -283,7 +283,8 @@ this change does not make those clients capable of reading them.
 
 Trino writes ARRAY/MAP/named ROW with IDs on every catalog node, required map keys,
 and preserved nested nullability. It writes signed narrow integers, nanosecond
-timestamps within int64 range, and unshredded native VARIANT. Existing unsigned
+timestamps within int64 range, and native VARIANT, shredded as a column's
+`type_params.shredding` declares (below). Existing unsigned
 columns use wider signed SQL types or DECIMAL(20,0) for uint64, while preserving
 native physical encodings. uint64 retains the documented Iceberg-facade file
 limitation; Trino's native connector converts the unsigned bits explicitly.
@@ -358,6 +359,34 @@ Existing no-metadata receipts retain their earlier encodings. Python, DuckDB,
 hedgerow and console consumers can ignore the additive response fields; this change
 does not add metadata editing to their UIs or synthesize Iceberg properties.
 
+
+### Shredded VARIANT declarations
+
+A top-level `variant` column may declare in `type_params.shredding` the shredded
+layout the connector gives it in the files it writes: which object fields and
+array elements get Parquet columns of their own, and the Variant type of each
+(`ColumnDef.type_params` in the spec has the grammar). Reads use each file's own
+layout, so a declaration changes no read and no file already written.
+
+The server checks a declaration wherever a column is defined: table creation,
+`add_column`, and two-phase creation, whose receipt is checked again when it is
+published (one stored by an older replica becomes `rejected` with
+`definition_invalid`). The rules are the connector's own
+(`HoglakeVariantShredding`), which it still checks on every write, so a
+declaration it cannot write is a 422 when it is declared instead of a failure of
+every later INSERT. A declaration on a variant nested in a struct, list or map is
+refused, since the connector shreds only top-level columns, and so is a
+`shredding` key on a column of another type or any other key on a variant.
+Declarations come only from the REST API: Trino SQL DDL sends no `type_params`
+for a variant. A declaration is fixed when its column is defined; no alter op
+changes it, so a different layout is a new column.
+
+Python sends no `type_params` for a variant, and reads a stored declaration as an
+ordinary `type_params` map; the console does not show `type_params`. DuckDB
+clients refuse VARIANT at bind (#87) and read only decimal parameters. Hedgerow
+compares `type_params` exactly, so it refuses a destination variant that has a
+declaration as a schema mismatch; it writes through DuckDB, which honours no
+declaration. Compaction still skips every table with a VARIANT column (#70).
 
 ### Reclaiming abandoned Trino uploads
 

@@ -1,0 +1,4 @@
+{"type":"object","fields":[{"name":"$browser","type":"string"},
+                       {"name":"price","type":"decimal8","precision":18,"scale":2},
+                       {"name":"tags","type":"array","element":{"type":"string"}},
+                       {"name":"payload","type":"variant"}]}
