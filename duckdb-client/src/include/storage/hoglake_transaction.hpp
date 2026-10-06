@@ -50,7 +50,7 @@ public:
 	//! shipped as ONE CommitRequest at COMMIT (multi-statement,
 	//! multi-table atomicity comes from the wire contract).
 	void AddAppend(const string &ns, const string &table, const string &expected_table_uuid,
-	               vector<HoglakeFileRegistration> files);
+	               idx_t read_snapshot, vector<HoglakeFileRegistration> files);
 	//! Buffer superseding deletion vectors (puffin files already
 	//! uploaded). Registrations REPLACE any earlier buffered
 	//! registration for the same data_file_id — a statement's DV must
@@ -109,6 +109,7 @@ private:
 	case_insensitive_map_t<vector<string>> ambiguous_schemas;
 	//! buffered appends, one entry per (namespace, table)
 	vector<HoglakeTableAppend> buffered_appends;
+	optional_idx append_read_snapshot;
 	//! buffered deletes, one entry per (namespace, table); at most one
 	//! file registration per data_file_id
 	vector<HoglakeTableDeletes> buffered_deletes;
