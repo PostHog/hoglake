@@ -24,7 +24,7 @@ Server behaviors OBSERVED on 2026-09-05 and pinned here:
   historical name works at its own snapshot; the current name 404s
   there); at_timestamp before earliest -> 410; after head -> head.
 * read_snapshot=0 against a table with post-creation DDL -> 409
-  commit_conflict (retryable).
+  ddl_since_read_snapshot (prepare a new request).
 """
 
 import threading
@@ -36,7 +36,7 @@ import pytest
 from conftest import S3_ACCESS_KEY, S3_ENDPOINT, S3_SECRET_KEY
 
 from pyhoglake import (
-    CommitConflictError,
+    DdlSinceReadSnapshotError,
     ExpiredError,
     HoglakeClient,
     HoglakeError,
@@ -249,12 +249,12 @@ def test_zero_row_append_zero_width_rowid_range(catalog, ns):
     )
     r0 = t.append(empty)
     assert r0.snapshot_id > 0
-    (f0,) = t.files()
+    (f0,) = t.files(snapshot=r0.snapshot_id)
     assert f0.record_count == 0
     assert f0.row_id_start == 0  # zero-width range at 0
 
-    t.append(_rows(1, 2, 3, 4, 5))
-    files = sorted(t.files(), key=lambda f: f.data_file_id)
+    r1 = t.append(_rows(1, 2, 3, 4, 5))
+    files = sorted(t.files(snapshot=r1.snapshot_id), key=lambda f: f.data_file_id)
     assert [f.record_count for f in files] == [0, 5]
     # adjacent zero-width: the 5-row file starts where the empty one did
     assert files[1].row_id_start == files[0].row_id_start == 0
@@ -319,8 +319,8 @@ def test_duplicate_paths_accepted_within_and_across_commits(catalog, ns):
 
 def test_delete_count_bounds_and_read_snapshot_requirement(catalog, ns):
     t = ns.create_table("dv", _schema())
-    t.append(_rows(1, 2, 3, 4, 5))
-    (df,) = t.files()
+    appended = t.append(_rows(1, 2, 3, 4, 5))
+    (df,) = t.files(snapshot=appended.snapshot_id)
     base = f"s3://{BUCKET}/{RUN_ID}/fab/dv"
 
     def deletes(count, path, read_snapshot=...):
@@ -351,7 +351,7 @@ def test_delete_count_bounds_and_read_snapshot_requirement(catalog, ns):
     # delete_count == record_count is the legal maximum
     res = deletes(5, base + "-eq.puffin")
     assert res.snapshot_id > 0
-    (sf,) = t.scan_plan()
+    (sf,) = t.scan_plan(snapshot=res.snapshot_id)
     assert sf.delete_file is not None
     assert sf.delete_file.delete_count == 5
 
@@ -547,8 +547,8 @@ def test_500_column_table(catalog, ns):
         | {f"c{i:03d}": pa.array([float(i), None]) for i in range(499)},
         schema=schema,
     )
-    t.append(data)
-    (f,) = t.files()
+    result = t.append(data)
+    (f,) = t.files(snapshot=result.snapshot_id)
     assert f.record_count == 2
     assert f.stats_state == "provided"
     assert _info_at_head(catalog, ns.table("wide")).record_count == 2
@@ -659,10 +659,15 @@ def test_read_snapshot_zero_after_heavy_ddl_conflicts(catalog, ns):
     t.alter([ops.rename_column("extra", "extra2")])
     t.alter([ops.drop_column("extra2")])
 
-    with pytest.raises(CommitConflictError) as ei:
+    head_before = catalog.refresh().head_snapshot_id
+    with pytest.raises(DdlSinceReadSnapshotError) as ei:
         t.append(_rows(2), read_snapshot=0)
-    assert ei.value.retryable is True
-    # the retry contract works: refresh and go again
+    assert ei.value.retryable is False
+    assert ei.value.re_prepare is True
+    assert ei.value.read_snapshot == 0
+    assert ei.value.tables == ("ns1.ddl_heavy",)
+    assert catalog.refresh().head_snapshot_id == head_before
+    # Prepare a new append at the current snapshot; the old request cannot succeed.
     res = t.append(_rows(2), read_snapshot=catalog.refresh().head_snapshot_id)
     assert res.snapshot_id > 0
     assert _info_at_head(catalog, t).record_count == 2
