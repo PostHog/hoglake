@@ -19,9 +19,11 @@ import com.posthog.hoglake.api.parsePartitionFilter
 import com.posthog.hoglake.api.parseScanRequest
 import com.posthog.hoglake.api.parseScanStatsRequest
 import com.posthog.hoglake.commit.commitFingerprint
+import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.HoglakeException
 import com.posthog.hoglake.model.SplitOffsets
 import com.posthog.hoglake.model.validateSplitOffsets
+import com.posthog.hoglake.service.ColumnTrees
 import com.posthog.hoglake.service.TableCreationDefinition
 import com.posthog.hoglake.service.TableCreationDefinitionCodec
 import com.posthog.hoglake.wireObjectMapper
@@ -238,6 +240,9 @@ class WireDtoParseFuzzTest {
                     val encoded = TableCreationDefinitionCodec.encode(definition)
                     check(TableCreationDefinitionCodec.decode(encoded) == definition)
                 }
+                // The column rules every DDL path runs, a variant's
+                // type_params.shredding included: refusals only.
+                ColumnTrees.validate(definition.columns)
             } catch (e: Exception) {
                 checkAllowed("PrepareTableCreationDto", e)
             }
@@ -245,7 +250,15 @@ class WireDtoParseFuzzTest {
 
         parseOrNull { mapper.readValue<AlterTableRequestDto>(data) }?.let { dto ->
             try {
-                dto.ops.forEach { it.toModel() }
+                dto.ops.forEach { op ->
+                    val model = op.toModel()
+                    if (model is AlterOp.AddColumn) {
+                        ColumnTrees.validate(
+                            listOf(model.def),
+                            depthOffset = if (model.parent == null) 0 else 1,
+                        )
+                    }
+                }
             } catch (e: Exception) {
                 checkAllowed("AlterTableRequestDto", e)
             }

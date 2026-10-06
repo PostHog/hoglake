@@ -275,6 +275,7 @@ val fuzzSoakTargets =
         "WireDtoParseFuzzTest",
         "TableCreationDefinitionCodecFuzzTest",
         "CommitReceiptFuzzTest",
+        "VariantShreddingFuzzTest",
     )
 
 val fuzzSweepTargets =
