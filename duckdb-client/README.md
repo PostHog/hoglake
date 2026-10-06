@@ -85,9 +85,17 @@ conditional fixture gate accordingly owns its own `.test` file.
 
 Needs the dev stack (`just server compose-up && just server run`) plus
 a pyhoglake checkout (`PYHOGLAKE_DIR`, default `~/src/hoglake/pyhoglake`)
-for the fixtures. `make test` alone runs the sqllogictests, which
-**skip cleanly without `HOGLAKE_URL`** — so a green `make test` with no
-server up is not a verification of anything. Say which you ran.
+for the fixtures. Configure the test server with
+`HOGLAKE_COMPACTION_MIN_INPUT_FILES=2` so the two-file points fixture
+can compact. `run-live-tests.sh` runs the sqllogictests through a proxy
+that supplies malformed metadata for the wire-hardening cases. Direct
+`make test` against the valid server fixtures cannot pass those cases,
+and **skips cleanly without `HOGLAKE_URL`**.
+
+For sqllogictests, the proxy waits up to 15 seconds for live files to
+hydrate before forwarding ALTER. These tests require verified parquet
+field IDs; a missing hydrator fails the run. The append guard race tests
+run without that wait.
 
 The suite creates disposable `duckext-*` catalogs in a `duckext-itest`
 bucket, and its files are idempotent: repeat runs without re-running
@@ -98,3 +106,9 @@ the test reads the `_hog_row_id` carrier), extension-written and
 pyhoglake-written partition values land in byte-identical partition
 strings, and both directions of the reserved-field-id contract refuse
 typed instead of killing the instance.
+
+The harness also runs append guard regressions through an HTTP proxy.
+They cover DDL between file preparation and commit, table recreation,
+eager DDL, multi-table atomicity, and retries that preserve the request.
+Run against a server with `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS=true`
+to verify that partitioned INSERTs satisfy the strict server setting.

@@ -134,13 +134,22 @@ Writes buffer in the transaction: INSERTs write parquet immediately
 (data plane), and file registrations accumulate. On DuckDB COMMIT, one
 `POST /catalogs/{c}/commit` ships every buffered `TableAppend` +
 `TableDeletes` — multi-statement, multi-table atomicity comes from the
-wire contract itself (one CommitRequest = one snapshot). Append-only
-commits are blind (no `read_snapshot`); commits with deletes carry
-`read_snapshot = pinned`. A 409 on an append-only commit retries with
-backoff; a 409 with deletes is NOT auto-retried (the superseded
-deletion vectors would have to be rebuilt against the new state — the
-statement must be re-run), and the "table was recreated" refusal never
-retries. ROLLBACK drops the registrations; uploaded parquet/puffin is
+wire contract itself (one CommitRequest = one snapshot). Every append
+retains the snapshot of the table entry used to encode its files.
+The commit sends the earliest preparation snapshot as `read_snapshot`;
+when deletes are present, it also includes the transaction pin in that
+minimum. It never refreshes head at commit or advances the snapshot
+during a retry. This guards schema and partition-spec changes even when
+the server refuses blind partitioned appends.
+
+`409 ddl_since_read_snapshot` and `409 table_recreated` require a new
+transaction and a fresh INSERT; replaying prepared files cannot resolve
+them. Other 409s also stop unless the server names `commit_conflict`
+on an append-only request. That conflict and 503 backpressure retry with
+backoff, using the same request. A 409 with deletes never retries: the
+deletion vectors must be rebuilt. Long transactions can also fail with
+410 when the preparation snapshot expires. ROLLBACK drops the
+registrations; uploaded parquet/puffin is
 orphaned (cleanup's problem, never the catalog's — the pyhoglake
 position).
 
@@ -186,14 +195,19 @@ finding 3). Two rules keep this honest instead of quietly broken:
    transaction's own alter. DDL on OTHER tables stays allowed — the
    server's conflict check is table-scoped.
 1b. **The mirror order is refused too.** The server's conflict check
-   runs iff the commit carries deletes and scans
+   runs whenever the commit carries `read_snapshot` and scans
    `table_dropped`/`table_altered` changes after `read_snapshot` over
    every touched table (appends and deletes alike). So after an eager
    ALTER on table x in this transaction: DELETE/UPDATE on x is
    refused; DELETE/UPDATE anywhere is refused while buffered appends
    target x; INSERT into x is refused while buffered deletes exist.
-   ALTER x; INSERT x; COMMIT stays legal (append-only commits are
-   blind). `table_created` is NOT conflict-scanned, so tables created
+   ALTER x; INSERT x; COMMIT stays legal when all append targets were
+   prepared after that ALTER: x uses its post-DDL entry snapshot. Mixing
+   that append with an older preparation on another table can fail
+   conservatively against the eager ALTER. A single request has one
+   conflict window, so moving it forward would hide DDL on the older
+   target. Start a new transaction and rerun the inserts in that case.
+   `table_created` is NOT conflict-scanned, so tables created
    in the transaction are freely writable.
 2. **Tables created or altered inside the transaction read at the
    post-DDL snapshot**, not the (older) transaction pin: their entry
@@ -525,9 +539,7 @@ See [PARITY.md](PARITY.md) for the per-capability checklist
    compaction starved). As of 2026-09-12 the stack hydrates and
    compacts again; the fixture force-compacts `points` and the
    suite reads real compaction output (explicit `_hog_row_id`).
-12. Partitioned INSERT sends no `read_snapshot`, so its commits are
-   exactly the blind-partitioned-append shape
-   `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS` will 422 once the server
-   flag flips. `storage/hoglake_transaction.cpp` and
-   `storage/hoglake_insert.cpp` must start carrying one first
-   (hoglake#236).
+12. Resolved (hoglake#236): INSERT carries the table preparation snapshot,
+   including partitioned INSERT under
+   `HOGLAKE_REFUSE_BLIND_PARTITIONED_APPENDS`. DDL and recreation
+   conflicts require fresh preparation rather than retries of stale files.

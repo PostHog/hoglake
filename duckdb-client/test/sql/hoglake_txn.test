@@ -308,8 +308,8 @@ DELETE FROM lake.ns1.ryo_txn_a WHERE a = 11
 statement ok
 ROLLBACK
 
-# ALTER then INSERT (no deletes anywhere) commits fine: append-only
-# commits are blind and never conflict-checked
+# ALTER then INSERT (no deletes anywhere) commits using the table's
+# post-DDL preparation snapshot
 statement ok
 BEGIN
 
