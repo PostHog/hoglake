@@ -3797,32 +3797,57 @@ class CompactionService(
             // here. hog_table_stats is untouched (gross append counters;
             // visible-file aggregates shrink only by the rows the DVs
             // already masked).
-            h.createUpdate(
-                """
-                UPDATE hog_data_file SET end_snapshot = :snapshotId
-                WHERE catalog_id = :catalogId AND data_file_id IN (<ids>)
-                """,
-            )
-                .bind("snapshotId", snapshotId)
-                .bind("catalogId", ctx.catalogId)
-                .bindList("ids", ids)
-                .execute()
+            //
+            // `table_id = :tableId` on both updates is a guard (#264), and
+            // a CHECKED one. The liveState re-verify above, in this same
+            // transaction under this same lock, already filtered every id
+            // on `table_id` and bailed on any that was missing, so the
+            // predicate matches every row the id set does — today. The
+            // check is for the day it does not (an identity that is no
+            // longer `(catalog_id, data_file_id)` alone, a DV whose
+            // `table_id` disagrees with its file's): an UPDATE that ended
+            // fewer rows than it was given would otherwise commit the
+            // output LIVE beside a still-live input, serving its rows
+            // twice with nothing logged. Failing here rolls the group
+            // back into the one-failed-group path instead.
+            val ended =
+                h.createUpdate(
+                    """
+                    UPDATE hog_data_file SET end_snapshot = :snapshotId
+                    WHERE catalog_id = :catalogId AND table_id = :tableId AND data_file_id IN (<ids>)
+                    """,
+                )
+                    .bind("snapshotId", snapshotId)
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("tableId", ctx.tableId)
+                    .bindList("ids", ids)
+                    .execute()
+            check(ended == ids.size) {
+                "end-snapshotted $ended of ${ids.size} inputs of ${ctx.namespace}.${ctx.table}; " +
+                    "refusing to commit the group"
+            }
 
             // The applied DVs die with their files: end-snapshot them so
             // scans at older snapshots still mask, and expiry queues the
             // puffin paths alongside the input parquets.
             val dvIds = group.files.mapNotNull { it.dv?.deleteFileId }
             if (dvIds.isNotEmpty()) {
-                h.createUpdate(
-                    """
-                    UPDATE hog_delete_file SET end_snapshot = :snapshotId
-                    WHERE catalog_id = :catalogId AND delete_file_id IN (<ids>)
-                    """,
-                )
-                    .bind("snapshotId", snapshotId)
-                    .bind("catalogId", ctx.catalogId)
-                    .bindList("ids", dvIds)
-                    .execute()
+                val endedDvs =
+                    h.createUpdate(
+                        """
+                        UPDATE hog_delete_file SET end_snapshot = :snapshotId
+                        WHERE catalog_id = :catalogId AND table_id = :tableId AND delete_file_id IN (<ids>)
+                        """,
+                    )
+                        .bind("snapshotId", snapshotId)
+                        .bind("catalogId", ctx.catalogId)
+                        .bind("tableId", ctx.tableId)
+                        .bindList("ids", dvIds)
+                        .execute()
+                check(endedDvs == dvIds.size) {
+                    "end-snapshotted $endedDvs of ${dvIds.size} deletion vectors of " +
+                        "${ctx.namespace}.${ctx.table}; refusing to commit the group"
+                }
             }
 
             // Settle the staging ticket in the SAME transaction that makes
