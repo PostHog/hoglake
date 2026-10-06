@@ -510,12 +510,24 @@ export interface DatabaseIndex {
 
 export type FindingSeverity = "info" | "warn" | "critical";
 
+export type ResolutionKind = "maintenance" | "operator" | "watch";
+
+/** What happens next about a finding, and by whom. */
+export interface FindingResolution {
+  kind: ResolutionKind;
+  /** The maintenance task's wire name when `kind` is `maintenance`. */
+  task?: string;
+  text: string;
+}
+
 export interface DatabaseFinding {
   severity: FindingSeverity;
   code: string;
   title: string;
   detail: string;
   hoglake_impact: string;
+  /** Absent from a server that predates it; the console renders the finding without. */
+  resolution?: FindingResolution;
 }
 
 export interface DatabaseHealth {
