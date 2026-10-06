@@ -965,6 +965,107 @@ button.ghost:hover:not(:disabled) {
 .metrics-fetched-at {
   padding-bottom: 7px;
 }
+.metrics-pinned {
+  padding-bottom: 12px;
+  margin-bottom: 20px;
+  border-bottom: 1px dashed var(--border);
+}
+/* Pin: the same quiet look as theme-toggle, lit when set. */
+button.pin-toggle {
+  margin-left: auto;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  font-weight: 400;
+  border-radius: 4px;
+  padding: 0 6px;
+  line-height: 1.4;
+}
+button.pin-toggle:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+button.pin-toggle.pinned {
+  color: var(--warn);
+}
+.series-disclosure {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+button.hbars-more {
+  align-self: flex-start;
+  margin-top: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 12px;
+  border-radius: 4px;
+  padding: 1px 8px;
+}
+button.hbars-more:hover {
+  color: var(--text);
+  border-color: var(--text-dim);
+}
+.card-actions {
+  margin-left: auto;
+  display: inline-flex;
+  gap: 4px;
+}
+.card-actions button.pin-toggle {
+  margin-left: 0;
+}
+/* One family, full viewport: fixed over the page, scrolls on its own. */
+.metric-focus {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  background: var(--bg);
+  padding: 12px 24px 24px;
+  overflow: auto;
+}
+.metric-focus .metric-family {
+  margin: 0;
+}
+.metric-focus .stat-tile {
+  display: block;
+  min-width: 0;
+  margin-right: 0;
+}
+.metric-focus .stat-tile .metric-history {
+  min-width: 0;
+}
+.metric-focus-bar {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.stat-tile-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+/* The uPlot host: full width of the card; the axis text takes the theme. */
+.metric-history {
+  margin: 6px 0 10px;
+}
+.metric-history-note {
+  margin: 2px 0 0;
+  font-size: 11px;
+}
+.timeseries .u-legend {
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.timeseries .u-legend .u-series > * {
+  padding: 2px 6px;
+}
+.stat-tile .metric-history {
+  min-width: 320px;
+}
 
 /* Stat tile: a scalar family's single value, big. */
 .stat-tile {

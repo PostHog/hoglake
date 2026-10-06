@@ -1731,11 +1731,11 @@ data class RetirementResult(
      */
     val timeouts: Long,
     /**
-     * Tables whose batch selected rows and deleted none, which ends the
-     * run for that table. Structurally impossible on a healthy catalog
-     * — the select and the delete name the same primary keys — so a
-     * nonzero here is a concurrent writer or a broken cascade, and the
-     * point of the counter is that the loop stops rather than spins.
+     * Tables skipped because a batch deleted none of its selected rows
+     * or reached a row belonging to another table. A table-guard failure
+     * rolls back the batch, including its removal-queue inserts. The run
+     * logs the reason and continues with the next table. These failures
+     * require operator repair; the loop does not retry them in this run.
      */
     val skippedTables: Long,
     /**
