@@ -1,6 +1,6 @@
 package com.posthog.hoglake.hydrator
 
-import org.apache.parquet.hadoop.ParquetFileReader
+import com.posthog.hoglake.ParquetReaders
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.InputFile
 import java.io.IOException
@@ -43,7 +43,7 @@ class FooterParseException(message: String, cause: Throwable) : IOException(mess
 object FooterParse {
     fun parse(input: InputFile): ParquetMetadata =
         try {
-            ParquetFileReader.open(input).use { it.footer }
+            ParquetReaders.open(input).use { it.footer }
         } catch (e: IOException) {
             throw e
         } catch (e: RuntimeException) {
