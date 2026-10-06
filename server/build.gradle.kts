@@ -25,10 +25,10 @@ val jdbiVersion = "3.55.0"
 // the transactional lock through the typed configuration extension. See
 // the comment there — losing that setting HANGS every migration rather
 // than failing it.
-val flywayVersion = "13.8.0"
+val flywayVersion = "13.8.1"
 // >= 1.21.1: older versions pin Docker API 1.32, which OrbStack's Docker 29 rejects.
 val testcontainersVersion = "1.21.4"
-val awsSdkVersion = "2.55.6"
+val awsSdkVersion = "2.55.7"
 
 dependencies {
     // Background loops (BackgroundLoops.kt): explicit pin of the

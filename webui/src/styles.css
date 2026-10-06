@@ -1304,6 +1304,25 @@ button.expand-toggle[aria-expanded="true"] .expand-chevron {
   border-top: 1px dotted var(--border);
   padding-top: 6px;
 }
+/* What happens next: the badge says who, the sentence says what. A
+   maintenance-owned finding reads calm (ok), an operator's reads as a
+   to-do (warn), a watch reads like the impact text it follows. */
+.db-finding-resolution {
+  margin: 6px 0 0;
+  font-size: 13px;
+}
+.badge.resolution-maintenance {
+  color: var(--ok);
+  border-color: var(--ok);
+}
+.badge.resolution-operator {
+  color: var(--warn);
+  border-color: var(--warn);
+}
+.badge.resolution-watch {
+  color: var(--text-dim);
+  border-color: var(--text-dim);
+}
 .severity-info {
   color: var(--text-dim);
   border-color: var(--text-dim);

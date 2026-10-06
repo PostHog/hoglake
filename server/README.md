@@ -1661,9 +1661,16 @@ transaction (`observability/`):
   paths, identifiers, author strings) and only durations and counts may
   cross the wire. Each finding is a `severity` (`INFO`, `WARN` or
   `CRITICAL`, sorted worst-first) plus a stable `code`, a `detail` of
-  what was measured and a `hoglake_impact` saying why it matters HERE —
+  what was measured, a `hoglake_impact` saying why it matters HERE —
   the second half is the reason this endpoint exists rather than a link
-  to a generic Postgres dashboard. The CRITICAL-capable codes are
+  to a generic Postgres dashboard — and a `resolution` saying what
+  happens next and by whom: `kind` is `maintenance` (one of hoglake's
+  own loops closes it on its schedule, and `task` names it, e.g.
+  `reindex` for bloated indexes while that loop has recorded a run in
+  the last two days), `operator` (nothing in hoglake will; `text` says
+  what to do) or `watch` (no action; `text` says what would change
+  that). A finding's kind can follow its severity: `xid_wraparound` and
+  `dead_tuples` are a watch at WARN and an operator's at CRITICAL. The CRITICAL-capable codes are
   `invalid_indexes`, `inactive_replication_slot`,
   `prepared_transactions`, `commit_lock_held`, `autovacuum_disabled`,
   `xid_wraparound` and `idle_in_transaction` (which escalates from WARN
