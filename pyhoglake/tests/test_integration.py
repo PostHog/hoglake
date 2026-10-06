@@ -152,7 +152,11 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
     )
     assert res.snapshot_id > head_before
 
-    files = table.files()
+    # The create handle still reads its DDL snapshot. Select the append
+    # receipt to verify the newly published data.
+    assert table.files() == []
+    assert table.scan_plan() == []
+    files = table.files(snapshot=res.snapshot_id)
     assert len(files) == 1
     f = files[0]
     assert f.record_count == 1000
@@ -178,9 +182,12 @@ def test_append_lifecycle_roundtrip(client, catalog, ns, s3config):
         assert f"field_id={fid}" in str(pf.schema)
 
     # scan plan: no deletion vectors in an append-only table
-    plan = table.scan_plan()
+    plan = table.scan_plan(snapshot=res.snapshot_id)
     assert len(plan) == 1
     assert plan[0].delete_file is None
+    assert plan[0].data_file.path == f.path
+    # A handle resolved by name has no DDL pin and reads the current head.
+    assert [item.path for item in ns.table(table.name).files()] == [f.path]
 
     # table info aggregates, at head so they are exact (see _info_at_head)
     info = _info_at_head(catalog, table)
@@ -215,7 +222,7 @@ def test_uuid_column_roundtrip_carries_the_parquet_annotation(
     values = [uuid.UUID(int=i) for i in range(4)]
     # The caller hands over plain 16-byte storage: the client's own
     # target schema is what adds the annotation.
-    table.append(
+    appended_result = table.append(
         pa.table(
             {
                 "id": pa.array([1, 2, 3, 4], pa.int64()),
@@ -231,7 +238,7 @@ def test_uuid_column_roundtrip_carries_the_parquet_annotation(
         leaf = parquet.schema.column(parquet.schema.names.index("event_id"))
         return leaf, parquet
 
-    (appended,) = table.files()
+    (appended,) = table.files(snapshot=appended_result.snapshot_id)
     leaf, parquet = uuid_leaf(appended.path)
     assert leaf.physical_type == "FIXED_LEN_BYTE_ARRAY"
     assert leaf.length == 16
@@ -281,45 +288,42 @@ def test_uuid_column_roundtrip_carries_the_parquet_annotation(
     assert parquet.read().column("event_id").to_pylist() == [uuid.UUID(int=9).bytes]
 
 
-def test_deferred_append_hydrates_with_exact_footer_size(catalog, ns, s3config):
-    """Live regression for the footer_size wire convention (bugs.md #7):
-    deferred-stats append -> the hydrator tail-reads the footer with the
-    registered EXACT size -> the file flips to 'provided'.
-
-    footer_size must be the trailer's 4-byte LE thrift length, EXCLUDING
-    the 8-byte length+magic suffix (the convention the server's tail math
-    and compaction's stored value define). Files registered before this
-    fix carried meta_len + 8; the hydrator's tolerant tail read absorbs
-    that over-read, so no data repair is needed for them — this test pins
-    that the NEW exact value works end-to-end against the live server.
-    (Replaces test_deferred_append_stays_pending, whose premise — hydrator
-    loop off on the dev server — does not hold: the server runs the
-    hydrator at its 5s default.)"""
+def test_deferred_append_hydrates_with_exact_footer_size(
+    catalog, ns, s3config, monkeypatch
+):
+    """Deferred registration hydrates from the exact Parquet footer length."""
     table = ns.create_table("deferred", _events_schema())
-    table.append(_events_data(50), deferred_stats=True)
-    (f,) = table.files()
-    assert f.stats_state == "pending"  # no inline stats at commit
-    assert f.record_count == 50  # record_count can never be deferred
+    commit = catalog._commit
+    requests = []
 
-    # the registered footer_size is the exact trailer meta_len
+    def capture_commit(payload, **kwargs):
+        requests.append(payload)
+        return commit(payload, **kwargs)
+
+    # Observe the real request: the background hydrator can complete before
+    # the first read, so a pending state is not a reliable assertion.
+    with monkeypatch.context() as patch:
+        patch.setattr(catalog, "_commit", capture_commit)
+        result = table.append(_events_data(50), deferred_stats=True)
+    assert len(requests) == 1
+    (registration,) = requests[0]["appends"][0]["files"]
+    assert "column_stats" not in registration
+    (f,) = table.files(snapshot=result.snapshot_id)
+    assert f.record_count == 50
+
+    # footer_size excludes the 8-byte length and magic suffix.
     fs = s3config.filesystem()
     raw = fs.open_input_file(f.path[len("s3://") :]).read()
     assert raw[-4:] == b"PAR1"
     (meta_len,) = struct.unpack("<I", raw[-8:-4])
     assert f.footer_size == meta_len
 
-    # the hydrator sweep (5s interval, 100 files/sweep on the dev server)
-    # picks it up and the stats land: 'provided' is flipped in the same
-    # transaction as the per-column stats upserts. Generous deadline: the
-    # qe_live_adversarial suite (which runs first in this session)
-    # fabricates ~1000 pending registrations that drain ahead of this
-    # file at ~100 per 5s sweep.
-    deadline = time.time() + 180
-    while time.time() < deadline:
-        (f,) = table.files()
-        if f.stats_state != "pending":
-            break
-        time.sleep(1.0)
+    # The live runner enables the hydrator. Allow time for the adversarial
+    # suite's pending registrations to drain ahead of this file.
+    deadline = time.monotonic() + 180
+    while f.stats_state == "pending" and time.monotonic() < deadline:
+        time.sleep(0.2)
+        (f,) = table.files(snapshot=result.snapshot_id)
     assert f.stats_state == "provided"
 
 
@@ -405,7 +409,7 @@ def test_nested_lifecycle_roundtrip(catalog, ns, s3config):
     result = table.append(data)
     assert result.snapshot_id > 0
 
-    (f,) = table.files()
+    (f,) = table.files(snapshot=result.snapshot_id)
     assert f.record_count == 4
     assert f.stats_state == "provided"  # inline stats, computed per leaf
 
@@ -460,7 +464,7 @@ def test_changes_correctness(catalog, ns):
     s0 = catalog.refresh().head_snapshot_id
     s1 = table.append(_events_data(10)).snapshot_id
     s2 = table.append(_events_data(10, start=10)).snapshot_id
-    files = table.files()
+    files = table.files(snapshot=s2)
     assert len(files) == 2
     path_by_snapshot = {f.begin_snapshot: f.path for f in files}
 
@@ -496,8 +500,12 @@ def test_alter_add_column_then_append(catalog, ns):
     new_field_id = info.columns[1].field_id
     assert new_field_id > info.columns[0].field_id
 
-    table.append(pa.table({"id": pa.array([3, 4], pa.int64()), "score": [1.5, None]}))
-    files = table.files()
+    result = table.append(
+        pa.table({"id": pa.array([3, 4], pa.int64()), "score": [1.5, None]})
+    )
+    assert table.snapshot_id == info.snapshot_id
+    assert len(table.files()) == 1  # the alter snapshot excludes the later append
+    files = table.files(snapshot=result.snapshot_id)
     assert len(files) == 2
     assert _info_at_head(catalog, table).record_count == 4
 
@@ -693,7 +701,7 @@ def test_partitioned_append_fanout(catalog, ns):
     assert {f.partition_values: f.record_count for f in res.files} == expected
     assert sum(f.record_count for f in res.files) == total
 
-    files = table.files()
+    files = table.files(snapshot=res.snapshot_id)
     assert len(files) == 6
     assert all(f.begin_snapshot == res.snapshot_id for f in files)
     assert all(f.spec_id is not None for f in files)
@@ -701,7 +709,7 @@ def test_partitioned_append_fanout(catalog, ns):
     assert {f.partition_values: f.record_count for f in files} == expected
     assert sum(f.record_count for f in files) == total
 
-    plan = table.scan_plan()
+    plan = table.scan_plan(snapshot=res.snapshot_id)
     assert {
         sf.data_file.partition_values: sf.data_file.record_count for sf in plan
     } == expected
@@ -739,8 +747,8 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
     # HOGLAKE_COMPACTION_MIN_INPUT_FILES=5, so each partition's files
     # are a group the planner will take.
     for _ in range(8):
-        table.append(_part_batch(counts))
-    assert sum(f.record_count for f in table.files()) == 48
+        appended = table.append(_part_batch(counts))
+    assert sum(f.record_count for f in table.files(snapshot=appended.snapshot_id)) == 48
 
     for _ in range(5):
         result = catalog._client._request(
@@ -749,7 +757,7 @@ def test_partitioned_compaction_groups_within_partition(catalog, ns):
         if result["groups_compacted"] == 0:
             break
 
-    files = table.files()
+    files = table.files(snapshot=catalog.refresh().head_snapshot_id)
     by_values: dict[tuple[str | None, ...], list] = {}
     for f in files:
         by_values.setdefault(f.partition_values, []).append(f)

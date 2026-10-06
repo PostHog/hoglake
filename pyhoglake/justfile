@@ -20,8 +20,8 @@ integration:
     {{_uv}} run pytest -m integration
 
 lint:
-    {{_uv}} run ruff check .
-    {{_uv}} run ruff format --check .
+    {{_uv}} run ruff check . ../ci
+    {{_uv}} run ruff format --check . ../ci
     {{_uv}} run mypy
 
 fmt:
