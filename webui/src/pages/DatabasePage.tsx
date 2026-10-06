@@ -4,6 +4,7 @@ import {
   getDatabaseHealth,
   type CommitLockHolder,
   type DatabaseFinding,
+  type FindingResolution,
   type DatabaseIndex,
   type DatabaseTable,
   type ReplicationSlot,
@@ -49,6 +50,26 @@ function Stat({
   );
 }
 
+/**
+ * What happens next, led by who does it: a reader should never have
+ * to work out whether "12 indexes are bloated" is their job or the
+ * reindex task's tomorrow at 03:00.
+ */
+function Resolution({ resolution }: { resolution: FindingResolution }) {
+  // Terse like every other badge on the page; the sentence does the talking.
+  const lead =
+    resolution.kind === "maintenance"
+      ? `${resolution.task ?? "maintenance"} task handles it`
+      : resolution.kind === "operator"
+        ? "operator"
+        : "no action";
+  return (
+    <p className="db-finding-resolution">
+      <span className={`badge resolution-${resolution.kind}`}>{lead}</span> {resolution.text}
+    </p>
+  );
+}
+
 function Findings({ findings }: { findings: DatabaseFinding[] }) {
   if (findings.length === 0) {
     return (
@@ -70,6 +91,8 @@ function Findings({ findings }: { findings: DatabaseFinding[] }) {
           {/* The reason this page exists rather than a link to a generic
               Postgres dashboard: what the number means for this schema. */}
           <p className="db-finding-impact">{f.hoglake_impact}</p>
+          {/* A server from before the field simply has no third part. */}
+          {f.resolution && <Resolution resolution={f.resolution} />}
         </li>
       ))}
     </ul>
