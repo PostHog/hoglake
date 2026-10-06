@@ -227,6 +227,27 @@ is included in the UI build.
 Unset, blank, `default`, and unknown values use the original Hoglake palette.
 The UI also uses that palette if `/v1/info` fails or the server predates this field.
 
+## Metrics page
+
+The Metrics page polls `GET /metrics` on an interval (15 s by default;
+5, 30 and 60 s are offered, and the choice is remembered in the
+browser) and keeps a bounded history per series in memory, for as long
+as the tab is open. Each family draws its history above its snapshot:
+gauges as values, counters as per-second rates, histograms as p50 and
+p99 of each interval's observations, summaries as their quantiles. A
+family with many label sets draws its 12 largest and says how many it
+left out. The snapshot's per-series detail (bars, bucket strips,
+quantiles) sits closed under a "show N series" button, since on a
+large instance a family can carry hundreds of label sets. The window
+is 960 polls (4 h at 15 s). Nothing is stored server-side, and a
+reload starts the history over.
+
+The star on a family pins it: pinned families sit at the top in pin
+order, whatever the filter says, and the pins are remembered in the
+browser. Charts are drawn with [uPlot](https://github.com/leeoniya/uPlot);
+`src/lib/metricsHistory.ts` holds the ring buffers and the rate and
+quantile math, and `test/metricsHistory.test.ts` covers them.
+
 ## Test / build
 
 ```sh
