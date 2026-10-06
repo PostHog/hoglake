@@ -127,6 +127,10 @@ class V23PartitionValueLookupMigrationIntegrationTest {
 
     @BeforeAll
     fun seedThenMigrate() {
+        // The fixture is seeded through today's CatalogService, which reads
+        // hog_table.file_format (V26). Apply that idempotent file out of
+        // order, as V17's test does; `Database.migrate` re-applies it.
+        PgTestSupport.applyMigrationFile(db, "V26__packed_mergetree_format.sql")
         catalogId = createCatalog("v23")
         neighbourId = createCatalog("v23-neighbour")
         seedManifest()
