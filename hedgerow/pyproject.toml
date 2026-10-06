@@ -10,7 +10,7 @@ dependencies = [
     # UUID logical annotation hoglake's uuid wire form requires, and
     # this package reads and filters those columns.
     "pyarrow>=21.0",
-    "duckdb==1.5.5",
+    "duckdb==1.5.6",
     "pyyaml>=6.0",
 ]
 
@@ -27,7 +27,7 @@ dev = [
     "prometheus-client>=0.20",
     # Pinned: see pyhoglake's note — an unpinned ruff resolves a
     # different rule set per machine.
-    "ruff==0.16.7",
+    "ruff==0.16.9",
 ]
 
 [tool.uv.sources]
