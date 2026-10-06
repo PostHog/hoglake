@@ -146,7 +146,11 @@ For durable publication, call `prepare_append`, persist the returned JSON payloa
 idempotency key; replay `commit_prepared` with the persisted payload. Preparation creates one
 MergeTree part in an isolated local directory, refuses any layout except one `data.packed` file,
 claims a fresh `.packed` object
-path from Hoglake, uploads it, and includes Arrow-derived Iceberg bounds in the registration.
+path from Hoglake, uploads it, and registers it with counts only (`column_stats: []`; packed
+files carry no per-column bounds). An `idempotency_key` must be a UUID and is sent in canonical
+form (`str(uuid.UUID(key))`). `append(idempotency_key=...)` is not a retry handle: calling it again
+uploads a second object under a fresh claim, which the server refuses as a different request under
+the same key. Retry through the persisted `prepare_append` payload instead.
 `abandon_prepared` fences a payload that is known not to have committed. Do not abandon after an
 unknown commit outcome; replay the exact payload instead.
 
@@ -155,13 +159,18 @@ isolated local table, enable ClickHouse `table_readonly`, and return an Arrow ta
 or scan an object-storage prefix. The adapter currently supports boolean, signed and unsigned integer,
 float, double, string, binary, date, and second/millisecond/microsecond/nanosecond timestamp columns.
 Date and timestamp values must also fit the configured ClickHouse version's `Date32`/`DateTime64`
-ranges; the adapter does not widen those engine domains. Schemas are fixed. Partition specs, sort
+ranges; the adapter does not widen those engine domains. Column names starting with `_` are
+refused, because a real column shadows a ClickHouse virtual column (`_part`, `_part_offset`, ...)
+that reads depend on for ordering. Schemas are fixed. Partition specs, sort
 orders, deletion vectors, explicit row IDs, packed-part
 compaction, and mixed-format tables are refused. The writer and reader should use the same ClickHouse
 version; no cross-version compatibility or remote-read performance claim is made.
 
-The adapter also bounds each part, part count and total registered bytes in a read, ClickHouse
-memory, result bytes, worker threads, and process time. Constructor arguments can lower or raise those limits for a
+Rows come back in scan-plan order and, within a part, in insertion order. Each part is read and
+sorted on its own, so memory is bounded by the largest part rather than the snapshot. The adapter
+also bounds each part (1 GiB), part count (500) and total registered bytes (2 GiB) in a read,
+ClickHouse memory (4 GiB), result bytes (2 GiB), worker threads, and process time. One append is
+always exactly one part. Constructor arguments can lower or raise those limits for a
 known workload. The ordinary `Table.append` and `prepare_append_*` methods remain Parquet-only and
 reject packed tables before writing an object.
 

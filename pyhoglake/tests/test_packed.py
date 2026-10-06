@@ -19,7 +19,6 @@ from pyhoglake import (
 )
 from pyhoglake.client import Catalog, Namespace, Table
 from pyhoglake.models import Column
-from pyhoglake.packed import _column_stats
 
 BASE = "http://hog.test"
 CATALOG_WIRE = {
@@ -309,7 +308,7 @@ def test_snapshot_part_count_is_bounded_before_download(httpx_mock) -> None:
 
 def test_failed_upload_is_abandoned(httpx_mock) -> None:
     class LocalPartAdapter(ClickHousePackedAdapter):
-        def _run(self, root, sql, *, input_bytes=None):
+        def _run(self, root, sql, *, input_bytes=None, settings=None):
             if sql.startswith("INSERT INTO"):
                 part = root / "part"
                 part.mkdir()
@@ -377,27 +376,9 @@ def test_prepared_payload_is_bound_to_its_table() -> None:
     table._namespace._catalog._client.close()
 
 
-def test_arrow_stats_exclude_nans_and_normalize_signed_zero() -> None:
-    columns = (
-        Column("f", "double", 1, 0, nullable=True),
-        Column("ts", "timestamp_ns", 2, 1, nullable=True),
-    )
-    table = pa.table(
-        {
-            "f": pa.array([float("nan"), -0.0, None], pa.float64()),
-            "ts": pa.array([1234567891, None, 1234567890], pa.timestamp("ns")),
-        }
-    )
-    stats = _column_stats(table, columns)
-    assert stats[0]["value_count"] == 3
-    assert stats[0]["null_count"] == 1
-    assert stats[0]["nan_count"] == 1
-    assert stats[0]["lower_bound"] == "AAAAAAAAAIA="
-    assert stats[0]["upper_bound"] == "AAAAAAAAAAA="
-    assert stats[1]["lower_bound"] == "0gKWSQAAAAA="
-    assert stats[1]["upper_bound"] == "0wKWSQAAAAA="
-
-
+# Integration: needs a real ClickHouse (PYHOGLAKE_CLICKHOUSE); ci/live-python.sh
+# provides the pinned one and fails the run on a skip.
+@pytest.mark.integration
 def test_real_clickhouse_packed_append_and_snapshot_read(httpx_mock) -> None:
     executable = os.environ.get("PYHOGLAKE_CLICKHOUSE")
     if not executable:
@@ -505,6 +486,9 @@ def test_real_clickhouse_packed_append_and_snapshot_read(httpx_mock) -> None:
     table._namespace._catalog._client.close()
 
 
+# Integration: needs a real ClickHouse (PYHOGLAKE_CLICKHOUSE); ci/live-python.sh
+# provides the pinned one and fails the run on a skip.
+@pytest.mark.integration
 def test_real_clickhouse_packed_multi_part_numeric_ordering(httpx_mock) -> None:
     executable = os.environ.get("PYHOGLAKE_CLICKHOUSE")
     if not executable:

@@ -47,6 +47,15 @@ ci_python=(uv run --no-project --with defusedxml==0.7.1 python)
     ./gradlew --no-daemon :installDist -x test -x ktlintCheck --console=plain
 ) 2>&1 | tee "$report_dir/build.log"
 "${compose[@]}" up -d --wait --wait-timeout 90 postgres minio
+# The packed MergeTree tests run real ClickHouse. Pull the pinned image up
+# front so its pull time does not count against the adapter's timeouts.
+clickhouse_image=$(sed -n 's/^image=//p' "$repo_dir/ci/clickhouse-local.sh")
+for ((attempt = 1; attempt <= 3; attempt++)); do
+    docker pull --quiet "$clickhouse_image" && break
+    [[ $attempt -lt 3 ]] || exit 1
+    sleep $((attempt * 5))
+done
+export PYHOGLAKE_CLICKHOUSE="$repo_dir/ci/clickhouse-local.sh"
 
 # The deferred-stats integration test requires the hydrator loop.
 env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
@@ -56,6 +65,7 @@ env HOGLAKE_JDBC_URL="jdbc:postgresql://localhost:$HOGLAKE_PG_PORT/hoglake" \
     HOGLAKE_CLEANUP_INTERVAL_MS=0 HOGLAKE_COMPACTION_INTERVAL_MS=0 \
     HOGLAKE_RETIREMENT_INTERVAL_MS=0 HOGLAKE_REINDEX_INTERVAL_MS=0 \
     HOGLAKE_METRICS_INTERVAL_MS=0 HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS=0 \
+    HOGLAKE_PACKED_MERGETREE_ENABLED=true \
     "$repo_dir/server/build/install/hoglake-server/bin/hoglake-server" \
     > "$report_dir/server.log" 2>&1 &
 server_pid=$!

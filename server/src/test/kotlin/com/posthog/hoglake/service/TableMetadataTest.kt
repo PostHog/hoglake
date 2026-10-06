@@ -78,6 +78,24 @@ class TableMetadataTest {
             )
         }.isInstanceOf(HoglakeException.Validation::class.java)
             .hasMessageContaining("sort")
+        for (name in listOf("_part", "_part_offset", "_anything")) {
+            assertThatThrownBy {
+                TableMetadata.validateDefinitionForFormat(
+                    packed,
+                    listOf(ColumnDef("id", ColType.LONG), ColumnDef(name, ColType.LONG)),
+                    emptyList(),
+                    emptyList(),
+                )
+            }.isInstanceOf(HoglakeException.Validation::class.java)
+                .hasMessageContaining(name)
+        }
+        // Parquet tables are unaffected: the reservation is the packed reader's.
+        TableMetadata.validateDefinitionForFormat(
+            emptyMap(),
+            listOf(ColumnDef("_part", ColType.LONG)),
+            emptyList(),
+            emptyList(),
+        )
     }
 
     @Test

@@ -14,17 +14,13 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
-from .bounds import encode_bound, normalize_bound
 from .client import Table, _align_table
 from .errors import HoglakeError, ValidationError
 from .formats import CLICKHOUSE_MERGETREE_PACKED_FORMAT, table_format
 from .models import (
     AppendedFile,
     AppendResult,
-    Column,
-    ColumnStats,
     CommitResult,
     TableInfo,
 )
@@ -78,10 +74,14 @@ _CLICKHOUSE_TYPES = {
     "binary": "String",
 }
 
-_DEFAULT_MAX_PART_BYTES = 2 * 1024**3
-_DEFAULT_MAX_SNAPSHOT_BYTES = 8 * 1024**3
+# Coherent by construction: ClickHouse needs ~2.5x a block's size to parse an
+# Arrow insert, and a read sorts one part at a time, so the memory limit
+# covers the largest part; a snapshot within its byte limit is readable
+# within the result limit (packed parts compress, results do not).
+_DEFAULT_MAX_PART_BYTES = 1 * 1024**3
+_DEFAULT_MAX_SNAPSHOT_BYTES = 2 * 1024**3
 _DEFAULT_MAX_SNAPSHOT_PARTS = 500
-_DEFAULT_MAX_MEMORY_BYTES = 1 * 1024**3
+_DEFAULT_MAX_MEMORY_BYTES = 4 * 1024**3
 _DEFAULT_MAX_RESULT_BYTES = 2 * 1024**3
 
 _ARROW_TYPES: dict[str, pa.DataType] = {
@@ -123,6 +123,14 @@ def _schema(info: TableInfo) -> pa.Schema:
                 f"packed MergeTree requires a safe catalog column identifier, got {column.name!r}",
                 status_code=None,
             )
+        if column.name.startswith("_"):
+            # ClickHouse resolves a real column before a virtual one, so a column
+            # named _part or _part_offset would silently reorder every read.
+            raise ValidationError(
+                "packed MergeTree reserves column names starting with '_' for "
+                f"ClickHouse virtual columns, got {column.name!r}",
+                status_code=None,
+            )
         if column.children or column.type not in _SUPPORTED_TYPES:
             raise ValidationError(
                 f"packed MergeTree does not support column {column.name!r} "
@@ -161,60 +169,6 @@ def _arrow_stream(table: pa.Table) -> bytes:
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
     return sink.getvalue().to_pybytes()
-
-
-def _min_max(array: pa.Array, column: Column) -> tuple[Any, Any] | None:
-    values = pc.drop_null(array)
-    if len(values) == 0:
-        return None
-    if column.type in {"float", "double"}:
-        values = pc.filter(values, pc.invert(pc.is_nan(values)))
-        if len(values) == 0:
-            return None
-    if column.type == "boolean":
-        any_true = bool(pc.any(values).as_py())
-        all_true = bool(pc.all(values).as_py())
-        return all_true, any_true
-    result = pc.min_max(values)
-    lower = result["min"]
-    upper = result["max"]
-    if column.type == "timestamp_ns":
-        return lower.value, upper.value
-    return lower.as_py(), upper.as_py()
-
-
-def _column_stats(table: pa.Table, columns: tuple[Column, ...]) -> list[dict[str, Any]]:
-    stats: list[dict[str, Any]] = []
-    for column in columns:
-        array = table.column(column.name).combine_chunks()
-        nan_count: int | None = None
-        if column.type in {"float", "double"}:
-            non_null = pc.drop_null(array)
-            nan_count = int(pc.sum(pc.is_nan(non_null)).as_py() or 0)
-        bounds = _min_max(array, column)
-        lower = upper = None
-        if bounds is not None:
-            lower = normalize_bound(
-                column.type,
-                encode_bound(column.type, bounds[0], column.type_params),
-                lower=True,
-            )
-            upper = normalize_bound(
-                column.type,
-                encode_bound(column.type, bounds[1], column.type_params),
-                lower=False,
-            )
-        stats.append(
-            ColumnStats(
-                field_id=column.field_id,
-                value_count=len(array),
-                null_count=array.null_count,
-                nan_count=nan_count,
-                lower_bound=lower,
-                upper_bound=upper,
-            ).to_wire()
-        )
-    return stats
 
 
 class ClickHousePackedAdapter:
@@ -294,10 +248,19 @@ class ClickHousePackedAdapter:
         with tempfile.TemporaryDirectory(prefix="pyhoglake-packed-write-") as directory:
             root = Path(directory)
             self._run(root, self._create_sql(info, "packed_write"))
+            # Squash the whole input into one block: by default ClickHouse cuts
+            # inserts at min_insert_block_size_bytes (~256 MiB uncompressed),
+            # which would produce several parts for one append.
+            unbounded = str(2**62)
             self._run(
                 root,
                 f"INSERT INTO {_quote_identifier('packed_write')} FORMAT ArrowStream",
                 input_bytes=_arrow_stream(aligned),
+                settings={
+                    "min_insert_block_size_rows": unbounded,
+                    "min_insert_block_size_bytes": unbounded,
+                    "max_insert_block_size": unbounded,
+                },
             )
             part = self._single_part(root, "packed_write", aligned.num_rows)
             packed_file = part / "data.packed"
@@ -488,71 +451,65 @@ class ClickHousePackedAdapter:
                 f"'all_{index}_{index}_0'"
                 for index in range(1, len(plan) + 1)
             )
-            self._run(
+            raw = self._run(
                 root,
                 attach
                 + ";ALTER TABLE "
                 + _quote_identifier("packed_read")
-                + " MODIFY SETTING table_readonly=1",
+                + " MODIFY SETTING table_readonly=1"
+                + ";SELECT name, rows FROM system.parts WHERE active AND "
+                + "table='packed_read' ORDER BY min_block_number FORMAT JSONEachRow",
             )
+            # ATTACH numbers blocks in statement order, so block order is plan
+            # order. Check it rather than assume it: every part must hold
+            # exactly the rows its own registration records.
+            parts = [json.loads(line) for line in raw.splitlines() if line]
+            attached = [int(part["rows"]) for part in parts]
+            registered = [item.data_file.record_count for item in plan]
+            if attached != registered:
+                raise HoglakeError(
+                    f"attached packed parts hold {attached} rows, the scan plan "
+                    f"registers {registered}"
+                )
+            # One output file per part, sorted within the part only. A single
+            # ORDER BY across parts would materialize and sort the whole
+            # snapshot under max_memory_usage; per part, the sort is bounded by
+            # one part. Files rather than stdout, so the run goes through
+            # _run's bounded path (both pipes drained, timeout enforced, exit
+            # status checked before any output is trusted).
             columns = ", ".join(_quote_identifier(field.name) for field in schema)
-            query = (
-                f"SELECT {columns} FROM {_quote_identifier('packed_read')} "
-                "ORDER BY toUInt64(splitByChar('_', _part)[2]), _part_offset FORMAT ArrowStream"
+            outputs = [root / f"result-{index}.arrow" for index in range(len(parts))]
+            self._run(
+                root,
+                ";".join(
+                    f"SELECT {columns} FROM {_quote_identifier('packed_read')} "
+                    f"WHERE _part = {_quote_string(str(part['name']))} "
+                    f"ORDER BY _part_offset INTO OUTFILE {_quote_string(str(output))} "
+                    "FORMAT ArrowStream"
+                    for part, output in zip(parts, outputs, strict=True)
+                ),
             )
-            command = [
-                *self._command,
-                "local",
-                "--path",
-                str(root),
-                "--background_schedule_pool_size",
-                str(self._max_threads),
-                "--max_threads",
-                str(self._max_threads),
-                "--max_memory_usage",
-                str(self._max_memory_bytes),
-                "--max_result_bytes",
-                str(self._max_result_bytes),
-                "--result_overflow_mode",
-                "throw",
-                "--output_format_arrow_string_as_string",
-                "0",
-                "--query",
-                query,
-            ]
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=root,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+            result_bytes = sum(output.stat().st_size for output in outputs)
+            if result_bytes > self._max_result_bytes:
+                raise ValidationError(
+                    f"packed snapshot result is {result_bytes} bytes, over "
+                    f"max_result_bytes {self._max_result_bytes}",
+                    status_code=None,
                 )
-            except OSError as error:
-                raise HoglakeError(
-                    f"could not execute clickhouse local: {error}"
-                ) from error
-            try:
-                assert process.stdout is not None
-                with pa.ipc.open_stream(process.stdout) as reader:
-                    result = reader.read_all()
-                _, stderr = process.communicate(timeout=self._timeout)
-            except subprocess.TimeoutExpired as error:
-                process.kill()
-                process.communicate()
-                raise HoglakeError(
-                    f"clickhouse local exceeded the {self._timeout:g}s timeout"
-                ) from error
-            if process.returncode != 0:
-                detail = stderr.decode("utf-8", errors="replace").strip()
-                raise HoglakeError(
-                    "clickhouse local failed" + (f": {detail[:2000]}" if detail else "")
-                )
-        try:
-            result = result.cast(schema)
-        except (pa.ArrowInvalid, pa.ArrowNotImplementedError) as error:
-            raise HoglakeError(
-                f"ClickHouse returned an Arrow schema incompatible with the packed table: {error}"
-            ) from error
+            tables: list[pa.Table] = []
+            for output in outputs:
+                try:
+                    with (
+                        pa.OSFile(str(output)) as source,
+                        pa.ipc.open_stream(source) as reader,
+                    ):
+                        tables.append(reader.read_all().cast(schema))
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError, OSError) as error:
+                    raise HoglakeError(
+                        "ClickHouse returned an Arrow result incompatible with the "
+                        f"packed table: {error}"
+                    ) from error
+            result = pa.concat_tables(tables)
         expected_rows = sum(item.data_file.record_count for item in plan)
         if result.num_rows != expected_rows:
             raise HoglakeError(
@@ -610,7 +567,19 @@ class ClickHousePackedAdapter:
             )
         return part
 
-    def _run(self, root: Path, sql: str, *, input_bytes: bytes | None = None) -> bytes:
+    def _run(
+        self,
+        root: Path,
+        sql: str,
+        *,
+        input_bytes: bytes | None = None,
+        settings: Mapping[str, str] | None = None,
+    ) -> bytes:
+        extra = [
+            arg
+            for key, value in (settings or {}).items()
+            for arg in (f"--{key}", value)
+        ]
         command = [
             *self._command,
             "local",
@@ -628,6 +597,7 @@ class ClickHousePackedAdapter:
             "throw",
             "--output_format_arrow_string_as_string",
             "0",
+            *extra,
             "--query",
             sql,
         ]

@@ -58,6 +58,15 @@ internal object TableMetadata {
 
         fun nodes(defs: List<ColumnDef>): Sequence<ColumnDef> =
             defs.asSequence().flatMap { def -> sequenceOf(def) + nodes(def.children.orEmpty()) }
+        // ClickHouse resolves a real column before a virtual one of the same
+        // name, and packed readers order by the `_part*` virtual columns: a
+        // column named `_part_offset` would silently reorder every read.
+        nodes(columns).firstOrNull { it.name.startsWith("_") }?.let {
+            throw HoglakeException.Validation(
+                "packed MergeTree tables reserve column names starting with '_' " +
+                    "for ClickHouse virtual columns, got '${it.name}'",
+            )
+        }
         val unsupported = nodes(columns).firstOrNull { it.type !in FileFormats.packedColumnTypes }
         if (unsupported != null) {
             throw HoglakeException.Validation(
