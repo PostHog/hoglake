@@ -51,7 +51,7 @@ echo "== sqllogictests =="
 expected_files=$(find "$HERE/test/sql" -name '*.test' | wc -l | tr -d ' ')
 test_log=$(mktemp)
 trap 'rm -f "$test_log"' EXIT
-(cd "$HERE" && make test) 2>&1 | tee "$test_log"
+(cd "$PYHOGLAKE_DIR" && uv run python "$HERE/test/fixtures/verify_append_guards.py" --sqllogictests) 2>&1 | tee "$test_log"
 test_status=${PIPESTATUS[0]}
 if (( test_status != 0 )); then
     echo "FAIL: sqllogictests exited $test_status" >&2
@@ -80,5 +80,8 @@ echo "   verified: $ran_cases/$expected_files test files ran, $ran_assertions as
 echo "== cross-client partition-wire check =="
 (cd "$PYHOGLAKE_DIR" && HOGLAKE_S3_ENDPOINT="http://$DUCKEXT_S3_ENDPOINT" \
     uv run python "$HERE/test/fixtures/verify_partition_wire.py")
+
+echo "== append preparation and conflict guards =="
+(cd "$PYHOGLAKE_DIR" && uv run python "$HERE/test/fixtures/verify_append_guards.py")
 
 echo "ALL LIVE TESTS PASSED ($ran_cases test files, $ran_assertions assertions, 0 skipped)"
