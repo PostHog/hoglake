@@ -155,6 +155,17 @@ data class Config(
     val hydratorMaxWholeObjectBytes: Long =
         env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
     /**
+     * statement_timeout for ONE catalog's claim inside the hydrator
+     * sweep (#269). A claim is `limit` rows off one range of
+     * `hog_data_file_pending`, milliseconds when healthy; a catalog whose
+     * claim exceeds this (a dropped table's pending backlog the claim
+     * walks and discards, until retirement deletes it) loses its share
+     * of that sweep, is counted (`hoglake_hydrator_claim_timeouts_total`)
+     * and logged, and no other catalog waits on it. Must stay under the
+     * session's 60 s statement_timeout to mean anything. Default 10 s.
+     */
+    val hydratorClaimTimeoutMs: Long = env("HOGLAKE_HYDRATOR_CLAIM_TIMEOUT_MS", "10000").toLong(),
+    /**
      * Expiry sweep interval; 0 disables. Sweeps are incremental (bounded
      * per run).
      *
@@ -658,30 +669,29 @@ data class Config(
      * Catalog-health gauge sample interval; <= 0 disables the sampler
      * loop.
      *
-     * STILL 15 s, AND STILL ON EVERY REPLICA — deliberately left alone
-     * by #193, which is a decision rather than an omission.
-     * `CatalogMetrics.SAMPLE_SQL` is now ONE pass over the manifest
-     * instead of five correlated subqueries per catalog (measured
-     * 9,467 -> 1,168 execution buffers on a 60,000-row fixture), but
-     * one pass is still a FULL SCAN of `hog_data_file`: there is no
-     * index that answers "sum the live rows", and at
-     * gigahog-prod-us's ~1.5 GiB manifest that is ~1.5 GiB of buffer
-     * traffic every 15 seconds on every pod that registers the loop —
-     * which `App.startBackground` does unconditionally.
+     * 15 s, on every replica, and since #269 that is cheap enough to
+     * leave alone: `CatalogMetrics.SAMPLE_SQL` no longer scans the
+     * manifest, nor anything that grows with it. Live rows, bytes and
+     * files are four columns the maintenance summary stamps per
+     * catalog when it publishes a generation (V27; one row per
+     * catalog per tick), the three rare-state counts come from partial
+     * indexes that hold exactly their live population (V26's
+     * `_pending`, `_failed` and `_missing_field_ids`), and a catalog
+     * with no published totals publishes none rather than being read
+     * from its own manifest. The plan test
+     * (`CatalogMetricsPlanIntegrationTest`) pins "no hog_data_file
+     * buffers outside those three indexes" against a 200,000-row
+     * manifest.
      *
-     * Turning the DEFAULT to 0, the way compaction and
-     * retirement default off, would be a one-line change here and a
-     * fleet-wide observability regression: every `hoglake_*` gauge,
-     * `/v1/info`'s instance totals and the catalogs listing's per-
-     * catalog totals are served from this sample, and a deployment
-     * that did not know to set the variable would simply go dark. So
-     * the default stays and the runbook carries the ops step instead —
-     * `HOGLAKE_METRICS_INTERVAL_MS=0` on the API replicas, or >= 300000
-     * fleet-wide — which is a chart change somebody makes on purpose.
-     *
-     * The real fix is a sample that does not scan the manifest at all
-     * (the asynchronous summary the maintenance sampler already
-     * maintains is the shape); that is a separate change.
+     * The history, so nobody re-measures it: #193 made the sample ONE
+     * pass over the manifest instead of five correlated subqueries
+     * (9,467 -> 1,168 buffers on a 60,000-row fixture), and one pass was
+     * still ~1.5 GiB of buffer traffic every 15 s on gigahog-prod-us,
+     * on every pod. The runbook step that covered it —
+     * `HOGLAKE_METRICS_INTERVAL_MS=0` on the API replicas, or
+     * >= 300000 fleet-wide — is no longer needed, and the default stays
+     * because every `hoglake_*` gauge, `/v1/info`'s totals and the
+     * catalogs listing's per-catalog totals are served from this sample.
      */
     val metricsIntervalMs: Long = env("HOGLAKE_METRICS_INTERVAL_MS", "15000").toLong(),
     /**

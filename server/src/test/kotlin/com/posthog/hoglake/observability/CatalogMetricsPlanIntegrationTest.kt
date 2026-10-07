@@ -6,6 +6,7 @@ import com.posthog.hoglake.testing.PgTestSupport
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
 import org.jdbi.v3.core.kotlin.useHandleUnchecked
+import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import org.jdbi.v3.core.statement.Query
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.BeforeAll
@@ -35,6 +36,13 @@ import org.junit.jupiter.api.TestInstance
  *  - `unsampled`: tables and files, no published generation;
  *  - `empty`: nothing.
  *
+ * `prod`'s manifest also carries the three rare states SAMPLE_SQL
+ * counts — [PENDING_FILES] pending, [FAILED_FILES] failed,
+ * [MISSING_ID_FILES] without field ids, a few of each on a dropped
+ * table — and its published generation has stamped live totals (V27)
+ * at snapshot 5 with [LATE_DROPS] tables dropped AFTER it that still
+ * hold buckets, the shape the sampler's dropped-table subtraction reads.
+ *
  * Every statement runs serially (`max_parallel_workers_per_gather = 0`)
  * with its production parameters. Assertions are on the SHAPE that
  * bounds the work (which index, which columns are in the Index Cond,
@@ -59,6 +67,10 @@ class CatalogMetricsPlanIntegrationTest {
         const val LEDGER_ROWS = 500_000
         const val OTHER_TASK_ROWS = 300
         const val SMALL_LEDGER_ROWS = 3
+        const val PENDING_FILES = 500
+        const val FAILED_FILES = 200
+        const val MISSING_ID_FILES = 200
+        const val LATE_DROPS = 10
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -145,6 +157,20 @@ class CatalogMetricsPlanIntegrationTest {
                   FROM generate_series(1, $DELETE_FILES) g
                 """,
             )
+            // The rare states, on live tables and (a few) on the oldest
+            // pending drops, which the counts must exclude.
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'pending' WHERE catalog_id = 1 " +
+                    "AND (data_file_id % ${DATA_FILES / PENDING_FILES} = 0 OR data_file_id > $DATA_FILES)",
+            )
+            h.execute(
+                "UPDATE hog_data_file SET stats_state = 'failed' WHERE catalog_id = 1 " +
+                    "AND data_file_id % ${DATA_FILES / FAILED_FILES} = 1",
+            )
+            h.execute(
+                "UPDATE hog_data_file SET missing_field_ids = true WHERE catalog_id = 1 " +
+                    "AND data_file_id % ${DATA_FILES / MISSING_ID_FILES} = 2",
+            )
             // Summary: `prod` and `small` published generation 1 with
             // generation 2 in flight; `unsampled` has a row that never
             // published.
@@ -154,6 +180,18 @@ class CatalogMetricsPlanIntegrationTest {
                     "SELECT c, 2, 1, 1, now(), '{\"snapshotId\": 5}' FROM generate_series(1, 2) c",
             )
             h.execute("INSERT INTO hog_maintenance_summary (catalog_id) VALUES (3)")
+            // $LATE_DROPS of prod's dropped tables were dropped AFTER the
+            // generation's snapshot and keep a bucket each in it.
+            h.execute(
+                "UPDATE hog_table SET dropped_snapshot = 6 WHERE catalog_id = 1 " +
+                    "AND table_id BETWEEN ${LIVE_TABLES + 1} AND ${LIVE_TABLES + LATE_DROPS}",
+            )
+            h.execute(
+                "INSERT INTO hog_maintenance_summary_tier (catalog_id, generation, bucket_key, table_id, quota, " +
+                    "remaining, pending, file_count, total_bytes, record_count) " +
+                    "SELECT 1, 1, 'late-' || g, $LIVE_TABLES + g, 1, 1, 0, 1, 100, 10 " +
+                    "FROM generate_series(1, $LATE_DROPS) g",
+            )
             h.execute(
                 """
                 INSERT INTO hog_maintenance_summary_tier (catalog_id, generation, bucket_key, table_id,
@@ -168,6 +206,19 @@ class CatalogMetricsPlanIntegrationTest {
                 "INSERT INTO hog_maintenance_summary_tier (catalog_id, generation, bucket_key, table_id, quota, " +
                     "remaining, pending, file_count) SELECT 2, gen, gen || '-' || g, g, 1, 1, 0, 2 " +
                     "FROM generate_series(1, 5) g, generate_series(1, 2) gen",
+            )
+            // The stamped totals (V27): what the publish statement writes,
+            // from the published generation's buckets.
+            h.execute(
+                """
+                UPDATE hog_maintenance_summary ms
+                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows,
+                       live_generation = 1, live_as_of = now() - interval '20 minutes', published_snapshot = 5
+                  FROM (SELECT catalog_id, SUM(file_count) AS files, SUM(total_bytes) AS bytes,
+                               SUM(record_count) AS rows
+                          FROM hog_maintenance_summary_tier WHERE generation = 1 GROUP BY catalog_id) tot
+                 WHERE tot.catalog_id = ms.catalog_id
+                """,
             )
             // Ledger: `small`'s $SMALL_LEDGER_ROWS rows first (older run
             // ids; `unsampled` and `empty` have none), then
@@ -411,6 +462,105 @@ class CatalogMetricsPlanIntegrationTest {
         assertThat(plan).describedAs(plan).doesNotContain("hog_data_file")
         // Never more than one pass over the DV relation.
         assertThat(buffers).describedAs(plan).isLessThanOrEqualTo(dvPages + 1_000)
+    }
+
+    /**
+     * #269: the sample used to be one full pass over hog_data_file per
+     * tick. Now every read of the manifest is an index descent — the
+     * three partial indexes for the rare states, `hog_data_file_live`
+     * scoped by catalog for a catalog with no published generation — and
+     * `prod`'s $DATA_FILES-row manifest is never walked: its live totals
+     * come from the published tier generation.
+     */
+    @Test
+    fun `SAMPLE_SQL reads nothing that grows with the manifest or the generation`() {
+        val plan = explain(CatalogMetrics.SAMPLE_SQL)
+        val exec = execution(plan)
+        println("[metrics-plan] SAMPLE_SQL: $DATA_FILES files, ${executionBuffers(plan)} buffers\n$plan")
+        assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_data_file")
+        assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_maintenance_summary_tier")
+        assertThat(exec).describedAs(plan).doesNotContain("Seq Scan on hog_table")
+        // EVERY manifest read is through one of the three attention
+        // indexes (V26) — not `_live`, not the primary key, nothing a
+        // catalog's whole manifest sits under. A plain Index Scan names
+        // its index on the scan line, a Bitmap Heap Scan on the Bitmap
+        // Index Scan beneath it; both are checked.
+        val manifestIndexLines =
+            exec.lines().filter {
+                Regex("""Index (Only )?Scan using hog_data_file|Bitmap Index Scan on hog_data_file""")
+                    .containsMatchIn(it)
+            }
+        assertThat(manifestIndexLines).describedAs(plan).hasSizeGreaterThanOrEqualTo(3)
+        for (line in manifestIndexLines) {
+            assertThat(line)
+                .describedAs("a manifest read outside the attention indexes:%n%s", plan)
+                .containsPattern("hog_data_file_(pending|failed|missing_field_ids)\\b")
+        }
+        // And the manifest's buffers are the rare populations' — index
+        // pages plus a heap fetch for whatever the visibility map does
+        // not cover — against a $DATA_FILES-row relation. MUTATION: put
+        // the fallback manifest sum back for `unsampled` and this reads
+        // that catalog's files; put it back for every catalog and it
+        // reads prod's.
+        val manifestBuffers =
+            ExplainPlan.nodes(exec).filter { it.line.contains("on hog_data_file") }.sumOf { it.buffers }
+        assertThat(manifestBuffers)
+            .describedAs("manifest buffers must be the rare populations', not the manifest's:%n%s", plan)
+            .isLessThan((PENDING_FILES + FAILED_FILES + MISSING_ID_FILES).toLong())
+        // The live totals are the summary row: the tier is read ONLY for
+        // the tables dropped since the generation's snapshot, through
+        // the (catalog_id, generation, table_id) index, one range per
+        // late drop — never the generation's $BUCKETS buckets, and never
+        // the in-flight generation. MUTATION: sum the published
+        // generation's tiers at read time and this reads them all.
+        assertThat(exec).describedAs(plan).contains("hog_maintenance_summary_tier_table")
+        val tierNodes = ExplainPlan.nodes(exec).filter { it.line.contains("on hog_maintenance_summary_tier") }
+        assertThat(tierNodes.sumOf { it.buffers })
+            .describedAs("the late drops' buckets, not the generation's:%n%s", plan)
+            .isLessThanOrEqualTo(8L * LATE_DROPS)
+        // hog_table is read by its primary key only: the catalog's range
+        // for the drops and for each count's join (a Bitmap Heap Scan
+        // names its index on the Bitmap Index Scan beneath it).
+        assertThat(exec.lines().filter { Regex("""(using|Bitmap Index Scan on) hog_table_\w+""").containsMatchIn(it) })
+            .describedAs(plan)
+            .isNotEmpty()
+            .allSatisfy { assertThat(it).contains("hog_table_pkey") }
+    }
+
+    @Test
+    fun `SAMPLE_SQL's live totals are the stamped ones less the tables dropped since the generation`() {
+        val rows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(CatalogMetrics.SAMPLE_SQL).mapToMap().list().associateBy { it["name"] as String }
+            }
+        val prod = rows.getValue("prod")
+        val stamped =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    "SELECT live_files, live_bytes, live_rows FROM hog_maintenance_summary WHERE catalog_id = 1",
+                )
+                    .mapToMap().one()
+            }
+        // The late drops hold one file / 100 bytes / 10 rows each in the
+        // published generation; the sampler takes them off the stamped
+        // totals. MUTATION: drop the `dr` LATERAL and the stamped totals
+        // come through whole.
+        assertThat(prod["live_sampled"]).isEqualTo(true)
+        assertThat(prod["live_files"]).isEqualTo((stamped["live_files"] as Long) - LATE_DROPS)
+        assertThat(prod["live_bytes"]).isEqualTo((stamped["live_bytes"] as Long) - 100L * LATE_DROPS)
+        assertThat(prod["live_rows"]).isEqualTo((stamped["live_rows"] as Long) - 10L * LATE_DROPS)
+        // The rare counts: live tables only. MUTATION: drop any count's
+        // hog_table join and its pending-drop rows come back.
+        assertThat(prod["stats_pending"]).isEqualTo(PENDING_FILES.toLong())
+        assertThat(prod["stats_failed"]).isEqualTo(FAILED_FILES.toLong())
+        assertThat(prod["missing_field_ids"]).isEqualTo(MISSING_ID_FILES.toLong())
+        // No generation: absent, with the flag saying so — and the
+        // catalog's files, which exist, are not summed in its place.
+        val unsampled = rows.getValue("unsampled")
+        assertThat(unsampled["live_sampled"]).isEqualTo(false)
+        assertThat(unsampled["live_files"]).isNull()
+        assertThat(unsampled["live_rows"]).isNull()
+        assertThat(unsampled["table_count"]).isEqualTo(5L)
     }
 
     @Test

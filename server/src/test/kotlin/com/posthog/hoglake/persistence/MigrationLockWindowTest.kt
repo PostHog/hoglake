@@ -14,8 +14,9 @@ import java.nio.file.Path
  * > `ALTER TABLE` (ADD COLUMN included — it is ACCESS EXCLUSIVE even
  * > when metadata-only), `ADD/DROP CONSTRAINT`, `DROP INDEX` and any
  * > backfill `UPDATE` sit after the save+`SET lock_timeout = '5s'` and
- * > before the restore; only `CREATE INDEX CONCURRENTLY` sits outside
- * > it, because that build waits out older transactions by design.
+ * > before the restore; only `CREATE INDEX CONCURRENTLY` and `DROP
+ * > INDEX CONCURRENTLY` sit outside it, because both wait out older
+ * > transactions by design.
  *
  * NOTHING PINNED THAT. The rule has been stated in AGENT.md since V9,
  * broken by V10 (ADD COLUMN after the restore), broken by V11 and V12
@@ -74,16 +75,19 @@ class MigrationLockWindowTest {
          * Statements that take a lock conflicting with ordinary writes,
          * as a line-level pattern over the migration text.
          *
-         * `CREATE INDEX` counts only when it is NOT `CONCURRENTLY` —
-         * that is the one build AGENT.md exempts, and the exemption is
-         * the whole reason the pattern has to look at the modifier
-         * rather than the keyword. `EXECUTE 'DROP INDEX ...'` inside a
-         * `DO` block counts as a `DROP INDEX`, because it is one.
+         * `CREATE INDEX` and `DROP INDEX` count only when NOT
+         * `CONCURRENTLY` — those are the two AGENT.md exempts (each
+         * waits out older transactions by design, under SHARE UPDATE
+         * EXCLUSIVE, which blocks no write), and the exemption is the
+         * whole reason the pattern has to look at the modifier rather
+         * than the keyword. `EXECUTE 'DROP INDEX ...'` inside a `DO`
+         * block counts as a `DROP INDEX`, because it is one.
          */
         val HEAVY =
             listOf(
                 "ALTER TABLE" to Regex("""\bALTER\s+TABLE\b""", RegexOption.IGNORE_CASE),
-                "DROP INDEX" to Regex("""\bDROP\s+INDEX\b""", RegexOption.IGNORE_CASE),
+                "DROP INDEX (not CONCURRENTLY)" to
+                    Regex("""\bDROP\s+INDEX\s+(?!CONCURRENTLY)""", RegexOption.IGNORE_CASE),
                 "CREATE INDEX (not CONCURRENTLY)" to
                     Regex("""\bCREATE\s+(UNIQUE\s+)?INDEX\s+(?!CONCURRENTLY)""", RegexOption.IGNORE_CASE),
                 "CREATE TABLE ... REFERENCES" to Regex("""\bCREATE\s+TABLE\b""", RegexOption.IGNORE_CASE),
@@ -92,9 +96,9 @@ class MigrationLockWindowTest {
 
         val SET_TIMEOUT = Regex("""\bSET\s+(LOCAL\s+)?lock_timeout\b""", RegexOption.IGNORE_CASE)
 
-        /** A concurrent build: the one heavy statement that belongs OUTSIDE the window. */
+        /** A concurrent build or drop: the heavy statements that belong OUTSIDE the window. */
         val CONCURRENT_BUILD =
-            Regex("""\bCREATE\s+INDEX\s+CONCURRENTLY\b""", RegexOption.IGNORE_CASE)
+            Regex("""\b(CREATE|DROP)\s+INDEX\s+CONCURRENTLY\b""", RegexOption.IGNORE_CASE)
 
         /** Lifting the statement bound for a build that may outlast it. */
         val SET_STATEMENT_TIMEOUT_ZERO =

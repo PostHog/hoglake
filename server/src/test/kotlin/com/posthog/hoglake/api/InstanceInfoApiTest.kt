@@ -13,6 +13,7 @@ import com.posthog.hoglake.model.FileRegistration
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.publishMaintenanceSample
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
 import io.ktor.client.statement.HttpResponse
@@ -31,9 +32,12 @@ import java.time.Instant
  * Wire-level pinning for GET /v1/info — the webui header builds against
  * exactly this shape. Semantics pinned: totals come from the metrics
  * sampler's last pass (never computed per request), the fields are
- * ABSENT before the first sample, they sum live data files only, and a
- * dropped table's files leave the totals on the next sample. The version
- * is pinned as ALWAYS present, sampler or no sampler.
+ * ABSENT before the first sample, each catalog's share is as of its
+ * maintenance summary's published generation and ABSENT until it has
+ * one (#269: the sampler never reads a catalog's manifest for them),
+ * they sum live data files only, and a dropped table's files leave the
+ * totals on the next sample. The version is pinned as ALWAYS present,
+ * sampler or no sampler.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -118,17 +122,41 @@ class InstanceInfoApiTest {
             val before = body(client.get("/v1/info"))
             assertThat(before.has("total_rows")).isFalse()
             assertThat(before.has("total_size_bytes")).isFalse()
+            assertThat(before.has("unsampled_catalogs")).isFalse()
 
-            seed("info-totals")
+            val cat = "info-totals"
+            seed(cat)
+            app.catalogMetrics.sampleOnce()
+
+            // Sampled, but this catalog's maintenance summary has published
+            // nothing yet: the totals exist and the catalog is counted OUT
+            // of them, not read from its manifest (#269).
+            val unsampled = body(client.get("/v1/info"))
+            assertThat(unsampled["total_rows"].isIntegralNumber).isTrue()
+            assertThat(unsampled["unsampled_catalogs"].asInt()).isGreaterThanOrEqualTo(1)
+            assertThat(unsampled["total_rows"].asLong()).isEqualTo(sumOfListing(client, "live_rows"))
+
+            publishMaintenanceSample(db.jdbi)
             app.catalogMetrics.sampleOnce()
 
             val res = client.get("/v1/info")
             assertThat(res.status).isEqualTo(HttpStatusCode.OK)
             val root = body(res)
-            assertThat(root["total_rows"].isIntegralNumber).isTrue()
-            assertThat(root["total_rows"].asLong()).isEqualTo(15)
-            assertThat(root["total_size_bytes"].asLong()).isEqualTo(1_050_624)
+            val mine = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(mine["live_rows"].asLong()).isEqualTo(15)
+            assertThat(mine["live_size_bytes"].asLong()).isEqualTo(1_050_624)
+            // The instance totals are exactly the sum of what the listing
+            // shows, and the unsampled count is exactly what it omits.
+            assertThat(root["total_rows"].asLong()).isEqualTo(sumOfListing(client, "live_rows"))
+            assertThat(root["total_size_bytes"].asLong()).isEqualTo(sumOfListing(client, "live_size_bytes"))
+            assertThat(root["unsampled_catalogs"].asInt())
+                .isEqualTo(body(client.get("/v1/catalogs")).count { !it.has("live_rows") })
         }
+
+    private suspend fun sumOfListing(
+        client: HttpClient,
+        field: String,
+    ): Long = body(client.get("/v1/catalogs")).sumOf { if (it.has(field)) it[field].asLong() else 0L }
 
     @Test
     fun `version is present from boot, before any sample`() =
@@ -176,6 +204,18 @@ class InstanceInfoApiTest {
 
             app.catalogMetrics.sampleOnce()
 
+            // Sampled, no published generation: the table count is live
+            // metadata and present; the two file totals are as of a
+            // generation the catalog does not have, so they stay ABSENT
+            // — the sampler does not read the manifest in their place.
+            val unsampled = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
+            assertThat(unsampled["table_count"].asLong()).isEqualTo(1)
+            assertThat(unsampled.has("live_rows")).isFalse()
+            assertThat(unsampled.has("live_size_bytes")).isFalse()
+
+            publishMaintenanceSample(db.jdbi)
+            app.catalogMetrics.sampleOnce()
+
             val after = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
             assertThat(after["table_count"].asLong()).isEqualTo(1)
             assertThat(after["live_rows"].asLong()).isEqualTo(15)
@@ -215,6 +255,7 @@ class InstanceInfoApiTest {
         api { client ->
             val cat = "info-catalog-stale"
             seed(cat)
+            publishMaintenanceSample(db.jdbi)
             app.catalogMetrics.sampleOnce()
 
             // Drop the table: the catalog is now empty in the database.
@@ -228,9 +269,15 @@ class InstanceInfoApiTest {
             val stale = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
             assertThat(stale["live_rows"].asLong()).isEqualTo(15)
 
+            // The next metrics sample, WITHOUT a new maintenance
+            // generation: the dropped table's buckets are still in the
+            // published generation (a drop leaves it alone), and the
+            // sampler subtracts them (SAMPLE_SQL's KDoc). MUTATION: drop
+            // the `dr` LATERAL and this reads 15.
             app.catalogMetrics.sampleOnce()
             val fresh = body(client.get("/v1/catalogs")).single { it["name"].asText() == cat }
             assertThat(fresh["live_rows"].asLong()).isZero()
+            assertThat(fresh["live_size_bytes"].asLong()).isZero()
             assertThat(fresh["table_count"].asLong()).isZero()
         }
 
@@ -238,6 +285,7 @@ class InstanceInfoApiTest {
     fun `totals hold the last sample until the next one and drop dead files then`() {
         val cat = "info-totals-resample"
         seed(cat)
+        publishMaintenanceSample(db.jdbi)
         app.catalogMetrics.sampleOnce()
         val before = app.catalogMetrics.latestTotals!!
 

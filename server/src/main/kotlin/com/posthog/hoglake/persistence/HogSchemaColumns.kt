@@ -23,11 +23,14 @@ object HogSchemaColumns {
                     "catalog_id", "idempotency_key", "request", "fingerprint",
                     "snapshot_id", "schema_version", "created_at",
                 ),
-            // MaintenanceSummarySampler: published samples + durable scan checkpoints.
+            // MaintenanceSummarySampler: published samples + durable scan
+            // checkpoints, and the published generation's live totals
+            // (V27) that CatalogMetrics.SAMPLE_SQL reads.
             "hog_maintenance_summary" to
                 setOf(
                     "catalog_id", "generation", "published_generation", "sampled_at",
                     "sample", "scan_state", "next_batch_at", "measures_generation",
+                    "live_files", "live_bytes", "live_rows", "live_generation", "live_as_of", "published_snapshot",
                 ),
             "hog_maintenance_summary_tier" to
                 setOf(

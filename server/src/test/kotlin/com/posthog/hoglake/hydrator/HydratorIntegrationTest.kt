@@ -742,6 +742,170 @@ class HydratorIntegrationTest {
     }
 
     @Test
+    fun `the claim shares the batch across catalogs instead of draining the lowest id first`() {
+        // #269: one catalog's backlog used to sit at the head of an
+        // instance-wide queue. Two catalogs with 5 pending each and a
+        // limit of 4: two each, never four from the first.
+        val a = seedCatalogAndTable()
+        val b = seedCatalogAndTable()
+        for (i in 1L..5L) {
+            seedDataFile(a, i, "s3://$BUCKET/t1/fair-a-$i.parquet", ROWS.toLong(), 100, null)
+            seedDataFile(b, i, "s3://$BUCKET/t1/fair-b-$i.parquet", ROWS.toLong(), 100, null)
+        }
+        val h = jdbi.open()
+        try {
+            h.begin()
+            val claimed = hydrator.claimPending(h, 4)
+            assertThat(claimed.groupBy { it.catalogId }.mapValues { it.value.size })
+                .containsEntry(a, 2)
+                .containsEntry(b, 2)
+        } finally {
+            h.rollback()
+            h.close()
+        }
+    }
+
+    @Test
+    fun `unused share flows to a catalog with more work, continuing past what it already holds`() {
+        // Catalog a has 1 pending, b has 6, limit 6: a takes its one, b
+        // takes its share of 3 and then the 2 nobody else wanted — the
+        // same 5 distinct rows a single ordered claim would have given it,
+        // never a row twice (our own locks are not skipped by SKIP LOCKED).
+        val a = seedCatalogAndTable()
+        val b = seedCatalogAndTable()
+        seedDataFile(a, 1, "s3://$BUCKET/t1/flow-a-1.parquet", ROWS.toLong(), 100, null)
+        for (i in 1L..6L) seedDataFile(b, i, "s3://$BUCKET/t1/flow-b-$i.parquet", ROWS.toLong(), 100, null)
+        val h = jdbi.open()
+        try {
+            h.begin()
+            val claimed = hydrator.claimPending(h, 6)
+            assertThat(claimed).hasSize(6)
+            assertThat(claimed.filter { it.catalogId == a }).hasSize(1)
+            val fromB = claimed.filter { it.catalogId == b }.map { it.dataFileId }
+            assertThat(fromB).hasSize(5).doesNotHaveDuplicates()
+        } finally {
+            h.rollback()
+            h.close()
+        }
+    }
+
+    @Test
+    fun `an ended pending row is not claimed`() {
+        // Compacted away or expired before the hydrator reached it: its
+        // stats would land on a row no scan returns, after a footer read
+        // for nothing. MUTATION: drop `end_snapshot IS NULL` from the
+        // claim and this reads 2.
+        val catalogId = seedCatalogAndTable()
+        seedDataFile(catalogId, 1, "s3://$BUCKET/t1/ended.parquet", ROWS.toLong(), 100, null)
+        seedDataFile(catalogId, 2, "s3://$BUCKET/t1/alive.parquet", ROWS.toLong(), 100, null)
+        jdbi.useHandle<Exception> { h ->
+            h.execute("UPDATE hog_data_file SET end_snapshot = 2 WHERE catalog_id = ? AND data_file_id = 1", catalogId)
+        }
+        val h = jdbi.open()
+        try {
+            h.begin()
+            assertThat(hydrator.claimPending(h, 10).map { it.dataFileId }).containsExactly(2L)
+        } finally {
+            h.rollback()
+            h.close()
+        }
+    }
+
+    @Test
+    fun `the claim's starting catalog rotates by the catalogs served`() {
+        // Two catalogs, one pending row each, a limit of 1: the first
+        // sweep serves one of them and the next must serve the other.
+        // MUTATION: drop the rotation (start at 0 every sweep) and both
+        // sweeps serve the lower id.
+        val a = seedCatalogAndTable()
+        val b = seedCatalogAndTable()
+        seedDataFile(a, 1, "s3://$BUCKET/t1/rot-a.parquet", ROWS.toLong(), 100, null)
+        seedDataFile(b, 1, "s3://$BUCKET/t1/rot-b.parquet", ROWS.toLong(), 100, null)
+
+        fun sweep(): Long {
+            val h = jdbi.open()
+            try {
+                h.begin()
+                return hydrator.claimPending(h, 1).single().catalogId
+            } finally {
+                h.rollback()
+                h.close()
+            }
+        }
+        val first = sweep()
+        val second = sweep()
+        assertThat(setOf(first, second)).containsExactlyInAnyOrder(a, b)
+        // And round again: the third sweep is back to the first.
+        assertThat(sweep()).isEqualTo(first)
+    }
+
+    @Test
+    fun `a catalog whose claim times out loses its share, and no other catalog's sweep`() {
+        // A dropped table's pending rows are index entries the claim
+        // walks and the hog_table join discards — every sweep, until
+        // retirement deletes them. Half a million of them, unvacuumed
+        // so each is a heap fetch, against a 50 ms claim timeout: that
+        // catalog's claim is cancelled, and the sweep — ONE transaction
+        // — must still hydrate the healthy catalog's file. MUTATION:
+        // claim without the savepoint and the cancelled statement
+        // aborts the transaction; the healthy file stays pending.
+        val wedged = seedCatalogAndTable()
+        val healthy = seedCatalogAndTable()
+        val path = "s3://$BUCKET/t1/healthy.parquet"
+        store.put(path, parquetBytes)
+        seedDataFile(healthy, 1, path, ROWS.toLong(), parquetBytes.size.toLong(), footerSize)
+        jdbi.useHandle<Exception> { h ->
+            h.execute(
+                "INSERT INTO hog_table (catalog_id, table_id, created_snapshot, dropped_snapshot) VALUES (?, 2, 1, 2)",
+                wedged,
+            )
+            h.execute(
+                """
+                INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot, path,
+                                           record_count, file_size_bytes, row_id_start, stats_state)
+                SELECT ?, g, 2, 1, 's3://$BUCKET/t2/backlog-' || g, 1, 1, g, 'pending'
+                  FROM generate_series(1, 500000) g
+                """,
+                wedged,
+            )
+        }
+        val registry = io.micrometer.core.instrument.simple.SimpleMeterRegistry()
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        val bounded = Hydrator(jdbi, store, claimTimeoutMs = 50)
+        assertThat(bounded.runOnce()).isEqualTo(1)
+        assertThat(statsState(healthy, 1)).isEqualTo("provided")
+        assertThat(
+            registry.find("hoglake_hydrator_claim_timeouts_total").tag("catalog", catalogName(wedged)).counter()
+                ?.count(),
+        ).isEqualTo(1.0)
+        // The sweep's own statement budget is back to the session's
+        // after the claim: the per-file work ran under it, and so does
+        // a plain statement on a fresh transaction.
+        assertThat(
+            jdbi.withHandle<String, Exception> { h ->
+                h.createQuery("SELECT current_setting('statement_timeout')").mapTo(String::class.java).one()
+            },
+        ).isNotEqualTo("50ms")
+    }
+
+    @Test
+    fun `rehydrate leaves an ended failed row alone - the sweep would never take it`() {
+        // An ended row the claim skips must not be requeued to a state
+        // nothing drains. MUTATION: drop `end_snapshot IS NULL` from the
+        // requeue and `requeued` reads 2 with a pending row forever.
+        val catalogId = seedCatalogAndTable()
+        seedDataFile(catalogId, 1, "s3://$BUCKET/t1/failed-live.parquet", ROWS.toLong(), 100, null)
+        seedDataFile(catalogId, 2, "s3://$BUCKET/t1/failed-ended.parquet", ROWS.toLong(), 100, null)
+        jdbi.useHandle<Exception> { h ->
+            h.execute("UPDATE hog_data_file SET stats_state = 'failed' WHERE catalog_id = ?", catalogId)
+            h.execute("UPDATE hog_data_file SET end_snapshot = 2 WHERE catalog_id = ? AND data_file_id = 2", catalogId)
+        }
+        assertThat(hydrator.rehydrateFailed(catalogName(catalogId)).requeued).isEqualTo(1)
+        assertThat(statsState(catalogId, 1)).isEqualTo("pending")
+        assertThat(statsState(catalogId, 2)).isEqualTo("failed")
+    }
+
+    @Test
     fun `concurrent claims are disjoint - FOR UPDATE SKIP LOCKED`() {
         // Pinned regression (bug hunt #12): N replicas used to select the
         // same pending head and burn N x the S3 GETs on identical files.

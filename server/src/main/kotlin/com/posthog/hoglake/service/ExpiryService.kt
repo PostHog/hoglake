@@ -1089,20 +1089,16 @@ class ExpiryService(
      * page instead, the two statements could disagree about which files
      * are going, and a skipped file would lose its vectors.
      *
-     * WHAT DOES WRITE TO SUCH A ROW is the hydrator: `CLAIM_PENDING_SQL`
-     * carries no `end_snapshot` filter (deliberately — its subject is
-     * `stats_state`), so it can claim a below-floor ended row, read its
-     * footer, and UPDATE its stats columns. That is wasted object-store
-     * I/O and a wasted WAL record for a row about to go, not a
-     * correctness problem: it does not touch `end_snapshot`, so the row
-     * stays eligible and the next page takes it. It is also not new —
-     * ended rows ABOVE the floor have always been claimable — but this
-     * change widens the population, and `hoglake_stats_pending_files`
-     * counts it (`CatalogMetrics.SAMPLE_SQL` has no end filter either,
-     * while `MaintenanceSummarySampler` does, so the gauge and the
-     * console's hydrator backlog can disagree by that much). Giving the
-     * hydrator's claim a liveness filter is a separate change with a
-     * separate argument.
+     * NOTHING WRITES TO SUCH A ROW. The hydrator used to: its claim
+     * carried no `end_snapshot` filter, so it could claim a below-floor
+     * ended row, read its footer, and UPDATE its stats columns — wasted
+     * object-store I/O and a wasted WAL record for a row about to go,
+     * not a correctness problem, since it never touched `end_snapshot`.
+     * Since #269 `CLAIM_PENDING_SQL` claims LIVE pending rows only, and
+     * `hog_data_file_pending` is partial on the same term (V26), so an
+     * ended row is neither claimed nor walked; `hoglake_stats_pending_files`
+     * counts live pending rows too, and agrees with the maintenance
+     * sampler's pending count up to a generation's staleness.
      *
      * The one consequence of a row being writable is for the `ctid`
      * page, and it is smaller than an earlier draft of this comment

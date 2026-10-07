@@ -107,6 +107,13 @@ data class CatalogDto(
      * facts, and zero would assert the wrong one. table_count counts
      * live tables; live_rows is gross of deletion-vector masking, as
      * /v1/info's totals are.
+     *
+     * live_rows and live_size_bytes are AS OF THE CATALOG'S MAINTENANCE
+     * SUMMARY PUBLISHED GENERATION (minutes behind head on a large
+     * catalog), and omitted — table_count still present — while the
+     * catalog has no generation with published totals: the sampler
+     * never reads a catalog's manifest for them (#269). live_rows is
+     * also omitted while the generation did not measure rows.
      */
     val tableCount: Long? = null,
     val liveRows: Long? = null,
@@ -835,7 +842,10 @@ data class CommitOffsetRequestDto(val snapshotId: Long)
 /**
  * GET /v1/info — instance identity plus live-data totals for the webui
  * header. Name omitted when unset; totals come from the metrics
- * sampler's last pass and are omitted in the boot window before it.
+ * sampler's last pass (each catalog as of its maintenance summary's
+ * published generation; a catalog without one contributes nothing and
+ * is counted in unsampledCatalogs) and are omitted in the boot window
+ * before it.
  * Version is the running server's own, always present (BuildInfo falls
  * back to "unknown" rather than omitting it — "which version is this?"
  * having no answer is itself the answer an operator needs).
@@ -852,6 +862,8 @@ data class InstanceInfoDto(
     val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
+    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted with them. */
+    val unsampledCatalogs: Int? = null,
     val uiTheme: String? = null,
 )
 

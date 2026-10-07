@@ -1,7 +1,7 @@
 package com.posthog.hoglake.observability
 
-import com.posthog.hoglake.testing.ExplainPlan
 import com.posthog.hoglake.testing.PgTestSupport
+import com.posthog.hoglake.testing.publishMaintenanceSample
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.assertj.core.api.Assertions.assertThat
 import org.jdbi.v3.core.kotlin.inTransactionUnchecked
@@ -26,10 +26,11 @@ import org.junit.jupiter.api.TestInstance
  * than merely tidy: the old shape was measured at 1.6M buffers and
  * 2.2 s per sample at two catalogs and a 5M-row manifest.
  *
- * The buffer assertion is DERIVED from the manifest this fixture holds,
- * not written down, and it is taken from the SCAN NODES rather than the
- * plan's maximum (AGENT.md: EXPLAIN's `Planning:` block carries a
- * `Buffers:` line that dwarfs a well-indexed scan's).
+ * Since #269 the live totals come from the maintenance summary's
+ * published generation, so the fixture publishes one: the scan skips
+ * the dropped table (dropped before the scan began), and the stamped
+ * totals are the kept table's. The three counts still read the
+ * manifest, through the attention indexes, and still need the join.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -44,6 +45,9 @@ class CatalogMetricsDroppedTableIntegrationTest {
         const val ROWS_PER_FILE = 1_000L
 
         const val BYTES_PER_FILE = 4_096L
+
+        /** Every Nth file on each table is pending and without field ids. */
+        const val ATTENTION_EVERY = 20
     }
 
     private val db = PgTestSupport.freshDatabase()
@@ -77,6 +81,12 @@ class CatalogMetricsDroppedTableIntegrationTest {
                     "VALUES (?, 2, 1, 4)",
                 catalogId,
             )
+            // One file in ATTENTION_EVERY on each table is pending and
+            // without field ids — a few per cent, as a manifest with a
+            // backlog looks, so the planner's choice is the attention
+            // index and not (as it is when every row qualifies) a pass
+            // over the table. The dropped table's share is what the
+            // counts must leave out.
             val tables = listOf(Triple(1L, KEPT_FILES, 0L), Triple(2L, DROPPED_FILES, 1_000_000L))
             for ((tableId, count, base) in tables) {
                 h.createUpdate(
@@ -86,16 +96,19 @@ class CatalogMetricsDroppedTableIntegrationTest {
                                                stats_state, missing_field_ids)
                     SELECT :c, :base + g, :t, 1,
                            's3://gauge-drop/t' || :t || '/part-' || g || '.parquet',
-                           :rows, :bytes, g, 'pending', true
+                           :rows, :bytes, g,
+                           CASE WHEN g % :every = 0 THEN 'pending' ELSE 'provided' END, g % :every = 0
                     FROM generate_series(1, :n) g
                     """,
                 ).bind("c", catalogId).bind("t", tableId).bind("base", base).bind("n", count)
+                    .bind("every", ATTENTION_EVERY)
                     .bind("rows", ROWS_PER_FILE).bind("bytes", BYTES_PER_FILE).execute()
             }
             h.execute("VACUUM (ANALYZE) hog_data_file")
             h.execute("ANALYZE hog_table")
             h.execute("ANALYZE hog_catalog")
         }
+        publishMaintenanceSample(db.jdbi)
     }
 
     private fun gauge(name: String): Double? = registry.find(name).tag("catalog", "gauge-drop").gauge()?.value()
@@ -111,27 +124,30 @@ class CatalogMetricsDroppedTableIntegrationTest {
         // rows are live for as long as retirement has not reached them.
         assertThat(gauge("hoglake_live_rows")).isEqualTo(KEPT_FILES * ROWS_PER_FILE.toDouble())
         assertThat(gauge("hoglake_live_bytes")).isEqualTo(KEPT_FILES * BYTES_PER_FILE.toDouble())
-        assertThat(gauge("hoglake_missing_field_id_files")).isEqualTo(KEPT_FILES.toDouble())
+        assertThat(gauge("hoglake_missing_field_id_files")).isEqualTo((KEPT_FILES / ATTENTION_EVERY).toDouble())
         // stats_pending too, and for a second-order reason: the
         // HYDRATOR no longer claims a dropped table's pending files, so
         // counting them would publish a backlog nothing is draining —
         // an alert that can never clear.
-        assertThat(gauge("hoglake_stats_pending_files")).isEqualTo(KEPT_FILES.toDouble())
+        assertThat(gauge("hoglake_stats_pending_files")).isEqualTo((KEPT_FILES / ATTENTION_EVERY).toDouble())
         assertThat(gauge("hoglake_stats_failed_files")).isEqualTo(0.0)
         // The dropped table is already out of the table count, which is
         // the gauge that was always right.
         assertThat(gauge("hoglake_table_count")).isEqualTo(1.0)
 
-        // A catalog with no file rows at all still publishes zeros: the
-        // LEFT JOIN, not an inner one. A MultiGauge refreshed with
-        // overwrite = true retires a series that stops appearing, so an
-        // inner join would make an empty catalog look deleted.
+        // A catalog with no file rows at all still publishes zeros once
+        // its summary has published a generation: zero is what the
+        // publish stamped, and the series is present. (Before that it
+        // is ABSENT, with hoglake_live_totals_sampled = 0 — the Gaps
+        // test pins that half.)
         assertThat(registry.find("hoglake_live_rows").tag("catalog", "gauge-drop-neighbour").gauge()?.value())
             .isEqualTo(0.0)
+        assertThat(gauge("hoglake_live_totals_sampled")).isEqualTo(1.0)
+        assertThat(gauge("hoglake_live_files")).isEqualTo(KEPT_FILES.toDouble())
     }
 
     @Test
-    fun `the sample reads the manifest once, not once per counter`() {
+    fun `the sample never scans the manifest, whatever a dropped table left in it`() {
         val plan =
             db.jdbi.inTransactionUnchecked { h ->
                 // Serial: a Gather splits buffer counts across workers and
@@ -143,76 +159,28 @@ class CatalogMetricsDroppedTableIntegrationTest {
                 ).mapTo(String::class.java).list().joinToString("\n")
             }
 
-        // ONE scan of hog_data_file. The old shape had five, one per
-        // correlated subquery, each re-read per catalog row — which is
-        // the thing this asserts rather than the buffer count, because
-        // a buffer budget alone would pass on a plan that read the
-        // manifest twice on a small fixture.
-        val manifestScans = plan.lines().count { Regex("""Scan.* on hog_data_file\b""").containsMatchIn(it) }
-        assertThat(manifestScans)
-            .describedAs("the manifest must be read once per sample, not once per counter:%n%s", plan)
-            .isEqualTo(1)
-
-        // And it must not run once per CATALOG. A correlated subquery
-        // reports `loops=` equal to the number of catalog rows; the
-        // grouped scan reports one.
-        val manifestNode =
-            ExplainPlan.nodes(plan)
-                .first { Regex("""Scan.* on hog_data_file\b""").containsMatchIn(it.line) }
-        assertThat(manifestNode.loops)
-            .describedAs("the manifest scan must not be re-run per catalog:%n%s", plan)
-            .isEqualTo(1)
-
-        // The buffer budget, DERIVED from the relation this statement
-        // has to read rather than written down: one pass over the
-        // manifest's heap plus its hog_table probes, with slack. The
-        // shape it excludes is the old one, which read that heap FIVE
-        // times per catalog.
-        val heapPages =
-            db.jdbi.inTransactionUnchecked { h ->
-                h.createQuery("SELECT relpages FROM pg_class WHERE relname = 'hog_data_file'")
-                    .mapTo(Long::class.java).one()
+        // #269: no pass over hog_data_file at all. The old shape read the
+        // manifest once per sample (and before that, once per counter);
+        // this one reads it only through the three attention indexes
+        // (V26), and the live totals not at all. What a dropped table
+        // leaves behind is still WALKED where it sits in one of those
+        // indexes — this fixture's 2,000 pending rows on the dropped
+        // table are index entries the pending count reads and the join
+        // discards, index-only — but never scanned, and never summed.
+        assertThat(plan)
+            .describedAs("the sampler must not scan the manifest:%n%s", plan)
+            .doesNotContain("Seq Scan on hog_data_file")
+        val manifestIndexLines =
+            plan.lines().filter {
+                Regex("""Index (Only )?Scan using hog_data_file|Bitmap Index Scan on hog_data_file""")
+                    .containsMatchIn(it)
             }
-        val executionBuffers =
-            ExplainPlan.nodes(plan.lines().takeWhile { !it.trim().startsWith("Planning:") }.joinToString("\n"))
-                .maxOf { it.buffers }
-        assertThat(executionBuffers)
-            .describedAs(
-                "one pass over a %d-page manifest; the shape this excludes reads it five times " +
-                    "per catalog:%n%s",
-                heapPages,
-                plan,
-            )
-            .isLessThanOrEqualTo(heapPages * 2)
-
-        // THE BEFORE HALF, measured on the same rows rather than quoted
-        // from the review that raised it. This is the statement this
-        // change replaced, verbatim minus the columns that did not move,
-        // so the comparison is like for like.
-        val beforePlan =
-            db.jdbi.inTransactionUnchecked { h ->
-                h.execute("SET LOCAL max_parallel_workers_per_gather = 0")
-                h.createQuery(
-                    "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) $fiveSubquerySql",
-                ).mapTo(String::class.java).list().joinToString("\n")
-            }
-        val beforeBuffers =
-            ExplainPlan.nodes(beforePlan.lines().takeWhile { !it.trim().startsWith("Planning:") }.joinToString("\n"))
-                .maxOf { it.buffers }
-        println(
-            "[#193] metrics sample over a $heapPages-page manifest " +
-                "(${KEPT_FILES + DROPPED_FILES} file rows, 2 catalogs): " +
-                "five correlated subqueries = $beforeBuffers execution buffers, " +
-                "one grouped pass = $executionBuffers",
-        )
-        assertThat(executionBuffers)
-            .describedAs(
-                "the rewrite must be cheaper than the shape it replaced, on the SAME rows:%n" +
-                    "before:%n%s%nafter:%n%s",
-                beforePlan,
-                plan,
-            )
-            .isLessThan(beforeBuffers)
+        assertThat(manifestIndexLines).describedAs(plan).isNotEmpty()
+        for (line in manifestIndexLines) {
+            assertThat(line)
+                .describedAs("every manifest read must be through an attention index:%n%s", plan)
+                .containsPattern("hog_data_file_(pending|failed|missing_field_ids)\\b")
+        }
     }
 
     /**

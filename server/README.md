@@ -162,6 +162,15 @@ bad file never wedges a sweep, and a bound the codec can't represent
 safely (e.g. a timestamp whose unit conversion would overflow) stores
 as NULL — bounds are never guessed. Until hydrated, a pending file
 simply matches every scan: correctness holds, pruning quality lags.
+The sweep claims **per catalog** (#269): each catalog gets an even
+share of the sweep's limit off its own range of `hog_data_file_pending`
+(live pending rows only, V26), the order rotates so no catalog is
+always first, unused shares pass to catalogs with more work, and each
+claim runs under its own savepoint and timeout — a catalog whose claim
+is slow (a dropped table's pending backlog, walked and discarded until
+retirement deletes it) loses its share and is counted
+(`hoglake_hydrator_claim_timeouts_total{catalog}`); no other catalog
+waits on it.
 
 `null_count` is mandatory in `hog_file_column_stats`, so a leaf whose
 footer omits it in any row group gets **no row** — unless the leaf's
@@ -1518,8 +1527,14 @@ transaction (`observability/`):
   (`hoglake_missing_field_id_files`), live table
   count, per-consumer lag (cardinality-capped), and
   `hoglake_live_files{catalog}` (live data files, dropped tables
-  excluded; one more FILTER on the same manifest pass that yields
-  `hoglake_live_rows`/`_bytes`, so the three agree at one instant).
+  excluded). The three live totals are read from the maintenance
+  summary, which stamps them per catalog when it publishes a generation
+  (V27), not from the manifest (#269): one row per catalog, minutes
+  behind head on a large instance, and the sampler never scans
+  `hog_data_file` — the rare counts come from partial indexes (V26). A
+  catalog with no published totals yet publishes NO live series
+  (`hoglake_live_totals_sampled{catalog}` = 0) and `null` on the wire,
+  and is never read from its own manifest for them.
   The five EXTENDED groups — the gauges that replaced the DuckLake
   catalog-metrics cron's (millpond `tools/ducklake_metrics.py`) — run
   ONLY where `HOGLAKE_MAINTENANCE_SUMMARY_INTERVAL_MS > 0`, i.e. on the

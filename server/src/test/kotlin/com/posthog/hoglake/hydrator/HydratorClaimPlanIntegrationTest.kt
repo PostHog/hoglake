@@ -13,12 +13,13 @@ import org.junit.jupiter.api.TestInstance
 /**
  * `Hydrator.claimPending`'s PLAN, because #193 added a join to it.
  *
- * The claim is the head of the hydrator's sweep and it runs instance-
- * wide, unfiltered by catalog: it asks for the globally oldest
- * `pending` files and takes row locks on them. Before #193 it was a
- * single-table read driven by `hog_data_file_pending`, the partial
- * index on `stats_state = 'pending'`; it now joins `hog_table` so a
- * dropped table's pending rows are never claimed.
+ * The claim is the head of the hydrator's sweep and runs ONCE PER
+ * CATALOG (#269): it asks for the catalog's oldest live `pending`
+ * files past a cursor and takes row locks on them. Before #193 it was
+ * a single-table read driven by `hog_data_file_pending`, the partial
+ * index on `stats_state = 'pending' AND end_snapshot IS NULL` (V26);
+ * it now joins `hog_table` so a dropped table's pending rows are never
+ * claimed.
  *
  * A JOIN ADDED TO A HOT LOOP WITH NO PLAN TEST is how an index stops
  * being used without anything saying so. The failure this excludes is
@@ -153,7 +154,8 @@ class HydratorClaimPlanIntegrationTest {
                 h.createQuery(
                     "EXPLAIN (ANALYZE, BUFFERS, TIMING false, COSTS false, SUMMARY false) " +
                         Hydrator.CLAIM_PENDING_SQL,
-                ).bind("limit", LIMIT).mapTo(String::class.java).list().joinToString("\n")
+                ).bind("catalogId", catalogId).bind("after", Long.MIN_VALUE).bind("limit", LIMIT)
+                    .mapTo(String::class.java).list().joinToString("\n")
             }
     }
 
@@ -185,6 +187,14 @@ class HydratorClaimPlanIntegrationTest {
         assertThat(plan)
             .describedAs("the claim must be driven by the partial pending index:%n%s", plan)
             .contains("hog_data_file_pending")
+        // Per catalog (#269): the catalog is in the index's condition,
+        // so another catalog's backlog is never walked, and the
+        // continuation bound rides the same index.
+        assertThat(plan)
+            .describedAs("the claim must probe its own catalog, not walk the pending queue:%n%s", plan)
+            .containsPattern(
+                Regex("""Index Cond: \(\(catalog_id = '?\d+'?(::bigint)?\) AND \(data_file_id > """).toPattern(),
+            )
         // The LIMIT must be able to stop the scan: the index's order is
         // the statement's ORDER BY, so there is no Sort above it. A
         // Sort would read every pending row in the instance before the
@@ -252,6 +262,8 @@ class HydratorClaimPlanIntegrationTest {
         val claimed =
             db.jdbi.inTransactionUnchecked { h ->
                 h.createQuery(Hydrator.CLAIM_PENDING_SQL)
+                    .bind("catalogId", catalogId)
+                    .bind("after", Long.MIN_VALUE)
                     .bind("limit", LIMIT)
                     .map { rs, _ -> rs.getLong("table_id") }
                     .list()

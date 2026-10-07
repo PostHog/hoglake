@@ -346,6 +346,17 @@ object Metrics {
     fun hydratorTransientError() = increment("hoglake_hydrator_transient_errors_total", 1.0)
 
     /**
+     * hoglake_hydrator_claim_timeouts_total{catalog} — sweeps in which
+     * this catalog's claim exceeded the hydrator's claim timeout and
+     * was skipped (#269: the catalog lost its share of that sweep; no
+     * other catalog was affected). A catalog that counts here every
+     * sweep has a pending backlog the claim walks and discards — a
+     * dropped table's rows, until retirement deletes them.
+     */
+    fun hydratorClaimTimeout(catalog: String) =
+        increment("hoglake_hydrator_claim_timeouts_total", 1.0, "catalog", catalog)
+
+    /**
      * hoglake_rows_retired_total{catalog} — file METADATA rows a
      * retirement run deleted off dropped tables (data files + deletion
      * vectors), each of which queued one path for the cleanup drain.

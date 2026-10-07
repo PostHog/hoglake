@@ -75,13 +75,24 @@ import java.time.Instant
  * instead of racing the same pending head through S3 (the guarded flip
  * kept that correct but paid N× the GETs). The row locks are held across
  * the footer fetches — acceptable for a background sweep bounded by
- * [runOnce]'s limit; foreground paths never lock pending rows.
+ * [runOnce]'s limit; foreground paths never lock pending rows. The claim
+ * is PER CATALOG, each under its own savepoint and timeout
+ * ([claimPending], #269): catalogs share the sweep's limit evenly, and
+ * a catalog whose claim is slow loses its share, not the sweep.
  */
 class Hydrator(
     private val jdbi: Jdbi,
     private val store: ObjectStore,
     /** Whole-object fallback cap; see class KDoc. */
     private val maxWholeObjectBytes: Long = DEFAULT_MAX_WHOLE_OBJECT_BYTES,
+    /**
+     * statement_timeout for ONE catalog's claim inside the sweep
+     * ([claimPending]); a catalog whose claim exceeds it is skipped
+     * for the sweep. A claim is `limit` rows off one index range, so
+     * the default is generous for any catalog that is not wedged.
+     * `HOGLAKE_HYDRATOR_CLAIM_TIMEOUT_MS` (Config.hydratorClaimTimeoutMs).
+     */
+    private val claimTimeoutMs: Long = DEFAULT_CLAIM_TIMEOUT_MS,
     /**
      * Most row groups whose offsets a hydrated file stores
      * ([SplitOffsets.MAX_ROW_GROUPS]); past it the file hydrates with no
@@ -111,16 +122,161 @@ class Hydrator(
     private class TransientFetchException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
     /**
-     * The sweep's claim query: pending rows in (catalog_id, data_file_id)
-     * order, locked FOR UPDATE with SKIP LOCKED so a concurrent replica's
-     * sweep claims a disjoint set. Must run inside the sweep transaction
-     * (the locks ARE the claim).
+     * The sweep's claim, PER CATALOG with a fair share of [limit] (#269).
+     *
+     * One instance-wide claim ordered by `(catalog_id, data_file_id)`
+     * served the lowest catalog id first: a catalog with a backlog sat
+     * at the head of the queue and every catalog behind it waited until
+     * that backlog drained, however small their own. Now each catalog
+     * is claimed on its own, with an even share of the limit; a second
+     * pass hands what the first left unused to the catalogs that filled
+     * their share, evenly again, continuing past the rows they already
+     * hold (`data_file_id > :after`, since the claim orders by it —
+     * SKIP LOCKED skips OTHER transactions' locks, not our own, so a
+     * re-run of the same claim would return the same rows).
+     *
+     * ROTATION, BY CATALOGS SERVED. When there are more catalogs than
+     * the limit, each sweep can serve only `limit` of them (one row
+     * each), so the start of the order advances by the number served:
+     * every catalog's turn comes once per `ceil(catalogs / limit)`
+     * sweeps. Advancing by ONE would serve a window of catalogs for
+     * `limit` consecutive sweeps and starve the rest for the remainder
+     * — at 5,000 catalogs and a limit of 1,000 that is ten days on,
+     * forty off. The counter is seeded at random per replica so
+     * replicas booted together do not walk the same window in step
+     * (SKIP LOCKED keeps their rows disjoint; it does not spread them).
+     *
+     * EACH CATALOG'S CLAIM IS ITS OWN UNIT OF WORK, under a savepoint
+     * and [claimTimeoutMs]: a claim that times out — a dropped table's
+     * 10^7 still-pending rows, which the index holds and the hog_table
+     * join discards, walked every sweep until retirement deletes them
+     * — costs that catalog its share, is counted
+     * (`hoglake_hydrator_claim_timeouts_total{catalog}`) and logged, and
+     * the sweep goes on to the next catalog. Without the savepoint the
+     * timeout aborted the ONE sweep transaction, and with it every
+     * other catalog's hydration, which is the instance-wide blocking
+     * this change exists to end. A claim that fails for any other
+     * reason still fails the sweep: that is a database that is not
+     * answering, not a catalog that is slow.
+     *
+     * Cost per sweep is O(catalogs) statements, one per catalog with
+     * work plus one empty descent of `hog_data_file_pending` per
+     * catalog without (a fraction of a millisecond each; thousands of
+     * catalogs are seconds inside a fifteen-minute sweep). The pending
+     * index is never walked across catalogs. Must run inside the sweep
+     * transaction (the locks ARE the claim).
      */
     internal fun claimPending(
         h: Handle,
         limit: Int,
+    ): List<PendingFile> {
+        if (limit <= 0) return emptyList()
+        val names =
+            h.createQuery("SELECT catalog_id, name FROM hog_catalog ORDER BY catalog_id")
+                .map { rs, _ -> rs.getLong("catalog_id") to rs.getString("name") }
+                .list().toMap(java.util.LinkedHashMap())
+        val catalogs = names.keys.toList()
+        if (catalogs.isEmpty()) return emptyList()
+        val start = Math.floorMod(rotation.get(), catalogs.size)
+        val order = catalogs.drop(start) + catalogs.take(start)
+        val share = maxOf(1, limit / order.size)
+        val claimed = mutableListOf<PendingFile>()
+        val filled = mutableListOf<Pair<Long, Long>>() // catalog -> last id claimed, when its share filled
+        var served = 0
+        // The claim's statement_timeout for the length of the loop,
+        // restored after it (set_config's `is_local` is SET LOCAL, and a
+        // SET LOCAL survives RELEASE SAVEPOINT — hence outside the
+        // savepoints, once, and put back by hand).
+        val sessionTimeout =
+            h.createQuery("SELECT current_setting('statement_timeout')").mapTo(String::class.java).one()
+        setStatementTimeout(h, "${claimTimeoutMs}ms")
+        try {
+            for (catalogId in order) {
+                val room = minOf(share, limit - claimed.size)
+                if (room <= 0) break
+                served++
+                val rows =
+                    claimBounded(h, catalogId, names.getValue(catalogId), after = Long.MIN_VALUE, limit = room)
+                        ?: continue
+                claimed += rows
+                if (rows.size == room) filled += catalogId to rows.last().dataFileId
+            }
+            // The leftover, shared evenly among the catalogs that filled
+            // their share, in the same order; what one cannot use passes
+            // to the next.
+            var left = filled.size
+            for ((catalogId, after) in filled) {
+                val remaining = limit - claimed.size
+                val room = minOf(maxOf(1, remaining / left), remaining)
+                left--
+                if (room <= 0) break
+                claimed +=
+                    claimBounded(h, catalogId, names.getValue(catalogId), after = after, limit = room) ?: continue
+            }
+        } finally {
+            setStatementTimeout(h, sessionTimeout)
+        }
+        // Advance past the catalogs this sweep served; by one when it
+        // served them all, so the leftover's first taker rotates too.
+        rotation.addAndGet(if (served >= catalogs.size) 1 else served)
+        return claimed
+    }
+
+    /** Where the next sweep's catalog order starts; seeded at random so replicas differ. */
+    private val rotation =
+        java.util.concurrent.atomic.AtomicInteger(java.util.concurrent.ThreadLocalRandom.current().nextInt())
+
+    private fun setStatementTimeout(
+        h: Handle,
+        value: String,
+    ) {
+        h.createQuery("SELECT set_config('statement_timeout', :t, true)").bind("t", value)
+            .mapTo(String::class.java).one()
+    }
+
+    /**
+     * [claimCatalog] under a savepoint: null when the claim timed out
+     * (SQLSTATE 57014, `query_canceled`), which rolls back to the
+     * savepoint and leaves the sweep transaction usable; any other
+     * failure propagates.
+     */
+    private fun claimBounded(
+        h: Handle,
+        catalogId: Long,
+        catalog: String,
+        after: Long,
+        limit: Int,
+    ): List<PendingFile>? {
+        h.savepoint(CLAIM_SAVEPOINT)
+        return try {
+            claimCatalog(h, catalogId, after, limit).also { h.release(CLAIM_SAVEPOINT) }
+        } catch (e: Exception) {
+            if (!isQueryCanceled(e)) throw e
+            h.rollbackToSavepoint(CLAIM_SAVEPOINT)
+            Metrics.hydratorClaimTimeout(catalog)
+            log.warn {
+                "hydrator claim for catalog '$catalog' exceeded ${claimTimeoutMs}ms and was skipped this " +
+                    "sweep (a backlog of pending rows the claim walks and discards — a dropped table's, " +
+                    "until retirement deletes them); other catalogs are unaffected"
+            }
+            null
+        }
+    }
+
+    private fun isQueryCanceled(e: Throwable): Boolean =
+        generateSequence(e) { it.cause.takeIf { c -> c !== it } }
+            .any { it is java.sql.SQLException && it.sqlState == "57014" }
+
+    /** One catalog's claim: its pending, live, undropped files after [after], locked. */
+    internal fun claimCatalog(
+        h: Handle,
+        catalogId: Long,
+        after: Long,
+        limit: Int,
     ): List<PendingFile> =
         h.createQuery(CLAIM_PENDING_SQL)
+            .bind("catalogId", catalogId)
+            .bind("after", after)
             .bind("limit", limit)
             .map { rs, _ ->
                 PendingFile(
@@ -142,7 +298,7 @@ class Hydrator(
      * attempted). Each file's writes ride a savepoint so one file's DB
      * failure never poisons the sweep transaction for the rest.
      *
-     * The sweep is instance-wide, so its ledger rows fan out per catalog:
+     * The sweep spans every catalog, so its ledger rows fan out per catalog:
      * one hog_maintenance_run row per catalog the sweep claimed files for,
      * recorded AFTER the sweep transaction commits (a no-claim sweep
      * records nothing — a catalog's waiting work is the stats_state
@@ -283,6 +439,7 @@ class Hydrator(
                         UPDATE hog_data_file f
                            SET stats_state = 'pending'
                         WHERE f.catalog_id = :catalogId AND f.stats_state = 'failed'
+                          AND f.end_snapshot IS NULL
                           AND (:tableId::bigint IS NULL OR f.table_id = :tableId)
                           AND EXISTS (
                               SELECT 1 FROM hog_table t
@@ -723,11 +880,17 @@ class Hydrator(
          * stay pending and this sweep would otherwise keep claiming
          * them — fetching footers from S3 to write stats onto rows the
          * retirement loop is about to delete, and holding row locks on
-         * a dropped table while it does. The sweep is instance-wide and
-         * ordered by (catalog_id, data_file_id), so a big dropped
-         * table's pending backlog would sit at the HEAD of the queue
+         * a dropped table while it does. The claim is ordered by
+         * data_file_id within the catalog, so a big dropped table's
+         * pending backlog would sit at the HEAD of the catalog's queue
          * and starve every live table behind it, forever, on a catalog
-         * whose floor has not reached the drop yet.
+         * whose floor has not reached the drop yet. The join discards
+         * them, but the index range still WALKS them — index-only
+         * since V26 put `table_id` in the index's payload, one memoized
+         * hog_table probe per table, and still O(backlog) per sweep
+         * until retirement deletes the rows. [claimPending]'s
+         * per-catalog timeout is what bounds that walk's cost to the
+         * one catalog.
          *
          * It is also what lets the retirement batch's victim select
          * drop its `FOR UPDATE`: the hydrator was the only row-level
@@ -737,11 +900,28 @@ class Hydrator(
          * `FOR UPDATE OF f`, not a bare `FOR UPDATE`: the join must not
          * take row locks on `hog_table`, which every DDL path writes.
          * The scan stays driven by `hog_data_file_pending` (the partial
-         * index on `stats_state = 'pending'`) with a primary-key probe
-         * into `hog_table` per claimed row — asserted in
+         * index on `stats_state = 'pending' AND end_snapshot IS NULL`,
+         * `(catalog_id, data_file_id)`), probed by `catalog_id` and
+         * continued past `:after`, with a primary-key probe into
+         * `hog_table` per claimed row — asserted in
          * `HydratorClaimPlanIntegrationTest`, because a join added to a
          * hot loop with no plan test is how an index stops being used
          * without anything saying so.
+         *
+         * `f.end_snapshot IS NULL` (#269): an ENDED pending row — the
+         * file was compacted away, or its snapshot expired, before the
+         * hydrator reached it — is not work either. Its stats would be
+         * written onto a row no scan can return, after a footer read
+         * from the object store for nothing. The term is IN THE INDEX'S
+         * PREDICATE (V26), not merely in this WHERE: a row the claim
+         * skips must not stay in the index the claim walks, or every
+         * sweep would walk the catalog's whole ended-pending residue —
+         * unbounded on a retention-NULL catalog, where nothing deletes
+         * ended rows — before reaching its first live row. With it in
+         * the predicate, the UPDATE that ends a row drops it from the
+         * index at that moment. The same rule keeps `rehydrateFailed`
+         * from requeueing an ended failed row: the sweep would never
+         * take it, and the backlog gauge would count it forever.
          */
         internal const val CLAIM_PENDING_SQL: String =
             """
@@ -750,9 +930,12 @@ class Hydrator(
             FROM hog_data_file f
             JOIN hog_table t
               ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
-            WHERE f.stats_state = 'pending'
+            WHERE f.catalog_id = :catalogId
+              AND f.stats_state = 'pending'
+              AND f.data_file_id > :after
+              AND f.end_snapshot IS NULL
               AND t.dropped_snapshot IS NULL
-            ORDER BY f.catalog_id, f.data_file_id
+            ORDER BY f.data_file_id
             LIMIT :limit
             FOR UPDATE OF f SKIP LOCKED
             """
@@ -805,6 +988,17 @@ class Hydrator(
 
         /** Per-file savepoint name inside the sweep transaction. */
         private const val FILE_SAVEPOINT = "hoglake_hydrate_file"
+
+        private const val CLAIM_SAVEPOINT = "hoglake_hydrate_claim"
+
+        /**
+         * [Hydrator.claimTimeoutMs]'s default. A claim is one range of
+         * `hog_data_file_pending` bounded by its LIMIT; ten seconds is
+         * four orders of magnitude over a healthy one and well under the
+         * session's 60 s, so the sweep spends at most this per wedged
+         * catalog and never its whole statement budget on one.
+         */
+        const val DEFAULT_CLAIM_TIMEOUT_MS: Long = 10_000
     }
 }
 
