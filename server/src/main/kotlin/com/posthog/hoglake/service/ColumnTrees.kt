@@ -71,13 +71,16 @@ object ColumnTrees {
                     "(a top-level column is depth 1)",
             )
         }
-        validateSiblings(defs, path = emptyList(), syntheticallyNamed = false)
+        // A subtree grafted into a struct (depthOffset > 0) is nested
+        // even at its root.
+        validateSiblings(defs, path = emptyList(), syntheticallyNamed = false, topLevel = depthOffset == 0)
     }
 
     private fun validateSiblings(
         defs: List<ColumnDef>,
         path: List<String>,
         syntheticallyNamed: Boolean,
+        topLevel: Boolean,
     ) {
         val dupes = defs.groupingBy { it.name }.eachCount().filterValues { it > 1 }.keys
         if (dupes.isNotEmpty()) {
@@ -91,13 +94,14 @@ object ColumnTrees {
                 "duplicate column names$where: ${dupes.sorted().map { Identifiers.cap(it) }}",
             )
         }
-        for (def in defs) validateNode(def, path, syntheticallyNamed)
+        for (def in defs) validateNode(def, path, syntheticallyNamed, topLevel)
     }
 
     private fun validateNode(
         def: ColumnDef,
         path: List<String>,
         syntheticallyNamed: Boolean,
+        topLevel: Boolean,
     ) {
         TableMetadata.validateComment(def.comment)
         val here = path + def.name
@@ -156,6 +160,7 @@ object ColumnTrees {
                     "column '$qualified' is '${def.type.wire}', a scalar type, and cannot have children",
                 )
             }
+            validateShredding(def, qualified, topLevel)
             return
         }
 
@@ -213,7 +218,41 @@ object ColumnTrees {
                 )
             }
         }
-        validateSiblings(children, here, syntheticallyNamed = synthetic != null)
+        validateSiblings(children, here, syntheticallyNamed = synthetic != null, topLevel = false)
+    }
+
+    /**
+     * A scalar's `type_params.shredding`, the layout a variant column
+     * declares for the writers that shred it ([VariantShredding]).
+     *
+     * Only a top-level variant takes one, and a variant takes no other
+     * parameter: a misspelt key, or a declaration on a column of another
+     * type (the `json` column that a variant is meant to replace), would
+     * otherwise be stored, handed back on every read and silently honoured
+     * by no writer, which is the failure this check exists to prevent.
+     * `"shredding": null` declares nothing, as on the connector.
+     */
+    private fun validateShredding(
+        def: ColumnDef,
+        qualified: String,
+        topLevel: Boolean,
+    ) {
+        val params = def.typeParams ?: return
+        if (def.type != ColType.VARIANT) {
+            if (VariantShredding.KEY in params) throw VariantShredding.notVariant(qualified, def.type.wire)
+            return
+        }
+        // The first unknown key only, CAPPED: the map is caller input of
+        // any size, and its keys have met no identifier policy.
+        params.keys.firstOrNull { it != VariantShredding.KEY }?.let {
+            throw HoglakeException.Validation(
+                "variant column '$qualified' has an unknown type_params key '${Identifiers.cap(it)}': " +
+                    "a variant takes only '${VariantShredding.KEY}'",
+            )
+        }
+        val declaration = params[VariantShredding.KEY] ?: return
+        if (!topLevel) throw VariantShredding.nested(qualified)
+        VariantShredding.validate(declaration, qualified)
     }
 
     /**

@@ -1,0 +1,5 @@
+{"namespace":"ns","name":"t","columns":[{"name":"id","type":"long"},
+                       {"name":"properties","type":"variant","type_params":{"shredding":{"type":"object",
+                        "fields":[{"name":"$browser","type":"string"},
+                        {"name":"price","type":"decimal8","precision":18,"scale":2},
+                        {"name":"tags","type":"array","element":{"type":"string"}}]}}}]}

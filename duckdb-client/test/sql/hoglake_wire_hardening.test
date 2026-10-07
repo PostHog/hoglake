@@ -2,8 +2,8 @@
 # description: round-3 hardening — wire- or user-supplied values must
 #   only ever produce typed, catchable errors, NEVER an
 #   InternalException (which DuckDB escalates to whole-instance
-#   invalidation). The fixture registers poison tables (via raw REST —
-#   shapes other clients can legally create) in duckext-read/ns1:
+#   invalidation). The live-test proxy poisons metadata responses for
+#   valid fixture tables in duckext-read/ns1:
 #   bad_dec100 (decimal precision 100), bad_dec_nop (decimal, no
 #   type_params), bad_cols (case-colliding columns), plus
 #   duckext-sqltest/ns1.dup_path (one physical parquet registered as

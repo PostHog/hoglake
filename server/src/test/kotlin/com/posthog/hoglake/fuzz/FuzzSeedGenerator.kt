@@ -70,6 +70,7 @@ object FuzzSeedGenerator {
         seedDtoTarget(root)
         seedTableCreationCodecTarget(root)
         seedCommitReceiptTarget(root)
+        seedVariantShreddingTarget(root)
 
         println("fuzz seed corpus written under $root")
     }
@@ -328,6 +329,19 @@ object FuzzSeedGenerator {
                        {"op":"set_sort_order","sort_fields":[
                           {"source_field_id":1,"direction":"asc","null_order":"nulls_last"}]}]}""",
                 "alter_unknown_op" to """{"ops":[{"op":"explode"}]}""",
+                // A variant's shredded layout, which a definition carries in
+                // type_params and which the target checks as the DDL paths
+                // do: one every writer can honour, and one nested in a
+                // struct, where none can.
+                "creation_variant_shredding" to
+                    """{"namespace":"ns","name":"t","columns":[{"name":"id","type":"long"},
+                       {"name":"properties","type":"variant","type_params":{"shredding":{"type":"object",
+                        "fields":[{"name":"${'$'}browser","type":"string"},
+                        {"name":"price","type":"decimal8","precision":18,"scale":2},
+                        {"name":"tags","type":"array","element":{"type":"string"}}]}}}]}""",
+                "creation_variant_shredding_nested" to
+                    """{"namespace":"ns","name":"t","columns":[{"name":"r","type":"struct","children":[
+                       {"name":"x","type":"variant","type_params":{"shredding":{"type":"string"}}}]}]}""",
                 // int128, not uint64: uint64 is a real type now. This seed
                 // must stay a name the parser REJECTS, and a permanently
                 // refused one exercises the named-refusal branch too.
@@ -402,6 +416,61 @@ object FuzzSeedGenerator {
             "scan_stats_fields_int64" to "column_stats$nul-9223372036854775808,9223372036854775807",
             "scan_stats_fields_over_cap" to "column_stats$nul" + (1..10_001).joinToString(","),
         )
+    }
+
+    // ---- type_params.shredding -------------------------------------------------
+
+    /**
+     * Seeds for the declaration target. Its input ends with the byte that
+     * picks the mode (FuzzedDataProvider takes integral values from the
+     * END): 1 for a declaration as a request carries it, which is the rest
+     * of the input, and 0 for generator entropy. The declarations are the
+     * documented example, each kind of refusal once, and the field and
+     * depth limits on both sides.
+     */
+    private fun seedVariantShreddingTarget(root: Path) {
+        val out = dir(root, "VariantShreddingFuzzTest", "declarationsFollowTheDocumentedRules")
+        val deepest = (1..16).fold("""{"type":"string"}""") { inner, _ -> """{"type":"array","element":$inner}""" }
+
+        fun fields(count: Int) =
+            (0 until count).joinToString(",", """{"type":"object","fields":[""", "]}") {
+                """{"name":"k$it","type":"string"}"""
+            }
+        val declarations =
+            mapOf(
+                "documented" to
+                    """{"type":"object","fields":[{"name":"${'$'}browser","type":"string"},
+                       {"name":"price","type":"decimal8","precision":18,"scale":2},
+                       {"name":"tags","type":"array","element":{"type":"string"}},
+                       {"name":"payload","type":"variant"}]}""",
+                "primitive_root" to """{"type":"timestamptz_ns"}""",
+                "unknown_type" to """{"type":"text"}""",
+                "unknown_key" to """{"type":"string","nullable":true}""",
+                "no_fields" to """{"type":"object","fields":[]}""",
+                "no_element" to """{"type":"array"}""",
+                "field_without_name" to """{"type":"object","fields":[{"type":"string"}]}""",
+                "case_collision" to
+                    """{"type":"object","fields":[{"name":"plan","type":"string"},
+                       {"name":"Plan","type":"string"}]}""",
+                "decimal_too_wide" to """{"type":"decimal4","precision":10,"scale":2}""",
+                "decimal_fractional_precision" to """{"type":"decimal8","precision":18.0,"scale":2}""",
+                "decimal_narrowing_precision" to """{"type":"decimal8","precision":4294967314,"scale":2}""",
+                "depth_limit" to deepest,
+                "depth_over_limit" to """{"type":"array","element":$deepest}""",
+                "fields_limit" to fields(1000),
+                "fields_over_limit" to fields(1001),
+                "not_an_object" to """["string"]""",
+            )
+        for ((name, value) in declarations) {
+            write(out, "request_$name", value.trimIndent().toByteArray(Charsets.UTF_8) + byteArrayOf(1))
+        }
+        // Generator entropy: a spread of lengths and byte patterns, as for
+        // the nested agreement target.
+        val random = Random(29)
+        for (length in listOf(1, 2, 8, 32, 128, 512)) {
+            write(out, "generated_random_$length", ByteArray(length - 1).also(random::nextBytes) + byteArrayOf(0))
+            write(out, "generated_ones_$length", ByteArray(length - 1) { 0x7f } + byteArrayOf(0))
+        }
     }
 
     // ---- table creation definition codec ---------------------------------------

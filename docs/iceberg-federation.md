@@ -535,5 +535,8 @@ Prepared-file validation requires the native Parquet VARIANT(1) group annotation
 and its metadata/value storage shape; an ordinary struct is not equivalent.
 Shredded child statistics are not whole-column statistics and are omitted.
 Compaction planning skips tables with live VARIANT columns, and the scalar
-rewriter rejects them explicitly. Reader support must be verified per engine;
+rewriter rejects them explicitly. A top-level variant may declare the shredded
+layout writers give it (`type_params.shredding`); it is catalog metadata for
+writers, has no Iceberg counterpart, and no read depends on it. Reader support
+must be verified per engine;
 this does not enable an Iceberg REST facade or the buffered-ingestion CLI.

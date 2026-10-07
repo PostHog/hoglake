@@ -1,0 +1,2 @@
+{"namespace":"ns","name":"t","columns":[{"name":"r","type":"struct","children":[
+                       {"name":"x","type":"variant","type_params":{"shredding":{"type":"string"}}}]}]}

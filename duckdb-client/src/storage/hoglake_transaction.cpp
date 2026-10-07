@@ -104,11 +104,14 @@ HoglakeTravel HoglakeTransaction::TravelFor(optional_ptr<BoundAtClause> at_claus
 //===--------------------------------------------------------------------===//
 
 void HoglakeTransaction::AddAppend(const string &ns, const string &table, const string &expected_table_uuid,
-                                   vector<HoglakeFileRegistration> files) {
+                                   idx_t read_snapshot, vector<HoglakeFileRegistration> files) {
 	if (files.empty()) {
 		return;
 	}
 	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
+	if (!append_read_snapshot.IsValid() || read_snapshot < append_read_snapshot.GetIndex()) {
+		append_read_snapshot = read_snapshot;
+	}
 	for (auto &append : buffered_appends) {
 		if (StringUtil::CIEquals(append.namespace_name, ns) && StringUtil::CIEquals(append.table_name, table)) {
 			for (auto &file : files) {
@@ -209,10 +212,10 @@ bool HoglakeTransaction::IsAlteredTable(const string &ns, const string &table) {
 }
 
 //! Self-conflict prevention: the server's commit conflict check (runs
-//! iff the commit carries deletes) scans table_dropped/table_altered
+//! whenever read_snapshot is present) scans table_dropped/table_altered
 //! changes after read_snapshot over every TOUCHED table (appends and
 //! deletes alike). An eager ALTER inside this transaction mints such a
-//! change AFTER the pin, so a later commit-with-deletes touching that
+//! change AFTER the pin, so a later commit using that pin and touching that
 //! table would deterministically 409 against our own DDL. These rules
 //! keep touched∩altered empty whenever deletes are present.
 void HoglakeTransaction::RequireDMLAllowed(const string &ns, const string &table, bool is_delete) {
@@ -308,15 +311,14 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 		request.deletes = std::move(buffered_deletes);
 		buffered_appends.clear();
 		buffered_deletes.clear();
-		// append-only commits are blind (no read_snapshot: no conflict
-		// window; the incarnation guard rides expected_table_uuid).
-		// Deletes REQUIRE a read_snapshot (they always conflict-check) —
-		// and a delete conflict is never auto-retried: the superseded
-		// deletion vector must be rebuilt against the new state, so the
-		// statement has to be re-run.
+		request.read_snapshot = append_read_snapshot;
+		append_read_snapshot = optional_idx();
 		has_deletes = !request.deletes.empty();
 		if (has_deletes) {
-			request.read_snapshot = GetSnapshotInternal();
+			auto delete_snapshot = GetSnapshotInternal();
+			if (!request.read_snapshot.IsValid() || delete_snapshot < request.read_snapshot.GetIndex()) {
+				request.read_snapshot = delete_snapshot;
+			}
 		}
 	}
 
@@ -342,9 +344,9 @@ void HoglakeTransaction::Commit(ClientContext &context) {
 		idx_t sleep_ms = 0;
 		if (outcome.status == 409) {
 			auto text = StringUtil::Lower(outcome.error + " " + outcome.detail);
-			if (StringUtil::Contains(text, RECREATED_MARKER)) {
-				// incarnation guard: atomic refusal, never retryable
-				throw TransactionException("%s", message);
+			if (outcome.error != "commit_conflict" || StringUtil::Contains(text, RECREATED_MARKER)) {
+				throw TransactionException("%s (start a new transaction and re-run the statement)",
+				                           message);
 			}
 			if (has_deletes) {
 				throw TransactionException("%s (a conflicting commit superseded this transaction's deletion "
@@ -378,6 +380,7 @@ void HoglakeTransaction::Rollback() {
 	std::lock_guard<std::recursive_mutex> guard(transaction_lock);
 	buffered_appends.clear();
 	buffered_deletes.clear();
+	append_read_snapshot = optional_idx();
 }
 
 //===--------------------------------------------------------------------===//
