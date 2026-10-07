@@ -688,9 +688,11 @@ ran on the local stack and what it showed.
     `ALTER TABLE` (ADD COLUMN included — it is ACCESS EXCLUSIVE even
     when metadata-only), `ADD/DROP CONSTRAINT`, `DROP INDEX` and any
     backfill `UPDATE` sit after the V9 save+`SET lock_timeout = '5s'`
-    and before the restore; only `CREATE INDEX CONCURRENTLY` sits
-    outside it, because that build waits out older transactions by
-    design. A migration session has no `lock_timeout` of its own, so an
+    and before the restore; only `CREATE INDEX CONCURRENTLY` and
+    `DROP INDEX CONCURRENTLY` sit outside it, because both wait out
+    older transactions by design (a wait a 5 s `lock_timeout` would
+    abort while a hydrator sweep holds the index) and neither blocks a
+    write while they wait. A migration session has no `lock_timeout` of its own, so an
     unguarded ALTER queues behind one in-flight commit for up to the
     statement timeout and every reader queues behind IT, while every
     other booting pod waits on the Flyway advisory lock. V10 put its

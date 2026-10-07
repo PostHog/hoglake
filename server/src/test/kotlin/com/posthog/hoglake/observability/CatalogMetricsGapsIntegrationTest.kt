@@ -69,7 +69,16 @@ class CatalogMetricsGapsIntegrationTest {
         /** Compaction target for the sample: 100-byte files are small, 5,000-byte ones are not. */
         const val TARGET = 1_000L
 
-        /** Live data files on live tables: big 4 + little 2 + late 1 + newname 1. */
+        /**
+         * Live data files as the PUBLISHED GENERATION has them, less the
+         * tables dropped since: big 4 + little 3 (two bucket rows in the
+         * generation, see the fixture) + newname 1. NOT `late` (created
+         * after the generation's snapshot), NOT gone's 5 or gone2's 1
+         * (in the generation, dropped after it, subtracted), NOT the
+         * ended row on big. The manifest arithmetic — big 4 + little 2 +
+         * late 1 + newname 1 — happens to be 8 as well, so the live
+         * ROWS, which the two sums disagree on, are what the test pins.
+         */
         const val LIVE_FILES = 8.0
 
         val TABLE_FAMILIES =
@@ -295,6 +304,22 @@ class CatalogMetricsGapsIntegrationTest {
                 published,
                 littleId,
             )
+            // Re-stamp the published generation's live totals (V27) the
+            // way its publish did, now that the generation has one more
+            // bucket row than when it published: in production the
+            // target change happens mid-scan and the publish sums it.
+            h.execute(
+                """
+                UPDATE hog_maintenance_summary ms
+                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows
+                  FROM (SELECT SUM(file_count) AS files, SUM(total_bytes) AS bytes, SUM(record_count) AS rows
+                          FROM hog_maintenance_summary_tier WHERE catalog_id = ? AND generation = ?) tot
+                 WHERE ms.catalog_id = ?
+                """,
+                catalogId,
+                published,
+                catalogId,
+            )
 
             // The floor moved past a snapshot that is still present: the
             // two oldest snapshots backdated by an hour and half an hour,
@@ -388,10 +413,40 @@ class CatalogMetricsGapsIntegrationTest {
     }
 
     @Test
-    fun `live files ride the manifest pass and exclude dropped tables and ended rows`() {
+    fun `live totals are the published generation's less the tables dropped since, never the manifest's`() {
         metrics.sampleOnce()
-        // NOT gone's 5 (dropped, still live rows), NOT the ended row on big.
         assertThat(value("hoglake_live_files", "catalog", CAT)).isEqualTo(LIVE_FILES)
+        assertThat(value("hoglake_live_totals_sampled", "catalog", CAT)).isEqualTo(1.0)
+        assertThat(value("hoglake_live_totals_age_seconds", "catalog", CAT)).isNotNull()
+        // The rows: the generation's buckets on tables still live, which
+        // is NOT the manifest's number — the manifest has `late`'s rows
+        // and lacks the second little bucket's 7. MUTATION: sum
+        // hog_data_file instead and this reads the manifest's.
+        val generationRows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT SUM(p.record_count) FROM hog_maintenance_summary_tier p
+                      JOIN hog_maintenance_summary ms ON ms.catalog_id = p.catalog_id
+                       AND p.generation = ms.published_generation
+                      JOIN hog_table t ON t.catalog_id = p.catalog_id AND t.table_id = p.table_id
+                     WHERE p.catalog_id = :c AND t.dropped_snapshot IS NULL
+                    """,
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        val manifestRows =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT SUM(f.record_count) FROM hog_data_file f
+                      JOIN hog_table t ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
+                     WHERE f.catalog_id = :c AND f.end_snapshot IS NULL AND t.dropped_snapshot IS NULL
+                    """,
+                ).bind("c", catalogId).mapTo(Long::class.java).one()
+            }
+        assertThat(generationRows).isNotEqualTo(manifestRows)
+        assertThat(value("hoglake_live_rows", "catalog", CAT)).isEqualTo(generationRows.toDouble())
+        // An empty catalog with a generation: zero, present.
         assertThat(value("hoglake_live_files", "catalog", NEIGHBOUR)).isEqualTo(0.0)
     }
 
@@ -447,8 +502,20 @@ class CatalogMetricsGapsIntegrationTest {
             assertThat(tableSeries(registry, family, UNSAMPLED)).describedAs(family).isEmpty()
         }
         assertThat(value("hoglake_table_series_truncated", "catalog", UNSAMPLED)).isNull()
-        // The core group still covers it.
-        assertThat(value("hoglake_live_files", "catalog", UNSAMPLED)).isEqualTo(1.0)
+        // The core group still covers it — table count, backlog counts
+        // — but its live totals are ABSENT, with the flag saying so, not
+        // read from its manifest (#269: the catalog that cannot publish
+        // a generation is the one whose manifest must not be scanned
+        // every tick). MUTATION: put the per-catalog manifest fallback
+        // back and this reads 1.
+        assertThat(value("hoglake_table_count", "catalog", UNSAMPLED)).isEqualTo(1.0)
+        assertThat(value("hoglake_live_totals_sampled", "catalog", UNSAMPLED)).isEqualTo(0.0)
+        assertThat(value("hoglake_live_files", "catalog", UNSAMPLED)).isNull()
+        assertThat(value("hoglake_live_rows", "catalog", UNSAMPLED)).isNull()
+        assertThat(value("hoglake_live_bytes", "catalog", UNSAMPLED)).isNull()
+        assertThat(value("hoglake_live_totals_age_seconds", "catalog", UNSAMPLED)).isNull()
+        assertThat(metrics.latestByCatalog.getValue(UNSAMPLED).liveRows).isNull()
+        assertThat(metrics.latestTotals!!.unsampledCatalogs).isEqualTo(1)
     }
 
     @Test
@@ -462,6 +529,11 @@ class CatalogMetricsGapsIntegrationTest {
             // MUTATION: drop the `measured` filter and rows appear.
             assertThat(tableSeries(reg, "hoglake_table_rows")).isEmpty()
             assertThat(value(reg, "hoglake_table_files", *table("big"))).isEqualTo(4.0)
+            // The catalog's rows are withheld by the same rule (files and
+            // bytes are not: the measure they come from is complete).
+            assertThat(value(reg, "hoglake_live_rows", "catalog", CAT)).isNull()
+            assertThat(value(reg, "hoglake_live_files", "catalog", CAT)).isEqualTo(LIVE_FILES)
+            assertThat(value(reg, "hoglake_live_totals_sampled", "catalog", CAT)).isEqualTo(1.0)
         } finally {
             db.jdbi.useHandleUnchecked {
                 it.execute(

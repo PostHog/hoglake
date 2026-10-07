@@ -2620,11 +2620,17 @@ paths:
         came off the pipeline, its build stamp — the webui shows both
         beside the brand so the deployed build is readable without
         shelling in. Also carries instance-wide live-data totals for the
-        webui header: sums over live data files (end_snapshot unset)
-        across every catalog, refreshed by the server's periodic metrics
-        sampler — display numbers, not a consistency primitive.
-        total_rows is gross of deletion-vector masking. Both totals are
-        omitted in the boot window before the first sample.
+        webui header: sums over live data files across every catalog,
+        refreshed by the server's periodic metrics sampler from each
+        catalog's maintenance summary, as of its published generation
+        (minutes behind head on a large instance, hours on a very
+        large one) — display numbers, not a consistency primitive.
+        total_rows is gross of deletion-vector masking. A catalog whose
+        maintenance summary has not yet published totals contributes
+        NOTHING to the sums and is never read from its own manifest for
+        them; unsampled_catalogs counts those, so a reader can tell a
+        partial sum from a whole one. All three are omitted in the boot
+        window before the first sample.
       responses:
         "200":
           description: Instance info
@@ -2664,6 +2670,13 @@ paths:
                       depend on.
                   total_rows: { type: integer, format: int64 }
                   total_size_bytes: { type: integer, format: int64 }
+                  unsampled_catalogs:
+                    type: integer
+                    description: >
+                      Catalogs whose live totals are not yet published
+                      by their maintenance summary and so are missing
+                      from total_rows and total_size_bytes. 0 when the
+                      totals cover every catalog.
 
   /catalogs/{catalog}/consumers:
     get:
@@ -2900,17 +2913,24 @@ components:
           type: integer
           format: int64
           description: >
-            Rows across live data files, from the same sample. Gross of
+            Rows across live data files, as of the catalog's maintenance
+            summary published generation (minutes behind head on a
+            large catalog), read by the same sample. Gross of
             deletion-vector masking, as GET /v1/info's totals are.
+            Omitted while the generation did not measure rows.
         live_size_bytes:
           type: integer
           format: int64
           description: >
-            Bytes across live data files, from the same sample. All
-            three totals are OMITTED — never zeroed — for a catalog the
-            sampler has not covered yet (the boot window, or one created
-            since the last pass): an unsampled catalog and an empty one
-            are different facts.
+            Bytes across live data files, as of the same generation.
+            All three totals are OMITTED — never zeroed — for a catalog
+            the sampler has not covered yet (the boot window, or one
+            created since the last pass), and live_rows and
+            live_size_bytes also while the catalog's maintenance summary
+            has not published a generation with totals (a new catalog,
+            or an instance with no maintenance pod); the catalog is
+            never read from its own manifest for them. An unsampled
+            catalog and an empty one are different facts.
         oldest_snapshot_time:
           type: string
           format: date-time

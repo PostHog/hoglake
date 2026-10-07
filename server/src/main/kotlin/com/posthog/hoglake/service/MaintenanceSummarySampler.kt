@@ -369,11 +369,25 @@ class MaintenanceSummarySampler(
                             scan.pending, scan.failed, scan.debt, scan.queued, scan.oldest,
                             scan.snapshot, scan.startedAt, target, minInputFiles, maxInputFiles,
                         )
+                    // THE LIVE TOTALS ARE SUMMED HERE, ONCE PER GENERATION
+                    // (V27, #269). The metrics sampler used to sum the
+                    // manifest every 15 s on every pod; summing the tier
+                    // rows there instead would still be O(buckets) per
+                    // catalog per tick. So the publish takes the sum from
+                    // the generation it has just finished — one range of
+                    // the tier primary key, bounded by this catalog's
+                    // buckets, paid once per generation — and the tick
+                    // reads four columns. `live_rows` only when the scan
+                    // measured record_count: an unmeasured generation
+                    // publishes NULL (absent), not an undercount.
                     h.createUpdate(
                         """
                         UPDATE hog_maintenance_summary SET generation = :generation, published_generation = :generation,
                             sampled_at = now(), sample = CAST(:sample AS jsonb), scan_state = NULL,
                             next_batch_at = now() + make_interval(secs => :refresh),
+                            live_files = tot.files, live_bytes = tot.bytes,
+                            live_rows = CASE WHEN :measured THEN tot.rows END,
+                            published_snapshot = :snapshot,
                             -- STAMPED AT PUBLISH, from the scan's own
                             -- flag, so `measures_generation` names the
                             -- last generation PUBLISHED with the V22
@@ -387,10 +401,16 @@ class MaintenanceSummarySampler(
                             -- deploy straddle unreported.
                             measures_generation =
                                 CASE WHEN :measured THEN :generation ELSE measures_generation END
+                        FROM (
+                            SELECT COALESCE(SUM(file_count), 0) AS files, COALESCE(SUM(total_bytes), 0) AS bytes,
+                                   COALESCE(SUM(record_count), 0) AS rows
+                            FROM hog_maintenance_summary_tier
+                            WHERE catalog_id = :id AND generation = :generation
+                        ) tot
                         WHERE catalog_id = :id
                         """,
                     ).bind("generation", generation).bind("sample", json.writeValueAsString(sample))
-                        .bind("measured", scan.measures)
+                        .bind("measured", scan.measures).bind("snapshot", scan.snapshot)
                         .bind("refresh", refreshSeconds).bind("id", job.catalogId).execute()
                 } else {
                     checkpoint(h, job.catalogId, generation, scan)

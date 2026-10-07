@@ -15,8 +15,13 @@ import org.jdbi.v3.core.kotlin.withHandleUnchecked
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicLong
 
-/** Instance-wide live-data totals, refreshed by the metrics sampler. */
-data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long)
+/**
+ * Instance-wide live-data totals, refreshed by the metrics sampler:
+ * the sum over every catalog whose maintenance summary has stamped
+ * totals (as of each catalog's published generation), and how many
+ * catalogs it has not, which contribute nothing to the sums.
+ */
+data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long, val unsampledCatalogs: Int)
 
 /**
  * `hoglake_expiry_purge_remaining{catalog}` — file rows still eligible
@@ -461,8 +466,13 @@ object IndexBloatGauges {
  */
 data class CatalogTotals(
     val tableCount: Long,
-    val liveRows: Long,
-    val liveBytes: Long,
+    /**
+     * As of the maintenance summary's published generation; null while
+     * the catalog has no stamped generation (SAMPLE_SQL's KDoc), and
+     * rows alone null while the generation did not measure them.
+     */
+    val liveRows: Long?,
+    val liveBytes: Long?,
     /**
      * Commit time of the oldest RETAINED snapshot: the first snapshot
      * at or above the expiry floor, by primary key (one index descent —
@@ -624,15 +634,39 @@ class CatalogMetrics(
             "Live data files whose parquet schema lacks field ids (rename-blocking); " +
                 "dropped tables excluded",
         )
+    private val liveTotalsSampled =
+        multiGauge(
+            "hoglake_live_totals_sampled",
+            "1 when the catalog's maintenance summary has published a generation with live totals, " +
+                "which hoglake_live_rows/_bytes/_files and the API totals are read from; 0 while it " +
+                "has not, in which case those series are absent rather than zero",
+        )
+    private val liveTotalsAge =
+        multiGauge(
+            "hoglake_live_totals_age_seconds",
+            "Seconds since the maintenance summary generation that hoglake_live_rows/_bytes/_files are " +
+                "as of was published; absent while the catalog has none. Grows without bound if the " +
+                "maintenance sampler stops, which is how a frozen total announces itself",
+        )
     private val liveRows =
         multiGauge(
             "hoglake_live_rows",
-            "Live registered rows per catalog (gross of DV masking; dropped tables excluded)",
+            "Live registered rows per catalog (gross of DV masking; dropped tables excluded), as of " +
+                "the maintenance summary's published generation; absent while the catalog has none " +
+                "(hoglake_live_totals_sampled = 0) or the generation did not measure rows",
         )
     private val liveBytes =
-        multiGauge("hoglake_live_bytes", "Live data-file bytes per catalog (dropped tables excluded)")
+        multiGauge(
+            "hoglake_live_bytes",
+            "Live data-file bytes per catalog (dropped tables excluded), as of the maintenance summary's " +
+                "published generation; absent while the catalog has none (hoglake_live_totals_sampled = 0)",
+        )
     private val liveFiles =
-        multiGauge("hoglake_live_files", "Live data files per catalog (dropped tables excluded)")
+        multiGauge(
+            "hoglake_live_files",
+            "Live data files per catalog (dropped tables excluded), as of the maintenance summary's " +
+                "published generation; absent while the catalog has none (hoglake_live_totals_sampled = 0)",
+        )
     private val tableCount =
         multiGauge("hoglake_table_count", "Live (non-dropped) tables")
     private val consumerLag =
@@ -796,9 +830,14 @@ class CatalogMetrics(
         val statsFailed: Long,
         val missingFieldIds: Long,
         val tables: Long,
-        val liveRows: Long,
-        val liveBytes: Long,
-        val liveFiles: Long,
+        /** Whether the maintenance summary has stamped this catalog's live totals (V27). */
+        val liveSampled: Boolean,
+        /** Seconds since the generation the totals are as of was published; null when unsampled. */
+        val liveTotalsAgeSeconds: Double?,
+        /** Null when unsampled, or when the published generation did not measure rows. */
+        val liveRows: Long?,
+        val liveBytes: Long?,
+        val liveFiles: Long?,
         val oldestSnapshotTime: Instant?,
     )
 
@@ -898,14 +937,35 @@ class CatalogMetrics(
         statsFailedFiles.register(rowsOf { it.statsFailed }, true)
         missingFieldIdFiles.register(rowsOf { it.missingFieldIds }, true)
         tableCount.register(rowsOf { it.tables }, true)
-        liveRows.register(rowsOf { it.liveRows }, true)
-        liveBytes.register(rowsOf { it.liveBytes }, true)
-        liveFiles.register(rowsOf { it.liveFiles }, true)
+
+        // The live totals are ABSENT, not zero, on a catalog the
+        // maintenance summary has not stamped (SAMPLE_SQL's KDoc):
+        // `overwrite = true` retires the series, and the sampled flag —
+        // published for every catalog — says why it is missing.
+        fun liveRowsOf(value: (CatalogRow) -> Long?) =
+            rows.mapNotNull { r -> value(r)?.let { MultiGauge.Row.of(Tags.of("catalog", r.name), it) } }
+        liveTotalsSampled.register(rowsOf { if (it.liveSampled) 1 else 0 }, true)
+        liveTotalsAge.register(
+            rows.mapNotNull { r ->
+                r.liveTotalsAgeSeconds?.let { MultiGauge.Row.of(Tags.of("catalog", r.name), it) }
+            },
+            true,
+        )
+        liveRows.register(liveRowsOf { it.liveRows }, true)
+        liveBytes.register(liveRowsOf { it.liveBytes }, true)
+        liveFiles.register(liveRowsOf { it.liveFiles }, true)
 
         // Instance-wide totals for /v1/info: served from this sample,
         // never computed per call (a manifest sum per request would tax
-        // the same RDS that serves the commit tail at fleet scale).
-        latestTotals = InstanceTotals(rows.sumOf { it.liveRows }, rows.sumOf { it.liveBytes })
+        // the same RDS that serves the commit tail at fleet scale). A
+        // catalog without stamped totals contributes nothing and is
+        // counted, so the reader can tell a partial sum from a whole one.
+        latestTotals =
+            InstanceTotals(
+                totalRows = rows.sumOf { it.liveRows ?: 0 },
+                totalSizeBytes = rows.sumOf { it.liveBytes ?: 0 },
+                unsampledCatalogs = rows.count { !it.liveSampled },
+            )
         // The same rows, kept per catalog for the catalogs listing. The
         // map is replaced wholesale so a reader never sees a half-updated
         // mixture of two samples.
@@ -1145,9 +1205,14 @@ class CatalogMetrics(
                             statsFailed = rs.getLong("stats_failed"),
                             missingFieldIds = rs.getLong("missing_field_ids"),
                             tables = rs.getLong("table_count"),
-                            liveRows = rs.getLong("live_rows"),
-                            liveBytes = rs.getLong("live_bytes"),
-                            liveFiles = rs.getLong("live_files"),
+                            liveSampled = rs.getBoolean("live_sampled"),
+                            liveTotalsAgeSeconds =
+                                rs.getObject("live_totals_age_seconds")?.let {
+                                    rs.getDouble("live_totals_age_seconds")
+                                },
+                            liveRows = rs.getObject("live_rows", java.lang.Long::class.java)?.toLong(),
+                            liveBytes = rs.getObject("live_bytes", java.lang.Long::class.java)?.toLong(),
+                            liveFiles = rs.getObject("live_files", java.lang.Long::class.java)?.toLong(),
                             oldestSnapshotTime =
                                 rs.getObject(
                                     "oldest_snapshot_time",
@@ -1247,49 +1312,95 @@ class CatalogMetrics(
          * The per-catalog sample, `internal` so the plan test EXPLAINs
          * the SQL PRODUCTION runs rather than a lookalike.
          *
-         * ONE PASS OVER THE MANIFEST, not five. Every 15 seconds, for
-         * every catalog, this used to issue five CORRELATED subqueries
-         * over `hog_data_file` — stats_pending, stats_failed,
-         * missing_field_ids, live_rows, live_bytes — each of which the
-         * planner runs once per catalog row. At two catalogs and a 5M-row
-         * manifest that was measured at 1.6M buffers and 2.2 s per
-         * sample, i.e. ten full scans of the manifest a minute against
-         * the database that also serves the commit tail, and it scaled
-         * with catalogs x subqueries. The `files` CTE reads the manifest
-         * ONCE and splits it with aggregate FILTERs: measured 213k
-         * buffers and 0.53 s on the same fixture.
+         * NO PASS OVER THE MANIFEST, AND NOTHING THAT GROWS WITH IT
+         * (#269). This used to read every row of `hog_data_file` once
+         * per sample — every 15 s, on every pod — because "sum the live
+         * rows" had no index to answer it: at gigahog-prod-us's ~1.5 GiB
+         * manifest that was 1.5 GiB of buffer traffic per tick against
+         * the database that serves the commit tail. Each number now
+         * comes from a structure bounded by something smaller than the
+         * manifest, and by something that does not grow with it:
          *
-         * `live_files` RIDES THE SAME PASS rather than summing the
-         * summary tier's `file_count`: the pass is already paid, so a
-         * sixth FILTER costs no extra page, and it keeps
-         * hoglake_live_files exact at the same instant as
-         * hoglake_live_rows/_bytes — a tier sum would be a generation old
-         * (tens of minutes on prod-us) and would disagree with its
-         * siblings by that much.
+         *  - `live_rows`, `live_bytes`, `live_files`: FOUR COLUMNS OF
+         *    `hog_maintenance_summary` (V27), stamped by the maintenance
+         *    sampler's publish from the generation it has just finished
+         *    — the same tier rows the table GET totals and the
+         *    partitions listing read, summed once per generation instead
+         *    of once per tick per pod. One primary-key row per catalog.
+         *    Rows only while the generation MEASURED them
+         *    (`measures_generation = published_generation`, the rule
+         *    every other tier reader applies): an unmeasured
+         *    generation's record_count is an undercount, and absent
+         *    beats wrong. The publish stamps NULL for one; the gate here
+         *    covers a flag moved after the stamp.
+         *    The totals are therefore AS OF THE PUBLISHED GENERATION —
+         *    minutes behind head on prod-us, hours on a 10 PB instance —
+         *    and the gauge descriptions say so. #292's KDoc chose
+         *    exactness over this; the rule that overrides it is that
+         *    nothing in the sampler may scan a whole table (#269).
+         *  - A catalog with NO stamped totals — no generation yet (new,
+         *    or a dev stack with no maintenance pod), or one published
+         *    by a sampler older than V27 — publishes NO live series and
+         *    `null` on the wire (`live_sampled` says which), and is NOT
+         *    read from its own manifest. The first version of this
+         *    change did that, scoped by catalog; the 10 PB review
+         *    killed it: the catalog that never publishes a generation
+         *    is the one whose scan outruns its retention, i.e. the
+         *    LARGEST catalog, and "scan its manifest every 15 s instead"
+         *    is the regression this change exists to remove. Absence is
+         *    the honest answer; `hoglake_live_totals_sampled{catalog}`
+         *    makes it a visible one.
+         *  - A table dropped AFTER the generation's scan snapshot may
+         *    still have buckets in it (the drop touches no file row and
+         *    leaves the generation alone — the production order), so its
+         *    share is SUBTRACTED: `hog_table` by catalog, filtered to
+         *    `dropped_snapshot > published_snapshot`, each dropped table
+         *    summed over its buckets through
+         *    `hog_maintenance_summary_tier_table`. A table dropped at or
+         *    before the snapshot was skipped by the scan and has no
+         *    buckets. The cost is the catalog's tables (the same range
+         *    `table_count` reads) plus the buckets of its recent drops,
+         *    never the whole generation.
+         *  - `stats_pending`, `stats_failed`, `missing_field_ids`: one
+         *    index-only range per catalog each, over the partial indexes
+         *    that hold exactly that LIVE population —
+         *    `hog_data_file_pending`, `hog_data_file_failed` and
+         *    `hog_data_file_missing_field_ids` (all V26, each carrying
+         *    `table_id`). Each is joined to `hog_table` per distinct
+         *    table of the rare population, not per manifest row.
+         *    `end_snapshot IS NULL` on all three for the reason the
+         *    indexes carry it: the hydrator's claim skips ended rows, so
+         *    an ended pending row is not a backlog anything drains.
          *
          * THE JOIN TO hog_table IS THE POINT, not a detail. Since #193 a
          * dropped table's file rows are still `end_snapshot IS NULL` —
          * the drop touches none of them, and the retirement sweep
          * deletes them later — so `end_snapshot IS NULL` alone is no
-         * longer "live". Without this join `hoglake_live_rows` and
-         * `hoglake_live_bytes` would keep counting a dropped 3M-row
-         * table's data as live data for as long as its rows survived,
-         * which on a retention-NULL catalog is forever. This is the
-         * invariant's third carve-out in practice: a gauge counts rows
-         * at NO snapshot, so it filters on `hog_table` instead of
-         * resolving visibility at one.
+         * longer "live". The published generation carries the dropped
+         * table's buckets for the same reason. Without the join
+         * `hoglake_live_rows` and `hoglake_live_bytes` would keep
+         * counting a dropped 3M-row table's data as live data for as
+         * long as its rows survived, which on a retention-NULL catalog
+         * is forever. `stats_pending` and `stats_failed` carry the same
+         * filter for a second-order reason: the HYDRATOR no longer
+         * claims a dropped table's pending files, so counting them would
+         * publish a backlog nothing is draining.
          *
-         * `stats_pending` and `stats_failed` carry the same filter for
-         * a second-order reason: the HYDRATOR no longer claims a
-         * dropped table's pending files, so counting them would publish
-         * a backlog nothing is draining — an alert that can never clear
-         * and a number no operator can act on.
+         * WHAT IS STILL O(POPULATION): a dropped table's pending rows
+         * stay in `hog_data_file_pending` until retirement deletes them
+         * (the drop ends nothing), and the pending count walks them —
+         * index-only, with one memoized hog_table probe — every tick
+         * until then. That is the rare population by construction
+         * (pending is a transient state); a catalog with 10^7 pending
+         * rows on a dropped table is a catalog whose retirement sweep is
+         * off, and the gauge says so by its size.
          *
-         * `LEFT JOIN`, and the COALESCEs, because a catalog with no
-         * file rows at all must still publish zeros. An INNER join
-         * would make an empty catalog's whole gauge row vanish, and a
+         * `LEFT JOIN`, and the COALESCEs on the counts, because a catalog
+         * with no rows anywhere must still publish zeros for them: a
          * MultiGauge refreshed with `overwrite = true` retires a series
-         * that stops appearing — an empty catalog would look deleted.
+         * that stops appearing, and an empty catalog would look deleted.
+         * The live totals are the deliberate exception: NULL means "not
+         * sampled", and zero would be a lie about an unsampled catalog.
          *
          * `oldest_snapshot_time` is the first snapshot AT OR ABOVE THE
          * FLOOR by primary key — one descent of `hog_snapshot_pkey`,
@@ -1300,40 +1411,9 @@ class CatalogMetrics(
          * transaction's start skew; the floor bound is defence, since
          * expiry deletes below the floor in the transaction that advances
          * it.
-         *
-         * The subqueries that remain are over other relations
-         * (hog_snapshot twice, hog_file_removal once, hog_table once)
-         * and are index-driven per catalog; folding them in would trade
-         * four cheap probes for extra grouped scans.
          */
         internal const val SAMPLE_SQL: String =
             """
-            WITH files AS (
-                SELECT f.catalog_id,
-                       count(*) FILTER (
-                           WHERE f.stats_state = 'pending'
-                             AND t.dropped_snapshot IS NULL) AS stats_pending,
-                       count(*) FILTER (
-                           WHERE f.stats_state = 'failed'
-                             AND t.dropped_snapshot IS NULL) AS stats_failed,
-                       count(*) FILTER (
-                           WHERE f.missing_field_ids
-                             AND f.end_snapshot IS NULL
-                             AND t.dropped_snapshot IS NULL) AS missing_field_ids,
-                       COALESCE(SUM(f.record_count) FILTER (
-                           WHERE f.end_snapshot IS NULL
-                             AND t.dropped_snapshot IS NULL), 0) AS live_rows,
-                       COALESCE(SUM(f.file_size_bytes) FILTER (
-                           WHERE f.end_snapshot IS NULL
-                             AND t.dropped_snapshot IS NULL), 0) AS live_bytes,
-                       count(*) FILTER (
-                           WHERE f.end_snapshot IS NULL
-                             AND t.dropped_snapshot IS NULL) AS live_files
-                  FROM hog_data_file f
-                  JOIN hog_table t
-                    ON t.catalog_id = f.catalog_id AND t.table_id = f.table_id
-                 GROUP BY f.catalog_id
-            )
             SELECT c.name,
                    c.last_snapshot_id,
                    c.earliest_snapshot_id,
@@ -1352,14 +1432,77 @@ class CatalogMetrics(
                    (SELECT count(*) FROM hog_table t
                      WHERE t.catalog_id = c.catalog_id
                        AND t.dropped_snapshot IS NULL) AS table_count,
-                   COALESCE(fl.stats_pending, 0) AS stats_pending,
-                   COALESCE(fl.stats_failed, 0) AS stats_failed,
-                   COALESCE(fl.missing_field_ids, 0) AS missing_field_ids,
-                   COALESCE(fl.live_rows, 0) AS live_rows,
-                   COALESCE(fl.live_bytes, 0) AS live_bytes,
-                   COALESCE(fl.live_files, 0) AS live_files
+                   -- Each count: the index range GROUPED BY table_id first,
+                   -- then the hog_table join per distinct table. The
+                   -- aggregate is a fence the planner cannot move the join
+                   -- below, so the read is always the attention index's
+                   -- range for the catalog (index-only: table_id is in each
+                   -- index) and never the catalog's live files probed from
+                   -- hog_table through some other index — the plan it picks
+                   -- when the attention population is a large fraction of
+                   -- the catalog, i.e. the dropped-backlog case this guards.
+                   (SELECT COALESCE(SUM(b.n), 0)::bigint
+                      FROM (SELECT f.table_id, count(*) AS n FROM hog_data_file f
+                             WHERE f.catalog_id = c.catalog_id
+                               AND f.stats_state = 'pending'
+                               AND f.end_snapshot IS NULL
+                             GROUP BY f.table_id) b
+                      JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
+                     WHERE t.dropped_snapshot IS NULL) AS stats_pending,
+                   (SELECT COALESCE(SUM(b.n), 0)::bigint
+                      FROM (SELECT f.table_id, count(*) AS n FROM hog_data_file f
+                             WHERE f.catalog_id = c.catalog_id
+                               AND f.stats_state = 'failed'
+                               AND f.end_snapshot IS NULL
+                             GROUP BY f.table_id) b
+                      JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
+                     WHERE t.dropped_snapshot IS NULL) AS stats_failed,
+                   (SELECT COALESCE(SUM(b.n), 0)::bigint
+                      FROM (SELECT f.table_id, count(*) AS n FROM hog_data_file f
+                             WHERE f.catalog_id = c.catalog_id
+                               AND f.missing_field_ids
+                               AND f.end_snapshot IS NULL
+                             GROUP BY f.table_id) b
+                      JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
+                     WHERE t.dropped_snapshot IS NULL) AS missing_field_ids,
+                   ms.catalog_id IS NOT NULL AS live_sampled,
+                   extract(epoch FROM (now() - ms.sampled_at)) AS live_totals_age_seconds,
+                   CASE WHEN ms.measures_generation = ms.published_generation
+                        THEN (ms.live_rows - COALESCE(dr.rows, 0))::bigint END AS live_rows,
+                   (ms.live_bytes - COALESCE(dr.bytes, 0))::bigint AS live_bytes,
+                   (ms.live_files - COALESCE(dr.files, 0))::bigint AS live_files
               FROM hog_catalog c
-              LEFT JOIN files fl ON fl.catalog_id = c.catalog_id
+              -- One row per catalog with stamped totals. `live_files IS
+              -- NOT NULL` is the whole test: a generation published by a
+              -- pre-V27 sampler has a published_generation and no totals.
+              LEFT JOIN hog_maintenance_summary ms
+                ON ms.catalog_id = c.catalog_id AND ms.live_files IS NOT NULL
+              -- Tables dropped since the generation's snapshot, and their
+              -- buckets in it: one aggregate probe of the tier's
+              -- (catalog_id, generation, table_id) index PER DROPPED
+              -- TABLE, as a nested LATERAL, so the planner cannot answer
+              -- "which buckets" with a range over the whole generation
+              -- hashed against hog_table (its estimate for `dropped_snapshot
+              -- > ?` is a third of the catalog's tables, which makes that
+              -- look cheap). The outer guard sits inside the subquery,
+              -- where it is a one-time filter per catalog rather than a
+              -- join filter applied after the read.
+              LEFT JOIN LATERAL (
+                  SELECT SUM(b.rows) AS rows, SUM(b.bytes) AS bytes, SUM(b.files) AS files
+                    FROM hog_table t
+                   CROSS JOIN LATERAL (
+                       SELECT SUM(p.record_count) AS rows,
+                              SUM(p.total_bytes) AS bytes,
+                              SUM(p.file_count) AS files
+                         FROM hog_maintenance_summary_tier p
+                        WHERE p.catalog_id = t.catalog_id
+                          AND p.generation = ms.published_generation
+                          AND p.table_id = t.table_id
+                   ) b
+                   WHERE ms.catalog_id IS NOT NULL
+                     AND t.catalog_id = c.catalog_id
+                     AND t.dropped_snapshot > ms.published_snapshot
+              ) dr ON true
             """
 
         /**

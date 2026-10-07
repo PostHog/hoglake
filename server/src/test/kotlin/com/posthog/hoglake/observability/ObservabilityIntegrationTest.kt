@@ -163,15 +163,18 @@ class ObservabilityIntegrationTest {
                 WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :name)
                 """,
                 ).bind("name", catalog).execute()
-                // One hydration-failed file (historical, so it stays out of
-                // the live-scoped field-id gauge) -> the stats-failed gauge
-                // (B1 mirrors the pending gauge).
+                // One hydration-failed LIVE file (inserted after the flag
+                // above, so its field-id flag is false and it stays out of
+                // that gauge) -> the stats-failed gauge (B1 mirrors the
+                // pending gauge). Live, because since #269 every one of
+                // these gauges counts live rows only: an ended failed row
+                // is history nothing requeues.
                 h.createUpdate(
                     """
                 INSERT INTO hog_data_file (catalog_id, data_file_id, table_id, begin_snapshot,
-                                           end_snapshot, path, record_count, file_size_bytes,
+                                           path, record_count, file_size_bytes,
                                            row_id_start, stats_state)
-                SELECT f.catalog_id, 999, f.table_id, 1, 2,
+                SELECT f.catalog_id, 999, f.table_id, 1,
                        's3://hog/$catalog/failed.parquet', 0, 0, 0, 'failed'
                 FROM hog_data_file f
                 WHERE f.catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :name)

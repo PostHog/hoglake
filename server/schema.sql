@@ -329,9 +329,13 @@ CREATE TABLE hog_data_file (
 CREATE INDEX hog_data_file_live
     ON hog_data_file (catalog_id, table_id, begin_snapshot)
     WHERE end_snapshot IS NULL;
+-- V26: the hydrator's queue, LIVE rows only (the claim skips ended
+-- rows, so an ended row must not sit in the index the claim walks),
+-- in claim order, carrying table_id so the backlog gauge's hog_table
+-- join is answered from the index (#269).
 CREATE INDEX hog_data_file_pending
-    ON hog_data_file (catalog_id, data_file_id)
-    WHERE stats_state = 'pending';
+    ON hog_data_file (catalog_id, data_file_id) INCLUDE (table_id)
+    WHERE stats_state = 'pending' AND end_snapshot IS NULL;
 -- V19: ExpiryService's data-file DELETE (`end_snapshot IS NOT NULL AND
 -- end_snapshot <= floor`), which was a sequential scan of the whole
 -- manifest inside the sweep transaction, under the per-catalog commit
@@ -345,6 +349,17 @@ CREATE INDEX hog_data_file_pending
 CREATE INDEX hog_data_file_ended
     ON hog_data_file (catalog_id, end_snapshot)
     WHERE end_snapshot IS NOT NULL;
+-- V26: the two other rare states CatalogMetrics.SAMPLE_SQL counts, so
+-- the sampler never scans the manifest (#269). Partial on the state and
+-- on liveness, so an ordinary append enters neither; `table_id` in the
+-- key, so each count is an index-only scan plus one hog_table probe per
+-- distinct table.
+CREATE INDEX hog_data_file_failed
+    ON hog_data_file (catalog_id, table_id)
+    WHERE stats_state = 'failed' AND end_snapshot IS NULL;
+CREATE INDEX hog_data_file_missing_field_ids
+    ON hog_data_file (catalog_id, table_id)
+    WHERE missing_field_ids AND end_snapshot IS NULL;
 
 -- Per-file, per-column zone maps. Bounds are stored in Iceberg
 -- single-value binary serialization (opaque to Postgres) so manifest
@@ -664,6 +679,18 @@ CREATE TABLE hog_maintenance_summary (
     -- publishes without setting it. The partitions listing reports
     -- those two measures only when this equals published_generation.
     measures_generation bigint NOT NULL DEFAULT -1,
+    -- V27: the published generation's live totals, summed from its
+    -- tier rows ONCE by the publish statement so the metrics sampler
+    -- reads one row per catalog (#269). live_rows is NULL when the
+    -- generation was not measured; all four are NULL until the first
+    -- publish by a sampler that stamps them, and a catalog with none
+    -- is reported absent, never scanned. published_snapshot is the
+    -- generation's scan snapshot: a table dropped after it may still
+    -- have buckets in the generation, which the sampler subtracts.
+    live_files bigint,
+    live_bytes bigint,
+    live_rows bigint,
+    published_snapshot bigint,
     CHECK ((sampled_at IS NULL) = (sample IS NULL))
 );
 CREATE INDEX hog_maintenance_summary_due

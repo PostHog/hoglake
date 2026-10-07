@@ -56,6 +56,7 @@ fun Application.installApiRoutes(
                     build = BuildInfo.buildStamp,
                     totalRows = totals?.totalRows,
                     totalSizeBytes = totals?.totalSizeBytes,
+                    unsampledCatalogs = totals?.unsampledCatalogs,
                 ),
             )
         }
