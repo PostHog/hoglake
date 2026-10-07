@@ -18,8 +18,10 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Instance-wide live-data totals, refreshed by the metrics sampler:
  * the sum over every catalog whose maintenance summary has stamped
- * totals (as of each catalog's published generation), and how many
- * catalogs it has not, which contribute nothing to the sums.
+ * BOTH rows and bytes for its published generation, and how many
+ * catalogs are left out of both sums (no stamp, or a generation that
+ * did not measure rows). All or nothing per catalog, so the two sums
+ * always cover the same set.
  */
 data class InstanceTotals(val totalRows: Long, val totalSizeBytes: Long, val unsampledCatalogs: Int)
 
@@ -644,9 +646,10 @@ class CatalogMetrics(
     private val liveTotalsAge =
         multiGauge(
             "hoglake_live_totals_age_seconds",
-            "Seconds since the maintenance summary generation that hoglake_live_rows/_bytes/_files are " +
-                "as of was published; absent while the catalog has none. Grows without bound if the " +
-                "maintenance sampler stops, which is how a frozen total announces itself",
+            "Seconds since the maintenance summary scan that hoglake_live_rows/_bytes/_files are as of " +
+                "BEGAN (the data's age, not the publish's: a scan runs for hours on a large catalog); " +
+                "absent while the catalog has none. Grows without bound if the maintenance sampler " +
+                "stops, which is how a frozen total announces itself",
         )
     private val liveRows =
         multiGauge(
@@ -957,14 +960,17 @@ class CatalogMetrics(
 
         // Instance-wide totals for /v1/info: served from this sample,
         // never computed per call (a manifest sum per request would tax
-        // the same RDS that serves the commit tail at fleet scale). A
-        // catalog without stamped totals contributes nothing and is
-        // counted, so the reader can tell a partial sum from a whole one.
+        // the same RDS that serves the commit tail at fleet scale). ALL
+        // OR NOTHING per catalog: one with rows OR bytes missing (no
+        // stamp, or a generation that did not measure rows) is left out
+        // of BOTH sums and counted, so the two totals always cover the
+        // same catalogs and the count says exactly what they omit.
+        val covered = rows.filter { it.liveRows != null && it.liveBytes != null }
         latestTotals =
             InstanceTotals(
-                totalRows = rows.sumOf { it.liveRows ?: 0 },
-                totalSizeBytes = rows.sumOf { it.liveBytes ?: 0 },
-                unsampledCatalogs = rows.count { !it.liveSampled },
+                totalRows = covered.sumOf { it.liveRows!! },
+                totalSizeBytes = covered.sumOf { it.liveBytes!! },
+                unsampledCatalogs = rows.size - covered.size,
             )
         // The same rows, kept per catalog for the catalogs listing. The
         // map is replaced wholesale so a reader never sees a half-updated
@@ -1338,9 +1344,12 @@ class CatalogMetrics(
          *    and the gauge descriptions say so. #292's KDoc chose
          *    exactness over this; the rule that overrides it is that
          *    nothing in the sampler may scan a whole table (#269).
-         *  - A catalog with NO stamped totals — no generation yet (new,
-         *    or a dev stack with no maintenance pod), or one published
-         *    by a sampler older than V27 — publishes NO live series and
+         *  - A catalog whose PUBLISHED generation has no stamp — no
+         *    generation yet (new, or a dev stack with no maintenance
+         *    pod), or a generation published by a sampler that does not
+         *    stamp (older than V27, in a rollout or after a rollback),
+         *    which `live_generation = published_generation` catches the
+         *    way `measures_generation` is caught — publishes NO live series and
          *    `null` on the wire (`live_sampled` says which), and is NOT
          *    read from its own manifest. The first version of this
          *    change did that, scoped by catalog; the 10 PB review
@@ -1466,17 +1475,24 @@ class CatalogMetrics(
                       JOIN hog_table t ON t.catalog_id = c.catalog_id AND t.table_id = b.table_id
                      WHERE t.dropped_snapshot IS NULL) AS missing_field_ids,
                    ms.catalog_id IS NOT NULL AS live_sampled,
-                   extract(epoch FROM (now() - ms.sampled_at)) AS live_totals_age_seconds,
+                   extract(epoch FROM (now() - ms.live_as_of)) AS live_totals_age_seconds,
                    CASE WHEN ms.measures_generation = ms.published_generation
                         THEN (ms.live_rows - COALESCE(dr.rows, 0))::bigint END AS live_rows,
                    (ms.live_bytes - COALESCE(dr.bytes, 0))::bigint AS live_bytes,
                    (ms.live_files - COALESCE(dr.files, 0))::bigint AS live_files
               FROM hog_catalog c
-              -- One row per catalog with stamped totals. `live_files IS
-              -- NOT NULL` is the whole test: a generation published by a
-              -- pre-V27 sampler has a published_generation and no totals.
+              -- One row per catalog whose PUBLISHED generation carries
+              -- stamped totals. `live_generation = published_generation`
+              -- is the whole test, the rule measures_generation follows:
+              -- a publish by a sampler that does not stamp (an older pod
+              -- in a mixed-version rollout, a rollback) moves
+              -- published_generation on and leaves the stamp behind, and
+              -- the totals must go absent, not freeze while the age
+              -- gauge reads fresh and the subtraction probes the new
+              -- generation with the old snapshot. NULL = NULL is false,
+              -- so a never-stamped row fails the test too.
               LEFT JOIN hog_maintenance_summary ms
-                ON ms.catalog_id = c.catalog_id AND ms.live_files IS NOT NULL
+                ON ms.catalog_id = c.catalog_id AND ms.live_generation = ms.published_generation
               -- Tables dropped since the generation's snapshot, and their
               -- buckets in it: one aggregate probe of the tier's
               -- (catalog_id, generation, table_id) index PER DROPPED

@@ -2673,10 +2673,13 @@ paths:
                   unsampled_catalogs:
                     type: integer
                     description: >
-                      Catalogs whose live totals are not yet published
-                      by their maintenance summary and so are missing
-                      from total_rows and total_size_bytes. 0 when the
-                      totals cover every catalog.
+                      Catalogs left out of BOTH total_rows and
+                      total_size_bytes: their maintenance summary has
+                      not published live totals, or published a
+                      generation that did not measure rows. A catalog
+                      is in both totals or in neither, so the two
+                      always cover the same set. 0 when they cover
+                      every catalog.
 
   /catalogs/{catalog}/consumers:
     get:

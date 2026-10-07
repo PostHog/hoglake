@@ -156,7 +156,13 @@ class App private constructor(
     private val objectStore = ObjectStore(cfg)
 
     /** One hydrator: the background sweep loop AND the rehydrate route. */
-    private val hydrator = Hydrator(jdbi, objectStore, maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes)
+    private val hydrator =
+        Hydrator(
+            jdbi,
+            objectStore,
+            maxWholeObjectBytes = cfg.hydratorMaxWholeObjectBytes,
+            claimTimeoutMs = cfg.hydratorClaimTimeoutMs,
+        )
     private val compactionService =
         CompactionService(
             jdbi,

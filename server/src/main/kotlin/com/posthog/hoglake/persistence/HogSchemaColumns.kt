@@ -30,7 +30,7 @@ object HogSchemaColumns {
                 setOf(
                     "catalog_id", "generation", "published_generation", "sampled_at",
                     "sample", "scan_state", "next_batch_at", "measures_generation",
-                    "live_files", "live_bytes", "live_rows", "published_snapshot",
+                    "live_files", "live_bytes", "live_rows", "live_generation", "live_as_of", "published_snapshot",
                 ),
             "hog_maintenance_summary_tier" to
                 setOf(

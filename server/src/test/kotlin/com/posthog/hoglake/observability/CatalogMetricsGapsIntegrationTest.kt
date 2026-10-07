@@ -311,11 +311,12 @@ class CatalogMetricsGapsIntegrationTest {
             h.execute(
                 """
                 UPDATE hog_maintenance_summary ms
-                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows
+                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows, live_generation = ?
                   FROM (SELECT SUM(file_count) AS files, SUM(total_bytes) AS bytes, SUM(record_count) AS rows
                           FROM hog_maintenance_summary_tier WHERE catalog_id = ? AND generation = ?) tot
                  WHERE ms.catalog_id = ?
                 """,
+                published,
                 catalogId,
                 published,
                 catalogId,
@@ -519,6 +520,44 @@ class CatalogMetricsGapsIntegrationTest {
     }
 
     @Test
+    fun `a generation published without a stamp makes the live totals absent, not stale`() {
+        // A sampler that does not stamp (an older pod mid-rollout, a
+        // rollback) moves published_generation on and leaves live_* and
+        // published_snapshot behind. The tick must read NOTHING from
+        // the stale stamp: no totals, sampled = 0, no age — the frozen
+        // number with a fresh-looking age is the failure the age gauge
+        // exists to expose. MUTATION: join on `live_files IS NOT NULL`
+        // instead of `live_generation = published_generation` and the
+        // old totals come through.
+        db.jdbi.useHandleUnchecked {
+            it.execute(
+                "UPDATE hog_maintenance_summary SET published_generation = published_generation + 1, " +
+                    "generation = generation + 1, sampled_at = now() WHERE catalog_id = ?",
+                catalogId,
+            )
+        }
+        try {
+            val reg = SimpleMeterRegistry()
+            val m = CatalogMetrics(db.jdbi, reg)
+            m.sampleOnce()
+            assertThat(value(reg, "hoglake_live_totals_sampled", "catalog", CAT)).isEqualTo(0.0)
+            assertThat(value(reg, "hoglake_live_files", "catalog", CAT)).isNull()
+            assertThat(value(reg, "hoglake_live_rows", "catalog", CAT)).isNull()
+            assertThat(value(reg, "hoglake_live_totals_age_seconds", "catalog", CAT)).isNull()
+            assertThat(m.latestByCatalog.getValue(CAT).liveBytes).isNull()
+            assertThat(m.latestTotals!!.unsampledCatalogs).isEqualTo(2)
+        } finally {
+            db.jdbi.useHandleUnchecked {
+                it.execute(
+                    "UPDATE hog_maintenance_summary SET published_generation = published_generation - 1, " +
+                        "generation = generation - 1 WHERE catalog_id = ?",
+                    catalogId,
+                )
+            }
+        }
+    }
+
+    @Test
     fun `table rows are withheld while the generation's row measure is incomplete`() {
         db.jdbi.useHandleUnchecked {
             it.execute("UPDATE hog_maintenance_summary SET measures_generation = -1 WHERE catalog_id = ?", catalogId)
@@ -530,10 +569,20 @@ class CatalogMetricsGapsIntegrationTest {
             assertThat(tableSeries(reg, "hoglake_table_rows")).isEmpty()
             assertThat(value(reg, "hoglake_table_files", *table("big"))).isEqualTo(4.0)
             // The catalog's rows are withheld by the same rule (files and
-            // bytes are not: the measure they come from is complete).
+            // bytes are not: the measure they come from is complete) —
+            // and the instance totals leave the catalog out of BOTH sums
+            // and count it, so total_rows never undercounts silently.
             assertThat(value(reg, "hoglake_live_rows", "catalog", CAT)).isNull()
             assertThat(value(reg, "hoglake_live_files", "catalog", CAT)).isEqualTo(LIVE_FILES)
             assertThat(value(reg, "hoglake_live_totals_sampled", "catalog", CAT)).isEqualTo(1.0)
+            val m = CatalogMetrics(db.jdbi, reg)
+            m.sampleOnce()
+            assertThat(m.latestTotals!!.unsampledCatalogs).isEqualTo(2)
+            assertThat(m.latestTotals!!.totalSizeBytes)
+                .describedAs("gaps' bytes are left out with its rows")
+                .isEqualTo(
+                    m.latestByCatalog.filterKeys { it != CAT && it != UNSAMPLED }.values.sumOf { it.liveBytes ?: 0 },
+                )
         } finally {
             db.jdbi.useHandleUnchecked {
                 it.execute(

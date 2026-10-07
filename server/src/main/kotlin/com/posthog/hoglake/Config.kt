@@ -155,6 +155,17 @@ data class Config(
     val hydratorMaxWholeObjectBytes: Long =
         env("HOGLAKE_HYDRATOR_MAX_WHOLE_OBJECT_BYTES", "${256L * 1024 * 1024}").toLong(),
     /**
+     * statement_timeout for ONE catalog's claim inside the hydrator
+     * sweep (#269). A claim is `limit` rows off one range of
+     * `hog_data_file_pending`, milliseconds when healthy; a catalog whose
+     * claim exceeds this (a dropped table's pending backlog the claim
+     * walks and discards, until retirement deletes it) loses its share
+     * of that sweep, is counted (`hoglake_hydrator_claim_timeouts_total`)
+     * and logged, and no other catalog waits on it. Must stay under the
+     * session's 60 s statement_timeout to mean anything. Default 10 s.
+     */
+    val hydratorClaimTimeoutMs: Long = env("HOGLAKE_HYDRATOR_CLAIM_TIMEOUT_MS", "10000").toLong(),
+    /**
      * Expiry sweep interval; 0 disables. Sweeps are incremental (bounded
      * per run).
      *

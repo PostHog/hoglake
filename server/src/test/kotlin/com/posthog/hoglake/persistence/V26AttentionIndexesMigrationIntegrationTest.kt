@@ -107,10 +107,11 @@ class V26AttentionIndexesMigrationIntegrationTest {
             db.jdbi.withHandleUnchecked { h ->
                 h.createQuery(
                     "SELECT count(*) FROM information_schema.columns WHERE table_name = 'hog_maintenance_summary' " +
-                        "AND column_name IN ('live_files', 'live_bytes', 'live_rows', 'published_snapshot')",
+                        "AND column_name IN ('live_files', 'live_bytes', 'live_rows', 'live_generation', " +
+                        "'live_as_of', 'published_snapshot')",
                 ).mapTo(Long::class.java).one()
             }
-        assertThat(stamped).isEqualTo(4)
+        assertThat(stamped).isEqualTo(6)
 
         // The sampler reads the three counts through the new indexes,
         // on rows that predate them. The planner may pick a plain or a

@@ -684,12 +684,20 @@ CREATE TABLE hog_maintenance_summary (
     -- reads one row per catalog (#269). live_rows is NULL when the
     -- generation was not measured; all four are NULL until the first
     -- publish by a sampler that stamps them, and a catalog with none
-    -- is reported absent, never scanned. published_snapshot is the
-    -- generation's scan snapshot: a table dropped after it may still
-    -- have buckets in the generation, which the sampler subtracts.
+    -- is reported absent, never scanned. live_generation names the
+    -- generation they came from and the sampler reads them only while
+    -- it equals published_generation (measures_generation's rule), so
+    -- a publish by a sampler that does not stamp makes them absent
+    -- rather than stale. live_as_of is when that generation's scan
+    -- began, which is what the totals are as of. published_snapshot
+    -- is the generation's scan snapshot: a table dropped after it may
+    -- still have buckets in the generation, which the sampler
+    -- subtracts.
     live_files bigint,
     live_bytes bigint,
     live_rows bigint,
+    live_generation bigint,
+    live_as_of timestamptz,
     published_snapshot bigint,
     CHECK ((sampled_at IS NULL) = (sample IS NULL))
 );

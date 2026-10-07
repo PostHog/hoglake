@@ -90,6 +90,7 @@ class Hydrator(
      * ([claimPending]); a catalog whose claim exceeds it is skipped
      * for the sweep. A claim is `limit` rows off one index range, so
      * the default is generous for any catalog that is not wedged.
+     * `HOGLAKE_HYDRATOR_CLAIM_TIMEOUT_MS` (Config.hydratorClaimTimeoutMs).
      */
     private val claimTimeoutMs: Long = DEFAULT_CLAIM_TIMEOUT_MS,
     /**

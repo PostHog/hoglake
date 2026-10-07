@@ -862,7 +862,7 @@ data class InstanceInfoDto(
     val build: String?,
     val totalRows: Long?,
     val totalSizeBytes: Long?,
-    /** Catalogs missing from the totals: no published live totals yet. Omitted with them. */
+    /** Catalogs left out of BOTH totals: no published live totals, or none for rows. Omitted with them. */
     val unsampledCatalogs: Int? = null,
     val uiTheme: String? = null,
 )

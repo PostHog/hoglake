@@ -212,7 +212,8 @@ class CatalogMetricsPlanIntegrationTest {
             h.execute(
                 """
                 UPDATE hog_maintenance_summary ms
-                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows, published_snapshot = 5
+                   SET live_files = tot.files, live_bytes = tot.bytes, live_rows = tot.rows,
+                       live_generation = 1, live_as_of = now() - interval '20 minutes', published_snapshot = 5
                   FROM (SELECT catalog_id, SUM(file_count) AS files, SUM(total_bytes) AS bytes,
                                SUM(record_count) AS rows
                           FROM hog_maintenance_summary_tier WHERE generation = 1 GROUP BY catalog_id) tot

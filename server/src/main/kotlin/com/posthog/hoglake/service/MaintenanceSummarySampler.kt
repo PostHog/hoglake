@@ -377,9 +377,13 @@ class MaintenanceSummarySampler(
                     // the generation it has just finished — one range of
                     // the tier primary key, bounded by this catalog's
                     // buckets, paid once per generation — and the tick
-                    // reads four columns. `live_rows` only when the scan
-                    // measured record_count: an unmeasured generation
-                    // publishes NULL (absent), not an undercount.
+                    // reads them. `live_rows` only when the scan measured
+                    // record_count: an unmeasured generation publishes
+                    // NULL (absent), not an undercount. `live_generation`
+                    // names the generation the stamp came from, and the
+                    // tick reads the stamp only while it is the published
+                    // one; `live_as_of` is the scan's start, which is what
+                    // the totals are as of.
                     h.createUpdate(
                         """
                         UPDATE hog_maintenance_summary SET generation = :generation, published_generation = :generation,
@@ -387,6 +391,7 @@ class MaintenanceSummarySampler(
                             next_batch_at = now() + make_interval(secs => :refresh),
                             live_files = tot.files, live_bytes = tot.bytes,
                             live_rows = CASE WHEN :measured THEN tot.rows END,
+                            live_generation = :generation, live_as_of = :startedAt,
                             published_snapshot = :snapshot,
                             -- STAMPED AT PUBLISH, from the scan's own
                             -- flag, so `measures_generation` names the
@@ -411,6 +416,7 @@ class MaintenanceSummarySampler(
                         """,
                     ).bind("generation", generation).bind("sample", json.writeValueAsString(sample))
                         .bind("measured", scan.measures).bind("snapshot", scan.snapshot)
+                        .bind("startedAt", scan.startedAt.atOffset(java.time.ZoneOffset.UTC))
                         .bind("refresh", refreshSeconds).bind("id", job.catalogId).execute()
                 } else {
                     checkpoint(h, job.catalogId, generation, scan)
