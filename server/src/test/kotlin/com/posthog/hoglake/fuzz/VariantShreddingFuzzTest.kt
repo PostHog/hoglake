@@ -119,6 +119,8 @@ class VariantShreddingFuzzTest {
         }
 
         private val nodes = mutableListOf<Node>()
+
+        /** Fields and arrays, which the limit counts together. */
         private var fields = 0
 
         /** The declaration, and the rule it breaks, if any. */
@@ -127,7 +129,7 @@ class VariantShreddingFuzzTest {
             val target = nodes[data.consumeInt(0, nodes.size - 1)]
             val map = target.map
             val type = map["type"]
-            return when (data.consumeInt(0, 15)) {
+            return when (data.consumeInt(0, 16)) {
                 0 -> root to null
                 1 -> {
                     val obj = nodes.firstOrNull { it.map["type"] == "object" } ?: return root to null
@@ -145,7 +147,7 @@ class VariantShreddingFuzzTest {
                 4 -> {
                     val obj = nodes.firstOrNull { it.map["type"] == "object" } ?: return root to null
                     pad(obj, VariantShredding.MAX_FIELDS + 1 - fields)
-                    root to "more than ${VariantShredding.MAX_FIELDS} fields"
+                    root to "more than ${VariantShredding.MAX_FIELDS} fields and arrays"
                 }
                 5 -> {
                     map["type"] = notAType()
@@ -217,6 +219,27 @@ class VariantShreddingFuzzTest {
                     unnamed[data.consumeInt(0, unnamed.size - 1)].map["name"] = "n"
                     root to "a name on a node that is not a field"
                 }
+                15 -> {
+                    // A name the catalog cannot store as declared, or one
+                    // that takes the names on its path past the cap.
+                    val obj = nodes.firstOrNull { it.map["type"] == "object" } ?: return root to null
+                    val field = (obj.map["fields"] as MutableList<Any?>).first() as MutableMap<String, Any?>
+                    val name = field["name"] as String
+                    when (data.consumeInt(0, 2)) {
+                        0 -> {
+                            field["name"] = name + "\u0000"
+                            root to "a field name with a NUL character"
+                        }
+                        1 -> {
+                            field["name"] = name + if (data.consumeBoolean()) "\ud800" else "\udc00"
+                            root to "a field name with an unpaired surrogate"
+                        }
+                        else -> {
+                            field["name"] = name + "x".repeat(VariantShredding.MAX_PATH_NAME_BYTES)
+                            root to "names longer than ${VariantShredding.MAX_PATH_NAME_BYTES} bytes on a path"
+                        }
+                    }
+                }
                 else -> {
                     decimal(target, broken = false)
                     root to null
@@ -245,6 +268,7 @@ class VariantShreddingFuzzTest {
                     map["fields"] = list
                 }
                 1 -> {
+                    fields++
                     map["type"] = "array"
                     map["element"] = node(depth + 1, field = false)
                 }
@@ -255,9 +279,13 @@ class VariantShreddingFuzzTest {
             return map
         }
 
-        /** A name no field of [obj] has, compared case-insensitively. */
+        /**
+         * A name no field of [obj] has, compared case-insensitively. It has
+         * no NUL or surrogate characters, and at most 8 characters of 3 bytes
+         * and 3 underscores, so 16 of them on a path stay under the byte cap.
+         */
         private fun uniqueName(obj: Node): String {
-            var name = data.consumeString(8).ifEmpty { "f" }
+            var name = data.consumeString(8).filter { it != '\u0000' && !it.isSurrogate() }.ifEmpty { "f" }
             while (!obj.names.add(name.lowercase())) name += "_"
             return name
         }

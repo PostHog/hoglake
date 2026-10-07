@@ -377,8 +377,17 @@ declaration it cannot write is a 422 when it is declared instead of a failure of
 every later INSERT. A declaration on a variant nested in a struct, list or map is
 refused, since the connector shreds only top-level columns, and so is a
 `shredding` key on a column of another type or any other key on a variant.
-Declarations come only from the REST API: Trino SQL DDL sends no `type_params`
-for a variant. A declaration is fixed when its column is defined; no alter op
+A field name has no NUL character, which JSONB cannot hold, and no unpaired
+surrogate, which UTF-8 cannot encode, so the catalog stores it as declared. Two
+limits keep the footer of every data file within the 15 MB the connector reads:
+a declaration has at most 1000 fields and arrays, counted together, since each
+gives every data file columns of its own, and the names on the way to a field
+are at most 1024 bytes of UTF-8, since the footer repeats them once for each
+column below them.
+
+Trino SQL declares a layout with the connector's `shredding` column property, in
+`CREATE TABLE` and `ALTER TABLE ... ADD COLUMN`; other clients declare one through
+the REST API. A declaration is fixed when its column is defined; no alter op
 changes it, so a different layout is a new column.
 
 Python sends no `type_params` for a variant, and reads a stored declaration as an

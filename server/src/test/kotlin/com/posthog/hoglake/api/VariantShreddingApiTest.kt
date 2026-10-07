@@ -219,6 +219,27 @@ class VariantShreddingApiTest {
                         "$ has fields that differ only by case: 'plan' and 'Plan'",
                 ),
                 Arguments.of(
+                    "a NUL in a field name",
+                    """{"name": "properties", "type": "variant", "type_params": {"shredding": {"type": "object",
+                        "fields": [{"name": "a\u0000b", "type": "string"}]}}}""",
+                    "variant column 'properties' has an invalid type_params.shredding: " +
+                        "$ has a field name with a NUL character",
+                ),
+                Arguments.of(
+                    "an unpaired surrogate in a field name",
+                    """{"name": "properties", "type": "variant", "type_params": {"shredding": {"type": "object",
+                        "fields": [{"name": "\ud800", "type": "string"}, {"name": "\udc00", "type": "string"}]}}}""",
+                    "variant column 'properties' has an invalid type_params.shredding: " +
+                        "$ has a field name with an unpaired surrogate",
+                ),
+                Arguments.of(
+                    "names longer than 1024 bytes on a path",
+                    """{"name": "properties", "type": "variant", "type_params": {"shredding": {"type": "object",
+                        "fields": [{"name": "${"a".repeat(1025)}", "type": "string"}]}}}""",
+                    "variant column 'properties' has an invalid type_params.shredding: " +
+                        "$ has a field whose name, with the names above it, is longer than 1024 bytes",
+                ),
+                Arguments.of(
                     "a misspelt parameter",
                     """{"name": "properties", "type": "variant", "type_params": {"shreding": {"type": "string"}}}""",
                     "variant column 'properties' has an unknown type_params key 'shreding': " +

@@ -3113,7 +3113,9 @@ components:
             stay as they are. A declaration is a tree of JSON objects,
             each with a `type`: `object`, with a non-empty `fields`
             list, each field naming a variant key in `name` that no
-            other field of the object has, compared case-insensitively;
+            other field of the object has, compared case-insensitively,
+            and that has no NUL character or unpaired surrogate (which
+            the catalog could not store as declared);
             `array`, with an `element`; `variant`, shredded without a
             type into a value column of its own; or a Variant primitive
             type of the Parquet shredding specification: boolean, int8,
@@ -3122,10 +3124,15 @@ components:
             uuid, or decimal4, decimal8 or decimal16 with an integer
             `precision` (at most 9, 18 and 38) and an integer `scale` (0
             to the precision). A node has no other keys, objects and
-            arrays nest at most 16 deep, and a declaration has at most
-            1000 fields. For example, `{"shredding": {"type": "object",
-            "fields": [{"name": "$browser", "type": "string"}, {"name":
-            "price", "type": "decimal8", "precision": 18, "scale": 2}]}}`.
+            arrays nest at most 16 deep, a declaration has at most 1000
+            fields and arrays counted together, and the names on the way
+            to a field are at most 1024 bytes of UTF-8. Each field and
+            array gives every data file columns of its own, and the
+            footer repeats the names once for each column below them, so
+            these keep footers within what readers accept. For example,
+            `{"shredding": {"type": "object", "fields": [{"name":
+            "$browser", "type": "string"}, {"name": "price", "type":
+            "decimal8", "precision": 18, "scale": 2}]}}`.
             `"shredding": null` declares nothing. A declaration is fixed
             when its column is defined: no alter op changes it, so a
             different layout is a new column.

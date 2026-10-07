@@ -24,7 +24,9 @@ import java.math.BigInteger
  *
  *  - `object` lists its `fields`, at least one, each with a `name`: a
  *    variant key in its original case, which no other field of the object
- *    has, compared case-insensitively.
+ *    has, compared case-insensitively. A name has no NUL character, which
+ *    JSONB cannot store, and no unpaired surrogate, which UTF-8 cannot
+ *    encode, so it is stored as it was declared.
  *  - `array` has an `element`.
  *  - `variant` is shredded without a type, into a value column of its own.
  *  - Every other type is a Variant primitive type of the specification:
@@ -34,8 +36,13 @@ import java.math.BigInteger
  *    integer `precision` (at most 9, 18 and 38) and an integer `scale`
  *    (0 to the precision).
  *
- * A node has no other keys, at most [MAX_DEPTH] objects and arrays nest,
- * and a declaration has at most [MAX_FIELDS] fields.
+ * A node has no other keys, and at most [MAX_DEPTH] objects and arrays
+ * nest. Two more limits keep the footer of every data file within the
+ * 15 MB the Trino connector reads. A declaration has at most [MAX_FIELDS]
+ * fields and arrays, counted together, since each gives every data file
+ * columns of its own. And the names on the way to a field are at most
+ * [MAX_PATH_NAME_BYTES] bytes of UTF-8, since the footer repeats them
+ * once for each column below them.
  *
  * These are the rules of the writer that honours declarations, the Trino
  * connector (PostHog/trino, plugin/trino-hoglake,
@@ -51,8 +58,11 @@ object VariantShredding {
     /** How deeply objects and arrays may nest, the root being depth 0. */
     const val MAX_DEPTH = 16
 
-    /** How many object fields a declaration may have, counted over the whole tree. */
+    /** How many object fields and arrays a declaration may have, counted together over the whole tree. */
     const val MAX_FIELDS = 1000
+
+    /** The UTF-8 length of the field names on the way to any field. */
+    const val MAX_PATH_NAME_BYTES = 1024
 
     private val PRIMITIVE_TYPES =
         setOf(
@@ -81,7 +91,7 @@ object VariantShredding {
         declaration: Any,
         column: String,
     ) {
-        Walk(column).visit(declaration, "$", 0, emptySet())
+        Walk(column).visit(declaration, "$", 0, 0, emptySet())
     }
 
     /** The refusal for a declaration on a column whose type has no shredded layout. */
@@ -108,13 +118,15 @@ object VariantShredding {
         private var fields = 0
 
         /**
-         * One node at [path]. [context] holds the keys it may have besides
-         * those of its type: `name` for an object field.
+         * One node at [path]. [nameBytes] is the UTF-8 length of the field
+         * names on the way to it, and [context] holds the keys it may have
+         * besides those of its type: `name` for an object field.
          */
         fun visit(
             node: Any?,
             path: String,
             depth: Int,
+            nameBytes: Int,
             context: Set<String>,
         ) {
             if (node !is Map<*, *>) throw refusal(path, "is not a JSON object")
@@ -131,12 +143,24 @@ object VariantShredding {
                     // it cannot tell apart two that differ only by case.
                     val names = HashMap<String, String>()
                     for (field in list) {
-                        fields++
-                        if (fields > MAX_FIELDS) throw refusal("$", "has more than $MAX_FIELDS fields")
+                        count()
                         val name =
                             (field as? Map<*, *>)?.get("name") as? String
                                 ?: throw refusal(path, "has a field without a name")
                         if (name.isEmpty()) throw refusal(path, "has a field with an empty name")
+                        if (name.indexOf('\u0000') >= 0) throw refusal(path, "has a field name with a NUL character")
+                        val fieldNameBytes =
+                            nameBytes + (
+                                utf8Length(name)
+                                    ?: throw refusal(path, "has a field name with an unpaired surrogate")
+                            )
+                        if (fieldNameBytes > MAX_PATH_NAME_BYTES) {
+                            throw refusal(
+                                path,
+                                "has a field whose name, with the names above it, is longer than " +
+                                    "$MAX_PATH_NAME_BYTES bytes",
+                            )
+                        }
                         val previous = names.putIfAbsent(name.lowercase(), name)
                         if (previous == name) throw refusal(path, "has duplicate field '${Identifiers.cap(name)}'")
                         if (previous != null) {
@@ -146,14 +170,15 @@ object VariantShredding {
                                     "'${Identifiers.cap(name)}'",
                             )
                         }
-                        visit(field, "$path.${Identifiers.cap(name)}", depth + 1, FIELD_KEYS)
+                        visit(field, "$path.${Identifiers.cap(name)}", depth + 1, fieldNameBytes, FIELD_KEYS)
                     }
                 }
                 "array" -> {
                     checkKeys(node, path, context, "element")
                     checkDepth(path, depth)
+                    count()
                     val element = node["element"] ?: throw refusal(path, "has no element")
-                    visit(element, "$path[*]", depth + 1, emptySet())
+                    visit(element, "$path[*]", depth + 1, nameBytes, emptySet())
                 }
                 in PRIMITIVE_TYPES -> checkKeys(node, path, context)
                 in DECIMAL_TYPES -> {
@@ -179,6 +204,34 @@ object VariantShredding {
                     throw refusal(path, "has an unknown key '${Identifiers.cap(key)}'")
                 }
             }
+        }
+
+        /** Counts an object field or an array, each of which gives every data file columns of its own. */
+        private fun count() {
+            fields++
+            if (fields > MAX_FIELDS) throw refusal("$", "has more than $MAX_FIELDS fields and arrays")
+        }
+
+        /** The UTF-8 length of [name], or null when it has an unpaired surrogate. */
+        private fun utf8Length(name: String): Int? {
+            var bytes = 0
+            var index = 0
+            while (index < name.length) {
+                val char = name[index]
+                when {
+                    char.code < 0x80 -> bytes += 1
+                    char.code < 0x800 -> bytes += 2
+                    char.isHighSurrogate() -> {
+                        if (index + 1 == name.length || !name[index + 1].isLowSurrogate()) return null
+                        bytes += 4
+                        index++
+                    }
+                    char.isLowSurrogate() -> return null
+                    else -> bytes += 3
+                }
+                index++
+            }
+            return bytes
         }
 
         private fun checkDepth(

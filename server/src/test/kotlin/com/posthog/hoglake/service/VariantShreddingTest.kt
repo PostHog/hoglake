@@ -189,12 +189,21 @@ class VariantShreddingTest {
         refuse(deepObject, "$" + ".n".repeat(VariantShredding.MAX_DEPTH) + " is nested more than 16 levels deep")
 
         accept(objectWithFields(VariantShredding.MAX_FIELDS))
-        refuse(objectWithFields(VariantShredding.MAX_FIELDS + 1), "$ has more than 1000 fields")
+        refuse(objectWithFields(VariantShredding.MAX_FIELDS + 1), "$ has more than 1000 fields and arrays")
         // Over the whole tree, not per object.
         val split = objectWithFields(VariantShredding.MAX_FIELDS / 2)
         refuse(
             """{"type": "object", "fields": [{"name": "x", ${split.drop(1)}, {"name": "y", ${split.drop(1)}]}""",
-            "$ has more than 1000 fields",
+            "$ has more than 1000 fields and arrays",
+        )
+        // An array counts as a field does: each gives every data file columns
+        // of its own, so nested arrays would otherwise multiply the columns of
+        // a field.
+        val array = """"type": "array", "element": {"type": "string"}"""
+        accept(objectWithFields(VariantShredding.MAX_FIELDS - 1).replaceFirst(""""type": "string"""", array))
+        refuse(
+            objectWithFields(VariantShredding.MAX_FIELDS).replaceFirst(""""type": "string"""", array),
+            "$ has more than 1000 fields and arrays",
         )
     }
 
@@ -217,23 +226,26 @@ class VariantShreddingTest {
     @Test
     fun `a refusal does not echo the caller's blob`() {
         val huge = "z".repeat(5_000)
+        // As long as a name can be, so the rules about names reach it
+        val long = "z".repeat(VariantShredding.MAX_PATH_NAME_BYTES)
         for (declaration in listOf(
             mapOf("type" to huge),
             mapOf("type" to "string", huge to 1),
+            mapOf("type" to "object", "fields" to listOf(mapOf("name" to huge, "type" to "string"))),
             mapOf(
                 "type" to "object",
                 "fields" to
-                    listOf(mapOf("name" to huge, "type" to "string"), mapOf("name" to huge, "type" to "string")),
+                    listOf(mapOf("name" to long, "type" to "string"), mapOf("name" to long, "type" to "string")),
             ),
             mapOf(
                 "type" to "object",
                 "fields" to
                     listOf(
-                        mapOf("name" to huge, "type" to "string"),
-                        mapOf("name" to huge.uppercase(), "type" to "string"),
+                        mapOf("name" to long, "type" to "string"),
+                        mapOf("name" to long.uppercase(), "type" to "string"),
                     ),
             ),
-            mapOf("type" to "object", "fields" to listOf(mapOf("name" to huge, "type" to "text"))),
+            mapOf("type" to "object", "fields" to listOf(mapOf("name" to long, "type" to "text"))),
             mapOf("type" to "decimal8", "precision" to huge, "scale" to 2),
         )) {
             val thrown = catchThrowable { VariantShredding.validate(declaration, "v") }
@@ -244,15 +256,17 @@ class VariantShreddingTest {
             catchThrowable { ColumnTrees.validate(listOf(ColumnDef("v", ColType.VARIANT, mapOf(huge to 1)))) }
         assertThat(unknownKey).isInstanceOf(HoglakeException.Validation::class.java)
         assertThat(unknownKey.message!!.length).isLessThan(300)
-        // A path is at most MAX_DEPTH capped names, plus the last one.
-        var deep: Map<String, Any> = mapOf("name" to huge, "type" to "text")
-        repeat(
-            VariantShredding.MAX_DEPTH - 1,
-        ) { deep = mapOf("name" to huge, "type" to "object", "fields" to listOf(deep)) }
+        // A path is at most MAX_DEPTH names, each capped: here a long one and
+        // short ones under it, as many bytes as a path may have.
+        var deep: Map<String, Any> = mapOf("name" to "n", "type" to "text")
+        repeat(VariantShredding.MAX_DEPTH - 2) {
+            deep = mapOf("name" to "n", "type" to "object", "fields" to listOf(deep))
+        }
+        deep = mapOf("name" to long.drop(VariantShredding.MAX_DEPTH - 1), "type" to "object", "fields" to listOf(deep))
         val thrown =
             catchThrowable { VariantShredding.validate(mapOf("type" to "object", "fields" to listOf(deep)), "v") }
         assertThat(thrown).hasMessageEndingWith("has an unknown type 'text'")
-        assertThat(thrown.message!!.length).isLessThan((VariantShredding.MAX_DEPTH + 1) * 70)
+        assertThat(thrown.message!!.length).isLessThan(300)
     }
 
     @Test
@@ -317,6 +331,50 @@ class VariantShreddingTest {
             )
         }
             .hasMessage("variant column 'v' has an invalid type_params.shredding: $ has an unknown type 'text'")
+    }
+
+    @Test
+    fun `a field name is text the catalog stores as declared, and the names on a path are capped in bytes`() {
+        // JSON escapes, as a request carries them: JSONB has no NUL character,
+        // and UTF-8 has no unpaired surrogates
+        refuse(objectWith("""a\u0000b"""), "$ has a field name with a NUL character")
+        refuse(objectWith("""\ud800"""), "$ has a field name with an unpaired surrogate")
+        refuse(objectWith("""\ud800a"""), "$ has a field name with an unpaired surrogate")
+        refuse(objectWith("""a\udc00"""), "$ has a field name with an unpaired surrogate")
+        accept(objectWith("""\ud83d\ude00"""))
+
+        val tooLong = "has a field whose name, with the names above it, is longer than 1024 bytes"
+        // Bytes of UTF-8, not characters: a name of characters of each width at
+        // the cap, and one byte over it
+        for (char in listOf("a", "\u00e9", "\u20ac", "\ud83d\ude00")) {
+            val width = char.toByteArray(Charsets.UTF_8).size
+            val name = char.repeat(1024 / width) + "a".repeat(1024 % width)
+            accept(objectWith(name))
+            refuse(objectWith(name + "a"), "$ $tooLong")
+        }
+        val parent = "p".repeat(1000)
+        accept(objectWith(parent, "c".repeat(24)))
+        refuse(objectWith(parent, "c".repeat(25)), "$.${Identifiers.cap(parent)} $tooLong")
+        // An array adds no name, and keeps the names above it
+        accept("""{"type": "array", "element": ${objectWith("a".repeat(1024))}}""")
+        refuse(
+            """{"type": "object", "fields": [{"name": "$parent", "type": "array",
+                "element": ${objectWith("c".repeat(25))}}]}""",
+            "$.${Identifiers.cap(parent)}[*] $tooLong",
+        )
+        assertRefused(
+            listOf(ColumnDef("v", ColType.VARIANT, mapOf("shredding" to parse(objectWith("a".repeat(2000)))))),
+            "variant column 'v' has an invalid type_params.shredding: $ $tooLong",
+        )
+    }
+
+    /** An object with one field named by the last of [names], under objects with the others. */
+    private fun objectWith(vararg names: String): String {
+        var node = """{"type": "string"}"""
+        for (name in names.reversed()) {
+            node = """{"type": "object", "fields": [{"name": "$name", ${node.drop(1)}]}"""
+        }
+        return node
     }
 
     @Test
