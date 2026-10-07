@@ -436,6 +436,11 @@ object FuzzSeedGenerator {
             (0 until count).joinToString(",", """{"type":"object","fields":[""", "]}") {
                 """{"name":"k$it","type":"string"}"""
             }
+
+        fun named(name: String) = """{"type":"object","fields":[{"name":"$name","type":"string"}]}"""
+
+        fun withArray(count: Int) =
+            fields(count).replaceFirst(""""type":"string"""", """"type":"array","element":{"type":"string"}""")
         val declarations =
             mapOf(
                 "documented" to
@@ -459,7 +464,13 @@ object FuzzSeedGenerator {
                 "depth_over_limit" to """{"type":"array","element":$deepest}""",
                 "fields_limit" to fields(1000),
                 "fields_over_limit" to fields(1001),
+                "fields_and_arrays_limit" to withArray(999),
+                "fields_and_arrays_over_limit" to withArray(1000),
                 "not_an_object" to """["string"]""",
+                "nul_name" to named("""a\u0000b"""),
+                "unpaired_surrogate_name" to named("""\ud800"""),
+                "path_name_bytes_limit" to named("a".repeat(1024)),
+                "path_name_bytes_over_limit" to named("a".repeat(1025)),
             )
         for ((name, value) in declarations) {
             write(out, "request_$name", value.trimIndent().toByteArray(Charsets.UTF_8) + byteArrayOf(1))

@@ -1,0 +1,1 @@
+{"type":"object","fields":[{"name":"a\u0000b","type":"string"}]}
