@@ -3,7 +3,7 @@
 import importlib.metadata
 import logging
 
-from . import ops, transforms, upload
+from . import ops, transforms, upload, variant
 from .bounds import decode_bound, encode_bound
 from .client import (
     UNGUARDED,
@@ -54,6 +54,7 @@ from .models import (
 )
 from .ops import AlterOp
 from .types import arrow_type_to_coltype, coltype_to_arrow
+from .variant import variant_field
 
 # Read from the installed metadata so it cannot drift from pyproject.toml.
 __version__ = importlib.metadata.version("pyhoglake")
@@ -118,4 +119,6 @@ __all__ = [
     "ops",
     "transforms",
     "upload",
+    "variant",
+    "variant_field",
 ]

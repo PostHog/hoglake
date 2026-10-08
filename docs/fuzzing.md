@@ -43,6 +43,35 @@ test failure instead. JVM-side consumer test: planned alongside the
 server property tests. When a fuzzer finds a nasty value, it gets
 promoted into the vector file.
 
+`pyhoglake/tests/vectors/variant_shredding_vectors.json`: VARIANT
+`type_params.shredding` declarations, each with the decision the
+server's `VariantShredding.validate` reaches — accept, or the exact
+path and problem of its refusal. pyhoglake's `validate_shredding`
+mirrors the grammar so that a bad declaration fails before the round
+trip, and both suites read the file with the count pinned on both sides
+(`test_variant_ddl.py`'s `EXPECTED_VECTOR_COUNT` and
+`VariantShreddingVectorFile.EXPECTED_COUNT`). Unlike the bounds file,
+most of its expectations are transcribed by hand from the server's
+tests, seeds and documented grammar, and verified by the JVM-side
+consumer, `VariantShreddingVectorFileTest`, against the real validator.
+The case-folding vectors (GREEK CAPITAL SIGMA, whose lowercase the JDK
+decides by word boundaries, and case pairs of newer Unicode data) and
+the fault-order witnesses were recorded from that validator, as no
+independent oracle decides them; for those the JVM test is a regression
+snapshot.
+That test also requires every `request_*` seed of
+`VariantShreddingFuzzTestInputs/declarationsFollowTheDocumentedRules`
+to be in the file verbatim, as vector `fuzz_<seed>`, and every
+`refusal(...)` template of `VariantShredding.kt` to have a vector. A
+refusal marked `"client": "may_accept"` is a case collision the client
+cannot decide exactly as the JDK does (GREEK CAPITAL SIGMA, a case pair
+newer than its Unicode data) and leaves to the server; both tests refuse
+the marking on any other refusal, and on a pair of ASCII names. On a
+Python whose Unicode data is newer than the server's, the client leaves
+every case pair that is not ASCII to the server, and the Python test
+reads every such refusal as may_accept there (it runs the file under
+both this Python's data and newer data).
+
 ### 3. API fuzzing (live server)
 
 Adversarial generation against a disposable stack: hostile identifiers
@@ -102,7 +131,7 @@ Targets (one class, one `@FuzzTest` each):
 | `WireDtoParseFuzzTest` | soak | every structured request body, each to the depth it has: `toModel()` on `CommitRequestDto`, the polymorphic `AlterOp` and the file registrations of `PublishTableCreationDto`; the codec round trip on `PrepareTableCreationDto`; `ColumnTrees.validate` on the columns of `PrepareTableCreationDto` and of each `add_column`; parse-and-reserialize on `CreateCatalogRequestDto`, `ClaimUploadDto`, `UploadOwnerDto` and `AbandonUploadsDto` (none of which has a `toModel`); `parseExpectedTableUuid` / `parseLongQuery` on the guarded-DML query parameters | where a `toModel()` runs, it throws only what ErrorMapping turns into 4xx; where a DTO is reserialized, the bytes re-parse — compared for equality except on the bodies carrying `ColumnStatsDto`, whose `ByteArray` bounds keep identity equals by design |
 | `TableCreationDefinitionCodecFuzzTest` | soak | `TableCreationDefinitionCodec.encode`/`decode`, stored-format versions 0-6 | `decode` refuses arbitrary bytes with `CorruptDefinitionException` and nothing else, naming the receipt; `decode(encode(d)) == d`; `encode` writes the LOWEST version that can carry the definition (a rolling deploy's older reader refuses a version it does not know) |
 | `CommitReceiptFuzzTest` | soak | the stored commit receipt: `CommitFingerprint.commitFingerprint` over a `CommitRequest` parsed by the production wire mapper | handler-phase throws are only what StatusPages installs a handler for — `HoglakeException`, `CorruptDefinitionException`, `BadRequestException`, `JsonConvertException`, `ContentTransformationException` — and deliberately NOT `JacksonException`, which reaches the `Throwable` arm as a 500; the fingerprint is deterministic, idempotent (`fingerprint(parse(fingerprint(r))) == fingerprint(r)`) and invariant under permutation of `appends`, of `files` within an append and of `column_stats` within a file |
-| `VariantShreddingFuzzTest` | soak | the `type_params.shredding` rules (`VariantShredding.validate`, through `ColumnTrees.validate` on a top-level variant): arbitrary declarations parsed by the production wire mapper, and declarations a generator builds by the documented grammar and then breaks at most one rule of, or takes to the field or depth limit | arbitrary input: `HoglakeException.Validation` refusals only, bounded messages, the same decision after a write-and-read round trip; generated input, against the generator's own ground truth: a sound declaration is accepted, a broken one refused |
+| `VariantShreddingFuzzTest` | soak | the `type_params.shredding` rules (`VariantShredding.validate`, through `ColumnTrees.validate` on a top-level variant): arbitrary declarations parsed by the production wire mapper, and declarations a generator builds by the documented grammar and then breaks at most one rule of, or takes to the field or depth limit | arbitrary input: `HoglakeException.Validation` refusals only, bounded messages, the same decision after a write-and-read round trip; generated input, against the generator's own ground truth: a sound declaration is accepted, a broken one refused; its `request_*` seeds are also vectors of `variant_shredding_vectors.json` (§2), which the Python client decides too |
 | `IcebergSingleValueDecodeFuzzTest` | sweep | `IcebergSingleValue.decode` (arbitrary bytes × every ColType) | only `IllegalArgumentException` refusals; `encode(decode(x)) == x` for canonical encodings |
 | `IcebergSingleValueCompareFuzzTest` | sweep | `encode`/`compareValues` over generated typed values | round-trip; comparator sign-antisymmetry, reflexivity, transitivity, equals-consistency |
 | `BoundWireFuzzTest` | sweep | `BoundWire.render` (arbitrary type × scale × bytes — the decode surface of `.../files/{fileId}/stats` and `/v1/debug/decode-bound`) | only `IllegalArgumentException` refusals (the family the endpoints map to 422/null); every produced node serializes and reparses through the production mapper; total over the full int64 temporal range |
@@ -211,7 +240,12 @@ Promotion rule (unchanged): a fuzzer-found nasty value becomes a
 committed corpus entry here, a pinned regression test, and — when the
 surface is cross-language (the bounds codec) — an entry promoted into
 `bounds_vectors.json` by the Python side; the JVM side never edits the
-vector file directly.
+vector file directly. The shredding grammar is cross-language too, the
+other way round: a new `VariantShreddingFuzzTest` `request_*` seed, or a
+nasty declaration the target finds, goes into
+`variant_shredding_vectors.json` verbatim with the server's decision,
+with `EXPECTED_COUNT` bumped on both sides, and `pyhoglake/variant.py`
+changes with it if the client decides it differently.
 
 ## Rules
 

@@ -42,6 +42,23 @@ jobs:
               # The OpenAPI spec is the wire contract the clients
               # conform to.
               - "server/src/main/resources/openapi/hoglake.yaml"
+              # Server files the client's parity tests parse, so that a
+              # server-only change to them reds here rather than on the
+              # next unrelated pyhoglake PR: test_variant_ddl.py reads
+              # VariantShredding.kt's limits, vocabularies and column
+              # messages, ColumnTrees.kt's container message (ops.py
+              # raises it), Identifiers.kt's cap, Model.kt's ColType
+              # vocabulary (as test_transforms.py and test_nested.py
+              # read Model.kt too), and the request seeds of the
+              # shredding fuzz corpus (its JDK check also reads
+              # build.gradle.kts and the Dockerfile, which change with
+              # every dependency bump and are left out: only a JDK
+              # downgrade could red that check).
+              - "server/src/main/kotlin/com/posthog/hoglake/model/Model.kt"
+              - "server/src/main/kotlin/com/posthog/hoglake/service/VariantShredding.kt"
+              - "server/src/main/kotlin/com/posthog/hoglake/service/ColumnTrees.kt"
+              - "server/src/main/kotlin/com/posthog/hoglake/service/Identifiers.kt"
+              - "server/src/test/resources/com/posthog/hoglake/fuzz/VariantShreddingFuzzTestInputs/**"
               - ".github/workflows/ci-python.yml"
               - ".github/workflows/pyhoglake-checks.yml"
               - ".github/workflows/python-live.yml"

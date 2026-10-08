@@ -23,6 +23,7 @@ from pyhoglake import (
     OffsetRegressionError,
     S3Config,
     ops,
+    variant_field,
 )
 
 pytestmark = pytest.mark.integration
@@ -487,6 +488,45 @@ def test_changes_correctness(catalog, ns):
     ordered = sorted(files, key=lambda f: f.row_id_start)
     assert ordered[1].row_id_start == ordered[0].row_id_start + 10
     assert first == 0
+
+
+def test_variant_declarations_round_trip_through_the_server(ns):
+    """What pyhoglake declares, the server stores and returns: a declared
+    and an undeclared variant through create_table, a declaration through
+    add_column, and an undeclared variant nested in a struct. JSONB keeps
+    array order and integers, so the declaration comes back equal."""
+    decl = {
+        "type": "object",
+        "fields": [
+            {"name": "$browser", "type": "string"},
+            {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+            {"name": "tags", "type": "array", "element": {"type": "string"}},
+        ],
+    }
+    table = ns.create_table(
+        "variant_ddl",
+        pa.schema(
+            [
+                pa.field("id", pa.int64(), nullable=False),
+                variant_field("properties", decl),
+                variant_field("raw", nullable=False),
+                pa.field("r", pa.struct([variant_field("x")])),
+            ]
+        ),
+    )
+    by_name = {c.name: c for c in table.columns}
+    assert by_name["properties"].type == "variant"
+    assert by_name["properties"].type_params == {"shredding": decl}
+    assert by_name["raw"].type == "variant" and not by_name["raw"].type_params
+    assert by_name["raw"].nullable is False
+    assert by_name["r"].children[0].type == "variant"
+
+    info = table.alter(
+        [ops.add_column("later", "variant", shredding={"type": "int64"})]
+    )
+    later = next(c for c in info.columns if c.name == "later")
+    assert later.type_params == {"shredding": {"type": "int64"}}
+    assert ns.table("variant_ddl").columns[-1].type_params == later.type_params
 
 
 def test_alter_add_column_then_append(catalog, ns):

@@ -390,8 +390,13 @@ Trino SQL declares a layout with the connector's `shredding` column property, in
 the REST API. A declaration is fixed when its column is defined; no alter op
 changes it, so a different layout is a new column.
 
-Python sends no `type_params` for a variant, and reads a stored declaration as an
-ordinary `type_params` map; the console does not show `type_params`. DuckDB
+pyhoglake declares a layout too, with `variant.variant_field` in a `create_table`
+schema or `ops.add_column(..., "variant", shredding=...)`, and checks it locally
+against the same rules (a shared vector file keeps its copy of them in step with
+the server's), leaving to the server the few case collisions it cannot decide as
+the JDK does (around `Σ`, or past its Unicode data). It writes no VARIANT values
+from Arrow, so it honours no declaration yet, and it reads a stored declaration
+as an ordinary `type_params` map; the console does not show `type_params`. DuckDB
 clients refuse VARIANT at bind (#87) and read only decimal parameters. Hedgerow
 compares `type_params` exactly, so it refuses a destination variant that has a
 declaration as a schema mismatch; it writes through DuckDB, which honours no
