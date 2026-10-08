@@ -17,8 +17,22 @@ from typing import Any
 
 import pyarrow as pa
 
+from .errors import ValidationError
 from .models import PartitionField
-from .types import arrow_type_to_coltype
+from .types import NESTED_TYPES, arrow_type_to_coltype
+from .variant import SHREDDING_KEY, Shredding, _plain, validate_shredding
+
+#: The column types the server knows, by wire name (its ColType enum).
+#: test_variant_ddl.py reads the enum out of Model.kt, so a type added
+#: there fails the suite until it is added here.
+_COLUMN_TYPES = frozenset(
+    {
+        "boolean", "int8", "int16", "int", "long", "uint8", "uint16", "uint32",
+        "uint64", "float", "double", "decimal", "date", "time", "timestamp_s",
+        "timestamp_ms", "timestamp", "timestamp_ns", "timestamptz", "string",
+        "json", "binary", "uuid", "variant", "list", "struct", "map",
+    }
+)  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -31,21 +45,75 @@ class AlterOp:
 
 
 def _column_def(
-    name: str, type_: pa.DataType | str, nullable: bool = True
+    name: str,
+    type_: pa.DataType | str,
+    nullable: bool = True,
+    shredding: Shredding | None = None,
 ) -> dict[str, Any]:
     if isinstance(type_, pa.DataType):
         col_type, params = arrow_type_to_coltype(type_)
     else:
         col_type, params = type_, None
     col: dict[str, Any] = {"name": name, "type": col_type, "nullable": nullable}
+    if shredding is not None:
+        params = _shredding_params(name, col_type, shredding)
     if params:
         col["type_params"] = params
     return col
 
 
-def add_column(name: str, type_: pa.DataType | str, nullable: bool = True) -> AlterOp:
-    """Add a column. ``type_`` is a pyarrow DataType or a hoglake type name."""
-    return AlterOp("add_column", {"column": _column_def(name, type_, nullable)})
+def _shredding_params(name: str, col_type: str, shredding: Shredding) -> dict[str, Any]:
+    """The ``type_params`` that declare ``shredding`` on a column of
+    ``col_type``, refused here as the server's ColumnTrees would refuse
+    them, in its words.
+
+    The server reads a type name in any case (``ColType.fromWire``), so
+    ``"VARIANT"`` is a variant, and it quotes the wire name, not the
+    caller's spelling. A container refuses any ``type_params`` before it
+    is asked whether it is a variant. A name outside the vocabulary is
+    the server's to refuse, as it is without a declaration: which of its
+    refusals answers turns on the name (``int128`` has its own), so the
+    declaration goes as given, unvalidated.
+    """
+    wire = col_type.lower()
+    if wire == "variant":
+        validate_shredding(shredding, column=name)
+    elif wire in NESTED_TYPES:
+        # ColumnTrees' refusal of any type_params on a container.
+        raise ValidationError(
+            f"column '{name}' is '{wire}', a nested container, and cannot have "
+            "type_params: a container's shape is its children, not its parameters",
+            status_code=None,
+        )
+    elif wire in _COLUMN_TYPES:
+        # VariantShredding.notVariant.
+        raise ValidationError(
+            f"column '{name}' is '{wire}', and only a variant column can "
+            "declare type_params.shredding",
+            status_code=None,
+        )
+    return {SHREDDING_KEY: _plain(shredding)}
+
+
+def add_column(
+    name: str,
+    type_: pa.DataType | str,
+    nullable: bool = True,
+    *,
+    shredding: Shredding | None = None,
+) -> AlterOp:
+    """Add a column. ``type_`` is a pyarrow DataType or a hoglake type name.
+
+    ``shredding`` declares the shredded layout of a ``variant`` column
+    (``type_="variant"``, in any case; see :mod:`pyhoglake.variant`). It
+    is validated here, refused on any other type the server knows, and
+    copied into the op, so changing the caller's dict afterwards changes
+    nothing. A declaration is fixed once the column exists: no alter op
+    changes it.
+    """
+    return AlterOp(
+        "add_column", {"column": _column_def(name, type_, nullable, shredding)}
+    )
 
 
 def drop_column(name: str) -> AlterOp:

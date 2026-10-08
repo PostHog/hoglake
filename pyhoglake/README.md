@@ -128,10 +128,12 @@ for s in catalog.snapshots(before=head + 1):
 ## Type mapping
 
 The Arrow writer path maps 26 of the catalog's 27 wire names, both
-directions. `variant` is the exception: Arrow cannot construct it, so a
-`variant` column arrives only through `Table.prepare_append_files` (see
-"Native VARIANT files" below). An Arrow type outside the table is
-rejected with an error listing the supported set.
+directions. `variant` is the exception: Arrow has no VARIANT type, so a
+schema DECLARES one with `variant.variant_field` (see "variant columns:
+declaring a shredded layout" below), and the data arrives only through
+`Table.prepare_append_files` (see "Native VARIANT files" below). An
+Arrow type outside the table is rejected with an error listing the
+supported set.
 
 | pyarrow | hoglake |
 |---|---|
@@ -149,7 +151,8 @@ rejected with an error listing the supported set.
 | `timestamp("us", tz)` | `timestamptz` — micros only; the other units exist tz-naive |
 | `decimal128(p, s)` | `decimal` (`type_params: {precision, scale}`) |
 | `pa.uuid()` or `binary(16)` (fixed) | `uuid` — 16 big-endian bytes, i.e. `uuid.UUID(...).bytes` |
-| `list` family / `struct` / `map` | `list` / `struct` / `map` — children validated recursively; an empty struct is refused |
+| `list` family / `struct` / `map` | `list` / `struct` / `map` — children validated recursively; an empty struct is refused, and so is a struct shaped like VARIANT storage (below) |
+| `variant.variant_field(name[, shredding])` — a `pa.json_()` field with a marker | `variant`, with `type_params.shredding` when declared — DDL only |
 
 ### uuid columns: the wire form, and the two spellings
 
@@ -178,6 +181,106 @@ Both spellings are accepted everywhere on the way in:
 - Reading, `arrow_type_to_coltype` maps both to `uuid`, and footer
   bounds are read from either (the bytes are unsigned-lexicographic in
   both).
+
+### variant columns: declaring a shredded layout
+
+A top-level `variant` column may declare in `type_params.shredding` the
+layout that writers which shred VARIANT values (the Trino connector)
+give it: which object fields and array elements get Parquet columns of
+their own, and the Variant type of each. Readers use each file's own
+layout, so a declaration changes no read, and it is fixed once the
+column exists — no alter op changes it, so a different layout is a new
+column. pyhoglake declares one in either DDL call:
+
+```python
+from pyhoglake import ops, variant
+
+decl = {
+    "type": "object",
+    "fields": [
+        {"name": "$browser", "type": "string"},
+        {"name": "price", "type": "decimal8", "precision": 18, "scale": 2},
+        {
+            "name": "$active_feature_flags",
+            "type": "array",
+            "element": {"type": "string"},
+        },
+    ],
+}
+
+events = ns.create_table(
+    "events",
+    pa.schema(
+        [
+            pa.field("id", pa.int64(), nullable=False),
+            variant.variant_field("properties", decl),  # declared
+            variant.variant_field("props_raw"),  # undeclared: no type_params
+        ]
+    ),
+)
+events.alter([ops.add_column("extra", "variant", shredding={"type": "string"})])
+```
+
+`variant_field` is a `pa.json_()` field whose metadata carries
+`variant.VARIANT_FIELD_KEY`; `create_table` turns it into
+`{"type": "variant", "type_params": {"shredding": ...}}`, and leaves
+`type_params` out when nothing is declared. The marker, not the JSON
+type, makes it a variant: a `pa.json_()` field without it is still a
+`json` column.
+
+The grammar is the server's (the OpenAPI `ColumnDef.type_params` states
+it): `object` with a non-empty `fields` list of named fields, `array`
+with an `element`, `variant`, or a Variant primitive — `boolean`,
+`int8`/`16`/`32`/`64`, `float`, `double`, `date`, `time`, `timestamp`,
+`timestamp_ns`, `timestamptz`, `timestamptz_ns`, `binary`, `string`,
+`uuid`, or `decimal4`/`8`/`16` with an integer `precision` (at most
+9/18/38) and `scale` (0 to the precision). Field names are variant keys
+in their original case, unique case-insensitively, with no NUL and no
+unpaired surrogate; objects and arrays nest at most 16 deep; at most
+1000 fields and arrays, counted together; and the names on the way to a
+field are at most 1024 bytes of UTF-8. `variant.validate_shredding`
+checks all of it locally, so a declaration the server would refuse
+raises `ValidationError` before the request, with the server's own 422
+message and the path of the node at fault (`$.price`, `$.tags[*]`). The
+server stays authoritative; `tests/vectors/variant_shredding_vectors.json`
+is shared with its test suite so the two cannot drift silently. One rule
+is partly left to it: whether two names differ only by case follows the
+JDK's lowercase mapping, which Python's matches except for GREEK CAPITAL
+SIGMA (the JDK picks `ς` or `σ` by word boundaries, Python by Unicode's
+Final_Sigma rule) and for case pairs newer than one side's Unicode data.
+The client leaves a name with a `Σ`, and such a pair, out of its case
+check (names without one are still checked against each other), and
+the server answers with a 422 if it finds a collision; the client never
+refuses a pair the server accepts.
+
+The client also refuses, locally and in the server's words, a
+declaration on a variant nested in a struct, list or map (an
+undeclared nested `variant_field` is fine) and `shredding=` on a column
+of any other type the server knows (`add_column` reads the type name in
+any case, as the server does, so `"VARIANT"` is a variant; a name the
+server does not know is left to its 422). And an Arrow struct shaped exactly like VARIANT
+storage — `metadata` (binary, not null), `value` (binary), optionally
+`typed_value`, which is how pyarrow reads a VARIANT group out of a
+Parquet file — is refused with a pointer to `variant_field`, where it
+used to become a plain `struct` column without a word.
+
+Choose a declaration with the data's source in mind.
+`variant.json_unshreddable_paths(decl)` lists the leaves that values
+pyhoglake's writer will encode from JSON text (from 1.4) fill rarely or
+never: JSON has no temporal, binary, uuid or float values; an integer
+within the int64 range is an integer and never fills a `double` or
+`decimal` leaf, and a larger one fills only `decimal16` with scale 0
+and a precision of at least 19; a fraction is a double and never fills
+a `decimal`. Those columns would stay empty for the life of the table.
+Other writers type JSON their own way (DuckDB, for one, types a
+non-negative integer as unsigned), so the list speaks for pyhoglake's
+writer only.
+
+Declaring is all this release does with a layout. The Arrow write paths
+(`Table.append`, `prepare_append_tables`) still do not construct
+VARIANT values.
+
+### Identifiers and reserved names
 
 Identifiers (namespace/table/view/column names) must match
 `^[A-Za-z_][A-Za-z0-9_-]{0,127}$` — the server 422s anything else, and

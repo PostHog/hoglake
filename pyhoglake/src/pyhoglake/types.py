@@ -25,6 +25,7 @@ Supported mappings (both directions):
     pa.timestamp("us", tz)   <-> timestamptz
     pa.decimal128(p, s)      <-> decimal  (type_params: {"precision": p, "scale": s})
     pa.uuid()                <-> uuid   (pa.binary(16) also reads as uuid)
+    variant_field(name[, shredding]) -> variant  (DDL only; see below)
 
 Note on uuid: hoglake's ``uuid`` column is parquet
 ``FIXED_LEN_BYTE_ARRAY(16)`` carrying the ``UUID`` logical annotation
@@ -67,6 +68,21 @@ makes pyarrow stamp the parquet JSON logical annotation; on pyarrow < 19
 it falls back to ``pa.string()``, which loses that annotation but not
 one byte of the document.
 
+Note on variant: Arrow has no VARIANT type, so no Arrow TYPE maps to
+``variant``. A schema declares one with
+:func:`pyhoglake.variant.variant_field`, a ``pa.json_()`` field whose
+metadata carries :data:`pyhoglake.variant.VARIANT_FIELD_KEY`; the
+marker, not the type, is what :func:`schema_to_column_defs` reads, and
+it carries the column's ``type_params.shredding`` when one is declared.
+The other direction stays refused: ``coltype_to_arrow("variant")``
+raises, and the Arrow write paths do not construct VARIANT values. The
+one shape that looks like a variant without the marker — a struct of
+exactly ``metadata`` (binary, not null), ``value`` (binary) and an
+optional ``typed_value``, which is how pyarrow reads a VARIANT group out
+of a Parquet file — is refused rather than silently created as a plain
+``struct`` column, which no reader or writer then treats as a variant
+and no alter op can turn into one.
+
 Nested types (phase 2) map structurally, both ways::
 
     pa.list_(field)          <-> list   (one child, named "element")
@@ -100,6 +116,7 @@ import pyarrow as pa
 
 from .errors import UnsupportedTypeError
 from .models import Column
+from .variant import _variant_column_def
 
 PARQUET_FIELD_ID_KEY = b"PARQUET:field_id"
 
@@ -135,6 +152,29 @@ def _is_json_extension(t: pa.DataType) -> bool:
         return t.equals(pa.json_())  # pyarrow >= 19
     except AttributeError:  # pragma: no cover - old pyarrow
         return False
+
+
+def _is_binary(t: pa.DataType) -> bool:
+    return pa.types.is_binary(t) or pa.types.is_large_binary(t)
+
+
+def _is_variant_storage(t: pa.StructType) -> bool:
+    """Whether ``t`` is laid out as a VARIANT group: ``metadata`` (binary,
+    not null), ``value`` (binary), then optionally ``typed_value``, in
+    that order and nothing else.
+
+    That is what pyarrow reads out of a Parquet VARIANT group, from
+    every writer this repo knows (Trino, DuckDB). Exact, so a user struct
+    that merely has a ``metadata`` field is untouched: a nullable
+    ``metadata``, another order, or a fourth field is an ordinary struct.
+    """
+    names = [t.field(i).name for i in range(t.num_fields)]
+    if names not in (["metadata", "value"], ["metadata", "value", "typed_value"]):
+        return False
+    metadata, value = t.field(0), t.field(1)
+    return (
+        _is_binary(metadata.type) and not metadata.nullable and _is_binary(value.type)
+    )
 
 
 def arrow_type_to_coltype(t: pa.DataType) -> tuple[str, dict[str, Any] | None]:
@@ -241,6 +281,13 @@ def arrow_type_to_coltype(t: pa.DataType) -> tuple[str, dict[str, Any] | None]:
                 f"unsupported Arrow type {t!r}: a struct must have at least one "
                 "field (an empty struct has no representation in parquet or "
                 f"Iceberg); supported types: {_SUPPORTED}"
+            )
+        if _is_variant_storage(t):
+            raise UnsupportedTypeError(
+                f"unsupported Arrow type {t!r}: it is shaped like VARIANT storage "
+                "(metadata, value[, typed_value]), which would become a plain "
+                "struct column rather than a variant; declare the column with "
+                "pyhoglake.variant.variant_field(name[, shredding])"
             )
         for i in range(t.num_fields):
             arrow_type_to_coltype(t.field(i).type)
@@ -353,15 +400,31 @@ def _column_def_depth(defs: list[dict[str, Any]]) -> int:
     )
 
 
-def _field_to_column_def(f: pa.Field) -> dict[str, Any]:
-    """One Arrow field as a CreateTableRequest column def, recursively."""
+def _field_to_column_def(
+    f: pa.Field, _name: str | None = None, _parent: str | None = None
+) -> dict[str, Any]:
+    """One Arrow field as a CreateTableRequest column def, recursively.
+
+    ``_name`` is the catalog's name for a synthetic child (``element``,
+    ``key``, ``value``) and ``_parent`` the qualified name of the column
+    holding it; together they qualify a nested field the way the server's
+    messages do (``r.x``, ``l.element``).
+    """
+    name = f.name if _name is None else _name
+    qualified = name if _parent is None else f"{_parent}.{name}"
+    # The variant marker first: its Arrow type is pa.json_(), which on
+    # its own means a json column.
+    variant = _variant_column_def(f, name, qualified, top_level=_parent is None)
+    if variant is not None:
+        return variant
     type_, params = arrow_type_to_coltype(f.type)
-    col: dict[str, Any] = {"name": f.name, "type": type_, "nullable": f.nullable}
+    col: dict[str, Any] = {"name": name, "type": type_, "nullable": f.nullable}
     if params:
         col["type_params"] = params
     if type_ == "struct":
         col["children"] = [
-            _field_to_column_def(f.type.field(i)) for i in range(f.type.num_fields)
+            _field_to_column_def(f.type.field(i), _parent=qualified)
+            for i in range(f.type.num_fields)
         ]
     elif type_ == "list":
         # The element's own nullability is carried; its NAME is not.
@@ -369,21 +432,19 @@ def _field_to_column_def(f: pa.Field) -> dict[str, Any]:
         # anything, but the catalog's name for it is Iceberg's:
         # "element". Passing the local name through would make the DDL
         # depend on which library built the array.
-        value = f.type.value_field
-        child = _field_to_column_def(value)
-        child["name"] = "element"
-        col["children"] = [child]
+        col["children"] = [
+            _field_to_column_def(f.type.value_field, "element", qualified)
+        ]
     elif type_ == "map":
-        key = _field_to_column_def(f.type.key_field)
-        key["name"] = "key"
-        # `nullable` is NOT overridden here: arrow refuses to construct a
-        # map with a nullable key at all ("Map key field should be
-        # non-nullable" — pinned by a test), and Iceberg requires the
-        # same, so the value already read off the field is False. Writing
-        # it again would be a guard no test could ever fail.
-        value = _field_to_column_def(f.type.item_field)
-        value["name"] = "value"
-        col["children"] = [key, value]
+        # `nullable` is NOT overridden on the key: arrow refuses to
+        # construct a map with a nullable key at all ("Map key field
+        # should be non-nullable" — pinned by a test), and Iceberg
+        # requires the same, so the value already read off the field is
+        # False. Writing it again would be a guard no test could ever fail.
+        col["children"] = [
+            _field_to_column_def(f.type.key_field, "key", qualified),
+            _field_to_column_def(f.type.item_field, "value", qualified),
+        ]
     return col
 
 

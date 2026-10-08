@@ -228,7 +228,7 @@ jobs:
               sed -n '1,15p' verdict.txt
               echo
               echo "## Promotion rule (fuzzing.md)"
-              echo "A real finding becomes a committed corpus entry, a pinned regression test in \`:test\`, and a \`bounds_vectors.json\` entry when the surface is cross-language."
+              echo "A real finding becomes a committed corpus entry, a pinned regression test in \`:test\`, and, when the surface is cross-language, a \`bounds_vectors.json\` entry (the bounds codec) or a \`variant_shredding_vectors.json\` entry with \`EXPECTED_COUNT\` bumped on both sides (\`VariantShreddingFuzzTest\`). See the promotion rule in docs/fuzzing.md."
             } > issue-body.md
             gh issue create --repo "$GITHUB_REPOSITORY" \
               --title "Nightly fuzz: ${target:-unknown target} crash (dedup $token)" \

@@ -211,6 +211,14 @@ tasks.test {
     if (project.hasProperty("unitOnly")) {
         exclude("**/*IntegrationTest*")
     }
+    // The cross-language vector files the parity tests read from the
+    // Python tree (QeBoundsVectorsTest, VariantShreddingVectorFileTest).
+    // They are outside this project, so not an input unless declared: an
+    // edit to one alone would leave :test UP-TO-DATE and the gate unrun.
+    inputs
+        .dir(layout.projectDirectory.dir("../pyhoglake/tests/vectors"))
+        .withPropertyName("sharedVectors")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
     // jazzer-junit self-attaches its instrumentation agent (ByteBuddy)
     // for the corpus replay of the fuzz targets. The flag arrived to
     // silence the four-line JEP 451 warning a dynamic attach prints

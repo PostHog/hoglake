@@ -224,6 +224,17 @@ server — but it still works against an older one, which is what makes it
 a breaking client change worth a line rather than a silent deletion. Say
 so in the release notes when 1.3.8 is cut.
 
+**Pending note for the 1.4.0 release body**: pyhoglake's
+`arrow_type_to_coltype` now refuses, with `UnsupportedTypeError`, an
+Arrow struct laid out exactly as VARIANT storage — `metadata` (binary,
+not null), `value` (binary), optionally `typed_value`, in that order —
+and so do `schema_to_column_defs`, `Namespace.create_table` and
+`ops.add_column` given one, wherever it stands in the schema. Before,
+it became a plain `struct` column without a word. A variant column is
+declared with `pyhoglake.variant.variant_field`, or with
+`ops.add_column(name, "variant", shredding=...)`. Say so in the release
+notes when 1.4.0 is cut.
+
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
 CD job passes `HOGLAKE_BUILD_STAMP` (a UTC `date -u +%Y%m%dT%H%MZ`) as a
@@ -1307,9 +1318,19 @@ ran on the local stack and what it showed.
     `pyhoglake/tests/vectors/bounds_vectors.json` (109 vectors, count
     pinned on both sides — `qe_vectors.test_vector_file_header_contract`
     and `BoundsVectorFile.EXPECTED_COUNT` — so a silently shrunken file
-    cannot pass), and it mirrors the server's type mapping and
-    validation gates, which therefore move with the server. A parity
-    test must PARSE the other side's artifact or share a fixture:
+    cannot pass), and the VARIANT `type_params.shredding` grammar through
+    `pyhoglake/tests/vectors/variant_shredding_vectors.json` (declarations
+    with the exact refusal each gets, pinned the same way in
+    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`).
+    It mirrors the server's type mapping and validation gates, which
+    therefore move with the server: a change to `VariantShredding.kt`'s
+    rules or messages updates that file and `pyhoglake/variant.py`
+    together, and one to the column-level refusals pyhoglake raises
+    locally (`VariantShredding.kt`'s nested and not-a-variant messages,
+    `ColumnTrees.kt`'s type_params-on-a-container message) updates
+    `pyhoglake/variant.py` and `pyhoglake/ops.py`, which
+    `test_variant_ddl.py` checks against both sources. A parity test
+    must PARSE the other side's artifact or share a fixture:
     `test_transforms.py` regexes `ColType` out of `Model.kt` and
     `BUCKETABLE_TYPES` out of `AlterService.kt`, and
     `ScalarTypeParityTest` reads the migration, `schema.sql`, and the
