@@ -26,8 +26,10 @@ from .errors import (
     OffsetRegressionError,
     ReadSnapshotExpiredError,
     ReconciliationRequiredError,
+    UnsupportedShreddingError,
     UnsupportedTypeError,
     ValidationError,
+    VariantEncodingError,
 )
 from .models import (
     AppendedFile,
@@ -54,7 +56,7 @@ from .models import (
 )
 from .ops import AlterOp
 from .types import arrow_type_to_coltype, coltype_to_arrow
-from .variant import variant_field
+from .variant import VARIANT_NULL, VariantReport, variant_field
 
 # Read from the installed metadata so it cannot drift from pyproject.toml.
 __version__ = importlib.metadata.version("pyhoglake")
@@ -70,6 +72,7 @@ logging.getLogger("pyhoglake").addHandler(logging.NullHandler())
 
 __all__ = [
     "UNGUARDED",
+    "VARIANT_NULL",
     "AlreadyExistsError",
     "AlterOp",
     "AppendResult",
@@ -107,8 +110,11 @@ __all__ = [
     "Table",
     "TableInfo",
     "TableSummary",
+    "UnsupportedShreddingError",
     "UnsupportedTypeError",
     "ValidationError",
+    "VariantEncodingError",
+    "VariantReport",
     "View",
     "ViewInfo",
     "__version__",

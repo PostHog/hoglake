@@ -60,6 +60,55 @@ class ValidationError(HoglakeError):
     """422 — invalid request (bad op, bad stats shape, unknown field ids...)."""
 
 
+class VariantEncodingError(ValidationError):
+    """A VARIANT value that cannot be encoded, or storage that does not
+    decode — raised client-side, so ``status_code`` is None.
+
+    :attr:`reason` says why in one word (``duplicate_key``,
+    ``invalid_unicode``, ``sql_null_in_not_null``, ...; the full list is
+    ``pyhoglake.variant.InvalidReason``), :attr:`row` is the row's index in
+    the input, and :attr:`path` the place in the value (``$.tags[3]``),
+    None where the JSON parser found the fault and the value has no
+    position. A path is built from the value's keys or the storage's
+    column names, which are data, so it is cut to its first 1024
+    characters, ``...`` marking the cut, as names the message quotes are
+    to 64. A ValidationError, because the input is what is wrong, as it
+    is when the server refuses a request."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason: str,
+        column: str | None = None,
+        row: int | None = None,
+        path: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.column = column
+        self.row = row
+        self.path = path
+
+    def __reduce__(self) -> tuple[object, ...]:
+        # Exception pickling replays self.args, the message alone, and
+        # ``reason`` is required: rebuild from every attribute instead, so
+        # the error crosses a process boundary (a pool encoding groups)
+        # and survives copy.copy whole.
+        return (
+            _variant_encoding_error,
+            (self.message, self.reason, self.column, self.row, self.path),
+        )
+
+
+def _variant_encoding_error(
+    message: str, reason: str, column: str | None, row: int | None, path: str | None
+) -> VariantEncodingError:
+    return VariantEncodingError(
+        message, reason=reason, column=column, row=row, path=path
+    )
+
+
 class OffsetRegressionError(HoglakeError):
     """409 on consumer-offset commit — offsets are monotonic; the snapshot
     is below the stored offset."""
@@ -175,6 +224,16 @@ class MalformedResponseError(HoglakeError):
 
 class UnsupportedTypeError(HoglakeError, TypeError):
     """An Arrow type with no hoglake column-type mapping."""
+
+
+class UnsupportedShreddingError(UnsupportedTypeError):
+    """A VARIANT ``type_params.shredding`` declaration this version of
+    pyhoglake cannot honour: a node type it does not know, or a catalog
+    column's declaration (which the server accepted) that its copy of the
+    grammar refuses. Either is a newer server's grammar. The encoders fail
+    closed rather than write a layout other than the declared one, and the
+    readers rather than check storage against a declaration they do not
+    know; upgrade pyhoglake."""
 
 
 class ReconciliationRequiredError(HoglakeError):

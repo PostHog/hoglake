@@ -491,7 +491,7 @@ def test_json_unshreddable_paths():
     paths = json_unshreddable_paths(decl)
     assert [p for p, _ in paths] == [
         "$.d", "$.f", "$.when", "$.raw", "$.id", "$.p4", "$.p8", "$.big",
-        "$.small16", "$.frac16", "$.frac16_1", "$.a.b[*].day",
+        "$.small16", "$.frac16", "$.frac16_1", '$["a.b"][*].day',
     ]  # fmt: skip
     reasons = dict(paths)
     assert reasons["$.d"].startswith("double: only numbers written with a fraction")
