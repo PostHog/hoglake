@@ -24,7 +24,14 @@ four are generator-friendly.
   either maps or raises `UnsupportedTypeError`, never passes silently),
   stats extraction vs independently computed ground truth, and
   wire-model parsing under mutated JSON (extra/missing/wrong-typed
-  fields must fail cleanly, never leak `KeyError`).
+  fields must fail cleanly, never leak `KeyError`). The VARIANT codec's
+  properties live in `tests/variant_conformance/qe_prop_variant_codec.py`
+  (beside its other suites, which the `tests/qe_*.py` glob misses):
+  JSON and Python values round-trip to the source value under generated
+  declarations, encoding is deterministic however the rows are chunked,
+  an invalid row becomes SQL NULL and nothing else moves, aware
+  datetimes round-trip or are refused, and mutated Variant bytes are
+  read or refused with `VariantEncodingError`, never another exception.
 - **server** (planned, kotest-property or jqwik): the same codec
   properties on `IcebergSingleValue`, expiry `newEarliest` math under
   generated snapshot/offset/time configurations (invariants: never >
@@ -71,6 +78,15 @@ Python whose Unicode data is newer than the server's, the client leaves
 every case pair that is not ASCII to the server, and the Python test
 reads every such refusal as may_accept there (it runs the file under
 both this Python's data and newer data).
+
+The VARIANT decoder has no second implementation here to diff against,
+so its external ground truth is apache/parquet-testing's `variant/` and
+`shredded_variant/` vectors, vendored in
+`pyhoglake/tests/data/parquet-testing` (read by
+`test_parquet_testing.py`), and small files DuckDB 1.5.5 wrote
+(`pyhoglake/tests/data/README.md` has their regeneration SQL). A fuzzer
+finding in the codec gets promoted into the suites' hand-built vectors
+(`test_encoding_vectors.py`, `DECODER_FAULTS`).
 
 ### 3. API fuzzing (live server)
 

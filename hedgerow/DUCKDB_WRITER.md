@@ -61,6 +61,12 @@ paths = write_duckdb_event_partition(
   Invalid JSON and malformed UUIDs
   fail rather than being replaced with nulls. Conversion follows DuckDB JSON
   numeric semantics; arbitrary-precision JSON numbers are not promised.
+- A string of exactly 64 bytes is not preserved where DuckDB 1.5.5 keeps it in
+  a VARIANT's `value` bytes rather than a typed leaf: it writes an empty short
+  string followed by the 64 bytes. DuckDB reads that back as `""`, and
+  pyhoglake's Variant reader (`variant.to_python`/`verify`) refuses the row as
+  malformed. Nothing here detects it; see pyhoglake's
+  `tests/data/duckdb_64_byte_strings.parquet`.
 - Row-group selection uses file-row-number ranges. Correct selection is tested,
   and `test_source_fragments_are_scanned_exactly_once` pins the one-scan
   property; efficient row-group I/O pruning is still not measured here.

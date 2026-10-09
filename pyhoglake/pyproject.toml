@@ -79,6 +79,11 @@ packages = ["src/pyhoglake"]
 # adds pyproject.toml, README.md, and LICENSE on its own.
 only-include = ["src", "tests"]
 
+[tool.ruff]
+# Vendored verbatim (tests/data/parquet-testing/NOTICE): its regen.py is
+# Apache Parquet's, not ours to restyle.
+extend-exclude = ["tests/data/parquet-testing"]
+
 [tool.ruff.lint.per-file-ignores]
 # Default rule selection applies; src/ stays strict.
 "tests/**" = [
