@@ -120,7 +120,7 @@ to the PR.
 
 **Scope.** `stage.py`: microbatched `WriteBatch` puts, transaction
 covering row puts + stats + sched maintenance, range scans, range
-deletes, staged-bytes accounting for backpressure.
+deletes, staged-bytes accounting for the gauges.
 
 **Tests.**
 - Component, `memory:///`: put/scan/delete correctness; the
@@ -152,11 +152,8 @@ quarantine.
 
 **Tests.**
 - Scripted fake consumer (hedgerow `fakes.py` shape): loop logic,
-  pause/resume thresholds (pure decision function, `_liveness_status`
-  pattern), quarantine routing, rebalance listener (revoked partitions
-  flush nothing, abandon nothing).
-- Backpressure: gauge thresholds crossed → consumer paused exactly once,
-  resumed exactly once; no flapping (hypothesis over gauge sequences).
+  quarantine routing, rebalance listener (revoked partitions flush
+  nothing, abandon nothing).
 
 **Exit:** fake-driven suite covers every loop branch.
 
@@ -235,8 +232,8 @@ and replicas) for GC now and compaction when the binding route lands.
   listing, bounded budgeted sweeps, jittered cadence, per-DB failure
   containment. Parity tests first: GC concurrent with an active writer
   (integrity reconciles throughout, garbage actually reclaimed), GC vs.
-  checkpoints, and the stalled-compaction backpressure shape
-  (`l0_max_ssts` → writer stalls → consumer pause).
+  checkpoints, and the stalled-compaction shape (`l0_max_ssts` →
+  writer stalls → the stall series).
 - **Compaction service**: deferred (route 3 decision). The binding gap
   stands (no `CompactorBuilder` in UniFFI; `submit_compaction` is
   queue-only — probe-verified 2026-10-09). Revisit when replica
@@ -249,13 +246,7 @@ and replicas) for GC now and compaction when the binding route lands.
 
 ## Phase 5.6 — review follow-ups (adversarial review 2026-10-09)
 
-> 2026-10-10, PR #331 review: **consumer backpressure was removed
-> entirely** rather than refined — there is no reason to stop consuming
-> except on error; the object store is the unbounded buffer, and pausing
-> moves the backlog toward Kafka's retention cliff. The gauges remain as
-> alert inputs (oldest age = oldest *eligible* key). Phase 3's
-> pause/resume suites are obsolete; the design doc's §Deployment carries
-> the posture. Also from that round: pyarrow floor is >= 25.0 (the
+> 2026-10-10, PR #331 review: pyarrow floor is >= 25.0 (the
 > sort-keys triple form), float columns check float32 range, unpaired
 > surrogates are per-record poison.
 

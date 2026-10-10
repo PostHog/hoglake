@@ -74,20 +74,12 @@ sweep's planning scan instead, which fences the partition out of
 scheduling and fails liveness (flush.py ``_note_fenced``). See the
 README's rollout-barrier paragraph.
 
-There is deliberately NO consumer backpressure: the loop stops
-consuming only on error. SlateDB on object storage is the durable
-buffer before hoglake and is effectively unbounded — nothing bounded
-grows with staged bytes (memtable and block cache are bounded by
-SlateDB's own settings; staged data lives on the object store) — so
-pausing would only move the backlog from SlateDB (ours, unbounded) into
-Kafka (bounded by topic retention, not ours), and Kafka retention
-expiring unread offsets is the one way this pipeline can lose data. The
-staging gauges (staged bytes/rows per partition, oldest ELIGIBLE staged
-age) are published for alerts, never for control flow — an alert on
-them is the entire feature (docs/kafka-ingestion.md §Deployment).
-SlateDB's own L0 write stall (``l0_max_ssts`` with the compactor
-behind) is an error condition that stalls the write on its own and
-surfaces through SlateDB's metrics; no latch would add anything there.
+The loop stops consuming only on error. The staging gauges (staged
+bytes/rows per partition, oldest ELIGIBLE staged age) are published for
+alerts and never read by the loop (docs/kafka-ingestion.md
+§Deployment). SlateDB's own L0 write stall (``l0_max_ssts`` with the
+compactor behind) stalls the staging write itself and surfaces through
+SlateDB's metrics.
 
 Poison pills are quarantined, counted and logged, never silently
 dropped: they land in the same durable write batch as the cycle's staged

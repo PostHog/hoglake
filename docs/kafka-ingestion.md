@@ -73,8 +73,7 @@ O(tenants) pass per reader per poll.
   design exists to break), and its cruft is structural: destination
   duality, DuckDB coupling, VARIANT dual-write. We take three ideas —
   the sink seam, offset-derived flush identity, staging gauges as
-  alert inputs (not backpressure — nothing pauses the consumer) — and
-  no code.
+  alert inputs — and no code.
 - **Not hedgerow's buffered mode.** The staging discipline (persist the
   complete prepared commit request before publication; separate
   discovery and publication checkpoints) is adopted verbatim, but its
@@ -422,17 +421,14 @@ flush tick — the serial loop sits within 2× of the ~110 ready keys/s
 the design arithmetic wants, so the bound-parallel loop shipped; the
 tick dominates the rig (at a 1 ms interval the same rig reads 189/253
 keys/s), and production WAL latencies (object-store round trips, not an
-in-process tick) are exactly what the parallelism overlaps. There is deliberately NO consumer backpressure. SlateDB on object
-storage is the unbounded buffer; pausing would only move the backlog
-into Kafka, whose retention is the one data-loss cliff millrace has —
-and "flusher stuck" would surface as consumer lag, paging the wrong
-people. The staged gauges (bytes/rows per partition, oldest ELIGIBLE
-staged age — a key is aged only once any flush lane will take it, so
-pathological slow-lane tenants don't page) are alert inputs and only
-ever that. SlateDB's own write stall (L0 at `l0_max_ssts` with no
-compactor draining) is an error condition, not a policy: it stalls the
-staging write itself and surfaces through the `slatedb.db` stall
-series. On the consume side, one poll's per-partition stage
+in-process tick) are exactly what the parallelism overlaps. The
+consume loop stops only on error. The staged gauges (bytes/rows per
+partition, oldest ELIGIBLE staged age — a key is aged only once any
+flush lane will take it, so pathological slow-lane tenants don't page)
+are alert inputs; the loop never reads them. SlateDB's own write stall
+(L0 at `l0_max_ssts` with no compactor draining) stalls the staging
+write itself and surfaces through the `slatedb.db` stall series.
+On the consume side, one poll's per-partition stage
 batches are in flight CONCURRENTLY (each partition's WAL write and
 durability wait overlap; the single offset commit still follows every
 ack), and the librdkafka fetch knobs are config

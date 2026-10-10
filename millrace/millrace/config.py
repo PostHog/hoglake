@@ -61,19 +61,6 @@ the downtime reaper became a first-class lane with a bounded range), so
 carrying an old value under the new name would deploy a policy the
 operator did not ask for, and no deployment predates the rename.
 
-Removed knobs — the four ``MILLRACE_BACKPRESSURE_*`` names are REFUSED
-at boot, each refusal naming the knob. There is no successor: the
-consumer never pauses. SlateDB on object storage is the buffer before
-hoglake and is effectively unbounded — nothing bounded grows with
-staged bytes (memtable and block cache are bounded by SlateDB's own
-settings) — and pausing would move the backlog into Kafka, whose
-retention is the only data-loss cliff this pipeline has. The
-staged-bytes and oldest-eligible-age gauges plus alerts are the whole
-feature (docs/kafka-ingestion.md §Deployment); SlateDB's own L0 write
-stall (``l0_max_ssts`` with no compactor keeping up) is an error
-condition surfaced through its metrics, not a policy, and needs no
-latch. No deployment predates the removal.
-
 ``MILLRACE_KAFKA_AUTO_OFFSET_RESET`` carries a real tension, so the
 default is stated rather than inherited: ``earliest`` never silently
 drops a partition's existing data (with ``latest``, a partition with no
@@ -336,17 +323,6 @@ _RENAMED_ENV: Final = {
     "MILLRACE_TARGET_FILE_BYTES": "MILLRACE_TARGET_OUTPUT_BYTES",
     "MILLRACE_REAP_DEADLINE_S": "MILLRACE_SLOW_LANE_DEADLINE_S",
 }
-
-#: Removed knob names, REFUSED at boot (module docstring): the
-#: backpressure latches are gone — there is no successor to point at,
-#: only the posture (the consumer never pauses; gauges + alerts are the
-#: mechanism).
-_REMOVED_ENV: Final = (
-    "MILLRACE_BACKPRESSURE_PAUSE_BYTES",
-    "MILLRACE_BACKPRESSURE_RESUME_BYTES",
-    "MILLRACE_BACKPRESSURE_PAUSE_AGE_S",
-    "MILLRACE_BACKPRESSURE_RESUME_AGE_S",
-)
 
 
 @dataclass(frozen=True)
@@ -627,26 +603,14 @@ def load_config(env: Mapping[str, str]) -> Config:
     """
     problems: list[str] = []
 
-    # Renamed and removed knobs are refused FIRST, so an operator
-    # migrating an environment meets the rename/removal before any
-    # other complaint.
+    # Renamed knobs are refused FIRST, so an operator migrating an
+    # environment meets the rename before any other complaint.
     for old_name, new_name in _RENAMED_ENV.items():
         if env.get(old_name, "").strip():
             problems.append(
                 f"{old_name} was renamed {new_name} and is refused — the "
                 f"rename narrowed the knob's semantics (see the module "
                 f"docstring); set {new_name}"
-            )
-    for removed_name in _REMOVED_ENV:
-        if env.get(removed_name, "").strip():
-            problems.append(
-                f"{removed_name} was removed and is refused — there is no "
-                f"successor: the consumer never pauses (SlateDB on object "
-                f"storage is the unbounded buffer; pausing would move the "
-                f"backlog into Kafka, whose retention is the only "
-                f"data-loss cliff). The staged-bytes and "
-                f"oldest-eligible-age gauges plus alerts are the "
-                f"mechanism (see the module docstring)"
             )
 
     bootstrap = _required(env, "MILLRACE_KAFKA_BOOTSTRAP_SERVERS", problems)

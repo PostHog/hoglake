@@ -107,10 +107,6 @@ def test_pipeline_collector_counters_without_a_loop():
         collector = main._PipelineCollector(consumer, flusher, stages, loop)
         samples = _samples(collector)
         assert samples["millrace_messages_consumed_total"] == 0
-        # The removed backpressure series stay removed (the consumer
-        # never pauses; gauges + alerts are the mechanism).
-        assert "millrace_backpressure_paused" not in samples
-        assert "millrace_backpressure_paused_partitions" not in samples
         # No running loop: the staging gauges degrade to absent.
         assert "millrace_staged_bytes" not in samples
     finally:
@@ -375,7 +371,6 @@ async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
         raw = await raw_samples()
         assert ("millrace_oldest_eligible_staged_age_seconds", ()) in raw
         assert ("millrace_oldest_staged_age_seconds", ()) not in raw
-        assert ("millrace_backpressure_paused", ()) not in raw
 
         # A publish with nothing eligible drops the series (absent, not
         # zero — "no backlog" is not "backlog age zero").

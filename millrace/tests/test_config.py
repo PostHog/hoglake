@@ -136,44 +136,6 @@ def test_renamed_knob_with_an_empty_value_is_unset_not_refused():
     assert cfg.slow_lane_deadline_s == 21600
 
 
-# -- removed (backpressure) knobs --------------------------------------------------
-#
-# The MILLRACE_BACKPRESSURE_* four are REFUSED — the consumer never
-# pauses, so there is no successor to alias to: SlateDB on object
-# storage is the unbounded buffer, pausing would move the backlog into
-# Kafka (whose retention is the only data-loss cliff), and the
-# staged-bytes / oldest-eligible-age gauges plus alerts are the whole
-# feature. No deployment predates the removal, so no deprecation
-# window.
-
-REMOVED_BACKPRESSURE_KNOBS = (
-    "MILLRACE_BACKPRESSURE_PAUSE_BYTES",
-    "MILLRACE_BACKPRESSURE_RESUME_BYTES",
-    "MILLRACE_BACKPRESSURE_PAUSE_AGE_S",
-    "MILLRACE_BACKPRESSURE_RESUME_AGE_S",
-)
-
-
-@pytest.mark.parametrize("knob", REMOVED_BACKPRESSURE_KNOBS)
-def test_removed_backpressure_knobs_are_refused_naming_the_mechanism(knob):
-    (p,) = problems(MINIMAL_ENV | {knob: "1024"})
-    assert knob in p and "removed" in p
-    assert "gauges" in p and "alerts" in p  # the successor is the alerting posture
-
-
-def test_removed_backpressure_knobs_refused_together_and_first():
-    probs = problems(MINIMAL_ENV | {k: "1" for k in REMOVED_BACKPRESSURE_KNOBS})
-    assert len(probs) == 4
-    assert all("MILLRACE_BACKPRESSURE_" in p and "removed" in p for p in probs)
-
-
-def test_removed_backpressure_knob_with_an_empty_value_is_unset_not_refused():
-    # Consistent with the renamed knobs and every other knob:
-    # whitespace-only reads as absent.
-    cfg = load(MINIMAL_ENV | {"MILLRACE_BACKPRESSURE_PAUSE_AGE_S": "  "})
-    assert cfg.slow_lane_deadline_s == 21600
-
-
 # -- the slow lane's 6-24 h range ------------------------------------------------------
 
 

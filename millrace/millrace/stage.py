@@ -1128,7 +1128,7 @@ class PartitionStage:
         settles ACTUALS: afterwards a team can hold ``row_count > 0`` with
         zero staged rows. Left alone the residue re-decides the key every
         sweep and — worse — its stale ``first_staged_ts`` pins the
-        backpressure age gauge forever. The flush path calls this when a
+        staged-age gauge forever. The flush path calls this when a
         decided key scans empty.
 
         ONE serializable transaction: the stats read and the row scan see
@@ -1447,7 +1447,7 @@ class StageManager:
     passing ``max_staleness_s`` while it is fresh, falling back to a
     live scan when the sweep stops publishing — a halted or slow flush
     loop therefore degrades to the old per-reader scans, never to
-    silently frozen backpressure numbers. A live fallback scan is NOT
+    silently frozen gauges. A live fallback scan is NOT
     itself published: a reader in fallback needs a fresh answer on
     every call.
     """

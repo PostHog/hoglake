@@ -3756,7 +3756,7 @@ class TestRunner:
         """A redelivered batch re-puts the same rows (idempotent) but
         inflates the stats counters; the flush settles ACTUALS, and the
         next tick's empty scan repairs the residue instead of letting the
-        stale first_staged_ts pin the backpressure age gauge forever."""
+        stale first_staged_ts pin the staged-age gauge forever."""
         cfg = make_config(target_output_bytes=1)
         async with StageManager(
             "memory:///", "millrace", settings=fast_flush_settings()
@@ -5095,7 +5095,7 @@ class TestReadinessRouting:
     ) -> None:
         """A partition whose reconciliation fails transiently is skipped
         for the tick, but its staged bytes must NOT vanish from the
-        published gauges — the consumer's backpressure reads them."""
+        published gauges — the alerts read them."""
         cfg = make_config(target_output_bytes=1)
         async with StageManager(
             "memory:///",

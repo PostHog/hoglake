@@ -40,12 +40,6 @@ Pinned here:
 - poison records quarantine durably (readable after reopen), are
   counted, and never block the partition's commits; a poison FLOOD
   halts loudly without committing past it;
-- there is NO consumer backpressure (PR #331 review — the latches were
-  removed, not fixed): a partition past where the retired thresholds
-  would have tripped keeps staging and committing, and the loop never
-  drives librdkafka's pause/resume or reads the staging gauges. SlateDB
-  on object storage is the unbounded buffer; pausing would only move
-  the backlog into Kafka, whose retention is the one data-loss cliff.
   The gauges are alert inputs, published by the flush sweep;
 - commit retry ladder and its exhaustion; a failed stage commits
   nothing;
@@ -1292,62 +1286,6 @@ async def test_the_byte_cap_never_stalls_an_oversized_record(fake_clock):
         await consumer._step()
     assert fake.requested_batch_sizes[:2] == [5, 1]
     assert fake.committed_store == {("events", 0): 8}
-    assert_commits_follow_acks(journal)
-    await manager.close()
-
-
-# -- no consumer backpressure: the removal's regression pin (PR #331 review) ---------
-
-
-@component
-async def test_staging_pressure_never_pauses_consumption(fake_clock):
-    """A partition past where the RETIRED latches would have tripped
-    keeps staging and committing — the backpressure policy was REMOVED,
-    not fixed (review: there is no reason to stop consuming except on
-    error; SlateDB on object storage is the unbounded buffer, and
-    pausing would move the backlog into Kafka, whose retention is the
-    only data-loss cliff). The loop also never READS the staging
-    gauges: they are alert inputs the flush sweep publishes, never
-    control flow."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(fake, manager, make_config(), fake_clock)
-
-    gauges_calls = 0
-    real_gauges = manager.gauges
-
-    async def spy_gauges(*, max_staleness_s=None):
-        nonlocal gauges_calls
-        gauges_calls += 1
-        return await real_gauges(max_staleness_s=max_staleness_s)
-
-    manager.gauges = spy_gauges  # type: ignore[method-assign]
-    await consumer.start()
-
-    fake.feed(keyed_msg(0, 0, team=1, value=b"x" * 60))
-    await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 1}
-
-    # Two hours pass with the row staged and unflushed — past the
-    # retired policy's age trip (its pause-age default was 3600 s) —
-    # then more records arrive. Consumption continues regardless:
-    # every offset commits.
-    fake_clock.advance(2 * 3600 * 10**6)
-    fake.feed(
-        keyed_msg(0, 1, team=1, value=b"y" * 60),
-        keyed_msg(0, 2, team=2, value=b"z" * 60),
-    )
-    await run_steps(consumer, fake)
-
-    assert fake.committed_store == {("events", 0): 3}
-    stage = manager.stage("events", 0)
-    assert await team_offsets(stage, 1) == [0, 1]
-    assert await team_offsets(stage, 2) == [2]
-    # librdkafka's pause/resume were never driven, and the gauges were
-    # never read (the removed policy read them every step).
-    assert not [e for e in journal if e[0] in ("pause", "resume")]
-    assert gauges_calls == 0
     assert_commits_follow_acks(journal)
     await manager.close()
 
