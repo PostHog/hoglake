@@ -38,6 +38,7 @@ jobs:
             python:
               - "pyhoglake/**"
               - "hedgerow/**"
+              - "millrace/**"
               - "bench/**"
               # The OpenAPI spec is the wire contract the clients
               # conform to.
@@ -65,7 +66,7 @@ jobs:
               - "ci/**"
 
   # THE GATE, and the check the ruleset requires. It is this job and not
-  # `pyhoglake` or `check` so that the live client suites (run inside
+  # `pyhoglake`, `check` or `millrace` so that the live client suites (run inside
   # pyhoglake-checks) cannot be red on a PR that merges: #304 wired the
   # live suites in while they were failing and merged on a ruleset that
   # required only the leaf jobs, and main was red for two hours until
@@ -75,7 +76,7 @@ jobs:
   # to check".
   python-checks:
     if: always() && (needs.changes.result != 'success' || needs.changes.outputs.python == 'true')
-    needs: [changes, pyhoglake, check]
+    needs: [changes, pyhoglake, check, millrace]
     runs-on: ubuntu-latest
     steps:
       - name: Require Python checks and live suites
@@ -83,10 +84,12 @@ jobs:
           CHANGES_RESULT: ${{ needs.changes.result }}
           CLIENT_RESULT: ${{ needs.pyhoglake.result }}
           OTHER_RESULT: ${{ needs.check.result }}
+          MILLRACE_RESULT: ${{ needs.millrace.result }}
         run: |
           test "$CHANGES_RESULT" = success &&
             test "$CLIENT_RESULT" = success &&
-            test "$OTHER_RESULT" = success
+            test "$OTHER_RESULT" = success &&
+            test "$MILLRACE_RESULT" = success
 
   pyhoglake:
     needs: changes
@@ -130,3 +133,51 @@ jobs:
       # The reusable pyhoglake checks run both clients against a live stack.
       - name: Tests
         run: uv run pytest -m "not integration" -q
+
+  millrace:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: millrace
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - run: uv sync --locked
+
+      - name: Lint (ruff, pinned in dev deps)
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Type check (mypy)
+        run: uv run mypy
+
+      # Phase 2 integration tests (file:/// SlateDB: hard-kill
+      # durability, contested-open fencing) need no services, so the
+      # whole suite runs here; the LIVE docker stack suite (tests/live/,
+      # marker `live`) is deselected by tests/conftest.py and runs
+      # through ci/live-millrace.sh in the reusable python-live.yml
+      # workflow (the `live-millrace` job). Benches stay deselected
+      # (non-gating; conftest drops the bench marker without --bench).
+      - name: Tests
+        run: uv run pytest -q
+
+      # M8: mutation-test the pure core (keyspace.py + planner.py — the
+      # [tool.mutmut] scope) on every millrace change. Clean-slate:
+      # mutmut 3.8's incremental stats go stale on function renames
+      # (tests/MUTATION_TESTING.md), so `mutants/` is deleted first; a
+      # full run is ~4 min here, well inside this job's budget, so no
+      # incremental mode. The survivors gate (tests/check_mutants.py)
+      # fails on any survivor the ledger does not name.
+      - name: Mutation tests (pure core) + survivors gate
+        run: |
+          rm -rf mutants
+          uv run mutmut run
+          uv run python tests/check_mutants.py

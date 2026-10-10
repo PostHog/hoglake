@@ -9,9 +9,10 @@ the pre-split commits).
 
 **Do not push until all required tests have run on the exact changes being
 pushed.** This includes the server suite with Docker, Kotlin and Python lint,
-Python type checks, both Python unit suites, both live client suites, and the
-UI tests and build. Run additional component checks for affected code, such as
-the DuckDB extension's live tests.
+Python type checks, all three Python unit suites (`just pyhoglake unit`,
+`just hedgerow unit`, `just millrace unit`), both live client suites plus
+`just millrace live`, and the UI tests and build. Run additional component
+checks for affected code, such as the DuckDB extension's live tests.
 
 A skipped live suite, a missing service, a unit-only run, or checks from an
 older revision do not satisfy this rule. Wait for every command to finish and
@@ -30,10 +31,12 @@ stack and what it showed.)
 
 ```bash
 (cd server && flox activate -- ./gradlew :test)       # Docker required
-just lint-all        # ktlint + ruff (check & format) across both Python trees, mypy on pyhoglake
+just lint-all        # ktlint + ruff (check & format) across the three Python trees, mypy on pyhoglake + millrace
 just pyhoglake unit
 just hedgerow unit
+just millrace unit
 just live-python    # builds this checkout, starts isolated services, fails on skips
+just millrace live  # the Kafka-ingestion live stack (PG + MinIO + Kafka), fails on skips
 just webui test
 just webui build
 ```
@@ -121,6 +124,7 @@ React console, Python replication daemon:
 | `pyhoglake/` | Thin API client; owns the Python writer path (parquet with field IDs, footer stats, Iceberg bounds codec) | Python 3.12 (flox) / uv / httpx / pyarrow | pytest + pytest-httpx + hypothesis |
 | `webui/` | Lakekeeper-style management console: catalog browser (namespaces/tables/files/scan with time travel; the namespace listing is NAME, RECORD_COUNT, FILE_COUNT, FILE_SIZE, SNAPSHOTS, EARLIEST_SNAPSHOT, COMMENT — `table_uuid` stays on the wire but is shown on the table page, not as a column), newest-first snapshot timeline (`before` paging), consumers (grouped, names resolved, dropped badges), compaction-debt page, maintenance pages (central catalog×task matrix + per-catalog task panels over the run ledger), `/metrics` visualizer, instance-name badge; int64 wire fields carried as strings (lossless above 2^53) | Vite / React / TS | vitest (mocked fetch) |
 | `hedgerow/` | viaduck's successor: source table → destination table replication, append-only, single-destination | Python / uv / pyhoglake | pytest; scripted-fake unit + live integration |
+| `millrace/` | Kafka → hoglake ingestion daemon with SlateDB staging; see docs/kafka-ingestion.md | Python / uv / pyhoglake + slatedb | pytest + hypothesis + live stack |
 | `duckdb-client/` | DuckDB extension: ATTACH over REST, scan (partition pruning + deletion vectors), INSERT/UPDATE/DELETE via footer-shipping commits, DDL, time travel, metadata/maintenance functions | C++ / DuckDB (pinned) / cpp-httplib + yyjson (both duckdb-vendored) / roaring via vcpkg | sqllogictests against the live dev stack + cross-client wire vectors |
 
 The REST contract is `server/src/main/resources/openapi/hoglake.yaml`
@@ -141,7 +145,7 @@ path-scoped per component, posthog-monorepo style:
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
 | `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
-| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
+| `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites (`live` job) and the millrace Kafka-ingestion live suite (`live-millrace` job, which adds apache/kafka to the stack via `ci/live-millrace.sh`), rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
 | `fuzz.yml` | nightly cron + dispatch | `./gradlew fuzz` over every Jazzer target (600s each by default), with the generated corpus accumulated across nights through the actions cache. Not a PR check: PR CI only REPLAYS the committed seed corpus, inside `:test` |
 | `semgrep.yml` | all | python / kotlin+java / general packs, pinned container |
