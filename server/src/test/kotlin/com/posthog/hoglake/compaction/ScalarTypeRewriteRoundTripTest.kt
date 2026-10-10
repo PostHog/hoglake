@@ -5,12 +5,17 @@ import com.posthog.hoglake.hydrator.FooterStats
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.Column
 import com.posthog.hoglake.model.ColumnDef
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.stats.IcebergSingleValue
 import org.apache.parquet.example.data.Group
 import org.apache.parquet.example.data.simple.SimpleGroupFactory
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
 import org.apache.parquet.hadoop.example.ExampleParquetWriter
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
+import org.apache.parquet.io.ColumnIOFactory
 import org.apache.parquet.io.LocalInputFile
 import org.apache.parquet.io.LocalOutputFile
 import org.apache.parquet.schema.LogicalTypeAnnotation
@@ -305,8 +310,87 @@ class ScalarTypeRewriteRoundTripTest {
         // `first` is a compaction output: its ids live in the carrier.
         rewrite(first, type, second, explicitRowIds = true)
         assertBounds(bounds(second, type), pre, "$name after re-compaction")
+        assertSpillReadBack(name, inPath, type, first)
+        assertAppendReadBack(name, type, first)
         return Trip(pre.first, pre.second, inPath, first, second)
     }
+
+    /**
+     * The same input through a SORTED rewrite with a one-row chunk, so
+     * every row is written to a spill file and read back before it
+     * reaches the output: the values per row id, the physical type and
+     * the bounds must all be what the unsorted rewrite produced.
+     */
+    private fun assertSpillReadBack(
+        name: String,
+        input: Path,
+        type: ColType,
+        unsorted: Path,
+    ) {
+        val spilled = tmp.resolve("$name-spilled.parquet")
+        val spillDir = Files.createDirectories(tmp.resolve("$name-spill"))
+        val result =
+            rewriteToLocal(
+                listOf(localInput(input, 0)),
+                listOf(Column(1, 0, ColumnDef("v", type))),
+                listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST)),
+                spilled,
+                spill = roomySpill(spillDir).copy(chunkRows = 1),
+            )
+        assertThat(result.runsSpilled).describedAs("%s rows each spilled", name).isEqualTo(result.rowsWritten)
+        assertThat(physical(spilled)).describedAs("physical type after a spill, %s", name).isEqualTo(physical(unsorted))
+        assertBounds(bounds(spilled, type), bounds(unsorted, type), "$name after a spill")
+        assertThat(valuesByRowId(spilled)).describedAs("values after a spill, %s", name)
+            .isEqualTo(valuesByRowId(unsorted))
+    }
+
+    /**
+     * [output], a compaction output, compacted again with the append
+     * floor lowered so its row group is APPENDED byte for byte (package
+     * D1): the footer's schema must EQUAL the output schema for this type
+     * — or the append would not happen — and the values, physical type
+     * and bounds must be what the decode path produced.
+     */
+    private fun assertAppendReadBack(
+        name: String,
+        type: ColType,
+        output: Path,
+    ) {
+        val appended = tmp.resolve("$name-appended.parquet")
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(localInput(output, 0, explicitRowIds = true)),
+                listOf(Column(1, 0, ColumnDef("v", type))),
+                emptyList(),
+                LocalDiscardableOutput(appended),
+                appendFloorBytes = 1,
+            )
+        assertThat(result.rowGroupsAppended).describedAs("%s output appended", name).isEqualTo(1)
+        assertThat(
+            physical(appended),
+        ).describedAs("physical type after an append, %s", name).isEqualTo(physical(output))
+        assertBounds(bounds(appended, type), bounds(output, type), "$name after an append")
+        assertThat(valuesByRowId(appended)).describedAs("values after an append, %s", name)
+            .isEqualTo(valuesByRowId(output))
+    }
+
+    private fun valuesByRowId(path: Path): Map<Long, String?> =
+        ParquetFileReader.open(LocalInputFile(path)).use { reader ->
+            val schema = reader.footer.fileMetaData.schema
+            val rowId = schema.getFieldIndex(ParquetRewriter.ROW_ID_COLUMN)
+            val io = ColumnIOFactory().getColumnIO(schema)
+            val out = HashMap<Long, String?>()
+            var pages = reader.readNextRowGroup()
+            while (pages != null) {
+                val rr = io.getRecordReader(pages, GroupRecordConverter(schema))
+                repeat(Math.toIntExact(pages.rowCount)) {
+                    val g = rr.read()
+                    out[g.getLong(rowId, 0)] = if (g.getFieldRepetitionCount(0) == 0) null else g.getValueToString(0, 0)
+                }
+                pages = reader.readNextRowGroup()
+            }
+            out
+        }
 
     private fun assertBounds(
         actual: Pair<ByteArray, ByteArray>,

@@ -99,6 +99,243 @@ class ParquetRewriterTest {
 
     /** Arbitrary-schema writer for the heterogeneous/unconvertible cases. */
     @Test
+    fun `materialized binaries own their bytes, so the output writer cannot pin input pages`() {
+        // The reader decodes a plain-encoded string as a slice of its
+        // decoded PAGE, and Binary.copy() returns such a slice unchanged,
+        // so every min/max the output writer's statistics and column index
+        // kept pinned a whole input page until the footer. Large pages,
+        // no dictionary: every value is a slice of a 1 MiB page.
+        val schema =
+            Types.buildMessage()
+                .addField(
+                    Types.optional(PrimitiveTypeName.BINARY).`as`(LogicalTypeAnnotation.stringType()).id(1).named("s"),
+                )
+                .named("pages")
+        val path = tmp.resolve("big-pages.parquet")
+        ExampleParquetWriter.builder(LocalOutputFile(path))
+            .withType(schema)
+            .withCompressionCodec(CompressionCodecName.UNCOMPRESSED)
+            .withDictionaryEncoding(false)
+            .withPageSize(1 shl 20)
+            .build()
+            .use { w ->
+                val f = SimpleGroupFactory(schema)
+                for (i in 0 until 5_000) w.write(f.newGroup().append("s", "value-$i-" + "x".repeat(40)))
+            }
+        var seen = 0
+        ParquetFileReader.open(LocalInputFile(path)).use { reader ->
+            val columnIO = ColumnIOFactory().getColumnIO(schema)
+            val materializer =
+                ParquetRewriter.budgetedMaterializer(
+                    schema,
+                    ParquetRewriter.NodeBudget(Int.MAX_VALUE, "t"),
+                )
+            var pages = reader.readNextRowGroup()
+            while (pages != null) {
+                val records = columnIO.getRecordReader(pages, materializer)
+                repeat(Math.toIntExact(pages.rowCount)) {
+                    val value = records.read().getBinary(0, 0)
+                    val buffer = value.toByteBuffer()
+                    assertThat(buffer.hasArray() && buffer.arrayOffset() == 0 && buffer.array().size == value.length())
+                        .describedAs("value %d is backed by an array of exactly its own bytes", seen)
+                        .isTrue()
+                    seen++
+                }
+                pages = reader.readNextRowGroup()
+            }
+        }
+        assertThat(seen).isEqualTo(5_000)
+    }
+
+    @Test
+    fun `the writer never sees an output SimpleGroup`() {
+        // hoglake#134 package D2: every row used to be copied into an
+        // output-shaped SimpleGroup that the example writer then walked
+        // into parquet's record consumer — two materializations per row.
+        // Structural, because the property is an absence: the writer's only
+        // record entry point takes a decoded Row and its plan, and no
+        // production source in the package builds a Group or an example
+        // writer any more. (Test fixtures still write inputs with them.)
+        assertThat(
+            OutputWriter::class.java.declaredMethods
+                .filter { it.name == "write" }
+                .map { it.parameterTypes.toList() },
+        ).containsExactly(listOf(ParquetRewriter.Row::class.java))
+        val main = Path.of("src/main/kotlin/com/posthog/hoglake/compaction")
+        val sources = Files.list(main).use { files -> files.filter { it.toString().endsWith(".kt") }.toList() }
+        assertThat(sources).isNotEmpty
+        for (source in sources) {
+            assertThat(Files.readString(source))
+                .describedAs("%s must not build output-shaped Groups", source.fileName)
+                .doesNotContain("SimpleGroupFactory(")
+                .doesNotContain("ExampleParquetWriter.builder")
+                .doesNotContain("newGroup()")
+                .doesNotContain(".addGroup(")
+                .doesNotContain("ParquetWriter<Group>")
+        }
+    }
+
+    @Test
+    fun `an input is read PROJECTED to the columns the plan maps - dropped columns are never decoded`() {
+        // The chunk phase holds decoded rows and is sized from the LIVE
+        // schema's nodes, so a dropped column must not be decoded at all:
+        // a file written before half its columns were dropped would
+        // otherwise hold twice the nodes per chunk row the budget assumed.
+        val schema =
+            Types.buildMessage()
+                .addField(Types.optional(PrimitiveTypeName.INT64).id(1).named("a"))
+                .addField(
+                    Types.optional(
+                        PrimitiveTypeName.BINARY,
+                    ).`as`(LogicalTypeAnnotation.stringType()).id(9).named("gone"),
+                )
+                .addField(
+                    Types.optionalGroup()
+                        .addField(Types.optional(PrimitiveTypeName.INT32).id(3).named("x"))
+                        .addField(
+                            Types.optional(PrimitiveTypeName.BINARY).`as`(LogicalTypeAnnotation.stringType())
+                                .id(4).named("y"),
+                        )
+                        .id(2).named("s"),
+                )
+                .named("t")
+        val wide = "w".repeat(2_000)
+        val input =
+            writeCustom(
+                "projected.parquet",
+                schema,
+                (0 until 200).map { i ->
+                    { g: Group ->
+                        g.add(0, i.toLong())
+                        g.add(1, "$wide$i")
+                        g.addGroup(2).also { it.add(0, i) }.add(1, "$wide$i")
+                    }
+                },
+            )
+        // Live: a, and s with only x — `gone` and `s.y` were dropped.
+        val live =
+            listOf(
+                Column(1, 0, ColumnDef("a", ColType.LONG)),
+                Column(
+                    2,
+                    1,
+                    ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("x", ColType.INT))),
+                    children = listOf(Column(3, 0, ColumnDef("x", ColType.INT))),
+                ),
+            )
+        val shape = ParquetRewriter.OutputShape(live, ParquetRewriter.outputSchema(live), 1_000_000)
+        val counted = ByteCountingInputFile(LocalInputFile(input))
+        val rows =
+            ParquetFileReader.open(counted).use { reader ->
+                val survivors = ParquetRewriter.SurvivorReader(localInput(input, 0), reader, shape)
+                assertThat(survivors.requestedSchema.fields.map { it.name }).containsExactly("a", "s")
+                assertThat(survivors.requestedSchema.getType("s").asGroupType().fields.map { it.name })
+                    .containsExactly("x")
+                survivors.asSequence().toList()
+            }
+        assertThat(rows).hasSize(200)
+        assertThat(rows.first().group.type.fields.map { it.name }).containsExactly("a", "s")
+        // The dropped chunks — 200 values of 2 KB each, twice — were never
+        // even read.
+        assertThat(counted.bytesRead).isLessThan(200L * 2_000)
+
+        // And the rewrite still maps what it should (the heterogeneous-input
+        // tests are the wider oracle).
+        val out = tmp.resolve("projected-out.parquet")
+        rewriteToLocal(listOf(localInput(input, 0)), live, emptyList(), out)
+        ParquetFileReader.open(LocalInputFile(out)).use { reader ->
+            val outSchema = reader.footer.fileMetaData.schema
+            val rr =
+                ColumnIOFactory().getColumnIO(
+                    outSchema,
+                ).getRecordReader(reader.readNextRowGroup(), GroupRecordConverter(outSchema))
+            val first = rr.read()
+            assertThat(first.getLong(0, 0)).isZero()
+            assertThat(first.getGroup(1, 0).getInteger(0, 0)).isZero()
+        }
+    }
+
+    @Test
+    fun `a file the plan reads nothing from, or a struct none of whose members it reads, still counts its rows`() {
+        // Every column of this client file was dropped (live has only id
+        // 1): it projects to an empty message, whose rows parquet-java
+        // still counts. A struct none of whose members the plan reads is
+        // read whole (parquet has no empty group), so its presence survives.
+        val schema =
+            Types.buildMessage()
+                .addField(Types.optional(PrimitiveTypeName.INT64).id(9).named("gone"))
+                .named("t")
+        val input =
+            writeCustom(
+                "all-dropped.parquet",
+                schema,
+                (0 until 3).map {
+                        i ->
+                    { g: Group -> g.add(0, i.toLong()) }
+                },
+            )
+        val out = tmp.resolve("all-dropped-out.parquet")
+        val result =
+            rewriteToLocal(
+                listOf(localInput(input, 40)),
+                listOf(Column(1, 0, ColumnDef("a", ColType.LONG))),
+                emptyList(),
+                out,
+            )
+        assertThat(result.rowsWritten).isEqualTo(3)
+        assertThat(result.minRowId).isEqualTo(40)
+
+        val structOnly =
+            Types.buildMessage()
+                .addField(Types.optional(PrimitiveTypeName.INT64).id(1).named("a"))
+                .addField(
+                    Types.optionalGroup().addField(
+                        Types.optional(PrimitiveTypeName.INT32).id(4).named("y"),
+                    ).id(2).named("s"),
+                )
+                .named("t")
+        val input2 =
+            writeCustom(
+                "struct-dropped.parquet",
+                structOnly,
+                (0 until 3).map { i -> { g: Group -> g.add(0, i.toLong()).also { g.addGroup(1).add(0, i) } } },
+            )
+        val live =
+            listOf(
+                Column(1, 0, ColumnDef("a", ColType.LONG)),
+                Column(
+                    2,
+                    1,
+                    ColumnDef("s", ColType.STRUCT, children = listOf(ColumnDef("x", ColType.INT))),
+                    children = listOf(Column(3, 0, ColumnDef("x", ColType.INT))),
+                ),
+            )
+        val out2 = tmp.resolve("struct-dropped-out.parquet")
+        assertThat(rewriteToLocal(listOf(localInput(input2, 0)), live, emptyList(), out2).rowsWritten).isEqualTo(3)
+        ParquetFileReader.open(LocalInputFile(out2)).use { reader ->
+            val outSchema = reader.footer.fileMetaData.schema
+            val rr =
+                ColumnIOFactory().getColumnIO(
+                    outSchema,
+                ).getRecordReader(reader.readNextRowGroup(), GroupRecordConverter(outSchema))
+            val first = rr.read()
+            assertThat(first.getFieldRepetitionCount(1)).describedAs("the struct is present").isEqualTo(1)
+            assertThat(first.getGroup(1, 0).getFieldRepetitionCount(0)).describedAs("its live member is null").isZero()
+        }
+    }
+
+    @Test
+    fun `writers share one configuration per zstd level`() {
+        // Building one parses Hadoop's default resources; a sorted rewrite
+        // builds a writer per spill file and one for the output.
+        val default = ParquetRewriter.OutputCodec()
+        assertThat(ParquetRewriter.writerConfiguration(default)).isSameAs(ParquetRewriter.writerConfiguration(default))
+        assertThat(ParquetRewriter.writerConfiguration(default).get(ParquetRewriter.ZSTD_LEVEL_KEY)).isEqualTo("1")
+        val level9 = ParquetRewriter.OutputCodec(zstdLevel = 9)
+        assertThat(ParquetRewriter.writerConfiguration(level9).get(ParquetRewriter.ZSTD_LEVEL_KEY)).isEqualTo("9")
+    }
+
+    @Test
     fun `the node budget is spent while the row is DECODED, not after`() {
         // The property, not a restatement of the refusal: a budget that
         // only counted the COPY was a report on memory already taken —
@@ -559,7 +796,7 @@ class ParquetRewriterTest {
         )
         val (_, rows) = readOutput(out)
         assertThat(rows.map { it.score }).containsExactly(0.5, 1.0, 4.0, 5.0, null, null)
-        // Nulls keep row-id order among themselves (stable sort): 1 then 101.
+        // Ties (the two nulls) fall through to the row id: 1 then 101.
         assertThat(rows.map { it.rowId }).containsExactly(102L, 2L, 100L, 0L, 1L, 101L)
     }
 

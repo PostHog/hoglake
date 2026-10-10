@@ -1256,7 +1256,19 @@ class NestedTypeRewriteRoundTripTest {
 
     // ---- harness -----------------------------------------------------------
 
-    /** Compact [input], then compact THAT, returning both outputs. */
+    /**
+     * Compact [input], then compact THAT, then compact [input] once more
+     * through a forced spill; returns all three outputs.
+     *
+     * The spill pass sorts on an extra live column the input predates
+     * (so every row's key is null and the merge key falls through to the
+     * row id, which is input order) with a one-row chunk: every row is
+     * written to a spill file and read back as the `Group` it was, which
+     * is the path nested values must survive in a sorted rewrite. The
+     * extra column sits AFTER the column under test, so the per-shape
+     * readers, which read field 0, and the bound checks, which bind by
+     * field id, see the same file shape as the other two outputs.
+     */
     private fun roundTrip(
         name: String,
         input: Path,
@@ -1267,7 +1279,31 @@ class NestedTypeRewriteRoundTripTest {
         val second = tmp.resolve("$name-out2.parquet")
         // The second pass reads a compaction OUTPUT.
         rewrite(first, live, second, explicitRowIds = true)
-        return listOf(first, second)
+        val spilled = tmp.resolve("$name-spilled.parquet")
+        val keyId = 900L
+        val result =
+            rewriteToLocal(
+                listOf(localInput(input, 0)),
+                live + Column(keyId, live.size, ColumnDef("spill_key", ColType.LONG)),
+                listOf(SortFieldDef(keyId, SortDirection.ASC, NullOrder.NULLS_LAST)),
+                spilled,
+                spill = roomySpill(Files.createDirectories(tmp.resolve("$name-spill"))).copy(chunkRows = 1),
+            )
+        assertThat(result.runsSpilled).describedAs("%s rows each spilled", name).isEqualTo(result.rowsWritten)
+        // And `first` APPENDED byte for byte (package D1): its footer
+        // schema must equal the output schema for this nested shape, or
+        // nothing is appended.
+        val appended = tmp.resolve("$name-appended.parquet")
+        val append =
+            ParquetRewriter.rewrite(
+                listOf(localInput(first, 0, explicitRowIds = true)),
+                live,
+                emptyList(),
+                LocalDiscardableOutput(appended),
+                appendFloorBytes = 1,
+            )
+        assertThat(append.rowGroupsAppended).describedAs("%s output appended", name).isEqualTo(1)
+        return listOf(first, second, spilled, appended)
     }
 
     /**

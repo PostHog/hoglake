@@ -2,13 +2,18 @@ package com.posthog.hoglake.compaction
 
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.hydrator.ObjectStore
+import com.posthog.hoglake.model.AlterOp
 import com.posthog.hoglake.model.ColType
 import com.posthog.hoglake.model.ColumnDef
 import com.posthog.hoglake.model.CommitRequest
 import com.posthog.hoglake.model.CompactionResult
 import com.posthog.hoglake.model.FileRegistration
+import com.posthog.hoglake.model.NullOrder
+import com.posthog.hoglake.model.SortDirection
+import com.posthog.hoglake.model.SortFieldDef
 import com.posthog.hoglake.model.TableAppend
 import com.posthog.hoglake.persistence.Locks
+import com.posthog.hoglake.service.AlterService
 import com.posthog.hoglake.service.CatalogService
 import com.posthog.hoglake.testing.CatalogInvariants
 import com.posthog.hoglake.testing.PgTestSupport
@@ -232,7 +237,12 @@ class CompactionParallelIntegrationTest {
         assertThat(result.dvSuperseded).isZero()
         assertThat(result.unconvertibleSchema).isZero()
         assertThat(result.invalidData).isZero()
+        // heap_budget_exceeded is historical (hoglake#134) and the
+        // external merge sort's refusals are a SORTED table's; an
+        // unsorted parallel sweep moves none of them, and runs no merge.
         assertThat(result.heapBudgetExceeded).isZero()
+        assertThat(result.spillBudgetExceeded + result.mergeBudgetExceeded).isZero()
+        assertThat(result.runsTrusted + result.runsSpilled + result.runsDemoted + result.spillBytes).isZero()
         assertThat(result.bytesIn).isGreaterThan(0)
         assertThat(result.bytesOut).isGreaterThan(0)
 
@@ -1345,6 +1355,82 @@ class CompactionParallelIntegrationTest {
     }
 
     /**
+     * A sort-order change landing inside a group's rewrite, for one
+     * transition: [before] is the spec the group is planned and rewritten
+     * under (null = unsorted), [after] what `set_sort_order` makes live
+     * while the rewrite is parked (empty = drop the sort order).
+     */
+    private fun sortChangeMidRewrite(
+        prefix: String,
+        before: List<SortFieldDef>?,
+        after: List<SortFieldDef>,
+    ) {
+        val fx = fixture(prefix, groups = 1)
+        val alter = AlterService(db.jdbi)
+        if (before != null) alter.alterTable(fx.cat, "ns", "t", listOf(AlterOp.SetSortOrder(before)))
+        val inRewrite = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val blocking = BlockingStore(inRewrite, release)
+        val cfg = policy(fx).copy(inputOpenParallelism = 1)
+        val svc = CompactionService(db.jdbi, blocking, cfg)
+        val outcome = java.util.concurrent.atomic.AtomicReference<CompactionResult?>(null)
+        val sweep = Thread({ outcome.set(runCatching { svc.runOnce(fx.cat, cfg) }.getOrNull()) }, "sort-race")
+        val headAfterAlter: Long
+        try {
+            sweep.start()
+            assertThat(inRewrite.await(60, TimeUnit.SECONDS))
+                .describedAs("the rewrite never reached its first object-store read")
+                .isTrue()
+            alter.alterTable(fx.cat, "ns", "t", listOf(AlterOp.SetSortOrder(after)))
+            headAfterAlter = catalogs.getCatalog(fx.cat).headSnapshotId
+        } finally {
+            release.countDown()
+        }
+        sweep.join(60_000)
+        blocking.close()
+        assertThat(sweep.isAlive).isFalse()
+
+        assertThat(outcome.get()?.skippedConflicts)
+            .describedAs("%s: a group rewritten under %s must not commit under %s", prefix, before, after)
+            .isEqualTo(1)
+        assertThat(outcome.get()?.groupsCompacted).isZero()
+        assertThat(outcome.get()?.failedGroups).isZero()
+        assertThat(catalogs.getCatalog(fx.cat).headSnapshotId)
+            .describedAs("no compaction snapshot after the spec change")
+            .isEqualTo(headAfterAlter)
+        assertThat(liveFileCount(fx.cat)).describedAs("every input still live").isEqualTo(fx.expectedFiles)
+        assertThat(stagingTicketOutcomes(fx.cat))
+            .describedAs("the refused group's staged output stays queued for the cleanup drain")
+            .allMatch { it == null }
+
+        // And the next sweep re-plans under the NEW spec and commits.
+        val again = CompactionService(db.jdbi, store, cfg).runOnce(fx.cat, cfg)
+        assertThat(again.groupsCompacted).isEqualTo(1)
+        assertThat(again.skippedConflicts).isZero()
+        assertSnapshotsDense(fx.cat)
+    }
+
+    @Test
+    fun `a sort-order change landing mid-rewrite is a conflict at commit, in every direction`() {
+        // hoglake#134's trust predicate reads a compaction output whose
+        // `begin_snapshot` is at or after the live spec's as an already
+        // SORTED run of that spec, merged in place forever after. A group
+        // planned under one spec and committed after another became live
+        // would register exactly such a file — sorted by the old spec, or
+        // not sorted at all — so the commit re-reads the live `sort_id`
+        // under the lock and refuses on any difference.
+        //
+        // MUTATION: drop the `sort_id` probe from `commitGroup` (or
+        // compare only when both sides are non-null) and the matching
+        // case reds: the group commits after the spec change.
+        val asc = listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))
+        val desc = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_FIRST))
+        sortChangeMidRewrite("compact-par-sort-set", before = null, after = asc)
+        sortChangeMidRewrite("compact-par-sort-change", before = asc, after = desc)
+        sortChangeMidRewrite("compact-par-sort-drop", before = asc, after = emptyList())
+    }
+
+    /**
      * A store that blocks the first read of every worker thread until
      * released, counting the multipart uploads it starts and aborts.
      */
@@ -1828,18 +1914,20 @@ class CompactionParallelIntegrationTest {
                     length: Int,
                 ): ByteArray {
                     read += pathUri
-                    // Stands in for the allocation the row ceiling is
-                    // supposed to have refused. A real one would come
-                    // out of the sort buffer.
-                    throw OutOfMemoryError("synthetic: sort buffer")
+                    // Stands in for an allocation the chunk accounting
+                    // or the merge admission under-counted.
+                    throw OutOfMemoryError("synthetic: sort chunk")
                 }
             }
         val cfg = policy(fx, maxGroups = 5)
         val result = CompactionService(db.jdbi, oomStore, cfg).runOnce(fx.cat, cfg)
-        assertThat(result.heapBudgetExceeded).isEqualTo(1)
+        // Counted as the ONE failed group (hoglake#134: an OOM is now an
+        // under-count of the chunk or the merge admission, and
+        // heap_budget_exceeded is historical) — and the sweep still stops.
+        assertThat(result.failedGroups).isEqualTo(1)
+        assertThat(result.heapBudgetExceeded).isZero()
         assertThat(claimRows(fx.cat)).isEmpty()
         assertThat(result.groupsCompacted).isZero()
-        assertThat(result.failedGroups).isZero()
         assertThat(read)
             .describedAs("only the group that OOM'd may have touched the object store")
             .hasSizeLessThanOrEqualTo(fx.filesPerGroup)

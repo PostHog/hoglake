@@ -4639,40 +4639,21 @@ components:
           type: integer
           format: int64
           description: >
-            Work the SORTED rewrite path's row ceiling cannot make a
-            group OF.
+            HISTORICAL — always 0 on a current server. Counted groups the
+            SORTED rewrite's pre-hoglake#134 row ceiling could not hold:
+            the sorted rewrite used to sort a whole group in memory, so a
+            sorted group was bounded in rows and dense work it could not
+            group was refused here.
 
-            Not "groups formed on input bytes and then refused" — groups
-            are PACKED to the ceiling (it is a capacity the bin packer
-            closes a group on, beside the byte target), so a dense
-            sorted table produces smaller groups rather than refused
-            ones. What is left to count is the residue: files dense
-            enough that no TWO of them fit under the ceiling, which the
-            packer closes one short of the file minimum. A file whose
-            OWN rows exceed the ceiling is never fetched — the candidate
-            filter carries record_count < ceiling — so it costs nothing
-            and is not counted.
-
-            Decided in metadata at planning time from the registered
-            record counts, before any object-store IO, so work that
-            cannot fit never spends ninety seconds finding out.
-
-            Durable, like invalid_data, but the fault is neither the
-            writer's nor the schema's: it is a table whose sort order and
-            row width exceed the heap this process was given. It clears
-            by raising HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD
-            sized for it) or by dropping the table's sort order, which
-            moves it to the streaming path where group size costs no
-            heap. A nonzero count no longer means the table is not
-            compacting: the rest of it is.
-
-            TEMPORARY. The ceiling exists only because the sorted rewrite
-            sorts a whole group in memory. An external merge sort removes
-            it: an input that is a previous compaction output is an
-            already-sorted run, so merging needs one row per input rather
-            than all of them, and a client-written file (whose sort order
-            is advisory and unverified) is bounded by the ingest flush
-            size and can be sorted alone and spilled as a run of its own.
+            The sorted rewrite is an external merge sort now: a group packs
+            to the byte target like any other, the heap holds one chunk or
+            one row group per merged run, and nothing produces this
+            counter. Its successors are spill_budget_exceeded and
+            merge_budget_exceeded; an OutOfMemoryError caught mid-rewrite
+            is counted in failed_groups. Kept, and still REQUIRED, because
+            it was required on the wire and the maintenance run ledger
+            holds rows that carry it; a nonzero value can only come from a
+            run recorded by an older server.
         failed_groups:
           type: integer
           format: int64
@@ -4702,8 +4683,9 @@ components:
 
             It spends no object-store IO, so it does NOT consume
             HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN — the same treatment
-            heap_budget_exceeded gets, and for the same reason: a skip
-            that costs nothing must not be able to starve the sweep.
+            spill_budget_exceeded and merge_budget_exceeded get, and for
+            the same reason: a skip that costs nothing must not be able
+            to starve the sweep.
 
             OPTIONAL, and not in `required`, for the same reason
             `offsets_released` is: the maintenance run ledger holds
@@ -4803,6 +4785,160 @@ components:
             OPTIONAL, with the four above and with claimed_elsewhere,
             for the reason that one states: the ledger holds rows
             written before these fields existed.
+        runs_trusted:
+          type: integer
+          format: int64
+          description: >
+            Inputs the SORTED rewrite read in place as already-sorted runs
+            of its external merge sort (hoglake#134): compaction outputs
+            (explicit_row_ids) registered at or after the live sort
+            spec's begin snapshot, and any other file the sortedness
+            pre-pass verified as already sorted (files_verified), admitted
+            by the merge's heap budget. Every one is sort work not done.
+            Summed over every rewrite that completed, committed or not.
+
+            OPTIONAL, like every counter below, for claimed_elsewhere's
+            reason: the ledger holds rows written before it existed, and
+            the read path fills 0 for them.
+        runs_spilled:
+          type: integer
+          format: int64
+          description: >
+            Sorted chunks the external merge sort wrote to local spill
+            files (HOGLAKE_COMPACTION_SPILL_DIR) and merged: client-written
+            inputs, outputs of an older sort spec, and demoted trusted
+            inputs, HOGLAKE_COMPACTION_SORTED_HEAP_BYTES' worth of rows
+            (divided by the parallel group count) per chunk. Optional.
+        runs_demoted:
+          type: integer
+          format: int64
+          description: >
+            Trusted inputs the merge's heap budget sent down the spill path
+            instead of reading them in place. Changes work, never
+            correctness; a standing high count says the sorted heap budget
+            is small for the group size. Optional.
+        spill_bytes:
+          type: integer
+          format: int64
+          description: >
+            Local bytes the external merge sort spilled (snappy), summed
+            over the sweep's sorted rewrites — including what a rewrite
+            had spilled when a spill or merge budget stopped it mid-run
+            (runs_spilled and runs_demoted count those too). Each
+            rewrite is bounded by HOGLAKE_COMPACTION_SPILL_BYTES.
+            Optional.
+        spill_budget_exceeded:
+          type: integer
+          format: int64
+          description: >
+            Sorted groups refused because their spill would exceed
+            HOGLAKE_COMPACTION_SPILL_BYTES — in metadata at planning, from
+            the registered bytes the spill path would read (no
+            object-store IO), or by the rewrite itself the moment the bytes
+            actually written would cross it (the output is discarded). The
+            bound is in-process because the spill directory is an emptyDir
+            whose overrun EVICTS the pod rather than failing a write.
+            Configuration, not fault: the same groups re-refuse every sweep
+            until the knob, the volume or the target moves. Does not
+            consume HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+        merge_budget_exceeded:
+          type: integer
+          format: int64
+          description: >
+            Sorted groups refused because their merge cannot fit the sorted
+            heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / the
+            parallel group count) even with every trusted input spilled:
+            too many spilled runs, each holding a row group while it is
+            read. Predicted in metadata from the registered survivor
+            counts, or raised by the rewrite from the exact spill files.
+            Reachable only by configuration (a heap budget small against
+            HOGLAKE_COMPACTION_TARGET_BYTES). Does not consume
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN. Optional.
+        spill_cleanup_failures:
+          type: integer
+          format: int64
+          description: >
+            Sorted rewrites whose spill directory could not be removed
+            afterwards. The output is good, but the spill volume still
+            holds the files and counts them toward its limit until the
+            process restarts (the startup sweep removes them). Optional.
+        files_verified:
+          type: integer
+          format: int64
+          description: >
+            Inputs of sorted rewrites that the sortedness pre-pass found
+            already in merge-key order, reading only their sort-key
+            columns (and the row-id carrier of a compaction output). Each
+            became a run read in place and was never spilled, unless the
+            heap budget demoted it (then counted in runs_demoted too).
+            runs_trusted counts metadata-trusted and verified runs alike.
+            A writer that sorts its files (millpond) shows up here; a
+            Trino INSERT's files do not. Optional.
+        files_unsorted:
+          type: integer
+          format: int64
+          description: >
+            Inputs the pre-pass found out of order, or not checkable
+            (id-less columns, a key under a container, an unsortable
+            physical type, a null row-id carrier), which took the spill
+            path. Not an error. Optional.
+        files_unchecked:
+          type: integer
+          format: int64
+          description: >
+            Inputs the pre-pass did not check because they are smaller
+            than HOGLAKE_COMPACTION_VERIFY_MIN_BYTES (default 16 MiB) or
+            of unknown size: a small file is cheapest on the chunk path —
+            read once, batched with others into a few sorted runs — so it
+            is spilled without a check. Neither verified nor unsorted.
+            Optional.
+        row_groups_appended:
+          type: integer
+          format: int64
+          description: >
+            Input row groups copied into outputs byte for byte instead of
+            decoded and re-encoded: a prior compaction output of the live
+            schema, with no live deletion vector and every row group at
+            least 32 MiB, is appended as it stands (its codec, statistics,
+            column and offset indexes and bloom filters with it). On a
+            sorted table only when its first sort key's range does not
+            overlap any other run's, so that its rows are one contiguous
+            block of the sorted output. Optional.
+        bytes_appended:
+          type: integer
+          format: int64
+          description: >
+            Compressed bytes of the row groups counted in
+            row_groups_appended. Against bytes_in, the share of the input
+            that was copied rather than rewritten. Optional.
+        groups_retired:
+          type: integer
+          format: int64
+          description: >
+            Groups whose every input was fully deleted by its live
+            deletion vector: the rewrite read each input through its
+            vector and wrote zero rows, so the inputs and their vectors
+            were end-snapshotted at a snapshot of their own and NO output
+            file was registered (the empty object the rewrite uploaded is
+            left to the cleanup drain). Not counted in groups_compacted,
+            files_in, files_out, bytes_in or bytes_out, which describe
+            rewrites that produced a file. Consumes
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN like any attempt.
+            Optional.
+        files_unranged:
+          type: integer
+          format: int64
+          description: >
+            Runs of sorted rewrites whose FIRST sort key's range their
+            footer statistics could not give (none recorded, a
+            float/double key — parquet leaves NaN out of min/max — or a
+            key leaf of another type), counted only in groups where they
+            cost an append (row_groups_appended): some run passed every
+            other append condition and its range was disjoint from every
+            KNOWN range (other runs, spill chunks), so it would have
+            appended without them. Nothing is known to be disjoint from
+            an unranged run, so the group merges instead. Slower, never
+            wrong. Optional.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,

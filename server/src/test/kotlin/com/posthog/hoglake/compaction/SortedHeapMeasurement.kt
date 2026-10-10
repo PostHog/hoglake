@@ -21,10 +21,10 @@ import java.util.Random
 import kotlin.io.path.fileSize
 
 /**
- * The measurement behind [CompactionConfig.SORTED_HEAP_BYTES_PER_NODE]
- * and the density derate — manual, like [CodecMeasurement] and
- * [BudgetOomRepro], because it is evidence rather than a gate.
- * `CompactionConfigTest` is the gate.
+ * The measurement behind [CompactionConfig.SORTED_HEAP_BYTES_PER_NODE],
+ * which now sizes the sorted rewrite's CHUNK — manual, like
+ * [CodecMeasurement] and [BudgetOomRepro], because it is evidence rather
+ * than a gate. `CompactionConfigTest` is the gate.
  *
  *   ./gradlew writeTestClasspath
  *   java -Xmx6g -cp "$(cat build/test-classpath.txt)" \
@@ -33,25 +33,28 @@ import kotlin.io.path.fileSize
  * What it answers, for the flat event shape this catalog actually
  * holds (the bench seed's PAGEVIEWS columns, as in [CodecMeasurement]):
  *
- *  1. **Heap per materialized row**, which is what the SORTED rewrite
- *     path holds — it reads every survivor of a group into an
- *     `ArrayList<Group>` so it can sort them. Measured as RETAINED
- *     bytes (used-heap delta across a settled GC, with the list still
- *     strongly reachable), divided by rows, divided by nodes per row.
- *     A `SimpleGroup` is not a compact record: it is one object, one
+ *  1. **Heap per materialized row**, which is what one chunk of the
+ *     external merge sort holds: the chunk phase reads up to
+ *     `SortSpill.chunkRows` survivors into an `ArrayList` of `Group`s so
+ *     it can sort them before spilling. `chunkRows` is the per-group heap
+ *     budget divided by this number (times nodes per row), so an
+ *     underestimate here is an OOM in the chunk phase. Measured as
+ *     RETAINED bytes (used-heap delta across a settled GC, with the list
+ *     still strongly reachable), divided by rows, divided by nodes per
+ *     row. A `SimpleGroup` is not a compact record: it is one object, one
  *     `List<Object>[]` field array, and then one `ArrayList` PLUS its
  *     backing `Object[]` PLUS a boxed value per populated field.
  *
  *  2. **Compressed bytes per row** under SNAPPY (what every client
- *     writer here produces) and under ZSTD (what compaction itself
- *     writes since #115, and therefore what any compaction-output
- *     input is). The RATIO between them is the amount by which the same
- *     byte budget started admitting more rows — i.e. exactly how much
- *     #115 degraded `targetBytes` as a heap proxy.
+ *     writer here produces, and what spill files are written with) and
+ *     under ZSTD (what compaction outputs are written with). The ratio
+ *     says how many input bytes one chunk covers, which is what decides
+ *     how many spilled runs — each one a spill block of merge heap — a
+ *     group of a given byte target makes.
  *
- * Together those two numbers say how many bytes of input the sorted
- * path may plan per group for a given heap allowance, which is what
- * [CompactionConfig.effectiveTargetBytes] computes.
+ * That chunk is the whole heap story only for the chunk phase; that the
+ * rewrite's PEAK stays flat as the group grows, which is the point of
+ * the external sort, is [SortedRewriteHeapMeasurement]'s question.
  */
 object SortedHeapMeasurement {
     @JvmStatic
@@ -108,7 +111,7 @@ object SortedHeapMeasurement {
     private var heapPerRowHint = 0.0
 
     /**
-     * Read every row of [path] into a list — the sorted path's
+     * Read every row of [path] into a list — one chunk's
      * `ArrayList<Row>` — and report the RETAINED bytes.
      *
      * Settle the heap, sample, materialize, settle again with the list
@@ -149,7 +152,7 @@ object SortedHeapMeasurement {
 
     /**
      * The bench seed's pageview columns plus the `_hog_row_id` carrier
-     * every compaction output holds — the shape the sorted path actually
+     * every compaction output holds — the shape a chunk actually
      * materializes.
      */
     private val schema: MessageType =

@@ -505,6 +505,14 @@ data class SortFieldDef(
 data class SortSpec(
     val sortId: Long,
     val fields: List<SortFieldDef>,
+    /**
+     * The snapshot this spec became live at (`hog_sort_spec.begin_snapshot`).
+     * Compaction's trust predicate: an explicit-row-id file whose own
+     * `begin_snapshot` is at or after this was written by a compaction
+     * under THIS spec, so the sorted rewrite may read it as an
+     * already-sorted run instead of spilling it (hoglake#134).
+     */
+    val beginSnapshot: Long,
 )
 
 /**
@@ -1407,29 +1415,19 @@ data class CompactionResult(
      */
     val invalidData: Long = 0,
     /**
-     * Groups the SORTED path declined because materializing them would
-     * not fit CompactionConfig.sortedHeapBytes — groupable by bytes,
-     * too many rows for the heap.
+     * HISTORICAL. Groups the pre-hoglake#134 SORTED path declined because
+     * materializing them would not fit CompactionConfig.sortedHeapBytes —
+     * the sorted row ceiling's refusal, decided in metadata, plus an
+     * OutOfMemoryError caught mid-rewrite.
      *
-     * Almost always refused in METADATA, at planning, from
-     * hog_data_file.record_count: exact, free, and before any IO. The
-     * remainder is an OutOfMemoryError actually caught mid-rewrite,
-     * which means the per-node heap estimate is wrong for that table's
-     * shape and ends the sweep.
-     *
-     * Durable like [invalidData] — the same table re-plans and
-     * re-refuses every sweep — but the fault is neither the writer's nor
-     * the schema's: it is a table whose sort order plus row width
-     * exceeds the heap this process was given. It clears by raising
-     * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with a POD sized for it) or
-     * by dropping the sort order, which puts the table on the streaming
-     * path where group size costs no heap at all.
-     *
-     * TEMPORARY, and a nonzero count should be read that way. The
-     * ceiling exists only because the sorted rewrite sorts a whole group
-     * in memory; an external merge sort removes it, and compaction's own
-     * outputs are already sorted runs, so a group of them barely needs
-     * one. See CompactionConfig.sortedHeapBytes for the full argument.
+     * Nothing produces it any more: the sorted rewrite is an external
+     * merge sort whose heap is bounded by its chunk and its runs, not by
+     * the group, so a group is never refused for its size in rows. Its
+     * successors are [spillBudgetExceeded] and [mergeBudgetExceeded]; an
+     * OOM is now counted in [failedGroups]. KEPT, and always 0 for a new
+     * run, because it is on the wire as a required field and in the run
+     * ledger's rows from before the change (MaintenanceDto's
+     * COMPACTION_COUNTERS_ADDED_LATER is append-only).
      */
     val heapBudgetExceeded: Long = 0,
     /**
@@ -1544,6 +1542,122 @@ data class CompactionResult(
      */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val planMs: Long = 0,
+    /**
+     * Inputs sorted rewrites read IN PLACE as already-sorted runs:
+     * compaction outputs written under the live sort spec
+     * (`explicit_row_ids` and `begin_snapshot >= spec.begin_snapshot`),
+     * admitted by the merge's heap budget. Each is spill work not done.
+     * Summed over every rewrite that completed, committed or not.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val runsTrusted: Long = 0,
+    /**
+     * Spill files (sorted chunks) sorted rewrites wrote to local disk and
+     * merged — client-written inputs, outputs of an older sort spec, and
+     * demoted trusted inputs.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val runsSpilled: Long = 0,
+    /**
+     * Trusted inputs the merge's heap budget sent down the spill path
+     * instead of reading them in place. Changes work, never correctness;
+     * a standing high count says HOGLAKE_COMPACTION_SORTED_HEAP_BYTES is
+     * small for the group size.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val runsDemoted: Long = 0,
+    /**
+     * Local bytes sorted rewrites spilled (snappy), summed — including the
+     * bytes a rewrite had spilled when a budget stopped it mid-run, as are
+     * [runsSpilled] and [runsDemoted].
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val spillBytes: Long = 0,
+    /**
+     * Sorted groups refused because their spill would exceed
+     * HOGLAKE_COMPACTION_SPILL_BYTES: in metadata at planning from the
+     * registered input bytes (no IO), or stopped by the rewrite the moment
+     * the bytes actually written would cross it (output discarded). A
+     * spill directory is an emptyDir whose overrun EVICTS the pod, which
+     * is why the bound is in-process. Configuration, not fault; not
+     * charged to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val spillBudgetExceeded: Long = 0,
+    /**
+     * Sorted groups refused because their merge cannot fit the sorted
+     * heap budget (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES / parallel
+     * groups) even with every trusted input spilled. Reachable only by
+     * configuration; not charged, like [spillBudgetExceeded].
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val mergeBudgetExceeded: Long = 0,
+    /**
+     * Sorted rewrites whose `hoglake-compaction-spill-<uuid>` directory could not be removed
+     * afterwards. The output is good; the spill volume still holds the
+     * files, and an emptyDir counts them until the process dies.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val spillCleanupFailures: Long = 0,
+    /**
+     * Inputs of sorted rewrites the sortedness pre-pass found already in
+     * merge-key order (reading only their sort-key columns). Each became
+     * a run read in place, never spilled, unless the heap budget demoted
+     * it (counted in [runsDemoted] too). [runsTrusted] minus the verified
+     * runs admitted is the metadata-trusted count.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val filesVerified: Long = 0,
+    /**
+     * Inputs the pre-pass found out of order, or not checkable (id-less
+     * columns, a key under a container, an unsortable physical type, a
+     * null row-id carrier), which took the spill path. Not an error.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val filesUnsorted: Long = 0,
+    /**
+     * Inputs under HOGLAKE_COMPACTION_VERIFY_MIN_BYTES (or of unknown
+     * size) the pre-pass did not check: they went to the chunk phase,
+     * where a small file is cheapest. Neither verified nor unsorted.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val filesUnchecked: Long = 0,
+    /**
+     * Input row groups copied into outputs byte for byte rather than
+     * decoded and re-encoded (hoglake#134 package D1): prior compaction
+     * outputs of the live schema with no live DV and row groups of at
+     * least ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES — on a sorted table
+     * only when their first-key range is disjoint from every other run's.
+     * Work, not an outcome.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val rowGroupsAppended: Long = 0,
+    /** Compressed bytes of [rowGroupsAppended]. */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val bytesAppended: Long = 0,
+    /**
+     * Groups whose every input was fully deleted by its live DV: the
+     * rewrite read them all and wrote zero rows, so the inputs and their
+     * DVs were end-snapshotted at a snapshot of their own and NO output
+     * was registered (the empty object it uploaded is left to the cleanup
+     * drain). Not in [groupsCompacted], [filesIn], [filesOut], [bytesIn]
+     * or [bytesOut], which describe rewrites that produced a file;
+     * charged to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN like any attempt.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val groupsRetired: Long = 0,
+    /**
+     * Runs of sorted rewrites whose FIRST sort key's range the footer
+     * statistics could not give (none recorded, a float/double key —
+     * parquet leaves NaN out of min/max — or a key leaf of another type),
+     * counted only in groups where they cost an append: some run passed
+     * every other append condition and its range was disjoint from every
+     * KNOWN range (other runs, spill chunks), so it would have appended
+     * without them. Nothing is known to be disjoint from an unranged run,
+     * so the group merges instead. Slower, never wrong.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val filesUnranged: Long = 0,
 )
 
 /**

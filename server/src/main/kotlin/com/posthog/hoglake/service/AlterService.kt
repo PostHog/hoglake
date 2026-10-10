@@ -881,7 +881,7 @@ class AlterService(private val jdbi: Jdbi) {
                 .add()
         }
         batch.execute()
-        return SortSpec(sortId, fields)
+        return SortSpec(sortId, fields, snapshot)
     }
 
     // ---- row lifecycle helpers -------------------------------------------

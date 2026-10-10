@@ -4,6 +4,8 @@ import ch.qos.logback.classic.Logger
 import ch.qos.logback.classic.LoggerContext
 import ch.qos.logback.classic.spi.ILoggingEvent
 import ch.qos.logback.core.AppenderBase
+import com.posthog.hoglake.App
+import com.posthog.hoglake.Config
 import com.posthog.hoglake.commit.CommitService
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.AlterOp
@@ -40,31 +42,26 @@ import org.junit.jupiter.api.TestInstance
 import org.slf4j.LoggerFactory
 import org.testcontainers.containers.MinIOContainer
 import java.nio.file.Files
+import java.nio.file.Path
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * hoglake#118: the sorted path's group budget, and what a group it
- * cannot hold does instead.
+ * hoglake#134: the sorted rewrite as an EXTERNAL MERGE SORT, end to end
+ * against Postgres and MinIO — and what the planner still refuses.
  *
- * The bug these cover is a UNIT MISMATCH, so the fixtures are built to
- * separate the two units that used to be conflated. Group selection
- * reads input file BYTES; the sorted rewrite materializes every survivor
- * as a parquet-java `Group`, so what it holds is ROWS. As long as every
- * writer produced the same bytes per row the byte budget tracked the row
- * count well enough to survive; #115 made compaction's own zstd output
- * an input in its own right — 1.70x denser on event data
- * (`SortedHeapMeasurement`) — and the same byte budget started admitting
- * 1.70x the rows.
+ * This class used to pin #118's sorted ROW CEILING: a sorted group was
+ * packed to the rows its in-memory sort could hold, and what could not
+ * fit was refused as `heap_budget_exceeded`. That ceiling is gone. A
+ * sorted group packs to the byte target like any other; its heap is
+ * bounded by a CHUNK (rows sorted and spilled at a time) and by the
+ * merge's per-run admission, and the planner refuses only what the
+ * rewrite's own spill-disk and merge-heap budgets would, in metadata.
  *
- * So the tables here differ in DENSITY while agreeing on bytes, which is
- * the one axis a byte-only budget is blind to. Registrations are
- * metadata-only on purpose (`hog_data_file.record_count` and
- * `file_size_bytes` are what the planner reads, and registration never
- * opens the parquet): where a group must NOT be executed, the objects
- * deliberately do not exist, so an attempt to fetch one would surface as
- * `failed_groups` and fail the test. That absence is the assertion that
- * a refused group spends no IO.
+ * Registrations are metadata-only where a group must NOT execute: the
+ * objects deliberately do not exist, so an attempted fetch would surface
+ * as `failed_groups`. That absence is the assertion that a refused group
+ * spends no IO.
  */
 @Tag("integration")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
@@ -79,9 +76,9 @@ class CompactionHeapBudgetIntegrationTest {
         const val BUCKET = "hoglake-heap-budget-test"
 
         /**
-         * The fixture table is three scalar columns, so the sorted path
-         * materializes FOUR nodes per row: the three data fields plus the
-         * `_hog_row_id` carrier every compaction output writes.
+         * The fixture table is three scalar columns, so a chunk row is
+         * FOUR nodes: the three data fields plus the `_hog_row_id`
+         * carrier every compaction output writes.
          */
         const val NODES_PER_ROW = 4L
 
@@ -106,6 +103,9 @@ class CompactionHeapBudgetIntegrationTest {
                 pathStyle = true,
             )
         }
+
+        val ASC = listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST))
+        val DESC = listOf(SortFieldDef(1, SortDirection.DESC, NullOrder.NULLS_LAST))
     }
 
     @AfterAll
@@ -113,332 +113,661 @@ class CompactionHeapBudgetIntegrationTest {
         db.close()
     }
 
-    /** A heap budget that admits exactly [rows] rows of the fixture shape. */
+    /** A heap budget whose CHUNK is exactly [rows] rows of the fixture shape. */
     private fun heapBytesFor(rows: Long) = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * NODES_PER_ROW * rows
 
-    // ---- the budget is a row budget, expressed in bytes ---------------------
+    /** A private spill directory, so "empty afterwards" is about this test alone. */
+    private fun spillDir(): Path = Files.createTempDirectory("hoglake-spill-it")
+
+    private fun spillEntries(dir: Path): List<String> =
+        Files.list(dir).use { entries ->
+            entries.map { it.fileName.toString() }.filter { it.startsWith(SpillDirectory.PREFIX) }.toList()
+        }
+
+    // ---- the full target, through many chunks ------------------------------
 
     @Test
-    fun `two tables of identical bytes are planned on their rows, not their bytes`() {
-        // The regression this whole change exists for. Both tables hold
-        // eight 128 KiB files and the same 1 MiB compaction target; the
-        // ONLY difference is how many rows those bytes carry — 1024 each
-        // in one, 4096 each in the other, the 4x a codec change can
-        // plausibly move on real event data (measured 1.70x for
-        // snappy -> zstd; 4x keeps the arithmetic exact).
+    fun `a dense sorted table the row ceiling refused compacts to the FULL target in one rewrite`() {
+        // THE PRODUCTION CASE. On gigahog-prod-us's `ingest.events_raw` a
+        // byte-sized group was ~2.9M rows against a sorted row ceiling of
+        // 552,336, so groups were packed short or refused and the table
+        // never reached its target. Here: eight 50,000-row files under a
+        // heap budget whose old ceiling (= today's chunk) is 100,000 rows,
+        // so the old planner closed every group at two files. Now ONE
+        // group takes all eight, and the rewrite sorts it in four chunks.
         //
-        // Selecting on bytes, both tables plan the same group: eight
-        // files, 1 MiB, the full target. For the dense one that
-        // group is 32,768 rows against a sort buffer sized for 8,192 —
-        // four times over, which on the dev pod is ninety seconds of IO
-        // ending in `java.lang.OutOfMemoryError: Java heap space`.
-        //
-        // Packing WITH the row ceiling as a second capacity, the two
-        // tables' groups come out holding the SAME NUMBER OF ROWS out of
-        // different numbers of bytes: the sparse one closes on bytes at
-        // 8,192 rows, the dense one closes on ROWS at two files. That
-        // equality is the assertion, and it is true only if the bound is
-        // enforced in the unit the heap actually holds.
-        //
-        // It used to be true by a different route — `effectiveTargetBytes`
-        // measured the table's average density and scaled the byte
-        // target by it — and that arm is gone: an average was an
-        // estimate of a number `hog_data_file.record_count` holds
-        // exactly, and measuring it cost an unbounded aggregate over
-        // every candidate of the table inside the planning transaction.
+        // Why 100,000 and not something tinier: the same budget bounds the
+        // MERGE, and each spilled run is charged its 16 MiB read block, so
+        // four runs need ~66 MiB — which is 100,000 rows of this shape. A
+        // smaller budget is the merge refusal tested below.
+        val rowsPerFile = 50_000L
+        val files = 8
+        val chunk = 100_000L
+        val dir = spillDir()
         val cfg =
             CompactionConfig(
-                targetBytes = 1024 * 1024,
-                // Two files is a group here: the row capacity closes the
-                // dense table's group at two, and what this test
-                // measures is where the group closes, not the file
-                // minimum.
+                targetBytes = 256L * 1024 * 1024,
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(8192),
+                sortedHeapBytes = heapBytesFor(chunk),
+                spillDir = dir,
+            )
+        assertThat(cfg.spillChunkRows(fixtureLiveColumns)).isEqualTo(chunk)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        // Every file's ids DESCENDING and interleaved with every other
+        // file's, so the output order is the sort's work and no input or
+        // chunk is accidentally already in order.
+        val contents = (0 until files).map { f -> (0 until rowsPerFile).map { it * files + f }.reversed() }
+        val cat = realSortedTableOf("full-target", contents)
+
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        val group = plan.groups.single()
+        assertThat(group.files).describedAs("one group takes the whole table").hasSize(files)
+        assertThat(group.survivingRecords)
+            .describedAs("four times what the old row ceiling admitted into a group")
+            .isEqualTo(files * rowsPerFile)
+            .isGreaterThan(cfg.spillChunkRows(fixtureLiveColumns) * 3)
+        assertThat(plan.spillRefusedGroups + plan.mergeRefusedGroups).isZero()
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.failedGroups).isZero()
+        assertThat(result.runsSpilled).describedAs("400k rows at 100k a chunk").isEqualTo(4)
+        assertThat(result.runsTrusted).describedAs("client files are never trusted").isZero()
+        assertThat(result.runsDemoted).isZero()
+        assertThat(result.spillBytes).isGreaterThan(0)
+        assertThat(result.spillBytes).isLessThanOrEqualTo(cfg.spillBytes)
+        assertThat(result.spillBudgetExceeded).isZero()
+        assertThat(result.mergeBudgetExceeded).isZero()
+        // HISTORICAL: nothing produces heap_budget_exceeded since #134; it
+        // stays on the wire reading 0, which is all this states.
+        assertThat(result.heapBudgetExceeded).isZero()
+        assertThat(result.spillCleanupFailures).isZero()
+        assertThat(spillEntries(dir)).describedAs("the spill directory is removed afterwards").isEmpty()
+
+        // The ledger row carries the counters, under their wire names.
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(4)
+        assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
+
+        // And the output is the whole table, sorted.
+        val ids = readIds(livePaths(cat).single())
+        assertThat(ids).hasSize((files * rowsPerFile).toInt())
+        assertThat(ids).isSorted()
+        assertThat(ids.toSet()).isEqualTo((0L until files * rowsPerFile).toSet())
+    }
+
+    @Test
+    fun `the rewrite's own spill hard stop is a counted refusal, not a failure, and leaves nothing behind`() {
+        // The planner refuses on REGISTERED bytes; the rewrite meters the
+        // bytes it actually writes. Snappy spill of snappy input plus the
+        // row-id column comes out larger than the registered inputs, so a
+        // spill budget of exactly the registered bytes passes planning and
+        // stops mid-run — the output upload discarded, the spill
+        // directory removed, and the outcome counted where the planner's
+        // refusal is (typed arm before the catch-all; not failed_groups).
+        val dir = spillDir()
+        val contents = (0 until 4).map { f -> (0 until 50_000L).map { it * 4 + f }.reversed() }
+        val cat = realSortedTableOf("spill-hard-stop", contents)
+        val registered = db.jdbi.withHandleUnchecked { h -> registeredBytes(h, cat) }
+        val cfg =
+            CompactionConfig(
+                targetBytes = 256L * 1024 * 1024,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(100_000),
+                spillBytes = registered,
+                spillDir = dir,
             )
         val svc = CompactionService(db.jdbi, store, cfg)
+        assertThat(svc.planTable(cat, "ns", "t", cfg).spillRefusedGroups)
+            .describedAs("the registered bytes fit, so the planner admits it")
+            .isZero()
+        val headBefore = headSnapshot(cat)
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.spillBudgetExceeded).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.failedGroups).isZero()
+        assertThat(result.groupsCompacted).isZero()
+        // The work the stopped rewrite DID reaches the ledger: it is the
+        // group that spilled the most, and it has no result to report from.
+        assertThat(result.spillBytes).isPositive().isLessThanOrEqualTo(registered)
+        assertThat(result.runsSpilled).isPositive()
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["spill_bytes"].asLong()).isEqualTo(result.spillBytes)
+        assertThat(ledger["runs_spilled"].asLong()).isEqualTo(result.runsSpilled)
+        assertThat(headSnapshot(cat)).isEqualTo(headBefore)
+        assertThat(spillEntries(dir)).describedAs("no spill directory survives the stop").isEmpty()
+        val staged = removalRows(cat).single()
+        assertThat(objectExists(staged.path)).describedAs("the partial output was discarded").isFalse()
+    }
 
-        val sparse = sortedTable("sparse", files = 8, bytesEach = 128 * 1024, recordsEach = 1024)
-        val dense = sortedTable("dense", files = 8, bytesEach = 128 * 1024, recordsEach = 4096)
-
-        val sparsePlan = svc.planTable(sparse, "ns", "t", cfg)
-        val densePlan = svc.planTable(dense, "ns", "t", cfg)
-        assertThat(densePlan.groups)
-            .describedAs(
-                "packed on bytes alone the dense table's only group would be 32,768 rows and the " +
-                    "ceiling would refuse it, leaving nothing to compact (refused=%d)",
-                densePlan.heapRefusedGroups,
+    @Test
+    fun `the rewrite's own merge hard stop is a counted refusal, not a failure`() {
+        // Registered survivors predict ONE chunk, so the planner admits
+        // the group; the files really hold 50,000 rows each, so the
+        // rewrite spills dozens of runs and stops at the one whose exact
+        // cost breaks the merge budget. (Registration never opens the
+        // parquet, which is exactly why the rewrite checks for itself.)
+        val dir = spillDir()
+        val cat = "heap-merge-hard-stop-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(cat, "ns", "t", fixtureColumns)
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetSortOrder(ASC)))
+        val regs =
+            (0 until 8).map { f ->
+                val bytes = parquetBytes((0 until 50_000L).map { it * 8 + f })
+                val path = "s3://$BUCKET/$cat/data/ns/t/lie$f.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 1, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        val cfg =
+            CompactionConfig(
+                targetBytes = 256L * 1024 * 1024,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(10_000),
+                spillDir = dir,
             )
-            .isNotEmpty()
-        val sparseGroup = sparsePlan.groups.first()
-        val denseGroup = densePlan.groups.first()
+        val svc = CompactionService(db.jdbi, store, cfg)
+        assertThat(svc.planTable(cat, "ns", "t", cfg).mergeRefusedGroups).isZero()
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.mergeBudgetExceeded).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.failedGroups).isZero()
+        assertThat(result.groupsCompacted).isZero()
+        assertThat(result.runsSpilled).describedAs("the runs written before the stop").isPositive()
+        assertThat(result.spillBytes).isPositive()
+        assertThat(spillEntries(dir)).isEmpty()
+    }
 
-        assertThat(denseGroup.survivingRecords)
-            .describedAs("the sort buffer holds rows, so equal-heap groups hold equal rows")
-            .isEqualTo(sparseGroup.survivingRecords)
-            .isEqualTo(8192)
-        assertThat(denseGroup.totalBytes)
-            .describedAs("4x the rows per byte buys 4x fewer bytes per group")
-            .isEqualTo(sparseGroup.totalBytes / 4)
-        assertThat(sparseGroup.files).hasSize(8)
-        assertThat(denseGroup.files).hasSize(2)
-        // And the bound the numbers above exist to respect.
-        for (group in densePlan.groups) {
-            assertThat(group.survivingRecords)
-                .describedAs("no planned group may exceed the sorted row ceiling")
-                .isLessThanOrEqualTo(cfg.sortedRowCeiling(fixtureLiveColumns))
+    // ---- trust: only the spec an output was written under ------------------
+
+    @Test
+    fun `a compaction output is a trusted run of the spec it was written under, and of no other`() {
+        // The trust predicate is `explicit_row_ids AND begin_snapshot >=
+        // spec.begin_snapshot`. Both halves get a positive control and a
+        // negative one here: the first output is trusted by the next
+        // rewrite under the SAME spec, and not after `set_sort_order`.
+        val cfg = smallFileConfig().copy(maxInputFiles = 64, maxFanIn = 64)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val cat = realSortedTableOf("trust", (0 until 3).map { f -> listOf(30L - f, 20L - f, 10L - f) })
+
+        // 1. Client files only: nothing to trust.
+        val first = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(first.groupsCompacted).isEqualTo(1)
+        assertThat(first.runsTrusted).isZero()
+        assertThat(readIds(livePaths(cat).single())).isSorted()
+
+        // 2. Same spec, more client files: the output above is TRUSTED,
+        // read in place, and the new files are the one spilled run.
+        appendReal(cat, (0 until 3).map { f -> listOf(35L + f, 5L + f) })
+        val second = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(second.groupsCompacted).isEqualTo(1)
+        assertThat(second.runsTrusted).describedAs("the previous output, under the same spec").isEqualTo(1)
+        assertThat(second.runsSpilled).isEqualTo(1)
+        val ascending = readIds(livePaths(cat).single())
+        assertThat(ascending).hasSize(15).isSorted()
+
+        // 3. The spec moves (ASC -> DESC). The output above is sorted by
+        // the OLD spec, and its begin_snapshot predates the new one, so it
+        // must not be trusted: everything goes down the spill path (here
+        // one chunk, sorted in memory), and the result is sorted by DESC.
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetSortOrder(DESC)))
+        appendReal(cat, (0 until 3).map { f -> listOf(1L + f * 100, 2L + f * 100) })
+        val third = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(third.groupsCompacted).isEqualTo(1)
+        assertThat(third.runsTrusted).describedAs("an output of the OLD spec is not a run of the new one").isZero()
+        val descending = readIds(livePaths(cat).single())
+        assertThat(descending).hasSize(21)
+        assertThat(descending).isEqualTo(descending.sortedDescending())
+    }
+
+    // ---- the byte-level append (hoglake#134 package D1) -------------------------
+
+    @Test
+    fun `a prior output is appended byte for byte, and the ledger and the metric say so`() {
+        val registry =
+            io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+                io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT,
+            )
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        val cfg = smallFileConfig().copy(maxInputFiles = 64, maxFanIn = 64, spillDir = spillDir())
+        val svc = CompactionService(db.jdbi, store, cfg)
+        // Kilobyte fixtures: the production floor is 32 MiB.
+        svc.appendFloorBytes = 1
+        val cat = realSortedTableOf("append", (0 until 3).map { f -> listOf(30L - f, 20L - f, 10L - f) })
+        val first = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(first.groupsCompacted).isEqualTo(1)
+        assertThat(first.rowGroupsAppended).describedAs("client files are never appended").isZero()
+        val prior = livePaths(cat).single()
+
+        // New client rows ABOVE the prior output's keys: its range is
+        // disjoint from the new rows' chunk, so it is appended whole.
+        appendReal(cat, (0 until 3).map { f -> listOf(105L + f, 100L + f) })
+        val second = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(second.groupsCompacted).describedAs("%s", second).isEqualTo(1)
+        assertThat(second.runsTrusted).isEqualTo(1)
+        assertThat(second.rowGroupsAppended).isEqualTo(1)
+        assertThat(second.bytesAppended).isPositive()
+        val ids = readIds(livePaths(cat).single())
+        assertThat(ids).hasSize(15).isSorted()
+        assertThat(livePaths(cat).single()).isNotEqualTo(prior)
+
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["row_groups_appended"].asLong()).isEqualTo(1)
+        assertThat(ledger["bytes_appended"].asLong()).isEqualTo(second.bytesAppended)
+        assertThat(registry.scrape())
+            .contains("hoglake_compaction_appended_bytes_total{catalog=\"$cat\"} ${second.bytesAppended}.0")
+    }
+
+    // ---- the sortedness pre-pass ----------------------------------------------
+
+    /**
+     * Millpond-shaped files: each one sorted by the table's key (a
+     * writer that sorts its flushes), the files interleaved with each
+     * other so the OUTPUT still needs the merge.
+     */
+    private fun presorted(
+        files: Int,
+        rowsEach: Int,
+    ): List<List<Long>> = (0 until files).map { f -> (0 until rowsEach).map { it.toLong() * files + f } }
+
+    @Test
+    fun `pre-sorted client files are verified and merged in place - no spill at all`() {
+        val registry =
+            io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+                io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT,
+            )
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        val dir = spillDir()
+        // A floor below these fixtures' size, so every file is checked.
+        val cfg = smallFileConfig().copy(maxInputFiles = 64, maxFanIn = 64, spillDir = dir, verifyMinBytes = 1)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        var built: List<ParquetRewriter.Input> = emptyList()
+        svc.beforeRewrite = { built = it }
+        val files = 5
+        val cat = realSortedTableOf("presorted", presorted(files, 40))
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.filesVerified).isEqualTo(files.toLong())
+        assertThat(result.filesUnsorted).isZero()
+        assertThat(result.runsTrusted).describedAs("every verified file is a run").isEqualTo(files.toLong())
+        assertThat(result.runsSpilled).isZero()
+        assertThat(result.spillBytes).isZero()
+        assertThat(spillEntries(dir)).isEmpty()
+        val ids = readIds(livePaths(cat).single())
+        assertThat(ids).hasSize(files * 40).isSorted()
+
+        // The pre-pass reads through its own handle, at the small
+        // readahead: correct at the merge's 8 MiB too, just ~32x the bytes.
+        assertThat(built).hasSize(files)
+        for (input in built) {
+            val keys = input.keySource as S3InputFile
+            assertThat(keys.readaheadBytes).isEqualTo(S3InputFile.KEY_COLUMN_READAHEAD_BYTES)
+            assertThat((input.source as S3InputFile).readaheadBytes).isEqualTo(S3InputFile.DEFAULT_READAHEAD_BYTES)
+        }
+
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["files_verified"].asLong()).isEqualTo(files.toLong())
+        assertThat(ledger.has("files_unsorted")).describedAs("zero is omitted from the stored row").isFalse()
+        val scrape = registry.scrape()
+        assertThat(scrape).contains("hoglake_compaction_sort_check_total{catalog=\"$cat\",outcome=\"sorted\"} $files.0")
+        assertThat(scrape).containsPattern("hoglake_compaction_sort_check_bytes_total\\{catalog=\"$cat\"\\} [1-9]")
+    }
+
+    @Test
+    fun `an unsorted file among pre-sorted ones is the only spill`() {
+        val dir = spillDir()
+        val cfg = smallFileConfig().copy(maxInputFiles = 64, maxFanIn = 64, spillDir = dir, verifyMinBytes = 1)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        // A Trino-shaped file: the same key range, in no particular order.
+        val trino = (0L until 40L).map { (it * 7) % 40 + 1_000 }
+        val cat = realSortedTableOf("one-unsorted", presorted(4, 40) + listOf(trino))
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.filesVerified).isEqualTo(4)
+        assertThat(result.filesUnsorted).isEqualTo(1)
+        assertThat(result.runsTrusted).isEqualTo(4)
+        assertThat(result.runsSpilled).describedAs("the unsorted file's one chunk").isEqualTo(1)
+        assertThat(result.spillBytes).isPositive()
+        assertThat(readIds(livePaths(cat).single())).hasSize(200).isSorted()
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["files_unsorted"].asLong()).isEqualTo(1)
+    }
+
+    @Test
+    fun `small files are not checked - they spill into a few runs, whatever their order`() {
+        // Fifty sorted files of 3,000 rows (~30 KB each) under the default
+        // 16 MiB floor: none is checked, and the 150,000 rows are three
+        // spilled runs, not fifty one-file runs.
+        val dir = spillDir()
+        val chunk = 70_000L
+        val cfg =
+            smallFileConfig().copy(
+                targetBytes = 256L * 1024 * 1024,
+                maxInputFiles = 64,
+                maxFanIn = 64,
+                spillDir = dir,
+                sortedHeapBytes = heapBytesFor(chunk),
+            )
+        assertThat(cfg.verifyMinBytes).isEqualTo(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val files = 50
+        val cat = realSortedTableOf("tiny", presorted(files, 3_000))
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(1)
+        assertThat(result.filesUnchecked).isEqualTo(files.toLong())
+        assertThat(result.filesVerified + result.filesUnsorted).isZero()
+        assertThat(result.runsSpilled).describedAs("150k rows at 70k a chunk").isEqualTo(3)
+        assertThat(result.spillBytes).isPositive()
+        assertThat(readIds(livePaths(cat).single())).hasSize(files * 3_000).isSorted()
+        val ledger = com.fasterxml.jackson.databind.ObjectMapper().readTree(lastLedgerResult(cat))
+        assertThat(ledger["files_unchecked"].asLong()).isEqualTo(files.toLong())
+    }
+
+    // ---- what the planner still refuses, in metadata -----------------------
+
+    @Test
+    fun `a group whose spill exceeds the spill budget is refused in metadata and spends no IO`() {
+        // Four 900-row files under a 1,000-row chunk: four spilled runs,
+        // 4,096 registered bytes to spill against a 1,000-byte budget. The
+        // objects do not exist, so any fetch would be a failed group.
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(1_000),
+                spillBytes = 1_000,
+                spillDir = spillDir(),
+            )
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val cat = sortedTable("spill-refused", files = 4, bytesEach = 1024, recordsEach = 900)
+
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        assertThat(plan.groups).isEmpty()
+        assertThat(plan.spillRefusedGroups).isEqualTo(1)
+        assertThat(plan.mergeRefusedGroups).describedAs("the spill check answers first").isZero()
+
+        repeat(2) {
+            val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+            assertThat(result.spillBudgetExceeded).isEqualTo(1)
+            assertThat(result.failedGroups).describedAs("no fetch was attempted").isZero()
+            assertThat(result.groupsCompacted).isZero()
+        }
+        assertThat(removalRows(cat)).describedAs("no staging ticket: nothing was attempted").isEmpty()
+        assertThat(liveFileCount(cat)).isEqualTo(4)
+
+        // The comparison is `>`, not `>=`: a budget of exactly the
+        // registered bytes admits the group.
+        val exact = cfg.copy(spillBytes = 4 * 1024)
+        assertThat(svc.planTable(cat, "ns", "t", exact).spillRefusedGroups).isZero()
+    }
+
+    @Test
+    fun `a group whose spilled runs alone exceed the merge budget is refused in metadata and spends no IO`() {
+        // Same four files under the same 1,000-row chunk, default spill
+        // budget: four spilled runs at ~16.5 MiB each against a merge
+        // budget of 768 KB. Reachable only by configuration, which is what
+        // the log line says.
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(1_000),
+                spillDir = spillDir(),
+            )
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val cat = sortedTable("merge-refused", files = 4, bytesEach = 1024, recordsEach = 900)
+
+        val plan = svc.planTable(cat, "ns", "t", cfg)
+        assertThat(plan.groups).isEmpty()
+        assertThat(plan.mergeRefusedGroups).isEqualTo(1)
+        assertThat(plan.spillRefusedGroups).isZero()
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.mergeBudgetExceeded).isEqualTo(1)
+        assertThat(result.failedGroups).isZero()
+        assertThat(removalRows(cat)).isEmpty()
+
+        // The boundary, from the rewriter's own arithmetic. Two spilled
+        // runs cost exactly 2 x the predicted run, and a heap budget of
+        // exactly that has a chunk of half of 80,000 rows give or take, so
+        // the merge is two runs: admitted at the budget (the comparison is
+        // `>`), refused one byte under it.
+        val edge = sortedTable("merge-edge", files = 4, bytesEach = 1024, recordsEach = 20_000)
+        val leaves = ParquetRewriter.outputLeafCount(fixtureLiveColumns)
+        val twoRuns = 2 * ExternalMergeSort.predictedSpilledRunBytes(leaves, cfg.sortSpill(fixtureLiveColumns))
+        for ((budget, refused) in listOf(twoRuns to 0L, twoRuns - 1 to 1L)) {
+            val at = cfg.copy(sortedHeapBytes = budget)
+            val runs = ExternalMergeSort.spillRuns(80_000, at.sortSpill(fixtureLiveColumns))
+            assertThat(runs).describedAs("the fixture must be a two-run merge at %d B", budget).isEqualTo(2)
+            assertThat(svc.planTable(edge, "ns", "t", at).mergeRefusedGroups)
+                .describedAs("heap budget %d B against a two-run merge of %d B", budget, twoRuns)
+                .isEqualTo(refused)
         }
     }
 
     @Test
-    fun `an unsorted table keeps the full byte target however dense it is`() {
-        // The derate is the SORTED path's, and only the sorted path
-        // materializes a group: the streaming path writes each survivor
-        // as it reads it and its heap is flat in group size. Shrinking
-        // ordinary tables' groups for a heap cost they do not pay would
-        // be a permanent throughput tax on every table in the catalog.
+    fun `refusals are not charged to the run budget - a refused table does not starve the next`() {
+        // Two tables in one catalog, planned in name order: `a` is
+        // refused (merge budget), `b` compacts. With maxGroupsPerRun = 1,
+        // a refusal that charged the budget would leave `b` untouched
+        // forever.
+        val dir = spillDir()
+        val cfg = smallFileConfig().copy(sortedHeapBytes = heapBytesFor(1_000), spillDir = dir)
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val cat = "heap-uncharged-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        for (t in listOf("a", "b")) {
+            catalogs.createTable(cat, "ns", t, fixtureColumns)
+            alter.alterTable(cat, "ns", t, listOf(AlterOp.SetSortOrder(ASC)))
+        }
+        val refusedRegs =
+            (0 until 3).map { i -> FileRegistration("s3://$BUCKET/$cat/data/ns/a/m$i.parquet", 900, 1024) }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "a", refusedRegs))))
+        val goodRegs =
+            (0 until 3).map { i ->
+                val bytes = parquetBytes((0 until 4).map { it + i * 4L })
+                val path = "s3://$BUCKET/$cat/data/ns/b/r$i.parquet"
+                store.put(path, bytes)
+                FileRegistration(path, 4, bytes.size.toLong())
+            }
+        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "b", goodRegs))))
+
+        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        assertThat(result.mergeBudgetExceeded).isEqualTo(1)
+        assertThat(result.groupsCompacted).describedAs("the refusal left the run's one slot for `b`").isEqualTo(1)
+        assertThat(result.failedGroups).isZero()
+    }
+
+    @Test
+    fun `a permanent refusal is logged once, even when other catalogs plan in between`() {
+        // The refusal warning is rate-limited to fire only when a table's
+        // refusal picture CHANGES. That state is keyed by (catalog, table)
+        // — and the catalog half is load-bearing, because table_id is
+        // scoped per catalog: every catalog's first table is table 1.
+        // Keyed by table alone, each OTHER catalog's sweep, finding
+        // nothing refused, cleared the refusing catalog's entry, and the
+        // warning fired on every sweep. Production: 302 identical lines
+        // in 17 hours for one unchanged refusal (of the row ceiling this
+        // replaced; the mechanism is the same one, renamed).
+        val cfg =
+            CompactionConfig(
+                targetBytes = 65536,
+                minInputFiles = 2,
+                maxGroupsPerRun = 1,
+                sortedHeapBytes = heapBytesFor(1_000),
+                spillDir = spillDir(),
+            )
+        val svc = CompactionService(db.jdbi, store, cfg)
+        val refusing = sortedTable("refused-once", files = 4, bytesEach = 1024, recordsEach = 900)
+        val innocent = sortedTable("innocent", files = 4, bytesEach = 1024, recordsEach = 100, sort = false)
+
+        val events = CopyOnWriteArrayList<ILoggingEvent>()
+        val appender =
+            object : AppenderBase<ILoggingEvent>() {
+                override fun append(event: ILoggingEvent) {
+                    events += event
+                }
+            }
+        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
+        appender.context = ctx
+        appender.start()
+        val logger = LoggerFactory.getLogger(CompactionService::class.java) as Logger
+        logger.addAppender(appender)
+        try {
+            repeat(3) {
+                assertThat(svc.planTable(refusing, "ns", "t", cfg).mergeRefusedGroups).isEqualTo(1)
+                assertThat(svc.planTable(innocent, "ns", "t", cfg).mergeRefusedGroups).isZero()
+            }
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+        val warnings = events.filter { it.formattedMessage.contains("compaction refused") }
+        assertThat(warnings)
+            .describedAs("one unchanged refusal, planned three times with another catalog in between, logs ONCE")
+            .hasSize(1)
+
+        // And the picture is FORGOTTEN when the table plans clean: raise
+        // the budget (one chunk, no merge) and the refusal clears; lower
+        // it again and the same refusal is news again, so it WARNs a
+        // second time. Without the clear, a refusal that came back after
+        // an operator's fix and revert would never be logged.
+        events.clear()
+        logger.addAppender(appender)
+        appender.start()
+        try {
+            val raised = cfg.copy(sortedHeapBytes = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES)
+            assertThat(svc.planTable(refusing, "ns", "t", raised).mergeRefusedGroups).isZero()
+            assertThat(svc.planTable(refusing, "ns", "t", cfg).mergeRefusedGroups).isEqualTo(1)
+        } finally {
+            logger.detachAppender(appender)
+            appender.stop()
+        }
+        assertThat(events.filter { it.formattedMessage.contains("compaction refused") })
+            .describedAs("refuse, clear, refuse again: a SECOND warning")
+            .hasSize(1)
+        assertThat(warnings.single().formattedMessage)
+            .describedAs("and it names the knobs that clear it")
+            .contains("HOGLAKE_COMPACTION_SORTED_HEAP_BYTES")
+            .contains("HOGLAKE_COMPACTION_TARGET_BYTES")
+    }
+
+    @Test
+    fun `an unsorted table never spills and is never refused for its density`() {
+        val dir = spillDir()
         val cfg =
             CompactionConfig(
                 targetBytes = 1024 * 1024,
                 maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(8192),
+                sortedHeapBytes = heapBytesFor(1),
+                spillBytes = 1,
+                spillDir = dir,
             )
         val svc = CompactionService(db.jdbi, store, cfg)
         val dense = sortedTable("unsorted-dense", files = 8, bytesEach = 128 * 1024, recordsEach = 4096, sort = false)
-
-        val group = svc.planTable(dense, "ns", "t", cfg).groups.first()
-        assertThat(group.files).hasSize(8)
-        assertThat(group.totalBytes).isEqualTo(1024L * 1024)
+        val plan = svc.planTable(dense, "ns", "t", cfg)
+        assertThat(plan.groups.single().files).hasSize(8)
+        assertThat(plan.spillRefusedGroups + plan.mergeRefusedGroups).isZero()
     }
 
-    // ---- a group that cannot fit -------------------------------------------
+    // ---- concurrency and the spill directory -------------------------------
 
     @Test
-    fun `files too dense to pair under the ceiling are refused in metadata and spend no IO`() {
-        // What the row ceiling can still refuse, now that groups are
-        // PACKED to it rather than packed on bytes and then tested.
-        //
-        // Four files of 900 surviving rows each against a 1,024-row
-        // ceiling: no TWO of them fit, so the packer closes a group
-        // before every second file and each closure is a one-file group
-        // the file minimum drops. That is not the ordinary "short
-        // remainder waiting for more appends" case — more files never
-        // help, because the ceiling comes from the table's schema and
-        // this process's heap — so the packer hands those closures back
-        // (`CompactionGrouping.Packing.rowBoundRefusals`) and they are
-        // counted and warned about instead of vanishing.
-        //
-        // THREE, not four: the loop closes before files 2, 3 and 4, and
-        // the fourth file is then the trailing remainder, which closes
-        // on neither bound and is the ordinary silent case.
-        //
-        // "Spends no IO" is asserted by construction: these paths were
-        // never uploaded, so an attempted fetch would be NoSuchKey and
-        // would land in failed_groups. failed_groups staying zero is the
-        // proof that nothing was attempted.
-        val ceiling = 1024L
+    fun `two sorted groups in flight spill to separate directories and both are removed`() {
+        // Two groups of four files, two workers. The store holds a read
+        // on each worker, once its own group has started spilling, until
+        // the OTHER group's directory exists too — so both are on disk at
+        // once and must be distinct, and both must be gone afterwards.
+        val dir = spillDir()
+        val rowsPerFile = 50_000L
         val cfg =
             CompactionConfig(
-                targetBytes = 65536,
-                minInputFiles = 2,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(ceiling),
+                targetBytes = 256L * 1024 * 1024,
+                minInputFiles = 4,
+                maxInputFiles = 4,
+                maxFanIn = 4,
+                maxGroupsPerRun = 2,
+                parallelGroups = 2,
+                inputOpenParallelism = 1,
+                // Per group (divided by 2): a 100,000-row chunk, so each
+                // 200,000-row group is two spilled runs, which the same
+                // per-group budget can merge (two 16.5 MiB read blocks).
+                sortedHeapBytes = 2 * heapBytesFor(100_000),
+                spillDir = dir,
             )
-        val svc = CompactionService(db.jdbi, store, cfg)
-        val cat = sortedTable("too-big", files = 4, bytesEach = 1024, recordsEach = 900)
-        assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
-
-        val plan = svc.planTable(cat, "ns", "t", cfg)
-        assertThat(plan.groups).describedAs("no two of these files fit the ceiling").isEmpty()
-        assertThat(plan.heapRefusedGroups).isEqualTo(3)
-        // The bound the refusal defends, stated on the groups that WERE
-        // formed: none, here, which is why the assertion above is the
-        // one that matters.
-        assertThat(plan.groups.map { it.survivingRecords }).allSatisfy { assertThat(it).isLessThanOrEqualTo(ceiling) }
-
-        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(result.heapBudgetExceeded)
-            .describedAs(
-                "every refusal counted even though maxGroupsPerRun is 1: a refusal costs no IO, so " +
-                    "charging it to the run budget would let one un-compactable table starve the sweep",
-            )
-            .isEqualTo(3)
-        assertThat(result.groupsCompacted).isZero()
-        assertThat(result.failedGroups).describedAs("no fetch was attempted").isZero()
-        assertThat(result.invalidData).isZero()
-        assertThat(result.unconvertibleSchema).isZero()
-
-        // Nothing moved: no staged object claimed, every input still live.
-        assertThat(removalRows(cat)).isEmpty()
-        assertThat(liveFileCount(cat)).isEqualTo(4)
-
-        // Deterministic, and just as cheap the second time. The behaviour
-        // being replaced was ninety seconds of IO per sweep, forever.
-        val again = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(again.heapBudgetExceeded).isEqualTo(3)
-        assertThat(again.failedGroups).isZero()
-    }
-
-    @Test
-    fun `a single file above the ceiling is never fetched, and the rest of the bucket compacts`() {
-        // The one thing packing to the ceiling cannot rescue: a file
-        // whose OWN surviving rows exceed it. It can share a group with
-        // nothing.
-        //
-        // IT IS NOT FETCHED, and that is a deliberate change from the
-        // first version of this work, which fetched it, packed it into a
-        // one-file group, refused the group, counted it in
-        // `heap_budget_exceeded` and named it in a WARN — every sweep,
-        // forever, spending a slot of the candidate budget to rediscover
-        // something `hog_data_file.record_count` already said. The
-        // candidate filter now carries `record_count < ceiling`, which
-        // is exact and free.
-        //
-        // WHERE THE OPERATOR SIGNAL WENT, because this does cost one:
-        // the named WARN is gone with the refusal. What remains is the
-        // compaction-debt page, which counts the file (the sampler does
-        // not know the table's row ceiling, so its debt includes it) —
-        // that is one of the three over-reporting cases
-        // `PartitionStatsService`'s KDoc already lists, and it is now
-        // also the signal for this one. `heap_budget_exceeded` still
-        // covers the refusal that RECURS: files dense enough that no
-        // two of them fit.
-        //
-        // The other half is the point of the whole change: the rest of
-        // the bucket still compacts. Under the old shape a bucket was
-        // packed on bytes and every group that came out too dense was
-        // refused, so ONE pathological file's bucket contributed nothing
-        // at all — which is what `ingest.events_raw` looked like for
-        // days.
-        val ceiling = 1024L
-        val cfg =
-            CompactionConfig(
-                targetBytes = 65536,
-                minInputFiles = 2,
-                maxInputFiles = 2,
-                // Pinned: this test shapes its groups by the file count.
-                maxFanIn = 2,
-                maxGroupsPerRun = 4,
-                sortedHeapBytes = heapBytesFor(ceiling),
-            )
-        val svc = CompactionService(db.jdbi, store, cfg)
-        // Four 400-row files that pair happily under the ceiling, plus
-        // one 2,000-row file that cannot pair with anything. Sizes are
-        // deliberately equal so BYTES decide nothing here.
+        assertThat(cfg.spillChunkRows(fixtureLiveColumns)).isEqualTo(2 * rowsPerFile)
         val cat =
-            sortedTableOfFiles(
-                "one-over",
-                listOf(400L, 400L, 400L, 400L, 2_000L).map { 1024L to it },
-            )
-        assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
-
-        val plan = svc.planTable(cat, "ns", "t", cfg)
-        assertThat(plan.heapRefusedGroups)
-            .describedAs("the over-ceiling file costs no refusal, because it is never fetched")
-            .isZero()
-        assertThat(plan.groups)
-            .describedAs("the pairable files are NOT held hostage by the one that is not")
-            .isNotEmpty()
-        assertThat(plan.groups.flatMap { it.files }.map { it.recordCount })
-            .describedAs("the oversized file is in no group")
-            .doesNotContain(2_000L)
-        assertThat(plan.groups.flatMap { it.files })
-            .describedAs("and all four that fit are planned")
-            .hasSize(4)
-        for (group in plan.groups) {
-            assertThat(group.survivingRecords)
-                .describedAs("every group the planner emits fits the ceiling")
-                .isLessThanOrEqualTo(ceiling)
-        }
+            realSortedTableOf("two-dirs", (0 until 8).map { f -> (0 until rowsPerFile).map { it * 8 + f }.reversed() })
+        val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+        val maxConcurrent = AtomicInteger()
+        val waitingStore =
+            object : ObjectStore(minio.s3URL, "us-east-1", minio.userName, minio.password, true) {
+                override fun getRange(
+                    pathUri: String,
+                    startInclusive: Long,
+                    length: Int,
+                ): ByteArray {
+                    val deadline = System.nanoTime() + 20_000_000_000L
+                    var now = spillEntries(dir)
+                    while (now.size == 1 && System.nanoTime() < deadline) {
+                        Thread.sleep(10)
+                        now = spillEntries(dir)
+                    }
+                    seen += now
+                    maxConcurrent.accumulateAndGet(now.size) { a, b -> maxOf(a, b) }
+                    return super.getRange(pathUri, startInclusive, length)
+                }
+            }
+        val result = CompactionService(db.jdbi, waitingStore, cfg).runOnce(cat, cfg, MaintenanceTrigger.LOOP)
+        waitingStore.close()
+        assertThat(result.groupsCompacted).describedAs("%s", result).isEqualTo(2)
+        assertThat(result.runsSpilled).describedAs("two per group").isEqualTo(4)
+        assertThat(maxConcurrent.get()).describedAs("both groups' spill directories existed at once").isEqualTo(2)
+        assertThat(seen).hasSize(2)
+        assertThat(spillEntries(dir)).describedAs("and both are gone").isEmpty()
+        for (path in livePaths(cat)) assertThat(readIds(path)).hasSize(4 * rowsPerFile.toInt()).isSorted()
     }
 
-    // ---- packing TO the ceiling, end to end ---------------------------------
-
     @Test
-    fun `a dense sorted table that byte-packing could not compact at all now compacts end to end`() {
-        // THE PRODUCTION CASE, at fixture scale. On gigahog-prod-us's
-        // `ingest.events_raw` the stray-day files hold ~50 bytes per row,
-        // so a group packed to the BYTE target was ~2.9M rows against a
-        // row ceiling of 552,336 — and every single group was then
-        // refused. `heap_budget_exceeded` sat around 2,000 per run for
-        // days and the table did not compact at all.
-        //
-        // The fixture reproduces the RELATIONSHIP rather than the
-        // magnitudes: nine real parquet objects whose registered bytes
-        // are low enough per row that one byte-sized group holds far
-        // more rows than the ceiling admits.
-        val filesCount = 9
-        val rowsPerFile = 200L
-        val ceiling = 600L
-        val cfg =
-            CompactionConfig(
-                targetBytes = 65536,
-                minInputFiles = 2,
-                maxInputFiles = 64,
-                // Enough to execute every group the plan forms, so the
-                // "it compacts" half is not hidden by the run budget.
-                maxGroupsPerRun = 5,
-                sortedHeapBytes = heapBytesFor(ceiling),
+    fun `the startup sweep removes a planted spill directory before any loop runs, and only where compaction runs`() {
+        val dir = spillDir()
+        val planted = Files.createDirectories(dir.resolve("${SpillDirectory.PREFIX}from-a-killed-container"))
+        Files.write(planted.resolve("spill-1.parquet"), ByteArray(4096))
+        val bystander = Files.createDirectories(dir.resolve("someone-elses"))
+
+        fun boot(compactionIntervalMs: Long) =
+            App.build(
+                Config(
+                    compactionIntervalMs = compactionIntervalMs,
+                    compactionSpillDir = dir.toString(),
+                    hydratorIntervalMs = 0,
+                    expiryIntervalMs = 0,
+                    cleanupIntervalMs = 0,
+                    metricsIntervalMs = 0,
+                    maintenanceSummaryIntervalMs = 0,
+                ),
+                db.jdbi,
             )
-        assertThat(cfg.sortedRowCeiling(fixtureLiveColumns)).isEqualTo(ceiling)
-        val svc = CompactionService(db.jdbi, store, cfg)
-        val cat = realSortedTable("dense-e2e", files = filesCount, rowsPerFile = rowsPerFile)
 
-        val plan = svc.planTable(cat, "ns", "t", cfg)
+        val off = boot(0)
+        off.startBackground().close()
+        off.close()
+        assertThat(planted).describedAs("a pod that does not run the loop leaves the directory alone").exists()
 
-        // WHAT THE OLD RULE WOULD HAVE DONE, computed with the real
-        // grouping function rather than asserted in prose: pack the same
-        // candidates on BYTES alone, and every group that comes out is
-        // over the ceiling — which is what "the table keeps its debt"
-        // meant.
-        val candidates = plan.groups.flatMap { it.files } + plan.groups.flatMap { it.files }
-        val byteOnly =
-            CompactionGrouping.of(cfg.targetBytes)
-                .groups(
-                    candidates.distinctBy { it.dataFileId },
-                    cfg.minInputFiles,
-                    cfg.maxInputFiles,
-                ) { it.fileSizeBytes }
-        assertThat(byteOnly.groups).describedAs("byte packing forms groups").isNotEmpty()
-        for (group in byteOnly.groups) {
-            assertThat(group.sumOf { it.recordCount })
-                .describedAs("packed on bytes, every group is over the ceiling and would be refused")
-                .isGreaterThan(ceiling)
-        }
-
-        // WHAT THE NEW RULE DOES: groups that FIT, on both bounds.
-        assertThat(plan.groups).describedAs("packing to the ceiling produces work").isNotEmpty()
-        assertThat(plan.heapRefusedGroups).describedAs("and refuses none of it").isZero()
-        for (group in plan.groups) {
-            assertThat(group.survivingRecords)
-                .describedAs("every group fits the row ceiling")
-                .isLessThanOrEqualTo(ceiling)
-            assertThat(group.totalBytes)
-                .describedAs("and still respects the byte budget")
-                .isLessThanOrEqualTo(cfg.effectiveTargetBytes(fixtureLiveColumns, sorted = true))
-        }
-
-        // AND THEY REWRITE. The objects are real, the store is MinIO, and
-        // the rows have to survive: a plan that forms groups nothing can
-        // execute is the same non-event as a plan that forms none.
-        val plannedGroups = plan.groups.size
-        val rowsBefore = liveRecordCount(cat)
-        assertThat(rowsBefore).isEqualTo(filesCount * rowsPerFile)
-
-        val result = svc.runOnce(cat, cfg, MaintenanceTrigger.LOOP)
-        assertThat(result.groupsCompacted)
-            .describedAs("every planned group committed: %s", result)
-            .isEqualTo(plannedGroups.toLong())
-        assertThat(result.heapBudgetExceeded).isZero()
-        assertThat(result.failedGroups).isZero()
-        assertThat(result.skippedConflicts).isZero()
-        assertThat(liveRecordCount(cat))
-            .describedAs("no row is lost or duplicated by a rewrite")
-            .isEqualTo(rowsBefore)
-        assertThat(liveFileCount(cat))
-            .describedAs("and the file count actually fell")
-            .isLessThan(filesCount.toLong())
+        val on = boot(3_600_000)
+        on.startBackground().close()
+        on.close()
+        assertThat(planted).doesNotExist()
+        assertThat(bystander).describedAs("only hoglake-compaction-spill-* directories are compaction's").exists()
     }
 
     // ---- OOM containment and the staged-output ledger ----------------------
@@ -461,10 +790,11 @@ class CompactionHeapBudgetIntegrationTest {
 
         val result = svc.runOnce(fx, cfg, MaintenanceTrigger.LOOP)
 
-        // Contained: counted as a heap outcome, not an escaped Error that
-        // takes the whole sweep's accounting with it (which is what
-        // `catch (e: Exception)` did, because an Error is not one).
-        assertThat(result.heapBudgetExceeded).isEqualTo(1)
+        // Contained: counted as a FAILED group (the external merge sort
+        // makes an OOM an under-count, not a sizing outcome, and
+        // `heap_budget_exceeded` is historical), not an escaped Error that
+        // takes the whole sweep's accounting with it.
+        assertThat(result.failedGroups).isEqualTo(1)
         assertThat(result.groupsCompacted).isZero()
 
         // The ledger: exactly one claim, still undrained, still ours.
@@ -479,12 +809,9 @@ class CompactionHeapBudgetIntegrationTest {
         assertThat(headSnapshot(fx)).describedAs("no snapshot was cut").isEqualTo(headBefore)
 
         // And it is genuinely RECLAIMABLE, not merely present: the drain
-        // settles it. The object never made it to MinIO, so the honest
-        // outcome is 'missing' — the ledger row is what stops it being an
-        // orphan nothing knows about.
-        // stagingGraceSeconds = 0: the ticket is seconds old, and the
-        // production grace (1 h) exists to protect one whose group may
-        // still be uploading — this group's upload already failed.
+        // settles it. stagingGraceSeconds = 0: the ticket is seconds old,
+        // and the production grace (1 h) exists to protect one whose group
+        // may still be uploading — this group's upload already failed.
         val drained =
             CleanupService(db.jdbi, removalStore, stagingGraceSeconds = 0).runOnce(fx, batchSize = 100)
         assertThat(drained.removed + drained.missing).isEqualTo(1)
@@ -494,23 +821,11 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `an OOM reading an input leaves a reclaimable orphan and no catalog row`() {
-        // The site the dev OOM actually hit: the group dies while
-        // reading its inputs.
-        //
-        // This used to be "before the staging ticket leaves nothing at
-        // all" — inputs were fetched before the output path was minted,
-        // so nothing had been claimed. Inputs are now read in place
-        // DURING the rewrite, which is after the claim, so a read-side
-        // failure leaves the same reclaimable ticket a write-side one
-        // does. See the ordering note in CompactionService.compactGroup:
-        // for a DV-free group there is no longer a pre-claim failure
-        // point at all.
-        //
-        // What still matters, and is what this asserts: the failure is
-        // COUNTED rather than unwinding the run ledger, no snapshot is
-        // cut, no catalog row appears, and the claimed path is left for
-        // the cleanup drain — which finds no object, because the
-        // multipart upload was aborted.
+        // The group dies while reading its inputs, which happens after
+        // the claim (inputs are read in place during the rewrite). What
+        // matters: the failure is COUNTED rather than unwinding the run
+        // ledger, no snapshot is cut, no catalog row appears, and the
+        // claimed path is left for the cleanup drain.
         val cfg = smallFileConfig()
         val fx = realTable("oom-get")
         val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
@@ -518,7 +833,7 @@ class CompactionHeapBudgetIntegrationTest {
 
         val result = svc.runOnce(fx, cfg, MaintenanceTrigger.LOOP)
 
-        assertThat(result.heapBudgetExceeded).isEqualTo(1)
+        assertThat(result.failedGroups).isEqualTo(1)
         assertThat(result.groupsCompacted).isZero()
         assertThat(removalRows(fx)).describedAs("the claimed path is left to reclaim").hasSize(1)
         assertThat(liveFileCount(fx)).isEqualTo(3)
@@ -527,14 +842,10 @@ class CompactionHeapBudgetIntegrationTest {
 
     @Test
     fun `a read fault on an UNSORTED table leaves no object behind`() {
-        // The case the rest of this class cannot reach. On the streaming
-        // path the writer — and therefore the multipart upload — is open
-        // before the first input is read, so a read-side failure has a
-        // live upload to leave behind. It must be discarded, not
-        // completed: completion is atomic, and parquet writes a valid
-        // footer while closing even on the exception path, so a
-        // truncated-but-well-formed object is exactly what an
-        // insufficiently careful implementation publishes here.
+        // On the streaming path the writer — and therefore the multipart
+        // upload — is open before the first input is read, so a read-side
+        // failure has a live upload to leave behind. It must be discarded,
+        // not completed.
         val cfg = smallFileConfig()
         val fx = unsortedRealTable("oom-unsorted")
         val svc = CompactionService(db.jdbi, OomOnGet(), cfg)
@@ -598,57 +909,6 @@ class CompactionHeapBudgetIntegrationTest {
      * execute, their absence is what proves it did not.
      */
 
-    @Test
-    fun `a permanent refusal is logged once, even when other catalogs plan in between`() {
-        // The refusal warning is rate-limited to fire only when a table's
-        // refusal picture CHANGES. That state is keyed by (catalog, table)
-        // — and the catalog half is load-bearing, because table_id is
-        // scoped per catalog: every catalog's first table is table 1.
-        // Keyed by table alone, each OTHER catalog's sweep, finding
-        // nothing refused, cleared the refusing catalog's entry, and the
-        // warning fired on every sweep. Production: 302 identical lines
-        // in 17 hours for one unchanged refusal. This is that sequence.
-        val ceiling = 1024L
-        val cfg =
-            CompactionConfig(
-                targetBytes = 65536,
-                minInputFiles = 2,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapBytesFor(ceiling),
-            )
-        val svc = CompactionService(db.jdbi, store, cfg)
-        // Refused: two 900-row files per group against a 1024-row ceiling.
-        val refusing = sortedTable("refused-once", files = 4, bytesEach = 1024, recordsEach = 900)
-        // Innocent: same shape, table 1, nothing over the ceiling.
-        val innocent = sortedTable("innocent", files = 4, bytesEach = 1024, recordsEach = 100, sort = false)
-
-        val events = CopyOnWriteArrayList<ILoggingEvent>()
-        val appender =
-            object : AppenderBase<ILoggingEvent>() {
-                override fun append(event: ILoggingEvent) {
-                    events += event
-                }
-            }
-        val ctx = LoggerFactory.getILoggerFactory() as LoggerContext
-        appender.context = ctx
-        appender.start()
-        val logger = LoggerFactory.getLogger(CompactionService::class.java) as Logger
-        logger.addAppender(appender)
-        try {
-            repeat(3) {
-                assertThat(svc.planTable(refusing, "ns", "t", cfg).heapRefusedGroups).isEqualTo(3)
-                assertThat(svc.planTable(innocent, "ns", "t", cfg).heapRefusedGroups).isZero()
-            }
-        } finally {
-            logger.detachAppender(appender)
-            appender.stop()
-        }
-        val warnings = events.filter { it.formattedMessage.contains("compaction refused") }
-        assertThat(warnings)
-            .describedAs("one unchanged refusal, planned three times with another catalog in between, logs ONCE")
-            .hasSize(1)
-    }
-
     private fun sortedTable(
         label: String,
         files: Int,
@@ -680,85 +940,96 @@ class CompactionHeapBudgetIntegrationTest {
         return cat
     }
 
-    /**
-     * A sorted fixture table whose files differ PER FILE, as
-     * (bytes, records) pairs.
-     *
-     * [sortedTable] makes every file identical, which cannot express the
-     * case where one file alone is over the row ceiling and the others
-     * are not.
-     */
-    private fun sortedTableOfFiles(
+    /** A SORTED (id ASC) table with one real parquet object per entry of [files], rows in the given order. */
+    private fun realSortedTableOf(
         label: String,
-        files: List<Pair<Long, Long>>,
+        files: List<List<Long>>,
     ): String {
         val cat = "heap-$label-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(cat, "ns", "t", fixtureColumns)
-        alter.alterTable(
-            cat,
-            "ns",
-            "t",
-            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
-        )
-        val regs =
-            files.mapIndexed { i, (bytes, records) ->
-                FileRegistration(
-                    path = "s3://$BUCKET/$cat/data/ns/t/v$i.parquet",
-                    recordCount = records,
-                    fileSizeBytes = bytes,
-                )
-            }
-        commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
+        alter.alterTable(cat, "ns", "t", listOf(AlterOp.SetSortOrder(ASC)))
+        appendReal(cat, files)
         return cat
     }
 
-    /**
-     * A SORTED table of [files] real parquet objects of [rowsPerFile]
-     * rows each, registered at their true sizes.
-     *
-     * [sortedTable] registers metadata only, which is right for the
-     * tests that assert a refused group spends no IO and wrong for one
-     * that has to run a group to completion. [realTable] writes real
-     * objects but is fixed at three four-row files.
-     */
-    private fun realSortedTable(
-        label: String,
-        files: Int,
-        rowsPerFile: Long,
-    ): String {
-        val cat = "heap-$label-${counter.incrementAndGet()}"
-        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
-        catalogs.createNamespace(cat, "ns")
-        catalogs.createTable(cat, "ns", "t", fixtureColumns)
-        alter.alterTable(
-            cat,
-            "ns",
-            "t",
-            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
-        )
+    /** Append one real parquet object per entry of [files] to `ns.t`. */
+    private fun appendReal(
+        cat: String,
+        files: List<List<Long>>,
+    ) {
         val regs =
-            (0 until files).map { i ->
-                val ids = (0 until rowsPerFile).map { it + i * rowsPerFile }
+            files.map { ids ->
                 val bytes = parquetBytes(ids)
-                val path = "s3://$BUCKET/$cat/data/ns/t/d$i.parquet"
+                val path = "s3://$BUCKET/$cat/data/ns/t/a${counter.incrementAndGet()}.parquet"
                 store.put(path, bytes)
-                FileRegistration(path, rowsPerFile, bytes.size.toLong())
+                FileRegistration(path, ids.size.toLong(), bytes.size.toLong())
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
-        return cat
     }
 
-    private fun liveRecordCount(cat: String): Long =
+    private fun livePaths(cat: String): List<String> =
         db.jdbi.withHandleUnchecked { h ->
             h.createQuery(
                 """
-                SELECT coalesce(sum(f.record_count), 0) FROM hog_data_file f
+                SELECT f.path FROM hog_data_file f
                 JOIN hog_catalog c ON c.catalog_id = f.catalog_id
-                WHERE c.name = :cat AND f.end_snapshot IS NULL
+                WHERE c.name = :cat AND f.end_snapshot IS NULL ORDER BY f.data_file_id
                 """,
-            ).bind("cat", cat).mapTo(Long::class.java).one()
+            ).bind("cat", cat).mapTo(String::class.java).list()
+        }
+
+    /** The `id` column of the object at [path], in physical order. */
+    private fun readIds(path: String): List<Long> {
+        val tmp = Files.createTempFile("heap-budget-read", ".parquet")
+        val out = ArrayList<Long>()
+        try {
+            Files.write(tmp, store.get(path))
+            org.apache.parquet.hadoop.ParquetFileReader.open(org.apache.parquet.io.LocalInputFile(tmp)).use { reader ->
+                val schema = reader.footer.fileMetaData.schema
+                val idIndex = schema.getFieldIndex("id")
+                val columnIO = org.apache.parquet.io.ColumnIOFactory().getColumnIO(schema)
+                var pages = reader.readNextRowGroup()
+                while (pages != null) {
+                    val rr =
+                        columnIO.getRecordReader(
+                            pages,
+                            org.apache.parquet.example.data.simple.convert.GroupRecordConverter(schema),
+                        )
+                    repeat(Math.toIntExact(pages.rowCount)) { out += rr.read().getLong(idIndex, 0) }
+                    pages = reader.readNextRowGroup()
+                }
+            }
+        } finally {
+            Files.deleteIfExists(tmp)
+        }
+        return out
+    }
+
+    private fun registeredBytes(
+        h: org.jdbi.v3.core.Handle,
+        cat: String,
+    ): Long =
+        h.createQuery(
+            """
+            SELECT sum(f.file_size_bytes) FROM hog_data_file f
+            JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+            WHERE c.name = :cat AND f.end_snapshot IS NULL
+            """,
+        ).bind("cat", cat).mapTo(Long::class.java).one()
+
+    /** The latest compaction ledger row's stored result JSON for [cat]. */
+    private fun lastLedgerResult(cat: String): String =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT result FROM hog_maintenance_run
+                 WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                   AND task = 'compaction'
+                 ORDER BY run_id DESC LIMIT 1
+                """,
+            ).bind("cat", cat).mapTo(String::class.java).one()
         }
 
     /**
