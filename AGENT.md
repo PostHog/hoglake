@@ -139,7 +139,7 @@ path-scoped per component, posthog-monorepo style:
 | `server.yml` | every PR and push to main; a `changes` job selects `server/**`, codec vectors, the live-test harness, the file itself, and the heavy jobs skip otherwise (REQUIRED CHECK `server-checks`, the gate over `server-test` and `python-live`; see the ruleset note below) | server-test + ktlint (Docker/Testcontainers; schema-equivalence gate included), both live Python suites, and a `server-checks` gate that requires both suites before deployment, PR image boot-smoke, the gated `deploy` job, and `trino-test` — the integration harness against the fork's public image (`ghcr.io/posthog/trino`, newest ordered release tag; pin via the `HOGLAKE_TRINO_IMAGE` repo variable). trino-test runs on an ARM runner (the image is arm64-only), is NOT in deploy's `needs`, and must stay non-required: a broken fork build must never wedge hoglake CD |
 | `migration-chain.yml` | every PR and push to main, NO path filter | the append-only / no-duplicate-version / numbered-above-main gate on `server/src/main/resources/db/migration`, fetching main fresh at run time. Its own workflow because it is a REQUIRED CHECK, and it was the first to hit the rule below |
 | `webui.yml` | every PR and push to main; a `changes` job selects `webui/**`, the OpenAPI spec, the shared vectors, the file itself (REQUIRED CHECK `webui-test`) | `npm run build` (tsc gate) + vitest + PR image boot-smoke + gated `deploy` job |
-| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
+| `ci-python.yml` | every PR and push to main; a `changes` job selects `pyhoglake/**`, `hedgerow/**`, `bench/**`, the OpenAPI spec, `ci/**`, the workflow files, the server files and `.github/dependabot.yml` the client's tests read (the filter's comment names each), and the jobs skip otherwise (REQUIRED CHECK `python-checks`) | pyhoglake: `pyhoglake-checks.yml` (ruff, mypy, pytest on 3.11–3.13, the unit suite on each pyarrow of a matrix — the declared floor, millpond's 23.0.1, the lock, and the newest release at least 7 days old as a non-blocking canary — build, wheel smoke test). hedgerow and bench: uv sync, ruff (pinned; bench exempt until its format backlog lands), pytest. Unit tests plus both live client suites through `python-live.yml`; a `python-checks` job fails if any dependency fails |
 | `bench-image.yml` | `bench/**` `pyhoglake/**` | builds `bench/Dockerfile` (context = REPO ROOT: bench installs pyhoglake from the sibling tree, so both must be in the context) and smokes it — CLI runs, non-root, no `.venv`, and the installed pyhoglake is this commit's and not PyPI's. A main push then publishes multi-arch `ghcr.io/posthog/hoglake-bench` (sha + `latest`), gated on the smoke and live client tests. NOT CD: no charts dispatch, no chart references it, it is pulled by hand into `bench/deploy/bench-pod.yaml`. Its build stage is deliberately NOT `$BUILDPLATFORM`-pinned — a virtualenv holds native wheels, so each arch installs its own |
 | `python-live.yml` | reusable: server, Python checks, benchmark image | builds the checked-out server, starts PostgreSQL and MinIO, runs both live client suites, rejects skipped or empty reports, and saves logs and JUnit reports. A failed live run blocks server deployment, PyPI publishing, and benchmark image publishing |
 | `publish-pyhoglake.yml` | `pyhoglake-v*` tags; PRs touching the workflow | `pyhoglake-checks.yml`; tags also publish to PyPI (trusted publishing, `pypi` environment) and create a non-latest GitHub release |
@@ -225,15 +225,53 @@ a breaking client change worth a line rather than a silent deletion. Say
 so in the release notes when 1.3.8 is cut.
 
 **Pending note for the 1.4.0 release body**: pyhoglake's
-`arrow_type_to_coltype` now refuses, with `UnsupportedTypeError`, an
-Arrow struct laid out exactly as VARIANT storage — `metadata` (binary,
-not null), `value` (binary), optionally `typed_value`, in that order —
-and so do `schema_to_column_defs`, `Namespace.create_table` and
-`ops.add_column` given one, wherever it stands in the schema. Before,
-it became a plain `struct` column without a word. A variant column is
-declared with `pyhoglake.variant.variant_field`, or with
+`arrow_type_to_coltype` now refuses, with `UnsupportedTypeError`, an Arrow
+struct laid out exactly as VARIANT storage — `metadata` (binary, not
+null), `value` (binary), optionally `typed_value`, in that order — and so
+do `schema_to_column_defs`, `Namespace.create_table` and `ops.add_column`
+given one, wherever it stands in the schema. Before, it became a plain
+`struct` column without a word. A variant column is declared with
+`pyhoglake.variant.variant_field`, or with
 `ops.add_column(name, "variant", shredding=...)`. Say so in the release
-notes when 1.4.0 is cut.
+notes when 1.4.0 is cut. The same release raises pyhoglake's pyarrow floor
+from 21.0 to 23.0 (hedgerow's and bench's with it): 21 cannot open a
+VARIANT file at all, and 21 and 22 cannot read an INT32/INT64 DECIMAL
+column's statistics, so an install that resolved 21 or 22 crashed on a
+DuckDB file with a decimal of precision 18 or less in
+`prepare_append_files`. `pyproject.toml` has the measurements. And
+`prepare_append_files`, on its default path as well as with
+`allow_optional_fields` or `strict_variant`, now reads every file's footer
+before its statistics, and refuses with `ValidationError` files a 1.3.x
+client published or crashed on: column chunks pyarrow aborts the process
+reading (a type that is not the leaf's, a min or max too short for the
+type, SizeStatistics that do not fit the leaf, encryption), and with them
+a chunk with no metadata, a short legacy min or max pyarrow ignores for
+some writers, or a footer over 64 MiB; a footer that repeats a field,
+declares a list with another item type, spells a union (a logical type, a
+time unit, a column order) with two fields or none, or spells a field id
+or an integer wider than Thrift's generated readers hold it; a schema
+element without a `repetition_type` of REQUIRED, OPTIONAL or REPEATED,
+which pyarrow reads as REQUIRED, and a group with a physical type, which
+pyarrow reads as a group: parquet-java (the server's hydrator) and the
+Trino connector cannot read any of these at all; an element whose logical
+and converted types spell different types, which parquet-java reads as the
+converted one where pyarrow reads the logical one (a MICROS timestamp
+beside a converted TIMESTAMP_MILLIS was read a thousand times off), whose
+logical type sets no member parquet.thrift defines (the connector cannot
+read the footer), whose DECIMAL scale or precision field contradicts its
+logical type, or whose annotation parquet-java will not build on its type;
+a required enum field (a chunk's codec, a page encoding stat's page type
+or encoding) of a value parquet.thrift does not define; a chunk whose
+`path_in_schema` is not its leaf's (`extract_column_stats` filed a chunk
+naming a sibling under the sibling); an IEEE_754_TOTAL_ORDER column order
+on anything but a FLOAT, a DOUBLE or a FLOAT16; and, for a variant column,
+a group whose VariantType has no explicit `specification_version` 1, or
+that has a converted type beside it, which the server's hydrator reads as
+another type. It also refuses a footer holding a list, a set or a map in a
+field parquet.thrift does not define, naming where: a valid file, if its
+writer is newer than the client's parquet.thrift (as pyarrow's
+SizeStatistics lists once were), so say that a writer that starts emitting
+such a field needs a pyhoglake that knows it, or a pinned writer.
 
 Because that version is constant between releases, it cannot tell two
 deploys apart. The image build therefore also carries a BUILD STAMP: the
@@ -1321,7 +1359,11 @@ ran on the local stack and what it showed.
     cannot pass), and the VARIANT `type_params.shredding` grammar through
     `pyhoglake/tests/vectors/variant_shredding_vectors.json` (declarations
     with the exact refusal each gets, pinned the same way in
-    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`).
+    `test_variant_ddl.py` and `VariantShreddingVectorFile.EXPECTED_COUNT`),
+    and how parquet-java reads a footer's schema annotations, which
+    prepared files are refused by, through
+    `pyhoglake/tests/vectors/schema_annotation_vectors.json` (pinned in
+    `test_variant_schema.py` and `SchemaAnnotationVectorFile.EXPECTED_COUNT`).
     It mirrors the server's type mapping and validation gates, which
     therefore move with the server: a change to `VariantShredding.kt`'s
     rules or messages updates that file and `pyhoglake/variant.py`

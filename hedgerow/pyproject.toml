@@ -6,10 +6,13 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pyhoglake",
-    # >=21.0, matching pyhoglake: only pyarrow 21+ stamps the parquet
-    # UUID logical annotation hoglake's uuid wire form requires, and
-    # this package reads and filters those columns.
-    "pyarrow>=21.0",
+    # >=23.0, matching pyhoglake (its pyproject says why: 21 cannot open a
+    # VARIANT file, and 21 and 22 cannot read an INT32/INT64 decimal's
+    # statistics).
+    # The older reason still holds: only pyarrow 21+ stamps the parquet
+    # UUID logical annotation hoglake's uuid wire form requires, and this
+    # package reads and filters those columns.
+    "pyarrow>=23.0",
     "duckdb==1.5.5",
     "pyyaml>=6.0",
 ]

@@ -53,12 +53,19 @@ jobs:
               # shredding fuzz corpus (its JDK check also reads
               # build.gradle.kts and the Dockerfile, which change with
               # every dependency bump and are left out: only a JDK
-              # downgrade could red that check).
+              # downgrade could red that check), and the VARIANT files
+              # test_variant_schema.test_the_server_reads_the_same_variant_files
+              # holds byte-identical to pyhoglake's fixtures. The same
+              # goes for dependabot.yml, whose uv cooldown
+              # test_pyarrow_floor.test_the_latest_pyarrow_canary_keeps_the_dependency_cooldown
+              # holds the canary's to.
               - "server/src/main/kotlin/com/posthog/hoglake/model/Model.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/VariantShredding.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/ColumnTrees.kt"
               - "server/src/main/kotlin/com/posthog/hoglake/service/Identifiers.kt"
               - "server/src/test/resources/com/posthog/hoglake/fuzz/VariantShreddingFuzzTestInputs/**"
+              - "server/src/test/resources/variant/**"
+              - ".github/dependabot.yml"
               - ".github/workflows/ci-python.yml"
               - ".github/workflows/pyhoglake-checks.yml"
               - ".github/workflows/python-live.yml"

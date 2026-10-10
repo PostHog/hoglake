@@ -570,7 +570,7 @@ dev = [
 requires-dist = [
     { name = "boto3", marker = "extra == 'fast-upload'", specifier = ">=1.36.0" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "pyarrow", specifier = ">=21.0" },
+    { name = "pyarrow", specifier = ">=23.0" },
     { name = "thrift", specifier = ">=0.22.0,<1" },
 ]
 provides-extras = ["fast-upload"]

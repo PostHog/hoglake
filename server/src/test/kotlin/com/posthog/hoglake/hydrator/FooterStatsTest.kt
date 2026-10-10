@@ -17,6 +17,7 @@ import org.apache.parquet.schema.PrimitiveType
 import org.apache.parquet.schema.Type
 import org.apache.parquet.schema.Types
 import org.assertj.core.api.Assertions.assertThat
+import org.assertj.core.api.Assertions.assertThatThrownBy
 import org.junit.jupiter.api.Test
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -1418,16 +1419,8 @@ class FooterStatsTest {
         ).describedAs("list column").isEmpty()
     }
 
-    @Test
-    fun `an invalid variant is reported, with the fault named`(
-        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
-    ) {
-        // The merge turned #77's throw into a degrade, which is right —
-        // `aggregate` is total — but a degrade nobody can see is a
-        // silent drop. #77's test asserted the THROW's message; the
-        // rewrite asserted only `.isEmpty()`, which the generic
-        // shape-mismatch arm satisfies, so `variantFault`'s six messages
-        // became unreachable-by-test. Assert the warn.
+    /** The WARN lines [FooterStats] logs while [block] runs, joined. */
+    private fun warnsOf(block: () -> Unit): String {
         val events = java.util.concurrent.CopyOnWriteArrayList<ch.qos.logback.classic.spi.ILoggingEvent>()
         val appender =
             object : ch.qos.logback.core.AppenderBase<ch.qos.logback.classic.spi.ILoggingEvent>() {
@@ -1442,83 +1435,199 @@ class FooterStatsTest {
             org.slf4j.LoggerFactory.getLogger(FooterStats::class.java.name) as ch.qos.logback.classic.Logger
         logger.addAppender(appender)
         try {
-            fun faultOf(
-                label: String,
-                group: Type,
-            ): String {
-                events.clear()
-                val schema = MessageType("m", listOf(group))
-                val path = tmp.resolve("$label.parquet")
-                val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
-                org.apache.parquet.hadoop.example.ExampleParquetWriter
-                    .builder(org.apache.parquet.io.LocalOutputFile(path))
-                    .withType(schema)
-                    .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
-                    .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
-                    .build()
-                    .use { w -> w.write(factory.newGroup()) }
+            block()
+        } finally {
+            logger.detachAppender(appender)
+        }
+        return events.filter { it.level == ch.qos.logback.classic.Level.WARN }
+            .joinToString(" | ") { it.formattedMessage }
+    }
+
+    @Test
+    fun `an invalid variant is reported, with the fault named`(
+        @org.junit.jupiter.api.io.TempDir tmp: java.nio.file.Path,
+    ) {
+        // The merge turned #77's throw into a degrade, which is right —
+        // `aggregate` is total — but a degrade nobody can see is a
+        // silent drop. #77's test asserted the THROW's message; the
+        // rewrite asserted only `.isEmpty()`, which the generic
+        // shape-mismatch arm satisfies, so `variantFault`'s six messages
+        // became unreachable-by-test. Assert the warn.
+        fun faultOf(
+            label: String,
+            group: Type,
+        ): String {
+            val schema = MessageType("m", listOf(group))
+            val path = tmp.resolve("$label.parquet")
+            val factory = org.apache.parquet.example.data.simple.SimpleGroupFactory(schema)
+            org.apache.parquet.hadoop.example.ExampleParquetWriter
+                .builder(org.apache.parquet.io.LocalOutputFile(path))
+                .withType(schema)
+                .withCompressionCodec(org.apache.parquet.hadoop.metadata.CompressionCodecName.UNCOMPRESSED)
+                .withWriteMode(org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE)
+                .build()
+                .use { w -> w.write(factory.newGroup()) }
+            return warnsOf {
                 FooterStats.aggregate(
                     FooterParse.parse(org.apache.parquet.io.LocalInputFile(path)),
                     listOf(CatalogColumn(1, "p", ColType.VARIANT, null)),
                     path.toString(),
                 )
-                return events.filter { it.level == ch.qos.logback.classic.Level.WARN }
-                    .joinToString(" | ") { it.formattedMessage }
             }
-
-            // No variant annotation at all.
-            assertThat(
-                faultOf(
-                    "plain",
-                    Types.optionalGroup().id(1)
-                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
-                ),
-            ).contains("is not a native parquet VARIANT of spec version 1")
-
-            // Annotated, but `metadata` is optional where the spec says required.
-            assertThat(
-                faultOf(
-                    "optional-metadata",
-                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
-                ),
-            ).contains("has no REQUIRED binary 'metadata'")
-
-            // A child the variant spec does not define.
-            assertThat(
-                faultOf(
-                    "stray-child",
-                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
-                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("stray").named("p"),
-                ),
-            ).contains("outside metadata/value/typed_value")
-
-            // Neither payload child.
-            assertThat(
-                faultOf(
-                    "no-payload",
-                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
-                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata").named("p"),
-                ),
-            ).contains("has neither 'value' nor 'typed_value'")
-
-            // And a WELL-FORMED variant logs nothing: the degrade must
-            // not fire on the shape it is meant to accept.
-            assertThat(
-                faultOf(
-                    "good",
-                    Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
-                        .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
-                        .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
-                ),
-            ).describedAs("a valid variant is silent").isEmpty()
-        } finally {
-            logger.detachAppender(appender)
         }
+
+        // No variant annotation at all.
+        assertThat(
+            faultOf(
+                "plain",
+                Types.optionalGroup().id(1)
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+            ),
+        ).contains("is not a native parquet VARIANT of spec version 1")
+
+        // Annotated, but `metadata` is optional where the spec says required.
+        assertThat(
+            faultOf(
+                "optional-metadata",
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+            ),
+        ).contains("has no REQUIRED binary 'metadata'")
+
+        // A child the variant spec does not define.
+        assertThat(
+            faultOf(
+                "stray-child",
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("stray").named("p"),
+            ),
+        ).contains("outside metadata/value/typed_value")
+
+        // Neither payload child.
+        assertThat(
+            faultOf(
+                "no-payload",
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata").named("p"),
+            ),
+        ).contains("has neither 'value' nor 'typed_value'")
+
+        // And a WELL-FORMED variant logs nothing: the degrade must
+        // not fire on the shape it is meant to accept.
+        assertThat(
+            faultOf(
+                "good",
+                Types.optionalGroup().`as`(LogicalTypeAnnotation.variantType(1.toByte())).id(1)
+                    .required(PrimitiveType.PrimitiveTypeName.BINARY).named("metadata")
+                    .optional(PrimitiveType.PrimitiveTypeName.BINARY).named("value").named("p"),
+            ),
+        ).describedAs("a valid variant is silent").isEmpty()
+    }
+
+    @Test
+    fun `an element parquet-java reads as another type, or cannot read, in pyhoglake's shared fixtures`() {
+        // pyhoglake's shared fixtures, each native_variant.parquet with one
+        // element edited, as pyhoglake/tests/data/README.md says (and
+        // test_variant_schema compares the copies byte for byte). pyarrow
+        // shows Variant(1) for every one, and reads an element's logical type
+        // where it has one. pyhoglake refuses each this hydrator reads
+        // otherwise, on its default path too, and accepts the one it reads as
+        // pyarrow does (converted_undefined), so a parquet-java that reads any
+        // of them otherwise reds here, not as a file pyhoglake refuses for
+        // nothing or publishes unread:
+        //  - unversioned and converted_map, read as VARIANT(0) and as a MAP:
+        //    parquet-java takes an unset specification_version as 0 (it reads
+        //    the field without asking whether it is set), and lets a converted
+        //    type beside the logical one win;
+        //  - converted_undefined, read as VARIANT(1): its converted type, 22,
+        //    is one ConvertedType does not define, which parquet-java reads as
+        //    unset;
+        //  - lone_member and logical_beside_converted, read with id an
+        //    INTEGER(64, true), from its converted INT_64: the first's logical
+        //    type sets no member (an INTEGER spelled as a bool, which Thrift
+        //    skips), the second's is a TIMESTAMP, which pyarrow reads;
+        //  - typed_group, no_repetition, typed_subgroup, union_two_fields and
+        //    converted_unbuildable, which parquet-java cannot read at all
+        //    (below).
+        val columns =
+            listOf(
+                CatalogColumn(1, "id", ColType.LONG, null),
+                CatalogColumn(2, "properties", ColType.VARIANT, null),
+            )
+
+        fun inputOf(name: String) =
+            org.apache.parquet.io.LocalInputFile(
+                java.nio.file.Path.of(javaClass.getResource("/variant/$name")!!.toURI()),
+            )
+
+        fun warnsFor(name: String): String =
+            warnsOf {
+                FooterStats.aggregate(FooterParse.parse(inputOf(name)), columns, name)
+            }
+        for (name in listOf("native_variant_unversioned.parquet", "native_variant_converted_map.parquet")) {
+            assertThat(warnsFor(name))
+                .describedAs(name)
+                .contains("is not a native parquet VARIANT of spec version 1")
+        }
+        // The file all ten were made from, VARIANT(1) as DuckDB writes it,
+        // and the converted_type 22 beside it, which findByValue reads as
+        // null: the VARIANT(1) annotation stands, with no warning.
+        assertThat(warnsFor("native_variant.parquet")).isEmpty()
+        val undefined = FooterParse.parse(inputOf("native_variant_converted_undefined.parquet"))
+        assertThat(undefined.fileMetaData.schema.getType("properties").logicalTypeAnnotation)
+            .isEqualTo(LogicalTypeAnnotation.variantType(1.toByte()))
+        assertThat(warnsFor("native_variant_converted_undefined.parquet")).isEmpty()
+        // A union with no member set is no annotation to parquet-java, which
+        // reads id's converted INT_64 alone; the Trino connector's
+        // ParquetMetadata cannot read this footer (its getLogicalTypeAnnotation
+        // switches over the set member, with no case for none), and pyarrow
+        // reads a plain int64. And a logical TIMESTAMP beside the converted
+        // INT_64: parquet-java lets the converted type win, where pyarrow
+        // reads a timestamp.
+        for (name in listOf("native_variant_lone_member.parquet", "native_variant_logical_beside_converted.parquet")) {
+            val read = FooterParse.parse(inputOf(name))
+            assertThat(read.fileMetaData.schema.getType("id").logicalTypeAnnotation)
+                .describedAs(name)
+                .isEqualTo(LogicalTypeAnnotation.intType(64, true))
+        }
+        // The group given a physical type beside its children: an element
+        // with a type is a primitive to parquet-java, whatever children it
+        // states, so it cannot build the schema at all, and the hydrator
+        // never reads the file. pyarrow reads any element with children as
+        // a group, and shows Variant(1) for this one too.
+        assertThatThrownBy { FooterParse.parse(inputOf("native_variant_typed_group.parquet")) }
+            .isInstanceOf(FooterParseException::class.java)
+            .hasMessageContaining("VARIANT(1) can not be applied to a primitive type")
+        // The metadata with no repetition_type: parquet-java calls name() on
+        // it while it builds the schema (as the Trino connector's
+        // ParquetMetadata does), and throws. pyarrow reads it as REQUIRED.
+        assertThatThrownBy { FooterParse.parse(inputOf("native_variant_no_repetition.parquet")) }
+            .isInstanceOf(FooterParseException::class.java)
+            .hasMessageContaining("NullPointerException")
+        // properties.typed_value given a physical type: a primitive, whose
+        // children parquet-java cannot place. pyarrow reads it as a group.
+        assertThatThrownBy { FooterParse.parse(inputOf("native_variant_typed_subgroup.parquet")) }
+            .isInstanceOf(FooterParseException::class.java)
+            .hasMessageContaining("Arrived at primitive node")
+        // The group's LogicalType a STRING spelled as a bool, then VARIANT(1):
+        // libthrift's TUnion reads the first field (a mistyped one, so none)
+        // and takes the next field header for the union's end, and the rest
+        // of the footer is read out of step. pyarrow's C++ reads the union as
+        // a struct, skips the bool, and reads VARIANT(1).
+        assertThatThrownBy { FooterParse.parse(inputOf("native_variant_union_two_fields.parquet")) }
+            .isInstanceOf(java.io.IOException::class.java)
+            .hasMessageContaining("can not read class org.apache.parquet.format.FileMetaData")
+        // properties.typed_value.a.typed_value, an INT32, with a logical
+        // INT(32, true) beside a converted UTF8: the converted type wins, and
+        // the schema builder will not put a STRING on an INT32. pyarrow reads
+        // the logical type, an int32.
+        assertThatThrownBy { FooterParse.parse(inputOf("native_variant_converted_unbuildable.parquet")) }
+            .isInstanceOf(FooterParseException::class.java)
+            .hasMessageContaining("STRING can only annotate BINARY")
     }
 
     @Test

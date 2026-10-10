@@ -11,7 +11,6 @@ import contextlib
 import importlib.metadata
 import io
 import logging
-import struct
 import time
 import uuid as _uuid
 from collections.abc import Iterator, Mapping, Sequence
@@ -58,7 +57,12 @@ from .models import (
     ViewInfo,
 )
 from .ops import AlterOp
-from .parquet_schema import prepared_schema_matches, validate_variant_file
+from .parquet_schema import (
+    _footer_size,
+    prepared_schema_matches,
+    validate_column_chunks,
+    validate_variant_file,
+)
 from .stats import extract_column_stats
 from .transforms import partition_source_array, transform_strings
 from .types import columns_to_arrow_schema, is_list_family, schema_to_column_defs
@@ -1525,6 +1529,7 @@ class Table:
         expected_table_info: TableInfo | None = None,
         allow_optional_fields: bool = False,
         concurrency: int | None = None,
+        strict_variant: bool = False,
     ) -> dict[str, Any]:
         """Upload already partitioned/sorted local Parquet without loading it in RAM.
 
@@ -1535,6 +1540,55 @@ class Table:
         uploads, but cannot publish rows. Never regenerate files after preparing.
         With allow_optional_fields, external writers may use optional physical
         fields for required catalog columns only when footer counts prove no nulls.
+        Every file's column chunks are checked from its footer before their
+        statistics are read: pyarrow aborts the process on a chunk whose
+        metadata or statistics it cannot read, which a footer it opens can
+        still hold (:func:`~pyhoglake.parquet_schema.validate_column_chunks`).
+        Every file is also refused whose footer parquet-java (the server's
+        hydrator) or the Trino connector cannot read though pyarrow can, or
+        reads as another type than pyarrow does: a schema element without a
+        repetition_type, a group with a physical type, an annotation the two
+        read apart (a converted type that wins over a logical type spelling
+        another there, a logical type of no member, a DECIMAL its own scale
+        or precision field contradicts, an annotation parquet-java does not
+        build on the element's type), a required enum field of a value
+        parquet.thrift does not define, a chunk whose path_in_schema is not
+        its leaf's, an IEEE_754_TOTAL_ORDER column order on anything but a
+        floating-point column, or a footer spelled so that Thrift's generated
+        readers read it differently (such as a repeated field, a union of
+        two fields or none, or a field id or integer wider than they hold
+        it); and one holding a list, a set or a map in a field this
+        pyhoglake's parquet.thrift does not define, as a newer writer's may
+        (upgrade pyhoglake).
+
+        A ``variant`` column must be a native Parquet VARIANT(1) group, as
+        parquet-java (the server's hydrator) reads one: an explicit version
+        1, and no converted type or physical type beside it. It must have
+        the column's field id and a REQUIRED binary ``metadata``, whatever
+        its layout below that. ``strict_variant=True`` (no effect on a table
+        without variant columns) also requires the layout to be one the
+        VARIANT spec allows and the Trino connector reads, and the column's
+        ``type_params.shredding`` when it declares one (fields compared as
+        sets by name and type). It refuses DuckDB's files that shred an
+        object or an array, whose field and element groups are OPTIONAL
+        where the spec says REQUIRED (the connector tolerates that, and
+        reads them), and an unshredded group whose ``value`` is OPTIONAL,
+        which the connector does not read. And for a NOT NULL column of a
+        file DuckDB wrote, it requires each row group's top-level statistics
+        to prove no row is a Variant null, nor has neither ``value`` nor
+        ``typed_value``: DuckDB writes SQL NULL as a present group holding a
+        Variant null, which DuckDB and the connector read back as NULL (and
+        the connector reads a row with neither as one), and which the
+        ``metadata`` null counts cannot see. Statistics count nulls, not
+        rows, so only a row group whose ``value`` has no null (and no
+        ``00``) or is all null beside a ``typed_value`` leaf with none
+        proves it; DuckDB's row groups that shred some values and not others
+        are refused. That also refuses a JSON null in such a column, which
+        those readers show as NULL too. A declaration this client cannot
+        read raises UnsupportedShreddingError ("upgrade pyhoglake") rather
+        than go unchecked. The server never opens a file, so without it a
+        layout the connector cannot read is published, and fails at query
+        time.
 
         Each file is read only when its own upload runs — whole, by the
         uploading thread, when it is at or under
@@ -1589,6 +1643,7 @@ class Table:
             expected_table_info=expected_table_info,
             allow_optional_fields=allow_optional_fields,
             concurrency=concurrency,
+            strict_variant=strict_variant,
         )
 
     def prepare_append_tables(
@@ -1649,6 +1704,7 @@ class Table:
             expected_table_info=expected_table_info,
             allow_optional_fields=False,
             concurrency=concurrency,
+            strict_variant=False,
         )
 
     def _prepare_append(
@@ -1661,6 +1717,7 @@ class Table:
         expected_table_info: TableInfo | None,
         allow_optional_fields: bool,
         concurrency: int | None,
+        strict_variant: bool,
     ) -> dict[str, Any]:
         """The prepared-append path both public entry points are: resolve,
         validate every group, upload them all, build the commit request.
@@ -1749,6 +1806,7 @@ class Table:
                         schema,
                         has_variant=has_variant,
                         allow_optional_fields=allow_optional_fields,
+                        strict_variant=strict_variant,
                     )
                 )
                 arity = len(info.partition_spec.fields) if info.partition_spec else 0
@@ -2157,6 +2215,7 @@ def _describe_prepared_file(
     *,
     has_variant: bool,
     allow_optional_fields: bool,
+    strict_variant: bool,
 ) -> _PreparedPart:
     """Validate and measure one prepared file WITHOUT reading its data:
     the footer for schema and stats, the 8-byte trailer for
@@ -2164,16 +2223,23 @@ def _describe_prepared_file(
 
     The bytes stay on disk until this file's upload runs, which is what
     keeps a wide prepare's memory proportional to the fan-out instead of
-    to the flush.
+    to the flush. ``strict_variant`` reads nothing more: the checks it adds
+    are on the same footer.
     """
     with pq.ParquetFile(path) as parquet:
         if has_variant or allow_optional_fields:
-            validate_variant_file(path, parquet, info.columns)
-        elif not prepared_schema_matches(parquet.schema_arrow, schema):
-            raise ValidationError(
-                "prepared Parquet schema/field IDs differ from destination",
-                status_code=None,
-            )
+            validate_variant_file(path, parquet, info.columns, strict=strict_variant)
+        else:
+            if not prepared_schema_matches(parquet.schema_arrow, schema):
+                raise ValidationError(
+                    "prepared Parquet schema/field IDs differ from destination",
+                    status_code=None,
+                )
+            # validate_variant_file checks the chunks itself. A footer
+            # pyarrow opens can still abort the process when the stats
+            # below read its chunks, so a file it does not see is checked
+            # here.
+            validate_column_chunks(path, parquet)
         metadata = parquet.metadata
     with open(path, "rb") as source:
         source.seek(0, 2)
@@ -2270,21 +2336,6 @@ def _partition_groups(
             mask = field_mask if mask is None else pc.and_(mask, field_mask)
         out.append((values, data.filter(mask)))
     return out
-
-
-def _footer_size(raw: bytes) -> int:
-    """Thrift footer-metadata length for the commit's ``footer_size``.
-
-    Wire convention (bugs.md #7): ``footer_size`` is EXACTLY the 4-byte
-    LE length stored in the parquet trailer — the serialized thrift
-    FileMetaData size, EXCLUDING the trailing 8-byte suffix (4-byte
-    length + ``PAR1`` magic). The server's hydrator tail-reads
-    ``[file_size - footer_size - 8, file_size)`` and compaction stores
-    the same value for its own outputs; shipping ``meta_len + 8`` here
-    (the old behavior) made every client-written file 8 bytes off.
-    """
-    (meta_len,) = struct.unpack("<I", raw[-8:-4])
-    return meta_len
 
 
 def _upload(fs, uri: str, raw: bytes) -> None:
