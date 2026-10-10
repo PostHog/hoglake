@@ -977,7 +977,11 @@ data class CompactionPlan(
  * guard both see a settled row for a live path. If the group aborts —
  * skip, crash, failed upload — the ticket stays undrained and the
  * NORMAL cleanup drain reclaims the object (its liveness check passes:
- * the path was never registered). Because cleanup may legally drain the
+ * the path was never registered). A group whose rewrite produced ZERO
+ * rows (every input fully deleted) commits as a RETIREMENT — inputs and
+ * DVs end-snapshotted, no output registered — and leaves its ticket
+ * undrained the same way, so the drain disposes of the empty object.
+ * Because cleanup may legally drain the
  * ticket while the group is still in flight (it holds no lock at all
  * between upload and commit), the commit transaction first re-claims the
  * ticket — `FOR UPDATE`, and NOT OURS unless it is untouched
@@ -1083,6 +1087,15 @@ class CompactionService(
     /** How one group's execution+commit resolved (the sweep's accounting unit). */
     internal sealed class GroupOutcome {
         data class Committed(val snapshotId: Long, val bytesOut: Long) : GroupOutcome()
+
+        /**
+         * Every input was dead — the rewrite read each one through its
+         * live DV and wrote ZERO rows — so the inputs and their DVs were
+         * end-snapshotted at [snapshotId] and NO output was registered.
+         * The empty object the rewrite uploaded is left to the cleanup
+         * drain (see [commitGroup]).
+         */
+        data class Retired(val snapshotId: Long) : GroupOutcome()
 
         /** An input vanished/died, or cleanup reclaimed the staged output. */
         object SkippedConflict : GroupOutcome()
@@ -2401,7 +2414,8 @@ class CompactionService(
             catalog,
             null,
             detail = { r ->
-                "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
+                "groups_compacted=${r.groupsCompacted} groups_retired=${r.groupsRetired} " +
+                    "files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
                     "invalid_data=${r.invalidData} spill_budget_exceeded=${r.spillBudgetExceeded} " +
@@ -2413,6 +2427,7 @@ class CompactionService(
                     "files_verified=${r.filesVerified} files_unsorted=${r.filesUnsorted} " +
                     "files_unchecked=${r.filesUnchecked} " +
                     "row_groups_appended=${r.rowGroupsAppended} bytes_appended=${r.bytesAppended} " +
+                    "files_unranged=${r.filesUnranged} " +
                     "candidates_fetched=${r.candidatesFetched} " +
                     "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
                     "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs}"
@@ -2425,6 +2440,7 @@ class CompactionService(
             }
             val result = doRunOnce(catalog, cfg)
             Metrics.compactionGroups(catalog, result.groupsCompacted)
+            Metrics.compactionGroupsRetired(catalog, result.groupsRetired)
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
             Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
             Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
@@ -2434,6 +2450,7 @@ class CompactionService(
             Metrics.compactionSkipped(catalog, "merge_budget", result.mergeBudgetExceeded)
             Metrics.compactionSpillBytes(catalog, result.spillBytes)
             Metrics.compactionAppendedBytes(catalog, result.bytesAppended)
+            Metrics.compactionAppendSkipped(catalog, "unknown_range", result.filesUnranged)
             Metrics.compactionMergeRuns(catalog, "trusted", result.runsTrusted)
             Metrics.compactionMergeRuns(catalog, "spilled", result.runsSpilled)
             Metrics.compactionMergeRuns(catalog, "demoted", result.runsDemoted)
@@ -2462,6 +2479,16 @@ class CompactionService(
      */
     private data class GroupTally(
         val groupsCompacted: Long = 0,
+        /**
+         * Groups whose every input was fully deleted: retired at a
+         * snapshot of their own with no output (see [GroupOutcome.Retired]).
+         * An OUTCOME, so in [attempts]; and deliberately NOT in
+         * [groupsCompacted], [filesIn], [bytesIn] or [bytesOut], which
+         * describe rewrites that produced a file — `files_out` is
+         * `groups_compacted`, and counting a retirement there would claim
+         * an output that was never registered.
+         */
+        val groupsRetired: Long = 0,
         val filesIn: Long = 0,
         val bytesIn: Long = 0,
         val bytesOut: Long = 0,
@@ -2505,6 +2532,13 @@ class CompactionService(
          */
         val rowGroupsAppended: Long = 0,
         val bytesAppended: Long = 0,
+        /**
+         * Runs of sorted rewrites whose first-key range was unknown, in
+         * groups where that cost an append: a run that passed every other
+         * condition, disjoint from every known range, merged because of
+         * them. Work, like the append counters, so not in [attempts].
+         */
+        val filesUnranged: Long = 0,
         /**
          * The PLAN measures, which are not group outcomes at all: they
          * describe what the planner READ, not what a rewrite did.
@@ -2554,13 +2588,14 @@ class CompactionService(
         val attempts: Int
             get() =
                 (
-                    groupsCompacted + skippedConflicts + dvSuperseded +
+                    groupsCompacted + groupsRetired + skippedConflicts + dvSuperseded +
                         unconvertibleSchema + invalidData + failedGroups
                 ).toInt()
 
         operator fun plus(other: GroupTally) =
             GroupTally(
                 groupsCompacted + other.groupsCompacted,
+                groupsRetired + other.groupsRetired,
                 filesIn + other.filesIn,
                 bytesIn + other.bytesIn,
                 bytesOut + other.bytesOut,
@@ -2582,6 +2617,7 @@ class CompactionService(
                 filesUnchecked + other.filesUnchecked,
                 rowGroupsAppended + other.rowGroupsAppended,
                 bytesAppended + other.bytesAppended,
+                filesUnranged + other.filesUnranged,
                 candidatesFetched + other.candidatesFetched,
                 bucketsConsidered + other.bucketsConsidered,
                 bucketsAvailable + other.bucketsAvailable,
@@ -2868,6 +2904,8 @@ class CompactionService(
             filesUnchecked = filesUnchecked,
             rowGroupsAppended = rowGroupsAppended,
             bytesAppended = bytesAppended,
+            groupsRetired = groupsRetired,
+            filesUnranged = filesUnranged,
             candidatesFetched = candidatesFetched,
             bucketsConsidered = bucketsConsidered,
             bucketsAvailable = bucketsAvailable,
@@ -3135,6 +3173,7 @@ class CompactionService(
                             filesUnchecked = r.filesUnchecked.toLong(),
                             rowGroupsAppended = r.rowGroupsAppended.toLong(),
                             bytesAppended = r.bytesAppended,
+                            filesUnranged = r.filesUnranged.toLong(),
                         )
                     Metrics.compactionSortCheckBytes(catalog, r.sortCheckBytes)
                 }
@@ -3148,6 +3187,13 @@ class CompactionService(
                             bytesIn = group.totalBytes,
                             bytesOut = outcome.bytesOut,
                         )
+                    }
+                    is GroupOutcome.Retired -> {
+                        // Committed for the claim's purposes: the inputs
+                        // are dead, exactly as after a rewrite, and a
+                        // sibling's older plan still names them.
+                        committed = true
+                        GroupTally(groupsRetired = 1)
                     }
                     GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
                     GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
@@ -3693,6 +3739,13 @@ class CompactionService(
                         "${ctx.namespace}.${ctx.table} into $outputPath ($outputBytes B) " +
                         "at snapshot ${outcome.snapshotId}"
                 }
+            is GroupOutcome.Retired ->
+                log.info {
+                    "retired ${group.files.size} fully-deleted files (${group.totalBytes} B, " +
+                        "${group.totalRecords} registered rows, 0 survivors) of " +
+                        "${ctx.namespace}.${ctx.table} at snapshot ${outcome.snapshotId} with no " +
+                        "output; the empty object at $outputPath stays queued for the cleanup drain"
+                }
             GroupOutcome.SkippedConflict, GroupOutcome.SkippedDvSuperseded ->
                 log.warn {
                     "compaction group for ${ctx.namespace}.${ctx.table} lost a " +
@@ -3760,6 +3813,10 @@ class CompactionService(
      * `split_offsets` and leaves `missing_field_ids` at its DEFAULT
      * false — correct for its own output, which stamps an id on every
      * node it writes.
+     *
+     * [survivors] of zero does not register the output at all: past the
+     * same guards, the group is RETIRED ([retireDeadGroup]) and its
+     * staging ticket is left for the cleanup drain.
      */
     private fun commitGroup(
         ctx: TableContext,
@@ -3984,6 +4041,30 @@ class CompactionService(
                 return@inTransactionUnchecked GroupOutcome.SkippedDvSuperseded
             }
 
+            // A GROUP WITH NO SURVIVORS RETIRES ITS INPUTS AND REGISTERS
+            // NOTHING. Every input's live DV deletes every row it holds, so
+            // the rewrite wrote an EMPTY parquet — and registering that
+            // object used to put a phantom in `hog_data_file`: a live file
+            // of `record_count = 0` whose `row_id_start` (no survivor to
+            // take it from, so the inputs' minimum) is a row-id floor
+            // nothing in it owns, scanned, sampled and re-planned forever
+            // by everything that walks live files.
+            //
+            // The proof the group is dead is `survivors == 0` AFTER the
+            // rewrite read every input through its DV, with the caller's
+            // `rowsWritten == survivingRecords` check behind it — never
+            // the registered counts alone. A planner shortcut on
+            // `survivingRecords == 0` would retire live rows the day a DV
+            // registers a wrong `delete_count`; reading the rows is what
+            // makes the retirement safe. And it is reached only past every
+            // race guard above — ticket, drop, sort spec, input liveness
+            // and the DV identity check — so a DV superseded since the
+            // plan is still `dv_superseded`, never a retirement on a
+            // vector that is no longer live.
+            if (survivors == 0L) {
+                return@inTransactionUnchecked retireDeadGroup(h, ctx, group, ids)
+            }
+
             // Allocate snapshot + file id under the lock (CommitService
             // step 5); compaction is not DDL: schema_version untouched.
             val (snapshotId, dataFileId, schemaVersion) =
@@ -4089,65 +4170,7 @@ class CompactionService(
                 batch.execute()
             }
 
-            // End-snapshot the inputs — NOT delete: they stay readable at
-            // every snapshot below this one, and expiry queues their paths
-            // once end_snapshot sinks under the retention floor (the
-            // superseded-DV lifecycle). Nothing enters hog_file_removal
-            // here. hog_table_stats is untouched (gross append counters;
-            // visible-file aggregates shrink only by the rows the DVs
-            // already masked).
-            //
-            // `table_id = :tableId` on both updates is a guard (#264), and
-            // a CHECKED one. The liveState re-verify above, in this same
-            // transaction under this same lock, already filtered every id
-            // on `table_id` and bailed on any that was missing, so the
-            // predicate matches every row the id set does — today. The
-            // check is for the day it does not (an identity that is no
-            // longer `(catalog_id, data_file_id)` alone, a DV whose
-            // `table_id` disagrees with its file's): an UPDATE that ended
-            // fewer rows than it was given would otherwise commit the
-            // output LIVE beside a still-live input, serving its rows
-            // twice with nothing logged. Failing here rolls the group
-            // back into the one-failed-group path instead.
-            val ended =
-                h.createUpdate(
-                    """
-                    UPDATE hog_data_file SET end_snapshot = :snapshotId
-                    WHERE catalog_id = :catalogId AND table_id = :tableId AND data_file_id IN (<ids>)
-                    """,
-                )
-                    .bind("snapshotId", snapshotId)
-                    .bind("catalogId", ctx.catalogId)
-                    .bind("tableId", ctx.tableId)
-                    .bindList("ids", ids)
-                    .execute()
-            check(ended == ids.size) {
-                "end-snapshotted $ended of ${ids.size} inputs of ${ctx.namespace}.${ctx.table}; " +
-                    "refusing to commit the group"
-            }
-
-            // The applied DVs die with their files: end-snapshot them so
-            // scans at older snapshots still mask, and expiry queues the
-            // puffin paths alongside the input parquets.
-            val dvIds = group.files.mapNotNull { it.dv?.deleteFileId }
-            if (dvIds.isNotEmpty()) {
-                val endedDvs =
-                    h.createUpdate(
-                        """
-                        UPDATE hog_delete_file SET end_snapshot = :snapshotId
-                        WHERE catalog_id = :catalogId AND table_id = :tableId AND delete_file_id IN (<ids>)
-                        """,
-                    )
-                        .bind("snapshotId", snapshotId)
-                        .bind("catalogId", ctx.catalogId)
-                        .bind("tableId", ctx.tableId)
-                        .bindList("ids", dvIds)
-                        .execute()
-                check(endedDvs == dvIds.size) {
-                    "end-snapshotted $endedDvs of ${dvIds.size} deletion vectors of " +
-                        "${ctx.namespace}.${ctx.table}; refusing to commit the group"
-                }
-            }
+            endSnapshotInputs(h, ctx, group, ids, snapshotId)
 
             // Settle the staging ticket in the SAME transaction that makes
             // the path live: cleanup's drain and the commit path guard only
@@ -4181,6 +4204,145 @@ class CompactionService(
 
             GroupOutcome.Committed(snapshotId, outputBytes)
         }
+
+    /**
+     * End-snapshot a committing group's inputs and their applied DVs at
+     * [snapshotId] — the tail both a compaction ([commitGroup]) and a
+     * retirement ([retireDeadGroup]) share, inside the caller's
+     * transaction and under its catalog lock.
+     */
+    private fun endSnapshotInputs(
+        h: Handle,
+        ctx: TableContext,
+        group: CompactionGroup,
+        ids: List<Long>,
+        snapshotId: Long,
+    ) {
+        // End-snapshot the inputs — NOT delete: they stay readable at
+        // every snapshot below this one, and expiry queues their paths
+        // once end_snapshot sinks under the retention floor (the
+        // superseded-DV lifecycle). Nothing enters hog_file_removal
+        // here. hog_table_stats is untouched (gross append counters;
+        // visible-file aggregates shrink only by the rows the DVs
+        // already masked).
+        //
+        // `table_id = :tableId` on both updates is a guard (#264), and
+        // a CHECKED one. [commitGroup]'s liveState re-verify, in this same
+        // transaction under this same lock, already filtered every id
+        // on `table_id` and bailed on any that was missing, so the
+        // predicate matches every row the id set does — today. The
+        // check is for the day it does not (an identity that is no
+        // longer `(catalog_id, data_file_id)` alone, a DV whose
+        // `table_id` disagrees with its file's): an UPDATE that ended
+        // fewer rows than it was given would otherwise commit the
+        // output LIVE beside a still-live input, serving its rows
+        // twice with nothing logged (or, for a retirement, leave a
+        // dead input live whose DV was ended, un-masking its rows).
+        // Failing here rolls the group back into the one-failed-group
+        // path instead.
+        val ended =
+            h.createUpdate(
+                """
+                UPDATE hog_data_file SET end_snapshot = :snapshotId
+                WHERE catalog_id = :catalogId AND table_id = :tableId AND data_file_id IN (<ids>)
+                """,
+            )
+                .bind("snapshotId", snapshotId)
+                .bind("catalogId", ctx.catalogId)
+                .bind("tableId", ctx.tableId)
+                .bindList("ids", ids)
+                .execute()
+        check(ended == ids.size) {
+            "end-snapshotted $ended of ${ids.size} inputs of ${ctx.namespace}.${ctx.table}; " +
+                "refusing to commit the group"
+        }
+
+        // The applied DVs die with their files: end-snapshot them so
+        // scans at older snapshots still mask, and expiry queues the
+        // puffin paths alongside the input parquets.
+        val dvIds = group.files.mapNotNull { it.dv?.deleteFileId }
+        if (dvIds.isNotEmpty()) {
+            val endedDvs =
+                h.createUpdate(
+                    """
+                    UPDATE hog_delete_file SET end_snapshot = :snapshotId
+                    WHERE catalog_id = :catalogId AND table_id = :tableId AND delete_file_id IN (<ids>)
+                    """,
+                )
+                    .bind("snapshotId", snapshotId)
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("tableId", ctx.tableId)
+                    .bindList("ids", dvIds)
+                    .execute()
+            check(endedDvs == dvIds.size) {
+                "end-snapshotted $endedDvs of ${dvIds.size} deletion vectors of " +
+                    "${ctx.namespace}.${ctx.table}; refusing to commit the group"
+            }
+        }
+    }
+
+    /**
+     * Retire a group whose rewrite produced ZERO rows: one snapshot, one
+     * `table_compacted` change, every input and its DV end-snapshotted —
+     * and nothing registered in their place. Called from [commitGroup]
+     * inside its transaction, under the catalog commit lock, after every
+     * plan-to-commit guard has passed; see the call site for why the
+     * proof of death is the rewrite's row count and not the catalog's.
+     *
+     * NO FILE ID IS ALLOCATED. The snapshot allocation is the
+     * [commitGroup] UPDATE without its `next_file_id` term: nothing is
+     * registered, and a consumed id would be a hole in the sequence that
+     * names no file. The cost is a second statement shape for the same
+     * row, which is cheap; a uniform one would have spent an id per
+     * retirement for nothing.
+     *
+     * THE STAGING TICKET IS NOT SETTLED, and that is the disposal path,
+     * not an omission. The rewrite already uploaded an empty object to
+     * the group's output path, under an undrained `compaction_staging`
+     * ticket; leaving the ticket exactly as a lost race
+     * ([GroupOutcome.SkippedConflict], [GroupOutcome.SkippedDvSuperseded])
+     * leaves it hands the object to the normal cleanup drain, whose
+     * liveness check passes because no file row names the path. No
+     * direct delete here: an S3 call inside the commit lock would hold
+     * the lock for a round trip, and one that failed after the commit
+     * would leak the object with nothing left to retry it — the ticket is
+     * already the retrying, counted, crash-safe delete. The row lock the
+     * re-claim took is released at commit with the row untouched.
+     */
+    private fun retireDeadGroup(
+        h: Handle,
+        ctx: TableContext,
+        group: CompactionGroup,
+        ids: List<Long>,
+    ): GroupOutcome {
+        val (snapshotId, schemaVersion) =
+            h.createQuery(
+                """
+                UPDATE hog_catalog
+                   SET last_snapshot_id = last_snapshot_id + 1
+                 WHERE catalog_id = :catalogId
+                RETURNING last_snapshot_id, schema_version
+                """,
+            )
+                .bind("catalogId", ctx.catalogId)
+                .map { rs, _ -> rs.getLong(1) to rs.getLong(2) }
+                .one()
+        SnapshotRepo.insert(
+            h,
+            ctx.catalogId,
+            snapshotId,
+            schemaVersion,
+            author = "compaction",
+            message = "retired ${group.files.size} fully-deleted files of ${ctx.namespace}.${ctx.table}",
+        )
+        // The same change kind as a compaction, on purpose: a retirement
+        // changes no visible row either (every row was already masked),
+        // so it must stay invisible to the append-conflict guards and to
+        // the changefeed's exclusion exactly as `table_compacted` is.
+        SnapshotRepo.insertChange(h, ctx.catalogId, snapshotId, ChangeKind.TABLE_COMPACTED, ctx.tableId)
+        endSnapshotInputs(h, ctx, group, ids, snapshotId)
+        return GroupOutcome.Retired(snapshotId)
+    }
 
     // ---- loops -----------------------------------------------------------
 

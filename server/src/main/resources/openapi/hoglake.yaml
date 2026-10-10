@@ -4911,6 +4911,34 @@ components:
             Compressed bytes of the row groups counted in
             row_groups_appended. Against bytes_in, the share of the input
             that was copied rather than rewritten. Optional.
+        groups_retired:
+          type: integer
+          format: int64
+          description: >
+            Groups whose every input was fully deleted by its live
+            deletion vector: the rewrite read each input through its
+            vector and wrote zero rows, so the inputs and their vectors
+            were end-snapshotted at a snapshot of their own and NO output
+            file was registered (the empty object the rewrite uploaded is
+            left to the cleanup drain). Not counted in groups_compacted,
+            files_in, files_out, bytes_in or bytes_out, which describe
+            rewrites that produced a file. Consumes
+            HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN like any attempt.
+            Optional.
+        files_unranged:
+          type: integer
+          format: int64
+          description: >
+            Runs of sorted rewrites whose FIRST sort key's range their
+            footer statistics could not give (none recorded, a
+            float/double key — parquet leaves NaN out of min/max — or a
+            key leaf of another type), counted only in groups where they
+            cost an append (row_groups_appended): some run passed every
+            other append condition and its range was disjoint from every
+            KNOWN range (other runs, spill chunks), so it would have
+            appended without them. Nothing is known to be disjoint from
+            an unranged run, so the group merges instead. Slower, never
+            wrong. Optional.
     RetirementResult:
       type: object
       required: [tables, rows_retired, dvs_retired, paths_queued, batches,

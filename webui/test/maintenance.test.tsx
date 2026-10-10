@@ -304,6 +304,42 @@ describe("maintenance outcome and history", () => {
     expect(screen.queryByText(/appended:/)).not.toBeInTheDocument();
   });
 
+  it("shows retired groups apart from compacted ones, with a hover explanation", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, groups_retired: "2" },
+        }}
+      />,
+    );
+    expect(screen.getByText(/retired: 2 fully-deleted group\(s\), no output/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("without writing a replacement file"),
+    );
+  });
+
+  it("shows files whose unknown sort-key range blocked appends", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, files_unranged: "3" },
+        }}
+      />,
+    );
+    expect(screen.getByText(/not appended: 3 file\(s\) with no usable sort-key range/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("float/double"),
+    );
+  });
+
+  it("hides the retired and unranged counts when they are zero or absent", () => {
+    render(<RunSummary run={compaction} />);
+    expect(screen.queryByText(/retired:/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/not appended:/)).not.toBeInTheDocument();
+  });
+
   it("explains the heap-budget count on hover", () => {
     render(
       <RunSummary
@@ -555,6 +591,12 @@ describe("isQuietRun", () => {
 
   it("keeps a compaction sweep that left a spill directory on disk", () => {
     expect(isQuietRun(withField(quiet.compaction, "spill_cleanup_failures", "1"))).toBe(false);
+  });
+
+  it("keeps a compaction sweep whose only work was retiring a fully-deleted group", () => {
+    // A retirement commits a snapshot and ends files with groups_compacted
+    // and files_in both zero.
+    expect(isQuietRun(withField(quiet.compaction, "groups_retired", "1"))).toBe(false);
   });
 
   it("calls a compaction sweep quiet when the heap budget is its only count", () => {

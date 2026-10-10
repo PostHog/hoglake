@@ -915,6 +915,25 @@ exactly the rows the writer emitted and no input stats row is read at
 all — and the changefeed excludes compacted outputs so
 consumers never see merged rows re-appear as fresh appends.
 
+**A group with no survivors registers no output.** When every input's
+live deletion vector deletes every row it holds, the rewrite still runs
+— reading each input through its vector is the proof the group is
+dead, and the commit's `rowsWritten == survivingRecords` check stands
+behind it; the planner never skips a group on its registered counts,
+because a mis-registered `delete_count` would then retire live rows.
+It writes an empty parquet, and the commit, past every plan-to-commit
+guard above (a DV superseded since the plan is still `dv_superseded`),
+RETIRES the group: one snapshot with a `table_compacted` change
+(message `retired N fully-deleted files of ns.table`), inputs and
+their DVs end-snapshotted, and no `hog_data_file` row, partition
+values, column stats or file id. It used to register the empty file —
+a live `record_count = 0` row whose `row_id_start` no row owned. The
+empty object's `compaction_staging` ticket is left undrained, exactly as
+a lost race leaves it, and the cleanup drain deletes the object. Counted
+as `groups_retired` (`hoglake_compaction_groups_retired_total{catalog}`),
+not in `groups_compacted`, `files_in`, `files_out`, `bytes_in` or
+`bytes_out`; charged to the run's group budget like any attempt.
+
 Grouping is ONE PASS of ordinary **bin packing**, the shape Iceberg's
 `rewrite_data_files` uses. For each partition/spec bucket, sort the
 candidates by size and close a group as soon as its input bytes reach
@@ -945,8 +964,8 @@ forms, so nothing is refused and nothing is logged.
 
 The minimum is a **write-amplification** knob, not a termination
 condition: compaction terminates at any value >= 2, since a group turns
-N >= 2 files into exactly one and the bucket's file count strictly
-decreases. What a low value costs is repeated rewriting — compression
+N >= 2 files into at most one (none, when every row was deleted) and the
+bucket's file count strictly decreases. What a low value costs is repeated rewriting — compression
 puts every output back under the target, so at 2 it converges on the
 target from below one rewrite at a time, roughly 4x the bytes moved.
 That is the ladder by another name.
@@ -1319,8 +1338,9 @@ the spill directories that could not be removed. The ledger carries
 `runs_trusted`, `runs_spilled`, `runs_demoted`, `spill_bytes`,
 `spill_budget_exceeded`, `merge_budget_exceeded`,
 `spill_cleanup_failures`, `files_verified`, `files_unsorted`,
-`files_unchecked` (inputs under the size floor), `row_groups_appended`
-and `bytes_appended` (below).
+`files_unchecked` (inputs under the size floor), `row_groups_appended`,
+`bytes_appended` and `files_unranged` (below), and — not a merge-sort
+counter, but added with them — `groups_retired` (above).
 
 **What a spilled byte costs.** One extra snappy encode, one local read
 and one extra materialize; the object-store input is still read once.
@@ -1364,7 +1384,17 @@ first key at a boundary, a run whose statistics cannot give a range (none
 recorded, or a float/double first key — parquet leaves NaN out of
 min/max), or a key leaf of another type. A run with a DV never appends,
 and its range counts its deleted rows, so it can only look wider than it
-is.
+is. A run of unknown range blocks EVERY append in its group, and that is
+counted: `files_unranged` in the ledger and
+`hoglake_compaction_append_skipped_total{catalog,reason="unknown_range"}`
+count such runs, only in groups where they cost an append: at least one
+run passed every other condition AND its range was strictly disjoint from
+every KNOWN range — every other ranged run and every spill chunk — so it
+would have appended had the unranged runs not been there. A group with
+nothing appendable, or whose candidates overlap something known anyway,
+lost nothing to them and counts nothing.
+A standing rate on a table sorted by a double is that table never
+appending.
 
 Measured (`SortedRewriteCpuMeasurement append-*`, local files, median of
 7, zstd-1): sixteen prior outputs of 50,000 event rows (3.2 MiB row

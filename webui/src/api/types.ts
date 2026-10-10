@@ -927,6 +927,23 @@ export interface CompactionResult {
    */
   row_groups_appended?: Int64;
   bytes_appended?: Int64;
+  /**
+   * Groups whose every input was fully deleted: the inputs and their
+   * deletion vectors were retired with NO output file (the empty object
+   * goes to the cleanup drain). Not in groups_compacted / files_in /
+   * files_out / bytes_in / bytes_out. OPTIONAL for the same reason
+   * claimed_elsewhere is.
+   */
+  groups_retired?: Int64;
+  /**
+   * Sorted-rewrite runs whose first sort key's range their statistics
+   * could not give (none, a float/double key, another key leaf type),
+   * counted only where they cost an append: a run that passed every
+   * other condition, disjoint from every known range (other runs, spill
+   * chunks), merged because of them. OPTIONAL for the same reason
+   * claimed_elsewhere is.
+   */
+  files_unranged?: Int64;
 }
 
 /** HISTORICAL, with VerifyReport: only a `verify` ledger row carries it. */

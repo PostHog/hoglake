@@ -467,6 +467,16 @@ internal object ExternalMergeSort {
      * persisted: the file stays the output schema, and the extraction is
      * one leaf read per key. The reader belongs to the caller; [label]
      * names the file in a refusal.
+     *
+     * A spilled row is never re-checked against deletion-vector state,
+     * and needs no check: DVs are applied ONCE, in the chunk phase, by
+     * the [SurvivorReader] that fed the chunk, so a spill file holds
+     * survivors only — there is no position left in it for a vector to
+     * name. A DV superseded between plan and commit is not this merge's
+     * to catch either: the rewrite applied the PLANNED vectors by
+     * design, and `CompactionService.commitGroup` re-reads each input's
+     * live `delete_file_id` under the catalog lock and refuses the group
+     * (`dv_superseded`) when it moved.
      */
     private class SpillRows(
         private val reader: ParquetFileReader,
@@ -628,6 +638,9 @@ internal object ExternalMergeSort {
         private var unchecked = 0
         private var sortCheckBytes = 0L
 
+        /** Runs whose unknown first-key range blocked every append (see [chooseAppended]). */
+        private var unranged = 0
+
         fun run(): RewriteResult {
             var result: RewriteResult? = null
             try {
@@ -769,6 +782,7 @@ internal object ExternalMergeSort {
                 sortCheckBytes = sortCheckBytes,
                 rowGroupsAppended = appendedGroups,
                 bytesAppended = appendedBytes,
+                filesUnranged = unranged,
             )
         }
 
@@ -789,6 +803,18 @@ internal object ExternalMergeSort {
          * and any run whose range the statistics cannot give (no stats, a
          * float/double first key, a key leaf of another type) makes EVERY
          * candidate merge, since nothing is known to be disjoint from it.
+         *
+         * That last refusal is COUNTED ([unranged], the ledger's
+         * `files_unranged`), and only where it actually cost an append: when
+         * at least one candidate passed [ParquetRewriter.appendRefusal] AND
+         * has a known range strictly disjoint from every other RANGED run
+         * and every spill file's — that is, a candidate that would have
+         * appended had the unranged runs not been there. A debug line alone
+         * left it invisible: a table whose sort key is a double appends
+         * nothing, ever, and nothing said why. Counting in any other group
+         * would report a cost nobody paid — with no candidate, or with every
+         * candidate overlapping something known, nothing could have
+         * appended anyway.
          */
         private fun chooseAppended(kept: List<Confirmed>): Set<Int> {
             val candidates =
@@ -800,9 +826,21 @@ internal object ExternalMergeSort {
             // A run with no rows has no range and constrains nothing; a run
             // with rows whose range is unknown constrains everything.
             val others = kept.filter { it.reader.footer.blocks.any { b -> b.rowCount > 0 } }
+            val ranged = others.filter { it.range != null }
+
+            // Disjoint from everything whose range IS known: the whole test
+            // when every run is ranged, and the "would have appended" test
+            // when one is not.
+            fun disjointFromKnown(i: Int): Boolean {
+                val mine = kept[i].range ?: return false
+                return ranged.all { it === kept[i] || keys.disjoint(mine, it.range!!) } &&
+                    spillRanges.all { keys.disjoint(mine, it) }
+            }
             val unknown = others.firstOrNull { it.range == null }
             if (unknown != null) {
-                // Otherwise invisible: the group just never appends.
+                // Counted as well as logged, but only when an append was
+                // actually lost to it (see the doc above).
+                if (candidates.any { disjointFromKnown(it) }) unranged = others.count { it.range == null }
                 log.debug {
                     "sorted rewrite: no row group appended — ${unknown.input.label} gives no usable range for " +
                         "the first sort key (no footer statistics, a float/double key, or a key leaf of " +
@@ -810,11 +848,7 @@ internal object ExternalMergeSort {
                 }
                 return emptySet()
             }
-            return candidates.filter { i ->
-                val mine = kept[i].range ?: return@filter false
-                others.all { it === kept[i] || keys.disjoint(mine, it.range!!) } &&
-                    spillRanges.all { keys.disjoint(mine, it) }
-            }.toSet()
+            return candidates.filter { disjointFromKnown(it) }.toSet()
         }
 
         /**

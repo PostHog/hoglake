@@ -206,6 +206,11 @@ class MaintenanceLedgerIntegrationTest {
                 "files_unchecked",
                 "row_groups_appended",
                 "bytes_appended",
+                // Not merge-sort counters, but added after the ledger by
+                // the same rule: retired zero-survivor groups, and runs
+                // whose unknown range blocked an append.
+                "groups_retired",
+                "files_unranged",
             )
         for (counter in mergeSortCounters) {
             assertThat(result[counter]?.asLong())

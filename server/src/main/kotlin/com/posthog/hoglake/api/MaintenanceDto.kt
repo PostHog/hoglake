@@ -227,6 +227,16 @@ data class CompactionResultDto(
      */
     val rowGroupsAppended: Long,
     val bytesAppended: Long,
+    /**
+     * Groups retired with no output because every input was fully
+     * deleted. See CompactionResult.groupsRetired.
+     */
+    val groupsRetired: Long,
+    /**
+     * Sorted-rewrite runs with no usable first-key range, in groups where
+     * that cost an append. See CompactionResult.filesUnranged.
+     */
+    val filesUnranged: Long,
 )
 
 fun CompactionResult.toDto() =
@@ -260,6 +270,8 @@ fun CompactionResult.toDto() =
         filesUnchecked = filesUnchecked,
         rowGroupsAppended = rowGroupsAppended,
         bytesAppended = bytesAppended,
+        groupsRetired = groupsRetired,
+        filesUnranged = filesUnranged,
     )
 
 data class RehydrateResultDto(
@@ -367,6 +379,8 @@ private val COMPACTION_COUNTERS_ADDED_LATER =
         "files_unchecked",
         "row_groups_appended",
         "bytes_appended",
+        "groups_retired",
+        "files_unranged",
     )
 
 /**

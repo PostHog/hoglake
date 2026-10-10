@@ -2095,6 +2095,164 @@ class ExternalMergeSortTest {
             .containsExactly(1, 1)
     }
 
+    @Test
+    fun `pre-pass verdicts land on the file that earned them when inputs open in parallel`() {
+        // verifySortedness attributes each verdict with a cursor (`next++`)
+        // and not with the input the callback hands it, which is correct
+        // ONLY because forEachOpenedInput calls back serially and in INPUT
+        // order at any parallelism. This pins that contract directly; the
+        // property test randomizes parallelism and catches a break only
+        // by chance.
+        //
+        // Only the MIDDLE file is unsorted, and the FIRST file's pre-pass
+        // open is slow, so with three slots its successors finish opening
+        // before it: a window that handed readers over in completion order
+        // would give a's slot b's verdict, read b in place as a trusted run
+        // and publish a mis-sorted file.
+        val labels = listOf("a", "b", "c")
+        val paths =
+            listOf(
+                clientKv("order-a", listOf(1, 4, 7)),
+                clientKv("order-b", listOf(8, 2, 5)),
+                clientKv("order-c", listOf(3, 6, 9)),
+            )
+        val sources = paths.map { CountingInputFile(it) }
+        val keySources = paths.map { CountingInputFile(it) }
+        keySources[0].onOpen = { Thread.sleep(200) }
+        // The merge's opens, which say WHICH file took which path: the
+        // admitted runs' footers are opened before the chunk phase opens
+        // anything (see `admitted runs are opened largest first ...`).
+        val sourceOpens = java.util.Collections.synchronizedList(mutableListOf<String>())
+        sources.forEachIndexed { i, f -> f.onOpen = { sourceOpens += labels[i] } }
+        // A real floor every input clears, rather than 0.
+        val floor = paths.minOf { Files.size(it) }
+        val out = fresh("order-out.parquet")
+        val result =
+            rewrite(
+                labels.indices.map { i ->
+                    input(sources[i], labels[i], rowIdStart = i * 100L, survivors = 3).copy(keySource = keySources[i])
+                },
+                out,
+                spill(spillParent()).copy(verifyMinBytes = floor),
+                parallelism = 3,
+            )
+        assertThat(readKv(out).map { it.first }).containsExactly(1, 2, 3, 4, 5, 6, 7, 8, 9)
+        assertThat(result.filesVerified).isEqualTo(2)
+        assertThat(result.filesUnsorted).isEqualTo(1)
+        assertThat(result.filesUnchecked).isZero()
+        assertThat(result.runsTrusted).describedAs("a and c, read in place").isEqualTo(2)
+        assertThat(result.runsSpilled).describedAs("b, and only b").isEqualTo(1)
+        assertThat(result.runsDemoted).isZero()
+        assertThat(sourceOpens).hasSize(3)
+        assertThat(sourceOpens.take(2)).describedAs("the trusted runs' footers").containsExactlyInAnyOrder("a", "c")
+        assertThat(sourceOpens.drop(2)).describedAs("the chunk phase: the spilled file").containsExactly("b")
+        for (f in sources + keySources) assertThat(f.openStreams()).isZero()
+    }
+
+    // ---- appends a run of unknown range blocks (files_unranged) -------------------
+
+    /** A prior compaction output of [keys] at [rowIdStart], sorted by k, as the rewriter writes it. */
+    private fun priorKv(
+        name: String,
+        keys: List<Long>,
+        rowIdStart: Long,
+    ): Path {
+        val out = fresh("$name-prior.parquet")
+        rewriteToLocal(listOf(localInput(clientKv(name, keys), rowIdStart)), kv, byK, out)
+        return out
+    }
+
+    /**
+     * An output-shaped file with NO statistics on k, so its first-key
+     * range is unknown — otherwise appendable (explicit ids, the output
+     * schema, row-id statistics).
+     */
+    private fun unrangedKv(
+        name: String,
+        keys: List<Long>,
+        rowIdStart: Long,
+    ): Path {
+        val schema = ParquetRewriter.outputSchema(kv)
+        val path = fresh("$name.parquet")
+        val factory = SimpleGroupFactory(schema)
+        ExampleParquetWriter.builder(LocalOutputFile(path))
+            .withType(schema)
+            .withStatisticsEnabled("k", false)
+            .build()
+            .use { w ->
+                for ((i, k) in keys.withIndex()) {
+                    w.write(
+                        factory.newGroup().append("k", k).append("v", "v$k")
+                            .append(ParquetRewriter.ROW_ID_COLUMN, rowIdStart + i),
+                    )
+                }
+            }
+        return path
+    }
+
+    private fun appendBlockedGroup(
+        floor: Long,
+        extra: List<ParquetRewriter.Input> = emptyList(),
+    ): Pair<ParquetRewriter.RewriteResult, Path> {
+        // Interleaved keys: a run of unknown range really does overlap.
+        val ranged = priorKv("ranged", (0L until 10L).map { it * 2 }, 0)
+        val unranged = unrangedKv("unranged", (0L until 10L).map { it * 2 + 1 }, 100)
+        val out = fresh("unranged-out.parquet")
+        val result =
+            ParquetRewriter.rewrite(
+                listOf(
+                    localInput(ranged, 0, explicitRowIds = true, trustedSorted = true),
+                    localInput(unranged, 0, explicitRowIds = true, trustedSorted = true),
+                ) + extra,
+                kv,
+                byK,
+                LocalDiscardableOutput(out),
+                spill = spill(spillParent()),
+                appendFloorBytes = floor,
+            )
+        return result to out
+    }
+
+    @Test
+    fun `a run with no usable first-key range blocks every append, and is counted`() {
+        // Both runs pass appendRefusal at a floor of 1 byte; the unranged
+        // one makes both merge. Before files_unranged this was a debug
+        // line and nothing else.
+        val (result, out) = appendBlockedGroup(floor = 1)
+        assertThat(result.rowGroupsAppended).isZero()
+        assertThat(result.bytesAppended).isZero()
+        assertThat(result.filesUnranged).describedAs("the one run whose range is unknown").isEqualTo(1)
+        assertThat(result.runsTrusted).isEqualTo(2)
+        assertThat(readKv(out).map { it.first }).isEqualTo((0L until 20L).toList())
+    }
+
+    @Test
+    fun `an unranged run blocks nothing - and is not counted - when no run could append`() {
+        // The production floor (32 MiB) refuses both kilobyte fixtures in
+        // appendRefusal, so there is no candidate for the unknown range to
+        // block: counting it would report a cost nobody paid.
+        val (result, out) = appendBlockedGroup(floor = ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES)
+        assertThat(result.rowGroupsAppended).isZero()
+        assertThat(result.filesUnranged).isZero()
+        assertThat(readKv(out).map { it.first }).isEqualTo((0L until 20L).toList())
+    }
+
+    @Test
+    fun `an unranged run is not counted when the only candidate overlaps a spill chunk anyway`() {
+        // The ranged candidate passes appendRefusal, but a client file's
+        // spilled chunk [5, 7] sits inside its range [0, 18]: it would have
+        // merged with no unranged run present, so the unranged run cost
+        // nothing and is not counted.
+        val client = clientKv("unranged-spill", listOf(7, 5))
+        val (result, out) =
+            appendBlockedGroup(floor = 1, extra = listOf(input(LocalInputFile(client), "client", 1_000)))
+        assertThat(result.rowGroupsAppended).isZero()
+        assertThat(result.runsSpilled).describedAs("the client file's chunk").isEqualTo(1)
+        assertThat(result.filesUnranged).isZero()
+        assertThat(readKv(out).map { it.first })
+            .isEqualTo(((0L until 20L).toList() + listOf(5L, 7L)).sorted())
+    }
+
     // ---- the counting / fault-injecting input ------------------------------------
 
     /**

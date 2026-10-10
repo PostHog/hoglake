@@ -626,7 +626,12 @@ object ParquetRewriter {
      * [rowGroupsAppended] and [bytesAppended]: input row groups copied
      * into the output byte for byte instead of re-encoded (see
      * [appendRefusal]), on either path; an appended trusted run of a
-     * sorted rewrite is also counted in [runsTrusted].
+     * sorted rewrite is also counted in [runsTrusted]. [filesUnranged]:
+     * on the sorted path, runs whose first-key range the footer could not
+     * give, counted only when they cost an append — a run that passed
+     * every other condition, disjoint from every known range, merged
+     * because of them (see `ExternalMergeSort.SortedRewrite.chooseAppended`); always 0 on
+     * the unsorted path, which needs no range to append.
      */
     data class RewriteResult(
         val rowsWritten: Long,
@@ -643,6 +648,7 @@ object ParquetRewriter {
         val sortCheckBytes: Long = 0,
         val rowGroupsAppended: Int = 0,
         val bytesAppended: Long = 0,
+        val filesUnranged: Int = 0,
     )
 
     /**

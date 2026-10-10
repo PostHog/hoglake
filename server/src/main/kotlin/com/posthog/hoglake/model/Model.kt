@@ -1635,6 +1635,29 @@ data class CompactionResult(
     /** Compressed bytes of [rowGroupsAppended]. */
     @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
     val bytesAppended: Long = 0,
+    /**
+     * Groups whose every input was fully deleted by its live DV: the
+     * rewrite read them all and wrote zero rows, so the inputs and their
+     * DVs were end-snapshotted at a snapshot of their own and NO output
+     * was registered (the empty object it uploaded is left to the cleanup
+     * drain). Not in [groupsCompacted], [filesIn], [filesOut], [bytesIn]
+     * or [bytesOut], which describe rewrites that produced a file;
+     * charged to HOGLAKE_COMPACTION_MAX_GROUPS_PER_RUN like any attempt.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val groupsRetired: Long = 0,
+    /**
+     * Runs of sorted rewrites whose FIRST sort key's range the footer
+     * statistics could not give (none recorded, a float/double key —
+     * parquet leaves NaN out of min/max — or a key leaf of another type),
+     * counted only in groups where they cost an append: some run passed
+     * every other append condition and its range was disjoint from every
+     * KNOWN range (other runs, spill chunks), so it would have appended
+     * without them. Nothing is known to be disjoint from an unranged run,
+     * so the group merges instead. Slower, never wrong.
+     */
+    @get:JsonInclude(JsonInclude.Include.NON_DEFAULT)
+    val filesUnranged: Long = 0,
 )
 
 /**

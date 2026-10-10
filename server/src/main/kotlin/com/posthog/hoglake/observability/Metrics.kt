@@ -440,6 +440,21 @@ object Metrics {
         if (count > 0) increment("hoglake_compaction_groups_total", count.toDouble(), "catalog", catalog)
     }
 
+    /**
+     * hoglake_compaction_groups_retired_total{catalog} — groups whose every
+     * input was fully deleted, retired with NO output: the rewrite read
+     * them and wrote zero rows, the inputs and their DVs were
+     * end-snapshotted, and the empty object went to the cleanup drain.
+     * Not in `hoglake_compaction_groups_total`, which counts groups that
+     * registered a file.
+     */
+    fun compactionGroupsRetired(
+        catalog: String,
+        count: Long,
+    ) {
+        if (count > 0) increment("hoglake_compaction_groups_retired_total", count.toDouble(), "catalog", catalog)
+    }
+
     /** hoglake_compaction_files_rewritten_total{catalog} — input files merged away. */
     fun compactionFilesRewritten(
         catalog: String,
@@ -578,6 +593,28 @@ object Metrics {
         bytes: Long,
     ) {
         if (bytes > 0) increment("hoglake_compaction_appended_bytes_total", bytes.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_compaction_append_skipped_total{catalog, reason} — sorted
+     * rewrite runs that stopped a byte-for-byte append, by reason. The one
+     * reason today is `unknown_range`: a run whose first sort key's range
+     * the footer cannot give (no statistics, a float/double key, a key
+     * leaf of another type), counted only where it cost an append: some
+     * run passed every other append condition with a range disjoint from
+     * every KNOWN range (other runs, spill chunks), and merged because
+     * nothing is known to be disjoint from the unranged one. A standing rate on a table whose sort key is a
+     * double is that table never appending; the ledger's `files_unranged`
+     * is the same count.
+     */
+    fun compactionAppendSkipped(
+        catalog: String,
+        reason: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_append_skipped_total", count.toDouble(), "catalog", catalog, "reason", reason)
+        }
     }
 
     /**

@@ -111,6 +111,8 @@ class CompactionResultSpecParityTest {
                 filesUnchecked = 27,
                 rowGroupsAppended = 28,
                 bytesAppended = 29,
+                groupsRetired = 30,
+                filesUnranged = 31,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -151,6 +153,10 @@ class CompactionResultSpecParityTest {
         // Row groups appended byte for byte (package D1).
         assertThat(dto.rowGroupsAppended).isEqualTo(28)
         assertThat(dto.bytesAppended).isEqualTo(29)
+        // Retired zero-survivor groups, and runs whose unknown first-key
+        // range blocked an append.
+        assertThat(dto.groupsRetired).isEqualTo(30)
+        assertThat(dto.filesUnranged).isEqualTo(31)
     }
 
     @Test
@@ -190,6 +196,11 @@ class CompactionResultSpecParityTest {
                 "files_unchecked",
                 "row_groups_appended",
                 "bytes_appended",
+                // Not merge-sort counters, but added after the ledger by
+                // the same rule: retired zero-survivor groups, and runs
+                // whose unknown range blocked an append.
+                "groups_retired",
+                "files_unranged",
             )
         assertThat(properties(block)).containsAll(added)
         assertThat(requiredOf(block)).doesNotContainAnyElementsOf(added)

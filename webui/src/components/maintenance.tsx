@@ -223,6 +223,9 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         // hide the feature from the only screen that shows a sweep.
         r.claimed_elsewhere,
         r.spill_cleanup_failures,
+        // A retirement commits a snapshot and ends files without a single
+        // groups_compacted or files_in: hiding it would hide the commit.
+        r.groups_retired,
       ].some(positive);
     }
     case "verify": {
@@ -391,6 +394,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {formatCount(r.groups_compacted)} groups, {formatCount(r.files_in)}→
           {formatCount(r.files_out)} files, {formatBytes(r.bytes_in)}→
           {formatBytes(r.bytes_out)}
+          {positive(r.groups_retired) && (
+            <span className="subtle mono" title={RETIRED_TITLE}>
+              retired: {formatCount(r.groups_retired ?? "0")} fully-deleted group(s), no output
+            </span>
+          )}
           {positive(r.failed_groups) && (
             <span className="badge stats-failed">
               {formatCount(r.failed_groups)} failed (logged; retried next run)
@@ -457,6 +465,11 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
             <span className="subtle mono" title={APPENDED_TITLE}>
               appended: {formatCount(r.row_groups_appended ?? "0")} row group(s) (
               {formatBytes(r.bytes_appended ?? "0")})
+            </span>
+          )}
+          {positive(r.files_unranged) && (
+            <span className="subtle mono" title={UNRANGED_TITLE}>
+              not appended: {formatCount(r.files_unranged ?? "0")} file(s) with no usable sort-key range
             </span>
           )}
         </>
@@ -641,6 +654,23 @@ const APPENDED_TITLE =
   "sorted table only when an input's sort-key range does not overlap " +
   "any other input's, so its rows stay one sorted block. Several times " +
   "cheaper than rewriting the same bytes.";
+
+const RETIRED_TITLE =
+  "Groups in which every row of every file had already been deleted. " +
+  "Compaction read each file to confirm it, then retired the files and " +
+  "their deletion files in a snapshot of their own without writing a " +
+  "replacement file. These groups are not counted in the groups and " +
+  "files numbers before this note.";
+
+const UNRANGED_TITLE =
+  "Files that stopped a sorted rewrite from copying an earlier output " +
+  "into the new file as it is. Copying is only safe when an input's " +
+  "sort-key range does not overlap any other input's, and these files " +
+  "have no usable range: no statistics, or a float/double first sort key " +
+  "(NaN is left out of the statistics). Counted only when an earlier " +
+  "output would otherwise have been copied — every other range it was " +
+  "checked against was known and did not overlap. The group was merged " +
+  "instead — slower, never wrong.";
 
 const SORT_CHECK_TITLE =
   "Before sorting, the rewrite reads only the sort columns of each input " +

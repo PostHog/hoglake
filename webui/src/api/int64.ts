@@ -185,6 +185,9 @@ const INT64_FIELDS = new Set([
   // Row groups appended byte for byte (CompactionResult, hoglake#134).
   "row_groups_appended",
   "bytes_appended",
+  // Retirements and append blockers (CompactionResult).
+  "groups_retired",
+  "files_unranged",
   "violations",
 ]);
 
