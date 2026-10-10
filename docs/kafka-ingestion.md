@@ -62,7 +62,7 @@ index scan the staging layout promises (`sched_age/` prefix scan to the
 deadline cutoff, then a point-read per candidate for the exact decision
 input); the SIZE lane has no size-ordered index (`sched_size` is the
 deferred bench question below) and evaluates one `stats/` scan per
-partition per sweep — and that scan is shared with the backpressure
+partition per sweep — and that scan is shared with the published
 gauges, so a sweep costs one stats scan per partition, not an
 O(tenants) pass per reader per poll.
 
@@ -72,8 +72,9 @@ O(tenants) pass per reader per poll.
   (in-memory buffer, offsets withheld until flush — the coupling this
   design exists to break), and its cruft is structural: destination
   duality, DuckDB coupling, VARIANT dual-write. We take three ideas —
-  the sink seam, offset-derived flush identity, backpressure gauges —
-  and no code.
+  the sink seam, offset-derived flush identity, staging gauges as
+  alert inputs (not backpressure — nothing pauses the consumer) — and
+  no code.
 - **Not hedgerow's buffered mode.** The staging discipline (persist the
   complete prepared commit request before publication; separate
   discovery and publication checkpoints) is adopted verbatim, but its
@@ -421,15 +422,17 @@ flush tick — the serial loop sits within 2× of the ~110 ready keys/s
 the design arithmetic wants, so the bound-parallel loop shipped; the
 tick dominates the rig (at a 1 ms interval the same rig reads 189/253
 keys/s), and production WAL latencies (object-store round trips, not an
-in-process tick) are exactly what the parallelism overlaps. Backpressure is two-level, each level a
-hysteresis latch over the staged-bytes/oldest-age gauges driving
-`consumer.pause()/resume()`: per partition, a partition whose oldest
-staged byte ages past the pause age has a stuck flusher and pauses
-ALONE — the pod's other partitions keep flowing (a single stuck
-partition must never stall the pod); pod-wide, the AGGREGATE staged
-bytes crossing the ceiling pauses every assigned partition (the pod's
-flush-debt limit — total staged volume is the catch-up working set the
-pod is owed). On the consume side, one poll's per-partition stage
+in-process tick) are exactly what the parallelism overlaps. There is deliberately NO consumer backpressure. SlateDB on object
+storage is the unbounded buffer; pausing would only move the backlog
+into Kafka, whose retention is the one data-loss cliff millrace has —
+and "flusher stuck" would surface as consumer lag, paging the wrong
+people. The staged gauges (bytes/rows per partition, oldest ELIGIBLE
+staged age — a key is aged only once any flush lane will take it, so
+pathological slow-lane tenants don't page) are alert inputs and only
+ever that. SlateDB's own write stall (L0 at `l0_max_ssts` with no
+compactor draining) is an error condition, not a policy: it stalls the
+staging write itself and surfaces through the `slatedb.db` stall
+series. On the consume side, one poll's per-partition stage
 batches are in flight CONCURRENTLY (each partition's WAL write and
 durability wait overlap; the single offset commit still follows every
 ack), and the librdkafka fetch knobs are config
@@ -444,8 +447,8 @@ startup: resolve catalog, table, incarnation; refuse on mismatch. Junk
 
 Metrics are passive — they never feed control flow — and scraped from
 each pod's ops server: millrace's own counters and gauges (staged
-bytes/rows/age, backpressure latch, flush counters including orphans
-and quarantines) plus a whitelist of SlateDB internals, bridged via
+bytes/rows, oldest-eligible staged age, flush counters including
+orphans and quarantines) plus a whitelist of SlateDB internals, bridged via
 SlateDB's `DefaultMetricsRecorder` polled at scrape time
 (`snapshot()` is in-process atomics — no loop hop) and **aggregated
 across the pod's partition instances** — per-partition series at K
@@ -501,10 +504,11 @@ upstream tutorials (slatedb.io/docs/tutorials/standalone-compactor,
   the binding's JSON settings). Upstream documents exactly this for the
   standalone topology. Ordering rule: a writer's embedded loops are
   disabled only when the external service is live and proven — with no
-  compactor anywhere, L0 grows to `l0_max_ssts` and writes backpressure
-  (which our consumer pause surfaces as Kafka lag: safe, but an
-  incident; the stalled-compaction shape is pinned by a parity test,
-  and the alert is the maintenance service's per-DB L0 debt series).
+  compactor anywhere, L0 grows to `l0_max_ssts` and writes stall — an
+  error condition surfaced by SlateDB's own stall series and the
+  maintenance service's per-DB L0 debt gauges (there is no consumer
+  pause to surface it; §Deployment). The stalled-compaction shape is
+  pinned by a parity test.
 - **External GC is fully supported from Python today.**
   `Admin.run_gc_once(options)` runs against a live writer
   (probe-verified), needs no fencing — multiple collectors may run in

@@ -1162,8 +1162,7 @@ async def test_manager_gauges_serve_the_published_snapshot_while_fresh(memory_st
     fold without a rescan while it is fresh; a live scan is the
     fallback once the snapshot ages out — and a fallback scan is NOT
     itself republished (a reader in fallback needs a fresh answer on
-    every call, or the consumer's own scans would freeze its
-    backpressure gauges)."""
+    every call, or a scrape's own scans would freeze its gauges)."""
     mono = _Mono()
     manager = StageManager(
         "memory:///",
@@ -1226,6 +1225,41 @@ async def test_manager_publishes_aggregate_over_partitions(memory_store):
     assert served.staged_rows == 3
     assert served.staged_teams == 3
     assert served.oldest_first_staged_ts == NOW
+    await manager.close()
+
+
+async def test_manager_publishes_the_sweeps_eligible_oldest(memory_store):
+    """``oldest_eligible_staged_ts`` rides the published snapshot
+    (the flush sweep computes it with the planner's knobs — the stage
+    layer has none); a live fallback scan has no policy input and
+    reports None rather than guess."""
+    mono = _Mono()
+    manager = StageManager(
+        "memory:///",
+        "millrace",
+        settings=fast_flush_settings(),
+        monotonic=mono,
+    )
+    await manager.open_partition("events", 0)
+    manager.publish_gauges(
+        {("events", 0): StageGauges(4, 1, 1, NOW)},
+        oldest_eligible_staged_ts=NOW + 5,
+    )
+    served = await manager.gauges(max_staleness_s=100.0)
+    assert served.oldest_eligible_staged_ts == NOW + 5
+    # Aged out: the live fallback carries no eligibility.
+    mono.now += 101.0
+    assert (
+        await manager.gauges(max_staleness_s=100.0)
+    ).oldest_eligible_staged_ts is None
+    # A publish with nothing eligible clears the series (None, not stale).
+    manager.publish_gauges(
+        {("events", 0): StageGauges(4, 1, 1, NOW)},
+        oldest_eligible_staged_ts=None,
+    )
+    assert (
+        await manager.gauges(max_staleness_s=100.0)
+    ).oldest_eligible_staged_ts is None
     await manager.close()
 
 

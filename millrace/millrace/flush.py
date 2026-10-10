@@ -205,7 +205,15 @@ time, and magnitude-overflow literals (``1e400`` parses to ``inf``
 WITHOUT tripping the parse hook) are refused at coercion — nothing
 non-finite reaches a float column or its stats, and integer values
 outside a column's int64 (per-unit) range are refused the same way
-rather than detonating the batch's Arrow build. Supported column types
+rather than detonating the batch's Arrow build. Two more coercions
+guard what Arrow would otherwise do SILENTLY at the batch build: a
+catalog ``float`` (float32) column refuses magnitudes past the float32
+range (Arrow's narrowing cast stores infinity without raising), and a
+string carrying an unpaired surrogate (legal JSON: ``\\ud800`` parses
+to a lone surrogate) is refused per record because Arrow's UTF-8
+conversion raises a plain ``UnicodeEncodeError`` — outside the build
+isolation's taxonomy, so unhandled it would wedge the whole window.
+Supported column types
 are the scalars (boolean, the int widths, float/double, string,
 binary-as-base64, uuid, decimal, date, time, and the timestamp family
 from epoch ints in the column's own unit or strict ISO-8601 strings);
@@ -679,13 +687,60 @@ def _coerce_float(value: Any) -> float:
     return result
 
 
+#: The largest finite float32, exactly representable as a double
+#: (``struct.unpack(">f", bytes.fromhex("7f7fffff"))[0]``). A catalog
+#: ``float`` column narrows coerced doubles through Arrow's float32
+#: conversion, which produces INF WITHOUT ERROR past this magnitude —
+#: so the double-range check alone would publish infinity under the
+#: non-finite guard's nose.
+_FLOAT32_MAX: Final = 3.4028234663852886e38
+
+
+def _coerce_float32(value: Any) -> float:
+    """A catalog ``float`` (float32) column's coercion: the double
+    checks PLUS float32 range. Arrow narrows the Python double with a
+    native float cast that yields +/-inf for out-of-range magnitudes
+    WITHOUT raising (probe-pinned on pyarrow 21–25), so a finite JSON
+    double like ``1e100`` would publish infinity — defeating the
+    non-finite guard — unless the magnitude is refused here. The check
+    is deliberately the simple honest one: |v| > float32 max ⇒ refuse
+    (the half-ulp band just above max that would round DOWN to a finite
+    float32 is refused too — conservatism there is a rounding the
+    producer cannot have meant); non-finite stays refused via
+    :func:`_coerce_float`."""
+    result = _coerce_float(value)
+    if abs(result) > _FLOAT32_MAX:
+        raise DecodeError(
+            f"value {result!r} overflows a float32 (|v| > {_FLOAT32_MAX}); "
+            "Arrow's narrowing cast would store infinity",
+            reason=REASON_UNCASTABLE_COLUMN,
+        )
+    return result
+
+
 def _coerce_str(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    raise DecodeError(
-        f"expected a JSON string, got {type(value).__name__}",
-        reason=REASON_UNCASTABLE_COLUMN,
-    )
+    if not isinstance(value, str):
+        raise DecodeError(
+            f"expected a JSON string, got {type(value).__name__}",
+            reason=REASON_UNCASTABLE_COLUMN,
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as e:
+        # json.loads('{"event":"\\ud800"}') SUCCEEDS, producing a lone
+        # surrogate Python's str happily holds — but Arrow's UTF-8
+        # string conversion raises UnicodeEncodeError (neither
+        # pa.ArrowException nor OverflowError — outside the batch
+        # build's per-record isolation taxonomy), so one such record
+        # would fail its whole flush window identically forever.
+        # Refuse here instead: per-record quarantine, the batch
+        # survives.
+        raise DecodeError(
+            f"string is not valid UTF-8 ({e}); refusing a surrogate-bearing "
+            "value before the Arrow build",
+            reason=REASON_UNCASTABLE_COLUMN,
+        ) from e
+    return value
 
 
 def _coerce_b64(value: Any) -> bytes:
@@ -921,7 +976,12 @@ def _coercer_for(column: Column) -> Callable[[Any], Any]:
     if t in _INT_BOUNDS:
         lo, hi = _INT_BOUNDS[t]
         return lambda v: _coerce_int(v, t, lo, hi)
-    if t in ("float", "double"):
+    if t == "float":
+        # float32: Arrow's narrowing cast produces inf WITHOUT error on
+        # out-of-range doubles — range-checked per record (the coercion
+        # must stay total or one value wedges the batch build).
+        return _coerce_float32
+    if t == "double":
         return _coerce_float
     if t == "string":
         return _coerce_str
@@ -2995,9 +3055,9 @@ class HoglakeFlusher:
             # residue (stage_batch is idempotent at the row level but its
             # stats merge inflates on redelivery; a flush settles ACTUALS
             # and the leftover counters survive). Left alone the stale
-            # first_staged_ts pins the backpressure age gauge forever, so
-            # the stats entry is repaired away — race-free inside
-            # reconcile_stats' serializable transaction.
+            # first_staged_ts would pin the oldest-staged-age gauge
+            # forever, so the stats entry is repaired away — race-free
+            # inside reconcile_stats' serializable transaction.
             repaired = await stage.reconcile_stats(team_id)
             if repaired:
                 self._stats_repaired += 1
@@ -3398,6 +3458,20 @@ class SweepReport:
     fenced: int = 0
 
 
+def _oldest_eligible_staged_ts(decisions: Sequence[FlushDecision]) -> int | None:
+    """The oldest ``first_staged_ts`` among a partition's flush
+    decisions — the ALERTABLE backlog age basis
+    (``millrace_oldest_eligible_staged_age_seconds``). The decided keys
+    are exactly the eligible set (a planner lane trips ⇔ the key is
+    size-, age- or slow-eligible), so this is the oldest key the flush
+    owes work, never the raw oldest: a tiny key below
+    ``min_flush_bytes`` deliberately waits out its slow lane and must
+    not read as a stuck flush (PR #331 review). None when nothing is
+    eligible (the gauge is absent, not zero).
+    """
+    return min((d.first_staged_ts for d in decisions), default=None)
+
+
 class FlushRunner:
     """The flush loop: one planning pass per tick over the StageManager's
     claimed partitions. Per partition and tick:
@@ -3415,9 +3489,13 @@ class FlushRunner:
        prefix scan through the age-lane cutoff, then a point-read per
        candidate for the exact, current decision input (M6). The full
        scan is ALSO the gauge source: the sweep's fold is published on
-       the StageManager (``publish_gauges``) for the consumer's
-       backpressure read and the metrics scrape, so a sweep costs one
-       ``stats/`` scan per partition, not three.
+       the StageManager (``publish_gauges``) for the metrics scrape, so
+       a sweep costs one ``stats/`` scan per partition, not two. The
+       same pass computes the ALERTABLE backlog gauge: the oldest
+       ELIGIBLE staged key per partition (the decided keys' minimum
+       ``first_staged_ts`` — the planner's own knobs, policy and ratio,
+       so a tiny key waiting out its slow lane never reads as backlog),
+       published alongside as ``oldest_eligible_staged_ts``.
     3. PLAN: ``planner.plan_flush(stats, now, knobs,
        estimated_compression_ratio=...)`` — the ratio is the flusher's
        observed EWMA, the fallback until the first flush lands.
@@ -3568,6 +3646,7 @@ class FlushRunner:
         decisions = committed = replayed = receipt_settled = 0
         reprepared = quarantined = empty = failed = 0
         gauge_map: dict[tuple[str, int], StageGauges] = {}
+        eligible_oldest: dict[tuple[str, int], int] = {}
         work: list[tuple[PartitionStage, FlushDecision]] = []
         for topic, partition in sorted(open_set):
             if (topic, partition) in self._fenced:
@@ -3592,10 +3671,12 @@ class FlushRunner:
                     # Transient reconciliation failure: skipped this tick,
                     # retried the next (the partition is never marked
                     # reconciled). Its gauges must still reach the
-                    # published snapshot — the consumer's backpressure
-                    # reads them — so read them directly (best-effort: a
+                    # published snapshot — the scrape reads them — so
+                    # read them directly, eligibility included (a skipped
+                    # partition's waiting work is exactly what the
+                    # eligible-age alert exists for). Best-effort: a
                     # partition this broken must not wedge the sweep's
-                    # gauge publication either).
+                    # gauge publication either.
                     log.exception(
                         "reconciliation failed for %s[%d]; the partition is "
                         "skipped this tick",
@@ -3604,7 +3685,7 @@ class FlushRunner:
                     )
                     failed += 1
                     try:
-                        gauge_map[(topic, partition)] = await stage.gauges()
+                        skipped_stats = await stage.iter_key_stats()
                     except Exception:
                         log.debug(
                             "the gauge read for %s[%d] failed too",
@@ -3612,6 +3693,18 @@ class FlushRunner:
                             partition,
                             exc_info=True,
                         )
+                    else:
+                        gauge_map[(topic, partition)] = gauges_from_stats(skipped_stats)
+                        eldest = _oldest_eligible_staged_ts(
+                            plan_flush(
+                                skipped_stats,
+                                self._now_us(),
+                                self._knobs,
+                                estimated_compression_ratio=self._flusher.compression_ratio,
+                            )
+                        )
+                        if eldest is not None:
+                            eligible_oldest[(topic, partition)] = eldest
                     continue
                 self._reconciled.add((topic, partition))
                 for report in reconciliation:
@@ -3629,22 +3722,36 @@ class FlushRunner:
                 self._reconciled.discard((topic, partition))
                 continue
             gauge_map[(topic, partition)] = gauges_from_stats(stats)
-            for decision in plan_flush(
+            partition_decisions = plan_flush(
                 stats,
                 self._now_us(),
                 self._knobs,
                 estimated_compression_ratio=self._flusher.compression_ratio,
-            ):
+            )
+            # The alertable backlog gauge: the decided keys ARE the
+            # eligible set (a lane trips ⇔ eligible), so their minimum
+            # first_staged_ts is the oldest eligible staged byte — per
+            # the planner's own knobs/policy/ratio, never the raw
+            # oldest (a tiny key waiting out its slow lane is not
+            # backlog).
+            eldest = _oldest_eligible_staged_ts(partition_decisions)
+            if eldest is not None:
+                eligible_oldest[(topic, partition)] = eldest
+            for decision in partition_decisions:
                 work.append((stage, decision))
                 decisions += 1
         # The sweep's gauges ARE the planner input's fold (M6): one
-        # scan per partition per sweep serves the planner, the
-        # consumer's backpressure and the metrics scrape. A partition
-        # revoked mid-sweep drops out of the published set (its staged
-        # bytes are the new owner's concern now).
+        # scan per partition per sweep serves the planner and the
+        # metrics scrape. A partition revoked mid-sweep drops out of
+        # the published set (its staged bytes are the new owner's
+        # concern now).
         still_open = set(self._stages.partitions())
         self._stages.publish_gauges(
-            {key: g for key, g in gauge_map.items() if key in still_open}
+            {key: g for key, g in gauge_map.items() if key in still_open},
+            oldest_eligible_staged_ts=min(
+                (ts for key, ts in eligible_oldest.items() if key in still_open),
+                default=None,
+            ),
         )
         reports, decision_failures = await self._execute(work)
         failed += decision_failures

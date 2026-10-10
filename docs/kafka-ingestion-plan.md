@@ -249,6 +249,16 @@ and replicas) for GC now and compaction when the binding route lands.
 
 ## Phase 5.6 — review follow-ups (adversarial review 2026-10-09)
 
+> 2026-10-10, PR #331 review: **consumer backpressure was removed
+> entirely** rather than refined — there is no reason to stop consuming
+> except on error; the object store is the unbounded buffer, and pausing
+> moves the backlog toward Kafka's retention cliff. The gauges remain as
+> alert inputs (oldest age = oldest *eligible* key). Phase 3's
+> pause/resume suites are obsolete; the design doc's §Deployment carries
+> the posture. Also from that round: pyarrow floor is >= 25.0 (the
+> sort-keys triple form), float columns check float32 range, unpaired
+> surrogates are per-record poison.
+
 Full findings: `millrace/ADVERSARIAL-REVIEW-2026-10-09.md`. Verdict was
 fix-before-review; work proceeds in batches because the files overlap.
 

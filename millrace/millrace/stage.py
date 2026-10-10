@@ -73,15 +73,23 @@ paths (stats and row scans, gauges) take no lock: scan iterators are
 consistent snapshots as of creation (also pinned by the parity suite).
 
 Gauges — :meth:`PartitionStage.gauges`: derived from the ``stats/``
-prefix, the same snapshot the flush planner reads, so backpressure
+prefix, the same snapshot the flush planner reads, so the published
 numbers can never drift from flush decisions — across restarts and
 owner changes included. At the pod level the sweep's planner scan is
 SHARED with the gauges (``StageManager.publish_gauges`` /
-``StageManager.gauges(max_staleness_s=...)``): the consumer's
-per-poll backpressure read and the ``/metrics`` scrape serve the
-sweep's published snapshot while it is fresh and fall back to a live
-scan when the sweep stops publishing — one ``stats/`` scan per
-partition per sweep, not three independent ones (M6).
+``StageManager.gauges(max_staleness_s=...)``): the ``/metrics`` scrape
+serves the sweep's published snapshot while it is fresh and falls back
+to a live scan when the sweep stops publishing — one ``stats/`` scan
+per partition per sweep, not two independent ones (M6). The gauges are
+ALERT INPUTS, never control flow: nothing here pauses the consumer
+(there is no reason to stop consuming except on error — SlateDB on
+object storage is the unbounded buffer, and pausing would move the
+backlog into Kafka, whose retention is the only data-loss cliff). The
+alertable backlog signal is the oldest ELIGIBLE staged key
+(``ManagerGauges.oldest_eligible_staged_ts``), computed and published
+by the flush sweep with the planner's own knobs and policy — a tiny
+key waiting out its slow lane is not backlog and must not trip the
+alert.
 
 SlateDB metrics: every instance carries a ``DefaultMetricsRecorder``
 (``PartitionStage.metrics_recorder``; one is created unless the caller
@@ -307,10 +315,10 @@ class RecoveryReport:
 
 @dataclass(frozen=True, slots=True)
 class StageGauges:
-    """Backpressure gauges for one partition (docs/kafka-ingestion.md
-    §Deployment: staged-bytes and oldest-staged-age drive consumer
-    pause/resume). ``oldest_first_staged_ts`` is None when nothing is
-    staged."""
+    """Staging gauges for one partition (docs/kafka-ingestion.md
+    §Deployment: staged-bytes and oldest-staged-age are alert inputs,
+    never control flow). ``oldest_first_staged_ts`` is None when
+    nothing is staged."""
 
     staged_bytes: int
     staged_rows: int
@@ -1363,7 +1371,7 @@ class PartitionStage:
     # -- gauges and lifecycle ---------------------------------------------------
 
     async def gauges(self) -> StageGauges:
-        """Backpressure gauges derived from the ``stats/`` prefix — the
+        """Staging gauges derived from the ``stats/`` prefix — the
         same snapshot the planner reads, so gauges cannot drift from
         flush decisions (restart-safe by construction)."""
         return gauges_from_stats(await self.iter_key_stats())
@@ -1398,13 +1406,24 @@ class AssignmentSync:
 
 @dataclass(frozen=True, slots=True)
 class ManagerGauges:
-    """Backpressure gauges aggregated over the manager's open partitions."""
+    """Staging gauges aggregated over the manager's open partitions.
+
+    ``oldest_eligible_staged_ts`` is the alertable backlog signal: the
+    oldest ``first_staged_ts`` among keys the flush policy found
+    ELIGIBLE (size, age or slow lane) at the sweep that published the
+    snapshot — computed by the FlushRunner with the planner's own knobs
+    and ratio, because the stage layer has neither. It is None when
+    nothing was eligible and ALWAYS None on a live fallback scan (a
+    scan has no policy input), so a halted sweep's eligible-age series
+    goes absent rather than silently frozen — the halt itself is the
+    louder signal (/healthz)."""
 
     partitions: int
     staged_bytes: int
     staged_rows: int
     staged_teams: int
     oldest_first_staged_ts: int | None
+    oldest_eligible_staged_ts: int | None
     per_partition: Mapping[tuple[str, int], StageGauges]
 
 
@@ -1531,9 +1550,12 @@ class StageManager:
     @staticmethod
     def _aggregate_gauges(
         per_partition: Mapping[tuple[str, int], StageGauges],
+        *,
+        oldest_eligible_staged_ts: int | None = None,
     ) -> ManagerGauges:
         """The pod-wide fold of per-partition gauges (one code path for
-        live scans and the sweep's published snapshot)."""
+        live scans and the sweep's published snapshot). Eligibility is
+        the flush sweep's computation: a live scan passes None."""
         return ManagerGauges(
             partitions=len(per_partition),
             staged_bytes=sum(g.staged_bytes for g in per_partition.values()),
@@ -1547,18 +1569,32 @@ class StageManager:
                 ),
                 default=None,
             ),
+            oldest_eligible_staged_ts=oldest_eligible_staged_ts,
             per_partition=per_partition,
         )
 
     def publish_gauges(
-        self, per_partition: Mapping[tuple[str, int], StageGauges]
+        self,
+        per_partition: Mapping[tuple[str, int], StageGauges],
+        *,
+        oldest_eligible_staged_ts: int | None = None,
     ) -> None:
         """Publish the flush sweep's gauges — folded from the SAME
         ``stats/`` scans the planner decided from — as the pod's shared
         snapshot (M6: one scan per partition per sweep, shared by the
-        planner, the consumer's backpressure and the metrics scrape).
+        planner and the metrics scrape).
+
+        ``oldest_eligible_staged_ts`` is the sweep's oldest eligible
+        staged key (the alertable backlog signal behind main.py's
+        ``millrace_oldest_eligible_staged_age_seconds``); the runner
+        computes it with the planner's own knobs and ratio.
         """
-        self._published = (self._monotonic(), self._aggregate_gauges(per_partition))
+        self._published = (
+            self._monotonic(),
+            self._aggregate_gauges(
+                per_partition, oldest_eligible_staged_ts=oldest_eligible_staged_ts
+            ),
+        )
 
     async def gauges(self, *, max_staleness_s: float | None = None) -> ManagerGauges:
         """Aggregate the open partitions' gauges.
@@ -1568,10 +1604,13 @@ class StageManager:
         scans live. The fallback is the safety property: a flush loop
         that stops publishing degrades the readers to their own scans,
         never to frozen numbers. A LIVE scan is deliberately NOT
-        published: a reader falling back (e.g. the consumer with a
-        halted flusher) needs a fresh answer on every call, and
+        published: a reader falling back (e.g. the metrics scrape with
+        a halted flusher) needs a fresh answer on every call, and
         re-serving its own scan would freeze exactly the gauges that
-        reader exists to keep honest.
+        reader exists to keep honest. A live scan carries no
+        ``oldest_eligible_staged_ts`` — eligibility is the sweep's
+        computation (the planner knobs and the ratio live on the
+        runner), so a fallback read reports None rather than guess.
         """
         published = self._published
         if (

@@ -1,7 +1,8 @@
 """Operational HTTP surface: /metrics, /healthz, /readyz.
 
 /metrics is the Prometheus exposition — the staged-bytes and
-oldest-staged-age gauges are the backpressure signals, and metrics never
+oldest-eligible-staged-age gauges are the alerting inputs (they drive
+alerts, never the consumer), and metrics never
 feed control flow. /healthz and /readyz are the probe paths an operator
 reaches for exactly when the pipeline is busiest:
 

@@ -62,44 +62,32 @@ its next write's durability wait (``Error.Closed(FENCED)``, pinned by
 tests/test_slatedb_parity.py). Under static assignment no rebalance
 event announces the loss (an EKS one-at-a-time StatefulSet rollout
 double-assigns the ordinal, and the new pod opens the same paths). The
-loop therefore catches FENCED at the staging write (and at the
-backpressure gauge scan, where an idle partition's fence would surface),
-closes the stage locally so this process can never touch the path
-again, and raises :class:`ConsumerFencedError` — a halt DISTINCT from a
-config error or a flush halt, so the supervisor can tell "another owner
-holds this path" apart from a crash and never blindly restart this pod
-back onto the same assignment (a restarted fenced pod re-opens the path
-and fences the NEW owner: the flap this distinction exists to prevent).
-See the README's rollout-barrier paragraph.
+loop therefore catches FENCED at the staging write, closes the stage
+locally so this process can never touch the path again, and raises
+:class:`ConsumerFencedError` — a halt DISTINCT from a config error or a
+flush halt, so the supervisor can tell "another owner holds this path"
+apart from a crash and never blindly restart this pod back onto the
+same assignment (a restarted fenced pod re-opens the path and fences
+the NEW owner: the flap this distinction exists to prevent). An IDLE
+partition's fence has no write to raise from; it surfaces in the flush
+sweep's planning scan instead, which fences the partition out of
+scheduling and fails liveness (flush.py ``_note_fenced``). See the
+README's rollout-barrier paragraph.
 
-Backpressure is a two-level policy over the StageManager's
-stats-derived gauges, each level a PURE latch
-(:func:`backpressure_target`, millpond's ``_liveness_status`` pattern —
-testable without I/O) with hysteresis (pause AT the high water, resume
-STRICTLY BELOW the low water, hold inside the band):
-
-- per partition, the AGE arm: a partition whose oldest staged byte ages
-  past ``MILLRACE_BACKPRESSURE_PAUSE_AGE_S`` has a stuck flusher, and
-  pauses ALONE — the other partitions keep flowing (a single stuck
-  partition must never stall the pod). Byte pressure has no
-  per-partition arm: the byte thresholds are pod-shaped, so one
-  partition's bytes crossing them implies the aggregate already
-  tripped — a per-partition byte arm could never be the first to fire.
-- pod-wide, the BYTE arm: the AGGREGATE staged bytes crossing
-  ``MILLRACE_BACKPRESSURE_PAUSE_BYTES`` is the pod's flush-debt ceiling
-  (a different, legitimate limit — total staged volume is the catch-up
-  working set this pod is owed), and pauses every assigned partition.
-
-A partition pauses when either level says so and resumes only when both
-clear; transitions only, computed as a set diff, so each pause/resume
-fires exactly once per crossing, and a partition assigned while the pod
-ceiling is engaged starts paused. The gauge read goes through the
-sweep's shared snapshot when it is fresh
-(``StageManager.gauges(max_staleness_s=2 × flush_sweep_s)`` — M6's
-one-scan-per-sweep sharing, whose published fold carries the
-per-partition gauges this policy reads) and falls back to a live scan
-when the flush loop stops publishing, so backpressure never reads frozen
-numbers while staging continues.
+There is deliberately NO consumer backpressure: the loop stops
+consuming only on error. SlateDB on object storage is the durable
+buffer before hoglake and is effectively unbounded — nothing bounded
+grows with staged bytes (memtable and block cache are bounded by
+SlateDB's own settings; staged data lives on the object store) — so
+pausing would only move the backlog from SlateDB (ours, unbounded) into
+Kafka (bounded by topic retention, not ours), and Kafka retention
+expiring unread offsets is the one way this pipeline can lose data. The
+staging gauges (staged bytes/rows per partition, oldest ELIGIBLE staged
+age) are published for alerts, never for control flow — an alert on
+them is the entire feature (docs/kafka-ingestion.md §Deployment).
+SlateDB's own L0 write stall (``l0_max_ssts`` with the compactor
+behind) is an error condition that stalls the write on its own and
+surfaces through SlateDB's metrics; no latch would add anything there.
 
 Poison pills are quarantined, counted and logged, never silently
 dropped: they land in the same durable write batch as the cycle's staged
@@ -148,14 +136,13 @@ from confluent_kafka import (
 from slatedb.uniffi import CloseReason
 from slatedb.uniffi import Error as SlateError
 
-from .config import AssignmentMode, BackpressureConfig, Config, TeamKeyCodec
+from .config import AssignmentMode, Config, TeamKeyCodec
 from .stage import PoisonedRecord, StagedRecord, StageManager
 
 log = logging.getLogger(__name__)
 
 _T = TypeVar("_T")
 
-_MICROS_PER_SECOND: Final = 1_000_000
 _MICROS_PER_MILLI: Final = 1_000
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
@@ -213,12 +200,9 @@ class ConsumerFencedError(Exception):
     the flap: a restarted fenced pod re-opens the same path and fences
     the NEW owner, and two pods then fence each other until the rollout
     replaces one (offsets never advance during the flap). ``partitions``
-    names the fenced set; when the fence surfaced at the aggregate
-    gauge read (an idle partition's fence has no write to raise from)
-    the exact partition is unknowable there and the whole held set is
-    named. The offsets of the failed batch are never committed — the
-    rows either landed (and the replay re-puts them idempotently) or
-    did not (and the replay restages them).
+    names the fenced set. The offsets of the failed batch are never
+    committed — the rows either landed (and the replay re-puts them
+    idempotently) or did not (and the replay restages them).
     """
 
     def __init__(self, partitions: Sequence[tuple[str, int]]) -> None:
@@ -277,8 +261,6 @@ class KafkaConsumerLike(Protocol):
         on_lost: Any = None,
     ) -> None: ...
     def assignment(self) -> list[Any]: ...
-    def pause(self, partitions: list[Any]) -> None: ...
-    def resume(self, partitions: list[Any]) -> None: ...
     def close(self) -> None: ...
 
 
@@ -434,37 +416,6 @@ def classify_message(
     )
 
 
-def backpressure_target(
-    *,
-    staged_bytes: int,
-    oldest_first_staged_ts: int | None,
-    now_us: int,
-    currently_paused: bool,
-    knobs: BackpressureConfig,
-) -> bool:
-    """The pause decision as a pure function of a gauge snapshot, an
-    injected clock and the current state (millpond's ``_liveness_status``
-    pattern — testable without I/O).
-
-    Latch with hysteresis: TRIP (→ paused) when total staged bytes reach
-    the high water or the oldest staged byte is at least the pause age;
-    CLEAR (→ resumed) only when bytes are strictly below the low water
-    AND the oldest age is strictly below the resume age (or nothing is
-    staged); HOLD inside the band. Strictly-positive bands are a config
-    invariant (BackpressureConfig), so a fixed snapshot has a stable
-    answer and a monotone gauge sweep transitions at most once per
-    direction — no flapping, by construction.
-    """
-    age_us = None if oldest_first_staged_ts is None else now_us - oldest_first_staged_ts
-    trip = staged_bytes >= knobs.pause_staged_bytes or (
-        age_us is not None and age_us >= knobs.pause_oldest_age_s * _MICROS_PER_SECOND
-    )
-    clear = staged_bytes < knobs.resume_staged_bytes and (
-        age_us is None or age_us < knobs.resume_oldest_age_s * _MICROS_PER_SECOND
-    )
-    return trip or (currently_paused and not clear)
-
-
 @dataclass(frozen=True, slots=True)
 class ConsumerStats:
     """Cumulative counters for the run so far (the operational surface's
@@ -530,9 +481,9 @@ class MillraceConsumer:
     stages open/recover and close with the assignment
     (:meth:`StageManager.sync_assignment`).
 
-    ``now_us`` is the injected clock for staging timestamps and the age
-    gauge; ``sleep`` backs the commit retry ladder (both injectable so
-    tests never sleep).
+    ``now_us`` is the injected clock for staging timestamps; ``sleep``
+    backs the commit retry ladder (both injectable so tests never
+    sleep).
     """
 
     def __init__(
@@ -559,13 +510,6 @@ class MillraceConsumer:
         self._started = False
         self._stopping = False
         self._closed = False
-        # Two-level backpressure state (module docstring): the pod-wide
-        # byte-ceiling latch, the per-partition age latches, and the
-        # pause set actually applied to librdkafka (the union, pruned to
-        # the current assignment).
-        self._pod_paused = False
-        self._age_paused: set[tuple[str, int]] = set()
-        self._applied_pause: set[tuple[str, int]] = set()
         # Running observation of record sizes (key + value bytes over
         # classified records) feeding the per-poll byte cap — see _step.
         self._observed_records = 0
@@ -679,17 +623,6 @@ class MillraceConsumer:
 
     # -- introspection ---------------------------------------------------------
 
-    @property
-    def paused(self) -> bool:
-        """Whether the loop currently holds any assigned partition
-        paused (a per-partition age latch or the pod-wide byte ceiling —
-        the two-level policy in the module docstring)."""
-        return bool(self._applied_pause)
-
-    def paused_partitions(self) -> frozenset[tuple[str, int]]:
-        """The (topic, partition) set currently held paused."""
-        return frozenset(self._applied_pause)
-
     def committed_offsets(self) -> Mapping[tuple[str, int], int]:
         """The last successfully committed offset per partition this run."""
         return dict(self._committed)
@@ -787,10 +720,10 @@ class MillraceConsumer:
 
     async def _step(self) -> None:
         """One loop iteration: poll → apply assignment changes → stage →
-        commit → backpressure. Assignment changes land BEFORE the poll's
-        messages are staged, so a partition revoked mid-poll is closed
-        first and its just-fetched messages are dropped locally (the new
-        owner replays them from the last commit — zero loss).
+        commit. Assignment changes land BEFORE the poll's messages are
+        staged, so a partition revoked mid-poll is closed first and its
+        just-fetched messages are dropped locally (the new owner replays
+        them from the last commit — zero loss).
 
         The poll's message count is the record cap clamped by the byte
         cap: ``batch_max_bytes ÷ observed average record size`` (the
@@ -818,7 +751,6 @@ class MillraceConsumer:
         if msgs:
             self._messages_consumed += len(msgs)
             await self._stage_and_commit(msgs)
-        await self._apply_backpressure()
 
     async def _apply_assignment_events(self) -> None:
         """Reconcile the open stages with the consumer assignment after
@@ -856,24 +788,6 @@ class MillraceConsumer:
                 "store for the new owner",
                 topic,
                 partition,
-            )
-        if sync.closed:
-            # The revoke itself unpauses broker-side; drop the latches
-            # and the applied state so a later reclaim starts clean.
-            self._age_paused.difference_update(sync.closed)
-            self._applied_pause.difference_update(sync.closed)
-        if self._pod_paused and sync.opened:
-            # A partition assigned while the pod byte ceiling is engaged
-            # inherits the pause — it must not start fetching. (The age
-            # latches are per partition and start clear: the first gauge
-            # read, later in this same step, latches a reclaimed
-            # partition whose staged state is stale.)
-            newly = sorted(sync.opened)
-            self._kafka.pause([TopicPartition(t, p) for t, p in newly])
-            self._applied_pause.update(newly)
-            log.info(
-                "backpressure: %d newly assigned partition(s) start paused",
-                len(newly),
             )
 
     async def _stage_and_commit(self, msgs: Sequence[MessageView]) -> None:
@@ -1084,112 +998,3 @@ class MillraceConsumer:
                     exc_info=True,
                 )
                 await self._sleep(delay)
-
-    async def _apply_backpressure(self) -> None:
-        """Evaluate the gauges and apply the two-level pause policy
-        (module docstring): the per-partition AGE latches (a stuck flush
-        stalls one partition, never the pod) and the pod-wide BYTE
-        ceiling (the aggregate flush-debt limit). Transitions only,
-        computed as a set diff, so each pause/resume fires exactly once
-        per crossing.
-
-        The gauges come from the sweep's SHARED snapshot when it is
-        fresh (M6: one ``stats/`` scan per partition per sweep serves
-        planner, consumer and scrape): the flush sweep publishes its
-        fold — per-partition gauges included — every
-        ``MILLRACE_FLUSH_SWEEP_S`` seconds, and this read accepts it
-        while it is younger than two sweeps. An overdue snapshot (a
-        halted or wedged flush loop) falls back to a live scan —
-        backpressure must never read frozen numbers while the consumer
-        keeps staging.
-        """
-        try:
-            gauges = await self._stages.gauges(
-                max_staleness_s=2.0 * self._cfg.flush_sweep_s
-            )
-        except SlateError.Closed as exc:
-            if not _is_fenced(exc):
-                raise
-            # An idle partition's fence has no write to surface at; the
-            # gauge scan is where it shows. The aggregate read cannot
-            # name the partition, so the held set is named whole — the
-            # process is exiting regardless.
-            held = self._stages.partitions()
-            await self._relinquish_fenced(held)
-            raise ConsumerFencedError(held) from exc
-        now_us = self._now_us()
-        knobs = self._cfg.backpressure
-        assigned = set(self._stages.partitions())
-        # Revocation bookkeeping normally keeps this pruned; intersect
-        # again so a stage that vanished any other way (a fenced close)
-        # can never be resumed into fetching.
-        self._applied_pause.intersection_update(assigned)
-
-        # Pod level: BYTES ONLY. The aggregate's oldest-age is
-        # deliberately not consulted — the age arm is the per-partition
-        # latches' job (one partition's stuck flush must not pause the
-        # other 63).
-        pod = backpressure_target(
-            staged_bytes=gauges.staged_bytes,
-            oldest_first_staged_ts=None,
-            now_us=now_us,
-            currently_paused=self._pod_paused,
-            knobs=knobs,
-        )
-        # Per partition: the AGE arm only, over that partition's own
-        # gauges (staged_bytes=0 keeps the byte arm inert — the byte
-        # thresholds are pod-shaped, so a per-partition byte trip would
-        # imply the aggregate already tripped). A partition missing from
-        # the snapshot (assigned after the sweep published) reads as
-        # empty and unlatched; the live fallback covers it next step.
-        age_latched: set[tuple[str, int]] = set()
-        for key in sorted(assigned):
-            per = gauges.per_partition.get(key)
-            if backpressure_target(
-                staged_bytes=0,
-                oldest_first_staged_ts=(
-                    None if per is None else per.oldest_first_staged_ts
-                ),
-                now_us=now_us,
-                currently_paused=key in self._age_paused,
-                knobs=knobs,
-            ):
-                age_latched.add(key)
-
-        newly_latched = age_latched - self._age_paused
-        newly_cleared = self._age_paused - age_latched
-        if pod != self._pod_paused:
-            if pod:
-                log.warning(
-                    "backpressure: pod byte ceiling reached — pausing every "
-                    "assigned partition (staged_bytes=%d >= %d)",
-                    gauges.staged_bytes,
-                    knobs.pause_staged_bytes,
-                )
-            else:
-                log.info(
-                    "backpressure: pod byte ceiling cleared — the per-"
-                    "partition latches decide from here (staged_bytes=%d)",
-                    gauges.staged_bytes,
-                )
-        for topic, partition in newly_latched:
-            log.warning(
-                "backpressure: paused %s[%d] — its oldest staged byte "
-                "reached the pause age (a stuck flush stalls this "
-                "partition alone)",
-                topic,
-                partition,
-            )
-        for topic, partition in newly_cleared:
-            log.info("backpressure: %s[%d] age latch cleared", topic, partition)
-        self._pod_paused = pod
-        self._age_paused = age_latched
-
-        desired = age_latched | (assigned if pod else set())
-        to_pause = sorted(desired - self._applied_pause)
-        to_resume = sorted(self._applied_pause - desired)
-        if to_pause:
-            self._kafka.pause([TopicPartition(t, p) for t, p in to_pause])
-        if to_resume:
-            self._kafka.resume([TopicPartition(t, p) for t, p in to_resume])
-        self._applied_pause = desired

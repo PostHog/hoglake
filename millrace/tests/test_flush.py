@@ -1810,6 +1810,19 @@ class TestPartitionScopedIdentity:
 
 @component
 class TestSortSpec:
+    def test_sort_keys_triple_form_is_supported_by_the_pyarrow_floor(self):
+        """API-conformance pin for the pyarrow>=25.0 floor (pyproject.toml):
+        pc.sort_indices accepts (name, direction, null_placement) triples.
+        On pyarrow 21–24 this raises ValueError("too many values to
+        unpack") — the floor exists because every sorted flush would fail
+        that way (PR #331 review)."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
+
+        table = pa.table({"a": [2, 1], "b": [3, 4]})
+        order = pc.sort_indices(table, sort_keys=[("a", "ascending", "at_start")])
+        assert table.take(order)["a"].to_pylist() == [1, 2]
+
     async def test_inverted_kafka_and_payload_timestamps_flush_key_nondecreasing(
         self,
         httpx_mock: Any,

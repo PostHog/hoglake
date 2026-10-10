@@ -39,7 +39,6 @@ import pyarrow as pa
 from millrace import keyspace
 from millrace.config import (
     AssignmentMode,
-    BackpressureConfig,
     Config,
     EventTimePolicy,
     PoisonConfig,
@@ -359,12 +358,6 @@ def make_config(**overrides: Any) -> Config:
         "slow_lane_deadline_s": 21600,
         "min_flush_bytes": 1024 * 1024,
         "max_files_per_commit": 512,
-        "backpressure": BackpressureConfig(
-            pause_staged_bytes=10**9,
-            resume_staged_bytes=5 * 10**8,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        ),
         "poison": PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,

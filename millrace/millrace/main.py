@@ -85,14 +85,14 @@ def _now_us() -> int:
 
 def _probe_read[T](read: Callable[[], T], fallback: T) -> T:
     """Read loop-thread state from the ops thread, surviving the GIL
-    race: ``fenced_partitions`` / ``paused_partitions`` / the stage map
-    are mutated by the pipeline loop while the probe iterates them,
-    which CPython answers with a bare ``RuntimeError`` (set/dict changed
-    size). The window is bytecodes wide, so a couple of retries always
-    land; the fallback (a DEGRADED read — the metric family or the
-    fence detail is absent for one scrape) exists so a pathological
-    churn storm degrades the probe rather than 500ing it. Probes stay
-    honest either way: a missed observation is not a false state."""
+    race: ``fenced_partitions`` / the stage map are mutated by the
+    pipeline loop while the probe iterates them, which CPython answers
+    with a bare ``RuntimeError`` (set/dict changed size). The window is
+    bytecodes wide, so a couple of retries always land; the fallback (a
+    DEGRADED read — the metric family or the fence detail is absent for
+    one scrape) exists so a pathological churn storm degrades the probe
+    rather than 500ing it. Probes stay honest either way: a missed
+    observation is not a false state."""
     for _ in range(3):
         try:
             return read()
@@ -282,15 +282,29 @@ class _PipelineCollector:
     """Prometheus view of the pipeline counters and staging gauges.
 
     Passive observability (docs/kafka-ingestion.md §Deployment): nothing
-    here feeds control flow. Counter values come from the loops' own
-    stats snapshots; the staging gauges come from the StageManager's
-    stats-derived gauges — the SAME snapshot the flush planner and the
-    backpressure latch read, so the exposition can never drift from the
-    decisions (M6: the sweep's published fold is served while fresh —
-    ``gauge_max_staleness_s`` — and a live scan is the fallback). The
-    gauge read hops back to the pipeline's loop
+    here feeds control flow — the consumer NEVER pauses, so the gauges
+    are alert inputs, not latch drivers (SlateDB on object storage is
+    the unbounded buffer; an alert on them is the entire feature).
+    Counter values come from the loops' own stats snapshots; the
+    staging gauges come from the StageManager's stats-derived gauges —
+    the SAME snapshot the flush planner decides from, so the exposition
+    can never drift from the decisions (M6: the sweep's published fold
+    is served while fresh — ``gauge_max_staleness_s`` — and a live scan
+    is the fallback). The gauge read hops back to the pipeline's loop
     (``run_coroutine_threadsafe``); a busy loop degrades the gauges to
     absent rather than blocking the probe.
+
+    The alertable backlog signal is
+    ``millrace_oldest_eligible_staged_age_seconds``: the age of the
+    oldest staged key the flush policy found ELIGIBLE at the last sweep
+    (size, age or slow lane — computed by the FlushRunner with the
+    planner's own knobs and ratio, so a tiny key waiting out its slow
+    lane does not read as backlog). Absent when nothing is eligible —
+    and absent on a live fallback scan, which has no policy input: a
+    halted sweep drops the series rather than freeze it, and the halt
+    is the louder signal (/healthz). The raw per-partition oldest stays
+    on ``millrace_partition_oldest_staged_age_seconds`` for forensics;
+    it is NOT the alertable one.
 
     The SlateDB families (``millrace.slatedb_metrics``) come from the
     per-instance recorders' atomic snapshots — read directly, no loop
@@ -397,22 +411,6 @@ class _PipelineCollector:
                 "Quarantined (poison) entries deleted by the retention sweeper",
                 value=self._sweeper.purged_total,
             )
-        paused_partitions: frozenset[tuple[str, int]] = _probe_read(
-            self._consumer.paused_partitions, frozenset()
-        )
-        yield GaugeMetricFamily(
-            "millrace_backpressure_paused",
-            "Whether the consumer currently holds ANY partition paused "
-            "(a per-partition age latch or the pod-wide byte ceiling — "
-            "the two-level backpressure policy)",
-            value=1.0 if paused_partitions else 0.0,
-        )
-        yield GaugeMetricFamily(
-            "millrace_backpressure_paused_partitions",
-            "How many assigned partitions the consumer currently holds "
-            "paused (the two-level backpressure policy's applied set)",
-            value=float(len(paused_partitions)),
-        )
         if self._runner is not None:
             runner = self._runner  # narrowing survives the lambda below
             fenced = GaugeMetricFamily(
@@ -478,13 +476,20 @@ class _PipelineCollector:
                 per_partition_age.add_metric([topic, str(partition)], age_s)
         yield per_partition_bytes
         yield per_partition_age
-        if gauges.oldest_first_staged_ts is not None:
+        if gauges.oldest_eligible_staged_ts is not None:
             age_s = (
-                max(0, _now_us() - gauges.oldest_first_staged_ts) / _MICROS_PER_SECOND
+                max(0, _now_us() - gauges.oldest_eligible_staged_ts)
+                / _MICROS_PER_SECOND
             )
             yield GaugeMetricFamily(
-                "millrace_oldest_staged_age_seconds",
-                "Age of the oldest staged byte",
+                "millrace_oldest_eligible_staged_age_seconds",
+                "Age of the oldest staged key the flush policy found "
+                "ELIGIBLE (size/age/slow lane) at the last sweep — the "
+                "alertable backlog signal. Absent when nothing is "
+                "eligible; absent on a live fallback scan (a halted "
+                "sweep drops the series rather than freeze it — the "
+                "halt is the louder signal). The raw oldest stays on "
+                "millrace_partition_oldest_staged_age_seconds.",
                 value=age_s,
             )
 

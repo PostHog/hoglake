@@ -19,7 +19,7 @@ from kafkakit import FakeConsumer
 from millrace import main
 from millrace.consumer import ConsumerFencedError, MillraceConsumer
 from millrace.flush import FlushHalted
-from millrace.stage import StageManager
+from millrace.stage import StageGauges, StageManager
 
 
 def _valid_env() -> dict[str, str]:
@@ -107,7 +107,10 @@ def test_pipeline_collector_counters_without_a_loop():
         collector = main._PipelineCollector(consumer, flusher, stages, loop)
         samples = _samples(collector)
         assert samples["millrace_messages_consumed_total"] == 0
-        assert samples["millrace_backpressure_paused"] == 0.0
+        # The removed backpressure series stay removed (the consumer
+        # never pauses; gauges + alerts are the mechanism).
+        assert "millrace_backpressure_paused" not in samples
+        assert "millrace_backpressure_paused_partitions" not in samples
         # No running loop: the staging gauges degrade to absent.
         assert "millrace_staged_bytes" not in samples
     finally:
@@ -130,10 +133,12 @@ async def test_pipeline_collector_gauges_with_a_loop():
         # it on the loop's own thread would deadlock the gauge arm's
         # run_coroutine_threadsafe into its timeout.
         samples = await asyncio.to_thread(_samples, collector)
-        # Zero open partitions: staged bytes collect as 0, the age gauge
-        # is absent (nothing staged).
+        # Zero open partitions: staged bytes collect as 0; the
+        # eligible-age gauge is absent (a live scan carries no policy
+        # input, and nothing is staged anyway).
         assert samples["millrace_staged_bytes"] == 0
-        assert "millrace_oldest_staged_age_seconds" not in samples
+        assert "millrace_oldest_eligible_staged_age_seconds" not in samples
+        assert "millrace_oldest_staged_age_seconds" not in samples  # renamed away
     finally:
         flusher.close()
 
@@ -258,7 +263,7 @@ def test_probe_read_retries_the_gil_race_then_degrades():
     assert main._probe_read(always_raced, -1) == -1  # degraded, not raised
 
 
-# -- collector additions: per-partition series, fenced set, paused count ----------
+# -- collector additions: per-partition series, fenced set, the eligible-age gauge ------
 
 
 def _collector_with_runner():
@@ -284,7 +289,6 @@ async def test_pipeline_collector_per_partition_and_fenced_series():
 
         await opened.stage.stage_batch([rec(1, 100, 0, payload=b"abcd")], now_us=NOW)
         runner._note_fenced(("events", 1), RuntimeError("Closed(FENCED)"), where="test")
-        consumer._applied_pause.add(("events", 0))
 
         collector = main._PipelineCollector(
             consumer,
@@ -310,12 +314,87 @@ async def test_pipeline_collector_per_partition_and_fenced_series():
             ]
             == 1.0
         )
-        # the two-level backpressure surface: any-paused + the count
-        assert raw[("millrace_backpressure_paused", ())] == 1.0
-        assert raw[("millrace_backpressure_paused_partitions", ())] == 1.0
         assert raw[("millrace_poison_entries_purged_total", ())] == 0
     finally:
         flusher.close()
+
+
+async def test_pipeline_collector_serves_the_sweep_published_eligible_age():
+    """The alertable backlog series: the pod-level oldest-age gauge is
+    the oldest ELIGIBLE staged key, computed by the flush sweep with the
+    planner's own knobs and published with the fold — here the sweep is
+    stood in for by a direct ``publish_gauges`` (the runner-side
+    computation is pinned in test_flush.py). A live scan (no published
+    snapshot) carries no policy input and leaves the series absent;
+    the raw per-partition oldest stays regardless."""
+    from stagekit import NOW
+
+    consumer, stages, flusher = _collector()
+    try:
+        opened = await stages.open_partition("events", 0)
+        from stagekit import rec
+
+        await opened.stage.stage_batch([rec(1, 100, 0, payload=b"abcd")], now_us=NOW)
+        collector = main._PipelineCollector(
+            consumer,
+            flusher,
+            stages,
+            asyncio.get_running_loop(),
+            gauge_max_staleness_s=1000.0,
+        )
+
+        async def raw_samples() -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
+            out: dict[tuple[str, tuple[tuple[str, str], ...]], float] = {}
+            for family in await asyncio.to_thread(lambda: list(collector.collect())):
+                for s in family.samples:
+                    out[(s.name, tuple(sorted(s.labels.items())))] = s.value
+            return out
+
+        # No sweep has published: the live fallback serves the raw
+        # per-partition gauges but NO eligible-age series.
+        raw = await raw_samples()
+        assert ("millrace_oldest_eligible_staged_age_seconds", ()) not in raw
+        assert (
+            "millrace_partition_oldest_staged_age_seconds",
+            (("partition", "0"), ("topic", "events")),
+        ) in raw
+
+        # The sweep publishes its fold with an eligible oldest: the
+        # series appears, and the retired raw pod-level series is gone.
+        stages.publish_gauges(
+            {
+                ("events", 0): StageGauges(
+                    staged_bytes=4,
+                    staged_rows=1,
+                    staged_teams=1,
+                    oldest_first_staged_ts=NOW,
+                )
+            },
+            oldest_eligible_staged_ts=NOW,
+        )
+        raw = await raw_samples()
+        assert ("millrace_oldest_eligible_staged_age_seconds", ()) in raw
+        assert ("millrace_oldest_staged_age_seconds", ()) not in raw
+        assert ("millrace_backpressure_paused", ()) not in raw
+
+        # A publish with nothing eligible drops the series (absent, not
+        # zero — "no backlog" is not "backlog age zero").
+        stages.publish_gauges(
+            {
+                ("events", 0): StageGauges(
+                    staged_bytes=4,
+                    staged_rows=1,
+                    staged_teams=1,
+                    oldest_first_staged_ts=NOW,
+                )
+            },
+            oldest_eligible_staged_ts=None,
+        )
+        raw = await raw_samples()
+        assert ("millrace_oldest_eligible_staged_age_seconds", ()) not in raw
+    finally:
+        flusher.close()
+        await stages.close()
 
 
 # -- the poison sweeper -----------------------------------------------------------

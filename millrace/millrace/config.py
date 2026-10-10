@@ -22,7 +22,7 @@ Knobs
 | ``MILLRACE_KAFKA_AUTO_OFFSET_RESET`` | ``latest`` | where a partition with NO committed offset starts: ``latest`` (fleet policy — the head) or ``earliest`` (the log start). The tension is real and documented below the table |
 | ``MILLRACE_KAFKA_MAX_PARTITION_FETCH_BYTES`` | 33554432 (32 MiB) | librdkafka ``max.partition.fetch.bytes`` — per-partition fetch response cap. The 1 MiB library default capped millpond's hot partition at ~50 MB/s (dozens of serialized fetch round trips per poll); the whale shape is ~55 MB/s, i.e. ~25 MB per hot partition per 500 ms poll, so one response must hold a poll's worth with headroom |
 | ``MILLRACE_KAFKA_FETCH_MAX_BYTES`` | 268435456 (256 MiB) | librdkafka ``fetch.max.bytes`` — the per-fetch aggregate across the pod's partitions. Must be ≥ the per-partition cap (one hot partition's response must fit) and cover a poll's aggregate when several partitions run hot at once |
-| ``MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES`` | 262144 (256 MiB) | librdkafka ``queued.max.messages.kbytes`` — the local fetch queue. Sized at ~5 s of a 50 MB/s pod inflow so a staging-latency spike doesn't stall fetches; past it librdkafka throttles fetches, the intended first backpressure before the staged-bytes latches |
+| ``MILLRACE_KAFKA_QUEUED_MAX_MESSAGES_KBYTES`` | 262144 (256 MiB) | librdkafka ``queued.max.messages.kbytes`` — the local fetch queue. Sized at ~5 s of a 50 MB/s pod inflow so a staging-latency spike doesn't stall fetches; past it librdkafka throttles fetches — the only fetch-side throttle there is (nothing pauses the consumer downstream; the staging gauges and alerts carry that job) |
 | ``MILLRACE_TEAM_KEY_CODEC`` | ``utf8-decimal`` | how a record's ``team_id`` is extracted: ``utf8-decimal`` (the key is ``b"12345"``) or ``be64`` (the key is the 8-byte big-endian unsigned) for team-keyed topics, or ``value-json:<field>`` (e.g. ``value-json:team_id``) reading a top-level field of the JSON payload for topics NOT keyed by team — then every partition's instance can hold every team, and a team spread over K partitions flushes up to K files per window (docs/kafka-ingestion.md §Staging layout) |
 | ``MILLRACE_CATALOG`` / ``MILLRACE_NAMESPACE`` / ``MILLRACE_TABLE`` | required | the one destination table's identity |
 | ``MILLRACE_STAGE_URL`` | required | staging root: ``s3://bucket/millrace``, ``file:///path`` or ``memory:///`` (tests). One SlateDB instance per claimed partition lives at ``<base>/<topic>/<partition>`` |
@@ -31,10 +31,6 @@ Knobs
 | ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 (6 h) | slow lane: flush any key this old regardless of size; accepted range 6–24 h |
 | ``MILLRACE_MIN_FLUSH_BYTES`` | 1 MiB | the age lane's minimum size — a smaller key at the age deadline waits for the slow lane |
 | ``MILLRACE_MAX_FILES_PER_COMMIT`` | 512 | commit chunking bound |
-| ``MILLRACE_BACKPRESSURE_PAUSE_BYTES`` | 8 GiB | pause every assigned partition at/above this total staged bytes |
-| ``MILLRACE_BACKPRESSURE_RESUME_BYTES`` | 4 GiB | resume strictly below it (hysteresis band) |
-| ``MILLRACE_BACKPRESSURE_PAUSE_AGE_S`` | 3600 | pause when the oldest staged byte is at least this old (the flusher is not keeping up) |
-| ``MILLRACE_BACKPRESSURE_RESUME_AGE_S`` | 1800 | resume strictly below it |
 | ``MILLRACE_POISON_MAX_RECORDS`` | 1000 | per-run quarantine bound; exceeding it halts the loop loudly instead of committing past a flood |
 | ``MILLRACE_POISON_VALUE_MAX_BYTES`` | 1 MiB | per-record cap on the quarantined value bytes (original length recorded) |
 | ``MILLRACE_POISON_RETENTION_S`` | 604800 (7 d) | how long a quarantined record is kept for forensics before the poison sweeper deletes it (stage.py ``purge_poison_expired``). Entries older than this are deleted in bounded batches; entries WITHOUT a quarantine stamp (v1 envelopes — pre-retention builds, and flush-path quarantines until the flusher passes its clock) are kept forever: unknown age is never deleted. Poison is forensic — nothing depends on its presence, so a pod that is down at expiry simply purges at the next sweep. 7 d matches the server's default receipt retention: the incidents poison matters to are replay/settlement questions, all inside that window |
@@ -44,7 +40,7 @@ Knobs
 | ``MILLRACE_SLATEDB_L0_MAX_SSTS`` | 8 | L0 depth at which a writer's memtable flush stalls until the embedded compactor drains (SlateDB's default; the whale-shape stall margin is a bench topic — tests/test_stage_bench.py) |
 | ``MILLRACE_CONSUME_BATCH_SIZE`` | 65536 | max messages per ``consume()`` call — the RECORD cap, a backstop for degenerate tiny-payload floods; at the design's ~1 KB record shape the byte cap below is the operative bound. Per-partition durability waits overlap within a poll (consumer.py), so a large batch still stages in ~one WAL round trip |
 | ``MILLRACE_CONSUME_BATCH_MAX_BYTES`` | 268435456 (256 MiB) | per-poll byte bound, enforced by clamping the poll's message count to this ÷ the run's observed average record size (key + value bytes, cumulative; floored at 1 message so an oversized record still flows). The first poll after a start has no observation and is bounded by the record cap alone |
-| ``MILLRACE_POLL_TIMEOUT_MS`` | 500 | per-poll block bound; also the stop() latency and the idle backpressure re-evaluation cadence |
+| ``MILLRACE_POLL_TIMEOUT_MS`` | 500 | per-poll block bound; also the stop() latency |
 | ``MILLRACE_EVENT_TIME_POLICY`` | ``quarantine`` | flush-time junk ``event_time`` handling (``clamp`` or ``quarantine``; consumed by the flush phase) |
 | ``MILLRACE_EVENT_TIME_MAX_PAST_S`` | 2592000 (30 d) | junk window lower bound: an ``event_time`` older than ``now − this`` is junk (flush phase) |
 | ``MILLRACE_EVENT_TIME_MAX_FUTURE_S`` | 86400 (1 d) | junk window upper bound: an ``event_time`` newer than ``now + this`` is junk (flush phase) |
@@ -64,6 +60,19 @@ raw-staged-bytes trigger now sizes the estimated parquet OUTPUT, and
 the downtime reaper became a first-class lane with a bounded range), so
 carrying an old value under the new name would deploy a policy the
 operator did not ask for, and no deployment predates the rename.
+
+Removed knobs — the four ``MILLRACE_BACKPRESSURE_*`` names are REFUSED
+at boot, each refusal naming the knob. There is no successor: the
+consumer never pauses. SlateDB on object storage is the buffer before
+hoglake and is effectively unbounded — nothing bounded grows with
+staged bytes (memtable and block cache are bounded by SlateDB's own
+settings) — and pausing would move the backlog into Kafka, whose
+retention is the only data-loss cliff this pipeline has. The
+staged-bytes and oldest-eligible-age gauges plus alerts are the whole
+feature (docs/kafka-ingestion.md §Deployment); SlateDB's own L0 write
+stall (``l0_max_ssts`` with no compactor keeping up) is an error
+condition surfaced through its metrics, not a policy, and needs no
+latch. No deployment predates the removal.
 
 ``MILLRACE_KAFKA_AUTO_OFFSET_RESET`` carries a real tension, so the
 default is stated rather than inherited: ``earliest`` never silently
@@ -171,56 +180,6 @@ class EventTimePolicy(Enum):
 
     CLAMP = "clamp"
     QUARANTINE = "quarantine"
-
-
-@dataclass(frozen=True)
-class BackpressureConfig:
-    """Pause/resume thresholds over the staging gauges, applied with
-    hysteresis by consumer.py: pause AT the high water, resume STRICTLY
-    BELOW the low water. Both gaps must be strictly positive — the band
-    between them is what makes pause/resume incapable of flapping.
-    """
-
-    pause_staged_bytes: int
-    resume_staged_bytes: int
-    pause_oldest_age_s: int
-    resume_oldest_age_s: int
-
-    def __post_init__(self) -> None:
-        if self.pause_staged_bytes < 1:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_PAUSE_BYTES must be >= 1, "
-                f"got {self.pause_staged_bytes}"
-            )
-        if self.resume_staged_bytes < 1:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_RESUME_BYTES must be >= 1, "
-                f"got {self.resume_staged_bytes}"
-            )
-        if self.pause_oldest_age_s < 1:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_PAUSE_AGE_S must be >= 1, "
-                f"got {self.pause_oldest_age_s}"
-            )
-        if self.resume_oldest_age_s < 1:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_RESUME_AGE_S must be >= 1, "
-                f"got {self.resume_oldest_age_s}"
-            )
-        if self.pause_staged_bytes <= self.resume_staged_bytes:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_PAUSE_BYTES ({self.pause_staged_bytes}) "
-                f"must be greater than MILLRACE_BACKPRESSURE_RESUME_BYTES "
-                f"({self.resume_staged_bytes}) — the hysteresis band between "
-                f"them is what prevents pause/resume flapping"
-            )
-        if self.pause_oldest_age_s <= self.resume_oldest_age_s:
-            raise ValueError(
-                f"MILLRACE_BACKPRESSURE_PAUSE_AGE_S ({self.pause_oldest_age_s}) "
-                f"must be greater than MILLRACE_BACKPRESSURE_RESUME_AGE_S "
-                f"({self.resume_oldest_age_s}) — the hysteresis band between "
-                f"them is what prevents pause/resume flapping"
-            )
 
 
 @dataclass(frozen=True)
@@ -378,6 +337,17 @@ _RENAMED_ENV: Final = {
     "MILLRACE_REAP_DEADLINE_S": "MILLRACE_SLOW_LANE_DEADLINE_S",
 }
 
+#: Removed knob names, REFUSED at boot (module docstring): the
+#: backpressure latches are gone — there is no successor to point at,
+#: only the posture (the consumer never pauses; gauges + alerts are the
+#: mechanism).
+_REMOVED_ENV: Final = (
+    "MILLRACE_BACKPRESSURE_PAUSE_BYTES",
+    "MILLRACE_BACKPRESSURE_RESUME_BYTES",
+    "MILLRACE_BACKPRESSURE_PAUSE_AGE_S",
+    "MILLRACE_BACKPRESSURE_RESUME_AGE_S",
+)
+
 
 @dataclass(frozen=True)
 class Config:
@@ -408,7 +378,6 @@ class Config:
     slow_lane_deadline_s: int
     min_flush_bytes: int
     max_files_per_commit: int
-    backpressure: BackpressureConfig
     poison: PoisonConfig
     consume_batch_size: int
     poll_timeout_ms: int
@@ -658,14 +627,26 @@ def load_config(env: Mapping[str, str]) -> Config:
     """
     problems: list[str] = []
 
-    # Renamed knobs are refused FIRST, so an operator migrating an
-    # environment meets the rename before any other complaint.
+    # Renamed and removed knobs are refused FIRST, so an operator
+    # migrating an environment meets the rename/removal before any
+    # other complaint.
     for old_name, new_name in _RENAMED_ENV.items():
         if env.get(old_name, "").strip():
             problems.append(
                 f"{old_name} was renamed {new_name} and is refused — the "
                 f"rename narrowed the knob's semantics (see the module "
                 f"docstring); set {new_name}"
+            )
+    for removed_name in _REMOVED_ENV:
+        if env.get(removed_name, "").strip():
+            problems.append(
+                f"{removed_name} was removed and is refused — there is no "
+                f"successor: the consumer never pauses (SlateDB on object "
+                f"storage is the unbounded buffer; pausing would move the "
+                f"backlog into Kafka, whose retention is the only "
+                f"data-loss cliff). The staged-bytes and "
+                f"oldest-eligible-age gauges plus alerts are the "
+                f"mechanism (see the module docstring)"
             )
 
     bootstrap = _required(env, "MILLRACE_KAFKA_BOOTSTRAP_SERVERS", problems)
@@ -797,35 +778,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     max_files_per_commit = _positive_int(
         env, "MILLRACE_MAX_FILES_PER_COMMIT", MAX_FILES_PER_COMMIT_DEFAULT, problems
     )
-
-    backpressure: BackpressureConfig | None = None
-    pause_bytes = _positive_int(
-        env, "MILLRACE_BACKPRESSURE_PAUSE_BYTES", 8 * 1024**3, problems
-    )
-    resume_bytes = _positive_int(
-        env, "MILLRACE_BACKPRESSURE_RESUME_BYTES", 4 * 1024**3, problems
-    )
-    pause_age_s = _positive_int(
-        env, "MILLRACE_BACKPRESSURE_PAUSE_AGE_S", 3600, problems
-    )
-    resume_age_s = _positive_int(
-        env, "MILLRACE_BACKPRESSURE_RESUME_AGE_S", 1800, problems
-    )
-    if (
-        pause_bytes is not None
-        and resume_bytes is not None
-        and pause_age_s is not None
-        and resume_age_s is not None
-    ):
-        try:
-            backpressure = BackpressureConfig(
-                pause_staged_bytes=pause_bytes,
-                resume_staged_bytes=resume_bytes,
-                pause_oldest_age_s=pause_age_s,
-                resume_oldest_age_s=resume_age_s,
-            )
-        except ValueError as exc:
-            problems.append(str(exc))
 
     poison: PoisonConfig | None = None
     poison_max = _positive_int(env, "MILLRACE_POISON_MAX_RECORDS", 1000, problems)
@@ -959,7 +911,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert slow_lane_deadline_s is not None
     assert min_flush_bytes is not None
     assert max_files_per_commit is not None
-    assert backpressure is not None
     assert poison is not None
     assert slatedb is not None
     assert consume_batch_size is not None
@@ -999,7 +950,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
         max_files_per_commit=max_files_per_commit,
-        backpressure=backpressure,
         poison=poison,
         consume_batch_size=consume_batch_size,
         consume_batch_max_bytes=consume_batch_max_bytes,

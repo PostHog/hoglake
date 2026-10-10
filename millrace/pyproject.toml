@@ -6,10 +6,13 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "pyhoglake",
-    # >=21.0, matching pyhoglake: only pyarrow 21+ stamps the parquet
-    # UUID logical annotation hoglake's uuid wire form requires, and
-    # this package writes those columns.
-    "pyarrow>=21.0",
+    # >=25.0, NOT pyhoglake's 21: flush.py's _sort_batch_by_spec calls
+    # pc.sort_indices with (name, direction, null_placement) triples,
+    # which pyarrow only accepts from 25.0.0 — on 21–24 the compute
+    # layer unpacks two-tuples and raises "too many values to unpack"
+    # for every sorted flush (verified by bisecting 21.0.0–25.0.0 in
+    # scratch venvs; the failure mode is every sorted flush refusing).
+    "pyarrow>=25.0",
     # Pinned to the 0.17.x line: the binding-parity suite
     # (tests/test_slatedb_parity.py) pins THIS version's observed
     # semantics — lazy FENCED on a contested open, GC-beside-a-writer

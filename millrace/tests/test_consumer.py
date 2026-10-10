@@ -2,7 +2,7 @@
 
 Layers: the PURE decisions (team-id extraction — key codecs and the
 ``value-json:<field>`` payload codec —, record classification, the
-backpressure latch, the client-config pins) are unit tests without I/O;
+client-config pins) are unit tests without I/O;
 the loop itself is driven component-style — a scripted FakeConsumer
 (tests/kafkakit.py, hedgerow's fakes.py shape) over a REAL
 StageManager on ``memory:///``, so poll → stage → ack → commit ordering,
@@ -40,12 +40,13 @@ Pinned here:
 - poison records quarantine durably (readable after reopen), are
   counted, and never block the partition's commits; a poison FLOOD
   halts loudly without committing past it;
-- backpressure is two-level: a partition whose staged bytes age past
-  the pause age pauses ALONE (the others keep flowing), while the
-  aggregate staged bytes crossing the pod ceiling pauses everything —
-  hysteresis on both levels, exactly-once transitions, no flapping
-  (hypothesis over gauge sequences), partitions assigned while the pod
-  ceiling is engaged start paused;
+- there is NO consumer backpressure (PR #331 review — the latches were
+  removed, not fixed): a partition past where the retired thresholds
+  would have tripped keeps staging and committing, and the loop never
+  drives librdkafka's pause/resume or reads the staging gauges. SlateDB
+  on object storage is the unbounded buffer; pausing would only move
+  the backlog into Kafka, whose retention is the one data-loss cliff.
+  The gauges are alert inputs, published by the flush sweep;
 - commit retry ladder and its exhaustion; a failed stage commits
   nothing;
 - graceful shutdown: polling stops, the Kafka side closes, committed
@@ -56,23 +57,19 @@ Pinned here:
 from __future__ import annotations
 
 import asyncio
-from itertools import pairwise
 from typing import Any
 
 import pytest
 from confluent_kafka import OFFSET_STORED, KafkaError, KafkaException
-from hypothesis import given
-from hypothesis import strategies as st
 from kafkakit import FakeConsumer, error_event, keyed_msg, msg
 from slatedb.uniffi import CloseReason, DbBuilder
 from slatedb.uniffi import Error as SlateError
-from stagekit import NOW, fast_flush_settings, rec, window
+from stagekit import NOW, fast_flush_settings, rec
 
 import millrace.consumer as consumer_mod
 from millrace.config import (
     AssignmentMode,
     AutoOffsetReset,
-    BackpressureConfig,
     Config,
     EventTimePolicy,
     PoisonConfig,
@@ -92,7 +89,6 @@ from millrace.consumer import (
     ConsumerStats,
     MillraceConsumer,
     PoisonLimitExceeded,
-    backpressure_target,
     classify_message,
     create_kafka_consumer,
     decode_team_key,
@@ -132,12 +128,6 @@ def make_config(**overrides) -> Config:
         "slow_lane_deadline_s": 21600,
         "min_flush_bytes": 1024 * 1024,
         "max_files_per_commit": 512,
-        "backpressure": BackpressureConfig(
-            pause_staged_bytes=10**9,
-            resume_staged_bytes=5 * 10**8,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        ),
         "poison": PoisonConfig(max_records_per_run=1000, value_max_bytes=64),
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
@@ -187,9 +177,9 @@ async def run_steps(
 ) -> None:
     """Drive the loop until the fake has nothing deliverable and no
     scripted rebalance pending, plus ``extra`` idle steps (the idle
-    steps matter: backpressure re-evaluates on every step, and a resume
-    during an idle step can make held messages deliverable again — so
-    the drain condition is re-checked after them)."""
+    steps matter: a trailing error event or a rebalance callback can
+    land on an otherwise-empty poll, so the drain condition is
+    re-checked after them)."""
     while True:
         while fake.deliverable() or fake.has_pending_rebalance():
             await consumer._step()
@@ -223,18 +213,6 @@ def assert_commits_follow_acks(journal: list[tuple]) -> None:
                 prev = last_commit.get((topic, partition))
                 assert prev is None or offset > prev, "commits must be monotone"
                 last_commit[(topic, partition)] = offset
-
-
-async def settle_ranges(
-    manager: StageManager, partitions: tuple[int, ...], teams: tuple[int, ...]
-) -> None:
-    """The flusher's settlement, test-driven: delete exactly the
-    staged ranges of the given teams (one atomic settle per range)."""
-    for partition in partitions:
-        stage = manager.stage("events", partition)
-        for team in teams:
-            for r in await stage.read_offsets(team):
-                await stage.commit_flushed(window(team, r.first_offset, r.last_offset))
 
 
 async def team_offsets(stage: PartitionStage, team: int) -> list[int]:
@@ -472,152 +450,6 @@ def test_classify_names_the_FIRST_failing_check():
     # A tombstone with an undecodable key quarantines as malformed_key.
     out = classify(TeamKeyCodec.UTF8_DECIMAL, key=b"bad", value=None)
     assert isinstance(out, PoisonedRecord) and out.reason == REASON_MALFORMED_KEY
-
-
-# ==================================================================================
-# Pure: the backpressure latch
-# ==================================================================================
-
-KNOBS = BackpressureConfig(
-    pause_staged_bytes=1000,
-    resume_staged_bytes=500,
-    pause_oldest_age_s=100,
-    resume_oldest_age_s=50,
-)
-
-
-def target(*, staged_bytes, oldest=None, now_us, paused, knobs=KNOBS):
-    return backpressure_target(
-        staged_bytes=staged_bytes,
-        oldest_first_staged_ts=oldest,
-        now_us=now_us,
-        currently_paused=paused,
-        knobs=knobs,
-    )
-
-
-def test_backpressure_byte_boundaries():
-    # Trips AT the high water, not below it.
-    assert target(staged_bytes=1000, now_us=0, paused=False) is True
-    assert target(staged_bytes=999, now_us=0, paused=False) is False
-    # While paused, the low water is STRICT: at it, the latch holds.
-    assert target(staged_bytes=500, now_us=0, paused=True) is True
-    assert target(staged_bytes=499, now_us=0, paused=True) is False
-    # Inside the band the state persists in both directions.
-    assert target(staged_bytes=750, now_us=0, paused=False) is False
-    assert target(staged_bytes=750, now_us=0, paused=True) is True
-
-
-def test_backpressure_age_boundaries():
-    now = 10**12
-    pause_us, resume_us = 100 * 10**6, 50 * 10**6
-    # Trips AT the pause age.
-    assert (
-        target(staged_bytes=0, oldest=now - pause_us, now_us=now, paused=False) is True
-    )
-    assert (
-        target(staged_bytes=0, oldest=now - pause_us + 1, now_us=now, paused=False)
-        is False
-    )
-    # The resume age is strict: at it, the latch holds.
-    assert (
-        target(staged_bytes=0, oldest=now - resume_us, now_us=now, paused=True) is True
-    )
-    assert (
-        target(staged_bytes=0, oldest=now - resume_us + 1, now_us=now, paused=True)
-        is False
-    )
-
-
-def test_backpressure_nothing_staged_clears_the_age_arm():
-    assert target(staged_bytes=10**9, oldest=None, now_us=0, paused=False) is True
-    assert target(staged_bytes=0, oldest=None, now_us=0, paused=True) is False
-
-
-def test_backpressure_clock_skew_trips_nothing():
-    # A snapshot whose oldest timestamp is AHEAD of now (skew) has a
-    # negative age and trips no deadline, by construction.
-    assert target(staged_bytes=0, oldest=10**12, now_us=0, paused=False) is False
-    assert target(staged_bytes=0, oldest=10**12, now_us=0, paused=True) is False
-
-
-def test_backpressure_monotone_ramps_transition_once():
-    knobs = KNOBS
-    paused = False
-    seen: list[bool] = []
-    for staged_bytes in range(2001):  # ramp up through both bands
-        paused = target(staged_bytes=staged_bytes, now_us=0, paused=paused, knobs=knobs)
-        seen.append(paused)
-    transitions = sum(a != b for a, b in pairwise(seen))
-    assert transitions == 1 and seen[0] is False and seen[-1] is True
-    for staged_bytes in range(2000, -1, -1):  # ramp back down
-        paused = target(staged_bytes=staged_bytes, now_us=0, paused=paused, knobs=knobs)
-        seen.append(paused)
-    assert sum(a != b for a, b in pairwise(seen)) == 2  # one pause, one resume
-
-
-@given(
-    snapshots=st.lists(
-        st.tuples(
-            st.integers(min_value=0, max_value=10**12),
-            st.one_of(st.none(), st.integers(min_value=-(2**62), max_value=2**62)),
-            st.integers(min_value=-(2**62), max_value=2**62),
-        ),
-        max_size=200,
-    ),
-    initially_paused=st.booleans(),
-    gap_bytes=st.integers(min_value=1, max_value=10**6),
-    gap_age_s=st.integers(min_value=1, max_value=10**6),
-    base_bytes=st.integers(min_value=1, max_value=10**6),
-    base_age_s=st.integers(min_value=1, max_value=10**6),
-)
-def test_backpressure_never_flaps_over_arbitrary_gauge_sequences(
-    snapshots, initially_paused, gap_bytes, gap_age_s, base_bytes, base_age_s
-):
-    """No-flapping as a property: over ANY gauge sequence, a transition
-    is always justified by a full crossing (a pause only on a trip, a
-    resume only on a clear), and the decision is idempotent on a fixed
-    snapshot — so pause/resume each apply exactly once per crossing."""
-    knobs = BackpressureConfig(
-        pause_staged_bytes=base_bytes + gap_bytes,
-        resume_staged_bytes=base_bytes,
-        pause_oldest_age_s=base_age_s + gap_age_s,
-        resume_oldest_age_s=base_age_s,
-    )
-    paused = initially_paused
-    for staged_bytes, oldest, now_us in snapshots:
-        target_now = backpressure_target(
-            staged_bytes=staged_bytes,
-            oldest_first_staged_ts=oldest,
-            now_us=now_us,
-            currently_paused=paused,
-            knobs=knobs,
-        )
-        # Idempotence: a fixed snapshot has a stable answer, so applying
-        # the decision twice changes nothing (no double-pause).
-        assert (
-            backpressure_target(
-                staged_bytes=staged_bytes,
-                oldest_first_staged_ts=oldest,
-                now_us=now_us,
-                currently_paused=target_now,
-                knobs=knobs,
-            )
-            == target_now
-        )
-        if target_now != paused:
-            age_us = None if oldest is None else now_us - oldest
-            trip = staged_bytes >= knobs.pause_staged_bytes or (
-                age_us is not None and age_us >= knobs.pause_oldest_age_s * 1_000_000
-            )
-            clear = staged_bytes < knobs.resume_staged_bytes and (
-                age_us is None or age_us < knobs.resume_oldest_age_s * 1_000_000
-            )
-            if target_now:
-                assert trip, "paused without either high-water trip"
-            else:
-                assert clear, "resumed without both low-water clears"
-        paused = target_now
 
 
 # ==================================================================================
@@ -1323,41 +1155,6 @@ async def test_a_fenced_partition_closes_locally_and_halts_distinctly(fake_clock
 
 
 @component
-async def test_a_fence_surfacing_at_the_gauge_read_halts_distinctly(fake_clock):
-    """An IDLE fenced partition has no write to raise from — the fence
-    surfaces at the backpressure gauge scan instead. Same semantics:
-    local close of the held stages, distinct halt. (Detection is forced
-    first by a write — the parity suite pins WHICH call detects a fence
-    as timing-dependent, and that once detected every later operation
-    raises.)"""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    consumer = make_consumer(fake, manager, make_config(), fake_clock)
-    await consumer.start()
-    fake.feed(keyed_msg(0, 0, team=1))
-    await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 1}
-
-    new_owner = await DbBuilder(manager.path_for("events", 0), manager.store).build()
-    try:
-        # Force the detection onto the stage's handle without involving
-        # the consumer: the raw stage call raises SlateDB's Closed, and
-        # the handle keeps raising from here (the parity pin).
-        with pytest.raises(SlateError.Closed):
-            await manager.stage("events", 0).stage_batch([rec(1, NOW, 1)], now_us=NOW)
-        # The next step has nothing to stage; the live gauge scan (no
-        # flush sweep is publishing in this test) hits the fence.
-        with pytest.raises(ConsumerFencedError) as excinfo:
-            await consumer._step()
-        assert excinfo.value.partitions == (("events", 0),)
-        assert manager.partitions() == ()
-    finally:
-        await new_owner.shutdown()
-    await manager.close()
-
-
-@component
 async def test_a_non_fenced_closed_stage_error_is_not_the_fenced_path(fake_clock):
     """Only FENCED takes the distinct halt: a ``Closed`` with any other
     reason (a local shutdown racing an in-flight call) propagates as
@@ -1499,292 +1296,58 @@ async def test_the_byte_cap_never_stalls_an_oversized_record(fake_clock):
     await manager.close()
 
 
-# -- backpressure through the loop ---------------------------------------------------
+# -- no consumer backpressure: the removal's regression pin (PR #331 review) ---------
 
 
 @component
-async def test_backpressure_pauses_and_resumes_exactly_once(fake_clock):
-    """High-water pause, low-water resume, exactly once per crossing,
-    with the band between holding the state (no flapping). While paused
-    the fake delivers nothing for the paused partition."""
+async def test_staging_pressure_never_pauses_consumption(fake_clock):
+    """A partition past where the RETIRED latches would have tripped
+    keeps staging and committing — the backpressure policy was REMOVED,
+    not fixed (review: there is no reason to stop consuming except on
+    error; SlateDB on object storage is the unbounded buffer, and
+    pausing would move the backlog into Kafka, whose retention is the
+    only data-loss cliff). The loop also never READS the staging
+    gauges: they are alert inputs the flush sweep publishes, never
+    control flow."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=100,
-            resume_staged_bytes=50,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        )
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+
+    gauges_calls = 0
+    real_gauges = manager.gauges
+
+    async def spy_gauges(*, max_staleness_s=None):
+        nonlocal gauges_calls
+        gauges_calls += 1
+        return await real_gauges(max_staleness_s=max_staleness_s)
+
+    manager.gauges = spy_gauges  # type: ignore[method-assign]
     await consumer.start()
-    pauses = lambda: [e for e in journal if e[0] == "pause"]
-    resumes = lambda: [e for e in journal if e[0] == "resume"]
 
     fake.feed(keyed_msg(0, 0, team=1, value=b"x" * 60))
     await run_steps(consumer, fake)
     assert fake.committed_store == {("events", 0): 1}
-    assert not consumer.paused and pauses() == []
 
-    fake.feed(keyed_msg(0, 1, team=1, value=b"x" * 60))
-    await run_steps(consumer, fake)
-    # 120 staged bytes >= 100: paused, once, over the whole assignment.
-    assert consumer.paused
-    assert pauses() == [("pause", [("events", 0)])]
-    assert fake.paused == {("events", 0)}
-
-    # More data offered; a paused partition delivers nothing (the record
-    # is held in the fetch queue), and further steps neither stage nor
-    # re-pause.
-    fake.feed(keyed_msg(0, 2, team=1, value=b"x" * 60))
-    await run_steps(consumer, fake)
-    assert fake.deliverable() == 0 and fake.queued() == 1
-    assert fake.committed_store == {("events", 0): 2}
-    assert pauses() == [("pause", [("events", 0)])]
-
-    # Settle 60 bytes: 60 remains — inside the (50, 100) band, so the
-    # latch HOLDS (this is the hysteresis half of no-flapping).
-    stage = manager.stage("events", 0)
-    await stage.commit_flushed(window(1, 0, 0))
-    await run_steps(consumer, fake)
-    assert consumer.paused and resumes() == []
-
-    # Settle the rest: staged drops to 0 < 50 — resumed, exactly once.
-    await stage.commit_flushed(window(1, 1, 1))
-    await run_steps(consumer, fake)
-    assert not consumer.paused
-    assert resumes() == [("resume", [("events", 0)])]
-    assert fake.paused == set()
-
-    # And consumption continues: the held record stages and commits.
-    assert fake.committed_store == {("events", 0): 3}
-    assert_commits_follow_acks(journal)
-    await manager.close()
-
-
-@component
-async def test_backpressure_age_trigger_and_clear_on_drain(fake_clock):
-    """The age arm: the oldest staged byte crossing the pause age pauses
-    even at tiny byte counts (the flusher is not keeping up); draining
-    every key clears it."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=10**9,
-            resume_staged_bytes=5 * 10**8,
-            pause_oldest_age_s=100,
-            resume_oldest_age_s=50,
-        )
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    fake.feed(keyed_msg(0, 0, team=1, value=b"tiny"))
-    await run_steps(consumer, fake)
-    assert not consumer.paused
-
-    fake_clock.advance(100 * 10**6)  # oldest staged age reaches the pause water
-    await consumer._step()
-    assert consumer.paused
-
-    # Drained (the flusher settled the key): nothing staged, so the age
-    # arm is inert and the loop resumes.
-    await settle_ranges(manager, (0,), (1,))
-    await consumer._step()
-    assert not consumer.paused
-    await manager.close()
-
-
-@component
-async def test_partitions_assigned_while_paused_start_paused(fake_clock):
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        assignment_mode=AssignmentMode.COOPERATIVE,
-        static_partitions=None,
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=100,
-            resume_staged_bytes=50,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        ),
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-    fake.script_rebalance(assign=[0])
-    await consumer._step()
-
-    fake.feed(keyed_msg(0, 0, team=1, value=b"x" * 120))
-    await run_steps(consumer, fake)
-    assert consumer.paused and fake.paused == {("events", 0)}
-
-    fake.script_rebalance(assign=[1])
-    await consumer._step()
-    # The new partition inherits the pod-level pause, exactly once.
-    assert ("pause", [("events", 1)]) in [e for e in journal if e[0] == "pause"]
-    assert fake.paused == {("events", 0), ("events", 1)}
-    assert len([e for e in journal if e[0] == "pause"]) == 2
-    await manager.close()
-
-
-# -- T10: two-level backpressure — per-partition age latches + pod byte ceiling -------
-
-
-@component
-async def test_a_stuck_partition_pauses_alone(fake_clock):
-    """The age latch is PER PARTITION: a partition whose oldest staged
-    byte ages past the pause age (its flusher is stuck) pauses ALONE —
-    the pod's other partitions keep flowing and committing. (The
-    pre-fix policy folded the oldest age into one pod-wide latch and
-    stopped all 63 healthy partitions with the stuck one.)"""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        static_partitions=(0, 1),
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=10**9,
-            resume_staged_bytes=5 * 10**8,
-            pause_oldest_age_s=100,
-            resume_oldest_age_s=50,
-        ),
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    fake.feed(keyed_msg(0, 0, team=1, value=b"a"), keyed_msg(1, 0, team=2, value=b"b"))
-    await run_steps(consumer, fake)
-    assert fake.paused == set()
-
-    # Partition 1's flusher keeps up (its ranges settle); partition 0's
-    # staged byte then ages past the pause age.
-    await settle_ranges(manager, (1,), (2,))
-    fake_clock.advance(100 * 10**6)  # p0's oldest reaches the pause age
-    await consumer._step()
-    # The stuck partition pauses ALONE.
-    assert fake.paused == {("events", 0)}
-    assert consumer.paused
-    assert consumer.paused_partitions() == frozenset({("events", 0)})
-
-    # Partition 1 keeps flowing while 0 is latched.
-    fake.feed(keyed_msg(1, 1, team=2, value=b"c"))
-    await run_steps(consumer, fake)
-    assert fake.committed_store[("events", 1)] == 2
-    assert fake.paused == {("events", 0)}
-
-    # Partition 0's flush unsticks: its ranges settle, the age arm goes
-    # inert, exactly one resume fires.
-    await settle_ranges(manager, (0,), (1,))
-    await consumer._step()
-    assert fake.paused == set()
-    assert not consumer.paused
-    assert [e for e in journal if e[0] == "resume"] == [("resume", [("events", 0)])]
-    assert_commits_follow_acks(journal)
-    await manager.close()
-
-
-@component
-async def test_per_partition_age_latch_holds_inside_the_band(fake_clock):
-    """The per-partition latch keeps the hysteresis discipline: draining
-    the oldest key so the NEW oldest lands inside the (resume, pause)
-    band HOLDS the pause; only a full drain below the resume age
-    resumes."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=10**9,
-            resume_staged_bytes=5 * 10**8,
-            pause_oldest_age_s=100,
-            resume_oldest_age_s=50,
-        )
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    fake.feed(keyed_msg(0, 0, team=1, value=b"old"))
-    await run_steps(consumer, fake)
-    fake_clock.advance(30 * 10**6)
-    fake.feed(keyed_msg(0, 1, team=3, value=b"newer"))
-    await run_steps(consumer, fake)
-    fake_clock.advance(70 * 10**6)  # team1 age 100 (TRIP), team3 age 70
-    await consumer._step()
-    assert fake.paused == {("events", 0)}
-
-    # Drain the old key: the oldest staged byte is now team3's at 70 s —
-    # inside the (50, 100) band, and a latched latch HOLDS there
-    # (strictly-below-resume is the only clear).
-    await settle_ranges(manager, (0,), (1,))
-    await consumer._step()
-    assert fake.paused == {("events", 0)}
-    assert [e for e in journal if e[0] == "resume"] == []
-
-    # Drain the rest: nothing staged, the age arm goes inert, and the
-    # latch clears with exactly one resume.
-    await settle_ranges(manager, (0,), (3,))
-    await consumer._step()
-    assert fake.paused == set()
-    assert [e for e in journal if e[0] == "resume"] == [("resume", [("events", 0)])]
-    await manager.close()
-
-
-@component
-async def test_the_pod_byte_ceiling_pauses_everything(fake_clock):
-    """Level 2: the AGGREGATE staged bytes crossing the pod ceiling
-    pauses EVERY assigned partition — the legitimate pod-wide limit
-    (total staged volume is the catch-up working set this pod is owed)
-    — even when no single partition is near the threshold on its own.
-    Hysteresis is the aggregate's: partial drain into the band holds,
-    drain below the resume water resumes all."""
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        static_partitions=(0, 1),
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=100,
-            resume_staged_bytes=50,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        ),
-    )
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    # 60 bytes per partition: neither partition is near 100 alone, but
-    # the 120-byte aggregate crosses the pod ceiling.
+    # Two hours pass with the row staged and unflushed — past the
+    # retired policy's age trip (its pause-age default was 3600 s) —
+    # then more records arrive. Consumption continues regardless:
+    # every offset commits.
+    fake_clock.advance(2 * 3600 * 10**6)
     fake.feed(
-        keyed_msg(0, 0, team=1, value=b"x" * 60),
-        keyed_msg(1, 0, team=2, value=b"y" * 60),
+        keyed_msg(0, 1, team=1, value=b"y" * 60),
+        keyed_msg(0, 2, team=2, value=b"z" * 60),
     )
     await run_steps(consumer, fake)
-    assert fake.paused == {("events", 0), ("events", 1)}
-    assert consumer.paused
-    assert consumer.paused_partitions() == frozenset({("events", 0), ("events", 1)})
-    # One pause call covering the assignment, exactly once.
-    assert [e for e in journal if e[0] == "pause"] == [
-        ("pause", [("events", 0), ("events", 1)])
-    ]
 
-    # Partial drain into the (50, 100) band: the pod latch HOLDS.
-    await settle_ranges(manager, (1,), (2,))
-    await consumer._step()
-    assert fake.paused == {("events", 0), ("events", 1)}
-    assert not [e for e in journal if e[0] == "resume"]
-
-    # Drain below the resume water: one resume call for the assignment.
-    await settle_ranges(manager, (0,), (1,))
-    await consumer._step()
-    assert fake.paused == set()
-    assert [e for e in journal if e[0] == "resume"] == [
-        ("resume", [("events", 0), ("events", 1)])
-    ]
+    assert fake.committed_store == {("events", 0): 3}
+    stage = manager.stage("events", 0)
+    assert await team_offsets(stage, 1) == [0, 1]
+    assert await team_offsets(stage, 2) == [2]
+    # librdkafka's pause/resume were never driven, and the gauges were
+    # never read (the removed policy read them every step).
+    assert not [e for e in journal if e[0] in ("pause", "resume")]
+    assert gauges_calls == 0
     assert_commits_follow_acks(journal)
     await manager.close()
 
@@ -1886,71 +1449,4 @@ async def test_stats_snapshot_counts_the_run(fake_clock):
         commit_attempts=1,
         commit_retries=0,
     )
-    await manager.close()
-
-
-# -- M6(b): backpressure reads the sweep's shared gauge snapshot --------------------
-
-
-class _Mono:
-    def __init__(self) -> None:
-        self.now = 10_000.0
-
-    def __call__(self) -> float:
-        return self.now
-
-
-@component
-async def test_backpressure_reads_the_sweep_snapshot_and_falls_back_when_stale(
-    fake_clock,
-):
-    """The consumer's per-poll gauge read serves the flush sweep's
-    published fold while it is fresh (younger than two sweep
-    intervals) — here the published snapshot says 150 staged bytes
-    while the (empty) stage would scan 0, so the pause PROVES the
-    shared read — and falls back to a live scan once the sweep stops
-    publishing, so a halted flush loop never freezes backpressure."""
-    from stagekit import fast_flush_settings
-
-    from millrace.stage import StageGauges, StageManager
-
-    journal: list[tuple] = []
-    mono = _Mono()
-    manager = StageManager(
-        "memory:///",
-        "millrace",
-        settings=fast_flush_settings(),
-        ack_hook=lambda ack: journal.append(("ack", ack)),
-        monotonic=mono,
-    )
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=100,
-            resume_staged_bytes=50,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        )
-    )  # flush_sweep_s default 5 -> staleness bound 10 s
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    manager.publish_gauges(
-        {
-            ("events", 0): StageGauges(
-                staged_bytes=150,
-                staged_rows=1,
-                staged_teams=1,
-                oldest_first_staged_ts=None,
-            )
-        }
-    )
-    await consumer._step()
-    assert consumer.paused  # the snapshot's 150 bytes, not the live 0
-
-    # The snapshot ages past two sweep intervals: the consumer falls
-    # back to a live scan (0 bytes staged) and resumes.
-    mono.now += 11.0
-    await consumer._step()
-    assert not consumer.paused
     await manager.close()

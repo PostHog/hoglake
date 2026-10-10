@@ -11,7 +11,6 @@ import pytest
 from millrace.config import (
     AssignmentMode,
     AutoOffsetReset,
-    BackpressureConfig,
     Config,
     ConfigError,
     EventTimePolicy,
@@ -59,12 +58,6 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.slow_lane_deadline_s == 21600
     assert cfg.min_flush_bytes == 1024 * 1024
     assert cfg.max_files_per_commit == 512
-    assert cfg.backpressure == BackpressureConfig(
-        pause_staged_bytes=8 * 1024**3,
-        resume_staged_bytes=4 * 1024**3,
-        pause_oldest_age_s=3600,
-        resume_oldest_age_s=1800,
-    )
     assert cfg.poison == PoisonConfig(
         max_records_per_run=1000, value_max_bytes=1024 * 1024
     )
@@ -140,6 +133,44 @@ def test_renamed_knobs_refused_even_alongside_the_successor():
 def test_renamed_knob_with_an_empty_value_is_unset_not_refused():
     # Consistent with every other knob: whitespace-only reads as absent.
     cfg = load(MINIMAL_ENV | {"MILLRACE_REAP_DEADLINE_S": "  "})
+    assert cfg.slow_lane_deadline_s == 21600
+
+
+# -- removed (backpressure) knobs --------------------------------------------------
+#
+# The MILLRACE_BACKPRESSURE_* four are REFUSED — the consumer never
+# pauses, so there is no successor to alias to: SlateDB on object
+# storage is the unbounded buffer, pausing would move the backlog into
+# Kafka (whose retention is the only data-loss cliff), and the
+# staged-bytes / oldest-eligible-age gauges plus alerts are the whole
+# feature. No deployment predates the removal, so no deprecation
+# window.
+
+REMOVED_BACKPRESSURE_KNOBS = (
+    "MILLRACE_BACKPRESSURE_PAUSE_BYTES",
+    "MILLRACE_BACKPRESSURE_RESUME_BYTES",
+    "MILLRACE_BACKPRESSURE_PAUSE_AGE_S",
+    "MILLRACE_BACKPRESSURE_RESUME_AGE_S",
+)
+
+
+@pytest.mark.parametrize("knob", REMOVED_BACKPRESSURE_KNOBS)
+def test_removed_backpressure_knobs_are_refused_naming_the_mechanism(knob):
+    (p,) = problems(MINIMAL_ENV | {knob: "1024"})
+    assert knob in p and "removed" in p
+    assert "gauges" in p and "alerts" in p  # the successor is the alerting posture
+
+
+def test_removed_backpressure_knobs_refused_together_and_first():
+    probs = problems(MINIMAL_ENV | {k: "1" for k in REMOVED_BACKPRESSURE_KNOBS})
+    assert len(probs) == 4
+    assert all("MILLRACE_BACKPRESSURE_" in p and "removed" in p for p in probs)
+
+
+def test_removed_backpressure_knob_with_an_empty_value_is_unset_not_refused():
+    # Consistent with the renamed knobs and every other knob:
+    # whitespace-only reads as absent.
+    cfg = load(MINIMAL_ENV | {"MILLRACE_BACKPRESSURE_PAUSE_AGE_S": "  "})
     assert cfg.slow_lane_deadline_s == 21600
 
 
@@ -395,10 +426,6 @@ def test_stage_url_unknown_scheme():
         "MILLRACE_SLOW_LANE_DEADLINE_S",
         "MILLRACE_MIN_FLUSH_BYTES",
         "MILLRACE_MAX_FILES_PER_COMMIT",
-        "MILLRACE_BACKPRESSURE_PAUSE_BYTES",
-        "MILLRACE_BACKPRESSURE_RESUME_BYTES",
-        "MILLRACE_BACKPRESSURE_PAUSE_AGE_S",
-        "MILLRACE_BACKPRESSURE_RESUME_AGE_S",
         "MILLRACE_POISON_MAX_RECORDS",
         "MILLRACE_POISON_VALUE_MAX_BYTES",
         "MILLRACE_POISON_RETENTION_S",
@@ -429,10 +456,6 @@ def test_positive_int_knobs_accept_valid_values():
             "MILLRACE_SLOW_LANE_DEADLINE_S": "43200",
             "MILLRACE_MIN_FLUSH_BYTES": "32",
             "MILLRACE_MAX_FILES_PER_COMMIT": "3",
-            "MILLRACE_BACKPRESSURE_PAUSE_BYTES": "1000",
-            "MILLRACE_BACKPRESSURE_RESUME_BYTES": "500",
-            "MILLRACE_BACKPRESSURE_PAUSE_AGE_S": "100",
-            "MILLRACE_BACKPRESSURE_RESUME_AGE_S": "50",
             "MILLRACE_POISON_MAX_RECORDS": "7",
             "MILLRACE_POISON_VALUE_MAX_BYTES": "64",
             "MILLRACE_CONSUME_BATCH_SIZE": "11",
@@ -446,10 +469,6 @@ def test_positive_int_knobs_accept_valid_values():
     assert cfg.slow_lane_deadline_s == 43200
     assert cfg.min_flush_bytes == 32
     assert cfg.max_files_per_commit == 3
-    assert cfg.backpressure.pause_staged_bytes == 1000
-    assert cfg.backpressure.resume_staged_bytes == 500
-    assert cfg.backpressure.pause_oldest_age_s == 100
-    assert cfg.backpressure.resume_oldest_age_s == 50
     assert cfg.poison.max_records_per_run == 7
     assert cfg.poison.value_max_bytes == 64
     assert cfg.consume_batch_size == 11
@@ -458,49 +477,7 @@ def test_positive_int_knobs_accept_valid_values():
     assert cfg.receipt_horizon_s == 3600
 
 
-# -- hysteresis cross-checks --------------------------------------------------------------
-
-
-def test_backpressure_byte_thresholds_must_not_touch():
-    (p,) = problems(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_BACKPRESSURE_PAUSE_BYTES": "500",
-            "MILLRACE_BACKPRESSURE_RESUME_BYTES": "500",
-        }
-    )
-    assert "MILLRACE_BACKPRESSURE_PAUSE_BYTES" in p
-    assert "MILLRACE_BACKPRESSURE_RESUME_BYTES" in p
-    assert "flapping" in p
-
-
-def test_backpressure_age_thresholds_must_not_invert():
-    (p,) = problems(
-        MINIMAL_ENV
-        | {
-            "MILLRACE_BACKPRESSURE_PAUSE_AGE_S": "50",
-            "MILLRACE_BACKPRESSURE_RESUME_AGE_S": "100",
-        }
-    )
-    assert "MILLRACE_BACKPRESSURE_PAUSE_AGE_S" in p
-    assert "MILLRACE_BACKPRESSURE_RESUME_AGE_S" in p
-
-
-def test_backpressure_config_guards_direct_construction():
-    with pytest.raises(ValueError, match="MILLRACE_BACKPRESSURE_PAUSE_BYTES"):
-        BackpressureConfig(
-            pause_staged_bytes=10,
-            resume_staged_bytes=10,
-            pause_oldest_age_s=2,
-            resume_oldest_age_s=1,
-        )
-    with pytest.raises(ValueError, match="MILLRACE_BACKPRESSURE_RESUME_AGE_S"):
-        BackpressureConfig(
-            pause_staged_bytes=10,
-            resume_staged_bytes=5,
-            pause_oldest_age_s=1,
-            resume_oldest_age_s=0,
-        )
+# -- config-object guards --------------------------------------------------------------
 
 
 def test_poison_config_guards_direct_construction():

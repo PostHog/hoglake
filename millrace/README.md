@@ -34,8 +34,9 @@ static and cooperative assignment claiming via `StageManager.sync_assignment`,
 poll → stage → commit with offsets strictly after durable staging and
 the poll's per-partition stage batches overlapped (one WAL durability
 wait per partition, in flight together), the `value-json:<field>` team
-codec for topics not keyed by team, two-level hysteresis backpressure,
-the FENCED halt below, poison quarantine), `flush.py` (the flush
+codec for topics not keyed by team, the FENCED halt below, poison
+quarantine; there is deliberately NO consumer backpressure — the gauges
+are alert inputs and nothing pauses the loop, see below), `flush.py` (the flush
 loop: planner-driven sweeps, staged range → Arrow → partition fanout →
 parquet → persisted prepared commit → settle, the day-one wire contract
 (`read_snapshot` + `expected_table_uuid`, `totals=false` identity reads,
@@ -79,8 +80,9 @@ its next write's durability wait (`Error.Closed(FENCED)`, pinned by
 event announces the loss — an EKS one-at-a-time StatefulSet rollout
 double-assigns the ordinal while the old pod drains, and the new pod
 opens the same SlateDB paths. The consume loop therefore catches FENCED
-at the staging write (and at the backpressure gauge scan, where an idle
-partition's fence surfaces), closes the fenced stage locally, and halts
+at the staging write (and the flush loop's sweep surfaces an idle
+partition's fence at its next planning read), closes the fenced stage
+locally, and halts
 with `ConsumerFencedError` — deliberately DISTINCT from a crash or a
 flush halt: a blind restart would re-open the path and fence the NEW
 owner, and the two pods would fence each other until the rollout
@@ -167,10 +169,14 @@ that lost a partition's ownership is not ready to serve it.
 `millrace_partition_oldest_staged_age_seconds{topic,partition}`,
 `millrace_flush_partition_fenced{topic,partition}` — so a stuck
 partition is findable; cardinality is bounded by the pod's assigned
-partition count (tens), never by teams. Backpressure exposure is
-two-level like the policy: `millrace_backpressure_paused` means ANY
-partition paused; `millrace_backpressure_paused_partitions` is the
-count.
+partition count (tens), never by teams. There is no consumer
+backpressure: nothing pauses the loop (a backlog belongs in SlateDB's
+object store, not pushed back onto Kafka's retention). The staged
+gauges — `millrace_staged_bytes`, `millrace_staged_rows`,
+`millrace_oldest_eligible_staged_age_seconds` (the oldest key that is
+eligible under ANY flush lane, so pathological slow-lane tenants don't
+trip it) — plus SlateDB's own stall series are alert inputs, and only
+ever that.
 
 The maintenance service (`python -m millrace.maintenance`) does GC plus
 compaction-debt monitoring: per swept DB it reads the compactor state

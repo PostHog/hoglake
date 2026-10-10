@@ -42,7 +42,6 @@ from pyhoglake import HoglakeClient, S3Config, ops
 from millrace.config import (
     AssignmentMode,
     AutoOffsetReset,
-    BackpressureConfig,
     Config,
     EventTimePolicy,
     PoisonConfig,
@@ -530,12 +529,6 @@ def live_config(
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
         max_files_per_commit=512,
-        backpressure=BackpressureConfig(
-            pause_staged_bytes=1 << 30,
-            resume_staged_bytes=512 * 1024 * 1024,
-            pause_oldest_age_s=3600,
-            resume_oldest_age_s=1800,
-        ),
         poison=PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         consume_batch_size=500,
         poll_timeout_ms=100,
