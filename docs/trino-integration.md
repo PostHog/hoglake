@@ -390,17 +390,43 @@ Trino SQL declares a layout with the connector's `shredding` column property, in
 the REST API. A declaration is fixed when its column is defined; no alter op
 changes it, so a different layout is a new column.
 
-pyhoglake declares a layout too, with `variant.variant_field` in a `create_table`
-schema or `ops.add_column(..., "variant", shredding=...)`, and checks it locally
-against the same rules (a shared vector file keeps its copy of them in step with
-the server's), leaving to the server the few case collisions it cannot decide as
-the JDK does (around `Σ`, or past its Unicode data). It writes no VARIANT values
-from Arrow, so it honours no declaration yet, and it reads a stored declaration
-as an ordinary `type_params` map; the console does not show `type_params`. DuckDB
-clients refuse VARIANT at bind (#87) and read only decimal parameters. Hedgerow
-compares `type_params` exactly, so it refuses a destination variant that has a
-declaration as a schema mismatch; it writes through DuckDB, which honours no
-declaration. Compaction still skips every table with a VARIANT column (#70).
+pyhoglake declares a layout too, with `variant.variant_field` in a
+`create_table` schema or `ops.add_column(..., "variant", shredding=...)`, and
+checks it locally against the same rules (a shared vector file keeps its copy of
+them in step with the server's), leaving to the server the few case collisions
+it cannot decide as the JDK does (around `Σ`, or past its Unicode data). It
+writes no VARIANT values from Arrow yet. A foreign file it publishes through
+`prepare_append_files` is checked against the stored declaration only with
+`strict_variant=True`, which also holds the layout to what the connector reads
+(a declaration it cannot parse then raises `UnsupportedShreddingError`); by
+default only the group's VARIANT(1) annotation (as parquet-java reads it: an
+explicit version 1 and no converted type beside it), its field id and its
+top-level storage children (a REQUIRED binary `metadata`, and a binary `value`,
+a `typed_value` or both) are checked, and nothing below them, as the server
+publishes it, besides what every prepared file's footer is held to: column chunk
+metadata and statistics pyarrow can read without aborting the process, and a
+footer the connector's `ParquetMetadata` reads as pyarrow does, or at all. It
+cannot read one with a schema element without a `repetition_type`, a group with
+a physical type (a primitive to it), a union (a logical type, a time unit, a
+column order) that spells two fields or none, which pyarrow reads as a struct
+and libthrift's `TUnion` as its first field, the rest of the footer then out of
+step, a logical type of no member it defines, a required enum field of a value
+it does not define, a chunk whose `path_in_schema` names no column, or an
+annotation its schema builder will not put on the element's type; and it reads
+an element whose converted type spells another type than its logical type as the
+converted one, where pyarrow reads the logical one (a timestamp in MICROS beside
+a converted TIMESTAMP_MILLIS a thousand times too late), and a chunk whose path
+names a sibling as the sibling's. pyhoglake refuses all of these, and so an
+IEEE_754_TOTAL_ORDER on a column the server's parquet-java will not build it
+for. The console does not show `type_params`. DuckDB clients refuse VARIANT at
+bind (#87) and read only decimal parameters. Hedgerow compares `type_params`
+exactly, so it refuses a destination variant that has a declaration as a schema
+mismatch; it writes through DuckDB, which honours no declaration, and publishes
+on the default path. DuckDB 1.5.5 writes an object's field groups and a list's
+elements OPTIONAL where the spec says REQUIRED. The connector tolerates that, as
+it does a missing `value`, since the data means the same, and reads those files;
+`strict_variant`, which holds a file to the spec as well as to the connector,
+refuses them. Compaction still skips every table with a VARIANT column (#70).
 
 ### Reclaiming abandoned Trino uploads
 

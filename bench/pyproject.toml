@@ -7,10 +7,13 @@ requires-python = ">=3.11"
 dependencies = [
     "pyhoglake",
     "httpx>=0.27",
-    # >=21.0, matching pyhoglake: only pyarrow 21+ stamps the parquet
+    # >=23.0, matching pyhoglake (its pyproject says why: 21 cannot open a
+    # VARIANT file, and 21 and 22 cannot read an INT32/INT64 decimal's
+    # statistics).
+    # The older reason still holds: only pyarrow 21+ stamps the parquet
     # UUID logical annotation, and the generator's uuid columns are
     # generated in the catalog's own writer type.
-    "pyarrow>=21.0",
+    "pyarrow>=23.0",
     "numpy>=1.26",
     "faker>=30.0",
     # ANALYZE-only stats settling between seed and measure (pg.py).

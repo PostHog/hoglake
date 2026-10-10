@@ -38,7 +38,7 @@ accepted on input and still WRITES the same bytes — it just leaves the
 annotation off, which is the state every file written before this
 contract is in. Measured, the annotation needs pyarrow >= 21: 18 through
 20 have ``pa.uuid()`` but write a bare ``FIXED_LEN_BYTE_ARRAY(16)``.
-Below the floor (no ``pa.uuid()`` at all) the mapping falls back to
+Below pyarrow 18 (no ``pa.uuid()`` at all) the mapping falls back to
 ``pa.binary(16)``, losing the annotation and not one byte.
 
 Note on uint32 — the one deliberately asymmetric mapping. ``uint32``
@@ -363,10 +363,11 @@ def coltype_to_arrow(
         #
         # It is NOT the whole guard: on 18 through 20 pa.uuid() exists
         # and this branch is never taken, yet the file still comes out
-        # unannotated. Only the resolver floor (pyarrow>=21 in
-        # pyproject.toml) enforces the wire contract; this arm just keeps
-        # an environment built below the floor writing correct bytes
-        # instead of raising.
+        # unannotated. Only the resolver floor (pyarrow>=23 in
+        # pyproject.toml, above the 21 this needs) enforces the wire
+        # contract; this arm just keeps an environment built below
+        # pyarrow 18 (no pa.uuid() at all) writing correct bytes instead
+        # of raising.
         try:
             return pa.uuid()
         except AttributeError:

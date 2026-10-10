@@ -3400,6 +3400,49 @@ def _python_nest(kind: str, levels: int, *, leaf: bool, last: object = 1) -> obj
     return value
 
 
+def _value_only_nest(levels: int) -> pa.StructArray:
+    """Storage of ``levels`` shredded objects {"a": ...} whose deepest
+    field group holds a ``value`` column only, as a declared ``variant``
+    field is laid out, with the int 1 in it."""
+    inner = pa.StructArray.from_arrays(
+        [pa.array([b"\x0c\x01"], pa.binary())], names=["value"]
+    )
+    for _ in range(levels):
+        typed = pa.StructArray.from_arrays(
+            [inner], fields=[pa.field("a", inner.type, nullable=False)]
+        )
+        inner = pa.StructArray.from_arrays(
+            [pa.array([None], pa.binary()), typed], names=["value", "typed_value"]
+        )
+    return pa.StructArray.from_arrays(
+        [pa.array([KEY_A]), inner.field("value"), inner.field("typed_value")],
+        fields=[
+            pa.field("metadata", pa.binary(), nullable=False),
+            pa.field("value", pa.binary()),
+            pa.field("typed_value", inner.field("typed_value").type),
+        ],
+    )
+
+
+def test_a_value_only_field_group_at_the_depth_bound_is_refused_by_reason():
+    """At the deepest level the reader asks each field group which rows
+    hold its field, from the columns the group HAS: a declared ``variant``
+    field has a ``value`` and no ``typed_value``. Asked for both, it raised
+    a raw KeyError at depth 129 rather than refuse the row as
+    nesting_too_deep."""
+    at_bound = _value_only_nest(MAX_VARIANT_DEPTH)
+    assert variant.to_python(at_bound) == [
+        _python_nest("object", MAX_VARIANT_DEPTH, leaf=True)
+    ]
+    variant.verify(at_bound)
+    too_deep = _value_only_nest(MAX_VARIANT_DEPTH + 1)
+    for read in (variant.to_python, variant.verify):
+        with pytest.raises(VariantEncodingError) as raised:
+            read(too_deep)
+        assert (raised.value.reason, raised.value.row) == ("nesting_too_deep", 0)
+        assert raised.value.path == "$" + ".a" * MAX_VARIANT_DEPTH
+
+
 @pytest.mark.parametrize("kind", ["object", "array", "large_array"])
 def test_the_depth_bound_holds_through_shredded_nesting(kind):
     # Objects and arrays shredded as typed groups are levels of the value

@@ -39,7 +39,7 @@ from pyhoglake.types import (
 
 # -- generators -------------------------------------------------------------
 
-#: pa.json_() arrived in pyarrow 19, below the project's floor of 21,
+#: pa.json_() arrived in pyarrow 19, below the project's floor of 23,
 #: so this guard only matters to an environment built under the floor.
 #: Without it
 #: "json" maps to pa.string() and comes back as "string", so it is not a

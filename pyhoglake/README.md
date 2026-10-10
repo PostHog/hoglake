@@ -13,9 +13,15 @@ pip install pyhoglake                  # or: uv add pyhoglake
 pip install 'pyhoglake[fast-upload]'   # + boto3, for single-request uploads
 ```
 
-Dependencies: `httpx`, `pyarrow`, `thrift`. The `fast-upload` extra
-adds `boto3`, which the writer path uses to put a small parquet object
-in ONE request (see [Prepared
+Dependencies: `httpx`, `pyarrow` (23.0 or later), `thrift`. pyarrow
+21 cannot open a Parquet file with a VARIANT column at all, and 21 and 22
+cannot read the statistics of an INT32/INT64 DECIMAL column, which is
+how pyhoglake writes a decimal4/decimal8 VARIANT leaf and how DuckDB
+writes every decimal of precision 18 or less; 23.0 also matches
+millpond's pin. CI runs the unit suite on 23.0.0, 23.0.1 and the locked
+version, and on the newest release at least 7 days old as a non-blocking
+canary. The `fast-upload` extra adds `boto3`, which the writer path uses
+to put a small parquet object in ONE request (see [Prepared
 appends](#prepared-appends--buffered-encode-one-request-uploads-one-commit));
 without it every object takes pyarrow's three-request multipart write,
 and pyhoglake logs one warning saying so. Development uses the flox env
@@ -162,9 +168,9 @@ server-side compaction writes on every file it rewrites, and the form an
 Iceberg-conformant reader needs to see a UUID rather than opaque bytes.
 pyarrow stamps that annotation only for its canonical uuid extension
 type, so `coltype_to_arrow("uuid")` returns `pa.uuid()` and every file
-this client writes is annotated. It needs **pyarrow >= 21** (the package
-floor): `pa.uuid()` exists from 18, but 18 through 20 write the bytes
-with no annotation.
+this client writes is annotated. That needs **pyarrow >= 21**, below the
+package floor (23, see Install): `pa.uuid()` exists from 18, but 18
+through 20 write the bytes with no annotation.
 
 Both spellings are accepted everywhere on the way in:
 
@@ -174,7 +180,7 @@ Both spellings are accepted everywhere on the way in:
 - `Table.prepare_append_files` accepts a file whose uuid column is
   annotated **or** bare. A hoglake table holds both: compaction outputs
   have always been annotated, while files this client registered before
-  the contract — and any writer below the pyarrow floor, or one that
+  the contract — and any writer on a pyarrow below 21, or one that
   simply does not annotate — carry the bare form. Nothing else about the
   schema check is loosened, so a file with the right type and the wrong
   `PARQUET:field_id` is refused exactly as before.
@@ -280,10 +286,9 @@ writer only.
 
 `pyhoglake.variant` also holds a Variant codec at the Arrow level. **It is
 not wired into the write paths yet:** `Table.append` and
-`prepare_append_tables` still refuse a VARIANT column, and nothing here
-writes Parquet. What it gives is the storage a VARIANT column's Parquet
-group is written from, shredded as its declaration lays it out, and the
-reader of any such storage:
+`prepare_append_tables` still refuse a VARIANT column. What it gives is
+the storage a VARIANT column's Parquet group is written from, shredded as
+its declaration lays it out, and the reader of any such storage:
 
 ```python
 from decimal import Decimal
@@ -318,22 +323,22 @@ written as `decimal32(p, s)` and `decimal64(p, s)` and read back as
 `decimal128(p, s)` from a file with no Arrow schema stored in it (a file
 pyarrow wrote with its default `store_schema=True` reads back as the
 write form; both forms read). The file holds their unscaled INT32/INT64
-with `DECIMAL(p, s)`, the connector's layout. pyarrow 21 cannot write a
-decimal32 or decimal64 at all, and later versions write one as a
-fixed-length array by default. Their `store_decimal_as_integer=True`
-(23 and later) is file-wide and ruled out (D15): it also turns a
-`decimal16` leaf and a top-level decimal column of precision 18 or less
-into INT32/INT64, where the connector's layout has a fixed-length array.
-The writer instead views these leaves as int32/int64 and stamps
+with `DECIMAL(p, s)`, the connector's layout. pyarrow writes a decimal32
+or decimal64 as a fixed-length array by default, and its
+`store_decimal_as_integer=True` is file-wide and ruled out (D15): it also
+turns a `decimal16` leaf and a top-level decimal column of precision 18
+or less into INT32/INT64, where the connector's layout has a fixed-length
+array. The writer instead views these leaves as int32/int64 and stamps
 `DECIMAL(p, s)` from the plan. The group's VARIANT annotation, which
-Arrow cannot carry, is the writer's to add too. Because
-each leaf's type names its precision and scale, the storage of `int64`
-or of `decimal8(18,6)` is never `==` that of `decimal8(18,2)`, and Arrow
-will not put the two in one column, a concat, a take or a sort. The one
-overlap is `decimal4`, `decimal8` and `decimal16` of one (p, s): the
-first two read back as `decimal128(p, s)`, the third's write form, and
-all three hold the same values. A declaration this version cannot honour
-raises `UnsupportedShreddingError` (upgrade pyhoglake) rather than write
+Arrow cannot carry, is the writer's to add too (see "Footer stamping"
+below). Because each leaf's type names its precision and scale, the
+storage of `int64` or of `decimal8(18,6)` is never `==` that of
+`decimal8(18,2)`, and Arrow will not put the two in one column, a
+concat, a take or a sort. The one overlap is `decimal4`, `decimal8` and
+`decimal16` of one (p, s): the first two read back as
+`decimal128(p, s)`, the third's write form, and all three hold the same
+values. A declaration this version cannot honour raises
+`UnsupportedShreddingError` (upgrade pyhoglake) rather than write
 another layout, or check storage against one it does not know: a node
 type it does not know, or any fault in a catalog column's declaration,
 which the server accepted. A catalog column's refusal names it.
@@ -533,6 +538,57 @@ produces the same registrations `prepare_append_files` produces for the
 same rows. Use `prepare_append_files` for files another writer produced
 (native VARIANT, `allow_optional_fields`); Arrow tables are refused for
 a VARIANT destination, because an Arrow rewrite loses the annotation.
+Such a file's column chunks are checked from its footer's bytes before
+their statistics are read, whatever the destination: pyarrow aborts the
+process (its C++ exception is never translated) when it reads a chunk
+whose type is not its schema leaf's, whose min or max is too short for
+the type, whose SizeStatistics do not fit the leaf, or that is
+encrypted, so those are refused with `ValidationError` instead, and so
+is a chunk path that is not UTF-8. Each chunk is held to its leaf as
+pyarrow reads the leaf, and the footer is read as Thrift's generated
+readers read it: a field spelled with a wire type parquet.thrift does
+not declare for it is skipped, as they skip it, and a footer that gives
+a field twice (a second schema list, say) is refused, since pyarrow and
+parquet-java read a repeat differently, as is a union (a logical type, a
+time unit, a column order) that spells two fields or none, which pyarrow
+reads as a struct and parquet-java reads as its first field, then out of
+step; one that spells a field id or an integer wider than they hold it
+in, since they keep only its low bits; and a list whose header names
+another item type than parquet.thrift declares, since they read its
+items as the declared type. A list, a set or a map in a field
+parquet.thrift does not define is refused too, naming where it is: one a
+later parquet.thrift adds could hide what the guard checks. A writer
+newer than pyhoglake can start writing one (pyarrow came to write
+SizeStatistics, whose histograms are lists, on every chunk), and then
+every file it writes is refused, valid as it is, until pyhoglake is
+upgraded or the writer pinned. A schema element (the root aside) without
+a `repetition_type` of REQUIRED, OPTIONAL or REPEATED is refused, which
+pyarrow reads as REQUIRED, and so is a group with a physical type, which
+pyarrow reads as a group: parquet-java (the server's hydrator) and the
+Trino connector cannot read either footer at all. So is an element whose
+annotation pyarrow and parquet-java read apart. pyarrow reads the
+logical type where there is one; parquet-java, and the connector after
+it, lets a converted type that spells another type win over it, so a
+timestamp in MICROS beside a converted TIMESTAMP_MILLIS was read there a
+thousand times too late, and a string beside a converted DATE not at
+all. Also refused are a logical type that sets no member parquet.thrift
+defines (pyarrow reads none, the connector throws), a DECIMAL its own
+scale or precision field contradicts, and an annotation parquet-java
+will not build on the element's type;
+`tests/vectors/schema_annotation_vectors.json` holds those rules to
+parquet-java, in the server's suite too. So are a required enum field (a
+chunk's codec, a page encoding stat's page type or encoding) of a value
+parquet.thrift does not define, which parquet-java reads as absent and
+refuses the footer for; a chunk whose `path_in_schema` is not its leaf's
+path, by which parquet-java and the connector find its column, and under
+which `extract_column_stats` files its statistics; and an
+IEEE_754_TOTAL_ORDER column order on anything but a FLOAT, a DOUBLE or a
+FLOAT16, which parquet-java will not build. Nothing no check reads is
+kept, and the row groups are checked one at a time as they are read, so
+the footer is read in memory linear in its bytes: about its own size for
+one that is mostly row groups, a few times it (the schema list, held as
+dicts) for a wide file's. The time is Python's, though, about 30 µs a
+column chunk, where pyarrow opens the footer in C++.
 
 | | |
 |---|---|
@@ -690,9 +746,85 @@ stats), and everything transactional happens server-side.
 
 Catalog columns may use `variant` (Iceberg v3). Publish native Parquet VARIANT(1)
 files with `Table.prepare_append_files` and the existing prepared-commit API.
-The client validates top-level field IDs, native annotations, scalar types and
-required-column null counts, then uploads the original bytes. Arrow `Table.append`
-does not construct VARIANT; an Arrow rewrite loses the annotation.
+The client validates top-level field IDs, native annotations, scalar types,
+column chunks (as for every prepared file, above) and required-column null
+counts, then uploads the original bytes. Arrow `Table.append` does not
+construct VARIANT; an Arrow rewrite loses the annotation.
+
+The group must be VARIANT(1) as the server's hydrator reads it, through
+parquet-java: a VariantType with an explicit `specification_version` of 1
+(an absent one reads as 0), no converted type beside it (one would win,
+as a MAP, say; a value ConvertedType does not define reads as none), and
+no physical type (refused for any group, above: an element with one is a
+primitive to parquet-java, which then cannot build the schema). By
+default the layout below the group is not checked beyond a REQUIRED
+binary `metadata` and what every prepared file is held to, so a file the
+Trino connector cannot read is published and fails at query time (the
+server never opens files). Pass `strict_variant=True` to refuse it before any
+upload. Each variant column must then be laid out as the VARIANT spec
+allows and the connector reads:
+
+- unshredded, exactly a REQUIRED binary `metadata` and a REQUIRED binary
+  `value` (the connector's only unshredded shape);
+- shredded, an OPTIONAL binary `value` beside an OPTIONAL `typed_value`
+  in the group and in each object field group, field groups and list
+  elements REQUIRED, lists of three levels, field names distinct case
+  aside, and each leaf one of the spec's types, its annotation read as
+  the connector reads it: the logical type, unless a converted type beside
+  it spells another (then the converted type), or else the converted type
+  alone (an unsigned integer, MILLIS, TIME adjusted to UTC, INT96, a bare
+  fixed-length array and a DECIMAL that parquet-java cannot build are
+  refused);
+- no field id below the group, and nothing shredded more than 128 levels
+  deep (as a value's nesting is counted);
+- a column that declares `type_params.shredding` is held to it: the same
+  fields, compared as sets, by name and type, and an unshredded file for
+  a declared `{"type": "variant"}`. A declaration this client cannot read
+  raises `UnsupportedShreddingError` ("upgrade pyhoglake") rather than go
+  unchecked.
+
+And a NOT NULL variant column in a file DuckDB wrote must prove it holds no
+SQL NULL from each row group's top-level statistics: either `value` has no
+null and the first byte of its smallest is above `00` (the connector reads
+a value's header byte alone, so `00 01` is a Variant null too), or `value`
+is all null and a `typed_value` leaf has no null. DuckDB writes SQL NULL as
+a present group holding a Variant null, which it and the connector read
+back as NULL, and the connector reads a row with neither `value` nor
+`typed_value` as a Variant null too; the `metadata` null counts see
+neither. Statistics count nulls, not rows, so a row group where only some
+rows have a `value` cannot prove that none has neither (one with both
+balances the count, and the connector returns the first as NULL before it
+fails on the second), and is refused, though DuckDB writes one whenever it
+shreds some of a row group's values and not others. A `typed_value` that
+shreds an object or an array proves nothing (its leaves count the nulls
+below it), so such a column with rows of no `value` is refused. That also
+refuses a JSON null in such a column, which those readers show as NULL
+too. DuckDB 1.5.5 writes an object's field groups and a list's elements
+OPTIONAL, so its files that shred either are refused: the connector
+tolerates OPTIONAL groups and reads them, but the spec does not allow them.
+Hedgerow, which publishes them, keeps the default. `strict_variant` has no
+effect on a table without variant columns.
+
+#### Footer stamping
+
+pyarrow writes a VARIANT column's storage as the plain struct it is, and
+cannot annotate it (it reads the annotation, and drops it on write). So
+pyhoglake's own VARIANT files are written with `store_schema=False` (an
+Arrow schema in the file would describe the plain struct, which pyarrow
+then reads back instead of the footer) and their footer is patched:
+`parquet_schema.stamp_variant_footer` splices `VARIANT(1)` into each
+variant group (7 bytes) and `DECIMAL(p, s)` into each decimal4/decimal8
+leaf (14 bytes), before each element's end, as the compact protocol encodes
+them. Nothing else in the footer is re-encoded and the file body is
+untouched, so every offset in the footer still holds; only the footer
+length changes, and the file size and `footer_size` are measured after the
+patch. Each precondition refuses loudly: a pyarrow that started writing
+these annotations itself, or wrote its footer fields in another order,
+stops the writes rather than publish an unchecked layout. The result is
+re-read by pyarrow and held to the declaration's layout element for element
+(`variant_layout_fault(mode="exact")`). `parquet_schema.write_variant_parquet`
+does all of it; the Arrow write paths call it once they accept VARIANT
+columns.
 
 VARIANT columns cannot be partition or sort keys, and have no whole-column
 statistics. Shredded child statistics are not published as catalog bounds.

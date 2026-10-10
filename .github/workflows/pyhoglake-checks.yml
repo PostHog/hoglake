@@ -64,6 +64,73 @@ jobs:
       - name: Tests
         run: uv run pytest -m "not integration" -q
 
+  # The unit suite on every pyarrow pyhoglake claims: the declared floor
+  # (pyproject.toml), millpond's pin, the lock, and the newest release. The
+  # VARIANT footer splice and layout checks rest on what pyarrow writes into
+  # a footer (which fields, in what order) and on how it reads a stamped
+  # file back, the floor's other reason is the statistics of an INT32/INT64
+  # decimal, and the lock alone pins none of it for an install that
+  # resolves another version. tests/test_pyarrow_floor.py checks this list
+  # names the floor, so raising one without the other reds.
+  #
+  # "latest" is a canary, not a gate: it resolves whatever pyarrow is newest
+  # when it runs, so a release would otherwise turn python-checks (and the
+  # pyhoglake publish, which runs these checks) red on a change that did
+  # nothing. It still reports its failure on the run; the pinned entries
+  # are the ones that block. It installs the newest pyarrow at least 7
+  # days old, not the newest: the canary runs a release's native code
+  # across the whole suite, on every run and in the publish run, so it
+  # keeps dependabot.yml's cooldown, and a malicious or broken release
+  # ages out before it runs here. It still trips on a release, a week on.
+  pyarrow:
+    name: Unit tests (pyarrow ${{ matrix.pyarrow }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: ${{ matrix.pyarrow == 'latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pyarrow: ["23.0.0", "23.0.1", "locked", "latest"]
+    defaults:
+      run:
+        working-directory: pyhoglake
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+
+      - run: uv sync --locked
+
+      # Over the locked environment, so everything else stays as tested;
+      # `uv run --no-sync` below keeps uv from putting the lock back.
+      - name: Install pyarrow ${{ matrix.pyarrow }}
+        if: matrix.pyarrow != 'locked'
+        env:
+          PYARROW: ${{ matrix.pyarrow }}
+        run: |
+          if [ "$PYARROW" = latest ]; then
+            uv pip install --upgrade \
+              --exclude-newer "$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ)" pyarrow
+          else
+            uv pip install "pyarrow==$PYARROW"
+          fi
+
+      - name: Report the pyarrow under test
+        env:
+          PYARROW: ${{ matrix.pyarrow }}
+        run: |
+          installed=$(uv run --no-sync python -c "import pyarrow; print(pyarrow.__version__)")
+          echo "pyarrow $installed"
+          case "$PYARROW" in
+            locked|latest) ;;
+            *) test "$installed" = "$PYARROW" ;;
+          esac
+
+      - name: Tests
+        run: uv run --no-sync pytest -m "not integration" -q
+
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest
