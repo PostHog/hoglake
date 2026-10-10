@@ -137,10 +137,12 @@ function positive(value: Int64 | undefined): boolean {
  *
  * Expiry's new_earliest_snapshot_id is deliberately ignored: it reports where
  * the floor STANDS, which every sweep does whether or not the floor moved.
- * Compaction's heap_budget_exceeded is ignored on the same footing: it is
- * the configured heap ceiling being obeyed, not a fault, and a table too
- * dense to pair reports the same count on every sweep until the
- * configuration changes.
+ * Compaction's budget refusals — spill_budget_exceeded, merge_budget_exceeded
+ * and the historical heap_budget_exceeded — are ignored on the same footing:
+ * they are a configured bound being obeyed, not a fault, and the same groups
+ * report the same count on every sweep until the configuration changes.
+ * spill_cleanup_failures is NOT ignored: it is disk the spill volume keeps
+ * counting toward the limit that evicts the pod.
  */
 export function isQuietRun(run: MaintenanceRun): boolean {
   if (run.status !== "ok") return false;
@@ -220,6 +222,10 @@ export function isQuietRun(run: MaintenanceRun): boolean {
         // signal that says the claims are working, so hiding it would
         // hide the feature from the only screen that shows a sweep.
         r.claimed_elsewhere,
+        r.spill_cleanup_failures,
+        // A retirement commits a snapshot and ends files without a single
+        // groups_compacted or files_in: hiding it would hide the commit.
+        r.groups_retired,
       ].some(positive);
     }
     case "verify": {
@@ -388,24 +394,82 @@ export function RunSummary({ run }: { run: MaintenanceRun }) {
           {formatCount(r.groups_compacted)} groups, {formatCount(r.files_in)}→
           {formatCount(r.files_out)} files, {formatBytes(r.bytes_in)}→
           {formatBytes(r.bytes_out)}
+          {positive(r.groups_retired) && (
+            <span className="subtle mono" title={RETIRED_TITLE}>
+              retired: {formatCount(r.groups_retired ?? "0")} fully-deleted group(s), no output
+            </span>
+          )}
           {positive(r.failed_groups) && (
             <span className="badge stats-failed">
               {formatCount(r.failed_groups)} failed (logged; retried next run)
+            </span>
+          )}
+          {positive(r.spill_cleanup_failures) && (
+            <span className="badge stats-failed" title={SPILL_CLEANUP_TITLE}>
+              {formatCount(r.spill_cleanup_failures ?? "0")} spill dir(s) left on disk
             </span>
           )}
           {(positive(r.skipped_conflicts) ||
             positive(r.dv_superseded) ||
             positive(r.unconvertible_schema) ||
             positive(r.invalid_data) ||
-            positive(r.heap_budget_exceeded)) && (
+            positive(r.heap_budget_exceeded) ||
+            positive(r.spill_budget_exceeded) ||
+            positive(r.merge_budget_exceeded)) && (
             <span className="badge badge-warn">
               skipped {formatCount(r.skipped_conflicts)}, dv-superseded{" "}
               {formatCount(r.dv_superseded)}, unconvertible{" "}
               {formatCount(r.unconvertible_schema)}, invalid-data{" "}
-              {formatCount(r.invalid_data ?? "0")},{" "}
-              <span className="th-hint" title={HEAP_BUDGET_TITLE}>
-                heap-budget {formatCount(r.heap_budget_exceeded ?? "0")}
-              </span>
+              {formatCount(r.invalid_data ?? "0")}
+              {positive(r.spill_budget_exceeded) && (
+                <>
+                  ,{" "}
+                  <span className="th-hint" title={SPILL_BUDGET_TITLE}>
+                    spill-budget {formatCount(r.spill_budget_exceeded ?? "0")}
+                  </span>
+                </>
+              )}
+              {positive(r.merge_budget_exceeded) && (
+                <>
+                  ,{" "}
+                  <span className="th-hint" title={MERGE_BUDGET_TITLE}>
+                    merge-budget {formatCount(r.merge_budget_exceeded ?? "0")}
+                  </span>
+                </>
+              )}
+              {positive(r.heap_budget_exceeded) && (
+                <>
+                  ,{" "}
+                  <span className="th-hint" title={HEAP_BUDGET_TITLE}>
+                    heap-budget {formatCount(r.heap_budget_exceeded ?? "0")}
+                  </span>
+                </>
+              )}
+            </span>
+          )}
+          {(positive(r.runs_trusted) || positive(r.runs_spilled)) && (
+            <span className="subtle mono" title={MERGE_RUNS_TITLE}>
+              sorted: {formatCount(r.runs_trusted ?? "0")} in place,{" "}
+              {formatCount(r.runs_spilled ?? "0")} spilled ({formatBytes(r.spill_bytes ?? "0")})
+              {positive(r.runs_demoted) && <>, {formatCount(r.runs_demoted ?? "0")} demoted</>}
+            </span>
+          )}
+          {(positive(r.files_verified) || positive(r.files_unsorted) || positive(r.files_unchecked)) && (
+            <span className="subtle mono" title={SORT_CHECK_TITLE}>
+              checked: {formatCount(r.files_verified ?? "0")} already sorted,{" "}
+              {formatCount(r.files_unsorted ?? "0")} unsorted
+              {positive(r.files_unchecked) && <>, {formatCount(r.files_unchecked ?? "0")} too small to check</>}
+            </span>
+          )}
+          {positive(r.row_groups_appended) && (
+            <span className="subtle mono" title={APPENDED_TITLE}>
+              appended: {formatCount(r.row_groups_appended ?? "0")} row group(s) (
+              {formatBytes(r.bytes_appended ?? "0")})
+            </span>
+          )}
+          {positive(r.files_unranged) && (
+            <span className="subtle mono" title={UNRANGED_TITLE}>
+              not appended: {formatCount(r.files_unranged ?? "0")} file(s) with no usable sort-key range
             </span>
           )}
         </>
@@ -540,17 +604,83 @@ const TASK_FILTER_KEY = "hoglake-runs-task";
 const HIDE_QUIET_KEY = "hoglake-runs-hide-quiet";
 const SWITCH = ["on", "off"] as const;
 
-// For an operator who does not know the sorted rewrite path. The count
-// is FILES (CompactionService's refused list), not groups.
+// HISTORICAL: only a ledger row an older server recorded can carry a
+// nonzero count, so the title says what it was and that it is gone.
 const HEAP_BUDGET_TITLE =
-  "Files that compaction left as they are on this run because they have " +
-  "too many rows to merge. A table with a sort order is compacted by " +
-  "sorting a group of files in memory, and the memory for that sort is " +
-  "limited (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES). Each of these files " +
-  "has too many rows to share a group with another file. The rest of " +
-  "the table still compacts, and no data is lost or wrong. To clear it, " +
-  "raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES on a pod with enough " +
-  "memory, or remove the table's sort order.";
+  "A count from before compaction sorted with an external merge sort. " +
+  "Older servers sorted a whole group of files in memory and left out " +
+  "files with too many rows for the memory limit " +
+  "(HOGLAKE_COMPACTION_SORTED_HEAP_BYTES). Current servers sort in " +
+  "chunks on local disk and never produce this count; this run was " +
+  "recorded by an older server.";
+
+// For an operator who does not know that sorted compaction uses local disk.
+const SPILL_BUDGET_TITLE =
+  "Groups of a sorted table that compaction did not rewrite because " +
+  "sorting them would write more to local disk than one rewrite may " +
+  "(HOGLAKE_COMPACTION_SPILL_BYTES). The limit exists because filling " +
+  "that disk does not fail the write: Kubernetes evicts the whole pod, " +
+  "which on a maintenance pod also stops expiry, cleanup, retirement and " +
+  "reindex until it is rescheduled. Nothing " +
+  "is lost or wrong, and the same groups are skipped on every run until " +
+  "the limit is raised together with the disk, or the target size is " +
+  "lowered.";
+
+const MERGE_BUDGET_TITLE =
+  "Groups of a sorted table that compaction did not rewrite because " +
+  "merging their sorted pieces would need more memory than one rewrite " +
+  "may use (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES, divided by the number " +
+  "of groups compacted at once). Only the configuration causes this: " +
+  "the memory limit is small for the target size. Nothing is lost or " +
+  "wrong; raise the memory limit on a pod with enough memory, or lower " +
+  "the target size.";
+
+const SPILL_CLEANUP_TITLE =
+  "Sorted rewrites whose temporary files on local disk could not be " +
+  "deleted afterwards. The compacted files are correct, but the disk " +
+  "still holds the temporary ones and counts them toward its limit " +
+  "until the server restarts. The server log names the directory.";
+
+const MERGE_RUNS_TITLE =
+  "How the sorted rewrite worked: files already in sort order — written " +
+  "by an earlier compaction, or checked and found sorted — are read in " +
+  "place; everything else is sorted in pieces on local disk first, which " +
+  "costs extra time but no extra reads from storage.";
+
+const APPENDED_TITLE =
+  "Row groups copied into the output as they are, without being decoded " +
+  "and re-encoded: inputs that are earlier compaction outputs of the same " +
+  "schema, with no deleted rows and row groups of at least 32 MiB. On a " +
+  "sorted table only when an input's sort-key range does not overlap " +
+  "any other input's, so its rows stay one sorted block. Several times " +
+  "cheaper than rewriting the same bytes.";
+
+const RETIRED_TITLE =
+  "Groups in which every row of every file had already been deleted. " +
+  "Compaction read each file to confirm it, then retired the files and " +
+  "their deletion files in a snapshot of their own without writing a " +
+  "replacement file. These groups are not counted in the groups and " +
+  "files numbers before this note.";
+
+const UNRANGED_TITLE =
+  "Files that stopped a sorted rewrite from copying an earlier output " +
+  "into the new file as it is. Copying is only safe when an input's " +
+  "sort-key range does not overlap any other input's, and these files " +
+  "have no usable range: no statistics, or a float/double first sort key " +
+  "(NaN is left out of the statistics). Counted only when an earlier " +
+  "output would otherwise have been copied — every other range it was " +
+  "checked against was known and did not overlap. The group was merged " +
+  "instead — slower, never wrong.";
+
+const SORT_CHECK_TITLE =
+  "Before sorting, the rewrite reads only the sort columns of each input " +
+  "to see whether it is already in order. Files that are (a writer that " +
+  "sorts its output) are read in place and never written to local disk; " +
+  "files that are out of order, or not checkable (id-less columns, a key " +
+  "under a container, an unsortable physical type, a null row-id carrier), " +
+  "are sorted on local disk. Files smaller than " +
+  "HOGLAKE_COMPACTION_VERIFY_MIN_BYTES are not checked: a small file is " +
+  "cheapest to sort on local disk with the others.";
 
 // For an operator who sees the badge and does not know where a leftover
 // comes from.

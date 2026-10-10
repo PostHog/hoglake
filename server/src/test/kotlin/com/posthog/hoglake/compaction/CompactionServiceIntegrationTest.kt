@@ -2119,9 +2119,21 @@ class CompactionServiceIntegrationTest {
 
     // ---- DV pathology ------------------------------------------------------
 
-    @Test
-    fun `an all-deleted group commits an empty output`() {
-        val cat = "compact-empty-${counter.incrementAndGet()}"
+    /**
+     * Catalog with an unsorted table ns.t and two small files: e0 holds
+     * ids 1 and 2 (row ids 0..1), e1 holds id 3 (row id 2). A real puffin
+     * DV kills every row of e0; e1 is killed too unless [liveSecond]. The
+     * two files pack into one group at a 2 KiB target.
+     */
+    private class DeadFixture(
+        val cat: String,
+        val fileIds: List<Long>,
+        val paths: List<String>,
+        val dvPaths: List<String>,
+    )
+
+    private fun deadFixture(liveSecond: Boolean = false): DeadFixture {
+        val cat = "compact-dead-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
         catalogs.createTable(
@@ -2145,29 +2157,316 @@ class CompactionServiceIntegrationTest {
                 FileRegistration(path, rows.size.toLong(), bytes.size.toLong())
             }
         commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", "t", regs))))
-        val fileIds =
-            catalogs.listFiles(cat, "ns", "t").sortedBy { it.rowIdStart }.map { it.dataFileId }
-        // Every row of every input dies.
-        registerDv(cat, fileIds[0], "s3://$BUCKET/$cat/dv/e0.puffin", listOf(0L, 1L))
-        registerDv(cat, fileIds[1], "s3://$BUCKET/$cat/dv/e1.puffin", listOf(0L))
+        val fileIds = catalogs.listFiles(cat, "ns", "t").sortedBy { it.rowIdStart }.map { it.dataFileId }
+        val dvPaths = mutableListOf("s3://$BUCKET/$cat/dv/e0.puffin")
+        registerDv(cat, fileIds[0], dvPaths[0], listOf(0L, 1L))
+        if (!liveSecond) {
+            dvPaths += "s3://$BUCKET/$cat/dv/e1.puffin"
+            registerDv(cat, fileIds[1], dvPaths[1], listOf(0L))
+        }
+        return DeadFixture(cat, fileIds, regs.map { it.path }, dvPaths)
+    }
 
-        val result = svc.runOnce(cat, cfg.copy(targetBytes = 2048))
-        assertThat(result.groupsCompacted).isEqualTo(1)
+    private val deadCfg = cfg.copy(targetBytes = 2048)
+
+    /** (end_snapshot) of every data file row of [cat], live or not, by data_file_id. */
+    private fun fileEnds(cat: String): Map<Long, Long?> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT f.data_file_id, f.end_snapshot FROM hog_data_file f
+                JOIN hog_catalog c ON c.catalog_id = f.catalog_id
+                WHERE c.name = :cat
+                """,
+            )
+                .bind("cat", cat)
+                .map { rs, _ -> rs.getLong(1) to rs.getObject(2)?.let { (it as Number).toLong() } }
+                .list()
+                .toMap()
+        }
+
+    /** (path -> end_snapshot) of every deletion vector row of [cat]. */
+    private fun dvEnds(cat: String): Map<String, Long?> =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT d.path, d.end_snapshot FROM hog_delete_file d
+                JOIN hog_catalog c ON c.catalog_id = d.catalog_id
+                WHERE c.name = :cat
+                """,
+            )
+                .bind("cat", cat)
+                .map { rs, _ -> rs.getString(1) to rs.getObject(2)?.let { (it as Number).toLong() } }
+                .list()
+                .toMap()
+        }
+
+    private fun nextFileId(cat: String): Long =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery("SELECT next_file_id FROM hog_catalog WHERE name = :cat")
+                .bind("cat", cat)
+                .mapTo(Long::class.java)
+                .one()
+        }
+
+    private fun lastLedgerResult(cat: String): com.fasterxml.jackson.databind.JsonNode =
+        db.jdbi.withHandleUnchecked { h ->
+            h.createQuery(
+                """
+                SELECT CAST(result AS text) FROM hog_maintenance_run
+                 WHERE catalog_id = (SELECT catalog_id FROM hog_catalog WHERE name = :cat)
+                   AND task = 'compaction'
+                 ORDER BY run_id DESC LIMIT 1
+                """,
+            ).bind("cat", cat).mapTo(String::class.java).one()
+        }.let { com.fasterxml.jackson.databind.ObjectMapper().readTree(it) }
+
+    @Test
+    fun `a group whose every input is fully deleted retires its inputs and registers no output`() {
+        // This group used to COMMIT ITS EMPTY OUTPUT: a live hog_data_file
+        // row with record_count 0 and a row_id_start (the inputs' minimum)
+        // owned by no row in it. Now the rewrite still runs — reading every
+        // input through its DV is the proof the group is dead — and the
+        // commit retires the inputs with nothing in their place.
+        val registry =
+            io.micrometer.prometheusmetrics.PrometheusMeterRegistry(
+                io.micrometer.prometheusmetrics.PrometheusConfig.DEFAULT,
+            )
+        com.posthog.hoglake.observability.Metrics.bind(registry)
+        val fx = deadFixture()
+        val headBefore = catalogs.getCatalog(fx.cat).headSnapshotId
+        val fileIdBefore = nextFileId(fx.cat)
+
+        val result = svc.runOnce(fx.cat, deadCfg)
+        assertThat(result.groupsRetired).isEqualTo(1)
+        assertThat(result.groupsCompacted).describedAs("a retirement is not a compaction").isZero()
+        assertThat(listOf(result.filesIn, result.filesOut, result.bytesIn, result.bytesOut))
+            .containsOnly(0L)
+        assertThat(result.failedGroups).isZero()
+
+        // ONE new snapshot, a table_compacted change, its own message.
+        val head = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(head).isEqualTo(headBefore + 1)
+        val (kind, message) =
+            db.jdbi.withHandleUnchecked { h ->
+                h.createQuery(
+                    """
+                    SELECT ch.kind, s.commit_message FROM hog_snapshot s
+                    JOIN hog_catalog c ON c.catalog_id = s.catalog_id
+                    JOIN hog_snapshot_change ch
+                      ON ch.catalog_id = s.catalog_id AND ch.snapshot_id = s.snapshot_id
+                    WHERE c.name = :cat AND s.snapshot_id = :snap
+                    """,
+                )
+                    .bind("cat", fx.cat)
+                    .bind("snap", head)
+                    .map { rs, _ -> rs.getString(1) to rs.getString(2) }
+                    .one()
+            }
+        assertThat(kind).isEqualTo("table_compacted")
+        assertThat(message).isEqualTo("retired 2 fully-deleted files of ns.t")
+
+        // The inputs AND their DVs end at that snapshot; NO file row was
+        // added and no file id was spent.
+        assertThat(fileEnds(fx.cat)).isEqualTo(fx.fileIds.associateWith { head })
+        assertThat(dvEnds(fx.cat)).isEqualTo(fx.dvPaths.associateWith { head })
+        assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()
+        assertThat(nextFileId(fx.cat)).describedAs("nothing registered, so no id allocated").isEqualTo(fileIdBefore)
+        // Time travel below the retirement still sees the inputs.
+        assertThat(catalogs.listFiles(fx.cat, "ns", "t", snapshot = headBefore).map { it.path })
+            .containsExactlyInAnyOrderElementsOf(fx.paths)
+
+        // The empty object the rewrite uploaded is NOT registered and NOT
+        // settled: its staging ticket is undrained, exactly as a lost race
+        // leaves it, so the drain is what disposes of it.
+        val staged = removalRows(fx.cat).single { it.reason == "compaction_staging" }
+        assertThat(staged.drainedOutcome).isNull()
+        assertThat(removalStore.exists(staged.path)).isTrue()
+        CatalogInvariants.assertRemovalQueueUnreferenced(db.jdbi, fx.cat)
+        CatalogInvariants.assertVisibilityBounds(db.jdbi, fx.cat)
+
+        val ledger = lastLedgerResult(fx.cat)
+        assertThat(ledger["groups_retired"].asLong()).isEqualTo(1)
+        assertThat(ledger["groups_compacted"].asLong()).isZero()
+        assertThat(registry.scrape())
+            .contains("hoglake_compaction_groups_retired_total{catalog=\"${fx.cat}\"} 1.0")
+            .doesNotContain("hoglake_compaction_groups_total{catalog=\"${fx.cat}\"}")
+
+        // Nothing left to plan: the retired files are not candidates.
+        assertThat(svc.planTable(fx.cat, "ns", "t", deadCfg).groups).isEmpty()
+        val again = svc.runOnce(fx.cat, deadCfg)
+        assertThat(again.groupsRetired + again.groupsCompacted).isZero()
+        assertThat(catalogs.getCatalog(fx.cat).headSnapshotId).isEqualTo(head)
+
+        // The drain reclaims the empty object.
+        val drained = cleanup.runOnce(fx.cat, batchSize = 100)
+        assertThat(drained.removed).isEqualTo(1)
+        assertThat(drained.stillReferenced).isZero()
+        assertThat(removalStore.exists(staged.path)).isFalse()
+        assertThat(removalRows(fx.cat).single { it.reason == "compaction_staging" }.drainedOutcome)
+            .isEqualTo("deleted")
+    }
+
+    /**
+     * The SORTED twin of [deadFixture], built so the dead group holds a
+     * METADATA-TRUSTED run: ns.t sorted by score, two client files
+     * compacted into an output O (explicit_row_ids, registered after the
+     * spec began), then a client file e2 appended and every row of O and
+     * e2 deleted by real DVs. [DeadFixture.fileIds] is (O, e2).
+     */
+    private fun sortedDeadFixture(): DeadFixture {
+        val cat = "compact-dead-sorted-${counter.incrementAndGet()}"
+        catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
+        catalogs.createNamespace(cat, "ns")
+        catalogs.createTable(
+            cat,
+            "ns",
+            "t",
+            listOf(
+                ColumnDef("id", ColType.LONG, nullable = false),
+                ColumnDef("name", ColType.STRING),
+                ColumnDef("score", ColType.DOUBLE),
+            ),
+        )
+        alter.alterTable(
+            cat,
+            "ns",
+            "t",
+            listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(3, SortDirection.ASC, NullOrder.NULLS_LAST)))),
+        )
+
+        fun append(
+            name: String,
+            rows: List<TestRow>,
+        ): String {
+            val bytes = parquetBytes(rows)
+            val path = "s3://$BUCKET/$cat/data/ns/t/$name.parquet"
+            store.put(path, bytes)
+            commits.commit(
+                cat,
+                CommitRequest(
+                    appends =
+                        listOf(
+                            TableAppend(
+                                "ns",
+                                "t",
+                                listOf(FileRegistration(path, rows.size.toLong(), bytes.size.toLong())),
+                            ),
+                        ),
+                ),
+            )
+            return path
+        }
+        append("e0", listOf(TestRow(1, "a", 2.0), TestRow(2, "b", 1.0)))
+        append("e1", listOf(TestRow(3, "c", 3.0)))
+        assertThat(svc.runOnce(cat, cfg).groupsCompacted).describedAs("the prior output").isEqualTo(1)
         val output = catalogs.listFiles(cat, "ns", "t").single()
         assertThat(output.explicitRowIds).isTrue()
-        assertThat(output.recordCount).isZero()
-        assertThat(output.rowIdStart).isZero() // min input start: diagnostics only
-        assertThat(readRowIds(store.get(output.path))).isEmpty()
-        // AN EMPTY FILE'S STATS ARE KNOWN, not pending: the writer's
-        // footer has zero row groups, so the aggregate is legitimately
-        // empty and the file registers 'provided' with no rows rather
-        // than waiting for a hydrator sweep that would read the same
-        // footer and reach the same answer. A pending empty file would
-        // be re-fetched from S3 forever by a sweep that can never
-        // improve on it.
-        assertThat(output.statsState.wire).isEqualTo("provided")
-        assertThat(storedStats(cat, output.dataFileId)).isEmpty()
-        assertThat(scans.planScan(cat, "ns", "t").single().deleteFile).isNull()
+        val e2 = append("e2", listOf(TestRow(4, "d", 5.0), TestRow(5, "e", 4.0)))
+        val e2Id = catalogs.listFiles(cat, "ns", "t").single { it.path == e2 }.dataFileId
+        val dvPaths = listOf("s3://$BUCKET/$cat/dv/output.puffin", "s3://$BUCKET/$cat/dv/e2.puffin")
+        registerDv(cat, output.dataFileId, dvPaths[0], listOf(0L, 1L, 2L))
+        registerDv(cat, e2Id, dvPaths[1], listOf(0L, 1L))
+        return DeadFixture(cat, listOf(output.dataFileId, e2Id), listOf(output.path, e2), dvPaths)
+    }
+
+    @Test
+    fun `a fully deleted group on a sorted table retires through the sorted rewrite, trusted run included`() {
+        // The sorted path's own empty shape: the trusted run passes
+        // confirmFooters, cannot append (it has a DV), and the merge drains
+        // an empty queue — e2's rows all die in the chunk phase — so the
+        // rewrite writes 0 rows and the commit retires the group.
+        val fx = sortedDeadFixture()
+        val local = CompactionService(db.jdbi, store, cfg)
+        var built: List<ParquetRewriter.Input> = emptyList()
+        local.beforeRewrite = { built = it }
+        val group = local.planTable(fx.cat, "ns", "t", cfg).groups.single()
+        assertThat(group.files.map { it.dataFileId }).containsExactlyInAnyOrderElementsOf(fx.fileIds)
+        assertThat(group.survivingRecords).isZero()
+        val headBefore = catalogs.getCatalog(fx.cat).headSnapshotId
+        val fileIdBefore = nextFileId(fx.cat)
+        val endedBefore = fileEnds(fx.cat).filterKeys { it !in fx.fileIds }
+
+        val outcome = local.compactPlannedGroup(fx.cat, "ns", "t", group)
+        assertThat(outcome).isInstanceOf(CompactionService.GroupOutcome.Retired::class.java)
+        assertThat(built.single { it.label == fx.paths[0] }.trustedSorted)
+            .describedAs("the prior output is a metadata-trusted run")
+            .isTrue()
+
+        val head = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(head).isEqualTo(headBefore + 1)
+        assertThat((outcome as CompactionService.GroupOutcome.Retired).snapshotId).isEqualTo(head)
+        assertThat(fileEnds(fx.cat))
+            .isEqualTo(endedBefore + fx.fileIds.associateWith { head })
+        assertThat(dvEnds(fx.cat).filterKeys { it in fx.dvPaths }).isEqualTo(fx.dvPaths.associateWith { head })
+        assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()
+        assertThat(nextFileId(fx.cat)).isEqualTo(fileIdBefore)
+        val staged = removalRows(fx.cat).single { it.reason == "compaction_staging" && it.drainedOutcome == null }
+        assertThat(removalStore.exists(staged.path)).isTrue()
+        CatalogInvariants.assertRemovalQueueUnreferenced(db.jdbi, fx.cat)
+        CatalogInvariants.assertVisibilityBounds(db.jdbi, fx.cat)
+        assertThat(cleanup.runOnce(fx.cat, batchSize = 100).removed).isEqualTo(1)
+        assertThat(removalStore.exists(staged.path)).isFalse()
+
+        // The same shape through a sweep: the ledger and the run counters.
+        val swept = sortedDeadFixture()
+        val result = svc.runOnce(swept.cat, cfg)
+        assertThat(result.groupsRetired).isEqualTo(1)
+        assertThat(result.groupsCompacted).isZero()
+        assertThat(result.runsTrusted).describedAs("the prior output, read in place").isEqualTo(1)
+        assertThat(result.runsSpilled).describedAs("e2's rows all died: no chunk to spill").isZero()
+        assertThat(result.rowGroupsAppended).describedAs("a run with a DV never appends").isZero()
+        assertThat(catalogs.listFiles(swept.cat, "ns", "t")).isEmpty()
+        val ledger = lastLedgerResult(swept.cat)
+        assertThat(ledger["groups_retired"].asLong()).isEqualTo(1)
+        assertThat(ledger["runs_trusted"].asLong()).isEqualTo(1)
+        assertThat(ledger.has("runs_spilled")).describedAs("zero is omitted from the stored row").isFalse()
+    }
+
+    @Test
+    fun `a group with one dead input and one live input still compacts into one output`() {
+        val fx = deadFixture(liveSecond = true)
+        val result = svc.runOnce(fx.cat, deadCfg)
+        assertThat(result.groupsCompacted).isEqualTo(1)
+        assertThat(result.groupsRetired).isZero()
+        assertThat(result.filesIn).isEqualTo(2)
+        val output = catalogs.listFiles(fx.cat, "ns", "t").single()
+        assertThat(output.recordCount).isEqualTo(1)
+        assertThat(output.rowIdStart).describedAs("the one survivor's id").isEqualTo(2)
+        val (_, rows) = readParquet(store.get(output.path))
+        assertThat(rows).containsExactly(OutRow(3, "c", 3.0, 2))
+        assertThat(removalRows(fx.cat).single { it.reason == "compaction_staging" }.drainedOutcome)
+            .isEqualTo("registered")
+        val head = catalogs.getCatalog(fx.cat).headSnapshotId
+        assertThat(fileEnds(fx.cat).filterKeys { it in fx.fileIds }).isEqualTo(fx.fileIds.associateWith { head })
+        assertThat(dvEnds(fx.cat)).isEqualTo(fx.dvPaths.associateWith { head })
+    }
+
+    @Test
+    fun `a DV superseded after planning a zero-survivor group is dv_superseded, not a retirement`() {
+        val fx = deadFixture()
+        val group = svc.planTable(fx.cat, "ns", "t", deadCfg).groups.single()
+        assertThat(group.survivingRecords).isZero()
+
+        // The race: e0's vector is superseded (same positions — vectors
+        // only grow, and equal is allowed) after the plan. The rewrite
+        // applies the PLANNED vector, which is no longer live.
+        val superseding = "s3://$BUCKET/${fx.cat}/dv/e0-again.puffin"
+        registerDv(fx.cat, fx.fileIds[0], superseding, listOf(0L, 1L))
+        val headBefore = catalogs.getCatalog(fx.cat).headSnapshotId
+
+        assertThat(svc.compactPlannedGroup(fx.cat, "ns", "t", group))
+            .isEqualTo(CompactionService.GroupOutcome.SkippedDvSuperseded)
+        assertThat(catalogs.getCatalog(fx.cat).headSnapshotId).isEqualTo(headBefore)
+        assertThat(fileEnds(fx.cat).values).containsOnlyNulls()
+        assertThat(dvEnds(fx.cat)[superseding]).isNull()
+        val staged = removalRows(fx.cat).single { it.reason == "compaction_staging" }
+        assertThat(staged.drainedOutcome).isNull()
+
+        // The next sweep plans against the live vector and retires.
+        val rerun = svc.runOnce(fx.cat, deadCfg)
+        assertThat(rerun.groupsRetired).isEqualTo(1)
+        assertThat(catalogs.listFiles(fx.cat, "ns", "t")).isEmpty()
     }
 
     @Test

@@ -59,7 +59,7 @@ class S3InputFile(
     private val path: String,
     private val length: Long,
     private val footerSizeHint: Long? = null,
-    private val readaheadBytes: Int = DEFAULT_READAHEAD_BYTES,
+    internal val readaheadBytes: Int = DEFAULT_READAHEAD_BYTES,
     private val maxPrefetchBytes: Int = DEFAULT_MAX_PREFETCH_BYTES,
 ) : InputFile {
     init {
@@ -71,6 +71,17 @@ class S3InputFile(
 
     override fun newStream(): SeekableInputStream =
         S3SeekableInputStream(store, path, length, footerSizeHint, readaheadBytes, maxPrefetchBytes)
+
+    /**
+     * A stream that does NOT prefetch the footer tail: for a reader that
+     * already has the footer and only wants data ranges — the byte-level
+     * row-group append ([OutputWriter.appendRowGroups]), which copies
+     * column chunks of a file whose footer the open reader already holds.
+     * [newStream]'s prefetch would repeat that footer GET per appended
+     * input for bytes nobody reads.
+     */
+    fun newDataStream(): SeekableInputStream =
+        S3SeekableInputStream(store, path, length, null, readaheadBytes, maxPrefetchBytes)
 
     /**
      * The object URI: parquet-java and this package's error messages
@@ -86,6 +97,20 @@ class S3InputFile(
          * pattern) does not throw away much.
          */
         const val DEFAULT_READAHEAD_BYTES: Int = 8 * 1024 * 1024
+
+        /**
+         * 256 KiB, for the sorted rewrite's sortedness pre-pass, which
+         * reads only the sort-key column chunks of each row group. Those
+         * are NOT adjacent: the other columns sit between them, so every
+         * key chunk is its own ranged read, and a read shorter than the
+         * readahead is padded up to it. At [DEFAULT_READAHEAD_BYTES] that
+         * pads every key chunk to 8 MiB — for a wide table, most of the
+         * file fetched to check a few columns. 256 KiB keeps a small key
+         * chunk to one modest request (a chunk larger than it is read in
+         * one request of its own size anyway, since a read asks for at
+         * least what it needs) while bounding the over-read per chunk.
+         */
+        const val KEY_COLUMN_READAHEAD_BYTES: Int = 256 * 1024
 
         /**
          * Ceiling on the footer prefetch. 64 MiB: real footers get large

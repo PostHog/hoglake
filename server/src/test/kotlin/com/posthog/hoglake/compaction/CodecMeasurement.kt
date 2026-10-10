@@ -99,26 +99,38 @@ object CodecMeasurement {
         var uncompressed = 0L
         // UNCOMPRESSED first: it is the baseline the other rows divide by,
         // and it is the behaviour this measurement exists to price.
+        // zstd twice: at the default level and at parquet-java's own
+        // default of 3, which DEFAULT_ZSTD_LEVEL was until the rewrite's
+        // profile showed level 3 buying no size on event data for its CPU.
         val order =
-            listOf(CompressionCodecName.UNCOMPRESSED) +
+            listOf(ParquetRewriter.OutputCodec(CompressionCodecName.UNCOMPRESSED)) +
                 ParquetRewriter.SUPPORTED.filter { it != CompressionCodecName.UNCOMPRESSED }.sortedBy { it.name }
+                    .flatMap { name ->
+                        if (name == CompressionCodecName.ZSTD) {
+                            listOf(ParquetRewriter.OutputCodec(name), ParquetRewriter.OutputCodec(name, zstdLevel = 3))
+                        } else {
+                            listOf(ParquetRewriter.OutputCodec(name))
+                        }
+                    }
         for (codec in order) {
-            val out = dir.resolve("$shape-out-${codec.name}.parquet")
+            val label =
+                if (codec.name == CompressionCodecName.ZSTD) "zstd-${codec.zstdLevel}" else codec.name.name.lowercase()
+            val out = dir.resolve("$shape-out-$label.parquet")
             val started = System.nanoTime()
             rewriteToLocal(
                 inputs,
                 live,
                 emptyList(),
                 out,
-                codec = ParquetRewriter.OutputCodec(codec),
+                codec = codec,
             )
             val seconds = (System.nanoTime() - started) / 1e9
             val bytes = out.fileSize()
-            if (codec == CompressionCodecName.UNCOMPRESSED) uncompressed = bytes
+            if (codec.name == CompressionCodecName.UNCOMPRESSED) uncompressed = bytes
             println(
                 String.format(
                     "   %-14s %14s %9.2fx %9s %10.2f",
-                    codec.name.lowercase(),
+                    label,
                     fmt(bytes),
                     bytes.toDouble() / inputBytes,
                     if (uncompressed == 0L) "-" else String.format("%.2fx", bytes.toDouble() / uncompressed),

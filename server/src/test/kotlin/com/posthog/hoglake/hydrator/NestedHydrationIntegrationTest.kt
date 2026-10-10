@@ -228,18 +228,19 @@ class NestedHydrationIntegrationTest {
     }
 
     @Test
-    fun `a nested SORTED table is planned under the derated group budget`() {
-        // F2's boundary, end to end through the planner. The sorted path
-        // materializes a whole group to sort it, and a nested group's
-        // object graph measured 30-70x its compressed bytes — so
-        // targetBytes is not a heap bound for such a table and the
-        // planner derates it by nestedSortExpansion.
+    fun `a nested SORTED table packs to the raw target and sorts in derated chunks`() {
+        // F2's boundary used to be a GROUP budget: the sorted path
+        // materialized a whole group, a nested group's object graph
+        // measured 30-70x its compressed bytes, so the planner derated a
+        // nested sorted table's byte target by nestedSortExpansion and its
+        // files fell out of the plan. hoglake#134 made the sorted rewrite
+        // an external merge sort, and the derate now sizes only the CHUNK
+        // it materializes at a time. So: the same derate that used to
+        // split this table out of the plan now leaves it grouping like the
+        // unsorted one, and shows up as more, smaller spill files instead.
         //
-        // The test pins the BOUNDARY, not the arithmetic: with a budget
-        // the pair exactly reaches, the group forms; with the same raw
-        // budget and a derate applied, it does not — and an UNSORTED
-        // table with the same derate still groups, because only the
-        // sorted path materializes.
+        // An expansion large enough to force a ONE-row chunk, under a
+        // merge budget that fits the four spilled runs that makes.
         val cat = "nested-derate-${counter.incrementAndGet()}"
         catalogs.createCatalog(cat, "s3://$BUCKET/$cat")
         catalogs.createNamespace(cat, "ns")
@@ -252,15 +253,12 @@ class NestedHydrationIntegrationTest {
             "sorted",
             listOf(AlterOp.SetSortOrder(listOf(SortFieldDef(1, SortDirection.ASC, NullOrder.NULLS_LAST)))),
         )
-
-        val sizes = mutableListOf<Long>()
         for (table in listOf("sorted", "unsorted")) {
             val regs =
                 listOf(0, 1).map { half ->
                     val bytes = nestedParquet(half)
                     val path = "s3://$BUCKET/$cat/data/ns/$table/f$half.parquet"
                     store.put(path, bytes)
-                    sizes += bytes.size.toLong()
                     FileRegistration(
                         path = path,
                         recordCount = 2,
@@ -273,66 +271,40 @@ class NestedHydrationIntegrationTest {
         }
         hydrator.runOnce()
 
-        // The budget at which the pair exactly reaches the target.
-        val raw = configFor(sizes.take(2))
-
-        // Derate OFF: both tables group, which is the premise — without
-        // it "does not group" below would prove nothing.
-        val noDerate = raw.copy(nestedSortExpansion = 1)
-        assertThat(noDerate.effectiveTargetBytes(columnsOf(cat, "sorted"), sorted = true))
-            .isEqualTo(raw.targetBytes)
-        assertThat(compaction.runOnce(cat, noDerate).groupsCompacted)
-            .describedAs("premise: at the raw budget both tables have a group")
-            .isEqualTo(2)
-
-        // Now the same files again, with the derate ON.
-        for (table in listOf("sorted", "unsorted")) {
-            val regs =
-                listOf(0, 1).map { half ->
-                    val bytes = nestedParquet(half)
-                    val path = "s3://$BUCKET/$cat/data/ns/$table/g$half.parquet"
-                    store.put(path, bytes)
-                    FileRegistration(
-                        path = path,
-                        recordCount = 2,
-                        fileSizeBytes = bytes.size.toLong(),
-                        footerSize = footerSizeOf(bytes),
-                        columnStats = null,
-                    )
-                }
-            commits.commit(cat, CommitRequest(appends = listOf(TableAppend("ns", table, regs))))
-        }
-        hydrator.runOnce()
-
-        val derated = raw.copy(nestedSortExpansion = 64)
-        assertThat(derated.effectiveTargetBytes(columnsOf(cat, "sorted"), sorted = true))
-            .describedAs("a nested SORTED table is planned smaller")
-            .isEqualTo(maxOf(2L, raw.targetBytes / 64))
-        assertThat(derated.effectiveTargetBytes(columnsOf(cat, "unsorted"), sorted = false))
-            .describedAs("an UNSORTED table streams, so it keeps the raw budget")
-            .isEqualTo(raw.targetBytes)
-
-        // Only the unsorted table still forms a group: the sorted one's
-        // files are now each above its derated budget.
-        val result = compaction.runOnce(cat, derated)
-        assertThat(result.groupsCompacted)
-            .describedAs("the derate splits the nested sorted table out of the plan")
+        val spillDir = java.nio.file.Files.createTempDirectory("nested-spill")
+        val cfg =
+            CompactionConfig(
+                targetBytes = 1L shl 20,
+                minInputFiles = 2,
+                maxGroupsPerRun = 4,
+                sortedHeapBytes = 128L shl 20,
+                nestedSortExpansion = Int.MAX_VALUE,
+                spillDir = spillDir,
+            )
+        assertThat(cfg.spillChunkRows(columnsOf(cat, "sorted")))
+            .describedAs("the nested derate reaches the chunk")
             .isEqualTo(1)
-        assertThat(liveFileCount(cat, "sorted"))
-            .describedAs("the sorted table's new files stayed uncompacted")
-            .isEqualTo(3) // the earlier run's output + the two new ones
+        val result = compaction.runOnce(cat, cfg)
+        assertThat(result.groupsCompacted)
+            .describedAs("the derate no longer splits the nested sorted table out of the plan: %s", result)
+            .isEqualTo(2)
+        assertThat(result.runsSpilled).describedAs("four rows, one per chunk").isEqualTo(4)
+        assertThat(liveFileCount(cat, "sorted")).isEqualTo(1)
+        assertThat(liveFileCount(cat, "unsorted")).isEqualTo(1)
+        assertThat(java.nio.file.Files.list(spillDir).use { it.count() }).isZero()
     }
 
     @Test
-    fun `a FLAT sorted table keeps the raw budget however large the derate`() {
+    fun `a FLAT sorted table's chunk is not derated however large the derate`() {
         // The derate is about nested object graphs, not about sorting.
-        // Applying it to every sorted table would shrink flat tables'
-        // groups 64-fold for nothing.
+        // Applying it to every sorted table would make flat tables' spill
+        // files 64-fold smaller for nothing.
         val flat =
             listOf(ColumnDef("id", ColType.LONG, nullable = false), ColumnDef("name", ColType.STRING))
         val cfg = CompactionConfig(targetBytes = 1_000_000, minInputFiles = 2, maxGroupsPerRun = 4)
         val cols = flat.mapIndexed { i, d -> com.posthog.hoglake.model.Column(i + 1L, i, d) }
-        assertThat(cfg.effectiveTargetBytes(cols, sorted = true)).isEqualTo(1_000_000)
+        assertThat(cfg.spillChunkRows(cols))
+            .isEqualTo(cfg.sortedHeapBytesPerGroup / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * 3))
     }
 
     /** The live column forest of one table, for the derate decision. */

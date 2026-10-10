@@ -1424,9 +1424,55 @@ ran on the local stack and what it showed.
 
 - **Compaction (M4) — 100% implemented**, so what belongs here is only
   what is still deferred. The design — one-pass bin packing, the scaling
-  minimum, the two knobs, the claim, the sorted-heap bound, the typed
-  skips and their measurements — is in server/README.md §Sort orders and
-  compaction, the single home for it.
+  minimum, the two knobs, the claim, the sorted rewrite's external merge
+  sort and its budgets, the typed skips and their measurements — is in
+  server/README.md §Sort orders and compaction, the single home for it.
+  Three rules of the sorted rewrite (hoglake#134) that code elsewhere
+  must not break: (1) a TRUSTED run is `explicit_row_ids AND
+  begin_snapshot >= live sort spec's begin_snapshot` and is never
+  verified — so `commitGroup` refuses a group whose live `sort_id`
+  moved during its rewrite (null <-> non-null included), and anything
+  else that registers `explicit_row_ids = true` would be trusted as
+  sorted; only compaction may. (2) The ORDER GUARANTEE, stated
+  precisely: key order is exact whenever every trusted run is
+  key-nondecreasing; ties are (key, row_id) when every trusted input
+  was itself written that way — true of every output since #134 — and
+  otherwise deterministic but unspecified (pre-#134 outputs broke ties
+  in input order). Nothing may depend on more. (3) The spill directory
+  (`HOGLAKE_COMPACTION_SPILL_DIR`) is private to one hoglake process:
+  startup removes every `hoglake-compaction-spill-*` directory in it,
+  and only those (the prefix is hoglake's own because the default is
+  the shared `java.io.tmpdir`; never shorten it to something another
+  tool could also create). The planner's `spill_budget_exceeded`
+  / `merge_budget_exceeded` call `ExternalMergeSort.admit` rather than
+  restating its arithmetic; keep it that way. `heap_budget_exceeded` is
+  historical (reads 0) and stays on the wire. (4) Every other input of
+  at least `HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (16 MiB) is VERIFIED
+  by the sortedness pre-pass (`SortednessCheck`: a projected read of
+  its key columns, plus the carrier for an explicit-row-id file, every
+  physical row, stop at the first violation) and, if sorted, is a run
+  candidate like a trusted output; smaller files go straight to the
+  chunk phase (`files_unchecked`). The verdict is used once and never
+  recorded — under one-pass compaction a file is compacted once. The
+  planner's refusals stay worst case (assume nothing verifies); keep
+  them that way, since the planner cannot read files. Key comparison
+  in the file's own domain is only valid while every conversion the
+  rewrite makes preserves order: a new promotion that does not (any
+  unit or scale change) must make the pre-pass refuse that pairing.
+  (5) A prior output whose schema EQUALS the output schema, with no
+  live DV and row groups of at least 32 MiB, is APPENDED byte for byte
+  (`ParquetRewriter.appendRefusal`; on a sorted table only with a first-key
+  range strictly disjoint from every other run's). An appended row never
+  passes the column plan, so a change that makes the decode path alter a
+  value of an IDENTICAL schema (a normalization, a new conversion on an
+  identity column) must add a disqualifier there, and a change to
+  `outputSchema` silently stops existing outputs from appending (slower,
+  not wrong). An unsorted output's row order is not its inputs' order:
+  encoded rows land after the appended row groups. Rows are written by
+  their `RowPlan` straight from the decoded source row; there is no
+  output-shaped copy to hang per-row logic on.
+  Not done, by decision: writer-declared sortedness (a client's
+  declared order is never believed, only its rows), a multi-pass merge.
   Remaining rewrite deferrals (all surface as `unconvertible_schema`
   skips, never wrong bytes): INT96, decimal-scale changes, and
   non-native time(stamp) units — each timestamp type accepts only the

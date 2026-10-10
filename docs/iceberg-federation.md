@@ -305,8 +305,9 @@ would be a type change, not a column op.
 
 **Compaction rewrites nested columns; it does not refuse them.**
 parquet-java's Group API is already a tree, so the existing
-plan-and-copy pipeline extends one level at a time (the plan becomes a
-tree of steps; the copy recurses through `addGroup`/`getGroup`). The
+plan-and-write pipeline extends one level at a time (the plan becomes a
+tree of steps; the writer recurses through `getGroup`, emitting the
+output record straight from the decoded row). The
 alternative — making a nested schema `unconvertible_schema` — was
 cheaper and permanently wrong: a table with one `map` column could then
 never be compacted, and its small-file debt would grow forever with no
@@ -316,15 +317,14 @@ a time, so its heap is one row's object graph — bounded by the widest
 row, which `HOGLAKE_COMPACTION_MAX_NODES_PER_ROW` (default 1,000,000
 nodes) is what bounds: a row past it is an `invalid_data` skip rather
 than a process-fatal OOM in a background loop. The allowance is spent
-inside the record materializer as the row is DECODED, and again from a
-fresh allowance by the copy — not counted afterwards, which would be a
-report on memory already taken rather than a bound, and not shared
-across the two phases, which charged the same graph twice and halved the
-ceiling the docs advertised. The unit is NODES: a list element costs two
-of them (entry group plus value), a map entry three, and peak live heap
-is up to twice the budget because both graphs are reachable at once
-(measured: a 999,999-node row rewrites under `-Xmx192m`). The **sorted** path materializes the whole
-group to sort it, and a nested group's object graph is **not** its byte
+inside the record materializer as the row is DECODED — not counted
+afterwards, which would be a report on memory already taken rather than
+a bound. The unit is NODES: a list element costs two of them (entry
+group plus value), a map entry three, and peak live heap is one decoded
+row: the output record is written from it directly, never copied into a
+second graph (it was up to twice the budget while that copy existed;
+measured then, a 999,999-node row rewrote under `-Xmx192m`). The **sorted** path used to materialize the
+whole group to sort it, and a nested group's object graph is **not** its byte
 size: a measured `list<long>` table with five elements per row peaked at
 343 MiB of heap from a 4.6 MiB compressed input — 70x — because every
 element carries an object header, a field array and a boxed value, none
@@ -334,37 +334,45 @@ flat table either: a flat 11-column event row costs about 1.7 KiB of
 materialized heap against 119 bytes of snappy input (14x), and
 compaction's own zstd outputs are 1.70x denser again (24x).
 
-So the sorted path is bounded in ROWS.
-`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` (default 1 GiB — the largest
-value safe on today's 4 GiB maintenance pod; bigger pods take
-proportionally more, see server/README.md) divided by the
-live schema's node count (~192 B per node, measured) gives a row
-ceiling; the table's registered bytes-per-row — catalog metadata, never
-a footer read — converts that ceiling into the byte budget grouping is
-planned under, capped at the target. That derate is also why the group
-minimum scales with file size: it can put the effective target at tens
-of megabytes, where a fixed five-file minimum would mean no group ever
-forms. A nested table divides
-the ceiling again by
-`HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION` (default 64, near the top of
-the measured 30-70x range), because a nested row's node count is data
-rather than schema and the per-node accounting cannot see it. A group
-that is still above the ceiling on its registered counts is refused in
-metadata as `heap_budget_exceeded`, before any IO. That is a bounded
-mitigation per GROUP, not spilling; the per-ROW bound is the node budget
-above.
+So the sorted path is an EXTERNAL MERGE SORT (hoglake#134), and a group
+packs to the byte target like any other. The rewrite reads the
+survivors of every input it cannot trust into a CHUNK — the
+`HOGLAKE_COMPACTION_SORTED_HEAP_BYTES` budget (default 1 GiB, divided by
+the parallel group count) over the live schema's node count, ~192 B per
+node measured, divided again by `HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION`
+(default 64, near the top of the measured 30-70x range) for a nested
+table, whose node count is data rather than schema — sorts it, and spills
+it as a local parquet run under `HOGLAKE_COMPACTION_SPILL_DIR` (default
+`java.io.tmpdir`). It then k-way merges the spilled runs with the
+TRUSTED ones: compaction outputs registered under the live sort spec,
+read in place without a check (each was written sorted by the spec it
+was planned under; the commit refuses a group whose spec moved during the
+rewrite), and every other file of at least
+`HOGLAKE_COMPACTION_VERIFY_MIN_BYTES` (default 16 MiB) that a pre-pass
+over its sort-key columns found already in order — a client's DECLARED
+order is advisory and never believed, but its rows are checked, so a writer that
+sorts its files is merged without a spill. The same budget bounds the
+merge's buffered row groups; trusted inputs beyond it are demoted to the
+spill path.
 
-The group bound is explicitly TEMPORARY. It exists only because the
-sorted rewrite sorts a whole group in memory, and the replacement is an
-external merge sort: an input that is itself a compaction output is an
-already-sorted run, so a k-way merge holds one row per input rather than
-the whole group, while a client-written file — whose sort order is
-advisory and never verified by the server — is bounded by the ingest
-flush size and can be sorted alone and spilled as a temp run of its
-own. That removes the heap
-bound on group size, and with it the knob, the ceiling and the skip.
+What can still refuse a sorted group is configuration, in metadata,
+before any IO: `spill_budget_exceeded` when the bytes it would spill
+exceed `HOGLAKE_COMPACTION_SPILL_BYTES` (default 4 GiB per group — the
+spill volume is an emptyDir whose overrun evicts the pod, so the bound is
+in-process), and `merge_budget_exceeded` when its spilled runs alone
+cannot fit the heap budget. `heap_budget_exceeded`, the in-memory sort's
+refusal, is historical and reads 0. The per-ROW bound is still the node
+budget above. server/README.md §Sort orders and compaction carries the
+arithmetic and the pod table.
+
+A group's inputs are opened through a window of
+`HOGLAKE_COMPACTION_PARALLEL_INPUT_OPENS` (default 8) concurrent opens.
+Opening a parquet input is round trips, not bytes, so for a group of
+thousands of small files the window, not the data, sets the rewrite's
+latency; a small-file table wants it higher.
+
 A compaction OUTPUT is written with `HOGLAKE_COMPACTION_CODEC` (default
-**zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**; snappy,
+**zstd**, at `HOGLAKE_COMPACTION_ZSTD_LEVEL` default **1**; snappy,
 gzip, lz4_raw and uncompressed are the other legal names, and an
 unknown one is refused at boot). An input's own codec is never an
 instruction — the rewrite decodes and re-encodes, so a group of mixed
@@ -372,7 +380,12 @@ snappy, zstd and uncompressed inputs produces one output under the
 configured codec. The choice is not per-file: compaction rewrites a
 table's rows into target-sized files and then leaves them alone, so this
 is the codec a compacted table is stored and scanned under from then
-on. The writer previously took parquet-java's UNCOMPRESSED
+on. One exception, visible to readers: an input that is a prior
+compaction output of the same schema, with no deletion vector and row
+groups of at least 32 MiB, is APPENDED byte-for-byte rather than
+re-encoded, so a compacted file may hold row groups under different
+codecs. Parquet records the codec per column chunk, so any conforming
+reader handles that; nothing in hoglake assumes one codec per file. The writer previously took parquet-java's UNCOMPRESSED
 default, which made each merge a permanent decompression — measured on
 event-shaped data, an uncompressed merge of snappy inputs is 1.4-1.8x
 the input bytes, zstd 0.6-0.84x, and zstd is 0.43-0.45x of the

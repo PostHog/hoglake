@@ -169,7 +169,7 @@ class CompactionPlannerBoundedIntegrationTest {
 
     private fun service() = CompactionService(db.jdbi, deadStore, cfg)
 
-    /** The live column forest, for `sortedRowCeiling` arithmetic. */
+    /** The live column forest, for `spillChunkRows` arithmetic. */
     private fun columnsOf(cat: String): List<com.posthog.hoglake.model.Column> =
         db.jdbi.withHandleUnchecked { h ->
             val ids =
@@ -495,21 +495,17 @@ class CompactionPlannerBoundedIntegrationTest {
     }
 
     @Test
-    fun `a sorted table never fetches a file whose own rows exceed the ceiling`() {
-        // Dropping the density derate made every file under the RAW
-        // target a candidate again, so a sorted file whose own surviving
-        // rows exceed the row ceiling would be fetched, packed, emitted
-        // as a one-file group, refused, counted and named in a WARN —
-        // spending a slot of the candidate budget to learn something
-        // `record_count` already said. The candidate filter carries
-        // `record_count < ceiling` for exactly that, and it is exact
-        // rather than an estimate.
-        val ceiling = 100L
-        val policy =
-            cfg.copy(
-                minInputFiles = 2,
-                sortedHeapBytes = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * 3 * ceiling,
-            )
+    fun `a sorted table fetches and groups a file however many rows it holds`() {
+        // The INVERSE of what this test used to pin. The candidate filter
+        // carried `record_count < :rowCeiling` for a sorted table, because
+        // its rewrite held the whole group in heap and a file above the
+        // ceiling could join no group. The rewrite is an external merge
+        // sort now (hoglake#134): a sorted file is a candidate exactly
+        // when it is under the byte target, like any other, and the dense
+        // one below is fetched and grouped with the sparse ones. At the
+        // default heap budget its five million rows are a few spill
+        // files, which the merge budget admits.
+        val policy = cfg.copy(minInputFiles = 2)
         val cat = fixture(partitioned = true)
         alter.alterTable(
             cat,
@@ -521,30 +517,24 @@ class CompactionPlannerBoundedIntegrationTest {
                 ),
             ),
         )
-        // Two files the ceiling admits, one it cannot.
         append(
             cat,
             listOf(
-                file("fits-a", 100, records = 40, values = listOf("d")),
-                file("fits-b", 100, records = 40, values = listOf("d")),
-                file("huge", 100, records = 5_000, values = listOf("d")),
+                file("sparse-a", 100, records = 40, values = listOf("d")),
+                file("sparse-b", 100, records = 40, values = listOf("d")),
+                file("dense", 100, records = 5_000_000, values = listOf("d")),
             ),
         )
         publishSample(cat)
 
         val plan = service().planTable(cat, "ns", "t", policy)
-        assertThat(policy.sortedRowCeiling(columnsOf(cat)))
-            .describedAs("the fixture's ceiling")
-            .isEqualTo(ceiling)
         assertThat(plan.candidatesFetched)
-            .describedAs("the over-ceiling file must not be fetched at all")
-            .isEqualTo(2)
-        assertThat(plan.heapRefusedGroups)
-            .describedAs("so it costs no refusal, no WARN and no budget slot")
-            .isZero()
+            .describedAs("no row bound on the candidate read")
+            .isEqualTo(3)
         assertThat(plan.groups.single().files.map { it.recordCount })
-            .describedAs("and the two that fit still group")
-            .containsExactly(40L, 40L)
+            .describedAs("and the dense file groups with the rest")
+            .containsExactlyInAnyOrder(40L, 40L, 5_000_000L)
+        assertThat(plan.spillRefusedGroups + plan.mergeRefusedGroups).isZero()
     }
 
     @Test

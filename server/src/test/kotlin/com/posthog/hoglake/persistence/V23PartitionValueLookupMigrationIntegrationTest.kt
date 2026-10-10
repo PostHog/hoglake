@@ -283,7 +283,6 @@ class V23PartitionValueLookupMigrationIntegrationTest {
                 nullArms = emptySet(),
                 scopeToSpec = true,
                 withPartitionValues = false,
-                boundRows = false,
             )
         return db.jdbi.withHandleUnchecked { h ->
             h.begin()
