@@ -1,0 +1,11 @@
+schema-version = "1.15.0"
+
+
+## Install Packages --------------------------------------------------
+##  $ flox install gum  <- puts a package in [install] section below
+##  $ flox search gum   <- search for a package
+##  $ flox show gum     <- show all versions of a package
+## -------------------------------------------------------------------
+[install]
+uv.pkg-path = "uv"
+python312.pkg-path = "python312"
