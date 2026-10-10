@@ -99,6 +99,18 @@ class CompactionResultSpecParityTest {
                 bucketsAvailable = 15,
                 candidatesTruncated = 16,
                 planMs = 17,
+                runsTrusted = 18,
+                runsSpilled = 19,
+                runsDemoted = 20,
+                spillBytes = 21,
+                spillBudgetExceeded = 22,
+                mergeBudgetExceeded = 23,
+                spillCleanupFailures = 24,
+                filesVerified = 25,
+                filesUnsorted = 26,
+                filesUnchecked = 27,
+                rowGroupsAppended = 28,
+                bytesAppended = 29,
             )
         val dto = result.toDto()
         assertThat(dto.groupsCompacted).isEqualTo(1)
@@ -124,6 +136,21 @@ class CompactionResultSpecParityTest {
         assertThat(dto.bucketsAvailable).isEqualTo(15)
         assertThat(dto.candidatesTruncated).isEqualTo(16)
         assertThat(dto.planMs).isEqualTo(17)
+        // The external merge sort's counters (hoglake#134).
+        assertThat(dto.runsTrusted).isEqualTo(18)
+        assertThat(dto.runsSpilled).isEqualTo(19)
+        assertThat(dto.runsDemoted).isEqualTo(20)
+        assertThat(dto.spillBytes).isEqualTo(21)
+        assertThat(dto.spillBudgetExceeded).isEqualTo(22)
+        assertThat(dto.mergeBudgetExceeded).isEqualTo(23)
+        assertThat(dto.spillCleanupFailures).isEqualTo(24)
+        // The sortedness pre-pass's verdicts.
+        assertThat(dto.filesVerified).isEqualTo(25)
+        assertThat(dto.filesUnsorted).isEqualTo(26)
+        assertThat(dto.filesUnchecked).isEqualTo(27)
+        // Row groups appended byte for byte (package D1).
+        assertThat(dto.rowGroupsAppended).isEqualTo(28)
+        assertThat(dto.bytesAppended).isEqualTo(29)
     }
 
     @Test
@@ -138,5 +165,36 @@ class CompactionResultSpecParityTest {
         assertThat(requiredOf(block))
             .describedAs("a required counter cannot be one the ledger has rows without")
             .doesNotContain("claimed_elsewhere")
+    }
+
+    @Test
+    fun `the external merge sort's counters are optional, and heap_budget_exceeded stays required`() {
+        // Added after the ledger started recording, so optional for the
+        // claimed_elsewhere reason. heap_budget_exceeded is the opposite
+        // case: nothing produces it any more, but it was REQUIRED on the
+        // wire before, and dropping it — or making it optional — would
+        // break a client generated from the old spec. It stays, reads 0,
+        // and says it is historical.
+        val block = schemaBlock("    CompactionResult:")
+        val added =
+            listOf(
+                "runs_trusted",
+                "runs_spilled",
+                "runs_demoted",
+                "spill_bytes",
+                "spill_budget_exceeded",
+                "merge_budget_exceeded",
+                "spill_cleanup_failures",
+                "files_verified",
+                "files_unsorted",
+                "files_unchecked",
+                "row_groups_appended",
+                "bytes_appended",
+            )
+        assertThat(properties(block)).containsAll(added)
+        assertThat(requiredOf(block)).doesNotContainAnyElementsOf(added)
+        assertThat(requiredOf(block)).contains("heap_budget_exceeded")
+        val heap = block.substringAfter("        heap_budget_exceeded:").substringBefore("\n        failed_groups:")
+        assertThat(heap).describedAs("the spec must say the counter is historical").containsIgnoringCase("historical")
     }
 }

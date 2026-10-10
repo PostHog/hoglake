@@ -28,10 +28,13 @@ object SortRepo {
         tableId: Long,
         snapshot: Long,
     ): SortSpec? {
-        val sortId =
+        // begin_snapshot rides the SAME row: compaction's trust predicate
+        // needs it, and a second statement for it would be a second
+        // descent per table plan for a column the first one is on.
+        val (sortId, beginSnapshot) =
             handle.createQuery(
                 """
-            SELECT sort_id FROM hog_sort_spec
+            SELECT sort_id, begin_snapshot FROM hog_sort_spec
             WHERE catalog_id = :catalogId AND table_id = :tableId
               AND begin_snapshot <= :snapshot
               AND (end_snapshot IS NULL OR :snapshot < end_snapshot)
@@ -40,7 +43,7 @@ object SortRepo {
                 .bind("catalogId", catalogId)
                 .bind("tableId", tableId)
                 .bind("snapshot", snapshot)
-                .mapTo(Long::class.javaObjectType)
+                .map { rs, _ -> rs.getLong("sort_id") to rs.getLong("begin_snapshot") }
                 .findOne()
                 .orElse(null) ?: return null
         val fields =
@@ -63,6 +66,6 @@ object SortRepo {
                     )
                 }
                 .list()
-        return SortSpec(sortId, fields)
+        return SortSpec(sortId, fields, beginSnapshot)
     }
 }

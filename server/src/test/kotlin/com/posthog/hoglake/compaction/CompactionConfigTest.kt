@@ -65,21 +65,25 @@ class CompactionConfigTest {
         assertThat(Config().compactionClaimTtlSeconds).isEqualTo(3600)
     }
 
+    /** Rows of a chunk under [heap] for [nodes] schema nodes plus the row-id carrier. */
+    private fun chunkOf(
+        heap: Long,
+        nodes: Int,
+    ) = heap / (CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * (nodes + 1))
+
     @Test
-    fun `a config with NO override derates a nested sorted table`() {
+    fun `a config with NO override shrinks a nested sorted table's chunk`() {
         // The default value itself, exercised through the default path.
-        // With DEFAULT_NESTED_SORT_EXPANSION at 1 this is an equality and
-        // the sorted path goes back to materializing a full target's
-        // worth of nested object graph — tens of gigabytes at the
-        // measured 30-70x expansion.
+        // With DEFAULT_NESTED_SORT_EXPANSION at 1 this is an equality and a
+        // nested chunk materializes 30-70x the heap its node count claims.
+        // A CHUNK, not a group, since hoglake#134: the derate's only role.
         val cfg = defaulted()
         assertThat(cfg.nestedSortExpansion)
             .describedAs("the default must actually derate; 1 is the no-op")
             .isGreaterThan(1)
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = true))
-            .describedAs("a nested SORTED table is planned smaller than the raw target")
-            .isLessThan(target)
-            .isEqualTo(target / cfg.nestedSortExpansion)
+        assertThat(cfg.spillChunkRows(nestedColumns))
+            .describedAs("a nested SORTED table's chunk is divided by the expansion")
+            .isEqualTo(chunkOf(cfg.sortedHeapBytesPerGroup, 2) / cfg.nestedSortExpansion)
     }
 
     @Test
@@ -99,14 +103,12 @@ class CompactionConfigTest {
     }
 
     @Test
-    fun `a config with NO override leaves flat and unsorted tables alone`() {
-        // The derate is about nested object graphs, not about sorting or
-        // about nesting alone. Applying it more widely would shrink
-        // ordinary tables' groups 64-fold for nothing.
+    fun `a config with NO override leaves a flat table's chunk underated`() {
+        // The derate is about nested object graphs. Applying it to a flat
+        // table would make its spill files 64x smaller — 64x the runs to
+        // merge — for nothing.
         val cfg = defaulted()
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = true)).isEqualTo(target)
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = false)).isEqualTo(target)
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false)).isEqualTo(target)
+        assertThat(cfg.spillChunkRows(flatColumns)).isEqualTo(chunkOf(cfg.sortedHeapBytesPerGroup, 1))
     }
 
     @Test
@@ -275,93 +277,178 @@ class CompactionConfigTest {
         }
         // 1 is legal and documented: it disables the derate for an
         // operator who has sized the heap for it.
-        assertThat(
+        val undivided =
             CompactionConfig(
                 targetBytes = target,
                 minInputFiles = 2,
                 maxGroupsPerRun = 1,
                 nestedSortExpansion = 1,
             )
-                .effectiveTargetBytes(nestedColumns, sorted = true),
-        ).isEqualTo(target)
+        assertThat(undivided.spillChunkRows(nestedColumns)).isEqualTo(chunkOf(undivided.sortedHeapBytesPerGroup, 2))
     }
 
-    // ---- sortedHeapBytes: the bound targetBytes was standing in for ----
+    // ---- sortedHeapBytes: the chunk and the merge (hoglake#134) ----
     //
     // Same four checks again (default, env parity, App wiring, docs),
     // because the same hole is here: this knob has a default on both
     // sides and a wiring line in App, and every one of them can go
-    // quiet. What is NEW is the arithmetic below it — the budget is now
-    // derived from a row ceiling and the table's density, and the thing
-    // that must never regress is that DENSER INPUTS BUY FEWER BYTES.
+    // quiet. What changed is what the arithmetic below it bounds: a
+    // CHUNK of the external merge sort and its merge, never the group.
 
     /** Ten thousand rows of [flatColumns] (one data node + the row-id carrier). */
     private fun heapForTenThousandFlatRows() = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * 2 * 10_000
 
     @Test
-    fun `the row ceiling, not a byte budget, is what a denser table is planned under`() {
-        // #118's regression, and the assertion has MOVED rather than
-        // gone. Group selection reads BYTES; the sorted path holds ROWS,
-        // and #115 made every compaction input compaction's own zstd
-        // rather than a client's snappy — 1.70x denser on event data —
-        // so the same byte budget admitted 1.70x the rows with nothing
-        // noticing.
-        //
-        // `effectiveTargetBytes` used to convert between the two by
-        // measuring the table's AVERAGE density, which cost an
-        // unbounded aggregate over every candidate of the table on
-        // every sweep and was an estimate of a number the catalog holds
-        // exactly. `CompactionGrouping.groups` now takes the ceiling as
-        // a second capacity and closes a group on
-        // `hog_data_file.record_count`, per file. So the density-derived
-        // budget is gone and the byte budget is the plain target; what
-        // bounds a dense sorted table is the row capacity, tested in
-        // `CompactionGroupingTest` and end to end in
-        // `CompactionHeapBudgetIntegrationTest`.
+    fun `the old row ceiling's arithmetic sizes a chunk, and the sort spill carries every knob`() {
+        // The sorted row ceiling used to be a GROUP capacity; the same
+        // arithmetic now sizes one chunk, and the group packs to the
+        // target. `sortSpill` is the one function the planner's refusals
+        // and the rewrite both build their bounds from, so it has to carry
+        // each knob through unchanged.
+        val dir = Files.createTempDirectory("spill-cfg")
         val cfg =
             CompactionConfig(
                 targetBytes = target,
                 maxGroupsPerRun = 1,
                 sortedHeapBytes = heapForTenThousandFlatRows(),
+                spillBytes = 12_345,
+                spillDir = dir,
             )
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = true))
-            .describedAs("a flat sorted table plans at the raw target; rows are bounded by the packer")
-            .isEqualTo(target)
-        assertThat(cfg.sortedRowCeiling(flatColumns))
-            .describedAs("and THIS is the bound that replaced the derate, in the unit the heap holds")
-            .isEqualTo(10_000)
+        assertThat(cfg.spillChunkRows(flatColumns)).isEqualTo(10_000)
+        val spill = cfg.sortSpill(flatColumns)
+        assertThat(spill.chunkRows).isEqualTo(10_000)
+        assertThat(spill.mergeBudgetBytes).isEqualTo(cfg.sortedHeapBytesPerGroup)
+        assertThat(spill.spillBudgetBytes).isEqualTo(12_345)
+        assertThat(spill.spillDir).isEqualTo(dir)
+        assertThat(spill.verifyMinBytes).isEqualTo(cfg.verifyMinBytes)
+        assertThat(cfg.copy(verifyMinBytes = 77).sortSpill(flatColumns).verifyMinBytes).isEqualTo(77)
+        assertThat(cfg.sortSpill(nestedColumns).chunkRows)
+            .describedAs("nested: the chunk is divided by the expansion, and only the chunk")
+            .isEqualTo(maxOf(1L, chunkOf(cfg.sortedHeapBytesPerGroup, 2) / cfg.nestedSortExpansion))
     }
 
     @Test
-    fun `the nested derate survives the density arm's removal`() {
-        // The two bounds were never interchangeable and only one of them
-        // could be replaced by an exact row count. The per-node
-        // accounting the ROW ceiling is built on is exact for a flat row
-        // and a FLOOR for a nested one, because list lengths are data
-        // and not schema — so a nested sorted table still needs a bound
-        // stated in BYTES, which is what this arm is.
-        val cfg =
-            CompactionConfig(
-                targetBytes = target,
-                maxGroupsPerRun = 1,
-                sortedHeapBytes = heapForTenThousandFlatRows(),
-            )
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = true))
-            .describedAs("nested and sorted: still derated by the expansion")
-            .isEqualTo(target / cfg.nestedSortExpansion)
-        assertThat(cfg.sortedRowCeiling(nestedColumns))
-            .describedAs("and the ceiling is divided as well — both, tightest wins")
-            .isLessThan(cfg.sortedRowCeiling(flatColumns) / cfg.nestedSortExpansion + 1)
+    fun `the chunk never falls below one row`() {
+        // A heap budget smaller than one row, or a nested derate that
+        // divides it to nothing, must still make progress: a chunk of zero
+        // would spill nothing and SortSpill refuses it.
+        val cfg = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, sortedHeapBytes = 1)
+        assertThat(cfg.spillChunkRows(nestedColumns)).isEqualTo(1)
+        cfg.sortSpill(nestedColumns) // must not throw
+    }
+
+    // ---- spillBytes / spillDir (hoglake#134) ----
+
+    @Test
+    fun `the spill knobs default the same on both sides and App wires them`() {
+        assertThat(defaulted().spillBytes).isEqualTo(CompactionConfig.DEFAULT_SPILL_BYTES)
+        assertThat(CompactionConfig.DEFAULT_SPILL_BYTES).isEqualTo(4L * 1024 * 1024 * 1024)
+        assertThat(Config().compactionSpillBytes).isEqualTo(CompactionConfig.DEFAULT_SPILL_BYTES)
+        assertThat(defaulted().spillDir).isEqualTo(Path.of(System.getProperty("java.io.tmpdir")))
+        assertThat(Config().compactionSpillDir).isEqualTo(System.getProperty("java.io.tmpdir"))
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .containsPattern("""spillBytes\s*=\s*cfg\.compactionSpillBytes""")
+            .containsPattern("""spillDir\s*=\s*java\.nio\.file\.Path\.of\(cfg\.compactionSpillDir\)""")
+        for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
+            assertThat(Files.readString(Path.of(doc)))
+                .describedAs("%s must document the spill knobs", doc)
+                .contains("HOGLAKE_COMPACTION_SPILL_BYTES")
+                .contains("HOGLAKE_COMPACTION_SPILL_DIR")
+        }
     }
 
     @Test
-    fun `the unsorted path is never derated`() {
-        // It streams one record at a time. Shrinking its groups would be
-        // a permanent throughput tax for a heap cost it does not pay —
-        // which is also why it passes CompactionGrouping.NO_ROW_CAPACITY.
-        val cfg = defaulted()
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false)).isEqualTo(target)
-        assertThat(cfg.effectiveTargetBytes(nestedColumns, sorted = false)).isEqualTo(target)
+    fun `the verification floor defaults to the spill block on both sides, App wires it, and negative is refused`() {
+        assertThat(defaulted().verifyMinBytes).isEqualTo(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES)
+        assertThat(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES).isEqualTo(SortSpill.SPILL_BLOCK_BYTES.toLong())
+        assertThat(Config().compactionVerifyMinBytes).isEqualTo(CompactionConfig.DEFAULT_VERIFY_MIN_BYTES)
+        assertThat(Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt")))
+            .containsPattern("""verifyMinBytes\s*=\s*cfg\.compactionVerifyMinBytes""")
+        assertThat(Files.readString(Path.of("README.md"))).contains("HOGLAKE_COMPACTION_VERIFY_MIN_BYTES")
+        CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, verifyMinBytes = 0) // 0 checks everything
+        assertThatThrownBy { CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, verifyMinBytes = -1) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_VERIFY_MIN_BYTES")
+        assertThatThrownBy { Config(compactionVerifyMinBytes = -1) }
+            .isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_VERIFY_MIN_BYTES")
+    }
+
+    @Test
+    fun `a spill budget of zero or less is refused at construction and at boot`() {
+        for (bad in listOf(0L, -1L)) {
+            assertThatThrownBy { CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, spillBytes = bad) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_SPILL_BYTES")
+            assertThatThrownBy { Config(compactionSpillBytes = bad) }
+                .isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("HOGLAKE_COMPACTION_SPILL_BYTES")
+        }
+    }
+
+    @Test
+    fun `a spill directory that is missing or unwritable is refused at BOOT where the loop runs`() {
+        // The failure this exists for: without it a missing directory is
+        // a NoSuchFileException at every sorted group's first spill —
+        // `failed_groups`, re-planned every interval, a healthy-looking
+        // pod. Priced per workload like the pool check: an API pod with
+        // the loop off may have no writable volume at all.
+        val missing = Files.createTempDirectory("spill-boot").resolve("nope")
+        assertThatThrownBy {
+            Config(compactionIntervalMs = 3_600_000, compactionSpillDir = missing.toString())
+        }.isInstanceOf(IllegalArgumentException::class.java)
+            .hasMessageContaining("HOGLAKE_COMPACTION_SPILL_DIR")
+            .hasMessageContaining("not an existing directory")
+        val readOnly = Files.createTempDirectory("spill-boot-ro")
+        readOnly.toFile().setWritable(false)
+        try {
+            assertThatThrownBy {
+                Config(compactionIntervalMs = 3_600_000, compactionSpillDir = readOnly.toString())
+            }.isInstanceOf(IllegalArgumentException::class.java)
+                .hasMessageContaining("not writable")
+        } finally {
+            readOnly.toFile().setWritable(true)
+        }
+        // With the loop off the same directory boots.
+        Config(compactionIntervalMs = 0, compactionSpillDir = missing.toString())
+        // And a usable one boots with the loop on, leaving nothing behind.
+        val ok = Files.createTempDirectory("spill-boot-ok")
+        Config(compactionIntervalMs = 3_600_000, compactionSpillDir = ok.toString())
+        assertThat(Files.list(ok).use { it.count() }).describedAs("the probe cleans up after itself").isZero()
+    }
+
+    @Test
+    fun `the startup sweep removes leftover spill directories and nothing else`() {
+        val dir = Files.createTempDirectory("spill-sweep")
+        val leftover = Files.createDirectories(dir.resolve("${SpillDirectory.PREFIX}dead-process"))
+        Files.write(leftover.resolve("spill-1.parquet"), ByteArray(1234))
+        val bystanderDir = Files.createDirectories(dir.resolve("not-ours"))
+        val bystanderFile = Files.write(dir.resolve("${SpillDirectory.PREFIX}a-file-not-a-dir"), ByteArray(7))
+        // ANOTHER tool's spill directory in the same shared temp dir —
+        // the default is java.io.tmpdir — must survive: the sweep owns
+        // only the directories hoglake named.
+        val foreign = Files.createDirectories(dir.resolve("spill-someone-elses"))
+        Files.write(foreign.resolve("x"), ByteArray(3))
+        assertThat(SpillDirectory.PREFIX).startsWith("hoglake-")
+        assertThat(SpillDirectory.measuredBytes(dir)).describedAs("only spill-* directories' files").isEqualTo(1234)
+        assertThat(SpillDirectory.sweepLeftovers(dir)).isEqualTo(1)
+        assertThat(leftover).doesNotExist()
+        assertThat(bystanderDir).exists()
+        assertThat(bystanderFile).exists()
+        assertThat(foreign).describedAs("a bare spill-* directory is not hoglake's").exists()
+        assertThat(SpillDirectory.measuredBytes(dir)).isZero()
+        // A directory that is not there is nothing to sweep, not an error.
+        assertThat(SpillDirectory.sweepLeftovers(dir.resolve("absent"))).isZero()
+        assertThat(SpillDirectory.measuredBytes(dir.resolve("absent"))).isZero()
+        // Wired once, before the loops, and only where the loop runs.
+        val app = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/App.kt"))
+        assertThat(app)
+            .containsPattern(
+                """(?s)fun startBackground\(\): AutoCloseable \{.{0,900}if \(cfg\.compactionIntervalMs > 0\) \{\s*""" +
+                    """com\.posthog\.hoglake\.compaction\.SpillDirectory\.sweepLeftovers""" +
+                    """.{0,200}val loops = BackgroundLoops\(\)""",
+            )
     }
 
     @Test
@@ -413,65 +500,57 @@ class CompactionConfigTest {
     @Test
     fun `the default is sized for the pod the maintenance deployment actually has`() {
         // The knob is only honest if its default is safe on the pod that
-        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap, and
-        // the worst-case peak is the sort buffer (measured 0.79x of the
-        // DECLARED budget, since 192 B/node rounds 151.6 up) plus the
-        // group's input and output byte arrays, plus parquet-java's
-        // 128 MiB row-group block, plus the hydrator's 256 MiB
-        // whole-object ceiling firing in the same tick.
+        // exists. 4 GiB at MaxRAMPercentage=70 is ~2.8 GiB of heap. The
+        // worst-case process peak since the external merge sort
+        // (hoglake#134) is the LARGER of its two phases, plus the
+        // hydrator's 256 MiB whole-object ceiling firing in the same tick:
+        // the MERGE — the admitted runs charged up to the budget, the
+        // OUTPUT writer's buffered row group (measured flat at ~147 MB,
+        // SortedRewriteHeapMeasurement, since the materializer stopped its
+        // statistics pinning input pages) and the 16 MiB S3 part buffer —
+        // and the CHUNK phase — the chunk at ~0.79x the budget, a
+        // target-sized 512 MiB input row group, the spill writer's slabs
+        // and the sort's reference array (~37 MiB).
         //
         // Pinned as an inequality against the REAL heap rather than as
         // an equality on the constant: the failure this guards is
-        // someone raising the default because bigger groups would be
-        // nice, without the charts change that makes it survivable.
-        val podBytes = 4.0 * 1024 * 1024 * 1024
-        val heap = podBytes * 0.70
-        val declared = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
-        val sortBuffer = declared * (151.6 / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE)
-        // Group bytes at the measured zstd density, which is the denser
-        // of the two and therefore the smaller group — but the input and
-        // output arrays are the group's, so use snappy's larger number.
-        val groupBytes = declared * (119.0 / 11.0) / CompactionConfig.SORTED_HEAP_BYTES_PER_NODE
-        val peak = sortBuffer + 2 * groupBytes + (128 + 256) * 1024 * 1024
+        // someone raising the default (or a term growing) without the
+        // charts change that makes it survivable. The honest formula puts
+        // the default at 56%, stated in server/README.md.
+        val mib = 1024.0 * 1024
+        val heap = 4.0 * 1024 * mib * 0.70
+        val budget = CompactionConfig.DEFAULT_SORTED_HEAP_BYTES.toDouble()
+        val outputWriter = 147_502.0 * 1024
+        val merge = budget + outputWriter + 16 * mib
+        val chunk = 0.79 * budget + 512 * mib + 37 * mib
+        val peak = maxOf(merge, chunk) + 256 * mib
         assertThat(peak / heap)
             .describedAs(
                 "worst-case peak %.0f MiB against a %.0f MiB heap — raise the pod before the knob",
-                peak / 1024 / 1024,
-                heap / 1024 / 1024,
+                peak / mib,
+                heap / mib,
             )
-            .isLessThan(0.5)
+            .isLessThan(0.7)
     }
 
     @Test
-    fun `the sorted heap cap is labelled temporary with its replacement named`() {
-        // The cap costs real throughput — sorted tables compact to tens
-        // of megabytes instead of the 512 MiB target — and it ships
-        // anyway because it converts an OOM into a
-        // counted refusal. What must not happen is it quietly becoming
-        // the permanent answer because nobody wrote down that a real fix
-        // exists. The fix is an external merge sort: compaction's own
-        // outputs are already-sorted runs, so a k-way merge holds one
-        // row per input instead of the whole group.
-        //
-        // Pinned in the two places someone hitting the ceiling lands:
-        // the knob's own doc comment, and the operator-facing docs.
+    fun `the sorted heap knob no longer calls itself temporary, and the docs describe the spill`() {
+        // The cap is gone: the bound that called itself TEMPORARY until an
+        // external merge sort replaced it has been replaced by one. What
+        // must not survive is the old promise — an operator reading
+        // "TEMPORARY, the group is sorted in memory" would size a pod for
+        // a mechanism that no longer exists.
         val source = Files.readString(Path.of("src/main/kotlin/com/posthog/hoglake/compaction/CompactionService.kt"))
         assertThat(source)
-            .describedAs("CompactionConfig.sortedHeapBytes must say the bound is temporary")
-            .containsIgnoringCase("TEMPORARY")
-            .describedAs("...and must name the way out, not just that one exists")
-            .containsIgnoringCase("external merge sort")
-            .containsIgnoringCase("already-sorted")
-        // And the refusal itself, since a log line is what an operator
-        // reads before they ever open the source.
-        assertThat(source)
-            .describedAs("the heap_budget refusal must point at the same argument")
-            .containsPattern("""(?s)compaction refused .{0,2000}external merge sort""")
-
+            .doesNotContain("THIS BOUND IS TEMPORARY")
+            .doesNotContain("sortedRowCeiling")
+            .doesNotContain("effectiveTargetBytes")
+            .contains("external merge sort")
         for (doc in listOf("README.md", "../docs/iceberg-federation.md")) {
             assertThat(Files.readString(Path.of(doc)))
-                .describedAs("%s must mark the sorted cap temporary and name the replacement", doc)
+                .describedAs("%s must describe the external merge sort and its spill", doc)
                 .containsIgnoringCase("external merge sort")
+                .containsIgnoringCase("spill")
                 .containsIgnoringCase("advisory")
         }
     }
@@ -512,17 +591,6 @@ class CompactionConfigTest {
             .describedAs("JVM flags belong in applicationDefaultJvmArgs, not in the image's env")
             .doesNotContain("JAVA_OPTS")
             .doesNotContain("MaxRAMPercentage")
-    }
-
-    @Test
-    fun `the derated budget never falls below the smallest legal target`() {
-        // A tiny target divided by 64 must still be a usable target —
-        // CompactionGrouping refuses one below 2, and a table whose
-        // budget derated to nothing would silently stop compacting.
-        val cfg = CompactionConfig(targetBytes = 10, minInputFiles = 2, maxGroupsPerRun = 1)
-        val budget = cfg.effectiveTargetBytes(nestedColumns, sorted = true)
-        assertThat(budget).isGreaterThanOrEqualTo(2)
-        CompactionGrouping.of(budget) // must not throw
     }
 
     @Test
@@ -568,8 +636,8 @@ class CompactionConfigTest {
         val cfg = defaulted()
         assertThat(cfg.parallelGroups).isEqualTo(1)
         assertThat(cfg.sortedHeapBytesPerGroup).isEqualTo(cfg.sortedHeapBytes)
-        assertThat(cfg.sortedRowCeiling(flatColumns))
-            .isEqualTo(cfg.copy(parallelGroups = 1).sortedRowCeiling(flatColumns))
+        assertThat(cfg.spillChunkRows(flatColumns))
+            .isEqualTo(cfg.copy(parallelGroups = 1).spillChunkRows(flatColumns))
     }
 
     @Test
@@ -585,47 +653,35 @@ class CompactionConfigTest {
         val perRowBytes = CompactionConfig.SORTED_HEAP_BYTES_PER_NODE * nodesPlusCarrier
         for (n in listOf(1, 2, 4, 8, 64)) {
             val many = one.copy(parallelGroups = n)
-            val concurrentBytes = many.sortedRowCeiling(flatColumns) * perRowBytes * n
+            val concurrentBytes = many.spillChunkRows(flatColumns) * perRowBytes * n
             assertThat(concurrentBytes)
-                .describedAs("%d concurrent sorted groups at the ceiling", n)
-                .isLessThanOrEqualTo(one.sortedRowCeiling(flatColumns) * perRowBytes)
+                .describedAs("%d concurrent sorted chunks", n)
+                .isLessThanOrEqualTo(one.spillChunkRows(flatColumns) * perRowBytes)
+            assertThat(many.sortSpill(flatColumns).mergeBudgetBytes * n)
+                .describedAs("%d concurrent sorted merges", n)
+                .isLessThanOrEqualTo(heap)
         }
     }
 
     @Test
-    fun `the divided heap budget reaches the bound grouping runs under`() {
-        // Both bounds derive from the same heap, and only one of them is
-        // the one grouping actually runs under. When the group budget
-        // was a DENSITY-derived byte number, a division that reached
-        // `sortedRowCeiling` but not `effectiveTargetBytes` would form
-        // full-size groups and then refuse them one by one — a sweep
-        // that does nothing but plan. The byte conversion is gone and
-        // the ceiling IS what grouping runs under (it is passed as the
-        // row capacity), so the property to pin is that the division
-        // reaches the ceiling and that N groups at it add up to one
-        // undivided group.
+    fun `the divided heap budget reaches both bounds the rewrite runs under`() {
+        // The chunk and the merge both derive from the same heap; a
+        // division that reached one and not the other would let N groups
+        // take N times the heap in that phase.
         val one = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1)
         val eight = one.copy(parallelGroups = 8)
-        assertThat(eight.sortedRowCeiling(flatColumns))
-            .describedAs("eight-way concurrency must buy one eighth of the rows")
-            .isLessThan(one.sortedRowCeiling(flatColumns))
-        assertThat(eight.sortedRowCeiling(flatColumns) * 8)
-            .describedAs("eight groups' rows must add up to one group's")
-            .isLessThanOrEqualTo(one.sortedRowCeiling(flatColumns) + 8)
-        // And the byte budget is NOT divided for a flat table, because
-        // it is no longer a statement about the heap at all — the
-        // nested arm is the only one left, and it has its own test.
-        assertThat(eight.effectiveTargetBytes(flatColumns, sorted = true)).isEqualTo(target)
-    }
-
-    @Test
-    fun `the UNSORTED path is untouched by the division - its heap is flat in group size`() {
-        // The streaming path never materializes a group, so concurrency
-        // costs it nothing and dividing its budget would be a pure loss
-        // of compaction throughput on exactly the tables that have the
-        // most to gain.
-        val cfg = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1, parallelGroups = 16)
-        assertThat(cfg.effectiveTargetBytes(flatColumns, sorted = false)).isEqualTo(target)
+        assertThat(eight.spillChunkRows(flatColumns) * 8)
+            .describedAs("eight groups' chunks must add up to one group's")
+            .isLessThanOrEqualTo(one.spillChunkRows(flatColumns) + 8)
+            .isGreaterThan(0)
+        assertThat(eight.sortSpill(flatColumns).mergeBudgetBytes * 8)
+            .isLessThanOrEqualTo(one.sortSpill(flatColumns).mergeBudgetBytes)
+        assertThat(eight.sortSpill(nestedColumns).chunkRows * 8)
+            .describedAs("the nested chunk is divided too")
+            .isLessThanOrEqualTo(one.sortSpill(nestedColumns).chunkRows + 8)
+        // The SPILL budget is per group and NOT divided: it bounds one
+        // rewrite's disk, and the chart sizes the volume as N x it.
+        assertThat(eight.sortSpill(flatColumns).spillBudgetBytes).isEqualTo(one.spillBytes)
     }
 
     @Test
@@ -1006,34 +1062,5 @@ class CompactionConfigTest {
             CompactionConfig(targetBytes = 1024, maxGroupsPerRun = 1, committedClaimTtlSeconds = 0)
         }.isInstanceOf(IllegalArgumentException::class.java)
             .hasMessageContaining("HOGLAKE_COMPACTION_COMMITTED_CLAIM_TTL_SECONDS")
-    }
-
-    @Test
-    fun `the NESTED sorted bound is divided by the group concurrency too`() {
-        // Two bounds guard the sorted path and the tightest wins. The
-        // density one is a statement about ROWS and was divided from the
-        // start; the nested one is a statement about BYTES and was not —
-        // so for a table with nested columns, which is the case whose
-        // object graph is least predictable, the winning bound could be
-        // an undivided one and N concurrent groups could take N times
-        // the heap.
-        val one = CompactionConfig(targetBytes = target, maxGroupsPerRun = 1)
-        val eight = one.copy(parallelGroups = 8)
-        // No density measured, so the nested arm is the only thing that
-        // can bound this at all.
-        val budgetOne = one.effectiveTargetBytes(nestedColumns, sorted = true)
-        val budgetEight = eight.effectiveTargetBytes(nestedColumns, sorted = true)
-        assertThat(budgetEight)
-            .describedAs("eight concurrent nested sorted groups must not each get one group's bytes")
-            .isLessThan(budgetOne)
-        assertThat(budgetEight * 8).isLessThanOrEqualTo(budgetOne + 8)
-        // And it stays usable: CompactionGrouping refuses a target below
-        // 2, so a table derated to nothing would silently stop
-        // compacting rather than compact slowly.
-        val tiny =
-            CompactionConfig(targetBytes = 10, maxGroupsPerRun = 1, parallelGroups = 64)
-                .effectiveTargetBytes(nestedColumns, sorted = true)
-        assertThat(tiny).isGreaterThanOrEqualTo(2)
-        CompactionGrouping.of(tiny)
     }
 }

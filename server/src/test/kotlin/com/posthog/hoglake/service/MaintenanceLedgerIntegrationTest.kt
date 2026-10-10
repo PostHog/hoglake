@@ -189,6 +189,29 @@ class MaintenanceLedgerIntegrationTest {
                 .describedAs("the planner's plan measures joined the list when the planner was bounded")
                 .isZero()
         }
+        // The external merge sort's counters (hoglake#134) joined the list
+        // with the spill: a row from before it ran no external sort, so
+        // zero is the fact, not a guess.
+        val mergeSortCounters =
+            listOf(
+                "runs_trusted",
+                "runs_spilled",
+                "runs_demoted",
+                "spill_bytes",
+                "spill_budget_exceeded",
+                "merge_budget_exceeded",
+                "spill_cleanup_failures",
+                "files_verified",
+                "files_unsorted",
+                "files_unchecked",
+                "row_groups_appended",
+                "bytes_appended",
+            )
+        for (counter in mergeSortCounters) {
+            assertThat(result[counter]?.asLong())
+                .describedAs("%s is filled on read for a row that predates it", counter)
+                .isZero()
+        }
         // Every other field survives untouched, and the row is complete
         // against the schema's required list.
         assertThat(result["groups_compacted"].asLong()).isEqualTo(2)
@@ -199,6 +222,7 @@ class MaintenanceLedgerIntegrationTest {
                 "invalid_data", "heap_budget_exceeded", "failed_groups",
                 "claimed_elsewhere",
                 *planMeasures.toTypedArray(),
+                *mergeSortCounters.toTypedArray(),
             )
     }
 

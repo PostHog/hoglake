@@ -4,6 +4,7 @@ import com.posthog.hoglake.MemoryOutputFile
 import com.posthog.hoglake.compaction.InvalidDataException
 import com.posthog.hoglake.compaction.ParquetRewriter
 import com.posthog.hoglake.compaction.UnconvertibleSchemaException
+import com.posthog.hoglake.compaction.roomySpill
 import com.posthog.hoglake.hydrator.CatalogColumn
 import com.posthog.hoglake.hydrator.FooterParse
 import com.posthog.hoglake.hydrator.FooterStats
@@ -183,6 +184,7 @@ object NestedAgreement {
                         out,
                         ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
                         FUZZ_CODEC,
+                        spill = if (sortFields.isEmpty()) null else roomySpill(),
                     )
                 } catch (t: UnconvertibleSchemaException) {
                     null

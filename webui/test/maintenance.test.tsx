@@ -226,6 +226,84 @@ describe("maintenance outcome and history", () => {
     expect(screen.getByText(/invalid-data 3/)).toBeInTheDocument();
   });
 
+  it("explains the spill- and merge-budget refusals on hover", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, spill_budget_exceeded: "2", merge_budget_exceeded: "5" },
+        }}
+      />,
+    );
+    expect(screen.getByText("spill-budget 2")).toHaveAttribute(
+      "title",
+      expect.stringContaining("HOGLAKE_COMPACTION_SPILL_BYTES"),
+    );
+    expect(screen.getByText("spill-budget 2")).toHaveAttribute(
+      "title",
+      expect.stringContaining("evicts the whole pod"),
+    );
+    expect(screen.getByText("merge-budget 5")).toHaveAttribute(
+      "title",
+      expect.stringContaining("HOGLAKE_COMPACTION_SORTED_HEAP_BYTES"),
+    );
+    // The historical counter stays out of the badge while it is zero.
+    expect(screen.queryByText(/heap-budget/)).not.toBeInTheDocument();
+  });
+
+  it("shows how a sorted rewrite merged, and a spill directory left behind", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: {
+            ...compaction.result!,
+            runs_trusted: "3",
+            runs_spilled: "4",
+            runs_demoted: "1",
+            spill_bytes: "1048576",
+            spill_cleanup_failures: "1",
+            files_verified: "2",
+            files_unsorted: "5",
+            files_unchecked: "7",
+          },
+        }}
+      />,
+    );
+    expect(screen.getByText(/sorted: 3 in place, 4 spilled/)).toBeInTheDocument();
+    expect(screen.getByText(/checked: 2 already sorted, 5 unsorted/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("HOGLAKE_COMPACTION_VERIFY_MIN_BYTES"),
+    );
+    expect(screen.getByText(/7 too small to check/)).toBeInTheDocument();
+    expect(screen.getByText(/1 demoted/)).toBeInTheDocument();
+    expect(screen.getByText(/spill dir\(s\) left on disk/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("temporary files"),
+    );
+  });
+
+  it("shows row groups appended byte for byte, and only when there are some", () => {
+    render(
+      <RunSummary
+        run={{
+          ...compaction,
+          result: { ...compaction.result!, row_groups_appended: "3", bytes_appended: "104857600" },
+        }}
+      />,
+    );
+    expect(screen.getByText(/appended: 3 row group\(s\)/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("without being decoded"),
+    );
+    expect(screen.getByText(/100(\.0)? MiB/)).toBeInTheDocument();
+  });
+
+  it("hides the appended count when nothing was appended", () => {
+    render(<RunSummary run={compaction} />);
+    expect(screen.queryByText(/appended:/)).not.toBeInTheDocument();
+  });
+
   it("explains the heap-budget count on hover", () => {
     render(
       <RunSummary
@@ -465,6 +543,18 @@ describe("isQuietRun", () => {
     ["compaction", "failed_groups"],
   ] as const)("keeps a %s run whose %s is nonzero", (task, field) => {
     expect(isQuietRun(withField(quiet[task], field, "1"))).toBe(false);
+  });
+
+  it.each(["spill_budget_exceeded", "merge_budget_exceeded"] as const)(
+    "calls a compaction sweep quiet when %s is its only count",
+    (field) => {
+      // A configured bound obeyed, re-refused every sweep until a knob moves.
+      expect(isQuietRun(withField(quiet.compaction, field, "3"))).toBe(true);
+    },
+  );
+
+  it("keeps a compaction sweep that left a spill directory on disk", () => {
+    expect(isQuietRun(withField(quiet.compaction, "spill_cleanup_failures", "1"))).toBe(false);
   });
 
   it("calls a compaction sweep quiet when the heap budget is its only count", () => {

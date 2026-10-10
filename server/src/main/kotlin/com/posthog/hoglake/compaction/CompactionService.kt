@@ -120,9 +120,9 @@ data class CompactionConfig(
      * multiplier exists because the two numbers are not the same thing:
      * candidates are not all groupable. A bucket's trailing remainder is
      * under the file minimum, a group another maintainer claims is
-     * dropped, and the row ceiling closes some groups short — so a fetch
-     * of exactly the run's capacity would plan fewer groups than the run
-     * can execute.
+     * dropped, and a sorted group the spill or merge budget refuses is
+     * not executed — so a fetch of exactly the run's capacity would plan
+     * fewer groups than the run can execute.
      *
      * 2 is a headroom, not a model. It doubles the read to absorb those
      * losses. [maxCandidates] is what actually caps the product at the
@@ -174,11 +174,13 @@ data class CompactionConfig(
      *    commit. Raising this above the JDBI pool's free capacity turns
      *    compaction into a connection-starvation source for the
      *    foreground.
-     *  - **Sorted-path heap** — see [sortedHeapBytes] and
-     *    [sortedRowCeiling]. The heap budget is DIVIDED by this value,
-     *    so N concurrent sorted groups cannot exceed what one was
-     *    allowed; the price is proportionally smaller sorted groups, on
-     *    every table, whether or not a sweep ever runs two at once.
+     *  - **Sorted-path heap and spill disk** — see [sortedHeapBytes]
+     *    and [spillBytes]. The heap budget is DIVIDED by this value, so
+     *    N concurrent sorted groups cannot exceed what one was allowed;
+     *    the price is smaller chunks (more spilled runs) and fewer
+     *    trusted runs admitted per group, never a smaller group. The
+     *    spill budget is PER GROUP, so N groups may stage N times it on
+     *    the spill volume at once.
      *  - **Commit-lock pressure.** N groups queue their commits behind
      *    the same per-catalog lock that foreground writers use. Each
      *    wait is milliseconds of metadata, but N of them are N.
@@ -276,131 +278,150 @@ data class CompactionConfig(
      */
     val commitLockTimeoutMs: Long = 0,
     /**
-     * How far the SORTED path's group budget is derated for a table with
-     * nested columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
+     * How far the sorted rewrite's CHUNK is shrunk for a table with nested
+     * columns (HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION).
      *
-     * The sorted path materializes every survivor of a group as
-     * parquet-java `Group` objects so it can sort them — that is what
-     * makes sorting safe at all, since the row ids are explicit data
-     * rather than position. For NESTED rows the object graph runs far
-     * ahead of the bytes: a measured `list<long>` table with five
-     * elements per row peaked at 343 MiB of heap from a 4.6 MiB
-     * compressed input — **70x** — because every element becomes its own
-     * `SimpleGroup` with its own object header, field array and boxed
-     * value, and compression that packs an int64 column 10:1 does
-     * nothing for object headers.
+     * A chunk holds its rows as parquet-java `Group` objects so it can
+     * sort them. For NESTED rows that object graph runs far ahead of the
+     * bytes: a measured `list<long>` table with five elements per row
+     * peaked at 343 MiB of heap from a 4.6 MiB compressed input — **70x**
+     * — because every element becomes its own `SimpleGroup` with its own
+     * object header, field array and boxed value, and compression that
+     * packs an int64 column 10:1 does nothing for object headers.
      *
      * A nested row's node count is not knowable from the catalog (list
-     * lengths are data), so [sortedHeapBytes]'s per-node accounting
-     * cannot see it. This expansion is what covers the gap: for a table
-     * with BOTH nested columns and a live sort order the sorted ROW
-     * CEILING is divided by it. 64 is deliberately near the top of the
-     * measured 30-70x range — erring large costs smaller compaction
-     * groups, erring small costs an OOM in a background loop.
+     * lengths are data), so [spillChunkRows]' per-node accounting cannot
+     * see it. This expansion is what covers the gap: for a table with BOTH
+     * nested columns and a live sort order the chunk's row count is
+     * divided by it. 64 is deliberately near the top of the measured
+     * 30-70x range — erring large costs more, smaller spill files, erring
+     * small costs an OOM in a background loop.
      *
-     * It used to divide [targetBytes] directly, on the stated assumption
-     * that "for FLAT rows the object graph is a few boxed values per row
-     * and targetBytes is a fair proxy for the heap". That assumption was
-     * measured in #118 and is false by an order of magnitude
-     * (`SortedHeapMeasurement`): a flat 11-column event row costs ~1.7 KiB
-     * of materialized heap against ~119 bytes of snappy input, so the
-     * "proxy" was already 14x optimistic before #115 made compaction's
-     * own zstd output — 1.70x denser — an input in its own right, taking
-     * it to 24x. [sortedHeapBytes] is the real bound now;
-     * this is the nested multiplier on top of it.
+     * That is its ONLY role since hoglake#134. It used to size GROUPS (the
+     * sorted row ceiling, and before that a derated byte target), because
+     * the sort held the whole group; a group is now bounded by
+     * [targetBytes] alone and only the chunk is materialized.
      *
-     * NOT a spill implementation, and not a promise. It bounds the
-     * SORTED path only, and only per GROUP: one pathological ROW (a
+     * It bounds the sorted path's CHUNK only: one pathological ROW (a
      * million-element list) still materializes whole on either path, and
      * nothing here changes that — that is [maxNodesPerRow]'s job.
      */
     val nestedSortExpansion: Int = DEFAULT_NESTED_SORT_EXPANSION,
     /**
-     * How much HEAP one group's sorted-path materialization may take
-     * (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES).
+     * How much HEAP one sorted rewrite may hold, PER PHASE
+     * (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES), divided by
+     * [parallelGroups] ([sortedHeapBytesPerGroup]).
      *
-     * This is the quantity [targetBytes] was being used as a proxy for,
-     * and the two are not the same thing at all: [targetBytes] is how
-     * big an OUTPUT FILE should be, measured in compressed bytes on
-     * object storage, while this is how much of the JVM heap the sort
-     * buffer may occupy. Nothing relates them but the input's density,
-     * which is why the conversion between them ([effectiveTargetBytes])
-     * has to consult it.
+     * A sorted rewrite is an external merge sort (hoglake#134;
+     * `ParquetRewriter`'s class doc and `ExternalMergeSort`'s carry the
+     * mechanics) with two phases that never overlap, and this one number
+     * bounds each of them:
      *
-     * # THIS BOUND IS TEMPORARY, AND THE WAY OUT IS KNOWN
+     *  - **CHUNK phase.** Survivors of every input not read as a trusted
+     *    run are read into a chunk of [spillChunkRows] rows, sorted, and
+     *    spilled to [spillDir]. The chunk's object graph is what this
+     *    bounds, through the measured per-node cost
+     *    ([SORTED_HEAP_BYTES_PER_NODE]) and, for nested tables,
+     *    [nestedSortExpansion].
+     *  - **MERGE phase.** Every run — a trusted input read in place, or a
+     *    spill file — holds one row group while it is read. Trusted
+     *    inputs are ADMITTED largest first while the projected cost of
+     *    all runs fits this budget; the rest are demoted to the spill
+     *    path. A group whose spilled runs alone exceed it is refused in
+     *    metadata (`merge_budget_exceeded`), which only configuration can
+     *    cause.
      *
-     * It exists because the sorted rewrite reads the WHOLE group into an
-     * `ArrayList<Group>` and calls `sortedWith`. That is an in-memory
-     * sort, so the group has to fit in memory, so the group has to be
-     * small — measured, about 34 MiB of zstd input per GiB of sort
-     * buffer for a ten-column table. Capping a 512 MiB compaction target
-     * at tens of megabytes is a real cost: sorted tables stop reaching
-     * the target at all, and no setting of this knob fixes that, it only
-     * moves it.
-     *
-     * The fix is an EXTERNAL MERGE SORT, and compaction is unusually
-     * well set up for one:
-     *
-     *  - **A compaction OUTPUT needs no sort at all.** This rewriter
-     *    sorts what it writes (`ParquetRewriter.rewriteInto`, and
-     *    schema.sql's sort-spec comment: the spec is BINDING for
-     *    compaction rewrites), so such an input is an already-sorted
-     *    RUN, and merging k sorted runs needs one row per run in a
-     *    priority queue — O(files) live rows, not O(group).
-     *  - **A CLIENT-WRITTEN file cannot assume it**, because a client's
-     *    sort order is ADVISORY — `schema.sql` says so in as many words,
-     *    and the server never verifies file sortedness. But a
-     *    client-written file is bounded by the ingest flush size, and
-     *    sorting one file alone is bounded by that one file rather than
-     *    by the group. Sort each on its own, spill it as a temp run, and
-     *    stream-merge the runs like any other.
-     *
-     *    Note which case now carries the bytes. Under the ladder, most
-     *    input was a previous output being carried up a rung, so most
-     *    groups were free merges. One-pass compaction consumes each file
-     *    once, so nearly every input is client-written and the spill
-     *    path is the ordinary one — the external sort is MORE work to
-     *    build than it was, and worth more, because it is the only thing
-     *    that lets a sorted table reach the target in one rewrite.
-     *
-     *    NOTE the spill now needs a scratch directory of its own.
-     *    `compactGroup` used to create one per group and this plan was
-     *    written to borrow it; compaction streams both ends now and
-     *    touches no local disk, so whoever builds the external sort owns
-     *    that decision — including whether spilling to an emptyDir whose
-     *    overrun EVICTS the pod is the right place for it.
-     *
-     * Do that and group size stops being a heap question entirely — this
-     * knob, [sortedRowCeiling], and the `heap_budget` skip all go away.
-     * Until then this is the bound that converts an OOM into a counted
-     * refusal (hoglake#118).
+     * What it no longer does is bound the GROUP. A sorted group packs to
+     * [targetBytes] like any other; this knob decides how many spill files
+     * that takes and how many trusted runs fit beside them, i.e. how much
+     * local disk work a group costs, never whether it forms.
      *
      * # The default, and the pod it assumes
      *
-     * 1 GiB, which is the LARGEST value that is safe on the maintenance
-     * pod as it exists today: 4 GiB, so ~2.8 GiB of heap at the image's
-     * `MaxRAMPercentage=70` (server/build.gradle.kts). Worst-case peak
-     * at 1 GiB is ~1130 MiB — the sort buffer's measured ~0.79x of the
-     * declared budget (the 192 B/node constant rounds up from 151.6),
-     * plus parquet-java's 128 MiB row-group block, plus the hydrator's
-     * 256 MiB whole-object ceiling if it fires in the same tick — which
-     * is 39% of that heap.
+     * 1 GiB, which fits the 4 GiB maintenance pod (~2.8 GiB of heap at
+     * the image's `MaxRAMPercentage=70`, server/build.gradle.kts). The
+     * honest per-process peak is the larger of two phases, + the
+     * hydrator's 256 MiB whole-object ceiling if it fires in the same tick:
+     * the MERGE, `sortedHeapBytes` (the admitted runs at their charge) +
+     * per group in flight the OUTPUT writer's buffered row group (flat at
+     * ~140 MiB, ~1.1x the 128 MiB output row group) and the 16 MiB S3
+     * part buffer; and the CHUNK phase, the chunk (~0.79x its charge,
+     * flat ~82 MB at 50k-row chunks however large the group) + the
+     * input's row group (up to a target-sized 512 MiB) + the spill
+     * writer's block and the sort's reference array. With a target-sized
+     * single-row-group input the chunk phase is the larger, and the
+     * default's peak is ~1614 MiB, 56% of that heap. The writer term used
+     * to grow ~40 MB per million rows (643 MB at 8M rows) because its
+     * statistics pinned input pages; the materializer's copy of every
+     * binary value removed that (see ParquetRewriter's `unpinned`). The
+     * merge's per-run charge is conservative (~17.4 MiB charged against
+     * ~6.6 MB measured per spilled run). server/README.md carries the
+     * measurements and the pod table.
      *
-     * This figure USED to include the group's input and output byte
-     * arrays, which scaled with the data. They are gone: compaction
-     * streams both ends (S3InputFile / S3OutputFile), so its transport
-     * costs one 8 MiB readahead buffer and one 16 MiB part buffer,
-     * flat, whatever the group holds. The headroom that frees is
-     * unclaimed — this knob was not raised with it.
-     * Going higher on a 4 GiB pod spends margin this process does not
-     * have.
-     *
-     * Bigger pods buy proportionally bigger groups, and the arithmetic
-     * is linear (server/README.md carries the table). Raising this knob
-     * WITHOUT raising the pod converts the counted refusal back into the
-     * OOM it replaced.
+     * Bigger pods take a bigger value, which buys larger chunks (fewer
+     * spill files) and more trusted runs read in place. Raising it WITHOUT
+     * raising the pod is how the OOM this bound exists to prevent comes
+     * back.
      */
     val sortedHeapBytes: Long = DEFAULT_SORTED_HEAP_BYTES,
+    /**
+     * How many bytes one sorted rewrite may write to [spillDir]
+     * (HOGLAKE_COMPACTION_SPILL_BYTES), PER GROUP — N groups in flight
+     * may stage N times this.
+     *
+     * The bound is in-process because nothing outside the process will
+     * raise it as an error: the spill directory is an emptyDir in the
+     * chart, an overrun of its `sizeLimit` is a kubelet EVICTION of the
+     * whole pod (found by a periodic scan, after the overshoot), and
+     * `FileStore.usableSpace` reports the node's disk rather than the
+     * limit. So a group is refused in METADATA when the registered bytes
+     * its spill path would read exceed this (`spill_budget_exceeded`,
+     * no IO spent), and stopped mid-run, output discarded, the moment
+     * the bytes actually written would cross it.
+     *
+     * 4 GiB default, against an expected footprint of under ~0.9 GiB for
+     * a 512 MiB group of zstd client inputs (snappy spill of zstd input
+     * runs ~1.6x its bytes): headroom for a denser input, small enough
+     * that the chart's default 10 GiB `/tmp` holds two groups' worth.
+     * Size the volume as `parallelGroups x spillBytes` with margin.
+     */
+    val spillBytes: Long = DEFAULT_SPILL_BYTES,
+    /**
+     * Where sorted rewrites stage their spill files
+     * (HOGLAKE_COMPACTION_SPILL_DIR, default `java.io.tmpdir`), one
+     * `hoglake-compaction-spill-<uuid>` directory per rewrite, removed on every exit path.
+     *
+     * Must exist and be writable at BOOT ([SpillDirectory.requireUsable],
+     * on a pod whose compaction loop runs), because the
+     * alternative is worse than a crash loop: a missing directory fails
+     * every sorted group's first spill with `NoSuchFileException`, which
+     * the sweep counts as `failed_groups` and retries forever. Leftovers
+     * of a killed process are removed once at startup
+     * ([SpillDirectory.sweepLeftovers]).
+     */
+    val spillDir: java.nio.file.Path = java.nio.file.Path.of(System.getProperty("java.io.tmpdir")),
+    /**
+     * The smallest registered input a sorted rewrite VERIFIES as already
+     * sorted (HOGLAKE_COMPACTION_VERIFY_MIN_BYTES); smaller inputs go
+     * straight to the chunk phase, counted `files_unchecked`. 0 verifies
+     * every input of known size (an unknown size, 0, is never verified).
+     *
+     * The trade, per input. Verifying it costs `1 + keys x row groups`
+     * ranged GETs — the footer, then one per sort-key column chunk per row
+     * group, because the chunks are not adjacent and each becomes its own
+     * request — and merging it as a run costs a second footer read at the
+     * reopen plus a merge slot; against the chunk path's one read, one
+     * local spill write and one local read back. A writer with many small
+     * row groups multiplies the first term: DuckDB's 122,880-row default
+     * is 40+ row groups in a 500 MB file, so 40+ GETs per key column. At 16 MiB, the spill
+     * block, the local round trip costs about what the extra open does;
+     * below it the chunk path wins outright, and at millions of small
+     * files a day it is also what keeps the merge's fan-in small: a few
+     * spilled runs instead of thousands of one-file runs the heap budget
+     * would demote anyway. Metadata-trusted outputs are never checked, so
+     * the floor does not apply to them.
+     */
+    val verifyMinBytes: Long = DEFAULT_VERIFY_MIN_BYTES,
     /**
      * Per-ROW node budget for the rewrite
      * (HOGLAKE_COMPACTION_MAX_NODES_PER_ROW). [nestedSortExpansion]
@@ -440,6 +461,14 @@ data class CompactionConfig(
         require(nestedSortExpansion >= 1) { "nested sort expansion must be at least 1" }
         require(maxNodesPerRow >= 1) { "max nodes per row must be at least 1" }
         require(sortedHeapBytes >= 1) { "sorted heap bytes must be at least 1" }
+        require(spillBytes >= 1) {
+            "HOGLAKE_COMPACTION_SPILL_BYTES must be at least 1, got $spillBytes: a sorted group " +
+                "that could spill nothing could never be rewritten"
+        }
+        require(verifyMinBytes >= 0) {
+            "HOGLAKE_COMPACTION_VERIFY_MIN_BYTES must not be negative, got $verifyMinBytes " +
+                "(0 verifies every input of known size)"
+        }
         // Validated at CONSTRUCTION, which is boot, for the same reason
         // the file minimums are: a bad value caught inside the sweep
         // throws out of planSnapshot, outside the per-group catch, and
@@ -527,8 +556,8 @@ data class CompactionConfig(
      * then keeps the big file out of the small files' group.
      *
      * It is a CEILING, not a promise: the byte target still closes a
-     * group first if the bytes get there, the row ceiling still closes
-     * it if the rows do, and `need` still refuses one too short.
+     * group first if the bytes get there, and `need` still refuses one
+     * too short.
      */
     fun effectiveMaxInputFiles(sizes: List<Long>): Int {
         if (sizes.isEmpty()) return maxInputFiles
@@ -573,57 +602,29 @@ data class CompactionConfig(
      * The sorted path's heap budget for ONE group, after the division
      * [parallelGroups] forces.
      *
-     * # Divided, not gated — and why
+     * [sortedHeapBytes] is a statement about this PROCESS's heap, and N
+     * groups each sized to the whole heap is N times the heap. So it is
+     * DIVIDED, not gated: every sorted group gets 1/N of it for its chunk
+     * and for its merge, and N of them together are exactly the old
+     * bound. The arithmetic is evaluated in metadata at planning time
+     * (the merge-budget refusal) and again by the rewrite itself, so the
+     * bound holds no matter how the sweep interleaves — no semaphore, no
+     * permit held across object-store IO.
      *
-     * [sortedHeapBytes] is a statement about this PROCESS's heap: the
-     * sorted rewrite materializes a whole group as parquet-java `Group`
-     * objects, and that graph has to fit. It was a per-GROUP budget when
-     * only one group could be in flight, and those were the same
-     * sentence. Under [parallelGroups] > 1 they are not, and N groups
-     * each sized to the whole heap is N times the heap.
-     *
-     * Two ways to close that, and this takes the first:
-     *
-     *  - **DIVIDE** (what this does). The planner's row ceiling and the
-     *    group byte budget both derive from this value, so dividing it
-     *    makes every sorted group 1/N the size and N of them exactly the
-     *    old bound. It is enforced in METADATA at planning time — the
-     *    same place, and by the same arithmetic, as the existing exact
-     *    `record_count` ceiling — so a group that could not fit is never
-     *    formed, never claimed and never spends a byte of IO finding
-     *    out. No lock, no runtime coordination, nothing to deadlock, and
-     *    the bound holds no matter how the sweep interleaves.
-     *  - **GATE** (not done): let a sorted group keep the whole budget
-     *    and admit one at a time through a semaphore. That preserves
-     *    sorted group SIZE, which matters — a sorted table's effective
-     *    target is already derated hard, and the scaling file minimum
-     *    means a small enough target silently stops forming groups at
-     *    all. But it serializes exactly the tables that are slowest to
-     *    rewrite, makes the heap bound depend on a runtime invariant
-     *    rather than on arithmetic a test can evaluate, and the permit
-     *    has to be held across object-store IO — the thing this codebase
-     *    keeps out of the one lock it already has.
-     *
-     * The division is conservative: it applies whether or not a sweep
-     * ever runs two SORTED groups at once, because the planner cannot
-     * know what the other workers will pick up. That is the price, it is
-     * paid only by tables with a live sort order, and it is paid only
-     * when an operator raises [parallelGroups] above the default of 1 —
-     * at which point this returns [sortedHeapBytes] unchanged and every
-     * existing deployment's arithmetic is bit-identical.
-     *
-     * The real fix is the one [sortedHeapBytes] already names: an
-     * external merge sort, after which a group's size stops being a heap
-     * question and this division disappears with the rest of the
-     * ceiling.
+     * The price is per group, and since hoglake#134 it is WORK, not size:
+     * a smaller budget means smaller chunks (more spill files to merge)
+     * and fewer trusted runs read in place. At the default parallelGroups
+     * of 1 this is [sortedHeapBytes] unchanged.
      */
     val sortedHeapBytesPerGroup: Long
         get() = maxOf(1L, sortedHeapBytes / parallelGroups)
 
     /**
-     * How many ROWS of [columns] the sorted path may materialize inside
-     * [sortedHeapBytes] — the bound the group budget exists to respect,
-     * in the unit the heap actually holds.
+     * How many ROWS of [columns] one CHUNK of the sorted rewrite holds —
+     * the chunk phase's heap bound ([sortedHeapBytesPerGroup]) in the unit
+     * the heap actually holds. Only the arithmetic of the former sorted
+     * row ceiling survives here: it used to bound a whole GROUP, and now
+     * bounds one chunk (hoglake#134).
      *
      * A materialized row is not its bytes; it is a `SimpleGroup`, a
      * `List<Object>[]` field array, and then an `ArrayList` plus that
@@ -632,7 +633,7 @@ data class CompactionConfig(
      * shape this catalog holds (`SortedHeapMeasurement`, steady-state
      * retained heap over 200k rows);
      * [SORTED_HEAP_BYTES_PER_NODE] rounds that up, because erring large
-     * costs smaller groups and erring small costs an OOM in a background
+     * costs smaller chunks and erring small costs an OOM in a background
      * loop — the same asymmetry [nestedSortExpansion] is calibrated on.
      *
      * Nodes are counted off the LIVE schema (every node of the forest,
@@ -641,90 +642,29 @@ data class CompactionConfig(
      * [nestedSortExpansion] division, which is the only thing standing in
      * for list lengths the catalog cannot know.
      */
-    fun sortedRowCeiling(columns: List<Column>): Long {
+    fun spillChunkRows(columns: List<Column>): Long {
         val nodes = columns.allNodes().size + 1L // + the _hog_row_id carrier
         val perRow = SORTED_HEAP_BYTES_PER_NODE * nodes
-        // The PER-GROUP budget, which is the whole heap budget divided by
-        // the number of groups that may be in flight — see
-        // [sortedHeapBytesPerGroup] for why divided rather than gated. At
-        // the default parallelGroups = 1 this is sortedHeapBytes and the
-        // arithmetic is unchanged.
         val ceiling = sortedHeapBytesPerGroup / perRow
         val nested = columns.allNodes().any { it.def.type.isNested }
         return maxOf(1L, if (nested) ceiling / nestedSortExpansion else ceiling)
     }
 
     /**
-     * The group byte budget to plan a table under.
-     *
-     * [targetBytes], except for a SORTED table with NESTED columns,
-     * whose object graph runs far ahead of its bytes
-     * ([nestedSortExpansion]).
-     *
-     * # It used to carry a DENSITY arm, and the row capacity replaced it
-     *
-     * The sorted path's real bound is ROWS — a group is materialized as
-     * parquet-java `Group` objects, so what has to fit is
-     * [sortedRowCeiling] of them. Bin packing could only bound BYTES, so
-     * this function converted: it measured the table's average
-     * bytes-per-row over its candidate population and scaled the target
-     * by it, which fixed #118's blindness to a codec change (compaction's
-     * own zstd output is 1.70x denser than a client's snappy, so the same
-     * byte budget started admitting 1.70x the rows).
-     *
-     * That conversion is GONE, for two reasons, and both are
-     * improvements rather than trades:
-     *
-     *  - **`CompactionGrouping.groups` now takes the row ceiling as a
-     *    second capacity**, so the bound is enforced in the unit it is
-     *    stated in, on `hog_data_file.record_count`, which is
-     *    REGISTERED AND EXACT per file. An average density is an
-     *    estimate, and it was an estimate whose only job was to
-     *    approximate a number the catalog already had exactly.
-     *  - **Measuring it cost an unbounded aggregate.** `density` summed
-     *    `file_size_bytes` and `record_count` over every live candidate
-     *    of the table on every sweep — ~10M rows on gigahog-prod-us's
-     *    `ingest.events_raw`, inside the planning transaction, which is
-     *    the same defect as the candidate read it sat beside.
-     *
-     * What the derate did to the CANDIDATE FILTER went with it: a sorted
-     * table's candidates are now files under the raw target again,
-     * rather than under a derated budget, and the row capacity is what
-     * keeps the groups those files form small enough. That is strictly
-     * more compactable — a file the derate excluded could never join any
-     * group, and now it can join a short one.
-     *
-     * Never below 2: CompactionGrouping refuses a smaller target, and a
-     * table whose budget derated to nothing would stop compacting.
+     * The bounds a sorted rewrite of a table shaped [columns] runs under:
+     * [spillChunkRows], [sortedHeapBytesPerGroup] for the merge,
+     * [spillBytes] and [spillDir]. One function, called by the planner's
+     * metadata refusals and by the rewrite alike, so the two cannot
+     * disagree about a group.
      */
-    fun effectiveTargetBytes(
-        columns: List<Column>,
-        sorted: Boolean,
-    ): Long {
-        if (!sorted) return targetBytes
-        // The NESTED bound is a statement about BYTES, and it is the only
-        // thing in the system that sees list lengths at all — a nested
-        // group's materialized graph measured 30-70x its compressed size,
-        // and no row count can predict that, because list lengths are
-        // data. It therefore survives the density arm's removal: the row
-        // capacity bounds ROWS exactly, and this bounds the bytes those
-        // rows may carry when each row's node count is unknowable.
-        val nestedBound =
-            if (nestedSortExpansion == 1 || columns.allNodes().none { it.def.type.isNested }) {
-                targetBytes
-            } else {
-                // Divided by [parallelGroups] as well, for the reason
-                // [sortedHeapBytesPerGroup] gives: this arm is a
-                // statement about how much HEAP a group's nested object
-                // graph takes, so N concurrent groups multiply it just
-                // as they multiply the row ceiling. Leaving it undivided
-                // made the tightest-bound-wins rule choose an undivided
-                // bound for exactly the tables whose graphs are the
-                // least predictable — the nested ones.
-                maxOf(1L, targetBytes / nestedSortExpansion / parallelGroups)
-            }
-        return maxOf(2L, minOf(targetBytes, nestedBound))
-    }
+    fun sortSpill(columns: List<Column>): SortSpill =
+        SortSpill(
+            chunkRows = spillChunkRows(columns),
+            mergeBudgetBytes = sortedHeapBytesPerGroup,
+            spillBudgetBytes = spillBytes,
+            spillDir = spillDir,
+            verifyMinBytes = verifyMinBytes,
+        )
 
     companion object {
         /**
@@ -735,7 +675,7 @@ data class CompactionConfig(
 
         /**
          * Heap cost of one materialized parquet-java node, for
-         * [sortedRowCeiling].
+         * [spillChunkRows].
          *
          * Measured 151.6 B/node (`SortedHeapMeasurement`: 200k flat
          * 11-field event rows retained 333.5 MB, 1667 B/row); 192 rounds
@@ -747,17 +687,20 @@ data class CompactionConfig(
         const val SORTED_HEAP_BYTES_PER_NODE = 192L
 
         /**
-         * See [sortedHeapBytes] — including why this bound is TEMPORARY
-         * and what replaces it (an external merge sort, which a group
-         * of compaction outputs barely needs, since those are already
-         * sorted runs).
-         *
-         * 1 GiB: the largest value whose worst-case peak (~1260 MiB)
-         * still fits the 4 GiB maintenance pod's ~2.8 GiB heap with
-         * margin. Bigger pods take a bigger value; the knob is linear in
-         * the group bytes it buys and server/README.md has the ladder.
+         * See [sortedHeapBytes]. 1 GiB: worst-case process peak ~1614 MiB
+         * (the larger of the chunk phase with a target-sized input row
+         * group and the merge with the flat ~140 MiB output writer, plus
+         * the hydrator's whole-object ceiling), 56% of the 4 GiB
+         * maintenance pod's ~2.8 GiB heap. server/README.md has the pod
+         * table.
          */
         const val DEFAULT_SORTED_HEAP_BYTES = 1024L * 1024 * 1024
+
+        /** See [spillBytes]: 4 GiB of local spill per sorted group. */
+        const val DEFAULT_SPILL_BYTES = 4L * 1024 * 1024 * 1024
+
+        /** See [verifyMinBytes]: the spill block, 16 MiB. */
+        const val DEFAULT_VERIFY_MIN_BYTES = SortSpill.SPILL_BLOCK_BYTES.toLong()
 
         /**
          * See [parallelGroups]. 1 = today's sequential sweep, so an
@@ -851,7 +794,19 @@ data class CompactionCandidate(
     val explicitRowIds: Boolean = false,
     /** The file's live DV as planned; the rewrite APPLIES it. Null = none. */
     val dv: LiveDv? = null,
-)
+    /**
+     * `hog_data_file.begin_snapshot` — the snapshot that registered the
+     * file. Read on the candidate row itself (no extra descent) for the
+     * sorted rewrite's trust predicate: an explicit-row-id file
+     * registered at or after the live sort spec's `begin_snapshot` is a
+     * compaction output written under that spec. 0 = unknown, which a
+     * live spec's begin never is at or below, so it is never trusted.
+     */
+    val beginSnapshot: Long = 0,
+) {
+    /** Rows the rewrite will read from this file: registered records minus its planned DV's deletes. */
+    val survivingRecords: Long get() = recordCount - (dv?.deleteCount ?: 0)
+}
 
 /** A greedy run of candidates sharing (spec_id, partition_values). */
 data class CompactionGroup(
@@ -875,27 +830,24 @@ data class CompactionPlan(
     val table: String,
     val groups: List<CompactionGroup>,
     /**
-     * Groups the table's sorted-path row ceiling
-     * (CompactionConfig.sortedRowCeiling) left unrewritable.
-     *
-     * Groups are PACKED to the ceiling now, so this is no longer "groups
-     * formed on bytes and then refused" — that was the production
-     * pathology (~2,000 a run on gigahog-prod-us's `ingest.events_raw`,
-     * where ~50 bytes per row made every byte-sized group ~2.9M rows
-     * against a ceiling of 552,336, and the table never compacted).
-     * What it counts now is work the ceiling cannot make a group OF: a
-     * single file whose own surviving rows exceed it, or files dense
-     * enough that no two of them fit, both of which the packer closes
-     * short of the file minimum
-     * (`CompactionGrouping.Packing.rowBoundRefusals`).
-     *
-     * Decided in metadata rather than discovered by an
-     * OutOfMemoryError ninety seconds into a rewrite: record_count is
-     * already in the catalog, so the check is exact and free, and a
-     * group that cannot fit never spends the IO to find out. The count
-     * reaches the run outcome as CompactionResult.heapBudgetExceeded.
+     * Sorted groups refused in METADATA because the registered bytes
+     * their spill path would read exceed CompactionConfig.spillBytes
+     * (`spill_budget_exceeded`). Decided from `file_size_bytes` by the
+     * same arithmetic the rewrite applies (`ExternalMergeSort.admit`),
+     * so a group that cannot fit the spill volume never spends a byte
+     * of IO finding out — and never staged a byte toward the emptyDir
+     * limit whose overrun evicts the pod.
      */
-    val heapRefusedGroups: Long = 0,
+    val spillRefusedGroups: Long = 0,
+    /**
+     * Sorted groups refused in METADATA because their merge cannot fit
+     * CompactionConfig.sortedHeapBytesPerGroup even with every trusted
+     * input demoted to the spill path (`merge_budget_exceeded`): too
+     * many spilled runs, each holding a row group while it is read.
+     * Predicted from the registered survivor counts. Reachable only by
+     * configuration — a heap budget small against the byte target.
+     */
+    val mergeRefusedGroups: Long = 0,
     /**
      * Groups this plan formed and then dropped because another
      * maintainer holds a LIVE claim over one or more of their input
@@ -909,8 +861,9 @@ data class CompactionPlan(
      * claims are off or the planners are seeing different candidate
      * sets.
      *
-     * Like [heapRefusedGroups] and unlike every other skip flavor, it
-     * spends no IO, so it does NOT consume the run's group budget.
+     * Like [spillRefusedGroups] and [mergeRefusedGroups], and unlike
+     * every other skip flavor, it spends no IO, so it does NOT consume
+     * the run's group budget.
      */
     val claimedGroups: Long = 0,
     /**
@@ -1009,7 +962,12 @@ data class CompactionPlan(
  * delete_file_id — supersession always mints a new row); any miss
  * aborts just that group (skipped, logged, counted as
  * skipped_conflicts or dv_superseded) and the next run re-plans. A
- * delete that happened after planning is NEVER dropped.
+ * delete that happened after planning is NEVER dropped. The live sort
+ * spec is re-verified the same way (by `sort_id`, null for unsorted):
+ * a sorted table's compaction outputs are TRUSTED as already-sorted
+ * runs by later rewrites when registered after the live spec began, so
+ * an output sorted under a spec that changed mid-rewrite must not
+ * register at all.
  *
  * Aborted-upload orphans: before uploading, the output path is
  * PRE-REGISTERED as an undrained hog_file_removal row (reason
@@ -1055,7 +1013,9 @@ class CompactionService(
     private val runStore = MaintenanceRunStore(jdbi)
 
     /**
-     * Last heap-refusal picture per table, so a permanent condition is
+     * Last budget-refusal picture per table (spill and merge budget
+     * refusals, hoglake#134; the sorted row ceiling's before them), so a
+     * permanent condition is
      * logged when it CHANGES rather than on every sweep. One short string
      * per table that has ever been refused; the planner is the only
      * writer, but a manual sweep and the loop can plan concurrently, so
@@ -1068,7 +1028,7 @@ class CompactionService(
      * per-sweep warning this map exists to stop: 302 identical lines in
      * 17 hours for one unchanged refusal.
      */
-    private val lastHeapRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
+    private val lastBudgetRefusal = java.util.concurrent.ConcurrentHashMap<Pair<Long, Long>, String>()
 
     /** Everything execution needs beyond the group list. */
     private data class TableContext(
@@ -1081,6 +1041,20 @@ class CompactionService(
         val columns: List<Column>,
         /** Live sort order — BINDING for the rewrite. Empty = row-id order. */
         val sortFields: List<SortFieldDef>,
+        /**
+         * The live sort spec's id at planning, null = unsorted. The commit
+         * re-reads it under the catalog lock and refuses the group when it
+         * moved (null <-> non-null included): an output sorted under a
+         * spec that is no longer live would otherwise register with a
+         * `begin_snapshot` past the NEW spec's and be trusted as a run of
+         * it forever.
+         */
+        val sortId: Long? = null,
+        /**
+         * The live sort spec's `begin_snapshot`, null = unsorted: the
+         * trust predicate's threshold (see [trustedSorted]).
+         */
+        val sortBeginSnapshot: Long? = null,
         /** Per-row node budget for the rewrite (CompactionConfig.maxNodesPerRow). */
         val maxNodesPerRow: Int = ParquetRewriter.DEFAULT_MAX_NODES_PER_ROW,
         /** Output compression for the rewrite (CompactionConfig.codec). */
@@ -1097,6 +1071,11 @@ class CompactionService(
          * 0 = the unbounded wait this path used to take unconditionally.
          */
         val commitLockTimeoutMs: Long = 0,
+        /**
+         * The sorted rewrite's bounds; null exactly when [sortFields] is
+         * empty, because the rewriter refuses a sort without them.
+         */
+        val sortSpill: SortSpill? = null,
     )
 
     private data class PlanWithContext(val ctx: TableContext, val plan: CompactionPlan)
@@ -1169,6 +1148,25 @@ class CompactionService(
      */
     internal var beforeCommitTail: (Handle) -> Unit = {}
 
+    /**
+     * A hook [compactGroup] calls with the [ParquetRewriter.Input]s it
+     * built, just before the rewrite — so a test can check what each
+     * input reads THROUGH (the sortedness pre-pass's key source and its
+     * readahead), which no outcome of the rewrite reveals: a key source
+     * at the merge's 8 MiB readahead is correct and only costs fetches.
+     * Default is a no-op, called once per rewrite, and nothing but a test
+     * ever sets it.
+     */
+    internal var beforeRewrite: (List<ParquetRewriter.Input>) -> Unit = {}
+
+    /**
+     * The smallest input row group the rewrite appends byte for byte
+     * ([ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES], a constant, not a
+     * knob). A var only so an integration test can append kilobyte
+     * fixtures; nothing but a test ever sets it.
+     */
+    internal var appendFloorBytes: Long = ParquetRewriter.APPEND_MIN_ROW_GROUP_BYTES
+
     /** Public metadata-only planning for one table (also the test surface). */
     fun planTable(
         catalog: String,
@@ -1197,11 +1195,12 @@ class CompactionService(
      *    buckets to work on, and fetch their candidate rows. Everything
      *    that must agree with everything else is in here, on ONE MVCC
      *    snapshot — the schema the rewrite will be shaped by, the sort
-     *    spec that decides whether there is a row ceiling at all, and
-     *    the files. That invariant is why this phase is a transaction
+     *    spec whose `begin_snapshot` decides which files are trusted
+     *    runs, and the files. That invariant is why this phase is a transaction
      *    and not three autocommit reads.
-     *  - **(b) PACK**, outside a transaction: bin packing, the row
-     *    ceiling, the WARN. Pure CPU over the rows phase (a) returned.
+     *  - **(b) PACK**, outside a transaction: bin packing, a sorted
+     *    group's spill and merge budget refusals, the WARN. Pure CPU
+     *    over the rows phase (a) returned.
      *  - **(c) CLAIM READ**, one short autocommit read: which of this
      *    table's files another maintainer is already rewriting.
      *
@@ -1224,7 +1223,8 @@ class CompactionService(
      * commit is what checks. `commitGroup` re-verifies, under the
      * per-catalog commit lock, that the staging ticket is untouched,
      * that the TABLE is not dropped (`hog_table.dropped_snapshot`),
-     * that every input is still live (`end_snapshot IS NULL`) and that
+     * that the live SORT SPEC is the one planned against
+     * (`hog_sort_spec.sort_id`), that every input is still live (`end_snapshot IS NULL`) and that
      * every input still carries EXACTLY its planned deletion vector by
      * `delete_file_id`. A stale plan therefore costs one group —
      * `skipped_conflicts` or `dv_superseded` — and never a wrong commit.
@@ -1294,7 +1294,8 @@ class CompactionService(
                 namespace = fetched.ctx.namespace,
                 table = fetched.ctx.table,
                 groups = free.groups,
-                heapRefusedGroups = packed.heapRefused,
+                spillRefusedGroups = packed.spillRefused,
+                mergeRefusedGroups = packed.mergeRefused,
                 claimedGroups = free.claimed,
                 candidatesFetched = fetched.candidatesFetched,
                 bucketsConsidered = fetched.bucketsConsidered,
@@ -1330,22 +1331,53 @@ class CompactionService(
         val t =
             TableRepo.findLive(h, cat.catalogId, ns.namespaceId, table)
                 ?: throw HoglakeException.NotFound("table '$namespace.$table' in catalog '$catalog'")
+        val columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
+        val sortSpec = SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
+        val sortFields = sortSpec?.fields ?: emptyList()
         return TableContext(
             catalogId = cat.catalogId,
             dataPath = cat.dataPath,
             namespace = ns.name,
             table = t.name,
             tableId = t.tableId,
-            columns = TableRepo.columnsAt(h, cat.catalogId, t.tableId, cat.headSnapshotId),
-            sortFields =
-                SortRepo.sortSpecAt(h, cat.catalogId, t.tableId, cat.headSnapshotId)
-                    ?.fields ?: emptyList(),
+            columns = columns,
+            sortFields = sortFields,
+            sortId = sortSpec?.sortId,
+            sortBeginSnapshot = sortSpec?.beginSnapshot,
             maxNodesPerRow = cfg.maxNodesPerRow,
             codec = cfg.codec,
             inputOpenParallelism = cfg.inputOpenParallelism,
             commitLockTimeoutMs = cfg.commitLockTimeoutMs,
+            sortSpill = if (sortFields.isEmpty()) null else cfg.sortSpill(columns),
         )
     }
+
+    /**
+     * Whether [f] may be read as an already-sorted RUN of [ctx]'s live
+     * sort order instead of being spilled (hoglake#134).
+     *
+     * Both halves are load-bearing, and both are metadata:
+     *
+     *  - `explicit_row_ids`: only compaction writes it (registration has
+     *    no such field and `CommitService` never sets it), and a
+     *    compaction output of a sorted table is written sorted by the
+     *    spec live at its plan. A client's sort order is ADVISORY and
+     *    never verified (`schema.sql`), so no client file is trusted.
+     *  - `begin_snapshot >= spec.begin_snapshot`: the output was
+     *    committed under THIS spec. An output of an earlier spec, or of
+     *    the table while it was unsorted, predates it and is spilled.
+     *    What makes "committed after" mean "sorted under" is the commit's
+     *    re-verification of the live `sort_id` ([commitGroup]): a group
+     *    planned under one spec cannot commit under another.
+     *
+     * Never verified against the bytes (out of scope by decision): a
+     * trusted run that is not key-sorted yields a mis-sorted output, not
+     * an error. Unsorted tables trust nothing — there is no merge.
+     */
+    private fun trustedSorted(
+        ctx: TableContext,
+        f: CompactionCandidate,
+    ): Boolean = f.explicitRowIds && ctx.sortBeginSnapshot != null && f.beginSnapshot >= ctx.sortBeginSnapshot
 
     /** A candidate bucket: one (spec, partition values) pair. */
     private data class Bucket(val specId: Long?, val values: List<String?>?)
@@ -1353,13 +1385,8 @@ class CompactionService(
     /** Phase (a)'s output: what to pack, and what it cost to find. */
     private data class CandidateFetch(
         val ctx: TableContext,
-        /** The group byte budget this fetch filtered on. */
+        /** The group byte budget this fetch filtered on: the target, for every table. */
         val budget: Long,
-        /**
-         * The row ceiling this fetch filtered on, and the capacity
-         * packing will use. `NO_ROW_CAPACITY` for an unsorted table.
-         */
-        val rowCapacity: Long,
         val byBucket: Map<Bucket, List<CompactionCandidate>>,
         val candidatesFetched: Long,
         val bucketsConsidered: Long,
@@ -1477,27 +1504,19 @@ class CompactionService(
         cfg: CompactionConfig,
     ): CandidateFetch {
         val ctx = tableContext(h, catalog, namespace, table, cfg)
-        val sorted = ctx.sortFields.isNotEmpty()
-        val budget = cfg.effectiveTargetBytes(ctx.columns, sorted)
-        // THE ROW CEILING IS PART OF THE CANDIDATE FILTER, not only of
-        // the packing. A sorted file whose own surviving rows exceed the
-        // ceiling can never join any group, so fetching it costs a slot
-        // of the candidate budget to produce a one-file group, a
-        // refusal and a WARN. `record_count` is registered and exact, so
-        // the filter is free — which is what the removed density derate
-        // was approximating when it narrowed the filter by an average.
-        //
-        // `record_count`, not survivors: the DV's delete count is on
-        // another table and this predicate has to stay on the index's
-        // own row. It is therefore conservative in the right direction —
-        // a file the ceiling would admit only after its DV is applied is
-        // excluded, which costs one group and never an OOM.
-        val rowCapacity = if (sorted) cfg.sortedRowCeiling(ctx.columns) else CompactionGrouping.NO_ROW_CAPACITY
+        // THE TARGET, FOR EVERY TABLE. A sorted table's candidates used to
+        // be filtered and packed under a row ceiling (and, nested, a
+        // derated byte budget), because the sorted rewrite held the whole
+        // group in heap. It is an external merge sort now (hoglake#134),
+        // so a sorted group's heap is bounded by its CHUNK and its runs,
+        // not by its size; what a sorted group can still be refused for
+        // is decided per group in [pack], in metadata.
+        val budget = cfg.targetBytes
 
         fun empty(
             available: Long = 0,
             truncated: Boolean = false,
-        ) = CandidateFetch(ctx, budget, rowCapacity, emptyMap(), 0, 0, available, truncated)
+        ) = CandidateFetch(ctx, budget, emptyMap(), 0, 0, available, truncated)
         // The scalar rewriter cannot preserve VARIANT groups yet. Do not enqueue
         // work that could drop payloads or repeatedly fail the maintenance loop.
         // allNodes, not the top level: a variant nested inside a struct
@@ -1513,7 +1532,7 @@ class CompactionService(
         // question from "does it credit this table with a compactable
         // bucket", and the two have opposite answers.
         if (TierTotalsRepo.publishedGeneration(h, ctx.catalogId) == null) {
-            return fetchWholeTable(h, ctx, budget, rowCapacity, cfg)
+            return fetchWholeTable(h, ctx, budget, cfg)
         }
         val sampled = sampledBuckets(h, ctx, cfg)
         if (sampled.isEmpty()) return empty()
@@ -1541,7 +1560,7 @@ class CompactionService(
             // holds exactly its remaining room was truncated by nothing,
             // and a bucket that holds one more was. Trimmed below.
             val room = (candidateBudget - fetched).toInt()
-            val rows = bucketCandidates(h, ctx, budget, rowCapacity, cfg, bucket.bucket, room + 1)
+            val rows = bucketCandidates(h, ctx, budget, cfg, bucket.bucket, room + 1)
             considered++
             if (rows.size > room) truncated = true
             val taken = if (rows.size > room) rows.subList(0, room) else rows
@@ -1552,7 +1571,6 @@ class CompactionService(
         return CandidateFetch(
             ctx = ctx,
             budget = budget,
-            rowCapacity = rowCapacity,
             byBucket = byBucket,
             candidatesFetched = fetched,
             bucketsConsidered = considered,
@@ -1736,7 +1754,7 @@ class CompactionService(
      *
      * Keyed by (catalog, table) — `table_id` is scoped per catalog, so
      * a table-only key would let one catalog's sweep move another's
-     * cursor (the bug `lastHeapRefusal`'s key already records). It is
+     * cursor (the bug `lastBudgetRefusal`'s key already records). It is
      * lost on restart and NOT shared between replicas, which costs a
      * repeated bucket after a deploy and nothing else: the cursor is
      * fairness, never correctness, and two replicas planning the same
@@ -1788,7 +1806,6 @@ class CompactionService(
      *      WHERE catalog_id = ? AND table_id = ?        -- V10's index, leading
      *        AND end_snapshot IS NULL
      *        AND file_size_bytes < ?                    -- V10's index, range
-     *        [AND record_count < ?]                      -- the sorted row ceiling
      *        [AND EXISTS (one arm per partition key)]    -- V23's index
      *      [ORDER BY file_size_bytes, data_file_id]      -- ONLY when there are no arms
      *      LIMIT ?                                       -- THE SCAN CAP
@@ -1877,7 +1894,6 @@ class CompactionService(
         nullArms: Set<Int>,
         scopeToSpec: Boolean,
         withPartitionValues: Boolean,
-        boundRows: Boolean,
     ): String {
         val armSql =
             arms.joinToString("\n") { keyIndex ->
@@ -1891,7 +1907,6 @@ class CompactionService(
                                       AND $valuePredicate)
                 """.trimEnd()
             }
-        val rowBound = if (boundRows) "\n                       AND f0.record_count < :rowCeiling" else ""
         // THE INNER ORDER BY EXISTS ONLY WHEN THERE ARE NO ARMS, and
         // that asymmetry is the whole bound. See the KDoc.
         val innerOrder =
@@ -1913,16 +1928,16 @@ class CompactionService(
         return """
             SELECT f.data_file_id, f.path, f.record_count, f.file_size_bytes,
                    f.footer_size, f.row_id_start, f.explicit_row_ids,
-                   f.spec_id,
+                   f.begin_snapshot, f.spec_id,
                    dv.delete_file_id AS dv_id, dv.path AS dv_path, dv.delete_count AS dv_count$valuesProjection
               FROM (
                     SELECT f0.catalog_id, f0.data_file_id, f0.path, f0.record_count,
                            f0.file_size_bytes, f0.footer_size, f0.row_id_start,
-                           f0.explicit_row_ids, f0.spec_id
+                           f0.explicit_row_ids, f0.begin_snapshot, f0.spec_id
                       FROM hog_data_file f0
                      WHERE f0.catalog_id = :catalogId AND f0.table_id = :tableId
                        AND f0.end_snapshot IS NULL
-                       AND f0.file_size_bytes < :targetBytes$rowBound$armSql$innerOrder
+                       AND f0.file_size_bytes < :targetBytes$armSql$innerOrder
                      LIMIT :scanLimit
                    ) f
               LEFT JOIN hog_delete_file dv
@@ -1959,7 +1974,6 @@ class CompactionService(
         h: Handle,
         ctx: TableContext,
         budget: Long,
-        rowCapacity: Long,
         cfg: CompactionConfig,
         bucket: Bucket,
         limit: Int,
@@ -1967,7 +1981,6 @@ class CompactionService(
         val values = bucket.values ?: emptyList()
         val arms = values.indices.toList()
         val nullArms = values.indices.filter { values[it] == null }.toSet()
-        val boundRows = rowCapacity != CompactionGrouping.NO_ROW_CAPACITY
         val scanLimit = if (arms.isEmpty()) maxOf(limit, cfg.maxCandidates) else limit
         val query =
             h.createQuery(
@@ -1976,7 +1989,6 @@ class CompactionService(
                     nullArms = nullArms,
                     scopeToSpec = true,
                     withPartitionValues = false,
-                    boundRows = boundRows,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -1985,7 +1997,6 @@ class CompactionService(
                 .bind("specId", bucket.specId)
                 .bind("scanLimit", scanLimit)
                 .bind("limit", limit)
-        if (boundRows) query.bind("rowCeiling", rowCapacity)
         values.forEachIndexed { keyIndex, value ->
             query.bind("k$keyIndex", keyIndex)
             if (value != null) query.bind("v$keyIndex", value)
@@ -2010,10 +2021,8 @@ class CompactionService(
         h: Handle,
         ctx: TableContext,
         budget: Long,
-        rowCapacity: Long,
         cfg: CompactionConfig,
     ): CandidateFetch {
-        val boundRows = rowCapacity != CompactionGrouping.NO_ROW_CAPACITY
         val query =
             h.createQuery(
                 candidateSql(
@@ -2021,7 +2030,6 @@ class CompactionService(
                     nullArms = emptySet(),
                     scopeToSpec = false,
                     withPartitionValues = true,
-                    boundRows = boundRows,
                 ),
             )
                 .bind("catalogId", ctx.catalogId)
@@ -2029,7 +2037,6 @@ class CompactionService(
                 .bind("targetBytes", budget)
                 .bind("scanLimit", cfg.maxCandidates)
                 .bind("limit", cfg.maxCandidates)
-        if (boundRows) query.bind("rowCeiling", rowCapacity)
         val rows =
             query
                 .map { rs, _ ->
@@ -2053,7 +2060,6 @@ class CompactionService(
         return CandidateFetch(
             ctx = ctx,
             budget = budget,
-            rowCapacity = rowCapacity,
             byBucket = byBucket,
             candidatesFetched = rows.size.toLong(),
             // BOTH ZERO, and that is the honest report: this path did
@@ -2077,6 +2083,7 @@ class CompactionService(
             footerSize = rs.getObject("footer_size", java.lang.Long::class.java)?.toLong(),
             rowIdStart = rs.getLong("row_id_start"),
             explicitRowIds = rs.getBoolean("explicit_row_ids"),
+            beginSnapshot = rs.getLong("begin_snapshot"),
             dv =
                 rs.getObject("dv_id")?.let {
                     LiveDv(
@@ -2088,13 +2095,64 @@ class CompactionService(
         )
 
     /**
-     * What [pack] produced: what will be attempted, and what the row
-     * ceiling refused.
+     * What [pack] produced: what will be attempted, and the sorted groups
+     * the spill and merge budgets refused in metadata.
      */
     private data class PackedGroups(
         val groups: List<CompactionGroup>,
-        val heapRefused: Long,
+        val spillRefused: Long,
+        val mergeRefused: Long,
     )
+
+    /** A candidate as sorted-rewrite admission sees it: catalog facts only. */
+    private data class PlannedRun(
+        override val trustedSorted: Boolean,
+        override val fileSizeBytes: Long,
+        override val survivingRecords: Long,
+    ) : RunCandidate
+
+    /** Why the planner refused a sorted group; see [budgetRefusal]. */
+    private enum class BudgetRefusal { SPILL, MERGE }
+
+    /**
+     * Whether a SORTED group would be refused by the rewrite's own
+     * budgets, decided from registered sizes and survivor counts before
+     * any IO: [BudgetRefusal.SPILL] when the bytes its spill path would
+     * read exceed [SortSpill.spillBudgetBytes], [BudgetRefusal.MERGE]
+     * when its spilled runs alone exceed [SortSpill.mergeBudgetBytes].
+     * Null = attempt it.
+     *
+     * THE REWRITER'S ARITHMETIC, NOT A COPY OF IT: this calls
+     * [ExternalMergeSort.admit] with the same trust predicate, sizes and
+     * survivors [compactGroup] hands the rewrite, so the planner cannot
+     * refuse a group the rewrite would take or wave through one it would
+     * refuse in the same way. The rewrite still checks for itself — from
+     * the footers it opens and the bytes it actually writes — and those
+     * hard stops reach [executeGroup]'s arms as the same two exceptions.
+     *
+     * WORST CASE about sortedness: only metadata-trusted files count as
+     * runs here; every other file is assumed to spill. The rewrite's
+     * pre-pass may VERIFY some of them as already sorted and read them in
+     * place, and the planner cannot know which without reading them. So
+     * this refuses only groups that would need more spill (or more
+     * spilled runs) than the budgets allow even if nothing verified; a
+     * group it admits can only do better at execution, never worse.
+     */
+    private fun budgetRefusal(
+        ctx: TableContext,
+        spill: SortSpill,
+        leaves: Int,
+        group: CompactionGroup,
+    ): BudgetRefusal? {
+        val runs = group.files.map { PlannedRun(trustedSorted(ctx, it), it.fileSizeBytes, it.survivingRecords) }
+        val admission =
+            try {
+                ExternalMergeSort.admit(runs, spill, leaves)
+            } catch (_: SpillBudgetExceededException) {
+                return BudgetRefusal.SPILL
+            }
+        return if (admission.projectedBytes > spill.mergeBudgetBytes) BudgetRefusal.MERGE else null
+    }
 
     /**
      * A group's files in ROW-ID order, which is not cosmetic.
@@ -2129,29 +2187,16 @@ class CompactionService(
         cfg: CompactionConfig,
     ): PackedGroups {
         val ctx = fetched.ctx
-        // THE ROW CEILING IS A PACKING BOUND NOW, not a post-hoc filter.
-        //
-        // It used to be applied to finished groups: pack on bytes, then
-        // refuse any group whose registered survivors exceeded
-        // `sortedRowCeiling`. On gigahog-prod-us's `ingest.events_raw`
-        // that refused EVERY group — the stray-day files hold ~50 bytes
-        // per row, so a byte-sized group was ~2.9M rows against a
-        // ceiling of 552,336 — and the table did not compact at all for
-        // days, ~2,000 `heap_budget_exceeded` per run. Handed to the
-        // packer the same ceiling produces groups that FIT: smaller, but
-        // rewritten.
-        //
-        // Taken from the FETCH, which filtered on it too
-        // (`fetchCandidates`), so the two cannot disagree. Only the
-        // sorted path materializes a group, so only it has a ceiling;
-        // the streaming path writes each survivor as it reads it and its
-        // heap is flat in group size.
-        val rowCapacity = fetched.rowCapacity
+        // ONE CAPACITY: BYTES. The sorted path used to pack to a row
+        // ceiling as well, because its rewrite held the whole group in
+        // heap; on gigahog-prod-us's `ingest.events_raw` that closed
+        // every group far short of the target. The rewrite is an external
+        // merge sort now (hoglake#134) and a sorted group packs exactly
+        // like an unsorted one.
         val grouping = CompactionGrouping.of(fetched.budget)
         val out = mutableListOf<CompactionGroup>()
-        val refused = mutableListOf<CompactionGroup>()
         for ((bucket, candidates) in fetched.byBucket) {
-            val packing =
+            val packed =
                 grouping.groups(
                     candidates,
                     cfg.minInputFiles,
@@ -2160,73 +2205,97 @@ class CompactionService(
                     // a bucket of 12 KiB files gets thousands of inputs
                     // and a bucket of 200 MB files still gets a handful.
                     cfg.effectiveMaxInputFiles(candidates.map { it.fileSizeBytes }),
-                    rowCapacity,
-                    // SURVIVORS, not `record_count`: the rewrite
-                    // materializes what the deletion vectors leave, and
-                    // a file whose DV deletes most of it costs the heap
-                    // only what survives. Same expression as
-                    // CompactionGroup.survivingRecords, per file.
-                    { it.recordCount - (it.dv?.deleteCount ?: 0) },
                 ) { it.fileSizeBytes }
-            for (take in packing.groups) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
-            for (short in packing.rowBoundRefusals) {
-                refused += CompactionGroup(rowIdOrder(short), bucket.specId, bucket.values)
+            for (take in packed) out += CompactionGroup(rowIdOrder(take), bucket.specId, bucket.values)
+        }
+        // A SORTED group the rewrite's own budgets would refuse is refused
+        // HERE, in metadata, uncharged — see [budgetRefusal]. Only
+        // configuration produces either (a spill budget small against the
+        // byte target, a heap budget small against it), so the same groups
+        // re-plan and re-refuse every sweep until an operator moves a knob.
+        // The leaf count is the output schema's; a live schema the rewrite
+        // cannot shape at all has no count, and its groups are left for
+        // the rewrite to refuse with its own typed reason.
+        val spill = ctx.sortSpill
+        val leaves = spill?.let { runCatching { ParquetRewriter.outputLeafCount(ctx.columns) }.getOrNull() }
+        val spillRefused = mutableListOf<CompactionGroup>()
+        val mergeRefused = mutableListOf<CompactionGroup>()
+        val fits =
+            if (spill == null || leaves == null) {
+                out
+            } else {
+                out.filter { group ->
+                    when (budgetRefusal(ctx, spill, leaves, group)) {
+                        BudgetRefusal.SPILL -> false.also { spillRefused += group }
+                        BudgetRefusal.MERGE -> false.also { mergeRefused += group }
+                        null -> true
+                    }
+                }
             }
-        }
-        // THE BACKSTOP, and it should never fire. The packer closes a
-        // group BEFORE the file that would breach the ceiling, so every
-        // group it emits fits by construction — this is what catches a
-        // regression in that rule instead of an OutOfMemoryError ninety
-        // seconds into a rewrite. record_count is registered and exact,
-        // so the check is free.
-        val (fits, overCeiling) = out.partition { it.survivingRecords <= rowCapacity }
-        val allRefused = refused + overCeiling
-        // A table at the row ceiling is a STATE, not an event: the same
-        // files are re-packed and re-refused on every sweep, forever,
-        // until an operator raises the heap or drops the sort order.
-        // Logging it per sweep buried a burn-in in 289 identical
-        // warnings -- 235 KB -- in three minutes for a single table. Log
-        // when the picture CHANGES; the metric below carries the rest.
-        if (allRefused.isEmpty()) {
-            lastHeapRefusal.remove(ctx.catalogId to ctx.tableId)
-        }
-        val worst = allRefused.maxByOrNull { it.survivingRecords }
-        val signature = "${allRefused.size}/${worst?.survivingRecords ?: 0}/$rowCapacity"
-        if (worst != null && lastHeapRefusal.put(ctx.catalogId to ctx.tableId, signature) != signature) {
-            val worstFile = worst.files.maxByOrNull { it.recordCount - (it.dv?.deleteCount ?: 0) }
-            log.warn {
-                "compaction refused ${allRefused.size} group(s) of " +
-                    "${ctx.namespace}.${ctx.table} that the sorted-path row ceiling closed too " +
-                    "short to rewrite: ${worst.files.size} file(s) holding " +
-                    "${worst.survivingRecords} surviving row(s) against a ceiling of " +
-                    "$rowCapacity, the largest being ${worstFile?.path} with " +
-                    "${worstFile?.let { it.recordCount - (it.dv?.deleteCount ?: 0) }} row(s) " +
-                    "(heap budget ${cfg.sortedHeapBytesPerGroup} B per group = " +
-                    "${cfg.sortedHeapBytes} B / ${cfg.parallelGroups} concurrent group(s)). " +
-                    "Groups are now PACKED to the ceiling, so what is left here is work the " +
-                    "ceiling cannot make a group of at all — a single file above it, or files " +
-                    "dense enough that no two of them fit — and that part of the table keeps its " +
-                    "debt while the rest compacts. " +
-                    "Levers today: raise HOGLAKE_COMPACTION_SORTED_HEAP_BYTES together with the " +
-                    "pod's memory (the default is sized for a 4 GiB pod), lower " +
-                    "HOGLAKE_COMPACTION_PARALLEL_GROUPS (which divides that budget), or drop " +
-                    "the table's " +
-                    "sort order to move it to the streaming path, whose heap is flat in group " +
-                    "size. This ceiling is TEMPORARY: the sorted rewrite sorts the whole group " +
-                    "in memory, and replacing that with an external merge sort removes it — " +
-                    "a group of compaction outputs is a merge of already-sorted runs, so merging " +
-                    "them needs one row per input rather than all of them. See " +
-                    "CompactionConfig.sortedHeapBytes"
-            }
-        }
+        logBudgetRefusals(ctx, cfg, spillRefused, mergeRefused)
         // Most files first: every group now targets the same size, so the
         // one holding the most files buys the largest drop in file count
         // for the same bytes rewritten. Row-id order breaks ties, which
         // keeps a group's inputs adjacent in arrival order.
         return PackedGroups(
             fits.sortedWith(compareBy({ -it.files.size }, { it.files.first().rowIdStart })),
-            allRefused.size.toLong(),
+            spillRefused.size.toLong(),
+            mergeRefused.size.toLong(),
         )
+    }
+
+    /**
+     * WARN about a table's budget refusals when the picture CHANGES, not
+     * on every sweep.
+     *
+     * A refused table is a STATE, not an event: the same files re-pack
+     * and re-refuse every sweep until an operator moves a knob. Logging
+     * that per sweep buried a burn-in in 289 identical warnings — 235 KB
+     * — in three minutes for a single table (the row ceiling's refusal,
+     * which this replaces). The metric and the ledger carry the rest.
+     */
+    private fun logBudgetRefusals(
+        ctx: TableContext,
+        cfg: CompactionConfig,
+        spillRefused: List<CompactionGroup>,
+        mergeRefused: List<CompactionGroup>,
+    ) {
+        val key = ctx.catalogId to ctx.tableId
+        if (spillRefused.isEmpty() && mergeRefused.isEmpty()) {
+            lastBudgetRefusal.remove(key)
+            return
+        }
+        val worstSpill = spillRefused.maxByOrNull { it.totalBytes }
+        val worstMerge = mergeRefused.maxByOrNull { it.survivingRecords }
+        val signature =
+            "spill=${spillRefused.size}/${worstSpill?.totalBytes ?: 0}/${cfg.spillBytes} " +
+                "merge=${mergeRefused.size}/${worstMerge?.survivingRecords ?: 0}/${cfg.sortedHeapBytesPerGroup}"
+        if (lastBudgetRefusal.put(key, signature) == signature) return
+        if (worstSpill != null) {
+            log.warn {
+                "compaction refused ${spillRefused.size} sorted group(s) of ${ctx.namespace}.${ctx.table} " +
+                    "whose spill would exceed HOGLAKE_COMPACTION_SPILL_BYTES (${cfg.spillBytes} B per " +
+                    "group): the largest holds ${worstSpill.files.size} file(s), ${worstSpill.totalBytes} B " +
+                    "registered. Refused in metadata, before any IO, because an overrun of the spill " +
+                    "volume's emptyDir limit evicts the pod rather than failing the write. Levers: raise " +
+                    "HOGLAKE_COMPACTION_SPILL_BYTES together with the volume (the chart's tmpSizeLimit; " +
+                    "size it as parallel groups x spill bytes), or lower HOGLAKE_COMPACTION_TARGET_BYTES"
+            }
+        }
+        if (worstMerge != null) {
+            log.warn {
+                "compaction refused ${mergeRefused.size} sorted group(s) of ${ctx.namespace}.${ctx.table} " +
+                    "whose merge cannot fit the sorted heap budget even with every trusted input " +
+                    "spilled: the largest holds ${worstMerge.survivingRecords} surviving row(s), " +
+                    "${cfg.spillChunkRows(ctx.columns)} row(s) per spill file, against " +
+                    "${cfg.sortedHeapBytesPerGroup} B per group (HOGLAKE_COMPACTION_SORTED_HEAP_BYTES " +
+                    "${cfg.sortedHeapBytes} B / HOGLAKE_COMPACTION_PARALLEL_GROUPS " +
+                    "${cfg.parallelGroups}). Each spilled run holds a row group while it is merged, " +
+                    "so the budget is too small for the group size: raise " +
+                    "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES (with the pod's memory), lower " +
+                    "HOGLAKE_COMPACTION_PARALLEL_GROUPS, or lower HOGLAKE_COMPACTION_TARGET_BYTES"
+            }
+        }
     }
 
     /** Phase (c)'s output: the groups to attempt, and how many a sibling holds. */
@@ -2335,8 +2404,15 @@ class CompactionService(
                 "groups_compacted=${r.groupsCompacted} files_in=${r.filesIn} files_out=${r.filesOut} " +
                     "bytes_in=${r.bytesIn} bytes_out=${r.bytesOut} skipped_conflicts=${r.skippedConflicts} " +
                     "dv_superseded=${r.dvSuperseded} unconvertible_schema=${r.unconvertibleSchema} " +
-                    "invalid_data=${r.invalidData} heap_budget_exceeded=${r.heapBudgetExceeded} " +
+                    "invalid_data=${r.invalidData} spill_budget_exceeded=${r.spillBudgetExceeded} " +
+                    "merge_budget_exceeded=${r.mergeBudgetExceeded} " +
                     "failed_groups=${r.failedGroups} claimed_elsewhere=${r.claimedElsewhere} " +
+                    "runs_trusted=${r.runsTrusted} runs_spilled=${r.runsSpilled} " +
+                    "runs_demoted=${r.runsDemoted} spill_bytes=${r.spillBytes} " +
+                    "spill_cleanup_failures=${r.spillCleanupFailures} " +
+                    "files_verified=${r.filesVerified} files_unsorted=${r.filesUnsorted} " +
+                    "files_unchecked=${r.filesUnchecked} " +
+                    "row_groups_appended=${r.rowGroupsAppended} bytes_appended=${r.bytesAppended} " +
                     "candidates_fetched=${r.candidatesFetched} " +
                     "buckets_considered=${r.bucketsConsidered}/${r.bucketsAvailable} " +
                     "candidates_truncated=${r.candidatesTruncated} plan_ms=${r.planMs}"
@@ -2352,7 +2428,18 @@ class CompactionService(
             Metrics.compactionFilesRewritten(catalog, result.filesIn)
             Metrics.compactionSkipped(catalog, "unconvertible_schema", result.unconvertibleSchema)
             Metrics.compactionSkipped(catalog, "invalid_data", result.invalidData)
-            Metrics.compactionSkipped(catalog, "heap_budget", result.heapBudgetExceeded)
+            // `heap_budget` is HISTORICAL: nothing produces it since the
+            // external merge sort (hoglake#134). Its successors:
+            Metrics.compactionSkipped(catalog, "spill_budget", result.spillBudgetExceeded)
+            Metrics.compactionSkipped(catalog, "merge_budget", result.mergeBudgetExceeded)
+            Metrics.compactionSpillBytes(catalog, result.spillBytes)
+            Metrics.compactionAppendedBytes(catalog, result.bytesAppended)
+            Metrics.compactionMergeRuns(catalog, "trusted", result.runsTrusted)
+            Metrics.compactionMergeRuns(catalog, "spilled", result.runsSpilled)
+            Metrics.compactionMergeRuns(catalog, "demoted", result.runsDemoted)
+            Metrics.compactionSpillCleanupFailed(result.spillCleanupFailures)
+            Metrics.compactionSortCheck(catalog, "sorted", result.filesVerified)
+            Metrics.compactionSortCheck(catalog, "unsorted", result.filesUnsorted)
             // The red-flag outcome, and it had no series either.
             Metrics.compactionSkipped(catalog, "failed", result.failedGroups)
             // Its own reason label, because it is the one "skip" that is
@@ -2382,9 +2469,42 @@ class CompactionService(
         val dvSuperseded: Long = 0,
         val unconvertibleSchema: Long = 0,
         val invalidData: Long = 0,
-        val heapBudgetExceeded: Long = 0,
+        val spillBudgetExceeded: Long = 0,
+        val mergeBudgetExceeded: Long = 0,
         val failedGroups: Long = 0,
         val claimedElsewhere: Long = 0,
+        /**
+         * What sorted rewrites DID, summed over every rewrite that
+         * returned — committed or not, since the work was spent either
+         * way — and every rewrite a spill or merge budget stopped mid-run
+         * (carried on the exception; trusted runs are not counted there,
+         * since none was merged): inputs read in place as runs, spill files written, trusted
+         * inputs the merge budget demoted, bytes spilled, and spill
+         * directories that could not be removed afterwards. Not outcomes,
+         * so none of them is in [attempts].
+         */
+        val runsTrusted: Long = 0,
+        val runsSpilled: Long = 0,
+        val runsDemoted: Long = 0,
+        val spillBytes: Long = 0,
+        val spillCleanupFailures: Long = 0,
+        /**
+         * The sortedness pre-pass: inputs it verified as already sorted
+         * and inputs it found unsorted. Work, like the run counters, so
+         * not in [attempts]. Its bytes go straight to a metric where the
+         * rewrite returns ([executeGroup]); they are not a ledger field.
+         */
+        val filesVerified: Long = 0,
+        val filesUnsorted: Long = 0,
+        /** Inputs under the pre-pass's size floor, sent to the chunk phase unchecked. */
+        val filesUnchecked: Long = 0,
+        /**
+         * Input row groups the rewrite appended byte for byte, and their
+         * compressed bytes. Work, like the run counters, so not in
+         * [attempts].
+         */
+        val rowGroupsAppended: Long = 0,
+        val bytesAppended: Long = 0,
         /**
          * The PLAN measures, which are not group outcomes at all: they
          * describe what the planner READ, not what a rewrite did.
@@ -2405,11 +2525,12 @@ class CompactionService(
          * What this tally has spent of `maxGroupsPerRun`.
          *
          * The budget is a bound on OBJECT-STORE WORK, so it counts every
-         * outcome that spent a group's IO and no outcome that did not.
-         * Two do not:
+         * outcome that spent a group's IO and, with one exception, no
+         * outcome that did not. Not charged:
          *
-         *  - [heapBudgetExceeded] from the planner's exact row ceiling,
-         *    which is decided in metadata before a byte is fetched;
+         *  - [spillBudgetExceeded] and [mergeBudgetExceeded], the sorted
+         *    rewrite's budgets, which the planner decides in metadata
+         *    before a byte is fetched;
          *  - [claimedElsewhere], which is a group another maintainer is
          *    already rewriting — refused by the planner's claim read or
          *    by the claim insert, both of which run before the fetch.
@@ -2420,12 +2541,15 @@ class CompactionService(
          * the OpenAPI both state this; `attempts` is where it is
          * actually true.
          *
-         * An OOM caught mid-rewrite DID spend its IO and is NOT
-         * charged, because it arrives through [heapBudgetExceeded] and
-         * that counter is excluded wholesale. The budget is therefore
-         * one slot generous in that one case — which costs nothing,
-         * since an OOM also ends the sweep and no further group is
-         * attempted.
+         * The exception: the same two budget refusals raised by the
+         * REWRITE mid-run (an exact footer or the bytes actually spilled
+         * broke a budget the registered metadata fit) did spend IO, and
+         * they are still not charged — they arrive through the same
+         * counters, and splitting them would put one condition under two
+         * names. They are bounded anyway: the planner admits only groups
+         * whose registered metadata fits, so a hard stop needs metadata
+         * that under-predicts the bytes, and a sweep still executes at
+         * most the groups its plans claimed.
          */
         val attempts: Int
             get() =
@@ -2444,9 +2568,20 @@ class CompactionService(
                 dvSuperseded + other.dvSuperseded,
                 unconvertibleSchema + other.unconvertibleSchema,
                 invalidData + other.invalidData,
-                heapBudgetExceeded + other.heapBudgetExceeded,
+                spillBudgetExceeded + other.spillBudgetExceeded,
+                mergeBudgetExceeded + other.mergeBudgetExceeded,
                 failedGroups + other.failedGroups,
                 claimedElsewhere + other.claimedElsewhere,
+                runsTrusted + other.runsTrusted,
+                runsSpilled + other.runsSpilled,
+                runsDemoted + other.runsDemoted,
+                spillBytes + other.spillBytes,
+                spillCleanupFailures + other.spillCleanupFailures,
+                filesVerified + other.filesVerified,
+                filesUnsorted + other.filesUnsorted,
+                filesUnchecked + other.filesUnchecked,
+                rowGroupsAppended + other.rowGroupsAppended,
+                bytesAppended + other.bytesAppended,
                 candidatesFetched + other.candidatesFetched,
                 bucketsConsidered + other.bucketsConsidered,
                 bucketsAvailable + other.bucketsAvailable,
@@ -2621,8 +2756,8 @@ class CompactionService(
                         claimant,
                     )
                 pending = items
-                // Groups the heap ceiling refused in METADATA, and groups
-                // another maintainer holds. Counted but deliberately NOT
+                // Sorted groups the spill or merge budget refused in
+                // METADATA, and groups another maintainer holds. Counted but deliberately NOT
                 // charged to maxGroupsPerRun: every other skip flavor spends
                 // the group's IO before it resolves and these spend none, so
                 // letting either consume the run's slots would let one
@@ -2630,7 +2765,8 @@ class CompactionService(
                 // every other table of the sweep forever.
                 tally +=
                     GroupTally(
-                        heapBudgetExceeded = plan.heapRefusedGroups,
+                        spillBudgetExceeded = plan.spillRefusedGroups,
+                        mergeBudgetExceeded = plan.mergeRefusedGroups,
                         claimedElsewhere = plan.claimedGroups,
                         // The plan measures, summed over every table the
                         // sweep plans — so the ledger row says how much
@@ -2718,9 +2854,20 @@ class CompactionService(
             dvSuperseded = dvSuperseded,
             unconvertibleSchema = unconvertibleSchema,
             invalidData = invalidData,
-            heapBudgetExceeded = heapBudgetExceeded,
             failedGroups = failedGroups,
             claimedElsewhere = claimedElsewhere,
+            runsTrusted = runsTrusted,
+            runsSpilled = runsSpilled,
+            runsDemoted = runsDemoted,
+            spillBytes = spillBytes,
+            spillBudgetExceeded = spillBudgetExceeded,
+            mergeBudgetExceeded = mergeBudgetExceeded,
+            spillCleanupFailures = spillCleanupFailures,
+            filesVerified = filesVerified,
+            filesUnsorted = filesUnsorted,
+            filesUnchecked = filesUnchecked,
+            rowGroupsAppended = rowGroupsAppended,
+            bytesAppended = bytesAppended,
             candidatesFetched = candidatesFetched,
             bucketsConsidered = bucketsConsidered,
             bucketsAvailable = bucketsAvailable,
@@ -2970,20 +3117,41 @@ class CompactionService(
             return GroupTally(failedGroups = 1)
         }
         var committed = false
+        // What the rewrite did, whatever the commit then decides: the
+        // runs and the spill were spent either way.
+        var work = GroupTally()
         try {
-            return when (val outcome = compactGroup(ctx, group)) {
-                is GroupOutcome.Committed -> {
-                    committed = true
-                    GroupTally(
-                        groupsCompacted = 1,
-                        filesIn = group.files.size.toLong(),
-                        bytesIn = group.totalBytes,
-                        bytesOut = outcome.bytesOut,
-                    )
+            val outcome =
+                compactGroup(ctx, group) { r ->
+                    work =
+                        GroupTally(
+                            runsTrusted = r.runsTrusted.toLong(),
+                            runsSpilled = r.runsSpilled.toLong(),
+                            runsDemoted = r.runsDemoted.toLong(),
+                            spillBytes = r.spillBytes,
+                            spillCleanupFailures = if (r.spillCleanupFailed) 1 else 0,
+                            filesVerified = r.filesVerified.toLong(),
+                            filesUnsorted = r.filesUnsorted.toLong(),
+                            filesUnchecked = r.filesUnchecked.toLong(),
+                            rowGroupsAppended = r.rowGroupsAppended.toLong(),
+                            bytesAppended = r.bytesAppended,
+                        )
+                    Metrics.compactionSortCheckBytes(catalog, r.sortCheckBytes)
                 }
-                GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
-                GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
-            }
+            return work +
+                when (outcome) {
+                    is GroupOutcome.Committed -> {
+                        committed = true
+                        GroupTally(
+                            groupsCompacted = 1,
+                            filesIn = group.files.size.toLong(),
+                            bytesIn = group.totalBytes,
+                            bytesOut = outcome.bytesOut,
+                        )
+                    }
+                    GroupOutcome.SkippedConflict -> GroupTally(skippedConflicts = 1)
+                    GroupOutcome.SkippedDvSuperseded -> GroupTally(dvSuperseded = 1)
+                }
         } catch (e: HoglakeException.CommitQueueTimeout) {
             // The commit could not get the catalog lock inside the
             // admission bound. Race-class, not failure-class: nothing is
@@ -3050,38 +3218,88 @@ class CompactionService(
                     "(${e.message}); skipping"
             }
             return GroupTally(invalidData = 1)
-        } catch (e: OutOfMemoryError) {
-            // The ceiling in `groups` is supposed to make this
-            // unreachable; reaching it means the per-node heap
-            // estimate is wrong for this table's shape, which is
-            // an operator signal, not a retry.
+        } catch (e: SpillBudgetExceededException) {
+            // The rewrite's own HARD STOP: the bytes actually spilled (or
+            // the exact footers) broke a budget the registered metadata
+            // fit — the planner refuses the predictable cases before any
+            // IO. Its own arm, ahead of `Throwable`, because it is a
+            // configuration signal and not a failure: counted with the
+            // planner's refusals and, like them, not charged. The output
+            // upload was discarded and the spill directory removed by the
+            // rewriter on the way out.
             //
-            // Caught at the GROUP boundary because nothing else
-            // caught it at all: `catch (e: Exception)` below does
-            // not match an Error, so the OOM used to unwind the
-            // whole sweep — losing every other table's accounting
-            // and leaving the run ledger a bare "Java heap space"
-            // with no counters (hoglake#118). Catching an OOM is
-            // only defensible because the allocation it aborts is
-            // one ArrayList of Groups that is unreachable the
+            // The WORK it spent is on the exception, not on a result —
+            // there is none — and it is folded in here: a hard stop is
+            // the group that spilled the most, and leaving it out made
+            // `spill_bytes` / `runs_spilled` miss exactly those groups.
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} stopped at its spill budget " +
+                    "(${e.message}); skipping"
+            }
+            Metrics.compactionSortCheckBytes(catalog, e.sortCheckBytes)
+            return work +
+                stoppedWork(
+                    e.spillBytes,
+                    e.runsSpilled,
+                    e.runsDemoted,
+                    e.filesVerified,
+                    e.filesUnsorted,
+                    e.filesUnchecked,
+                ) +
+                GroupTally(spillBudgetExceeded = 1)
+        } catch (e: MergeBudgetExceededException) {
+            log.warn {
+                "compaction group of ${group.files.size} files for " +
+                    "$catalog/${ctx.namespace}.${ctx.table} cannot be merged inside its heap budget " +
+                    "(${e.message}); skipping"
+            }
+            Metrics.compactionSortCheckBytes(catalog, e.sortCheckBytes)
+            return work +
+                stoppedWork(
+                    e.spillBytes,
+                    e.runsSpilled,
+                    e.runsDemoted,
+                    e.filesVerified,
+                    e.filesUnsorted,
+                    e.filesUnchecked,
+                ) +
+                GroupTally(mergeBudgetExceeded = 1)
+        } catch (e: OutOfMemoryError) {
+            // The backstop, and it should be unreachable: a sorted
+            // rewrite's chunk is sized by the measured per-node cost and
+            // its merge is admitted run by run against the same budget
+            // (hoglake#134). Reaching it means one of those two
+            // under-counted THIS table's shape — a row far wider than its
+            // schema's node count says, or row groups larger than their
+            // footers report — which is an operator signal, not a retry.
+            //
+            // Caught at the GROUP boundary because nothing else caught it
+            // at all: `catch (e: Exception)` below does not match an
+            // Error, so the OOM used to unwind the whole sweep — losing
+            // every other table's accounting and leaving the run ledger a
+            // bare "Java heap space" with no counters (hoglake#118).
+            // Catching it is defensible because what it aborts is one
+            // rewrite whose chunk, runs and writer are unreachable the
             // instant this frame unwinds.
             //
-            // And then the sweep STOPS. Continuing would allocate
-            // the next group's inputs into a heap that just
-            // proved it has none to spare.
+            // And then the sweep STOPS. Continuing would allocate the next
+            // group into a heap that just proved it has none to spare.
+            // Counted as a failed group: `heap_budget_exceeded` is the
+            // pre-#134 planner refusal and stays historical.
             heapExhausted.set(true)
             log.error(e) {
                 "compaction group of ${group.files.size} files " +
                     "(${group.survivingRecords} survivors) exhausted the heap for " +
-                    "$catalog/${ctx.namespace}.${ctx.table} despite a row ceiling of " +
-                    "${cfg.sortedRowCeiling(ctx.columns)}; ending the sweep. The " +
-                    "per-node heap estimate is too small for this table's shape — " +
-                    "lower HOGLAKE_COMPACTION_SORTED_HEAP_BYTES, lower " +
-                    "HOGLAKE_COMPACTION_PARALLEL_GROUPS (which divides it), or raise the " +
-                    "heap. All three are workarounds for an in-memory group sort that should " +
-                    "be an external merge sort; see CompactionConfig.sortedHeapBytes"
+                    "$catalog/${ctx.namespace}.${ctx.table}; ending the sweep. A sorted rewrite " +
+                    "holds one chunk of ${cfg.spillChunkRows(ctx.columns)} rows or its admitted " +
+                    "merge runs, each bounded by ${cfg.sortedHeapBytesPerGroup} B per group, so " +
+                    "the chunk accounting (per-node heap estimate, nested expansion) or the merge " +
+                    "admission under-counted this table's shape. Lower " +
+                    "HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or raise " +
+                    "HOGLAKE_COMPACTION_NESTED_SORT_EXPANSION, and report the table's shape"
             }
-            return GroupTally(heapBudgetExceeded = 1)
+            return GroupTally(failedGroups = 1)
         } catch (e: Throwable) {
             // One bad group (unreadable input, corrupt DV, S3
             // hiccup, a stack overflow in the nested copier) never
@@ -3148,6 +3366,23 @@ class CompactionService(
             }
         }
     }
+
+    /** What a sorted rewrite spent before a budget hard stop (carried on the exception). */
+    private fun stoppedWork(
+        spillBytes: Long,
+        runsSpilled: Int,
+        runsDemoted: Int,
+        filesVerified: Int,
+        filesUnsorted: Int,
+        filesUnchecked: Int,
+    ) = GroupTally(
+        spillBytes = spillBytes,
+        runsSpilled = runsSpilled.toLong(),
+        runsDemoted = runsDemoted.toLong(),
+        filesVerified = filesVerified.toLong(),
+        filesUnsorted = filesUnsorted.toLong(),
+        filesUnchecked = filesUnchecked.toLong(),
+    )
 
     /** A broken claim table still permits work; a lost claim does not. */
     private fun refreshClaim(
@@ -3239,6 +3474,7 @@ class CompactionService(
     private fun compactGroup(
         ctx: TableContext,
         group: CompactionGroup,
+        onRewritten: (ParquetRewriter.RewriteResult) -> Unit = {},
     ): GroupOutcome {
         val inputs =
             group.files.map { f ->
@@ -3279,7 +3515,30 @@ class CompactionService(
                         }
                         decoded
                     }
-                ParquetRewriter.Input(source, f.path, f.rowIdStart, dv, f.explicitRowIds)
+                ParquetRewriter.Input(
+                    source,
+                    f.path,
+                    f.rowIdStart,
+                    dv,
+                    f.explicitRowIds,
+                    trustedSorted = trustedSorted(ctx, f),
+                    // Always passed: admission costs runs from them before
+                    // any byte is read, and 0 would mean "unknown".
+                    fileSizeBytes = f.fileSizeBytes,
+                    survivingRecords = f.survivingRecords,
+                    // The sortedness pre-pass's own handle on the object:
+                    // the same footer hint, a readahead sized for reading
+                    // a few non-adjacent key column chunks (see the
+                    // constant). Only a sorted table's rewrite opens it.
+                    keySource =
+                        S3InputFile(
+                            store,
+                            f.path,
+                            f.fileSizeBytes,
+                            f.footerSize,
+                            readaheadBytes = S3InputFile.KEY_COLUMN_READAHEAD_BYTES,
+                        ),
+                )
             }
         // Bare UUID, deliberately indistinguishable from an ingested
         // file (the pyhoglake writer's shape). A `compacted-` prefix
@@ -3333,6 +3592,7 @@ class CompactionService(
         // stream reports its own size and footer length, which used
         // to cost two more full passes over the output.
         val sink = S3OutputFile(store, outputPath)
+        beforeRewrite(inputs)
         val rewritten =
             ParquetRewriter.rewrite(
                 inputs,
@@ -3342,7 +3602,10 @@ class CompactionService(
                 ctx.maxNodesPerRow,
                 ctx.codec,
                 ctx.inputOpenParallelism,
+                ctx.sortSpill,
+                appendFloorBytes,
             )
+        onRewritten(rewritten)
         check(rewritten.rowsWritten == group.survivingRecords) {
             // Name the FILES, not just the counts. This check is durable
             // by nature — a mis-registered record_count does not heal —
@@ -3640,6 +3903,42 @@ class CompactionService(
                     "compaction group for ${ctx.namespace}.${ctx.table} was rewritten against a " +
                         "table dropped in snapshot $droppedSnapshot; skipping the commit. The " +
                         "uploaded output stays staged and the normal cleanup drain reclaims it"
+                }
+                return@inTransactionUnchecked GroupOutcome.SkippedConflict
+            }
+
+            // THE SORT SPEC IS STILL THE ONE PLANNED AGAINST. The output was
+            // sorted by the spec live at planning (or not sorted at all),
+            // and it is about to register with a `begin_snapshot` past
+            // every spec that exists — which [trustedSorted] reads as
+            // "written under the live spec". A `set_sort_order` that landed
+            // inside the rewrite would make this output a TRUSTED RUN of a
+            // spec it is not sorted by, forever: every later sorted rewrite
+            // would merge it in place and publish a mis-sorted file. So a
+            // moved spec — changed, set on an unsorted table, or dropped —
+            // is a lost race like any other: skipped, re-planned next
+            // sweep under the new spec, the staged output left for the
+            // cleanup drain. One probe on `hog_sort_spec_live`, under the
+            // lock DDL also takes, so a spec change either precedes this
+            // read or waits behind this transaction.
+            val liveSortId =
+                h.createQuery(
+                    """
+                SELECT sort_id FROM hog_sort_spec
+                WHERE catalog_id = :catalogId AND table_id = :tableId AND end_snapshot IS NULL
+                """,
+                )
+                    .bind("catalogId", ctx.catalogId)
+                    .bind("tableId", ctx.tableId)
+                    .mapTo(Long::class.javaObjectType)
+                    .findOne()
+                    .orElse(null)
+            if (liveSortId != ctx.sortId) {
+                log.info {
+                    "compaction group for ${ctx.namespace}.${ctx.table} was rewritten under sort " +
+                        "spec ${ctx.sortId ?: "none"} but the live spec is now ${liveSortId ?: "none"}; " +
+                        "skipping the commit so the output cannot be trusted as a run of a spec it " +
+                        "is not sorted by. The staged output stays queued for the cleanup drain"
                 }
                 return@inTransactionUnchecked GroupOutcome.SkippedConflict
             }

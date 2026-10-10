@@ -463,12 +463,14 @@ object Metrics {
      * is visible as a failure, which is exactly why neither gets
      * noticed.
      *
-     * `heap_budget` is a third of the same kind: a table whose sorted
-     * groups are too many ROWS for the compaction heap budget stops
-     * compacting, silently, forever — the debt page shows growing debt
-     * and nothing says why. It is also the counter that says the row
-     * ceiling is doing its job, since the alternative reading of the
-     * same condition is the OOM it replaced.
+     * `spill_budget` and `merge_budget` are the same kind: a sorted
+     * group the external merge sort's spill-disk or heap budget refuses
+     * (hoglake#134), in metadata at planning or as the rewrite's own
+     * hard stop. Configuration rather than fault, and the same groups
+     * re-refuse every sweep until a knob moves, so they need a line.
+     * `heap_budget` is HISTORICAL: the pre-#134 sorted row ceiling's
+     * refusal, which nothing produces any more. An existing series stays
+     * scrapeable until the process restarts and is never incremented.
      *
      * `failed` joins them, for the opposite reason: it IS the red-flag
      * outcome and it had no series either. (An earlier version of this
@@ -496,6 +498,128 @@ object Metrics {
                 reason,
             )
         }
+    }
+
+    /**
+     * hoglake_compaction_spill_bytes_total{catalog} — local bytes sorted
+     * rewrites spilled (hoglake#134). Its rate against
+     * `hoglake_compaction_groups_total` is the spill a sorted group costs;
+     * the per-group bound is HOGLAKE_COMPACTION_SPILL_BYTES.
+     */
+    fun compactionSpillBytes(
+        catalog: String,
+        bytes: Long,
+    ) {
+        if (bytes > 0) increment("hoglake_compaction_spill_bytes_total", bytes.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_compaction_merge_runs_total{catalog, kind} — the runs sorted
+     * rewrites merged: `trusted` (inputs read in place: compaction outputs
+     * of the live sort spec, and files the sortedness pre-pass verified),
+     * `spilled` (chunk files written and read back) and
+     * `demoted` (trusted inputs the heap budget sent down the spill path
+     * instead). `trusted` against `spilled` is how much sort work the
+     * trust predicate saves; `demoted` rising says the sorted heap budget
+     * is small for the group size.
+     */
+    fun compactionMergeRuns(
+        catalog: String,
+        kind: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_merge_runs_total", count.toDouble(), "catalog", catalog, "kind", kind)
+        }
+    }
+
+    /**
+     * hoglake_compaction_sort_check_total{catalog, outcome} — inputs the
+     * sorted rewrite's pre-pass checked: `sorted` (already in merge-key
+     * order, read in place as a run and never spilled) or `unsorted`
+     * (spilled). `sorted` against the whole is how much of a table's
+     * intake arrives pre-sorted — millpond's flushes do, a Trino INSERT's
+     * files do not — and so how much spill the pre-pass saves.
+     */
+    fun compactionSortCheck(
+        catalog: String,
+        outcome: String,
+        count: Long,
+    ) {
+        if (count > 0) {
+            increment("hoglake_compaction_sort_check_total", count.toDouble(), "catalog", catalog, "outcome", outcome)
+        }
+    }
+
+    /**
+     * hoglake_compaction_sort_check_bytes_total{catalog} — bytes the
+     * pre-pass read: the sort-key column chunks of the files it checked
+     * (the row-id carrier's too for an explicit-row-id file), up to each
+     * file's first out-of-order row. Its rate against the files' sizes is
+     * what verification costs in object-store reads.
+     */
+    fun compactionSortCheckBytes(
+        catalog: String,
+        bytes: Long,
+    ) {
+        if (bytes > 0) increment("hoglake_compaction_sort_check_bytes_total", bytes.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_compaction_appended_bytes_total{catalog} — compressed input
+     * bytes compaction copied into its outputs byte for byte instead of
+     * decoding and re-encoding them (hoglake#134 package D1): row groups
+     * of prior outputs of the live schema, DV-free, at least 32 MiB each.
+     * Its rate against the input bytes is how much of the rewrite's work
+     * the append saves (measured 8-9x cheaper per byte).
+     */
+    fun compactionAppendedBytes(
+        catalog: String,
+        bytes: Long,
+    ) {
+        if (bytes > 0) increment("hoglake_compaction_appended_bytes_total", bytes.toDouble(), "catalog", catalog)
+    }
+
+    /**
+     * hoglake_compaction_spill_cleanup_failures_total — spill directories
+     * that could not be removed: after a rewrite, or by the startup sweep
+     * of a previous process's leftovers. Any nonzero value is disk the
+     * spill volume (an emptyDir whose overrun evicts the pod) keeps
+     * counting until the process restarts; the WARN names the path.
+     */
+    fun compactionSpillCleanupFailed(count: Long = 1) {
+        if (count > 0) increment("hoglake_compaction_spill_cleanup_failures_total", count.toDouble())
+    }
+
+    /**
+     * `hoglake_compaction_spill_dir_bytes` — bytes currently held by
+     * sorted-rewrite spill directories under HOGLAKE_COMPACTION_SPILL_DIR,
+     * MEASURED by walking them at scrape time.
+     *
+     * Not the filesystem's free space, deliberately: on the chart's
+     * emptyDir `FileStore.usableSpace` reports the node's disk, while
+     * what evicts the pod is the volume's `sizeLimit` against what is
+     * written to it — this. Alert on it against `tmpSizeLimit`.
+     *
+     * COST: a `Files.walk` per SCRAPE, on every pod, O(spill files) —
+     * one directory listing plus one `size` per spill file of every group
+     * in flight. Today that is a few dozen files per group, because a
+     * spill file holds a whole chunk in 16 MiB row groups
+     * (`SortSpill.SPILL_BLOCK_BYTES` sizes the reads, the chunk sizes the
+     * file count). Anything that multiplies the spill FILE count — smaller
+     * chunks, a file per row group — multiplies this scrape's work with
+     * it; re-check it then. It touches only `hoglake-compaction-spill-*`
+     * directories and never throws.
+     */
+    fun registerSpillDirGauge(
+        registry: MeterRegistry,
+        bytes: () -> Long,
+    ) {
+        gauge(
+            registry,
+            "hoglake_compaction_spill_dir_bytes",
+            "Bytes held by compaction spill directories under HOGLAKE_COMPACTION_SPILL_DIR (measured)",
+        ) { bytes() }
     }
 
     /**

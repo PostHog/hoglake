@@ -829,22 +829,13 @@ export interface CompactionResult {
    */
   invalid_data?: Int64;
   /**
-   * FILES the SORTED rewrite path's row ceiling cannot put in a group.
-   * Groups are packed to the ceiling (a capacity beside the byte
-   * target), so a dense sorted table gets smaller groups, not refused
-   * ones. What is counted is the residue: files with so many rows that
-   * no two fit under the ceiling. A file whose own rows exceed the
-   * ceiling is never fetched as a candidate, so it is not counted.
-   * Decided in metadata at planning time, before any object-store IO.
-   *
-   * Durable like invalid_data, but the fault is neither the writer's nor
-   * the schema's — it is a table whose sort order and row width exceed
-   * the heap the server was given. It clears by raising
-   * HOGLAKE_COMPACTION_SORTED_HEAP_BYTES or by dropping the table's sort
-   * order. The rest of the table still compacts. TEMPORARY: the ceiling exists only
-   * because the sorted rewrite sorts a whole group in memory, and an
-   * external merge sort removes it (an input that is itself a compaction
-   * output is an already-sorted run).
+   * HISTORICAL — always 0 from a current server. Counted what the SORTED
+   * rewrite's pre-hoglake#134 row ceiling could not group: the rewrite
+   * used to sort a whole group in memory. It is an external merge sort
+   * now, so nothing produces this; spill_budget_exceeded and
+   * merge_budget_exceeded are its successors, and an OOM is counted in
+   * failed_groups. Only a ledger row recorded by an older server can be
+   * nonzero.
    *
    * OPTIONAL for the same reason invalid_data is: the counter postdates
    * ledger rows a rolling deploy can still serve from an older server.
@@ -889,6 +880,53 @@ export interface CompactionResult {
   buckets_available?: Int64;
   candidates_truncated?: Int64;
   plan_ms?: Int64;
+  /**
+   * The sorted rewrite's EXTERNAL MERGE SORT (hoglake#134), summed over
+   * the sweep's rewrites: inputs read in place as already-sorted runs
+   * (compaction outputs of the live sort spec, and files the sortedness
+   * pre-pass verified), chunks spilled to local
+   * disk and merged, trusted inputs the heap budget sent to the spill path
+   * instead, and the local bytes spilled.
+   *
+   * OPTIONAL for the same reason claimed_elsewhere is.
+   */
+  runs_trusted?: Int64;
+  runs_spilled?: Int64;
+  runs_demoted?: Int64;
+  spill_bytes?: Int64;
+  /**
+   * Sorted groups refused because their spill would exceed
+   * HOGLAKE_COMPACTION_SPILL_BYTES (decided from registered sizes before
+   * any IO, or stopped by the rewrite at the bytes actually written), and
+   * because their spilled runs alone cannot fit the sorted heap budget.
+   * Configuration, not fault: the same groups re-refuse every sweep until
+   * a knob moves.
+   */
+  spill_budget_exceeded?: Int64;
+  merge_budget_exceeded?: Int64;
+  /** Spill directories a rewrite could not remove: disk the spill volume still counts. */
+  spill_cleanup_failures?: Int64;
+  /**
+   * The sortedness PRE-PASS: inputs found already sorted (read in place,
+   * never spilled), inputs found out of order, or not checkable (id-less
+   * columns, a key under a container, an unsortable physical type, a null
+   * row-id carrier) (spilled), and inputs under
+   * HOGLAKE_COMPACTION_VERIFY_MIN_BYTES it did not check (spilled; a small
+   * file is cheapest that way). OPTIONAL for the same reason
+   * claimed_elsewhere is.
+   */
+  files_verified?: Int64;
+  files_unsorted?: Int64;
+  files_unchecked?: Int64;
+  /**
+   * Input row groups copied into outputs byte for byte instead of
+   * re-encoded (prior outputs of the live schema, no deletes, row groups
+   * of at least 32 MiB; on a sorted table only when their key range does
+   * not overlap another run's), and their compressed bytes. OPTIONAL for
+   * the same reason claimed_elsewhere is.
+   */
+  row_groups_appended?: Int64;
+  bytes_appended?: Int64;
 }
 
 /** HISTORICAL, with VerifyReport: only a `verify` ledger row carries it. */

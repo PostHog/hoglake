@@ -11,12 +11,11 @@ import com.posthog.hoglake.model.maxUnsignedParquetWidth
 import com.posthog.hoglake.service.Identifiers
 import org.apache.parquet.column.Dictionary
 import org.apache.parquet.example.data.Group
-import org.apache.parquet.example.data.simple.SimpleGroupFactory
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter
 import org.apache.parquet.hadoop.ParquetFileReader
-import org.apache.parquet.hadoop.ParquetFileWriter
-import org.apache.parquet.hadoop.ParquetWriter
-import org.apache.parquet.hadoop.example.ExampleParquetWriter
+import org.apache.parquet.hadoop.metadata.BlockMetaData
+import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData
+import org.apache.parquet.hadoop.metadata.ColumnPath
 import org.apache.parquet.hadoop.metadata.CompressionCodecName
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.io.ColumnIOFactory
@@ -26,6 +25,7 @@ import org.apache.parquet.io.api.Binary
 import org.apache.parquet.io.api.Converter
 import org.apache.parquet.io.api.GroupConverter
 import org.apache.parquet.io.api.PrimitiveConverter
+import org.apache.parquet.io.api.RecordConsumer
 import org.apache.parquet.io.api.RecordMaterializer
 import org.apache.parquet.schema.GroupType
 import org.apache.parquet.schema.LogicalTypeAnnotation
@@ -104,6 +104,120 @@ class InvalidDataException(message: String) : IllegalArgumentException(message)
  * breaking CDC identity downstream; hoglake row ids survive any
  * ordering because they are data, not position).
  *
+ * **A sorted rewrite is an external merge sort** (hoglake#134). The
+ * in-memory sort it replaced held every survivor of the group as a
+ * `Group` graph at once — heap O(group), measured at up to 70x the
+ * compressed bytes for nested rows — so the planner had to bound sorted
+ * groups in ROWS and a dense sorted table never reached its byte target.
+ * Now neither phase of a sorted rewrite grows with the group:
+ *
+ *  - CHUNK phase: survivors of the spill-path inputs are read in input
+ *    order into a chunk of at most [SortSpill.chunkRows] rows (chunks
+ *    span input boundaries), sorted by the merge key, and written to a
+ *    local parquet file in the OUTPUT schema (SNAPPY, row groups of
+ *    [SortSpill.spillBlockBytes]). Heap: one chunk.
+ *  - MERGE phase: a k-way merge of RUNS through a priority queue into the
+ *    output. Every run is pull-style on the caller's thread — no threads,
+ *    no handoff. Heap: one row group per run, plus readahead.
+ *
+ * Three kinds of run, and only the last costs a spill:
+ *
+ *  - METADATA-TRUSTED: an input the caller marks [Input.trustedSorted] —
+ *    a compaction output written under the live sort spec — read in
+ *    place, in file order, through the same per-input pipeline as every
+ *    input (DV applied, live schema, row id from its carrier). Nothing
+ *    checks its order: a trusted run that is not key-sorted yields a
+ *    mis-sorted output, not an error.
+ *  - VERIFIED: any other input of at least [SortSpill.verifyMinBytes]
+ *    whose rows the sortedness PRE-PASS ([SortednessCheck]) found already
+ *    in merge-key order (a smaller file is cheapest on the chunk path,
+ *    and is not checked: `files_unchecked`). The pre-pass reads only
+ *    the sort-key columns (a projected schema; the row-id carrier too
+ *    for an explicit-row-id file), every physical row, deleted or not,
+ *    and stops at the first row out of order. A file that passes is a
+ *    trusted candidate exactly like a metadata-trusted one — same
+ *    admission, same footer confirmation — and is read in place by the
+ *    merge; one that fails is spilled, which is not an error. This is
+ *    what makes the merge STREAMING for writers that already sort
+ *    (millpond's flushes): their files are never spilled. The pre-pass
+ *    runs through the open window ([inputOpenParallelism] files at
+ *    once, the check on the calling thread); each slot holds a footer,
+ *    one row group's PROJECTED column chunks and the key source's small
+ *    readahead, before admission and outside the merge budget.
+ *  - SPILLED: one chunk file of the remaining inputs, read back as the
+ *    `Group`s it holds — its schema is the output schema by
+ *    construction, so there is no column plan and no second
+ *    [maxNodesPerRow] charge.
+ *
+ * A group with no admitted run whose survivors fit one chunk is the
+ * degenerate merge: its chunk is sorted and written straight to the
+ * output, and nothing touches disk.
+ *
+ * Budgets. parquet-java's `readNextRowGroup()` allocates a reader's WHOLE
+ * compressed row group, and each column reader then holds one decoded
+ * page, so a run costs its largest row group plus a page per leaf plus
+ * its stream buffer — the formula, exact from a footer and estimated
+ * before one, is in [ExternalMergeSort]'s doc. Trusted runs are outputs
+ * written at the 128 MiB default block; spill files are written at
+ * [SortSpill.spillBlockBytes] with small pages and a row-group size
+ * check on every few rows, so the block actually bounds them. [SortSpill.mergeBudgetBytes] bounds both
+ * phases, which never overlap. Before any data is read, trusted inputs
+ * are admitted LARGEST FIRST while the projected merge cost — admitted
+ * runs plus every spilled run the other survivors will make — fits; the
+ * rest are DEMOTED to the spill path (and the smallest admitted runs are
+ * shed when a later demotion's rows no longer fit beside them), which
+ * changes work, never correctness. Admitted runs' footers are then read and their EXACT cost
+ * re-checked, demoting again, still before any row group is read. A
+ * group that does not fit even fully demoted is refused
+ * ([MergeBudgetExceededException]); so is one whose spill would pass
+ * [SortSpill.spillBudgetBytes] ([SpillBudgetExceededException]), from
+ * the registered sizes up front and from the bytes actually written
+ * mid-run, because an emptyDir overrun evicts the pod instead of failing
+ * the write.
+ *
+ * Order. The merge key is the sort keys, then row id ascending; row ids
+ * are unique per table and each key comparison is total per physical
+ * type, so the key is a total order. KEY order of the output is exact
+ * whenever every trusted run is key-nondecreasing. TIE order is
+ * (key, row id) when every trusted input was itself written in that
+ * order — true for every output this rewriter writes — and otherwise
+ * deterministic but unspecified: outputs written before #134 broke ties
+ * in INPUT order, which differs from row-id order when one of their own
+ * inputs was a compaction output.
+ *
+ * DV check timing. Every run checks at its EXHAUSTION that each DV
+ * position fell inside the file. A trusted run is exhausted at the end
+ * of the merge, after rows have streamed into the output, so a lying DV
+ * now aborts late; [rewrite]'s discard covers the partial output, and
+ * the exception is the same IllegalStateException as before.
+ *
+ * Spill directory. One `hoglake-compaction-spill-<uuid>` per sorted rewrite under
+ * [SortSpill.spillDir], created at the first spill and deleted — after
+ * every reader is closed — on every exit path, success or not.
+ *
+ * **Appended row groups** (hoglake#134 package D1). An input that is a
+ * prior compaction output of this very output schema, with no live DV,
+ * `explicit_row_ids`, row groups of at least [APPEND_MIN_ROW_GROUP_BYTES]
+ * and row-id statistics ([appendRefusal]) is not decoded at all: its row
+ * groups are copied into the output byte for byte, indexes, bloom filters
+ * and codec included ([OutputWriter.appendRowGroups]). The unsorted path
+ * appends every such input; the sorted path appends a trusted run only
+ * when its first-key range is strictly disjoint from every other run's
+ * and every spill file's (see `ExternalMergeSort`'s `chooseAppended`), and
+ * emits it in key order between the merged rows. The output then mixes
+ * appended and encoded row groups — and possibly codecs — which is legal
+ * parquet. Because an appended row skips the column plan, anything the
+ * decode path would do to a value of an identical schema (today: nothing)
+ * would have to become a disqualifier.
+ *
+ * **No output-shaped copy** (package D2). A decoded row is written by its
+ * [RowPlan] straight into parquet's record consumer — the plan's
+ * null-fills, drops, promotions and the row id applied on the way — so a
+ * row is materialized once, as decoded. Each input is read PROJECTED to
+ * the columns its plan maps plus the row-id carrier ([projectRead]), so a
+ * column the live schema dropped is never decoded: the chunk phase holds
+ * decoded rows, and its size is computed from the live schema's nodes.
+ *
  * Heterogeneous inputs (files written across ALTERs) map to the live
  * schema by FIELD ID: a live column absent from an input null-fills; an
  * input column whose field id the live schema no longer knows (dropped
@@ -119,15 +233,16 @@ class InvalidDataException(message: String) : IllegalArgumentException(message)
  * **Nested columns rewrite, they are not copied around.** The record
  * pipeline above is already the parquet-java Group API, and a `Group`
  * is a tree: `GroupRecordConverter` materializes the whole nested
- * record and `addGroup`/`getGroup` reach into it. So list, struct and
- * map extend the SAME plan-and-copy shape one level at a time — the
- * plan becomes a tree of [Step]s instead of a flat array — rather than
- * needing a copy-only escape hatch. That matters: making nested tables
+ * record and `getGroup` reaches into it. So list, struct and map extend
+ * the SAME plan-and-write shape one level at a time — the plan becomes a
+ * tree of [Step]s instead of a flat array — rather than needing a
+ * copy-only escape hatch. That matters: making nested tables
  * `unconvertible_schema` would have meant a table with one `map` column
  * could never be compacted, which is a permanent debt leak, not a
  * deferral. The cost is per-ROW heap proportional to the nested payload
  * (the unsorted path still holds exactly one Group at a time) and a
- * recursive copy per row.
+ * recursive walk per row. The walk writes the OUTPUT record straight from
+ * the decoded source row ([RowPlan]); there is no output-shaped copy.
  *
  * Nested structure is spec-shaped on both sides: the 3-level LIST
  * encoding (`optional group x (LIST) { repeated group list { optional
@@ -147,30 +262,30 @@ object ParquetRewriter {
      * DISCARDS the destination rather than finishing it.
      *
      * The ordering is the whole point, and `use {}` cannot express it.
-     * On the exception path `use` calls `ParquetWriter.close()` before
-     * the exception reaches any catch of ours — and close() flushes the
+     * On the exception path `use` would close the writer before the
+     * exception reaches any catch of ours — and a close flushes the
      * pending row group and writes a valid footer and `PAR1`. For a
      * streaming sink that is indistinguishable from success: the trailer
      * is there, so the multipart upload completes and a truncated-but-
      * well-formed parquet file is published. The rows are simply missing.
      *
-     * So the sink is poisoned FIRST and closed afterwards, at which point
-     * its close() has been told not to complete. Closing at all is still
-     * worth doing — it releases the writer's buffers — but it can only
-     * fail now, so its outcome is discarded along with the object.
+     * So the sink is poisoned FIRST and the writer ABORTED afterwards —
+     * no footer, buffers released, the stream closed, which the poisoned
+     * sink has been told not to complete.
      */
-    private inline fun <T> writingTo(
+    internal inline fun <T> writingTo(
         output: OutputFile,
         outputSchema: MessageType,
         codec: OutputCodec,
-        body: (ParquetWriter<Group>) -> T,
+        tuning: WriterTuning? = null,
+        body: (OutputWriter) -> T,
     ): Pair<T, ParquetMetadata?> {
-        // Inside the guard too: newWriter calls output.createOrOverwrite,
+        // Inside the guard too: the writer calls output.createOrOverwrite,
         // which for a streaming sink STARTS the upload — so a throw
         // between that and the first write would leave one dangling.
         val writer =
             try {
-                newWriter(outputSchema, output, codec)
+                OutputWriter(output, outputSchema, codec, tuning)
             } catch (e: Throwable) {
                 (output as? DiscardableOutputFile)?.discard()
                 throw e
@@ -180,7 +295,7 @@ object ParquetRewriter {
                 body(writer)
             } catch (e: Throwable) {
                 (output as? DiscardableOutputFile)?.discard()
-                runCatching { writer.close() }
+                runCatching { writer.abort() }
                 throw e
             }
         // NOT inside the try: close() is what completes the upload, so a
@@ -227,9 +342,12 @@ object ParquetRewriter {
      * and the OOM happened anyway. `BudgetOomRepro` demonstrates both
      * halves in a small-heap JVM: at THIS default an eight-million
      * -element row exhausts a 512 MB heap on the unbudgeted read path
-     * and refuses cleanly here. The copy is charged too, from a FRESH
-     * allowance — sharing one across both phases charged the same graph
-     * twice and silently halved the ceiling.
+     * and refuses cleanly here. Nothing else is charged: the output
+     * record is walked out of the decoded row ([RowPlan]), which visits
+     * each decoded node at most once and allocates none, so the walk
+     * cannot exceed what the decode was allowed. (While a copy existed it
+     * was charged from a FRESH allowance — sharing one across both phases
+     * charged the same graph twice and silently halved the ceiling.)
      *
      * NODES, which is the unit to calibrate in. A scalar column costs 1
      * per row; a list element costs 2 (its synthetic entry group plus
@@ -239,14 +357,11 @@ object ParquetRewriter {
      * heap can hold at ~50-100 bytes a node. The point is to convert a
      * process kill into one counted skip, not to police row shape.
      *
-     * PEAK LIVE HEAP IS UP TO 2x THE BUDGET, and that is the cost of
-     * the per-phase allowance: the decoded row is still reachable while
-     * the copy builds its own, so both graphs are live at once. The
-     * shared allowance bounded their SUM at 1x instead — which is the
-     * only thing it had going for it, and it paid for that by halving
-     * the ceiling the documentation advertised. Measured rather than
-     * assumed: a 999,999-node row rewrites under `-Xmx192m`, so 2x the
-     * default is comfortably inside any heap this server runs with.
+     * PEAK LIVE HEAP IS ONE ROW'S GRAPH, 1x the budget. It was up to 2x
+     * while every row was copied into an output graph beside the decoded
+     * one (before hoglake#134 package D2); measured then, a 999,999-node
+     * row rewrote under `-Xmx192m`, so the bound is comfortably inside
+     * any heap this server runs with.
      */
     const val DEFAULT_MAX_NODES_PER_ROW = 1_000_000
 
@@ -281,6 +396,24 @@ object ParquetRewriter {
     const val OPEN_DRAIN_MILLIS = 2_000L
 
     /**
+     * The smallest row group an input may have and still be APPENDED to
+     * the output byte for byte instead of decoded and re-encoded
+     * (hoglake#134 package D1; see [appendRefusal]). 32 MiB.
+     *
+     * A floor because appending keeps the input's row groups exactly as
+     * they are, and the point of compacting small files is to produce big
+     * row groups: a prior output of a few MiB appended as-is would carry
+     * its small row group into every later scan, and into the next
+     * compaction, forever. Re-encoding it merges it into a full one. At
+     * 32 MiB — a quarter of the 128 MiB block every output is written at —
+     * a row group is already large enough that scans are not paying for
+     * it, while the append is still the 8-9x cheaper path (measured: 128-151
+     * ms to append a same-schema group against 1,162 ms to decode and
+     * re-encode it). Below it, the bytes are worth re-encoding.
+     */
+    const val APPEND_MIN_ROW_GROUP_BYTES: Long = 32L * 1024 * 1024
+
+    /**
      * The synthetic repeated-group names the parquet LIST and MAP
      * encodings use. Written, never required on read: the parquet spec
      * says these names are not significant, and writers disagree about
@@ -293,9 +426,17 @@ object ParquetRewriter {
      * parquet-java's zstd level key, and the level this rewriter pins by
      * default. Named rather than typed because the value travels to the
      * codec through the writer's untyped configuration map.
+     *
+     * Level 1, not parquet-java's 3 (hoglake#134 package D): a JFR profile
+     * of the rewrite put zstd at 11-16% of its CPU on the event shape and
+     * 41-48% on JSON-heavy rows at level 3, level 1 cut the rewrite's wall
+     * time by ~12% and ~20-25% respectively, and level 3 bought no
+     * measurable size over level 1 on that data (`CodecMeasurement` prints
+     * both). Level 1 still decompresses at the same speed, which is what
+     * every later scan pays.
      */
     const val ZSTD_LEVEL_KEY = "parquet.compression.codec.zstd.level"
-    const val DEFAULT_ZSTD_LEVEL = 3
+    const val DEFAULT_ZSTD_LEVEL = 1
     const val MIN_ZSTD_LEVEL = 1
     const val MAX_ZSTD_LEVEL = 22
 
@@ -332,14 +473,15 @@ object ParquetRewriter {
      * ZSTD over SNAPPY because the cost sits on the side that is paid
      * once. Compression happens once per rewrite; the output is then
      * read by every scan, by any later rewrite, and paid for in
-     * S3 storage until expiry. zstd at level 3 lands well under snappy's
-     * size on the text-heavy event shapes this catalog holds, and its
+     * S3 storage until expiry. zstd lands well under snappy's size on the
+     * text-heavy event shapes this catalog holds (at level 1 as at 3 —
+     * see [DEFAULT_ZSTD_LEVEL]), and its
      * DEcompression — what readers and later rewrites actually spend —
      * is in snappy's league. The compaction sweep is CPU-bound on a
      * shared maintenance pod, so the level is pinned rather than
-     * inherited: [DEFAULT_ZSTD_LEVEL] is parquet-java's own default
-     * today, and pinning it means a library bump cannot silently move
-     * this pod's CPU budget. parquet-java's zstd workers default to 0
+     * inherited: [DEFAULT_ZSTD_LEVEL] is 1, below parquet-java's own
+     * default of 3, and pinning it means a library bump cannot silently
+     * move this pod's CPU budget. parquet-java's zstd workers default to 0
      * (in-thread), which is what a shared pod wants, so nothing here
      * asks for threads.
      *
@@ -425,7 +567,38 @@ object ParquetRewriter {
         val rowIdStart: Long,
         val deletes: DeletionVector? = null,
         val explicitRowIds: Boolean = false,
-    )
+        /**
+         * The caller's word that this file's rows are already in merge-key
+         * order (a compaction output written under the live sort spec), so
+         * a sorted rewrite may read it as a run in place without checking.
+         * An input without it is VERIFIED by the sortedness pre-pass
+         * instead (see the class doc's run kinds).
+         */
+        override val trustedSorted: Boolean = false,
+        /**
+         * `hog_data_file.file_size_bytes`: the trusted-run cost estimate
+         * before the footer is read, and the spill pre-refusal's measure.
+         * 0 = unknown, which estimates a trusted run at the full output
+         * block until its footer says otherwise.
+         */
+        override val fileSizeBytes: Long = 0,
+        /**
+         * Registered survivors (record_count minus the live DV's count):
+         * how many rows this input adds to the spill path, which is what
+         * predicts the spilled-run count before any data is read. 0 =
+         * unknown; the spill-time run check still bounds the merge.
+         */
+        override val survivingRecords: Long = 0,
+        /**
+         * Where the sortedness pre-pass reads this file's sort-key
+         * columns; null reads [source]. A separate [InputFile] because the
+         * pre-pass reads a few non-adjacent column chunks, and the merge's
+         * readahead would over-read the columns between them (see
+         * `S3InputFile.KEY_COLUMN_READAHEAD_BYTES`). Opened, read and closed
+         * by the pre-pass alone; the merge reopens [source].
+         */
+        val keySource: InputFile? = null,
+    ) : RunCandidate
 
     /**
      * [rowsWritten] survivors; [minRowId] their smallest row id (the
@@ -434,18 +607,81 @@ object ParquetRewriter {
      * once the writer closes, so compaction can register the output's
      * row-group offsets without reading anything back — or null if
      * parquet-java would not hand it over.
+     *
+     * The run counters describe a sorted rewrite's merge and are zero on
+     * the unsorted path: [runsTrusted] inputs read in place as runs,
+     * [runsSpilled] chunk files written, [runsDemoted] trusted inputs the
+     * merge budget sent to the spill path instead, [spillBytes] local
+     * bytes written for them. [spillCleanupFailed] is true when the
+     * rewrite's spill directory could not be removed afterwards: the
+     * output is good, but the volume still holds its spill files.
+     *
+     * The pre-pass counters: [filesVerified] inputs the sortedness check
+     * passed (each became a trusted candidate; [runsTrusted] counts the
+     * ones admitted, [runsDemoted] the ones the budget sent to the spill
+     * path), [filesUnsorted] the ones it failed, [filesUnchecked] the ones
+     * under the size floor ([SortSpill.verifyMinBytes]) it did not check,
+     * [sortCheckBytes] the bytes it read to decide.
+     *
+     * [rowGroupsAppended] and [bytesAppended]: input row groups copied
+     * into the output byte for byte instead of re-encoded (see
+     * [appendRefusal]), on either path; an appended trusted run of a
+     * sorted rewrite is also counted in [runsTrusted].
      */
     data class RewriteResult(
         val rowsWritten: Long,
         val minRowId: Long?,
         val footer: ParquetMetadata? = null,
+        val runsTrusted: Int = 0,
+        val runsSpilled: Int = 0,
+        val runsDemoted: Int = 0,
+        val spillBytes: Long = 0,
+        val spillCleanupFailed: Boolean = false,
+        val filesVerified: Int = 0,
+        val filesUnsorted: Int = 0,
+        val filesUnchecked: Int = 0,
+        val sortCheckBytes: Long = 0,
+        val rowGroupsAppended: Int = 0,
+        val bytesAppended: Long = 0,
     )
 
-    private class Row(val group: Group, val rowId: Long)
+    /**
+     * How a writer's row groups are bounded, when the default (128 MiB
+     * row groups, default pages, parquet-java's size-check cadence) is
+     * not the bound wanted. Only spill files ask: reading one back holds a
+     * whole row group, so the block must actually bound it, which
+     * parquet-java's check cadence does not ensure on its own (see
+     * [ExternalMergeSort.SPILL_MAX_ROWS_PER_SIZE_CHECK]).
+     */
+    internal class WriterTuning(
+        val rowGroupBytes: Long,
+        val pageBytes: Int,
+        val maxRowsPerSizeCheck: Int,
+    )
 
     /**
-     * One row's node allowance, spent as the row is DECODED and then
-     * copied.
+     * One materialized row: [group] as DECODED from its source — an input
+     * file's own schema, or the output schema for a spill file — and the
+     * [plan] that emits it as an output record. There is no output-shaped
+     * copy (hoglake#134 package D2): the writer walks [group] through
+     * [plan] straight into parquet's record consumer. [key] is its
+     * sort-key tuple in the OUTPUT domain, extracted once when the row is
+     * materialized ([SortKeys.bind]), so the sorted path compares a few
+     * values per comparison instead of walking the `Group` graph; empty
+     * on the unsorted path. [plan] is null only for rows that are never
+     * written (the sortedness pre-pass's projected rows).
+     */
+    internal class Row(
+        val group: Group,
+        val rowId: Long,
+        val key: Array<Any?> = NO_KEY,
+        val plan: RowPlan? = null,
+    )
+
+    private val NO_KEY = emptyArray<Any?>()
+
+    /**
+     * One row's node allowance, spent as the row is DECODED.
      *
      * "Decoded" is the load-bearing word and it was missing. The first
      * version of this charged only the copy, which runs after
@@ -458,7 +694,7 @@ object ParquetRewriter {
      *
      * [reset] is called once per row, by the root converter's `start`.
      */
-    private class NodeBudget(private val limit: Int, private val source: String) {
+    internal class NodeBudget(private val limit: Int, private val source: String) {
         private var spent = 0
 
         fun reset() {
@@ -477,7 +713,31 @@ object ParquetRewriter {
     }
 
     /**
-     * [GroupRecordConverter] with [budget] spent as the row is built.
+     * [value] copied into a byte array of its own, so that nothing that
+     * keeps it — the output writer's column statistics and its per-page
+     * column index, which live until the footer — keeps the reader's page.
+     *
+     * The reader hands out plain-decoded binaries as slices of the decoded
+     * PAGE buffer, and `Binary.copy()` returns `this` for a binary over a
+     * constant buffer. So every min/max the output writer kept was a
+     * reference into an input page, pinning the whole page until the
+     * output closed: retained heap grew with rows written and with the
+     * INPUT's page size (measured 310 MB at 3.2M rows of 1 MiB input row
+     * groups, 520 MB at 6.4M; ~80k live `ByteBufferBackedBinary` at the
+     * peak), on the unsorted path, the merge and the spill files alike.
+     *
+     * Copy rather than marking the slice reused (which makes the writer
+     * copy only the values it keeps): both flatten the writer, measured
+     * the same, but a slice keeps its page alive for as long as its ROW
+     * lives, and a sorted chunk holds tens of thousands of rows — the
+     * chunk phase measured 97 MB against the copy's 82 MB at 50,000 rows,
+     * and the copy was no slower (`SortedRewriteCpuMeasurement`).
+     */
+    private fun unpinned(value: Binary): Binary = Binary.fromConstantByteArray(value.bytes)
+
+    /**
+     * [GroupRecordConverter] with [budget] spent as the row is built, and
+     * every binary value [unpinned].
      *
      * Parquet hands a `RecordMaterializer` a tree of converters and
      * drives it from the column pages: every `start()` on a group
@@ -490,7 +750,7 @@ object ParquetRewriter {
      * parquet navigates it by index while binding columns and expects
      * the same converter object every time.
      */
-    private fun budgetedMaterializer(
+    internal fun budgetedMaterializer(
         schema: MessageType,
         budget: NodeBudget,
     ): RecordMaterializer<Group> {
@@ -545,7 +805,7 @@ object ParquetRewriter {
 
         override fun addBinary(value: Binary) {
             budget.spend()
-            delegate.addBinary(value)
+            delegate.addBinary(unpinned(value))
         }
 
         override fun addBoolean(value: Boolean) {
@@ -590,7 +850,7 @@ object ParquetRewriter {
      * way to reach one is a writer disagreeing with its own DDL, and
      * refusing that is the rewriter's job.
      */
-    private enum class CopyMode {
+    internal enum class CopyMode {
         IDENTITY,
         INT_TO_LONG,
         UINT32_TO_LONG,
@@ -604,9 +864,13 @@ object ParquetRewriter {
      * Merge [inputs] (caller orders them by rowIdStart) into [output]
      * under the live schema [liveColumns] (ordinal order). [sortFields]
      * non-empty sorts the merged survivors by the table's sort order
-     * (nulls per spec); empty keeps row-id order. [codec] is the output's
-     * compression (see [OutputCodec]) — an output's codec is independent
-     * of its inputs', which may be any mix.
+     * (nulls per spec, ties by row id) through the external merge sort
+     * the class doc describes, bounded by [spill] — which is then
+     * required: an in-memory sort is bounded by the chunk, and a group
+     * that fits one chunk is sorted in memory and written directly. Empty
+     * [sortFields] keeps row-id order and streams. [codec]
+     * is the output's compression (see [OutputCodec]) — an output's codec
+     * is independent of its inputs', which may be any mix.
      */
     fun rewrite(
         inputs: List<Input>,
@@ -616,8 +880,17 @@ object ParquetRewriter {
         maxNodesPerRow: Int = DEFAULT_MAX_NODES_PER_ROW,
         codec: OutputCodec = OutputCodec(),
         inputOpenParallelism: Int = DEFAULT_INPUT_OPEN_PARALLELISM,
+        spill: SortSpill? = null,
+        appendFloorBytes: Long = APPEND_MIN_ROW_GROUP_BYTES,
     ): RewriteResult {
         require(inputs.isNotEmpty()) { "rewrite needs at least one input" }
+        // A caller that forgot the bounds must not get an unbounded sort:
+        // silently materializing the group is the heap-O(group) behaviour
+        // #134 removed, and it OOMs the process rather than the group.
+        require(sortFields.isEmpty() || spill != null) {
+            "a sorted rewrite needs a SortSpill: an in-memory sort is bounded by the chunk — a group " +
+                "that fits one chunk is sorted in memory and written directly (hoglake#134)"
+        }
         // VARIANT anywhere in the forest, not just at the top. #77
         // checked `liveColumns.none {...}`, which was exhaustive in a
         // world without containers — `struct{v: variant}` has no
@@ -659,11 +932,26 @@ object ParquetRewriter {
                 maxNodesPerRow,
                 codec,
                 inputOpenParallelism,
+                spill,
+                appendFloorBytes,
             )
         } catch (e: Throwable) {
             runCatching { (output as? DiscardableOutputFile)?.discard() }
             throw e
         }
+    }
+
+    /** The live output schema and what every per-input pipeline derives from it. */
+    internal class OutputShape(
+        val liveColumns: List<Column>,
+        val schema: MessageType,
+        val maxNodesPerRow: Int,
+    ) {
+        val dataFields: List<Type> = schema.fields.dropLast(1) // all but _hog_row_id
+        val rowIdIndex: Int = schema.fieldCount - 1
+
+        /** Emits a row already in the output schema (a spill file's) as itself. */
+        val identityPlan: RowPlan by lazy { RowPlan(identitySteps(dataFields), this) }
     }
 
     private fun rewriteInto(
@@ -674,87 +962,129 @@ object ParquetRewriter {
         maxNodesPerRow: Int,
         codec: OutputCodec,
         inputOpenParallelism: Int,
+        spill: SortSpill?,
+        appendFloorBytes: Long,
     ): RewriteResult {
-        val outputSchema = outputSchema(liveColumns)
-        val dataFields = outputSchema.fields.dropLast(1) // all but _hog_row_id
-        val rowIdIndex = outputSchema.fieldCount - 1
-        val factory = SimpleGroupFactory(outputSchema)
+        val shape = OutputShape(liveColumns, outputSchema(liveColumns), maxNodesPerRow)
 
-        if (sortFields.isEmpty()) {
-            // No sort order: STREAM — write each survivor as it is read,
-            // never materializing the group. Materialize-then-write put
-            // the whole group's Group objects on the heap and OOM'd the
-            // server on a 400 MB catalog; heap must stay flat in group
-            // size (parquet-java's own row-group buffering bounds it).
-            //
-            // Flat in GROUP size, not in ROW size: one row still
-            // materializes whole. That used to be an accepted limit with
-            // no bound at all, which made a single pathological row a
-            // process-fatal OOM; [maxNodesPerRow] now caps it, so the
-            // worst case is one counted invalid_data skip.
-            var written = 0L
-            var minRowId: Long? = null
-            val (_, footer) =
-                writingTo(output, outputSchema, codec) { writer ->
-                    forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
-                        forEachSurvivor(
-                            input,
-                            reader,
-                            liveColumns,
-                            dataFields,
-                            rowIdIndex,
-                            factory,
-                            maxNodesPerRow,
-                        ) { group, rowId ->
-                            writer.write(group)
+        if (sortFields.isNotEmpty()) {
+            // Keys resolved before any IO: a sort spec the output schema
+            // cannot serve is refused without opening a file.
+            val keys = SortKeys(shape.schema, sortFields)
+            return ExternalMergeSort.rewrite(
+                inputs,
+                shape,
+                keys,
+                output,
+                codec,
+                inputOpenParallelism,
+                checkNotNull(spill),
+                appendFloorBytes,
+            )
+        }
+
+        // No sort order: STREAM — write each survivor as it is read,
+        // never materializing the group. Materialize-then-write put the
+        // whole group's Group objects on the heap and OOM'd the server on
+        // a 400 MB catalog; heap must stay flat in group size
+        // (parquet-java's own row-group buffering bounds it).
+        //
+        // Flat in GROUP size, not in ROW size: one row still materializes
+        // whole. That used to be an accepted limit with no bound at all,
+        // which made a single pathological row a process-fatal OOM;
+        // [maxNodesPerRow] now caps it, so the worst case is one counted
+        // invalid_data skip.
+        //
+        // An input that is already a compaction output of this very
+        // schema, with no deletes and big row groups, is APPENDED instead
+        // ([appendRefusal]): its row groups are copied byte for byte. The
+        // rows the other inputs produce keep filling the current encoded
+        // row group across it, so the encoded rows land after the appended
+        // groups rather than being cut into a small row group at every
+        // appended input; row ids ride the carrier, so where a row sits
+        // in an unsorted output carries no meaning.
+        var written = 0L
+        var minRowId: Long? = null
+        var appended = 0
+        var appendedBytes = 0L
+        val (_, footer) =
+            writingTo(output, shape.schema, codec) { writer ->
+                forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
+                    if (appendRefusal(input, reader.footer, shape.schema, appendFloorBytes) == null) {
+                        writer.appendRowGroups(input.source, reader, flushPending = false)
+                        written += reader.footer.blocks.sumOf { it.rowCount }
+                        val least = checkNotNull(minAppendedRowId(reader.footer))
+                        minRowId = minOf(minRowId ?: least, least)
+                    } else {
+                        for (row in SurvivorReader(input, reader, shape)) {
+                            writer.write(row)
                             written++
-                            minRowId = minOf(minRowId ?: rowId, rowId)
+                            minRowId = minOf(minRowId ?: row.rowId, row.rowId)
                         }
                     }
                 }
-            return RewriteResult(written, minRowId, footer)
+                appended = writer.rowGroupsAppended
+                appendedBytes = writer.bytesAppended
+            }
+        return RewriteResult(written, minRowId, footer, rowGroupsAppended = appended, bytesAppended = appendedBytes)
+    }
+
+    /**
+     * Why [input] cannot be APPENDED to an output of [outputSchema] —
+     * its row groups copied in byte for byte, never decoded — or null when
+     * it can. Each condition is what makes the copy byte-identical to
+     * what the decode path would have written, row for row:
+     *
+     *  - no live deletion vector: an appended row group cannot skip rows;
+     *  - `explicit_row_ids`: the ids ride in the [ROW_ID_COLUMN] carrier.
+     *    Positional ids live only in the catalog's `row_id_start`, and
+     *    copying the bytes would drop them;
+     *  - its parquet schema EQUALS the output schema — field ids, physical
+     *    types, repetition, logical annotations, the carrier, the order of
+     *    every field and the message name — which in practice means a
+     *    prior compaction output of the same live schema. Anything else
+     *    (a dropped or added column, a promotion, an annotation) needs the
+     *    column plan;
+     *  - every row group at least [floorBytes]
+     *    ([APPEND_MIN_ROW_GROUP_BYTES]): small row groups are re-encoded
+     *    into big ones, which is what compaction is for;
+     *  - every row group carries statistics on the row-id carrier: the
+     *    output's smallest row id ([RewriteResult.minRowId]) is read off
+     *    them, since no row is decoded.
+     *
+     * A file with no row groups is decoded (nothing to gain). The output
+     * then holds the input's codec on the appended row groups, which may
+     * differ from [OutputCodec] — legal parquet, per column chunk.
+     */
+    internal fun appendRefusal(
+        input: Input,
+        footer: ParquetMetadata,
+        outputSchema: MessageType,
+        floorBytes: Long,
+    ): String? =
+        when {
+            input.deletes != null -> "it has a live deletion vector"
+            !input.explicitRowIds -> "its row ids are positional"
+            footer.fileMetaData.schema != outputSchema -> "its schema is not the output schema"
+            footer.blocks.isEmpty() -> "it has no row groups"
+            footer.blocks.any { it.compressedSize < floorBytes } ->
+                "a row group is smaller than the append floor of $floorBytes B"
+            footer.blocks.any { rowIdStatistics(it) == null } -> "a row group has no row-id statistics"
+            else -> null
         }
 
-        // Sorted: survivors must be materialized to sort. Sorting is safe
-        // ONLY because ids are explicit; sortedWith is stable, so ties
-        // keep row-id order.
-        //
-        // The heap here is the group's OBJECT GRAPH, which is emphatically
-        // NOT its byte budget — an earlier version of this comment
-        // claimed the planner's targetBytes bounded it, and that is
-        // false. A measured `list<long>` table with five elements per
-        // row peaked at 343 MiB from a 4.6 MiB compressed input (70x):
-        // every element is its own SimpleGroup with an object header, a
-        // field array and a boxed value, and the compression that packs
-        // an int64 column 10:1 does nothing for any of that. Flat rows
-        // are a few boxed values each and stay near their byte size.
-        //
-        // The bound is therefore the planner's, not this loop's:
-        // CompactionService derates the group budget by
-        // CompactionConfig.nestedSortExpansion for a table that both
-        // nests and sorts, so the materialized graph lands back under
-        // roughly targetBytes. That bound is per GROUP; the per-ROW one
-        // is [maxNodesPerRow], as on the streaming path above.
-        val rows = ArrayList<Row>()
-        var minRowId: Long? = null
-        forEachOpenedInput(inputs, inputOpenParallelism) { input, reader ->
-            forEachSurvivor(
-                input,
-                reader,
-                liveColumns,
-                dataFields,
-                rowIdIndex,
-                factory,
-                maxNodesPerRow,
-            ) { group, rowId ->
-                rows.add(Row(group, rowId))
-                minRowId = minOf(minRowId ?: rowId, rowId)
-            }
-        }
-        val ordered = rows.sortedWith(comparator(outputSchema, sortFields))
-        val (_, footer) =
-            writingTo(output, outputSchema, codec) { writer -> for (row in ordered) writer.write(row.group) }
-        return RewriteResult(ordered.size.toLong(), minRowId, footer)
+    /** The smallest row id of an appendable file, off its footer. */
+    internal fun minAppendedRowId(footer: ParquetMetadata): Long? =
+        footer.blocks.mapNotNull { rowIdStatistics(it)?.first }.minOrNull()
+
+    /** The carrier's (min, max) in one row group, or null when its statistics cannot say. */
+    private fun rowIdStatistics(block: BlockMetaData): Pair<Long, Long>? {
+        val chunk = block.columns.firstOrNull { it.path.toArray().contentEquals(arrayOf(ROW_ID_COLUMN)) } ?: return null
+        val stats = chunk.statistics ?: return null
+        if (stats.isEmpty || !stats.hasNonNullValue() || !stats.isNumNullsSet || stats.numNulls != 0L) return null
+        val min = stats.genericGetMin() as? Long ?: return null
+        val max = stats.genericGetMax() as? Long ?: return null
+        return min to max
     }
 
     /**
@@ -768,7 +1098,7 @@ object ParquetRewriter {
      * single row can be read, and the rewrite used to pay that cost
      * strictly one input at a time, twice per input (once for the
      * schema, once for the rows — see the single [ParquetFileReader]
-     * threaded through [forEachSurvivor] now, which removed the second).
+     * threaded through [SurvivorReader] now, which removed the second).
      * That is the shape behind compaction's FIXED per-group cost:
      * measured on gigahog-prod-us, ~8.5 s per group regardless of the
      * group's size, because a 64-file group is 64 serialized opens. The
@@ -810,17 +1140,31 @@ object ParquetRewriter {
      * whether the walk finished or threw, because those readers hold
      * object-store streams nothing else will ever reach.
      */
-    private fun forEachOpenedInput(
+    internal fun forEachOpenedInput(
         inputs: List<Input>,
         parallelism: Int,
         body: (Input, ParquetFileReader) -> Unit,
+    ) = forEachOpenedReader(inputs, parallelism) { input, reader -> reader.use { body(input, it) } }
+
+    /**
+     * [forEachOpenedInput]'s window with OWNERSHIP handed over: [take]
+     * owns each reader from the moment it is called, and must close it or
+     * register it with something that will, even when it throws. The
+     * sorted path holds its trusted runs open across the whole merge, so
+     * the walk cannot close them; what it still guarantees is the same
+     * drain of every reader opened ahead and never handed over.
+     */
+    internal fun forEachOpenedReader(
+        inputs: List<Input>,
+        parallelism: Int,
+        take: (Input, ParquetFileReader) -> Unit,
     ) {
         val window = parallelism.coerceAtMost(inputs.size)
         if (window <= 1) {
             // EXACTLY the old shape, with no executor and no thread hop:
             // the default is 1 for the unit tests and for any caller that
             // did not ask, and "off" must mean off.
-            for (input in inputs) ParquetReaders.open(input.source).use { body(input, it) }
+            for (input in inputs) take(input, ParquetReaders.open(input.source))
             return
         }
         val pool =
@@ -868,7 +1212,7 @@ object ParquetRewriter {
                         // them.
                         throw e.cause ?: e
                     }
-                reader.use { body(input, it) }
+                take(input, reader)
             }
         } finally {
             // Three steps, in this order, and each one covers a case
@@ -915,62 +1259,123 @@ object ParquetRewriter {
         }
     }
 
-    /** The per-input pipeline: apply the DV, map to the live schema, stamp the row id, emit. */
-    private fun forEachSurvivor(
-        input: Input,
-        reader: ParquetFileReader,
-        liveColumns: List<Column>,
-        dataFields: List<Type>,
-        rowIdIndex: Int,
-        factory: SimpleGroupFactory,
-        maxNodesPerRow: Int,
-        emit: (Group, Long) -> Unit,
-    ) {
+    /**
+     * The per-input pipeline, PULL-style: apply the DV, map to the live
+     * schema, stamp the row id, one row per [next].
+     *
+     * Pull rather than a callback because the merge needs many inputs
+     * advanced one row at a time on one thread; parquet-java's
+     * `RecordReader.read()` is already pull-style, so row groups and
+     * records are simply read lazily. The reader belongs to the caller,
+     * which opened it (possibly ahead of time, on another thread) and
+     * closes it — this must not, and must not assume any row group has
+     * been consumed yet.
+     *
+     * The DV cardinality check runs in the EXHAUSTION path, whenever
+     * [hasNext] finds no row group left: a run in a merge is only
+     * exhausted at the merge's end, which is the one place the check can
+     * run without reading the run twice.
+     */
+    internal class SurvivorReader(
+        private val input: Input,
+        private val reader: ParquetFileReader,
+        private val shape: OutputShape,
+        /** The sorted path's keys, extracted per row; null on the unsorted path. */
+        private val keys: SortKeys? = null,
+    ) : Iterator<Row> {
         // From the reader the caller already opened, not a second open of
         // its own. This used to be `readSchema(input.source)` followed by
         // `readRows(input.source, ...)`, which opened — and so re-read and
         // re-parsed the footer of — every input TWICE.
-        val schema = reader.footer.fileMetaData.schema
-        refuseDuplicateNames(schema, emptyList())
-        // A previously-compacted input carries its ids in its own
-        // row-id column; positional ids would be wrong for it.
-        val srcRowIdIndex = rowIdCarrier(schema, input)
-        val plan = columnPlan(schema, liveColumns, input.label)
-        var applied = 0L
-        // One allowance per row PER PHASE. The root converter renews it
-        // at each row boundary for the decode; the copy renews it again
-        // below.
-        //
-        // Not one allowance shared across both, which is what this was
-        // and it was wrong twice over. Arithmetically: the copy walks
-        // the graph the decode just built, so a shared allowance charges
-        // the SAME nodes twice and the effective ceiling is half the
-        // configured value — a 500-element list<long> needed
-        // maxNodesPerRow=2002 to pass a limit documented as a million.
-        // Semantically: the decode is the phase that needs bounding,
-        // because a hostile file can declare any repetition count it
-        // likes, while the copy's size is already bounded by what the
-        // decode produced. Charging the copy is belt-and-braces; charging
-        // it from the same allowance turns the braces into a tighter belt.
-        val budget = NodeBudget(maxNodesPerRow, input.label)
-        readRows(reader, schema, budget) { src, ordinal ->
-            if (input.deletes?.contains(ordinal) == true) {
-                applied++
-                return@readRows
+        private val fileSchema: MessageType = reader.footer.fileMetaData.schema
+
+        init {
+            refuseDuplicateNames(fileSchema, emptyList())
+        }
+
+        // The plan and the carrier are resolved against the FILE's schema
+        // (every refusal sees the whole file), then the read is PROJECTED
+        // to exactly the columns they use: a column the live schema
+        // dropped is never decoded, never held in a chunk, never charged.
+        private val projected: ProjectedRead =
+            run {
+                // A previously-compacted input carries its ids in its own
+                // row-id column; positional ids would be wrong for it.
+                // Resolved FIRST: its refusals (a duplicated reserved id is
+                // invalid_data) take precedence over the plan's.
+                val carrier = rowIdCarrier(fileSchema, input)
+                projectRead(fileSchema, columnPlan(fileSchema, shape.liveColumns, input.label), carrier)
             }
-            val dst = factory.newGroup()
-            // The copy's own allowance. It cannot exceed the decode's
-            // spend in practice — every output node mirrors a source
-            // node, and dropped columns make it strictly smaller — so
-            // this bound is a backstop rather than the binding one, and
-            // resetting is what keeps the ADVERTISED ceiling the real
-            // ceiling.
-            budget.reset()
-            for ((outIdx, step) in plan.withIndex()) {
-                if (step != null && src.getFieldRepetitionCount(step.srcIndex) > 0) {
-                    copyField(src, step, dst, outIdx, dataFields[outIdx], budget)
+
+        /** What this reader decodes: the file schema pruned to the plan. */
+        internal val requestedSchema: MessageType = projected.schema
+        private val schema: MessageType = projected.schema
+        private val srcRowIdIndex = projected.carrier
+        private val plan = projected.steps
+
+        init {
+            reader.setRequestedSchema(schema)
+        }
+
+        // One allowance per row, spent by the DECODE: the root converter
+        // renews it at each row boundary. There is no second phase to
+        // charge any more — the output record is walked out of the
+        // decoded row (package D2), not copied into a second graph — and
+        // the walk cannot outgrow the decode: it visits each decoded node
+        // at most once, never allocates a node, and skips dropped
+        // columns. (Before D2 the copy was charged from a fresh
+        // allowance too; sharing one across both phases had charged the
+        // same graph twice and halved the advertised ceiling.)
+        private val budget = NodeBudget(shape.maxNodesPerRow, input.label)
+        private val rowPlan = RowPlan(plan, shape)
+        private val boundKeys = keys?.bind(rowPlan)
+        private val columnIO = ColumnIOFactory().getColumnIO(schema)
+        private var records: org.apache.parquet.io.RecordReader<Group>? = null
+        private var leftInRowGroup = 0L
+        private var ordinal = 0L
+        private var applied = 0L
+        private var pending: Row? = null
+
+        override fun hasNext(): Boolean {
+            if (pending == null) pending = advance()
+            return pending != null
+        }
+
+        override fun next(): Row {
+            if (!hasNext()) throw NoSuchElementException("${input.label} is exhausted")
+            return pending!!.also { pending = null }
+        }
+
+        private fun advance(): Row? {
+            while (true) {
+                while (leftInRowGroup == 0L) {
+                    val pages = reader.readNextRowGroup()
+                    if (pages == null) {
+                        val expected = input.deletes?.cardinality ?: 0L
+                        check(applied == expected) {
+                            "deletion vector for ${input.label} claims $expected positions but only " +
+                                "$applied fell inside the file — refusing a lossy compaction"
+                        }
+                        return null
+                    }
+                    records = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
+                    leftInRowGroup = pages.rowCount
                 }
+                val src = records!!.read()
+                leftInRowGroup--
+                val position = ordinal++
+                if (input.deletes?.contains(position) == true) {
+                    applied++
+                    continue
+                }
+                return row(src, position)
             }
+        }
+
+        private fun row(
+            src: Group,
+            position: Long,
+        ): Row {
             val rowId =
                 if (srcRowIdIndex != null) {
                     // PRESENT, not merely declared. A compaction output's
@@ -984,23 +1389,115 @@ object ParquetRewriter {
                     // committed with.
                     if (src.getFieldRepetitionCount(srcRowIdIndex) == 0) {
                         throw InvalidDataException(
-                            "row $ordinal of ${input.label} has a null $ROW_ID_COLUMN; the " +
+                            "row $position of ${input.label} has a null $ROW_ID_COLUMN; the " +
                                 "row id of a compacted file is required",
                         )
                     }
                     src.getLong(srcRowIdIndex, 0)
                 } else {
-                    input.rowIdStart + ordinal
+                    input.rowIdStart + position
                 }
-            dst.add(rowIdIndex, rowId)
-            emit(dst, rowId)
-        }
-        val expected = input.deletes?.cardinality ?: 0L
-        check(applied == expected) {
-            "deletion vector for ${input.label} claims $expected positions but only " +
-                "$applied fell inside the file — refusing a lossy compaction"
+            val key = boundKeys?.extract(src, input.label) ?: NO_KEY
+            return Row(src, rowId, key, rowPlan)
         }
     }
+
+    /** A projected read: the requested schema, the plan re-indexed into it, the carrier's index in it. */
+    internal class ProjectedRead(val schema: MessageType, val steps: List<Step?>, val carrier: Int?)
+
+    /**
+     * [fileSchema] pruned to the columns [steps] read and the row-id
+     * [carrier], with the steps and the carrier re-indexed into the pruned
+     * schema — what the per-input pipeline asks the reader for
+     * (`setRequestedSchema`), so that a column the live schema DROPPED is
+     * neither decoded nor materialized.
+     *
+     * Why it matters beyond CPU: the sorted rewrite's chunk holds decoded
+     * rows, and its size ([CompactionConfig.spillChunkRows]) is computed
+     * from the LIVE schema's node count. Without the projection a file
+     * written before half its table's columns were dropped materialized
+     * twice the nodes per row the chunk was sized for.
+     *
+     * Pruned at the top level and inside structs (a struct member is an
+     * independently droppable column). A list or a map is kept whole: its
+     * element/key/value steps already name exactly what they read, and a
+     * dropped member of a struct INSIDE a list is a rare enough shape not
+     * to complicate the index arithmetic for. A struct none of whose
+     * members the plan reads is kept whole too, because its presence still
+     * decides whether the output row has the (empty) struct or a null, and
+     * parquet has no empty group. A file the plan reads NOTHING from — a
+     * client file all of whose columns were dropped — projects to an empty
+     * message, which parquet-java still reads row by row (pinned: its rows
+     * survive, all-null).
+     */
+    internal fun projectRead(
+        fileSchema: MessageType,
+        steps: List<Step?>,
+        carrier: Int?,
+    ): ProjectedRead {
+        val used = (steps.mapNotNull { it?.srcIndex } + listOfNotNull(carrier)).distinct().sorted()
+        val newIndex = used.withIndex().associate { (i, src) -> src to i }
+        val fields =
+            used.map { src ->
+                val field = fileSchema.getType(src)
+                val struct = steps.filterIsInstance<Step.StructStep>().firstOrNull { it.srcIndex == src }
+                if (struct == null) field else pruneStruct(field.asGroupType(), struct).first
+            }
+        val remapped =
+            steps.map { step ->
+                when (step) {
+                    null -> null
+                    is Step.StructStep -> pruneStruct(fileSchema.getType(step.srcIndex).asGroupType(), step).second
+                    else -> step
+                }?.let { reindex(it, newIndex.getValue(step!!.srcIndex)) }
+            }
+        return ProjectedRead(
+            MessageType(fileSchema.name, fields),
+            remapped,
+            carrier?.let { newIndex.getValue(it) },
+        )
+    }
+
+    /** [group] pruned to the members [step] reads, and [step] re-indexed into it (its own index unchanged). */
+    private fun pruneStruct(
+        group: GroupType,
+        step: Step.StructStep,
+    ): Pair<Type, Step.StructStep> {
+        val used = step.children.mapNotNull { it?.srcIndex }.distinct().sorted()
+        if (used.isEmpty()) return group to step
+        val newIndex = used.withIndex().associate { (i, src) -> src to i }
+        val members =
+            used.map { src ->
+                val member = group.getType(src)
+                val child = step.children.firstOrNull { it?.srcIndex == src }
+                if (child is Step.StructStep) pruneStruct(member.asGroupType(), child).first else member
+            }
+        val children =
+            step.children.map { child ->
+                when (child) {
+                    null -> null
+                    is Step.StructStep ->
+                        reindex(
+                            pruneStruct(group.getType(child.srcIndex).asGroupType(), child).second,
+                            newIndex.getValue(child.srcIndex),
+                        )
+                    else -> reindex(child, newIndex.getValue(child.srcIndex))
+                }
+            }
+        return group.withNewFields(members) to Step.StructStep(step.srcIndex, children)
+    }
+
+    /** [step] reading from [index] instead. */
+    private fun reindex(
+        step: Step,
+        index: Int,
+    ): Step =
+        when (step) {
+            is Step.Scalar -> Step.Scalar(index, step.mode)
+            is Step.StructStep -> Step.StructStep(index, step.children)
+            is Step.ListStep -> Step.ListStep(index, step.element)
+            is Step.MapStep -> Step.MapStep(index, step.key, step.value)
+        }
 
     /**
      * The index of this input's row-id carrier, or null when its ids are
@@ -1044,7 +1541,7 @@ object ParquetRewriter {
      * about foreign files binding to CATALOG columns; a flag-true file
      * was written by compaction, which always stamps the id.
      */
-    private fun rowIdCarrier(
+    internal fun rowIdCarrier(
         schema: MessageType,
         input: Input,
     ): Int? {
@@ -1149,38 +1646,55 @@ object ParquetRewriter {
     }
 
     /**
-     * The output writer. [codec] is chosen, not inherited: this builder
-     * defaults to UNCOMPRESSED, and taking that default is what made
-     * every compaction a permanent decompression of its inputs (see
-     * [OutputCodec]).
+     * The Hadoop configuration a writer of [codec] is built with: ONE per
+     * zstd level, built once and shared, the way [ParquetReaders] shares
+     * the readers'.
      *
-     * The zstd level rides the writer's configuration map — parquet-java
-     * constructs the codec reflectively from it — and is set
-     * unconditionally because it is inert for every other codec. Setting
-     * it explicitly, rather than trusting the library default, keeps a
-     * parquet-java bump from moving a shared maintenance pod's CPU
-     * budget without a diff.
+     * Because building one is not free. `Builder.config(...)` creates a
+     * fresh `Configuration` per writer, and its first read parses the
+     * Hadoop default XML resources off the classpath — ~35 ms, measured,
+     * which a sorted rewrite paid for its output AND every spill file, and
+     * a tiny-file sweep's profile spent a quarter of its time in. Sharing
+     * is safe because nothing the writer does writes to it: the Group
+     * write support is handed its schema directly rather than through the
+     * configuration. The resources are loaded here, once, so no two
+     * writers race to load them.
      */
-    private fun newWriter(
-        outputSchema: MessageType,
-        output: OutputFile,
-        codec: OutputCodec,
-    ): ParquetWriter<Group> =
-        ExampleParquetWriter.builder(output)
-            .withType(outputSchema)
-            .withCompressionCodec(codec.name)
-            .config(ZSTD_LEVEL_KEY, codec.zstdLevel.toString())
-            .withWriteMode(ParquetFileWriter.Mode.OVERWRITE)
-            .build()
+    internal fun writerConfiguration(codec: OutputCodec): org.apache.hadoop.conf.Configuration =
+        writerConfigurations.computeIfAbsent(codec.zstdLevel) { level ->
+            org.apache.hadoop.conf.Configuration().apply {
+                set(ZSTD_LEVEL_KEY, level.toString())
+                size() // load the default resources now, not on a writer's first read
+            }
+        }
+
+    private val writerConfigurations =
+        java.util.concurrent.ConcurrentHashMap<Int, org.apache.hadoop.conf.Configuration>()
+
+    // The writer itself is [OutputWriter]: [codec] is chosen, never
+    // inherited (parquet-java's builders default to UNCOMPRESSED, which
+    // made every compaction a permanent decompression of its inputs — see
+    // [OutputCodec]); the zstd level rides the shared configuration above;
+    // [WriterTuning] null keeps parquet-java's defaults (128 MiB row
+    // groups), which is what every compaction output is written at and
+    // what the merge admission's trusted-run estimate assumes.
 
     // ---- schema ----------------------------------------------------------
+
+    /**
+     * Leaf columns of the output schema [liveColumns] produce, `_hog_row_id`
+     * included: the unit [ExternalMergeSort]'s per-run page charge is
+     * counted in. The planner calls this so its metadata refusals cost
+     * runs exactly as the rewrite will.
+     */
+    internal fun outputLeafCount(liveColumns: List<Column>): Int = outputSchema(liveColumns).columns.size
 
     /**
      * The output schema is the LIVE schema: every live column in
      * ordinal order (optional, field-id-stamped, type synthesized from
      * the catalog type), plus the required [ROW_ID_COLUMN].
      */
-    private fun outputSchema(liveColumns: List<Column>): MessageType {
+    internal fun outputSchema(liveColumns: List<Column>): MessageType {
         require(liveColumns.isNotEmpty()) { "table has no live columns" }
         // The DDL path reserves the `_hog` prefix
         // (Identifiers.validateColumn), so a live column with this name
@@ -1383,7 +1897,7 @@ object ParquetRewriter {
      * copies key and value per entry. [srcIndex] is always relative to
      * the group the step is read from, never absolute.
      */
-    private sealed class Step {
+    internal sealed class Step {
         abstract val srcIndex: Int
 
         /** A primitive: copy the value, up-casting per [mode]. */
@@ -1408,7 +1922,7 @@ object ParquetRewriter {
      * appear in any plan — their data drops with the rewrite, exactly
      * like every reader already treats them.
      */
-    private fun columnPlan(
+    internal fun columnPlan(
         schema: MessageType,
         liveColumns: List<Column>,
         inputPath: String,
@@ -1879,164 +2393,234 @@ object ParquetRewriter {
     private fun timestampUnit(src: PrimitiveType): LogicalTypeAnnotation.TimeUnit? =
         (src.logicalTypeAnnotation as? LogicalTypeAnnotation.TimestampLogicalTypeAnnotation)?.unit
 
-    // ---- row IO ----------------------------------------------------------
+    // ---- write -----------------------------------------------------------
 
     /**
-     * Read every row of an ALREADY-OPEN reader. The reader belongs to
-     * [forEachOpenedInput], which opened it (possibly ahead of time, on
-     * another thread) and closes it when this returns — so this must not
-     * close it, and must not assume any row group has been consumed yet.
+     * The [Step] tree that reads an OUTPUT-schema row as itself: every
+     * scalar [CopyMode.IDENTITY], every container by its own shape. What a
+     * spill file's rows are emitted with — they were mapped to the live
+     * schema when first read, so there is nothing to map and nothing to
+     * convert.
      */
-    private fun readRows(
-        reader: ParquetFileReader,
-        schema: MessageType,
-        budget: NodeBudget,
-        consume: (Group, Long) -> Unit,
-    ) {
-        val columnIO = ColumnIOFactory().getColumnIO(schema)
-        var ordinal = 0L
-        var pages = reader.readNextRowGroup()
-        while (pages != null) {
-            val recordReader = columnIO.getRecordReader(pages, budgetedMaterializer(schema, budget))
-            repeat(Math.toIntExact(pages.rowCount)) {
-                consume(recordReader.read(), ordinal++)
+    internal fun identitySteps(fields: List<Type>): List<Step?> =
+        fields.mapIndexed { i, field -> identityStep(field, i) }
+
+    private fun identityStep(
+        field: Type,
+        index: Int,
+    ): Step {
+        if (field.isPrimitive) return Step.Scalar(index, CopyMode.IDENTITY)
+        val group = field.asGroupType()
+        return when (group.logicalTypeAnnotation) {
+            is LogicalTypeAnnotation.ListLogicalTypeAnnotation ->
+                Step.ListStep(index, identityStep(group.getType(0).asGroupType().getType(0), 0))
+            is LogicalTypeAnnotation.MapLogicalTypeAnnotation -> {
+                val entry = group.getType(0).asGroupType()
+                Step.MapStep(index, identityStep(entry.getType(0), 0), identityStep(entry.getType(1), 1))
             }
-            pages = reader.readNextRowGroup()
+            else -> Step.StructStep(index, identitySteps(group.fields))
         }
     }
 
     /**
-     * Copy one present field from [src] into [dst] at [dstIdx], where
-     * [dstType] is the OUTPUT type at that position. Recursive for the
-     * containers; the caller has already checked the source field is
-     * present (repetition count > 0).
+     * How the rows of ONE source schema are written as output records:
+     * the column plan ([columnPlan], or [identitySteps] for a spill file)
+     * walked from the decoded source `Group` straight into parquet's
+     * [RecordConsumer] — null-filling absent live columns by not writing
+     * them, dropping columns the plan does not name, promoting per
+     * [CopyMode], and stamping the row id.
+     *
+     * This replaced a COPY (hoglake#134 package D2): every row used to be
+     * rebuilt as an output `SimpleGroup` and that graph walked into the
+     * consumer by the example writer, so each row was materialized twice;
+     * the profile put the copy plus the second walk at ~20% of a rewrite.
+     * The emission is the example model's own (`GroupWriter`): a field is
+     * started only when it has a value, a group per struct, list entry and
+     * map entry. Binaries are emitted as decoded, which the materializer
+     * has already [unpinned] — nothing the output writer keeps (statistics,
+     * the column index) can hold an input page.
      */
-    private fun copyField(
-        src: Group,
-        step: Step,
-        dst: Group,
-        dstIdx: Int,
-        dstType: Type,
-        budget: NodeBudget,
+    internal class RowPlan(
+        private val steps: List<Step?>,
+        shape: OutputShape,
     ) {
-        budget.spend()
-        when (step) {
-            is Step.Scalar -> copyValue(src, step, dst, dstIdx, dstType.asPrimitiveType())
-            is Step.StructStep -> {
-                val srcGroup = src.getGroup(step.srcIndex, 0)
-                val dstGroup = dst.addGroup(dstIdx)
-                val dstStruct = dstType.asGroupType()
-                for ((i, child) in step.children.withIndex()) {
-                    if (child != null && srcGroup.getFieldRepetitionCount(child.srcIndex) > 0) {
-                        copyField(srcGroup, child, dstGroup, i, dstStruct.getType(i), budget)
-                    }
-                }
-            }
-            is Step.ListStep -> {
-                // An EMPTY list stays an empty list, distinct from null:
-                // the output group is created either way, and only the
-                // entries repeat.
-                val srcList = src.getGroup(step.srcIndex, 0)
-                val dstList = dst.addGroup(dstIdx)
-                val dstEntryType = dstType.asGroupType().getType(0).asGroupType()
-                val n = srcList.getFieldRepetitionCount(0)
-                for (i in 0 until n) {
-                    val srcEntry = srcList.getGroup(0, i)
-                    // CHARGED before it is allocated, and whether or not
-                    // the element inside it is present: a list of a
-                    // million nulls is a million entry groups, and
-                    // charging only the copied elements made exactly that
-                    // shape free.
-                    budget.spend()
-                    val dstEntry = dstList.addGroup(0)
-                    if (srcEntry.getFieldRepetitionCount(step.element.srcIndex) > 0) {
-                        copyField(srcEntry, step.element, dstEntry, 0, dstEntryType.getType(0), budget)
-                    }
-                }
-            }
-            is Step.MapStep -> {
-                val srcMap = src.getGroup(step.srcIndex, 0)
-                val dstMap = dst.addGroup(dstIdx)
-                val dstEntryType = dstType.asGroupType().getType(0).asGroupType()
-                val n = srcMap.getFieldRepetitionCount(0)
-                for (i in 0 until n) {
-                    val srcEntry = srcMap.getGroup(0, i)
-                    budget.spend()
-                    val dstEntry = dstMap.addGroup(0)
-                    // The key is REQUIRED on both sides (planNode refuses
-                    // an optional input key), so it is always present.
-                    copyField(srcEntry, step.key, dstEntry, 0, dstEntryType.getType(0), budget)
-                    if (srcEntry.getFieldRepetitionCount(step.value.srcIndex) > 0) {
-                        copyField(srcEntry, step.value, dstEntry, 1, dstEntryType.getType(1), budget)
-                    }
-                }
-            }
-        }
-    }
+        private val fields = shape.dataFields
+        private val rowIdIndex = shape.rowIdIndex
 
-    private fun copyValue(
-        src: Group,
-        step: Step.Scalar,
-        dst: Group,
-        dstIdx: Int,
-        primitive: PrimitiveType,
-    ) {
-        val srcIdx = step.srcIndex
-        when (step.mode) {
-            CopyMode.INT_TO_LONG -> dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong())
-            // Zero-extend, never sign-extend: this mode exists precisely
-            // for the int32 bit patterns whose unsigned reading is > 2^31.
-            CopyMode.UINT32_TO_LONG ->
-                dst.add(dstIdx, src.getInteger(srcIdx, 0).toLong() and 0xFFFFFFFFL)
-            CopyMode.FLOAT_TO_DOUBLE -> dst.add(dstIdx, src.getFloat(srcIdx, 0).toDouble())
-            CopyMode.DECIMAL_INT32, CopyMode.DECIMAL_INT64, CopyMode.DECIMAL_BINARY -> {
-                // Binary decimals can exceed Long.MAX_VALUE. Never narrow them through Long.
-                val unscaled =
-                    when (step.mode) {
-                        CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(src.getInteger(srcIdx, 0).toLong())
-                        CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(src.getLong(srcIdx, 0))
-                        else -> {
-                            // A zero-length byte array is not a decimal:
-                            // BigInteger("") throws, and there is no
-                            // sensible value to invent. The file declared
-                            // DECIMAL and then stored something else.
-                            val bytes = src.getBinary(srcIdx, 0).bytes
-                            if (bytes.isEmpty()) {
-                                throw InvalidDataException(
-                                    "empty byte array under decimal column '${primitive.name}' — " +
-                                        "a decimal's unscaled value needs at least one byte",
-                                )
-                            }
-                            BigInteger(bytes)
+        /** For [SortKeys.bind]: the top-level steps, in output order. */
+        internal val topSteps: List<Step?> get() = steps
+
+        fun write(
+            rc: RecordConsumer,
+            src: Group,
+            rowId: Long,
+        ) {
+            rc.startMessage()
+            for (i in steps.indices) {
+                val step = steps[i] ?: continue
+                if (src.getFieldRepetitionCount(step.srcIndex) == 0) continue
+                val type = fields[i]
+                rc.startField(type.name, i)
+                writeValue(rc, src, step, type)
+                rc.endField(type.name, i)
+            }
+            rc.startField(ROW_ID_COLUMN, rowIdIndex)
+            rc.addLong(rowId)
+            rc.endField(ROW_ID_COLUMN, rowIdIndex)
+            rc.endMessage()
+        }
+
+        /** One present field of [src], as the output [type] at its position. */
+        private fun writeValue(
+            rc: RecordConsumer,
+            src: Group,
+            step: Step,
+            type: Type,
+        ) {
+            when (step) {
+                is Step.Scalar -> writeScalar(rc, src, step, type.asPrimitiveType())
+                is Step.StructStep -> {
+                    val g = src.getGroup(step.srcIndex, 0)
+                    val struct = type.asGroupType()
+                    rc.startGroup()
+                    for ((j, child) in step.children.withIndex()) {
+                        if (child != null && g.getFieldRepetitionCount(child.srcIndex) > 0) {
+                            val childType = struct.getType(j)
+                            rc.startField(childType.name, j)
+                            writeValue(rc, g, child, childType)
+                            rc.endField(childType.name, j)
                         }
                     }
-                val annotation = primitive.logicalTypeAnnotation as LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
-                val precision = annotation.precision
-                if (unscaled.abs().toString().length > precision) {
-                    // The VALUE is wrong, not the schema pairing: same
-                    // two schemas with in-range values rewrite fine, so
-                    // re-planning this group will never help.
-                    throw InvalidDataException("decimal value exceeds destination precision $precision")
+                    rc.endGroup()
                 }
-                dst.add(dstIdx, Binary.fromConstantByteArray(unscaled.toByteArray()))
+                is Step.ListStep -> {
+                    // An EMPTY list stays an empty list, distinct from
+                    // null: the group is written either way, and only the
+                    // entries repeat.
+                    val list = src.getGroup(step.srcIndex, 0)
+                    val entryType = type.asGroupType().getType(0).asGroupType()
+                    val elementType = entryType.getType(0)
+                    val n = list.getFieldRepetitionCount(0)
+                    rc.startGroup()
+                    if (n > 0) {
+                        rc.startField(entryType.name, 0)
+                        for (k in 0 until n) {
+                            val entry = list.getGroup(0, k)
+                            rc.startGroup()
+                            if (entry.getFieldRepetitionCount(step.element.srcIndex) > 0) {
+                                rc.startField(elementType.name, 0)
+                                writeValue(rc, entry, step.element, elementType)
+                                rc.endField(elementType.name, 0)
+                            }
+                            rc.endGroup()
+                        }
+                        rc.endField(entryType.name, 0)
+                    }
+                    rc.endGroup()
+                }
+                is Step.MapStep -> {
+                    val map = src.getGroup(step.srcIndex, 0)
+                    val entryType = type.asGroupType().getType(0).asGroupType()
+                    val keyType = entryType.getType(0)
+                    val valueType = entryType.getType(1)
+                    val n = map.getFieldRepetitionCount(0)
+                    rc.startGroup()
+                    if (n > 0) {
+                        rc.startField(entryType.name, 0)
+                        for (k in 0 until n) {
+                            val entry = map.getGroup(0, k)
+                            rc.startGroup()
+                            // The key is REQUIRED on both sides (planNode
+                            // refuses an optional input key), so it is
+                            // always present.
+                            rc.startField(keyType.name, 0)
+                            writeValue(rc, entry, step.key, keyType)
+                            rc.endField(keyType.name, 0)
+                            if (entry.getFieldRepetitionCount(step.value.srcIndex) > 0) {
+                                rc.startField(valueType.name, 1)
+                                writeValue(rc, entry, step.value, valueType)
+                                rc.endField(valueType.name, 1)
+                            }
+                            rc.endGroup()
+                        }
+                        rc.endField(entryType.name, 0)
+                    }
+                    rc.endGroup()
+                }
             }
-            CopyMode.IDENTITY ->
-                when (primitive.primitiveTypeName) {
-                    PrimitiveType.PrimitiveTypeName.BOOLEAN -> dst.add(dstIdx, src.getBoolean(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.INT32 -> dst.add(dstIdx, src.getInteger(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.INT64 -> dst.add(dstIdx, src.getLong(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.FLOAT -> dst.add(dstIdx, src.getFloat(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.DOUBLE -> dst.add(dstIdx, src.getDouble(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.BINARY,
-                    PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
-                    -> dst.add(dstIdx, src.getBinary(srcIdx, 0))
-                    PrimitiveType.PrimitiveTypeName.INT96, null ->
-                        throw IllegalArgumentException(
-                            "unsupported physical type ${primitive.primitiveTypeName}",
-                        )
+        }
+
+        private fun writeScalar(
+            rc: RecordConsumer,
+            src: Group,
+            step: Step.Scalar,
+            primitive: PrimitiveType,
+        ) {
+            val srcIdx = step.srcIndex
+            when (step.mode) {
+                CopyMode.INT_TO_LONG -> rc.addLong(src.getInteger(srcIdx, 0).toLong())
+                // Zero-extend, never sign-extend: this mode exists precisely
+                // for the int32 bit patterns whose unsigned reading is > 2^31.
+                CopyMode.UINT32_TO_LONG -> rc.addLong(src.getInteger(srcIdx, 0).toLong() and 0xFFFFFFFFL)
+                CopyMode.FLOAT_TO_DOUBLE -> rc.addDouble(src.getFloat(srcIdx, 0).toDouble())
+                CopyMode.DECIMAL_INT32, CopyMode.DECIMAL_INT64, CopyMode.DECIMAL_BINARY -> {
+                    val unscaled = unscaledOf(src, step, primitive.name)
+                    val annotation =
+                        primitive.logicalTypeAnnotation as LogicalTypeAnnotation.DecimalLogicalTypeAnnotation
+                    val precision = annotation.precision
+                    if (unscaled.abs().toString().length > precision) {
+                        // The VALUE is wrong, not the schema pairing: same
+                        // two schemas with in-range values rewrite fine, so
+                        // re-planning this group will never help.
+                        throw InvalidDataException("decimal value exceeds destination precision $precision")
+                    }
+                    rc.addBinary(Binary.fromConstantByteArray(unscaled.toByteArray()))
                 }
+                CopyMode.IDENTITY ->
+                    when (primitive.primitiveTypeName) {
+                        PrimitiveType.PrimitiveTypeName.BOOLEAN -> rc.addBoolean(src.getBoolean(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.INT32 -> rc.addInteger(src.getInteger(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.INT64 -> rc.addLong(src.getLong(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.FLOAT -> rc.addFloat(src.getFloat(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.DOUBLE -> rc.addDouble(src.getDouble(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.BINARY,
+                        PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
+                        -> rc.addBinary(src.getBinary(srcIdx, 0))
+                        PrimitiveType.PrimitiveTypeName.INT96, null ->
+                            throw IllegalArgumentException(
+                                "unsupported physical type ${primitive.primitiveTypeName}",
+                            )
+                    }
+            }
         }
     }
+
+    /**
+     * A decimal source value's unscaled integer. Binary decimals can
+     * exceed Long.MAX_VALUE, so they are never narrowed through Long.
+     */
+    private fun unscaledOf(
+        src: Group,
+        step: Step.Scalar,
+        column: String,
+    ): BigInteger =
+        when (step.mode) {
+            CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(src.getInteger(step.srcIndex, 0).toLong())
+            CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(src.getLong(step.srcIndex, 0))
+            else -> {
+                // A zero-length byte array is not a decimal: BigInteger("")
+                // throws, and there is no sensible value to invent. The
+                // file declared DECIMAL and then stored something else.
+                val bytes = src.getBinary(step.srcIndex, 0).bytes
+                if (bytes.isEmpty()) {
+                    throw InvalidDataException(
+                        "empty byte array under decimal column '$column' — " +
+                            "a decimal's unscaled value needs at least one byte",
+                    )
+                }
+                BigInteger(bytes)
+            }
+        }
 
     // ---- sorting ---------------------------------------------------------
 
@@ -2056,31 +2640,6 @@ object ParquetRewriter {
         val primitive: PrimitiveType,
         val field: SortFieldDef,
     )
-
-    private fun comparator(
-        schema: MessageType,
-        sortFields: List<SortFieldDef>,
-    ): Comparator<Row> {
-        val keys = sortFields.map { sortKeyPath(schema, it) }
-        return Comparator { a, b ->
-            for (key in keys) {
-                val aGroup = navigate(a.group, key.path)
-                val bGroup = navigate(b.group, key.path)
-                val leafIdx = key.path.last()
-                val aNull = aGroup == null || aGroup.getFieldRepetitionCount(leafIdx) == 0
-                val bNull = bGroup == null || bGroup.getFieldRepetitionCount(leafIdx) == 0
-                if (aNull || bNull) {
-                    if (aNull && bNull) continue
-                    val nullsFirst = key.field.nullOrder == com.posthog.hoglake.model.NullOrder.NULLS_FIRST
-                    return@Comparator if (aNull == nullsFirst) -1 else 1
-                }
-                var c = compareNonNull(key.primitive, aGroup!!, bGroup!!, leafIdx)
-                if (key.field.direction == SortDirection.DESC) c = -c
-                if (c != 0) return@Comparator c
-            }
-            0
-        }
-    }
 
     /**
      * The group holding the leaf, walking [path]'s struct levels; null
@@ -2149,52 +2708,338 @@ object ParquetRewriter {
     }
 
     /**
-     * Typed comparison per physical type. Decimal-annotated binary
-     * compares as the signed two's-complement BigInteger (an unsigned
-     * byte compare mis-sorts negatives); other binary/fixed (string,
-     * uuid, raw bytes) compare unsigned lexicographic, which for UTF-8
-     * strings is code-point order. Integers annotated INT(w, unsigned)
-     * compare UNSIGNED — a signed compare puts every uint64 above 2^63
-     * (and every uint32 above 2^31) below zero, which is the same class
-     * of bug as the decimal case. Float/Double order NaN greatest
-     * (Kotlin's natural compareTo).
+     * The sorted path's ONE ordering: each row's sort-key tuple extracted
+     * once, when the row is materialized, then compared as plain values —
+     * the sort keys in spec order, then the row id (the class doc's
+     * "Order"). Comparing the `Group`s directly walked the object graph,
+     * read the repetition count and boxed the value on every one of the
+     * n·log n chunk-sort and log k merge comparisons.
+     *
+     * The extracted form keeps the exact semantics of the typed compare
+     * it replaced, per physical type:
+     *  - BOOLEAN, INT32, INT64 -> a Long. INT(w, unsigned) is PRE-MAPPED so
+     *    a signed compare is the unsigned one: uint32 zero-extends,
+     *    uint64 flips its sign bit. A signed compare of the raw value puts
+     *    every uint64 above 2^63 (and uint32 above 2^31) below zero.
+     *  - FLOAT, DOUBLE -> a Double, compared by `Double.compareTo`: NaN
+     *    greatest, -0.0 below 0.0. A float widens exactly, NaN included.
+     *  - decimal-annotated BINARY/FIXED -> the signed two's-complement
+     *    BigInteger (an unsigned byte compare mis-sorts negatives); an
+     *    empty array is not a decimal and is refused here, naming the row's
+     *    source, as the copy path refuses it.
+     *  - other BINARY/FIXED (string, uuid, bytes) -> the bytes, compared
+     *    unsigned lexicographically, which for UTF-8 is code-point order.
+     * A null (the leaf absent, or an ancestor struct null) is placed by
+     * the field's null order whatever its direction; DESC negates the
+     * non-null compare.
      */
-    private fun compareNonNull(
-        primitive: PrimitiveType,
-        a: Group,
-        b: Group,
-        idx: Int,
-    ): Int =
-        when (primitive.primitiveTypeName) {
-            PrimitiveType.PrimitiveTypeName.BOOLEAN ->
-                a.getBoolean(idx, 0).compareTo(b.getBoolean(idx, 0))
-            PrimitiveType.PrimitiveTypeName.INT32 ->
-                if (isUnsigned(primitive)) {
-                    Integer.compareUnsigned(a.getInteger(idx, 0), b.getInteger(idx, 0))
+    internal class SortKeys(
+        schema: MessageType,
+        sortFields: List<SortFieldDef>,
+    ) {
+        private val keys = sortFields.map { sortKeyPath(schema, it) }
+
+        /** The spec these keys were resolved from, in order. */
+        val fields: List<SortFieldDef> = sortFields
+        private val kinds = keys.map { kindOf(it.primitive) }.toTypedArray()
+        private val descending = BooleanArray(keys.size) { keys[it].field.direction == SortDirection.DESC }
+        private val nullsFirst =
+            BooleanArray(keys.size) { keys[it].field.nullOrder == com.posthog.hoglake.model.NullOrder.NULLS_FIRST }
+
+        /** The key tuple of [group], an OUTPUT-schema row; [source] names it in a refusal. */
+        fun extract(
+            group: Group,
+            source: String,
+        ): Array<Any?> =
+            Array(keys.size) { i ->
+                val key = keys[i]
+                val holder = navigate(group, key.path)
+                val idx = key.path.last()
+                if (holder == null || holder.getFieldRepetitionCount(idx) == 0) {
+                    null
                 } else {
-                    a.getInteger(idx, 0).compareTo(b.getInteger(idx, 0))
-                }
-            PrimitiveType.PrimitiveTypeName.INT64 ->
-                if (isUnsigned(primitive)) {
-                    java.lang.Long.compareUnsigned(a.getLong(idx, 0), b.getLong(idx, 0))
-                } else {
-                    a.getLong(idx, 0).compareTo(b.getLong(idx, 0))
-                }
-            PrimitiveType.PrimitiveTypeName.FLOAT ->
-                a.getFloat(idx, 0).compareTo(b.getFloat(idx, 0))
-            PrimitiveType.PrimitiveTypeName.DOUBLE ->
-                a.getDouble(idx, 0).compareTo(b.getDouble(idx, 0))
-            PrimitiveType.PrimitiveTypeName.BINARY,
-            PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
-            -> {
-                val ab = a.getBinary(idx, 0).bytes
-                val bb = b.getBinary(idx, 0).bytes
-                if (primitive.logicalTypeAnnotation is LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) {
-                    decimalOf(primitive, ab).compareTo(decimalOf(primitive, bb))
-                } else {
-                    java.util.Arrays.compareUnsigned(ab, bb)
+                    valueOf(kinds[i], key, holder, idx, source)
                 }
             }
+
+        /** The leaf at [idx] of [holder], read as [kind]. */
+        private fun valueOf(
+            kind: KeyKind,
+            key: SortKey,
+            holder: Group,
+            idx: Int,
+            source: String,
+        ): Any =
+            when (kind) {
+                KeyKind.BOOLEAN -> if (holder.getBoolean(idx, 0)) 1L else 0L
+                KeyKind.INT32 -> holder.getInteger(idx, 0).toLong()
+                KeyKind.UINT32 -> holder.getInteger(idx, 0).toLong() and 0xFFFF_FFFFL
+                KeyKind.INT64 -> holder.getLong(idx, 0)
+                KeyKind.UINT64 -> holder.getLong(idx, 0) xor Long.MIN_VALUE
+                KeyKind.FLOAT -> holder.getFloat(idx, 0).toDouble()
+                KeyKind.DOUBLE -> holder.getDouble(idx, 0)
+                KeyKind.DECIMAL -> decimalOf(key.primitive, holder.getBinary(idx, 0).bytes, source)
+                KeyKind.BYTES -> holder.getBinary(idx, 0).bytes
+            }
+
+        /**
+         * These keys read out of a SOURCE row that [plan] emits: each key's
+         * output path resolved through the plan to the source's own field
+         * indexes, and its value produced in the OUTPUT domain by the
+         * plan's [CopyMode] — the value the written row will hold, so a
+         * row compares exactly as it would after the copy D2 removed. A
+         * key the source does not have (a column added after the file was
+         * written, or under a null-filled struct member) is null in every
+         * row.
+         */
+        fun bind(plan: RowPlan): BoundKeys = BoundKeys(plan)
+
+        inner class BoundKeys internal constructor(plan: RowPlan) {
+            /** Per key: the source index chain to its leaf, or null when absent. */
+            private val paths: Array<IntArray?>
+            private val leaves: Array<Step.Scalar?>
+
+            init {
+                paths = arrayOfNulls(keys.size)
+                leaves = arrayOfNulls(keys.size)
+                for ((k, key) in keys.withIndex()) {
+                    var level: List<Step?> = plan.topSteps
+                    val chain = IntArray(key.path.size)
+                    var leaf: Step.Scalar? = null
+                    for ((depth, index) in key.path.withIndex()) {
+                        val step = level[index] ?: break
+                        chain[depth] = step.srcIndex
+                        if (depth == key.path.lastIndex) {
+                            leaf = step as Step.Scalar
+                        } else {
+                            level = (step as Step.StructStep).children
+                        }
+                    }
+                    if (leaf != null) {
+                        paths[k] = chain
+                        leaves[k] = leaf
+                    }
+                }
+            }
+
+            fun extract(
+                src: Group,
+                source: String,
+            ): Array<Any?> =
+                Array(keys.size) { i ->
+                    val chain = paths[i]
+                    val leaf = leaves[i]
+                    if (chain == null || leaf == null) return@Array null
+                    var holder: Group = src
+                    for (d in 0 until chain.size - 1) {
+                        if (holder.getFieldRepetitionCount(chain[d]) == 0) return@Array null
+                        holder = holder.getGroup(chain[d], 0)
+                    }
+                    val idx = chain[chain.size - 1]
+                    if (holder.getFieldRepetitionCount(idx) == 0) return@Array null
+                    when (leaf.mode) {
+                        CopyMode.INT_TO_LONG -> holder.getInteger(idx, 0).toLong()
+                        CopyMode.UINT32_TO_LONG -> holder.getInteger(idx, 0).toLong() and 0xFFFF_FFFFL
+                        CopyMode.FLOAT_TO_DOUBLE -> holder.getFloat(idx, 0).toDouble()
+                        CopyMode.DECIMAL_INT32 -> BigInteger.valueOf(holder.getInteger(idx, 0).toLong())
+                        CopyMode.DECIMAL_INT64 -> BigInteger.valueOf(holder.getLong(idx, 0))
+                        CopyMode.DECIMAL_BINARY ->
+                            decimalOf(keys[i].primitive, holder.getBinary(idx, 0).bytes, source)
+                        CopyMode.IDENTITY -> valueOf(kinds[i], keys[i], holder, idx, source)
+                    }
+                }
+        }
+
+        /** Sort keys, then row id. */
+        val comparator: Comparator<Row> =
+            Comparator { a, b ->
+                val c = compareKeys(a.key, b.key)
+                if (c != 0) c else a.rowId.compareTo(b.rowId)
+            }
+
+        private fun compareKeys(
+            a: Array<Any?>,
+            b: Array<Any?>,
+        ): Int {
+            for (i in kinds.indices) {
+                val c = compareAt(i, a[i], b[i])
+                if (c != 0) return c
+            }
+            return 0
+        }
+
+        /** Key [i]'s order: nulls by the null order whatever the direction, DESC negating the rest. */
+        private fun compareAt(
+            i: Int,
+            av: Any?,
+            bv: Any?,
+        ): Int {
+            if (av == null || bv == null) {
+                if (av == null && bv == null) return 0
+                return if ((av == null) == nullsFirst[i]) -1 else 1
+            }
+            val c =
+                when (kinds[i]) {
+                    KeyKind.BOOLEAN, KeyKind.INT32, KeyKind.UINT32, KeyKind.INT64, KeyKind.UINT64 ->
+                        (av as Long).compareTo(bv as Long)
+                    KeyKind.FLOAT, KeyKind.DOUBLE -> (av as Double).compareTo(bv as Double)
+                    KeyKind.DECIMAL -> (av as BigInteger).compareTo(bv as BigInteger)
+                    KeyKind.BYTES -> java.util.Arrays.compareUnsigned(av as ByteArray, bv as ByteArray)
+                }
+            return if (descending[i]) -c else c
+        }
+
+        /** The FIRST sort key's order on two of its values (null = SQL null). */
+        fun compareFirst(
+            a: Any?,
+            b: Any?,
+        ): Int = compareAt(0, a, b)
+
+        /**
+         * Whether every row of [a] precedes every row of [b] in the merge
+         * order — STRICTLY on the first key, so that no tie on it can cross
+         * the boundary and no later key or row id needs consulting.
+         */
+        fun before(
+            a: KeyRange,
+            b: KeyRange,
+        ): Boolean = compareFirst(a.hi, b.lo) < 0
+
+        /** Neither range has a first-key value the other's span reaches. */
+        fun disjoint(
+            a: KeyRange,
+            b: KeyRange,
+        ): Boolean = before(a, b) || before(b, a)
+
+        /**
+         * The FIRST key's range over every row of the file [footer]
+         * describes — deleted rows included, so a superset of the survivors
+         * — in merge order, from the column chunks' statistics. Null when
+         * the statistics cannot say: the key leaf is not where the output
+         * has it or not of the output's exact type (the values would be in
+         * another domain), the key is a FLOAT or DOUBLE (parquet leaves NaN
+         * out of min/max, and NaN sorts greatest here), or a chunk has no
+         * null count, or non-null values but no min/max (a writer that
+         * dropped oversized statistics). A file with no rows has no range
+         * to speak of and returns null too.
+         */
+        fun footerRange(footer: ParquetMetadata): KeyRange? {
+            val key = keys[0]
+            val kind = kinds[0]
+            if (kind == KeyKind.FLOAT || kind == KeyKind.DOUBLE) return null
+            val schema = footer.fileMetaData.schema
+            val leaf =
+                try {
+                    sortKeyPath(schema, key.field)
+                } catch (e: UnconvertibleSchemaException) {
+                    return null
+                }
+            val p = leaf.primitive
+            val want = key.primitive
+            if (p.primitiveTypeName != want.primitiveTypeName ||
+                p.logicalTypeAnnotation != want.logicalTypeAnnotation ||
+                p.typeLength != want.typeLength
+            ) {
+                return null
+            }
+            val names = ArrayList<String>()
+            var group: GroupType = schema
+            for ((depth, index) in leaf.path.withIndex()) {
+                val type = group.getType(index)
+                names += type.name
+                if (depth < leaf.path.lastIndex) group = type.asGroupType()
+            }
+            val path = ColumnPath.get(*names.toTypedArray())
+            var range: KeyRange? = null
+            for (block in footer.blocks) {
+                if (block.rowCount == 0L) continue
+                val chunk = block.columns.firstOrNull { it.path == path } ?: return null
+                val here = chunkRange(chunk, kind) ?: return null
+                range =
+                    if (range == null) {
+                        here
+                    } else {
+                        KeyRange(
+                            if (compareFirst(here.lo, range.lo) < 0) here.lo else range.lo,
+                            if (compareFirst(here.hi, range.hi) > 0) here.hi else range.hi,
+                        )
+                    }
+            }
+            return range
+        }
+
+        private fun chunkRange(
+            chunk: ColumnChunkMetaData,
+            kind: KeyKind,
+        ): KeyRange? {
+            val stats = chunk.statistics ?: return null
+            if (!stats.isNumNullsSet) return null
+            val nulls = stats.numNulls
+            val values = chunk.valueCount
+            if (nulls > values || nulls < 0) return null
+            if (nulls == values) return KeyRange(null, null)
+            if (stats.isEmpty || !stats.hasNonNullValue()) return null
+            val min = statValue(stats.genericGetMin(), kind) ?: return null
+            val max = statValue(stats.genericGetMax(), kind) ?: return null
+            var lo: Any? = if (descending[0]) max else min
+            var hi: Any? = if (descending[0]) min else max
+            if (nulls > 0) {
+                if (nullsFirst[0]) lo = null else hi = null
+            }
+            return KeyRange(lo, hi)
+        }
+
+        /**
+         * A statistics bound as the key value [extract] would produce, or
+         * null when it cannot be one. The typed casts are a second line:
+         * [footerRange] has already required the file's key leaf to be of
+         * the output's exact type, which is what makes the statistics'
+         * ORDER the merge's (a signed INT32 file under a uint8 column would
+         * cast fine and mask negative values to the top of the range).
+         */
+        private fun statValue(
+            raw: Any?,
+            kind: KeyKind,
+        ): Any? =
+            when (kind) {
+                KeyKind.BOOLEAN -> (raw as? Boolean)?.let { if (it) 1L else 0L }
+                KeyKind.INT32 -> (raw as? Int)?.toLong()
+                KeyKind.UINT32 -> (raw as? Int)?.let { it.toLong() and 0xFFFF_FFFFL }
+                KeyKind.INT64 -> raw as? Long
+                KeyKind.UINT64 -> (raw as? Long)?.let { it xor Long.MIN_VALUE }
+                KeyKind.DECIMAL -> (raw as? Binary)?.bytes?.takeIf { it.isNotEmpty() }?.let { BigInteger(it) }
+                KeyKind.BYTES -> (raw as? Binary)?.bytes
+                // Converted faithfully; [footerRange] refuses these kinds
+                // before asking, because NaN is outside the statistics.
+                KeyKind.FLOAT -> (raw as? Float)?.toDouble()
+                KeyKind.DOUBLE -> raw as? Double
+            }
+    }
+
+    /**
+     * The span of the FIRST sort key over a run's rows, in merge order:
+     * [lo] sorts first, [hi] last, a null bound meaning SQL null (placed
+     * by the key's null order). See [SortKeys.footerRange].
+     */
+    internal class KeyRange(val lo: Any?, val hi: Any?)
+
+    private enum class KeyKind { BOOLEAN, INT32, UINT32, INT64, UINT64, FLOAT, DOUBLE, DECIMAL, BYTES }
+
+    private fun kindOf(primitive: PrimitiveType): KeyKind =
+        when (primitive.primitiveTypeName) {
+            PrimitiveType.PrimitiveTypeName.BOOLEAN -> KeyKind.BOOLEAN
+            PrimitiveType.PrimitiveTypeName.INT32 -> if (isUnsigned(primitive)) KeyKind.UINT32 else KeyKind.INT32
+            PrimitiveType.PrimitiveTypeName.INT64 -> if (isUnsigned(primitive)) KeyKind.UINT64 else KeyKind.INT64
+            PrimitiveType.PrimitiveTypeName.FLOAT -> KeyKind.FLOAT
+            PrimitiveType.PrimitiveTypeName.DOUBLE -> KeyKind.DOUBLE
+            PrimitiveType.PrimitiveTypeName.BINARY,
+            PrimitiveType.PrimitiveTypeName.FIXED_LEN_BYTE_ARRAY,
+            ->
+                if (primitive.logicalTypeAnnotation is LogicalTypeAnnotation.DecimalLogicalTypeAnnotation) {
+                    KeyKind.DECIMAL
+                } else {
+                    KeyKind.BYTES
+                }
             PrimitiveType.PrimitiveTypeName.INT96, null ->
                 throw IllegalArgumentException("unsupported sort key type ${primitive.primitiveTypeName}")
         }
@@ -2203,11 +3048,12 @@ object ParquetRewriter {
     private fun decimalOf(
         primitive: PrimitiveType,
         bytes: ByteArray,
+        source: String,
     ): BigInteger {
         if (bytes.isEmpty()) {
             throw InvalidDataException(
                 "empty byte array under decimal sort key '${primitive.name}' — " +
-                    "a decimal's unscaled value needs at least one byte",
+                    "a decimal's unscaled value needs at least one byte (in $source)",
             )
         }
         return BigInteger(bytes)
