@@ -112,7 +112,7 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  * that wide gets a smaller HOGLAKE_RETIREMENT_BATCH set by the operator
  * who knows it rather than discovered by a rollback.
  *
- * THE FIVE THINGS THE COMMIT LOCK SERIALIZES A BATCH AGAINST, stated
+ * THE FOUR THINGS THE COMMIT LOCK SERIALIZES A BATCH AGAINST, stated
  * because taking that lock at all is a deliberate act (AGENT.md: the
  * per-catalog commit lock is for commits, and nothing takes it unless
  * it settles state inside a commit transaction — this does):
@@ -122,28 +122,21 @@ import org.jdbi.v3.core.statement.UnableToExecuteStatementException
  *     INSERTS those rows; unserialized, a commit could read the queue
  *     between the delete and the insert and register a path this batch
  *     is about to queue for deletion;
- *  2. the CLEANUP DRAIN's re-check and liveness check, which run under
- *     the same lock and ask "does any file row still name this path".
- *     Deleting the row and queueing the path must be one atomic step
- *     to that reader, or the drain can see the row gone and the queue
- *     entry absent — an object nothing will ever reclaim;
- *  3. EXPIRY's floor advance, which is the gate this batch reads. The
+ *  2. EXPIRY's floor advance, which is the gate this batch reads. The
  *     floor is read inside the batch transaction, so it cannot move
  *     under the batch;
- *  4. COMPACTION's group commit, whose plan-to-commit re-verification
+ *  3. COMPACTION's group commit, whose plan-to-commit re-verification
  *     runs under the lock and would otherwise be re-verifying rows
  *     this batch is deleting;
- *  5. DROP and atomic REPLACEMENT themselves, which mark the table and
+ *  4. DROP and atomic REPLACEMENT themselves, which mark the table and
  *     allocate a snapshot under the lock.
  *
- * A RETIREMENT CONNECTION IS NEVER IDLE IN TRANSACTION, which is why
- * `CleanupService`'s hold budget arithmetic does NOT apply here.
- * Cleanup derives `hold <= min(idle bound, admission bound)` because it
- * makes object-store calls INSIDE the transaction — a backend awaiting
- * an S3 response is idle in transaction and Postgres will kill it.
- * This batch issues nothing but SQL, so the only bound that can fire is
- * `statement_timeout`, and the batch sets its own,
- * transaction-locally: `min(session statement_timeout / 4, commit
+ * Cleanup takes no catalog lock; it observes the file deletion and
+ * removal-queue insertion as one committed transaction. Its object-store
+ * calls run between its claim and settle transactions.
+ *
+ * A retirement batch performs no object-store work. It sets its own
+ * transaction-local `statement_timeout`: `min(session statement_timeout / 4, commit
  * admission / 2)`. Both halves matter — the first keeps a batch well
  * inside the session bound a pod's connection carries, the second keeps
  * one statement under half the window a foreground commit is willing to

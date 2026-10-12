@@ -579,20 +579,15 @@ The rules. Every one of them was violated by the code above.
   of it happens between transactions, never inside one. Read what you
   need, commit, compute, open a new transaction for the write, and
   re-check under it what could have changed (liveness, claims). The
-  test suite is where the rule gets enforced, and today it is opt-in:
-  `PgTestSupport.freshDatabase(productionSession = true)` wires the pool
-  with `Database.SESSION_INIT_SQL`, so the test connection carries
-  production's own bounds — a 60 s `statement_timeout` and a 30 s
-  `idle_in_transaction_session_timeout` — and it is default OFF on
-  purpose, because a suite-wide bound would sit under the six-figure bulk
-  seeds and the drain tests that hold a transaction open across MinIO
-  round trips. A suite-wide guard at
-  `idle_in_transaction_session_timeout = '2s'`, so that a transaction
-  left open across slow work fails the test the way production fails the
-  pod, lands with the compaction planner fix on branch
-  `jakob/compaction-plan-bounded` (PR pending). Either way the rule is
-  the rule: do not raise the value to make a test pass; split the
-  transaction.
+  test suite enforces this with `PgTestSupport`'s default 2 s
+  `idle_in_transaction_session_timeout` guard. Tests that need
+  production's statement bound opt into `productionSession = true`:
+  a 60 s `statement_timeout`, with the default 2 s idle guard still
+  applied. The production statement bound is opt-in because bulk
+  fixtures may take longer on a slow machine. Cleanup's object-store
+  calls happen after its claim commits and before its settle transaction
+  opens, so the idle guard does not constrain them. Do not raise the
+  value to make a test pass; split the transaction.
 - **Measure per-row cost, not per-statement cost.** A statement's
   plan says which index it uses; the per-row cost on production's
   access pattern (random heap reads on a 10M-row table versus PK-order

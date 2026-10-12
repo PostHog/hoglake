@@ -849,11 +849,12 @@ on tickets the drain was deliberately leaving alone — and #261 removed
 the check, so nothing bounds it today. Every other reason settles
 `'deleted'`, whether or not the key was there.
 
-The object-store call bound (`RemovalStore.apiCallTimeout`, 10 s at the
-defaults, derived as `min(idle bound, admission bound) / 3` so an
-operator who lowers `HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` gets shorter calls
-with it) is no longer an inequality against a lock hold: nothing is open
-across a call. What a hung call costs is one parked worker holding a
+The object-store call bound (`RemovalStore.apiCallTimeout`) is
+`min(10 s, admission bound / 3)`, so an operator who lowers
+`HOGLAKE_COMMIT_LOCK_TIMEOUT_MS` gets shorter calls with it. An unbounded
+admission wait (0) leaves the 10 s cap in effect. The cap is independent
+of database session timeouts: no transaction is open across a call.
+What a hung call costs is one parked worker holding a
 claim until its lease expires. The `deadline_skipped` counter and the
 `HOLD_BUDGET` arithmetic it belonged to bounded that hold and are gone;
 the counter stays on the wire, always 0, because the maintenance ledger

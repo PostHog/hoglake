@@ -1,7 +1,5 @@
 package com.posthog.hoglake.service
 
-import com.posthog.hoglake.Database
-import com.posthog.hoglake.commit.CommitService
 import org.assertj.core.api.Assertions.assertThat
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Test
@@ -14,33 +12,9 @@ import java.time.Duration
  * plumbing, and that no integration test can see: the SDK call bounds,
  * and how one `DeleteObjects` response's error list is read.
  *
- * THE CALL BOUND IS NO LONGER AN INEQUALITY, and these tests say so
- * rather than asserting one that stopped being load-bearing. The drain
- * used to make its object-store calls inside a transaction that held the
- * per-catalog commit lock, so the bound had to sit under both
- * `idle_in_transaction_session_timeout` and the commit admission bound
- * or it could never fire usefully. Cleanup is now a claimed work queue:
- * the claim commits before the first call, the settle opens a new
- * transaction after the last, and no lock is taken at all — so what a
- * hung call costs is one parked worker holding a claim until its lease
- * expires.
- *
- * What is still worth pinning is that the number FOLLOWS the admission
- * knob (an operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS gets
- * shorter calls, which is the only reason it is derived rather than
- * written down) and that it stays under both of the bounds it was
- * derived from — not because they constrain it any more, but because a
- * bound above them would be a number chosen by nothing at all.
- *
- * A unit test, deliberately: the failure it guards is a derived bound
- * silently changing meaning when one of its inputs moves, and that is a
- * fact about three constants rather than about a running system. It reds
- * in the fast lane, with no Docker.
- *
- * The idle bound is PARSED out of [Database.SESSION_INIT_SQL] rather
- * than restated, because `SESSION_INIT_SQL` is the single source of
- * truth for what production sets and a helper that copies its values
- * asserts only that it compiles (the rule its own KDoc states).
+ * The overall SDK budget is capped independently of database session
+ * timeouts, follows shorter admission bounds, and leaves time for
+ * retries. The claim lease must accommodate the resulting call budgets.
  */
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class RemovalStoreBoundsTest {
@@ -55,41 +29,19 @@ class RemovalStoreBoundsTest {
     @AfterAll
     fun tearDown() = store.close()
 
-    private val idleFromSql: Duration by lazy {
-        val match =
-            Regex("""idle_in_transaction_session_timeout\s*=\s*'(\d+)s'""")
-                .find(Database.SESSION_INIT_SQL)
-        requireNotNull(match) {
-            "SESSION_INIT_SQL no longer sets idle_in_transaction_session_timeout in whole seconds: " +
-                Database.SESSION_INIT_SQL
+    @Test
+    fun `default SDK budgets cap the call and leave time for retries`() {
+        assertThat(store.apiCallTimeout).isEqualTo(Duration.ofSeconds(10))
+        assertThat(store.apiCallAttemptTimeout).isEqualTo(Duration.ofSeconds(5))
+    }
+
+    @Test
+    fun `long or unbounded admission waits retain the call cap`() {
+        for (admissionMs in listOf(Long.MIN_VALUE, -1L, 0L, 30_000L, 30_001L, 60_000L, Long.MAX_VALUE)) {
+            assertThat(RemovalStore.callBoundFor(admissionMs))
+                .describedAs("call budget with admission bound %d ms", admissionMs)
+                .isEqualTo(Duration.ofSeconds(10))
         }
-        Duration.ofSeconds(match.groupValues[1].toLong())
-    }
-
-    @Test
-    fun `the named idle bound is the one SESSION_INIT_SQL actually sets`() {
-        assertThat(Database.SESSION_INIT_SQL_IDLE_TIMEOUT)
-            .describedAs(
-                "Database.SESSION_INIT_SQL_IDLE_TIMEOUT drifted from SESSION_INIT_SQL (%s)",
-                Database.SESSION_INIT_SQL,
-            )
-            .isEqualTo(idleFromSql)
-    }
-
-    @Test
-    fun `the call bound sits under both of the bounds it is derived from`() {
-        // NEITHER CONSTRAINS IT ANY MORE — no transaction is open across
-        // an object-store call and cleanup takes no lock, so a slow call
-        // can neither be killed idle-in-transaction nor convoy a commit.
-        // The bound is kept under both because `min(idle, admission) / 3`
-        // is where the number came from and a bound above its own inputs
-        // would be arbitrary.
-        assertThat(store.apiCallTimeout)
-            .describedAs("derived from min(idle, admission), so it sits under the idle bound")
-            .isLessThan(idleFromSql)
-        assertThat(store.apiCallTimeout)
-            .describedAs("and under the admission bound, which is the one an operator tunes")
-            .isLessThan(Duration.ofMillis(CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS))
     }
 
     @Test
@@ -159,20 +111,26 @@ class RemovalStoreBoundsTest {
 
     @Test
     fun `the bound follows the admission bound this process actually runs with`() {
-        // Derived, not written down: an operator who lowers
-        // HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep a pod responsive gets
-        // shorter object-store calls with it, which is the ONLY property
-        // the derivation still buys now that no call runs inside a
-        // transaction. App.kt passes cfg.commitLockTimeoutMs into
-        // RemovalStore for this reason.
         assertThat(RemovalStore.callBoundFor(6_000))
             .describedAs("a 6s admission bound is the binding one; the call bound follows it")
             .isEqualTo(Duration.ofSeconds(2))
-        // 0 is an UNBOUNDED wait, so it constrains nothing and the idle
-        // bound is left as the only constraint.
-        assertThat(RemovalStore.callBoundFor(0))
-            .describedAs("an unbounded admission wait leaves the idle bound in charge")
-            .isEqualTo(idleFromSql.dividedBy(3))
+        assertThat(RemovalStore.callBoundFor(29_999)).isEqualTo(Duration.ofNanos(9_999_666_666))
+        assertThat(RemovalStore.callBoundFor(1)).isEqualTo(Duration.ofNanos(333_333))
+    }
+
+    @Test
+    fun `shorter admission bounds reach both SDK budgets`() {
+        RemovalStore(
+            endpoint = null,
+            region = "us-east-1",
+            accessKey = null,
+            secretKey = null,
+            pathStyle = true,
+            commitLockTimeoutMs = 6_000,
+        ).use { shorter ->
+            assertThat(shorter.apiCallTimeout).isEqualTo(Duration.ofSeconds(2))
+            assertThat(shorter.apiCallAttemptTimeout).isEqualTo(Duration.ofSeconds(1))
+        }
     }
 
     @Test

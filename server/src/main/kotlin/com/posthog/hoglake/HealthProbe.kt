@@ -322,10 +322,8 @@ class HealthProbe(
          * is lost: the probe never opens a transaction. `SELECT 1` runs
          * on an autocommit connection borrowed and returned inside one
          * `use` block, so there is no idle-in-transaction state for a
-         * bound to kill. The request pool needs one because commits and
-         * the cleanup drain hold transactions open across object-store
-         * round trips (README.md §7, and `RemovalStore`'s call bounds
-         * derive from it).
+         * bound to kill. The request pool's idle bound applies to
+         * transactions waiting between SQL statements.
          *
          * `connectTimeout`/`socketTimeout` are pgjdbc CONNECTION
          * PROPERTIES in SECONDS, which is why they are rounded up to a

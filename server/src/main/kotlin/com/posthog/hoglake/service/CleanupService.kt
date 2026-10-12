@@ -1,7 +1,6 @@
 package com.posthog.hoglake.service
 
 import com.posthog.hoglake.Config
-import com.posthog.hoglake.Database
 import com.posthog.hoglake.hydrator.ObjectStore
 import com.posthog.hoglake.model.CleanupResult
 import com.posthog.hoglake.model.HoglakeException
@@ -292,63 +291,27 @@ open class RemovalStore(
         const val MAX_KEYS_PER_DELETE = 1000
 
         /**
-         * THE CALL BOUND, and what it is FOR has changed even though the
-         * number has not.
+         * Overall SDK call cap, including retries and backoff. At this
+         * cap a staging claim's 25 HEAD/DELETE pairs take at most 500 s,
+         * below the default 900 s claim lease.
+         */
+        val API_CALL_TIMEOUT: Duration = Duration.ofSeconds(10)
+
+        /**
+         * Cleanup's object-store calls run between the claim and settle
+         * transactions, so database session timeouts do not constrain
+         * them. A slow call occupies a worker and its claimed rows.
          *
-         * It used to be an inequality. `CleanupService`'s object-store
-         * calls ran inside a transaction that held the per-catalog
-         * commit lock, so a call that hung was a connection sitting
-         * idle-in-transaction holding the one lock the catalog's writers
-         * queue on — and the bound had to sit under BOTH
-         * `Database.SESSION_INIT_SQL`'s 30 s
-         * `idle_in_transaction_session_timeout` and
-         * [commitLockTimeoutMs] or it could never fire usefully.
-         *
-         * NEITHER BOUND APPLIES ANY MORE. The drain is a claimed work
-         * queue: the claim commits before the first call and the settle
-         * opens a new transaction after the last one, so no transaction
-         * is open across an object-store call and cleanup takes no
-         * catalog lock at any point. What a hung call costs now is one
-         * PARKED WORKER holding a claim until its lease expires
-         * (HOGLAKE_CLEANUP_CLAIM_LEASE_SECONDS, 900 s) — work delayed,
-         * never a convoy and never a lost object.
-         *
-         * The number is KEPT rather than re-derived, deliberately:
-         * `min(idle, admission) / 3` is 10 s at the defaults, it is the
-         * bound every measured drain in this repo ran under, and nothing
-         * measured argues for another. What it still buys is that an
-         * operator who lowers HOGLAKE_COMMIT_LOCK_TIMEOUT_MS to keep a
-         * pod responsive gets shorter object-store calls with it, and
-         * that A WHOLE CLAIM'S WORST CASE FITS INSIDE THE LEASE at this
-         * bound — which is a statement about a CLAIM and is only true
-         * because the claim is reason-aware: a staging claim is
-         * `STAGING_SUB_BATCH` rows and two calls each (25 x 2 x 10 s =
-         * 500 s), a bulk claim is one call per bucket chunk. It was NOT
-         * true of a claim with no reason predicate, which could hold
-         * `SUB_BATCH` tickets and 20,000 s of calls under one 900 s
-         * lease. `RemovalStoreBoundsTest` asserts both arms.
-         * A drain that wanted a different bound would get its own knob;
-         * inventing one here, with no measurement behind it, would only
-         * move the arbitrariness.
-         *
-         * `apiCallTimeout` is an OVERALL budget for the call — every
-         * attempt and all the backoff between them share it, rather than
-         * each attempt getting its own. That is why the per-attempt
-         * bound exists and is half of it: without it one stalled attempt
-         * consumes the whole budget and the call fails having never
-         * retried, which is the opposite of what a retryable
-         * object-store fault wants.
+         * Preserve shorter calls when an operator lowers the commit
+         * admission bound: use one third of that bound, capped at
+         * [API_CALL_TIMEOUT]. An unbounded admission wait (0) leaves the
+         * cap in effect. Each attempt gets half the overall call budget
+         * so a stalled attempt leaves time for a retry.
          */
         fun callBoundFor(commitLockTimeoutMs: Long): Duration {
-            val idle = Database.SESSION_INIT_SQL_IDLE_TIMEOUT
-            val admission =
-                if (commitLockTimeoutMs > 0) Duration.ofMillis(commitLockTimeoutMs) else idle
-            return minOf(idle, admission).dividedBy(3)
+            if (commitLockTimeoutMs <= 0) return API_CALL_TIMEOUT
+            return minOf(API_CALL_TIMEOUT, Duration.ofMillis(commitLockTimeoutMs).dividedBy(3))
         }
-
-        /** The bound at the compiled admission default, for no-arg construction. */
-        val API_CALL_TIMEOUT: Duration =
-            callBoundFor(com.posthog.hoglake.commit.CommitService.DEFAULT_COMMIT_LOCK_TIMEOUT_MS)
     }
 }
 
