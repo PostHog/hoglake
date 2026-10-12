@@ -1149,7 +1149,7 @@ being an expired claim outliving its table). #261 removed that check,
 so a purge that stops running is unobserved.
 
 `HOGLAKE_COMPACTION_CODEC` (default **zstd**, with
-`HOGLAKE_COMPACTION_ZSTD_LEVEL` default **1**) is the compression the
+`HOGLAKE_COMPACTION_ZSTD_LEVEL` default **3**) is the compression the
 rewrite writes its OUTPUT with; the legal set is zstd, snappy, gzip,
 lz4_raw and uncompressed, case-insensitive, and an unknown name is
 refused at boot. It is not a per-file detail. Compaction rewrites a
@@ -1176,22 +1176,24 @@ pinned rather than inherited because the sweep is CPU-bound on a shared
 maintenance pod and a parquet-java bump must not move that budget
 without a diff. parquet-java's zstd workers stay at 0 (in-thread).
 
-The level is **1**, not parquet-java's default of 3 (hoglake#134
-package D). A JFR profile of the rewrite with native frames (16 inputs
-x 50k rows) put zstd at 11-16% of the rewrite's CPU on the event shape
-and 41-48% on JSON-heavy rows at level 3; level 1 cut the rewrite's wall
-time by ~12% and ~20-25% respectively. Size, from `CodecMeasurement`
-(which now prints both levels; same four 200k-row files as above): level
-1 is SMALLER on the high-cardinality strings (50.6 against 52.1 MiB,
-0.58x against 0.60x the input) and on the mixed table (51.9 against
-53.4 MiB), and 7% larger on the low-cardinality enums (10.2 against
-9.5 MiB, 0.90x against 0.84x), where the dictionary has already done
-most of the work. Level 3 therefore buys no size on event-shaped data
-and a few percent on enum-only columns, for CPU that sets how many
-groups a maintenance pod can rewrite. Decompression speed does not
-depend on the level, so scans and later rewrites pay nothing for it. An
-operator who measures their own data the other way sets
-`HOGLAKE_COMPACTION_ZSTD_LEVEL=3`; no chart sets it today.
+The level is **3**, parquet-java's own default. hoglake#134 package D
+lowered it to 1 on a synthetic measurement: a JFR profile of the
+rewrite with native frames (16 inputs x 50k rows) put zstd at 11-16% of
+the rewrite's CPU on the event shape and 41-48% on JSON-heavy rows at
+level 3, level 1 cut the rewrite's wall time by ~12% and ~20-25%
+respectively, and `CodecMeasurement` (same four 200k-row files as
+above, printing both levels) showed level 1 SMALLER on the
+high-cardinality strings (50.6 against 52.1 MiB) and the mixed table
+(51.9 against 53.4 MiB) and 7% larger only on the low-cardinality enums
+(10.2 against 9.5 MiB). Real data disagreed: on 2026-10-10 the
+gigahog-dev catalog re-merged pairs of level-3 compaction outputs at
+level 1 and every pair grew 12-13% (968 MiB -> 1.1 GiB, 872 -> 974 MiB,
+3.8 -> 4.3 GiB over four pairs), where the synthetic rows had predicted
+no change. Compression is paid once per rewrite; the bytes are paid in
+S3 until expiry and by every scan, so the default went back to 3.
+Decompression speed does not depend on the level. An operator who
+measures their own data the other way sets
+`HOGLAKE_COMPACTION_ZSTD_LEVEL=1`; no chart sets it today.
 
 **A sorted rewrite is an external merge sort** (hoglake#134). It used
 to read the whole group into an `ArrayList<Group>` and call
