@@ -12,9 +12,9 @@ import org.jdbi.v3.postgres.PostgresPlugin
 import javax.sql.DataSource
 
 /**
- * The service owns ALL catalog connections (README.md §7): one pool,
- * statement timeouts, no third-party sessions. Migrations run at startup
- * under an advisory lock so concurrent replicas don't race DDL.
+ * The service owns its catalog connections and session timeouts.
+ * Migrations run at startup under an advisory lock so concurrent
+ * replicas don't race DDL.
  */
 object Database {
     private val log = KotlinLogging.logger {}
@@ -35,29 +35,14 @@ object Database {
         "SET idle_in_transaction_session_timeout = '30s'; SET statement_timeout = '60s'"
 
     /**
-     * The idle-in-transaction half of [SESSION_INIT_SQL], as a Duration,
-     * for the code that has to stay under it.
-     *
-     * `RemovalStore` is the caller: the cleanup drain makes object-store
-     * calls inside a transaction that holds the per-catalog commit lock,
-     * and a connection awaiting an S3 response IS idle in transaction.
-     * Its SDK timeouts are derived from this rather than written down,
-     * so changing the session bound moves them with it.
-     *
-     * [SESSION_INIT_SQL] stays the single source of truth — a test
-     * parses the value out of it rather than trusting this to agree.
-     */
-    val SESSION_INIT_SQL_IDLE_TIMEOUT: java.time.Duration = java.time.Duration.ofSeconds(30)
-
-    /**
      * The statement half of [SESSION_INIT_SQL], as a Duration, for the
      * code that has to derive a bound from it.
      *
      * `RetirementService` is the caller: a retirement batch runs
      * DELETEs under the per-catalog commit lock and sets a `SET LOCAL
      * statement_timeout` well under this, so a batch that turns out to
-     * be too big for the table's cascade fan-out is CANCELLED and
-     * halved rather than holding the lock for the whole session bound.
+     * exceed the bound is CANCELLED rather than holding the lock for
+     * the whole session bound. The next run retries the same batch size.
      * Derived from this rather than written down, so changing the
      * session bound moves it.
      *
@@ -78,7 +63,7 @@ object Database {
                 // 500/503 quickly, never hang on connection acquisition.
                 connectionTimeout = 5_000
                 validationTimeout = 2_500
-                // No idle-in-transaction squatters, ever (README.md §7).
+                // No idle-in-transaction squatters, ever.
                 connectionInitSql = SESSION_INIT_SQL
             }
         return HikariDataSource(hc)
