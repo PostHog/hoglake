@@ -56,8 +56,8 @@ def rec(team: int, ts: int, offset: int, payload: bytes | None = None) -> Staged
 
 def window(team: int, first: int, last: int) -> FlushedKey:
     """The settlement window for the committed range of tuple ``g(team)``
-    over ``first..last`` — what ``commit_flushed`` / ``settle_quarantined``
-    delete."""
+    over ``first..last`` — what ``commit_flushed``
+    deletes."""
     return FlushedKey(g(team), first, last, group_fields=FIELDS)
 
 

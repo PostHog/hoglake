@@ -298,7 +298,7 @@ def test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build
         assert keyer.group_for(load_json_object(raw)) == fanout_tuple, (col_type, doc)
 
 
-def test_a_null_non_nullable_source_is_a_null_component_and_the_flush_quarantines():
+def test_a_null_non_nullable_source_is_a_null_component_and_the_flush_drops():
     """The keyer keys a missing value of a NON-nullable source as a null
     component (grouping is not validation); the flush's decoder then
     refuses the record, so no file is ever written under that tuple."""

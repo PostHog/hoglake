@@ -22,9 +22,9 @@ Pinned here:
   keyed under an OLDER spec still fans out correctly by the live one;
 - the full refusal taxonomy, each recovery in its own scripted test
   (retry counts, re-prepare vs verbatim replay, halt vs continue,
-  metric/log emitted) — including B2's: ONLY a 422 coded
-  ``record_validation`` quarantines the window (whole payloads, never
-  capped); every other answered 4xx halts with the rows staged;
+  metric/log emitted) — including B2's: no answered refusal deletes
+  staged rows — every answered 4xx
+  (``record_validation`` included) halts with the rows staged;
 - files are sorted by the live sort spec (fields, directions, null
   placement) before the partition fanout — inverted record-vs-payload
   timestamps flush key-nondecreasing (B3);
@@ -39,11 +39,12 @@ Pinned here:
   smaller files register without ``column_stats`` (deferred);
 - orphan accounting: a mid-fanout upload failure counts and names the
   abandoned objects;
-- junk ``event_time``: quarantine lands the original payloads WHOLE in
-  ``poison/`` (never capped); clamp rewrites only the decoded values;
-  the scripted server never receives a junk partition value;
-- poisoned payloads inside a staged range route to ``poison/`` and the
-  good rows still flush;
+- junk ``event_time``: drop leaves the junk rows out of the payload
+  (counted under ``event_time_out_of_window``) and the settlement
+  deletes them; clamp rewrites only the decoded values; the scripted
+  server never receives a junk partition value;
+- undecodable payloads inside a staged range are dropped (counted per
+  reason) and the good rows still flush;
 - a fenced stage (SlateDB ``Error.Closed`` on a contested open) is a
   first-class terminal condition for that partition's decisions —
   logged once, surfaced in the runner's stats, other partitions
@@ -117,7 +118,6 @@ from millrace.coerce import (
 from millrace.config import EventTimePolicy
 from millrace.flush import (
     REASON_EVENT_TIME_OUT_OF_WINDOW,
-    REASON_FLUSH_REFUSED,
     FlushHalted,
     FlushPublishExhausted,
     FlushReport,
@@ -131,7 +131,7 @@ from millrace.flush import (
     parse_message_offsets,
 )
 from millrace.keyspace import FlushedKey, OffsetRange, PreparedRequest
-from millrace.stage import PoisonedRecord, StageManager
+from millrace.stage import StageManager
 
 component = pytest.mark.component
 
@@ -597,7 +597,7 @@ class TestJsonDecoder:
 
     def test_deeply_nested_payload_is_a_per_record_failure(self) -> None:
         # The C scanner reports extreme nesting as RecursionError — NOT a
-        # ValueError. It is quarantined per record like any other
+        # ValueError. It is dropped per record like any other
         # undecodable payload, or one such record wedges the flush.
         decoder = JsonObjectDecoder(columns())
         with pytest.raises(DecodeError) as excinfo:
@@ -632,7 +632,7 @@ class TestCommitMessage:
             group=team_label(TEAM),
             trigger="size",
             records=5,
-            quarantined=1,
+            dropped=1,
             files=2,
             partitions=2,
             staged_bytes=123,
@@ -649,7 +649,7 @@ class TestCommitMessage:
             (
                 f"millrace=v1 table={TABLE_UUID} group={team_label(7)} trigger=size "
                 "records=5 "
-                "quarantined=1 files=2 partitions=2 staged_bytes=123 arrow_bytes=456 "
+                "dropped=1 files=2 partitions=2 staged_bytes=123 arrow_bytes=456 "
                 "millrace=0.1.0.dev0"
             ),
             "offsets topic=events partition=3 ranges=10-14,20-24",
@@ -662,7 +662,7 @@ class TestCommitMessage:
             group=team_label(TEAM),
             trigger="age",
             records=250,
-            quarantined=0,
+            dropped=0,
             files=1,
             partitions=1,
             staged_bytes=1,
@@ -687,7 +687,7 @@ class TestCommitMessage:
             group=team_label(TEAM),
             trigger="size",
             records=1,
-            quarantined=0,
+            dropped=0,
             files=1,
             partitions=1,
             staged_bytes=1,
@@ -809,7 +809,7 @@ class TestHappyPath:
             "trigger=size",
         ]
         assert "records=5" in tokens
-        assert "quarantined=0" in tokens
+        assert "dropped=0" in tokens
         assert "files=2" in tokens
         assert "partitions=2" in tokens
         assert any(t.startswith("staged_bytes=") for t in tokens)
@@ -903,10 +903,8 @@ def _keyed_records(keyer: Any, rows: list[tuple[int, int, int]]) -> list[Any]:
         record = classify_message(
             keyer,
             offset=offset,
-            key=None,
             value=event_payload(team, ts),
             timestamp=(1, JAN_US // 1000),
-            poison_value_max_bytes=1 << 20,
         )
         assert isinstance(record, StagedRecord)
         out.append(record)
@@ -1387,8 +1385,8 @@ class TestRefusalTaxonomy:
         """B2: a request-shape 422 (``error="validation"`` — the only 422
         the current server can produce; it never opens the parquet) HALTS
         with the rows staged: nothing about the refusal says the ROWS can
-        never publish. The pre-fix behavior quarantined — truncated and
-        deleted — the whole window on this answer."""
+        never publish. The pre-fix behavior deleted the whole window on
+        this answer."""
         stage, capture, flusher = await self._stage_and_flush(
             httpx_mock,
             stage_factory,
@@ -1408,19 +1406,17 @@ class TestRefusalTaxonomy:
         assert excinfo.value.reason == "commit_refused"
         assert "422" in excinfo.value.detail
         assert len(capture.bodies) == 1  # an answered 4xx is never retried
-        # Nothing is settled, quarantined or deleted: the rows stay
-        # staged, the prepared entry stays for an operator, the upload is
+        # Nothing is settled, dropped or deleted: the rows stay staged,
+        # the prepared entry stays for an operator, the upload is
         # orphan-accounted — the idempotency_key_reused posture, verbatim.
         assert len(await staged_rows(stage, TEAM)) == 3
-        assert await stage.scan_poison() == []
         assert len(await stage.load_prepared()) == 1
         stats = flusher.stats()
-        assert stats.decisions_quarantined == 0
+        assert stats.decisions_dropped == 0
+        assert stats.records_dropped == {}
         assert stats.orphaned_uploads == 1
         assert any("orphaned 1 uploaded parquet" in r.message for r in caplog.records)
-        assert not any(
-            "flush decision quarantined" in r.message for r in caplog.records
-        )
+        assert not any("flush decision dropped" in r.message for r in caplog.records)
 
     @pytest.mark.parametrize("status", [400, 401, 403, 413])
     async def test_answered_4xx_halts_with_rows_staged(
@@ -1434,8 +1430,8 @@ class TestRefusalTaxonomy:
         sleeper: Sleeper,
     ) -> None:
         """B2: a proxy's 401/403, an ingress's 413, a plain 400 — each
-        ANSWERED refusal used to truncate the window to the poison cap
-        and delete the rows. Each now halts with the rows staged."""
+        ANSWERED refusal used to delete the window's rows. Each now halts
+        with the rows staged."""
         stage, _capture, flusher = await self._stage_and_flush(
             httpx_mock,
             stage_factory,
@@ -1455,89 +1451,14 @@ class TestRefusalTaxonomy:
         assert excinfo.value.reason == "commit_refused"
         assert str(status) in excinfo.value.detail
         assert len(await staged_rows(stage, TEAM)) == 3
-        assert await stage.scan_poison() == []
         assert len(await stage.load_prepared()) == 1
-        assert flusher.stats().decisions_quarantined == 0
+        assert flusher.stats().decisions_dropped == 0
+        assert flusher.stats().records_dropped == {}
 
-    async def test_422_record_validation_quarantines_uncapped(
+    @pytest.mark.parametrize("code", ["record_validation", "record_validation_v2"])
+    async def test_422_record_validation_halts_with_rows_staged(
         self,
-        httpx_mock: Any,
-        stage_factory: Any,
-        fake_clock: Any,
-        flusher_factory: Any,
-        store: FakeObjectStore,
-        sleeper: Sleeper,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """B2's ONE quarantine arm: a 422 whose error code is the
-        reserved ``record_validation`` — the server judged RECORDS, not
-        the request. The window's rows land in ``poison/`` WHOLE: a
-        flush-time quarantine is never capped, because settlement deletes
-        the staged rows and the poison entry is the only surviving copy.
-        The payloads here exceed ``poison.value_max_bytes`` to pin that
-        (the pre-fix cap truncated them)."""
-        stage = await stage_factory()
-        big = 2 * 1024 * 1024  # twice the default poison value cap (1 MiB)
-        payloads = [event_payload(TEAM, JAN_US, blob="x" * big) for _ in range(2)]
-        assert all(len(p) > make_config().poison.value_max_bytes for p in payloads)
-        await staged(
-            stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)], payloads=payloads
-        )
-        script_options(httpx_mock)
-        capture = CommitCapture(
-            httpx_mock,
-            [
-                commit_refusal(
-                    422, "record_validation", "record 1 of 2 fails the schema"
-                )
-            ],
-        )
-        flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
-        with caplog.at_level(logging.WARNING):
-            report = await flusher.flush_key(
-                stage,
-                decision(
-                    TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US
-                ),
-            )
-        assert report.outcome == "quarantined"
-        assert report.quarantined == 2
-        # The whole window quarantined with the ORIGINAL payloads, WHOLE
-        # (value_bytes_original == the stored length: nothing was cut)...
-        poisoned = await stage.scan_poison()
-        assert [(p.offset, p.reason) for p in poisoned] == [
-            (0, REASON_FLUSH_REFUSED),
-            (1, REASON_FLUSH_REFUSED),
-        ]
-        assert [p.value for p in poisoned] == payloads
-        assert all(p.value_bytes_original == len(p.value or b"") for p in poisoned)
-        # ...and the range settled WITHOUT a commit: rows and stats gone,
-        # no prepared entry, the refused upload orphan-accounted.
-        assert await staged_rows(stage, TEAM) == []
-        assert await stage.iter_key_stats() == []
-        assert await stage.load_prepared() == []
-        assert await read_markers(stage) == []
-        stats = flusher.stats()
-        assert stats.decisions_quarantined == 1
-        assert stats.records_quarantined == 2
-        assert stats.orphaned_uploads == 1
-        assert any("flush decision quarantined" in r.message for r in caplog.records)
-
-        # The loop is not wedged: the next decision flushes fine. (The 422
-        # dropped the shape cache — the refusal may name a stale shape —
-        # so this flush re-reads the table first.)
-        await staged(stage, fake_clock, TEAM, [(3, JAN_US), (4, JAN_US)])
-        script_table_refresh(httpx_mock)
-        capture.extend([commit_ok(51)])
-        report2 = await flusher.flush_key(
-            stage,
-            decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
-        )
-        assert report2.outcome == "committed"
-        assert capture.payloads[1]["appends"][0]["files"][0]["record_count"] == 2
-
-    async def test_422_record_validation_with_an_unknown_shape_still_halts(
-        self,
+        code: str,
         httpx_mock: Any,
         stage_factory: Any,
         fake_clock: Any,
@@ -1545,20 +1466,17 @@ class TestRefusalTaxonomy:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """Fail-safe: a 422 whose code is NOT exactly ``record_validation``
-        is an unknown shape — halt, never quarantine. (The matcher is the
-        (status, code) pair, never a substring of the detail prose.)"""
-        stage, _capture, flusher = await self._stage_and_flush(
+        """No answered refusal deletes staged rows: a 422 whose code
+        claims the server judged RECORDS halts like every other answered
+        4xx, rows and prepared/ entry intact, nothing dropped."""
+        stage, capture, flusher = await self._stage_and_flush(
             httpx_mock,
             stage_factory,
             fake_clock,
             flusher_factory,
             store,
             sleeper,
-            # The marker phrase in the DETAIL must not matter either way
-            # here (only the reused-key halt reads it, on the
-            # "validation" code).
-            [commit_refusal(422, "record_validation_v2", "a newer, unknown shape")],
+            [commit_refusal(422, code, "record 1 of 3 fails the schema")],
         )
         with pytest.raises(FlushHalted) as excinfo:
             await flusher.flush_key(
@@ -1568,8 +1486,12 @@ class TestRefusalTaxonomy:
                 ),
             )
         assert excinfo.value.reason == "commit_refused"
+        assert len(capture.bodies) == 1
         assert len(await staged_rows(stage, TEAM)) == 3
-        assert await stage.scan_poison() == []
+        assert len(await stage.load_prepared()) == 1
+        stats = flusher.stats()
+        assert stats.decisions_dropped == 0
+        assert stats.records_dropped == {}
 
     async def test_recovery_replay_answered_plain_422_halts(
         self,
@@ -1582,8 +1504,8 @@ class TestRefusalTaxonomy:
     ) -> None:
         """B2 on the recovery path: a persisted prepared/ entry whose
         verbatim replay draws a request-shape 422 halts with the entry
-        and the rows intact (pre-fix: the replay quarantine-settled the
-        window and DELETED the rows)."""
+        and the rows intact (pre-fix: the replay settled the window and
+        DELETED the rows)."""
         stage = await stage_factory()
         await staged(stage, fake_clock, TEAM, [(0, JAN_US), (1, JAN_US)])
         script_options(httpx_mock)
@@ -1619,31 +1541,9 @@ class TestRefusalTaxonomy:
         assert excinfo.value.reason == "commit_refused"
         assert len(await staged_rows(stage2, TEAM)) == 2
         assert len(await stage2.load_prepared()) == 1
-        assert await stage2.scan_poison() == []
+        assert flusher.stats().records_dropped == {}
         assert capture.bodies[-1] == capture.bodies[0]  # the replay was verbatim
         await stage2.close()
-
-    def test_record_validation_refusal_matcher_is_precise(self) -> None:
-        """The B2 matcher: exactly (status 422, code "record_validation")
-        — a locally-raised ValidationError (no status), a request-shape
-        "validation" 422, and other statuses all fail safe (halt)."""
-        from pyhoglake import ValidationError as _VE
-
-        assert flush_mod._is_record_validation_refusal(
-            _VE("record_validation", status_code=422, detail="row 3: bad")
-        )
-        assert not flush_mod._is_record_validation_refusal(
-            _VE("validation", status_code=422, detail="row 3: bad")
-        )
-        assert not flush_mod._is_record_validation_refusal(
-            _VE("record_validation", status_code=None)  # local, never on the wire
-        )
-        assert not flush_mod._is_record_validation_refusal(
-            flush_mod.HoglakeError("record_validation", status_code=422)
-        )
-        assert not flush_mod._is_record_validation_refusal(
-            _VE("record_validation", status_code=400)
-        )
 
     async def test_422_reused_idempotency_key_halts(
         self,
@@ -2658,7 +2558,7 @@ class TestJunkEventTime:
     FUTURE_JUNK = NOW + 10 * 86_400_000_000  # 10 days past the future edge
     PAST_JUNK = NOW - 100 * 86_400_000_000  # 100 days back, past the 30d edge
 
-    async def test_quarantine_mode_lands_original_payloads_in_poison(
+    async def test_drop_mode_leaves_junk_out_and_settles_it(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2691,17 +2591,9 @@ class TestJunkEventTime:
 
         assert report.outcome == "committed"
         assert report.records == 1
-        assert report.quarantined == 2
-        # The staged rows are NEVER mutated; the junk ones land in poison/
-        # with their ORIGINAL payloads...
-        poisoned = await stage.scan_poison()
-        assert [(p.offset, p.reason) for p in poisoned] == [
-            (1, REASON_EVENT_TIME_OUT_OF_WINDOW),
-            (2, REASON_EVENT_TIME_OUT_OF_WINDOW),
-        ]
-        assert poisoned[0].value == payloads[1]
-        assert poisoned[1].value == payloads[2]
-        assert all(p.value_bytes_original == len(p.value or b"") for p in poisoned)
+        assert report.dropped == 2
+        # The junk rows are counted under their reason...
+        assert flusher.stats().records_dropped == {REASON_EVENT_TIME_OUT_OF_WINDOW: 2}
         # ...and the server never receives a junk partition value: the
         # only tuple committed is the in-window month.
         files = capture.payloads[0]["appends"][0]["files"]
@@ -2709,9 +2601,8 @@ class TestJunkEventTime:
             [str(TEAM), month_wire(JAN_US)]
         ]
         # The window covers every settled row: all three staged rows are
-        # gone (the quarantined ones via the poison path).
+        # gone, the dropped ones by the same settlement.
         assert await staged_rows(stage, TEAM) == []
-        assert flusher.stats().records_quarantined == 2
 
     async def test_clamp_mode_rewrites_timestamps_to_the_window_edge(
         self,
@@ -2743,7 +2634,7 @@ class TestJunkEventTime:
 
         assert report.outcome == "committed"
         assert report.records == 3
-        assert await stage.scan_poison() == []
+        assert flusher.stats().records_dropped == {}
         # The clamped timestamps, read back from the parquet: the future
         # junk sits at now+max_future, the past junk at now-max_past.
         files = capture.payloads[0]["appends"][0]["files"]
@@ -2763,7 +2654,7 @@ class TestJunkEventTime:
                 ]
         assert sorted(written) == sorted([JAN_US, max_us, min_us])
 
-    async def test_a_quarantined_payload_is_never_capped(
+    async def test_an_all_junk_window_drops_and_settles_without_a_commit(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2772,26 +2663,14 @@ class TestJunkEventTime:
         store: FakeObjectStore,
         sleeper: Sleeper,
     ) -> None:
-        """B2's other half: the FLUSH-TIME quarantine (a junk event_time
-        here) stores the WHOLE payload — the consumer's
-        ``poison_value_max_bytes`` cap does not apply, because settlement
-        deletes the staged row and the poison entry is the only surviving
-        copy. (The consume-time path keeps its cap: a record that can
-        never become a row is forensic state, capped by design.)"""
+        """Every row junk: nothing to publish, so the window settles with
+        no commit and no upload; the rows are gone and counted."""
         stage = await stage_factory()
-        # A payload larger than the consumer's poison cap (1 MiB in these
-        # configs), out-of-window junk.
-        big = event_payload(TEAM, self.PAST_JUNK, blob="x" * (2 * 1024 * 1024))
-        assert len(big) > make_config().poison.value_max_bytes
         await staged(
-            stage,
-            fake_clock,
-            TEAM,
-            [(0, self.PAST_JUNK)],
-            payloads=[big],
+            stage, fake_clock, TEAM, [(0, self.PAST_JUNK), (1, self.PAST_JUNK)]
         )
         script_options(httpx_mock)
-        CommitCapture(httpx_mock, [])  # every row junk: no commit at all
+        capture = CommitCapture(httpx_mock, [])  # every row junk: no commit at all
         flusher = flusher_factory(store=store, cfg=make_config(target_output_bytes=1))
 
         report = await flusher.flush_key(
@@ -2799,21 +2678,25 @@ class TestJunkEventTime:
             decision(TEAM, trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
         )
 
-        assert report.outcome == "quarantined"  # nothing to commit
-        poisoned = await stage.scan_poison()
-        assert len(poisoned) == 1
-        assert poisoned[0].value == big  # WHOLE — the pre-fix cap cut it
-        assert poisoned[0].value_bytes_original == len(big)
+        assert report.outcome == "dropped"  # nothing to commit
+        assert report.dropped == 2
+        assert capture.bodies == []
+        assert store.files == {}
+        assert await staged_rows(stage, TEAM) == []
+        assert await stage.iter_key_stats() == []
+        stats = flusher.stats()
+        assert stats.decisions_dropped == 1
+        assert stats.records_dropped == {REASON_EVENT_TIME_OUT_OF_WINDOW: 2}
 
 
 # =====================================================================================
-# Poisoned payloads inside a staged range
+# Malformed payloads inside a staged range
 # =====================================================================================
 
 
 @component
-class TestPoisonedPayloads:
-    async def test_bad_records_route_to_poison_and_good_rows_flush(
+class TestMalformedPayloads:
+    async def test_bad_records_are_dropped_and_good_rows_flush(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2849,16 +2732,11 @@ class TestPoisonedPayloads:
 
         assert report.outcome == "committed"
         assert report.records == 2
-        assert report.quarantined == 4
-        poisoned = await stage.scan_poison()
-        assert [(p.offset, p.reason) for p in poisoned] == [
-            (1, REASON_UNDECODABLE_PAYLOAD),
-            (3, REASON_UNCASTABLE_COLUMN),
-            (4, REASON_UNCASTABLE_COLUMN),
-            (5, REASON_UNDECODABLE_PAYLOAD),
-        ]
-        # Original payloads preserved for forensics.
-        assert poisoned[0].value == payloads[1]
+        assert report.dropped == 4
+        assert flusher.stats().records_dropped == {
+            REASON_UNDECODABLE_PAYLOAD: 2,
+            REASON_UNCASTABLE_COLUMN: 2,
+        }
         # The good two flushed; every staged row is settled (no marker
         # is written anywhere: settlement is atomic, receipt in hand).
         files = capture.payloads[0]["appends"][0]["files"]
@@ -2953,7 +2831,7 @@ class TestBatchBuildIsolation:
 
 @component
 class TestMagnitudeOverflow:
-    async def test_magnitude_junk_poisons_the_record_never_the_flush(
+    async def test_magnitude_junk_drops_the_record_never_the_flush(
         self,
         httpx_mock: Any,
         stage_factory: Any,
@@ -2966,8 +2844,8 @@ class TestMagnitudeOverflow:
         (not a partition source, so the junk window never sees it)
         carrying 2**63+5, and a float column carrying the overflow
         literal 1e400 (parses to inf without tripping strict-JSON) and
-        10**400 (no double holds it). Each bad record routes to poison/
-        with its original payload; the good row still flushes. Pre-fix,
+        10**400 (no double holds it). Each bad record is dropped and
+        counted; the good row still flushes. Pre-fix,
         the first OverflowError escaped the per-record path and killed
         the batch's Arrow build — the key retried identically every
         sweep, wedging the partition."""
@@ -3022,12 +2900,8 @@ class TestMagnitudeOverflow:
         )
 
         assert report.outcome == "committed"
-        assert (report.records, report.quarantined) == (1, 3)
-        assert [(p.offset, p.reason) for p in await stage.scan_poison()] == [
-            (1, REASON_UNCASTABLE_COLUMN),
-            (2, REASON_UNCASTABLE_COLUMN),
-            (3, REASON_UNCASTABLE_COLUMN),
-        ]
+        assert (report.records, report.dropped) == (1, 3)
+        assert flusher.stats().records_dropped == {REASON_UNCASTABLE_COLUMN: 3}
         # The good row landed whole; nothing non-finite or clamped-away.
         (f,) = capture.payloads[0]["appends"][0]["files"]
         rows = parquet_rows(store, f["path"]).to_pylist()
@@ -4096,62 +3970,13 @@ class TestRunner:
 
 
 # =====================================================================================
-# The stage's flush-time quarantine primitives (stage.py's Phase 4 additions)
+# Settling a window that publishes nothing (every row dropped)
 # =====================================================================================
 
 
 @component
-class TestStageQuarantinePrimitives:
-    async def test_poison_records_are_durable_across_reopen(
-        self,
-        memory_store: Any,
-        stage_factory: Any,
-        fake_clock: Any,
-    ) -> None:
-        stage = await stage_factory()
-        await stage.stage_batch(
-            [  # one real row so the partition has live state
-                __import__("millrace.stage", fromlist=["StagedRecord"]).StagedRecord(
-                    group=team_group(TEAM), event_ts_us=JAN_US, offset=0, payload=b"ok"
-                )
-            ],
-            now_us=fake_clock(),
-        )
-        written = await stage.poison_records(
-            [
-                PoisonedRecord(
-                    offset=1,
-                    reason=REASON_EVENT_TIME_OUT_OF_WINDOW,
-                    key=None,
-                    value=b"junk",
-                    value_bytes_original=4,
-                )
-            ]
-        )
-        assert written == 1
-        await stage.close()
-
-        stage2 = await stage_factory()
-        poisoned = await stage2.scan_poison()
-        assert [(p.offset, p.reason, p.value) for p in poisoned] == [
-            (1, REASON_EVENT_TIME_OUT_OF_WINDOW, b"junk")
-        ]
-        # Idempotent under redelivery of the same write.
-        await stage2.poison_records(
-            [
-                PoisonedRecord(
-                    offset=1,
-                    reason=REASON_EVENT_TIME_OUT_OF_WINDOW,
-                    key=None,
-                    value=b"junk",
-                    value_bytes_original=4,
-                )
-            ]
-        )
-        assert len(await stage2.scan_poison()) == 1
-        await stage2.close()
-
-    async def test_settle_quarantined_deletes_cleanly(
+class TestSettlementWithoutCommit:
+    async def test_an_all_dropped_window_settles_cleanly(
         self,
         stage_factory: Any,
         fake_clock: Any,
@@ -4163,7 +3988,7 @@ class TestStageQuarantinePrimitives:
             team_group(TEAM), 0, prepared_request("k" * 36, TEAM, partition=0)
         )
 
-        report = await stage.settle_quarantined(
+        report = await stage.commit_flushed(
             FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
         )
         assert (report.rows_deleted, report.group_drained) == (3, True)
@@ -4172,7 +3997,7 @@ class TestStageQuarantinePrimitives:
         assert await stage.load_prepared() == []
         assert await read_markers(stage) == []  # nothing writes flushed/ any more
         # Idempotent replay...
-        again = await stage.settle_quarantined(
+        again = await stage.commit_flushed(
             FlushedKey(team_group(TEAM), 0, 2, group_fields=SPEC_FIELDS)
         )
         assert again.rows_deleted == 0
@@ -4390,7 +4215,7 @@ class TestJunkWindowBoundaries:
             records,
             info,
             ctx=ctx,
-            event_time_policy=EventTimePolicy.QUARANTINE,
+            event_time_policy=EventTimePolicy.DROP,
             event_time_window_us=(-(1 << 62), 1 << 62),
             data_path=DATA_PATH,
             max_files_per_commit=512,
@@ -4410,7 +4235,7 @@ class TestJunkWindowBoundaries:
             records,
             info,
             ctx=ctx,
-            event_time_policy=EventTimePolicy.QUARANTINE,
+            event_time_policy=EventTimePolicy.DROP,
             event_time_window_us=(-(1 << 62), 1 << 62),
             data_path=DATA_PATH,
             max_files_per_commit=512,
@@ -4421,7 +4246,7 @@ class TestJunkWindowBoundaries:
             plan.payload
         )
 
-    def test_pure_builder_all_quarantined_has_no_payload(self) -> None:
+    def test_pure_builder_all_dropped_has_no_payload(self) -> None:
         from pyhoglake import TableInfo
 
         info = TableInfo.from_wire(
@@ -4452,7 +4277,7 @@ class TestJunkWindowBoundaries:
             records,
             info,
             ctx=ctx,
-            event_time_policy=EventTimePolicy.QUARANTINE,
+            event_time_policy=EventTimePolicy.DROP,
             event_time_window_us=(-(1 << 62), 1 << 62),
             data_path=DATA_PATH,
             max_files_per_commit=512,
@@ -4460,8 +4285,75 @@ class TestJunkWindowBoundaries:
             version="test",
         )
         assert plan.payload is None
-        assert len(plan.quarantined) == 1
-        assert plan.quarantined[0].reason == REASON_UNDECODABLE_PAYLOAD
+        assert plan.dropped_records == (
+            flush_mod.DroppedRecord(0, REASON_UNDECODABLE_PAYLOAD),
+        )
+
+    def test_pure_builder_drops_the_record_that_defeats_the_build(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Encoder drift at the Arrow boundary: the build isolates the
+        one record that defeats it and DROPS it (``uncastable_column``);
+        the rest of the window still forms the payload."""
+        from pyhoglake import TableInfo
+
+        info = TableInfo.from_wire(
+            {
+                "name": TABLE,
+                "namespace": NAMESPACE,
+                "table_uuid": TABLE_UUID,
+                "columns": COLUMNS_WIRE,
+                "partition_spec": SPEC_WIRE,
+                "read_snapshot_id": 88,
+            }
+        )
+        real = flush_mod.JsonObjectDecoder.decode_record
+
+        def drifting(self: Any, payload: bytes) -> Any:
+            if payload == b"drift":
+                # No coercion emits this; a drifted one would.
+                return flush_mod.DecodedRecord(
+                    values={"team_id": 2**63 + 5, "timestamp": JAN_US, "event": None},
+                    dropped_keys=(),
+                )
+            return real(self, payload)
+
+        monkeypatch.setattr(flush_mod.JsonObjectDecoder, "decode_record", drifting)
+        records = [
+            (keyspace.RowKey(team_group(7), JAN_US, 0), event_payload(7, JAN_US)),
+            (keyspace.RowKey(team_group(7), JAN_US, 1), b"drift"),
+            (keyspace.RowKey(team_group(7), JAN_US, 2), event_payload(7, JAN_US)),
+        ]
+        ctx = flush_mod.FlushContext(
+            topic="events",
+            partition=0,
+            group=team_group(7),
+            group_fields=SPEC_FIELDS,
+            trigger="age",
+            first_offset=0,
+            last_offset=2,
+            offset_ranges=(OffsetRange("events", 0, 0, 2),),
+            idempotency_key=ikey(0, 7, 0, 2),
+            read_snapshot=88,
+            table_uuid=TABLE_UUID,
+        )
+        plan = build_prepared_plan(
+            records,
+            info,
+            ctx=ctx,
+            event_time_policy=EventTimePolicy.DROP,
+            event_time_window_us=(-(1 << 62), 1 << 62),
+            data_path=DATA_PATH,
+            max_files_per_commit=512,
+            footer_stats_min_bytes=1,
+            version="test",
+        )
+        assert plan.payload is not None
+        assert plan.records == 2
+        assert plan.dropped_records == (
+            flush_mod.DroppedRecord(1, REASON_UNCASTABLE_COLUMN),
+        )
+        assert "dropped=1" in plan.payload["message"].split()
 
 
 @component
@@ -4851,7 +4743,7 @@ class TestBoundedFlush:
         """The narrowing arithmetic, without I/O: full coverage returns
         the scan's own span; a hole ends the window below it; ranges
         outside the span clip away; gaps between ranges (other teams,
-        quarantines) need no coverage."""
+        consumer drops) need no coverage."""
         r = lambda a, b: OffsetRange("events", 0, a, b)
         # No inversion: the window is the scan's span.
         assert flush_mod._covered_window([3, 1, 2], [r(1, 3)]) == (1, 3)

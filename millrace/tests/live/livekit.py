@@ -44,7 +44,6 @@ from millrace.config import (
     AutoOffsetReset,
     Config,
     EventTimePolicy,
-    PoisonConfig,
 )
 from millrace.consumer import MillraceConsumer, create_kafka_consumer
 from millrace.flush import FlushRunner, HoglakeFlusher
@@ -499,7 +498,7 @@ def live_config(
     # below any production floor — the harness drops the age lane's
     # minimum size to 1 so the deadline alone decides.
     min_flush_bytes: int = 1,
-    event_time_policy: EventTimePolicy = EventTimePolicy.QUARANTINE,
+    event_time_policy: EventTimePolicy = EventTimePolicy.DROP,
     event_time_max_future_s: int = 86400,
     event_time_max_past_s: int = 30 * 86400,
     assignment: AssignmentMode = AssignmentMode.STATIC,
@@ -528,7 +527,6 @@ def live_config(
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
         max_files_per_commit=512,
-        poison=PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         consume_batch_size=500,
         poll_timeout_ms=100,
         event_time_policy=event_time_policy,

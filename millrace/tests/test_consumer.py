@@ -6,7 +6,7 @@ and the client-config pins) are unit tests without I/O;
 the loop itself is driven component-style — a scripted FakeConsumer
 (tests/kafkakit.py, hedgerow's fakes.py shape) over a REAL
 StageManager on ``memory:///``, so poll → stage → ack → commit ordering,
-assignment open/recover/revoke, quarantine and shutdown are all pinned
+assignment open/recover/revoke, drops and shutdown are all pinned
 against durable staged state with no broker anywhere.
 
 Pinned here:
@@ -36,7 +36,7 @@ Pinned here:
   ``identity(team_id)`` and ``(identity(team_id), month(timestamp))``
   group by the payload's values, a nested source (``properties.team_id``)
   is read by path, the Kafka key is never read, and a malformed source
-  quarantines with a reason naming the field;
+  drops with a reason naming the field;
 - a spec refresh mid-stream: past the shape TTL the consumer re-reads
   the destination and new records stage under the new spec's tuples
   while the old group stays staged and flushable; a failed re-read keeps
@@ -44,9 +44,10 @@ Pinned here:
 - a fenced partition (a REAL contested open on the stage's path — the
   parity suite's FENCED shape) closes locally and halts the loop with
   the distinct ConsumerFencedError, without committing the failed batch;
-- poison records quarantine durably (readable after reopen), are
-  counted, and never block the partition's commits; a poison FLOOD
-  halts loudly without committing past it;
+- malformed records are dropped: nothing staged, counted per reason
+  label (the partition-source path collapsed), logged at WARNING
+  rate-limited per (partition, reason), and covered by the partition's
+  commit;
   The gauges are alert inputs, published by the flush sweep;
 - commit retry ladder and its exhaustion; a failed stage commits
   nothing;
@@ -60,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Collection
 from typing import Any
 
 import pytest
@@ -76,9 +78,9 @@ from millrace.config import (
     AutoOffsetReset,
     Config,
     EventTimePolicy,
-    PoisonConfig,
 )
 from millrace.consumer import (
+    DROP_LOG_INTERVAL_S,
     REASON_INVALID_OFFSET,
     REASON_INVALID_TIMESTAMP,
     REASON_MALFORMED_PARTITION_SOURCE,
@@ -88,17 +90,17 @@ from millrace.consumer import (
     ConsumerFencedError,
     ConsumerStats,
     MillraceConsumer,
-    PoisonLimitExceeded,
     classify_message,
     create_kafka_consumer,
+    drop_reason_label,
     kafka_consumer_config,
 )
 from millrace.flush import FlushHalted
 from millrace.grouping import GroupKeyer
 from millrace.planner import PlannerKnobs, plan_flush
 from millrace.stage import (
+    DroppedRecord,
     PartitionStage,
-    PoisonedRecord,
     StageClosedError,
     StagedRecord,
     StageManager,
@@ -127,10 +129,9 @@ def make_config(**overrides) -> Config:
         "slow_lane_deadline_s": 21600,
         "min_flush_bytes": 1024 * 1024,
         "max_files_per_commit": 512,
-        "poison": PoisonConfig(max_records_per_run=1000, value_max_bytes=64),
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
-        "event_time_policy": EventTimePolicy.QUARANTINE,
+        "event_time_policy": EventTimePolicy.DROP,
         "metrics_port": 8000,
     }
     return Config(**{**base, **overrides})
@@ -268,30 +269,39 @@ async def run_steps(
             return
 
 
-def assert_commits_follow_acks(journal: list[tuple]) -> None:
+def assert_commits_follow_acks(
+    journal: list[tuple], dropped: Collection[tuple[str, int, int]] = ()
+) -> None:
     """The rows-then-offset invariant over the shared journal: every
-    commit is preceded by a durable ack covering it (same partition,
-    acked last_offset >= committed offset - 1), and per-partition
-    commits are strictly increasing."""
-    acks: list = []
+    commit is preceded by durable acks covering it — every offset below
+    the committed one and above the last acked one must be a DROPPED
+    record (``dropped``: ``(topic, partition, offset)``) — and
+    per-partition commits are strictly increasing."""
+    drops = set(dropped)
+    acked_through: dict[tuple[str, int], int] = {}
     last_commit: dict[tuple[str, int], int] = {}
     for entry in journal:
         if entry[0] == "ack":
-            acks.append(entry[1])
+            ack = entry[1]
+            key = (ack.topic, ack.partition)
+            acked_through[key] = max(ack.last_offset, acked_through.get(key, -1))
         elif entry[0] == "commit":
-            assert acks, "commit observed before any durable ack"
             for topic, partition, offset in entry[1]:
-                covering = [
-                    a for a in acks if a.topic == topic and a.partition == partition
+                key = (topic, partition)
+                floor = max(acked_through.get(key, -1), last_commit.get(key, 0) - 1)
+                uncovered = [
+                    o
+                    for o in range(floor + 1, offset)
+                    if (topic, partition, o) not in drops
                 ]
-                assert covering, f"commit {topic}[{partition}]@{offset} has no ack"
-                assert covering[-1].last_offset >= offset - 1, (
+                assert not uncovered, (
                     f"commit {topic}[{partition}]@{offset} precedes durable "
-                    f"staging (last acked offset {covering[-1].last_offset})"
+                    f"staging of offsets {uncovered[:5]} (acked through "
+                    f"{acked_through.get(key)})"
                 )
-                prev = last_commit.get((topic, partition))
+                prev = last_commit.get(key)
                 assert prev is None or offset > prev, "commits must be monotone"
-                last_commit[(topic, partition)] = offset
+                last_commit[key] = offset
 
 
 async def team_offsets(stage: PartitionStage, team: int) -> list[int]:
@@ -309,18 +319,9 @@ def _classify(
     value: bytes | None,
     *,
     offset: int = 41,
-    key: bytes | None = b"7",
     timestamp: tuple[int, int] = (1, 1_234_567),
-    cap: int = 64,
-) -> StagedRecord | PoisonedRecord:
-    return classify_message(
-        keyer,
-        offset=offset,
-        key=key,
-        value=value,
-        timestamp=timestamp,
-        poison_value_max_bytes=cap,
-    )
+) -> StagedRecord | DroppedRecord:
+    return classify_message(keyer, offset=offset, value=value, timestamp=timestamp)
 
 
 def _group(keyer: GroupKeyer, doc: dict[str, Any]) -> tuple[str | None, ...]:
@@ -390,7 +391,7 @@ def test_a_nested_source_is_read_by_its_path():
     assert _group(keyer, {"properties": {}}) == (None,)
     # A parent that is not an object is a malformed source.
     out = _classify(keyer, b'{"properties": [1, 2]}')
-    assert isinstance(out, PoisonedRecord)
+    assert isinstance(out, DroppedRecord)
     assert out.reason == f"{REASON_MALFORMED_PARTITION_SOURCE}:properties.team_id"
 
 
@@ -404,21 +405,19 @@ def test_a_nested_source_is_read_by_its_path():
         b'{"team_id": {"id": 7}}',
     ],
 )
-def test_a_malformed_source_is_poison_naming_the_field(payload):
+def test_a_malformed_source_is_dropped_naming_the_field(payload):
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
-    out = _classify(keyer, payload, key=b"junk", cap=8)
-    assert isinstance(out, PoisonedRecord)
-    assert out.reason == "malformed_partition_source:team_id"
-    assert out.key == b"junk"  # forensics only
-    assert out.value == payload[:8]
-    assert out.value_bytes_original == len(payload)
+    out = _classify(keyer, payload, offset=9)
+    assert out == DroppedRecord(9, "malformed_partition_source:team_id")
+    # The metric label drops the path (bounded cardinality).
+    assert drop_reason_label(out.reason) == REASON_MALFORMED_PARTITION_SOURCE
 
 
-def test_a_malformed_temporal_source_is_poison_naming_the_field():
+def test_a_malformed_temporal_source_is_dropped_naming_the_field():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM, MONTH_TIMESTAMP]))
     for raw in (b'"not a date"', b'"2027-01-15T08:00:00+02:00"', b"1e3"):
         out = _classify(keyer, b'{"team_id": 7, "timestamp": ' + raw + b"}")
-        assert isinstance(out, PoisonedRecord)
+        assert isinstance(out, DroppedRecord)
         assert out.reason == "malformed_partition_source:timestamp"
 
 
@@ -430,47 +429,56 @@ def test_a_payload_that_is_not_a_strict_json_object_is_malformed_value(payload):
     # Every spec parses the value first — the unpartitioned one too.
     for spec in (None, [IDENTITY_TEAM]):
         out = _classify(GroupKeyer(table_info(spec)), payload)
-        assert isinstance(out, PoisonedRecord) and out.reason == REASON_MALFORMED_VALUE
+        assert out == DroppedRecord(41, REASON_MALFORMED_VALUE)
 
 
 def test_the_kafka_key_is_never_read():
+    """Classification has no key input at all: the payload alone decides
+    the tuple (the loop-level pin is
+    test_a_keyless_topic_stages_by_the_payloads_partition_tuple)."""
+    import inspect
+
+    assert "key" not in inspect.signature(classify_message).parameters
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
-    payload = b'{"team_id": 7}'
-    groups = {
-        out.group
-        for key in (None, b"7", b"9", b"junk-not-a-team", b"\x00" * 8)
-        for out in [_classify(keyer, payload, key=key)]
-        if isinstance(out, StagedRecord)
-    }
-    assert groups == {("7",)}
+    assert _group(keyer, {"team_id": 7}) == ("7",)
 
 
-def test_classify_poison_reasons():
+def test_classify_drop_reasons():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
     out = _classify(keyer, b'{"team_id": 7}', timestamp=(0, 0))  # NOT_AVAILABLE
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_TIMESTAMP
-    out = _classify(keyer, None)
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_VALUE
-    assert out.value is None and out.value_bytes_original == 0
+    assert out == DroppedRecord(41, REASON_MISSING_TIMESTAMP)
+    assert _classify(keyer, None) == DroppedRecord(41, REASON_MISSING_VALUE)
 
 
 def test_classify_out_of_range_offset_and_timestamp():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
     out = _classify(keyer, b'{"team_id": 7}', offset=-1)
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_INVALID_OFFSET
+    assert out == DroppedRecord(-1, REASON_INVALID_OFFSET)
     # *1000 overflows int64 µs
     out = _classify(keyer, b'{"team_id": 7}', timestamp=(1, 10**18))
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_INVALID_TIMESTAMP
+    assert out == DroppedRecord(41, REASON_INVALID_TIMESTAMP)
 
 
 def test_classify_names_the_FIRST_failing_check():
     keyer = GroupKeyer(table_info([IDENTITY_TEAM]))
-    # A tombstone with no timestamp quarantines as missing_timestamp; a
+    # A tombstone with no timestamp drops as missing_timestamp; a
     # tombstone is missing_value, never a parse error.
     out = _classify(keyer, None, timestamp=(0, 0))
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_TIMESTAMP
-    out = _classify(keyer, None)
-    assert isinstance(out, PoisonedRecord) and out.reason == REASON_MISSING_VALUE
+    assert out == DroppedRecord(41, REASON_MISSING_TIMESTAMP)
+    assert _classify(keyer, None) == DroppedRecord(41, REASON_MISSING_VALUE)
+
+
+@pytest.mark.parametrize(
+    ("reason", "label"),
+    [
+        (REASON_INVALID_OFFSET, REASON_INVALID_OFFSET),
+        (REASON_MALFORMED_VALUE, REASON_MALFORMED_VALUE),
+        ("malformed_partition_source:a.b.c", REASON_MALFORMED_PARTITION_SOURCE),
+        (REASON_MALFORMED_PARTITION_SOURCE, REASON_MALFORMED_PARTITION_SOURCE),
+    ],
+)
+def test_drop_reason_label_collapses_only_the_partition_source_path(reason, label):
+    assert drop_reason_label(reason) == label
 
 
 # ==================================================================================
@@ -679,7 +687,7 @@ async def test_end_to_end_staged_rows_and_committed_offsets_cover(fake_clock):
     stats = consumer.stats()
     assert stats.messages_consumed == 30
     assert stats.records_staged == 30
-    assert stats.records_poisoned == 0
+    assert stats.records_dropped == {}
 
     # Every produced row is staged, byte-exact, in (group, ts, offset)
     # key order; the stats the planner reads reconcile exactly; the
@@ -740,66 +748,160 @@ async def test_error_events_are_counted_and_never_staged_or_committed(fake_clock
     assert fake.committed_store == {("events", 0): 2}
     stage = manager.stage("events", 0)
     assert await team_offsets(stage, 1) == [0, 1]
-    assert await stage.scan_poison() == []
+    assert stats.records_dropped == {}
     await manager.close()
 
 
+async def stage_key_prefixes(stage: PartitionStage) -> set[bytes]:
+    """Every key family present in the stage (the bytes up to the first
+    ``/``) — what a drop must never add to."""
+    return {
+        key.split(b"/", 1)[0] + b"/"
+        async for key, _ in stage._iter_range(b"\x00", b"\xff")
+    }
+
+
 @component
-async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
-    """Malformed records land in the quarantine (durable across reopen),
-    are counted and logged, and the partition's commit covers them —
-    they never wedge the loop."""
+async def test_malformed_records_are_dropped_counted_and_never_block(
+    fake_clock, caplog
+):
+    """Malformed records stage nothing, are counted per reason and logged
+    at WARNING with topic/partition/offset/reason, and the partition's
+    commit covers them — they never wedge the loop."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
-    cfg = make_config(poison=PoisonConfig(max_records_per_run=100, value_max_bytes=8))
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
     await consumer.start()
 
     fake.feed(
         team_msg(0, 0, team=3, tag="good-0"),
-        msg(0, 1, key=b"not-a-team", value=b"junk" * 20),  # not JSON, truncated
+        msg(0, 1, key=b"not-a-team", value=b"junk" * 20),  # not JSON
         msg(0, 2, key=b"3", ts_ms=None),  # no timestamp
         msg(0, 3, key=b"3", value=None),  # tombstone
         team_msg(0, 4, team=3, tag="good-4"),
     )
-    await run_steps(consumer, fake)
+    with caplog.at_level(logging.WARNING, logger="millrace.consumer"):
+        await run_steps(consumer, fake)
 
-    assert_commits_follow_acks(journal)
-    # The commit covers the poison records' offsets — they are skipped
-    # without blocking the partition.
+    assert_commits_follow_acks(journal, dropped={("events", 0, o) for o in (1, 2, 3)})
+    # The commit covers the dropped records' offsets.
     assert fake.committed_store == {("events", 0): 5}
     stats = consumer.stats()
-    assert stats.records_staged == 2 and stats.records_poisoned == 3
+    assert stats.records_staged == 2
+    assert stats.records_dropped == {
+        REASON_MALFORMED_VALUE: 1,
+        REASON_MISSING_TIMESTAMP: 1,
+        REASON_MISSING_VALUE: 1,
+    }
 
     stage = manager.stage("events", 0)
     assert await team_offsets(stage, 3) == [0, 4]
-    poisoned = await stage.scan_poison()
-    assert [(p.offset, p.reason) for p in poisoned] == [
-        (1, REASON_MALFORMED_VALUE),
-        (2, REASON_MISSING_TIMESTAMP),
-        (3, REASON_MISSING_VALUE),
+    assert await stage_key_prefixes(stage) == {
+        b"rows/",
+        b"stats/",
+        b"sched_age/",
+        b"offsets/",
+    }
+    lines = [r.getMessage() for r in caplog.records if "record dropped" in r.message]
+    assert [line.split(" (")[0] for line in lines] == [
+        "record dropped: topic=events partition=0 offset=1 reason=malformed_value",
+        "record dropped: topic=events partition=0 offset=2 reason=missing_timestamp",
+        "record dropped: topic=events partition=0 offset=3 reason=missing_value",
     ]
-    assert poisoned[0].key == b"not-a-team"
-    assert poisoned[0].value == b"junkjunk"  # truncated at the 8-byte cap
-    assert poisoned[0].value_bytes_original == 80
-    assert poisoned[2].value is None and poisoned[2].value_bytes_original == 0
+    await manager.close()
 
-    # Durable: a reopen (new owner, crash recovery) still reads them.
-    await manager.close_partition("events", 0)
-    reopened = await PartitionStage.open_store(
-        manager.store,
-        manager.path_for("events", 0),
-        topic="events",
-        partition=0,
-        settings=fast_flush_settings(),
+
+@component
+async def test_a_poll_of_only_dropped_records_still_commits(fake_clock):
+    """Nothing to stage is still handled: the offset advances past a
+    poll whose every record was dropped, with no stage_batch call."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    await consumer.start()
+
+    fake.feed(msg(0, 0, key=None, value=b"x"), msg(0, 1, key=None, value=None))
+    await run_steps(consumer, fake)
+
+    assert_commits_follow_acks(journal, dropped={("events", 0, 0), ("events", 0, 1)})
+    assert not [e for e in journal if e[0] == "ack"]  # nothing was staged
+    assert fake.committed_store == {("events", 0): 2}
+    stats = consumer.stats()
+    assert stats.records_staged == 0
+    assert sum(stats.records_dropped.values()) == 2
+    assert await manager.stage("events", 0).iter_key_stats() == []
+    await manager.close()
+
+
+@component
+async def test_drop_logging_is_rate_limited_per_partition_and_reason(
+    fake_clock, caplog
+):
+    """At most one line per (partition, reason) per DROP_LOG_INTERVAL_S:
+    the first drop of a reason always logs, a different reason or
+    partition logs independently, and the next line after the interval
+    names the suppressed count. The counter counts every drop."""
+    journal: list[tuple] = []
+    manager = make_manager(journal)
+    fake = FakeConsumer(journal=journal)
+    mono = FakeMonotonic()
+    consumer = make_consumer(
+        fake,
+        manager,
+        make_config(static_partitions=(0, 1)),
+        fake_clock,
+        monotonic=mono,
     )
-    assert [(p.offset, p.reason) for p in await reopened.scan_poison()] == [
-        (1, REASON_MALFORMED_VALUE),
-        (2, REASON_MISSING_TIMESTAMP),
-        (3, REASON_MISSING_VALUE),
-    ]
-    await reopened.close()
+    await consumer.start()
+
+    def dropped_lines() -> list[str]:
+        return [r.getMessage() for r in caplog.records if "record dropped" in r.message]
+
+    with caplog.at_level(logging.WARNING, logger="millrace.consumer"):
+        fake.feed(
+            *[msg(0, o, key=None, value=b"x") for o in range(5)],  # malformed_value
+            msg(0, 5, key=None, value=None),  # missing_value: its own first line
+            msg(1, 0, key=None, value=b"x"),  # another partition: its own line
+            msg(0, 6, key=None, value=b'{"team_id": "7"}'),  # path reason
+            msg(0, 7, key=None, value=b'{"team_id": "8"}'),
+        )
+        await run_steps(consumer, fake)
+        first = dropped_lines()
+        assert [line.split(" (")[0] for line in first] == [
+            "record dropped: topic=events partition=0 offset=0 reason=malformed_value",
+            "record dropped: topic=events partition=0 offset=5 reason=missing_value",
+            "record dropped: topic=events partition=1 offset=0 reason=malformed_value",
+            (
+                "record dropped: topic=events partition=0 offset=6 "
+                "reason=malformed_partition_source:team_id"
+            ),
+        ]
+        assert all("(0 more" in line for line in first)
+
+        # Still inside the interval: suppressed.
+        mono.now += DROP_LOG_INTERVAL_S - 1
+        fake.feed(msg(0, 8, key=None, value=b"x"))
+        await run_steps(consumer, fake)
+        assert dropped_lines() == first
+
+        # Past it: one line, carrying what was suppressed (offsets 1-4, 8).
+        mono.now += 2
+        fake.feed(msg(0, 9, key=None, value=b"x"))
+        await run_steps(consumer, fake)
+        (late,) = dropped_lines()[len(first) :]
+        assert late.startswith(
+            "record dropped: topic=events partition=0 offset=9 reason=malformed_value"
+        )
+        assert "(5 more" in late
+
+    assert consumer.stats().records_dropped == {
+        REASON_MALFORMED_VALUE: 8,
+        REASON_MISSING_VALUE: 1,
+        REASON_MALFORMED_PARTITION_SOURCE: 2,
+    }
+    assert fake.committed_store == {("events", 0): 10, ("events", 1): 1}
     await manager.close()
 
 
@@ -807,8 +909,8 @@ async def test_poison_records_quarantine_durably_and_never_block(fake_clock):
 async def test_a_keyless_topic_stages_by_the_payloads_partition_tuple(fake_clock):
     """The Kafka key is never read: keyless records (and records with
     junk keys) stage under the tuple their PAYLOAD gives; a payload that
-    is not a JSON object, or whose source scalar is malformed,
-    quarantines with the field named; the commit covers all of it."""
+    is not a JSON object, or whose source scalar is malformed, drops
+    with the field named; the commit covers all of it."""
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
@@ -826,19 +928,19 @@ async def test_a_keyless_topic_stages_by_the_payloads_partition_tuple(fake_clock
     )
     await run_steps(consumer, fake)
 
-    assert_commits_follow_acks(journal)
+    assert_commits_follow_acks(journal, dropped={("events", 0, 5), ("events", 0, 6)})
     assert fake.committed_store == {("events", 0): 7}
     stats = consumer.stats()
-    assert stats.records_staged == 5 and stats.records_poisoned == 2
+    assert stats.records_staged == 5
+    assert stats.records_dropped == {
+        REASON_MALFORMED_PARTITION_SOURCE: 1,
+        REASON_MALFORMED_VALUE: 1,
+    }
     stage = manager.stage("events", 0)
     assert await team_offsets(stage, 7) == [0, 2]
     assert await team_offsets(stage, 9) == [1, 3]
-    # An absent source is a null component, not poison.
+    # An absent source is a null component, not a drop.
     assert [rk.offset async for rk, _ in stage.scan_group_rows((None,))] == [4]
-    assert [(p.offset, p.reason) for p in await stage.scan_poison()] == [
-        (5, "malformed_partition_source:team_id"),
-        (6, REASON_MALFORMED_VALUE),
-    ]
     # The staged payload is the raw value bytes — classify parsed the
     # JSON once to read the tuple and never rewrote the record.
     rows = [(rk.offset, v) async for rk, v in stage.scan_group_rows(("7",))]
@@ -964,36 +1066,6 @@ async def test_a_recreated_table_at_reread_halts_the_loop_without_committing(
     assert fake.consume_calls == consume_calls  # never polled
     assert fake.committed_store == {("events", 0): 1}
     assert await team_offsets(manager.stage("events", 0), 7) == [0]
-    await manager.close()
-
-
-@component
-async def test_poison_flood_halts_loudly_without_committing_past_it(fake_clock):
-    journal: list[tuple] = []
-    manager = make_manager(journal)
-    fake = FakeConsumer(journal=journal)
-    cfg = make_config(poison=PoisonConfig(max_records_per_run=2, value_max_bytes=64))
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    await consumer.start()
-
-    fake.feed(team_msg(0, 0, team=1, tag="fine"))
-    await run_steps(consumer, fake)
-    assert fake.committed_store == {("events", 0): 1}
-
-    # A flood: three bad records against a limit of two. The cycle
-    # raises BEFORE anything in it is staged or committed.
-    fake.feed(
-        msg(0, 1, key=b"bad", value=b"not json"),
-        msg(0, 2, key=b"bad", value=b"not json"),
-        msg(0, 3, key=b"bad", value=b"not json"),
-    )
-    with pytest.raises(PoisonLimitExceeded, match="MILLRACE_POISON_MAX_RECORDS=2"):
-        await consumer._step()
-    assert fake.committed_store == {("events", 0): 1}
-    assert consumer.committed_offsets() == {("events", 0): 1}
-    stage = manager.stage("events", 0)
-    assert await stage.scan_poison() == []
-    assert await team_offsets(stage, 1) == [0]
     await manager.close()
 
 
@@ -1283,7 +1355,7 @@ async def test_a_non_fenced_closed_stage_error_is_not_the_fenced_path(fake_clock
 
     stage = manager.stage("events", 0)
 
-    async def clean_closed(records, *, now_us, poison=()):
+    async def clean_closed(records, *, now_us):
         raise SlateError.Closed(CloseReason.CLEAN, "scripted local shutdown")
 
     stage.stage_batch = clean_closed  # type: ignore[method-assign]
@@ -1326,13 +1398,13 @@ async def test_partitions_stage_concurrently_within_one_poll(fake_clock):
     order: list[tuple[str, tuple[str, int]]] = []
 
     def make_spy(key, original):
-        async def spy(records, *, now_us, poison=()):
+        async def spy(records, *, now_us):
             order.append(("start", key))
             in_flight.add(key)
             if len(in_flight) == 2:
                 gate.set()
             await asyncio.wait_for(gate.wait(), timeout=5)
-            ack = await original(records, now_us=now_us, poison=poison)
+            ack = await original(records, now_us=now_us)
             order.append(("end", key))
             return ack
 
@@ -1472,13 +1544,15 @@ async def test_run_propagates_a_fatal_error_but_still_closes_kafka(fake_clock):
     journal: list[tuple] = []
     manager = make_manager(journal)
     fake = FakeConsumer(journal=journal)
-    cfg = make_config(poison=PoisonConfig(max_records_per_run=1, value_max_bytes=64))
-    consumer = make_consumer(fake, manager, cfg, fake_clock)
-    fake.feed(
-        msg(0, 0, key=b"bad", value=b"not json"),
-        msg(0, 1, key=b"bad", value=b"not json"),
-    )
-    with pytest.raises(PoisonLimitExceeded):
+    consumer = make_consumer(fake, manager, make_config(), fake_clock)
+    await consumer.start()
+
+    async def broken(records, *, now_us):
+        raise RuntimeError("scripted staging failure")
+
+    manager.stage("events", 0).stage_batch = broken  # type: ignore[method-assign]
+    fake.feed(team_msg(0, 0, team=1))
+    with pytest.raises(RuntimeError, match="scripted staging failure"):
         await consumer.run()
     assert fake.closed
     assert fake.committed_store == {}
@@ -1505,7 +1579,7 @@ async def test_stats_snapshot_counts_the_run(fake_clock):
     assert consumer.stats() == ConsumerStats(
         messages_consumed=4,
         records_staged=2,
-        records_poisoned=1,
+        records_dropped={REASON_MALFORMED_VALUE: 1},
         kafka_error_events=1,
         messages_skipped_revoked=0,
         commit_attempts=1,

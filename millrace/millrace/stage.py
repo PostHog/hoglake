@@ -10,11 +10,10 @@ hand-encodes a key.
 
 Write path — :meth:`PartitionStage.stage_batch`: ONE write batch per
 call: the row puts, the per-tuple ``stats/`` merge, the ``sched_age/``
-readiness entry, the ``offsets/`` identity range and any ``poison/``
-quarantine entries land atomically, so readiness accounting cannot drift
-from the data, not even on a hard kill that lands between them, and the
-offset commit that follows covers quarantined records exactly like
-staged rows. ``first_staged_ts`` is SET-ONCE: an existing stats entry
+readiness entry and the ``offsets/`` identity range land atomically, so
+readiness accounting cannot drift from the data, not even on a hard kill
+that lands between them. Records the consumer DROPPED (malformed, counted
+and logged there) never reach this module. ``first_staged_ts`` is SET-ONCE: an existing stats entry
 keeps its value (the tail's freshness SLA stands on this and the planner
 relies on it); it is born again only after the key stood empty — i.e.
 after a flush drained the partition tuple's last staged row.
@@ -53,14 +52,6 @@ pages: one delete batch per page, the write lock taken PER PAGE, so a
 partition that accumulated markers for days is collected without one
 long lock hold (the consumer keeps staging between pages) and without a
 per-marker transaction.
-
-Retention — ``poison/`` is forensic state with a bounded lifetime:
-every entry carries the staging-clock stamp of its write (v2 envelope),
-and :meth:`PartitionStage.purge_poison_expired` deletes entries older
-than a caller-chosen cutoff in bounded batches (the periodic sweeper
-lives in main.py; nothing depends on poison presence, so a process
-that is down at expiry simply purges later). Envelopes without a stamp
-(v1) are kept forever — unknown age is never deleted.
 
 Concurrency: one writer thread of control per instance — an asyncio
 lock serializes this process's mutations (the consume loop and the flush
@@ -127,7 +118,6 @@ from .keyspace import (
     FlushedKey,
     OffsetRange,
     PartitionTuple,
-    PoisonValue,
     PreparedKey,
     PreparedRequest,
     RowKey,
@@ -148,43 +138,10 @@ write-lock acquisition) per page, so collecting a partition's markers
 never holds the lock across the whole sweep and never opens a
 per-marker transaction."""
 
-_POISON_WRITE_CHUNK: Final = 1000
-"""Poison entries per durable write batch in :meth:`PartitionStage.poison_records`
-(mirrors the consumer's per-poll-cycle bound: a batch is at most a poll's
-worth of capped quarantine envelopes)."""
-
-_POISON_PURGE_SCAN_BUDGET: Final = 10_000
-"""Poison entries scanned per :meth:`PartitionStage.purge_poison_expired`
-call (default) — the bounded unit of forensic-sweep work per partition
-per pass. Entries are scanned in offset (key) order; a truncated pass
-simply re-scans from the front next time (kept entries are re-read —
-cheap at the volumes poison is meant to exist in: the consumer HALTS
-past ``MILLRACE_POISON_MAX_RECORDS`` per run, so a prefix that has outgrown
-the budget means an incident, not a routine sweep)."""
-
 AckHook = Callable[["StageAck"], None]
 """Callback invoked once per successfully staged batch, after the batch
 is durable and before ``stage_batch`` returns (the offset-commit seam —
 the consumer's commit callback belongs here or later, never earlier)."""
-
-
-def _poison_value(entry: PoisonedRecord, *, stamped_at_us: int | None) -> PoisonValue:
-    """The envelope for one quarantined record, stamped with the write's
-    staging clock when the entry does not already carry a stamp (the
-    retention purge's age basis). An entry nobody stamped keeps ``None``
-    and encodes as v1 — never purged, the safe direction for forensic
-    state."""
-    return PoisonValue(
-        reason=entry.reason,
-        key=entry.key,
-        value=entry.value,
-        value_bytes_original=entry.value_bytes_original,
-        quarantined_at_us=(
-            entry.quarantined_at_us
-            if entry.quarantined_at_us is not None
-            else stamped_at_us
-        ),
-    )
 
 
 class StageError(Exception):
@@ -228,29 +185,16 @@ class StagedRecord:
 
 
 @dataclass(frozen=True, slots=True)
-class PoisonedRecord:
+class DroppedRecord:
     """One consumed Kafka record that can never become a staged row — a
     payload that is not a JSON object, a malformed partition source, no
-    usable timestamp, a tombstone.
-
-    Quarantined under ``poison/<offset>`` in the SAME write batch as the
-    poll cycle's staged rows, so the offset commit that follows covers
-    it exactly like a staged row: durably stored aside, never silently
-    dropped, never wedging the loop. ``reason`` is the consumer's
-    bounded rejection vocabulary; ``value`` may be truncated against the
-    consumer's poison byte cap, with ``value_bytes_original`` recording
-    the pre-truncation size (0 when the record carried no value).
-    ``quarantined_at_us`` is the staging-clock write stamp (v2 envelope)
-    — the retention purge's age basis (:meth:`PartitionStage.purge_poison_expired`);
-    the stage stamps it at write time when the caller did not.
-    """
+    usable timestamp, a tombstone. Nothing is written for it: the
+    consumer logs and counts the drop, and the offset commit that follows
+    covers it trivially. ``reason`` is the consumer's bounded rejection
+    vocabulary (``malformed_partition_source:<path>`` names the field)."""
 
     offset: int
     reason: str
-    key: bytes | None
-    value: bytes | None
-    value_bytes_original: int
-    quarantined_at_us: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,11 +202,9 @@ class StageAck:
     """What a successful :meth:`PartitionStage.stage_batch` stands for.
 
     The batch is remotely durable when this exists. ``first_offset`` /
-    ``last_offset`` are the batch's offset bounds over ALL its records,
-    staged rows and poison quarantine entries alike — the consumer
-    commits ``last_offset + 1`` for the partition, strictly after
-    receiving this. ``rows`` / ``staged_bytes`` count staged rows only;
-    ``poisoned`` counts the quarantined records the batch also carried.
+    ``last_offset`` are the batch's offset bounds; the consumer commits
+    the poll's last handled offset + 1 for the partition (dropped records
+    included), strictly after receiving this.
     """
 
     topic: str
@@ -271,7 +213,6 @@ class StageAck:
     staged_bytes: int
     first_offset: int
     last_offset: int
-    poisoned: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,22 +283,6 @@ def gauges_from_stats(stats: Iterable[KeyStats]) -> StageGauges:
         staged_groups=len(entries),
         oldest_first_staged_ts=min((s.first_staged_ts for s in entries), default=None),
     )
-
-
-@dataclass(frozen=True, slots=True)
-class PoisonPurgeReport:
-    """Accounting of one :meth:`PartitionStage.purge_poison_expired` call.
-
-    ``truncated`` is True when the scan budget ran out before the prefix
-    was exhausted — the next pass restarts at the front. ``unreadable``
-    counts entries that failed to decode (kept, never deleted — foreign
-    writes or a newer build's envelope).
-    """
-
-    scanned: int
-    deleted: int
-    unreadable: int
-    truncated: bool
 
 
 def build_slatedb_settings(
@@ -612,7 +537,6 @@ class PartitionStage:
         records: Iterable[StagedRecord],
         *,
         now_us: int,
-        poison: Iterable[PoisonedRecord] = (),
     ) -> StageAck:
         """Stage one consumed microbatch — ONE write batch, remotely durable
         before return.
@@ -622,16 +546,11 @@ class PartitionStage:
         exists; created with ``now_us`` when the tuple stands empty), the
         ``sched_age/`` entry on first stage, and the ``offsets/``
         identity-range merge. ``now_us`` is the injected staging clock —
-        never read from the wall here. ``poison`` entries (records that
-        can never become rows) land under ``poison/<offset>`` in the
-        same batch, so the ack — and the offset commit that follows it —
-        covers the quarantine exactly like the staged rows.
+        never read from the wall here.
 
-        Rejects a batch with neither staged nor poisoned records, a
-        batch carrying one row key twice, and a batch quarantining one
-        offset twice (both are consumer bugs; redelivery ACROSS batches
-        is fine — the row/poison keys are derived from the record, so
-        the re-put is idempotent and only the stats counters inflate
+        Rejects an empty batch and a batch carrying one row key twice
+        (both are consumer bugs; redelivery ACROSS batches is fine — the
+        row key is derived from the record, so the re-put is idempotent and only the stats counters inflate
         conservatively until the next flush). The ack hook fires after
         durability, never for a rejected or failed batch.
         """
@@ -650,17 +569,8 @@ class PartitionStage:
             seen.add(row_key)
             keyed.append((row_key, rec))
 
-        quarantined = list(poison)
-        seen_poison: set[int] = set()
-        for entry in quarantined:
-            if entry.offset in seen_poison:
-                raise ValueError(f"duplicate poison offset in batch: {entry.offset}")
-            seen_poison.add(entry.offset)
-
-        if not keyed and not quarantined:
-            raise ValueError(
-                "stage_batch requires at least one record (staged or poisoned)"
-            )
+        if not keyed:
+            raise ValueError("stage_batch requires at least one record")
 
         by_group: dict[PartitionTuple, list[tuple[bytes, StagedRecord]]] = {}
         for row_key, rec in keyed:
@@ -717,22 +627,10 @@ class PartitionStage:
                 )
                 total_bytes += group_bytes
 
-            for entry in quarantined:
-                batch.put(
-                    keyspace.poison_key(entry.offset),
-                    # Stamped with this batch's staging clock (the purge's
-                    # age basis); the consume side never pre-stamps.
-                    keyspace.encode_poison_value(
-                        _poison_value(entry, stamped_at_us=now_us)
-                    ),
-                )
-
             handle = await self._db.write(batch)
             await handle.await_durable()
 
-        all_offsets = [rec.offset for _, rec in keyed] + [
-            entry.offset for entry in quarantined
-        ]
+        all_offsets = [rec.offset for _, rec in keyed]
         ack = StageAck(
             topic=self._topic,
             partition=self._partition,
@@ -740,7 +638,6 @@ class PartitionStage:
             staged_bytes=total_bytes,
             first_offset=min(all_offsets),
             last_offset=max(all_offsets),
-            poisoned=len(quarantined),
         )
         if self._ack_hook is not None:
             self._ack_hook(ack)
@@ -875,101 +772,6 @@ class PartitionStage:
         raw = await self._db.get(keyspace.offsets_key(group))
         return keyspace.decode_offsets_value(raw) if raw is not None else ()
 
-    async def scan_poison(self) -> list[PoisonedRecord]:
-        """Every quarantined record, in offset order.
-
-        A forensic/test reader: nothing on the write, flush or recovery
-        path calls this — the ``poison/`` prefix is stored aside, and the
-        consumer's poison limits bound how much can accumulate per run.
-        """
-        self._ensure_open()
-        out: list[PoisonedRecord] = []
-        for key, raw in await self._scan_prefix(keyspace.POISON_PREFIX):
-            value = keyspace.decode_poison_value(raw)
-            out.append(
-                PoisonedRecord(
-                    offset=keyspace.decode_poison_key(key),
-                    reason=value.reason,
-                    key=value.key,
-                    value=value.value,
-                    value_bytes_original=value.value_bytes_original,
-                    quarantined_at_us=value.quarantined_at_us,
-                )
-            )
-        return out
-
-    async def purge_poison_expired(
-        self, cutoff_us: int, *, scan_budget: int = _POISON_PURGE_SCAN_BUDGET
-    ) -> PoisonPurgeReport:
-        """Delete the quarantine entries older than ``cutoff_us`` (the
-        retention policy's edge — the CALLER owns the policy; the stage
-        owns the bounded mechanism).
-
-        Poison is forensic: nothing depends on its presence, so the purge
-        is safe whenever it runs and a process that is DOWN at expiry
-        simply purges later. The pass is bounded: at most ``scan_budget``
-        entries are scanned (in offset order), deletes land in
-        ``_POISON_WRITE_CHUNK`` durable batches with the write lock taken
-        PER BATCH — never one unbounded batch, never one long lock hold,
-        so the purge cannot block staging or a flush settle. A truncated
-        pass reports ``truncated=True``; the next pass restarts at the
-        front of the prefix (kept entries are re-read — see the budget's
-        note).
-
-        Two classes are never deleted: entries whose stamp is None (v1
-        envelopes — unknown age is keep-forever, the safe direction for
-        forensic state) and entries that FAIL to decode (counted as
-        ``unreadable`` and logged once per entry per pass — foreign
-        writes or a newer build's envelope; a purge must never destroy
-        what it cannot read, and a bad entry must not wedge the pass).
-        """
-        self._ensure_open()
-        scanned = deleted = unreadable = 0
-        truncated = False
-        start, end = keyspace.poison_range()
-        pending: list[bytes] = []
-
-        async def flush_deletes() -> None:
-            nonlocal deleted
-            if not pending:
-                return
-            batch = WriteBatch()
-            for key in pending:
-                batch.delete(key)
-            async with self._write_lock:
-                handle = await self._db.write(batch)
-                await handle.await_durable()
-            deleted += len(pending)
-            pending.clear()
-
-        async for key, raw in self._iter_range(start, end):
-            if scanned >= scan_budget:
-                truncated = True
-                break
-            scanned += 1
-            try:
-                value = keyspace.decode_poison_value(raw)
-            except ValueError:
-                unreadable += 1
-                log.warning(
-                    "poison purge: %s[%d] entry at offset %d failed to "
-                    "decode — kept (never delete what we cannot read)",
-                    self._topic,
-                    self._partition,
-                    keyspace.decode_poison_key(key),
-                )
-                continue
-            if value.quarantined_at_us is None:
-                continue  # unknown age: keep-forever (the v1 rule)
-            if value.quarantined_at_us < cutoff_us:
-                pending.append(key)
-                if len(pending) >= _POISON_WRITE_CHUNK:
-                    await flush_deletes()
-        await flush_deletes()
-        return PoisonPurgeReport(
-            scanned=scanned, deleted=deleted, unreadable=unreadable, truncated=truncated
-        )
-
     # -- prepared/ lifecycle ----------------------------------------------------
 
     async def persist_prepared(
@@ -1039,7 +841,7 @@ class PartitionStage:
 
     async def drop_prepared(self, group: PartitionTuple, first_offset: int) -> None:
         """Delete one ``prepared/`` entry on its own — for abandoning a
-        quarantined flush decision. Successful flushes need no call:
+        refused request before a rebuild. Settled windows need no call:
         :meth:`commit_flushed` drops the entry in the settlement
         transaction."""
         self._ensure_open()
@@ -1048,87 +850,6 @@ class PartitionStage:
         async with self._write_lock:
             handle = await self._db.write(batch)
             await handle.await_durable()
-
-    # -- flush-time quarantine --------------------------------------------------
-    #
-    # The flush path's own quarantine (docs/kafka-ingestion.md §Staging layout:
-    # junk ``event_time`` is clamped or quarantined AT FLUSH TIME): records that
-    # staged fine but can never be PUBLISHED — an undecodable payload, an
-    # out-of-window ``event_time`` under the quarantine policy, or every row of
-    # a decision the server refused — land under ``poison/<offset>`` with the
-    # consumer's envelope and durability discipline, mirrored: durable (WAL on
-    # the object store) before return, so a later settlement never deletes a
-    # staged row whose quarantine entry has not survived it. Re-putting the
-    # same offset rewrites the same envelope (the flush's decode is
-    # deterministic), so a crash-and-retry between quarantine and settlement
-    # is idempotent.
-
-    async def poison_records(
-        self, entries: Iterable[PoisonedRecord], *, now_us: int | None = None
-    ) -> int:
-        """Quarantine flush-time rejections under ``poison/`` — durably, in
-        chunks (a refused whale-range decision must not build one unbounded
-        ``WriteBatch``). Returns the number of entries written.
-
-        ``now_us`` stamps each entry's ``quarantined_at_us`` (the
-        retention purge's age basis) unless the entry carries one.
-        Callers without a clock to pass leave the stamp out — those
-        envelopes encode as v1 and the purge keeps them forever (never
-        delete forensic state whose age is unknown)."""
-        self._ensure_open()
-        count = 0
-        chunk: list[PoisonedRecord] = []
-        for entry in entries:
-            chunk.append(entry)
-            if len(chunk) >= _POISON_WRITE_CHUNK:
-                count += await self._write_poison_chunk(chunk, stamped_at_us=now_us)
-                chunk = []
-        if chunk:
-            count += await self._write_poison_chunk(chunk, stamped_at_us=now_us)
-        return count
-
-    async def _write_poison_chunk(
-        self, chunk: list[PoisonedRecord], *, stamped_at_us: int | None
-    ) -> int:
-        batch = WriteBatch()
-        for entry in chunk:
-            batch.put(
-                keyspace.poison_key(entry.offset),
-                keyspace.encode_poison_value(
-                    _poison_value(entry, stamped_at_us=stamped_at_us)
-                ),
-            )
-        async with self._write_lock:
-            handle = await self._db.write(batch)
-            await handle.await_durable()
-        return len(chunk)
-
-    async def settle_quarantined(self, key: FlushedKey) -> FlushCommitReport:
-        """Settle a flush decision that will NEVER be committed: every row
-        of the window was quarantined (``poison/``) and no publication
-        happened, so there is no receipt and nothing to reconcile — the
-        settle is a plain delete.
-
-        ONE transaction: delete exactly the window's rows, settle
-        ``stats/``/``offsets/``, drop the range's ``prepared/`` entry.
-        Idempotent: a replay finds no rows in the window and reports
-        zeros."""
-        self._ensure_open()
-        async with self._write_lock:
-            txn = await self._db.begin(IsolationLevel.SERIALIZABLE_SNAPSHOT)
-            try:
-                settlement = await self._settle_flushed(txn, key)
-            except BaseException:
-                await txn.rollback()
-                raise
-            handle = await txn.commit()
-            if handle is not None:
-                await handle.await_durable()
-        return FlushCommitReport(
-            rows_deleted=settlement.rows_deleted,
-            bytes_deleted=settlement.bytes_deleted,
-            group_drained=settlement.group_drained,
-        )
 
     async def reconcile_stats(self, group: PartitionTuple) -> bool:
         """Remove a partition tuple's ``stats/`` + ``sched_age/`` entries when its rows
@@ -1198,6 +919,12 @@ class PartitionStage:
         leaves the ``prepared/`` entry; recovery replays it
         receipt-first (flush.py's recovery handoff).
 
+        The same settlement retires a window that will NEVER be committed
+        because the flush dropped every row of it (undecodable or junk
+        ``event_time``): there is no
+        receipt and nothing to reconcile, so the settle is a plain
+        delete.
+
         Idempotent: a replay after an ambiguous failure finds no rows in
         the window and reports zeros.
         """
@@ -1219,8 +946,7 @@ class PartitionStage:
         )
 
     async def _settle_flushed(self, txn: DbTransaction, key: FlushedKey) -> _Settlement:
-        """The settlement body shared by :meth:`commit_flushed` and
-        :meth:`settle_quarantined`."""
+        """The settlement body of :meth:`commit_flushed`."""
         # The exact settlement selection (keyspace.py §The settlement
         # window): scan the tuple's whole slice, delete the rows the
         # window selects.

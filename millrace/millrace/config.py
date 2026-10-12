@@ -3,7 +3,7 @@
 Fail-fast at boot (docs/kafka-ingestion.md §Deployment): the catalog,
 namespace and table are resolved before any consume begins and the
 table's incarnation (``table_uuid``) is pinned there — a later change
-halts the flush (``table_recreated``); the junk ``event_time`` policy (clamp vs quarantine) is
+halts the flush (``table_recreated``); the junk ``event_time`` policy (clamp vs drop) is
 config, validated here. One process = one topic → one table.
 
 Every knob is a ``MILLRACE_*`` environment variable; every validation
@@ -31,17 +31,13 @@ Knobs
 | ``MILLRACE_SLOW_LANE_DEADLINE_S`` | 21600 (6 h) | slow lane: flush any key this old regardless of size; accepted range 6–24 h |
 | ``MILLRACE_MIN_FLUSH_BYTES`` | 1 MiB | the age lane's minimum size — a smaller key at the age deadline waits for the slow lane |
 | ``MILLRACE_MAX_FILES_PER_COMMIT`` | 512 | the most files one flush decision may fan out to under the live partition spec; a decision past it HALTS the pipeline (``fanout_exceeds_commit_bound``) before any upload — there is no commit chunking |
-| ``MILLRACE_POISON_MAX_RECORDS`` | 1000 | per-run quarantine bound; exceeding it halts the loop loudly instead of committing past a flood |
-| ``MILLRACE_POISON_VALUE_MAX_BYTES`` | 1 MiB | per-record cap on the quarantined value bytes (original length recorded) |
-| ``MILLRACE_POISON_RETENTION_S`` | 604800 (7 d) | how long a quarantined record is kept for forensics before the poison sweeper deletes it (stage.py ``purge_poison_expired``). Entries older than this are deleted in bounded batches; entries WITHOUT a quarantine stamp (v1 envelopes) are kept forever: unknown age is never deleted. Every write path stamps today (consume-time and flush-time quarantines alike), so v1 entries come only from a caller that passes no clock. Poison is forensic — nothing depends on its presence, so a pod that is down at expiry simply purges at the next sweep. 7 d matches the server's default receipt retention: the incidents poison matters to are replay/settlement questions, all inside that window |
-| ``MILLRACE_POISON_SWEEP_S`` | 3600 | the poison sweeper's cadence (per partition, off the consume/flush path — main.py's side task) |
 | ``MILLRACE_SLATEDB_GC_ENABLED`` | ``false`` | the writer-internal SlateDB GC loop. DEFAULT OFF because the external maintenance service (``python -m millrace.maintenance``) is deployed beside every millrace fleet and owns collection — doubled GC is wasted LIST/DELETE traffic on the replicas (docs/kafka-ingestion.md §Maintenance services; GC itself is idempotent and overlap-safe, so a mixed or misconfigured deployment is wasteful, never corrupt). Boot logs a loud warning when off: the setting ASSUMES the maintenance service exists — without it, garbage accumulates forever. There is deliberately NO knob for ``compactor_options``: disabling the embedded compactor stalls memtable→L0 flushes at ``l0_max_ssts`` with nothing to drain them (parity-pinned, tests/test_slatedb_parity.py) |
 | ``MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES`` | 268435456 (256 MiB) | per-instance bound on unflushed memtable+WAL bytes before SlateDB stalls writes (the library default is 1 GiB — per INSTANCE, so 64 partitions per pod could hold 64 GiB of unflushed state; the README carries the per-pod memory arithmetic). The binding requires it to exceed ``l0_sst_size_bytes`` (never overridden; 64 MiB), which the validation enforces |
 | ``MILLRACE_SLATEDB_L0_MAX_SSTS`` | 8 | L0 depth at which a writer's memtable flush stalls until the embedded compactor drains (SlateDB's default; the whale-shape stall margin is a bench topic — tests/test_stage_bench.py) |
 | ``MILLRACE_CONSUME_BATCH_SIZE`` | 65536 | max messages per ``consume()`` call — the RECORD cap, a backstop for degenerate tiny-payload floods; at the design's ~1 KB record shape the byte cap below is the operative bound. Per-partition durability waits overlap within a poll (consumer.py), so a large batch still stages in ~one WAL round trip |
 | ``MILLRACE_CONSUME_BATCH_MAX_BYTES`` | 268435456 (256 MiB) | per-poll byte bound, enforced by clamping the poll's message count to this ÷ the run's observed average record size (key + value bytes, cumulative; floored at 1 message so an oversized record still flows). The first poll after a start has no observation and is bounded by the record cap alone |
 | ``MILLRACE_POLL_TIMEOUT_MS`` | 500 | per-poll block bound; also the stop() latency |
-| ``MILLRACE_EVENT_TIME_POLICY`` | ``quarantine`` | flush-time junk ``event_time`` handling (``clamp`` or ``quarantine``; consumed by the flush phase) |
+| ``MILLRACE_EVENT_TIME_POLICY`` | ``drop`` | flush-time junk ``event_time`` handling (``clamp`` or ``drop``; consumed by the flush phase — a dropped record is logged and counted, ``millrace_records_dropped_total{reason="event_time_out_of_window"}``) |
 | ``MILLRACE_EVENT_TIME_MAX_PAST_S`` | 2592000 (30 d) | junk window lower bound: an ``event_time`` older than ``now − this`` is junk (flush phase) |
 | ``MILLRACE_EVENT_TIME_MAX_FUTURE_S`` | 86400 (1 d) | junk window upper bound: an ``event_time`` newer than ``now + this`` is junk (flush phase) |
 | ``MILLRACE_RECEIPT_HORIZON_S`` | 518400 (6 d) | receipt-horizon guard: a persisted ``prepared/`` entry whose receipt lookup 404s is republished ONLY while younger than this; past it the server's receipt may have been purged and a blind replay could duplicate an executed commit, so the pipeline HALTS for operator reconciliation. THE DEPENDENCY IS NOT ON THE WIRE: the server never reports its receipt retention (``CatalogOptions`` carries snapshot retention only; ``GET /v1/info`` is instance identity — verified against hoglake.yaml), so this knob CARRIES the assumption that it stays below the server's effective receipt purge floor. That floor is ``max(HOGLAKE_RECEIPT_RETENTION_SECONDS, 2 × the catalog's snapshot retention)`` capped at 30 d and never below 1 h (server-side ``MIN_RECEIPT_RETENTION_SECONDS``): the 6 d default undercuts the 7 d server default; an operator who lowers the server knob (or runs a snapshot retention above ~3.5 d, which lifts the floor) must lower this knob with it. If pyhoglake grows a ``Catalog._receipt_retention_seconds`` accessor the flusher honors it instead of the knob (the guarded-accessor seam, flush.py ``_receipt_horizon_s``) |
@@ -140,46 +136,7 @@ class EventTimePolicy(Enum):
     """What the flush does with outlier ``event_time`` values."""
 
     CLAMP = "clamp"
-    QUARANTINE = "quarantine"
-
-
-@dataclass(frozen=True)
-class PoisonConfig:
-    """Quarantine bounds and retention. ``max_records_per_run`` is the
-    loud-halt bound: a flood of unstageable records means a producer bug
-    or payloads that do not match the destination's partition spec, and committing past it would hide the
-    damage — the consumer raises instead. ``value_max_bytes`` caps each
-    quarantined record's stored value; the original length is recorded.
-    ``retention_s`` / ``sweep_s`` drive the poison sweeper (main.py):
-    entries older than ``retention_s`` are purged per partition every
-    ``sweep_s`` — poison is forensic state with a bounded lifetime, and
-    entries whose age is unknowable (v1 envelopes) are kept forever.
-    """
-
-    max_records_per_run: int
-    value_max_bytes: int
-    retention_s: int = 7 * 86400
-    sweep_s: int = 3600
-
-    def __post_init__(self) -> None:
-        if self.max_records_per_run < 1:
-            raise ValueError(
-                f"MILLRACE_POISON_MAX_RECORDS must be >= 1, "
-                f"got {self.max_records_per_run}"
-            )
-        if self.value_max_bytes < 1:
-            raise ValueError(
-                f"MILLRACE_POISON_VALUE_MAX_BYTES must be >= 1, "
-                f"got {self.value_max_bytes}"
-            )
-        if self.retention_s < 1:
-            raise ValueError(
-                f"MILLRACE_POISON_RETENTION_S must be >= 1, got {self.retention_s}"
-            )
-        if self.sweep_s < 1:
-            raise ValueError(
-                f"MILLRACE_POISON_SWEEP_S must be >= 1, got {self.sweep_s}"
-            )
+    DROP = "drop"
 
 
 #: The binding validates ``max_unflushed_bytes > l0_sst_size_bytes`` at
@@ -321,7 +278,6 @@ class Config:
     slow_lane_deadline_s: int
     min_flush_bytes: int
     max_files_per_commit: int
-    poison: PoisonConfig
     consume_batch_size: int
     poll_timeout_ms: int
     event_time_policy: EventTimePolicy
@@ -633,31 +589,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         env, "MILLRACE_MAX_FILES_PER_COMMIT", MAX_FILES_PER_COMMIT_DEFAULT, problems
     )
 
-    poison: PoisonConfig | None = None
-    poison_max = _positive_int(env, "MILLRACE_POISON_MAX_RECORDS", 1000, problems)
-    poison_value_max = _positive_int(
-        env, "MILLRACE_POISON_VALUE_MAX_BYTES", 1024 * 1024, problems
-    )
-    poison_retention_s = _positive_int(
-        env, "MILLRACE_POISON_RETENTION_S", 7 * 86400, problems
-    )
-    poison_sweep_s = _positive_int(env, "MILLRACE_POISON_SWEEP_S", 3600, problems)
-    if (
-        poison_max is not None
-        and poison_value_max is not None
-        and poison_retention_s is not None
-        and poison_sweep_s is not None
-    ):
-        try:
-            poison = PoisonConfig(
-                max_records_per_run=poison_max,
-                value_max_bytes=poison_value_max,
-                retention_s=poison_retention_s,
-                sweep_s=poison_sweep_s,
-            )
-        except ValueError as exc:
-            problems.append(str(exc))
-
     slatedb: SlateDbConfig | None = None
     slatedb_gc = _bool(env, "MILLRACE_SLATEDB_GC_ENABLED", False, problems)
     slatedb_max_unflushed = _positive_int(
@@ -691,7 +622,7 @@ def load_config(env: Mapping[str, str]) -> Config:
         env,
         "MILLRACE_EVENT_TIME_POLICY",
         list(EventTimePolicy),
-        EventTimePolicy.QUARANTINE,
+        EventTimePolicy.DROP,
         problems,
     )
     event_time_max_past_s = _positive_int(
@@ -764,7 +695,6 @@ def load_config(env: Mapping[str, str]) -> Config:
     assert slow_lane_deadline_s is not None
     assert min_flush_bytes is not None
     assert max_files_per_commit is not None
-    assert poison is not None
     assert slatedb is not None
     assert consume_batch_size is not None
     assert consume_batch_max_bytes is not None
@@ -801,7 +731,6 @@ def load_config(env: Mapping[str, str]) -> Config:
         slow_lane_deadline_s=slow_lane_deadline_s,
         min_flush_bytes=min_flush_bytes,
         max_files_per_commit=max_files_per_commit,
-        poison=poison,
         consume_batch_size=consume_batch_size,
         consume_batch_max_bytes=consume_batch_max_bytes,
         poll_timeout_ms=poll_timeout_ms,

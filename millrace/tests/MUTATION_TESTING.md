@@ -108,55 +108,27 @@ not mutate:
 |---|---|---|---|---|
 | first full run | 928 | 813 | 115 | 0 |
 | after this triage | 928 | **823** | **105** | 0 |
-| Phase 3 (poison codec added; see below) | 1166 | **1046** | **120** | 0 |
+| Phase 3 (poison codec added) | 1166 | **1046** | **120** | 0 |
 | 2026-10-09 reconciliation, clean-slate | 1074 | **964** | **110** | **0** |
 | 2026-10-10 B1 reconciliation (v2 key derivation, `prepared/` v3), clean-slate | 1215 | **1086** | **129** | **0** |
 | 2026-10-10 poison envelope v2 (`quarantined_at_us`), clean-slate | 1261 | **1126** | **135** | **0** |
+| 2026-10-12 poison codec removed (ledger arithmetic, not re-run) | — | — | **114** | — |
 
-The last row is the current truth: a clean-slate run (`rm -rf mutants &&
-uv run mutmut run` — the header's incremental gotcha is why) against the
-poison-v2 tree (below). It supersedes the B1 row, which superseded the
-2026-10-09 row. (The 2026-10-09 row's header said 110 survivors while
+The 2026-10-10 row is the last clean-slate run (`rm -rf mutants &&
+uv run mutmut run` — the header's incremental gotcha is why). It
+supersedes the B1 row, which superseded the 2026-10-09 row. The
+2026-10-12 row removed the `poison/` codec from `keyspace.py` (malformed
+records are now dropped, logged and metered; nothing is quarantined):
+its 21 survivors left the tables below with the code that hosted them,
+and the totals are that subtraction, pending the next clean-slate run. (The 2026-10-09 row's header said 110 survivors while
 its own table footer counted 111 — off by one, resolved at B1 by
 regenerating both from that run's actual output: 129 and 129.)
 
 `planner.py`: 0 survivors — every trigger comparison, the
 size>slow>age precedence, knob validation, duplicate refusal, ordering
-and chunk-bound mutants are killed by `test_planner.py`. All 135
+and chunk-bound mutants are killed by `test_planner.py`. All 114
 remaining survivors are in `keyspace.py` and are argued equivalent
 below; none changes an observable behavior the suite contracts on.
-
-### Phase 3 update — the `poison/` codec
-
-Adding the `poison/` codec to `keyspace.py` (consume-time quarantine)
-regenerated the file's mutants: 1166 total. The triage added the
-cut-point sweeps (`test_poison_value_truncation_stages_*`, one test per
-envelope shape asserting the EXACT named parse stage at every byte
-boundary) and the width-boundary pins (`test_poison_reason_accepts_
-exactly_the_u16_maximum`, `test_poison_key_and_value_accept_exactly_
-the_u32_maximum`, `test_poison_value_bytes_original_accepts_exactly_
-the_u32_maximum`, `test_poison_value_round_trip_with_a_multi_byte_
-reason_length`). Two findings of note:
-
-- **One genuine bug caught**: the truncation-guard mutants probing the
-  `has_key=0` path exposed that a buffer cut exactly after the
-  `has_key` flag read `has_value` out of bounds (IndexError instead of
-  the named ValueError). `decode_poison_value` now guards the flag read
-  ("truncated poison value: flags"); the no-key sweep pins it.
-- The 15 surviving poison mutants are ALL in the equivalence classes
-  below: 8× E1 (redundant `"big"`), 2× E3 (`"utf-8"` case), 1× E5
-  (slice bound past an exactly-length-checked buffer —
-  `x_decode_poison_value__mutmut_131`), 4× M (error-message text:
-  `x_poison_key__mutmut_5`, `xǁPoisonValueǁ__post_init____mutmut_5`,
-  `x_decode_poison_value__mutmut_7`, `x_decode_poison_value__mutmut_124`).
-
-The harness repair that made this run possible: `mutmut run` had been
-broken since Phase 2 — `source_paths` lists two FILES, so `mutants/
-millrace/` held only those, and `setup_source_paths` puts `mutants/`
-first on `sys.path`; conftest's `from millrace.stage import ...` (via
-stagekit) then failed collection with `ModuleNotFoundError`.
-`[tool.mutmut] also_copy = ["millrace/"]` copies the rest of the
-package verbatim (never mutated) so the mutants tree imports.
 
 ## Phase 7 update — the B1 review fixes (v2 key derivation, `prepared/` v3)
 
@@ -206,55 +178,6 @@ reconcile-time envelope↔stage identity cross-check removed
 (`test_a_prepared_entry_naming_another_partition_is_corruption`, in
 test_flush.py).
 
-## Phase 8 update — the `poison/` envelope v2 (`quarantined_at_us`)
-
-The retention work (PR #331 review: `poison/` was a forever-growing
-prefix) appended the v2 tail to the poison envelope (the purge's age
-basis; v1 still decodes as unknown-age, never purged). The rewrite
-renumbered every mutant hosted by `PoisonValue.__post_init__` /
-`encode_poison_value` / `decode_poison_value`, so the survivor tables
-below carry the NEW indices from the 2026-10-10 clean-slate run (the
-ledger's standing rule: regenerate the tables to match the run the
-modules now produce).
-
-New load-bearing predicates, all killed by tests rather than ledgered:
-
-- the version dispatch itself: a v1 golden vector decodes (None age)
-  and a v2 golden is written out byte-by-byte
-  (`test_poison_value_golden_vector`,
-  `test_poison_value_v2_golden_vector_and_legacy_decode`); the unknown-
-  version refusal moved from `2` to `3` in
-  `test_poison_value_decode_refusals` because `2` is now KNOWN;
-- the v2 tail's exact-width guard: cutting the envelope anywhere inside
-  the 8-byte stamp names the parse stage
-  (`test_poison_value_v2_truncated_timestamp_tail`), and the round-trip
-  property now sweeps `quarantined_at_us` over the full u64 range;
-- the width boundary of the new field: `quarantined_at_us` at exactly
-  u64-max is accepted, one past is refused (`test_poison_value_validation`).
-
-The survivor delta is +6 net (129 → 135): the three rewritten functions'
-mutants renumbered (10 stale names out, 10 in — same equivalence
-classes; `x_decode_poison_value__mutmut_131` kept its NUMBER but its
-content moved from the E5 slice to the E1 redundant-`"big"` on the same
-line), and six genuinely new mutants, ALL in the existing classes:
-`x_encode_poison_value__mutmut_68` and `x_decode_poison_value__mutmut_150`
-(E1, the v2 tail's redundant `"big"`), `x_decode_poison_value__mutmut_152`
-(E5, +9 stop clamped by the exact-length guard one statement up),
-`x_decode_poison_value__mutmut_145` / `_157` and
-`xǁPoisonValueǁ__post_init____mutmut_28` (M, error-message text whose
-pinned substrings survive), and `x_decode_poison_value__mutmut_123` (M —
-the tail guard's two-stage split: which guard refuses is message text;
-THAT every cut refuses is pinned by the second guard). Hand-flips for the behavior mutmut cannot
-generate (the purge lives in stage.py, outside mutmut's scope): the
-expiry comparator `<` → `<=` RED on
-`test_purge_poison_expired_deletes_only_expired_entries`; the
-unknown-age-is-kept guard dropped RED on the same test; the stamp
-fallback order flipped RED on `test_poison_records_stamp_policy`; and
-the S12 pin — the ack hook observing an un-awaited durability handle —
-REDs on `test_ack_hook_fires_only_after_remote_durability`
-(test_stage.py) when `stage_batch`'s `await handle.await_durable()`
-goes, which the old call-order test provably could not see.
-
 ## Killed by tests added in this triage (10)
 
 Three tests added to `tests/test_keyspace.py` (no source changes, no
@@ -303,7 +226,7 @@ u64-team_id key codecs (stats, offsets, prepared, sched_age, row), so
 the class of mutant dies deterministically rather than at the mercy of
 a per-name stream. Hand-flip verified RED on the offsets decode.
 
-## Surviving mutants — all equivalent (135)
+## Surviving mutants — all equivalent (114)
 
 Each entry: the mutant, its one-line diff, and the justification. The
 equivalence arguments are interpreter semantics, verified on the pinned
@@ -312,7 +235,7 @@ happen to stay green". The tables are regenerated from a clean-slate
 run's actual output whenever the mutated modules change (see the
 header); `tests/check_mutants.py` is the mechanical cross-check.
 
-### Class E1 — dropped redundant explicit defaults, `to_bytes`/`from_bytes` (52)
+### Class E1 — dropped redundant explicit defaults, `to_bytes`/`from_bytes` (42)
 
 Since Python 3.11 the `byteorder` parameter of `int.to_bytes` /
 `int.from_bytes` defaults to `"big"`, and `signed` defaults to `False`;
@@ -364,16 +287,6 @@ round-trips; only the redundant explicit arguments are unpinnable.
 | `x_decode_prepared_value__mutmut_93` | `body_len = int.from_bytes(data[pos : pos + 4], "big")` → `body_len = int.from_bytes(data[pos : pos + 4], )` |
 | `x_decode_prepared_value__mutmut_120` | `int.from_bytes(data[pos + body_len :], "big", signed=False) if tail else None` → `int.from_bytes(data[pos + body_len :], signed=False) if tail else None` |
 | `x_decode_prepared_value__mutmut_121` | `int.from_bytes(data[pos + body_len :], "big", signed=False) if tail else None` → `int.from_bytes(data[pos + body_len :], "big", ) if tail else None` |
-| `x_encode_poison_value__mutmut_15` | `out += len(reason).to_bytes(2, "big")` → `out += len(reason).to_bytes(2, )` |
-| `x_encode_poison_value__mutmut_31` | `out += len(value.key).to_bytes(4, "big")` → `out += len(value.key).to_bytes(4, )` |
-| `x_encode_poison_value__mutmut_47` | `out += len(value.value).to_bytes(4, "big")` → `out += len(value.value).to_bytes(4, )` |
-| `x_encode_poison_value__mutmut_58` | `out += value.value_bytes_original.to_bytes(4, "big")` → `out += value.value_bytes_original.to_bytes(4, )` |
-| `x_encode_poison_value__mutmut_68` | `out += value.quarantined_at_us.to_bytes(8, "big")` → `out += value.quarantined_at_us.to_bytes(8, )` |
-| `x_decode_poison_value__mutmut_14` | `reason_len = int.from_bytes(data[1:3], "big")` → `reason_len = int.from_bytes(data[1:3], )` |
-| `x_decode_poison_value__mutmut_57` | `key_len = int.from_bytes(data[pos : pos + 4], "big")` → `key_len = int.from_bytes(data[pos : pos + 4], )` |
-| `x_decode_poison_value__mutmut_102` | `value_len = int.from_bytes(data[pos : pos + 4], "big")` → `value_len = int.from_bytes(data[pos : pos + 4], )` |
-| `x_decode_poison_value__mutmut_131` | `value_bytes_original = int.from_bytes(data[pos : pos + 4], "big")` → `value_bytes_original = int.from_bytes(data[pos : pos + 4], )` |
-| `x_decode_poison_value__mutmut_150` | `quarantined_at_us = int.from_bytes(data[pos : pos + 8], "big")` → `quarantined_at_us = int.from_bytes(data[pos : pos + 8], )` |
 
 ### Class E2 — `signed=None` ≡ `signed=False` (13)
 
@@ -401,7 +314,7 @@ one such flip survived a clean run (see the reconciliation section).
 | `x_decode_prepared_value__mutmut_71` | `partition = int.from_bytes(data[pos : pos + 4], "big", signed=False)` → `partition = int.from_bytes(data[pos : pos + 4], "big", signed=None)` |
 | `x_decode_prepared_value__mutmut_118` | `int.from_bytes(data[pos + body_len :], "big", signed=False) if tail else None` → `int.from_bytes(data[pos + body_len :], "big", signed=None) if tail else None` |
 
-### Class E3 — `"utf-8"` vs `"UTF-8"` (11)
+### Class E3 — `"utf-8"` vs `"UTF-8"` (9)
 
 Codec lookup normalizes case: `codecs.lookup("UTF-8") is
 codecs.lookup("utf-8")`, and every `str.encode`/`bytes.decode` result is
@@ -416,8 +329,6 @@ identical for all inputs.
 | `x_decode_prepared_value__mutmut_29` | `key = bytes(data[pos : pos + key_len]).decode("utf-8")` → `key = bytes(data[pos : pos + key_len]).decode("UTF-8")` |
 | `x_decode_prepared_value__mutmut_65` | `topic = bytes(data[pos : pos + topic_len]).decode("utf-8")` → `topic = bytes(data[pos : pos + topic_len]).decode("UTF-8")` |
 | `x_idempotency_key__mutmut_7` | `encoded_topic = topic.encode("utf-8")` → `encoded_topic = topic.encode("UTF-8")` |
-| `x_encode_poison_value__mutmut_9` | `reason = value.reason.encode("utf-8")` → `reason = value.reason.encode("UTF-8")` |
-| `x_decode_poison_value__mutmut_34` | `reason = bytes(data[3 : 3 + reason_len]).decode("utf-8")` → `reason = bytes(data[3 : 3 + reason_len]).decode("UTF-8")` |
 
 ### Class E4 — `b"\xff"` vs `b"\xFF"` (1)
 
@@ -426,7 +337,7 @@ object, so `_prefix_successor` strips exactly the same suffixes.
 
 | `x__prefix_successor__mutmut_5` | `stripped = prefix.rstrip(b"\xff")` → `stripped = prefix.rstrip(b"\xFF")` |
 
-### Class E5 — slice bound extended past an exactly-length-checked buffer (5)
+### Class E5 — slice bound extended past an exactly-length-checked buffer (4)
 
 Every decoder below enforces the buffer's exact length (`!=` raises)
 before slicing, so a widened stop index is clamped by Python slice
@@ -439,7 +350,6 @@ effect. Per-mutant arithmetic:
 | `x_decode_stats_value__mutmut_55` | `row_count=int.from_bytes(data[25:33], "big", signed=False),` → `row_count=int.from_bytes(data[25:34], "big", signed=False),` | len(data) == 33 is enforced above; data[25:34] clamps to data[25:33].
 | `x_decode_sched_age_key__mutmut_24` | `team_id=int.from_bytes(data[p + 8 : p + 16], "big", signed=False),` → `team_id=int.from_bytes(data[p + 8 : p + 17], "big", signed=False),` | len(data) == p+16 enforced; data[p+8:p+17] clamps to data[p+8:p+16].
 | `x_decode_prepared_key__mutmut_27` | `first_offset=_decode_i64_ordered(data[p + 8 : p + 16]),` → `first_offset=_decode_i64_ordered(data[p + 8 : p + 17]),` | len(data) == p+16 enforced; data[p+8:p+17] clamps to data[p+8:p+16].
-| `x_decode_poison_value__mutmut_152` | `quarantined_at_us = int.from_bytes(data[pos : pos + 8], "big")` → `quarantined_at_us = int.from_bytes(data[pos : pos + 9], "big")` | len(data) == pos+8 enforced by the v2-tail guard one statement up; the +9 stop clamps to pos+8.
 
 ### Class E6 — `or` ≡ `and` behind the dataclass's own guard (1)
 
@@ -455,7 +365,7 @@ the `not`/`is` flips of either disjunct.)
 
 | `x_encode_prepared_value__mutmut_12` | `if topic is None or partition is None:` → `if topic is None and partition is None:` | reachable only with exactly one None — `PreparedRequest.__post_init__` forbids that state. |
 
-### Class M — error-message text the suite deliberately does not pin (52)
+### Class M — error-message text the suite deliberately does not pin (44)
 
 The suite pins exception TYPE plus a stable identifying substring (the
 field name, or the failed parse stage) and deliberately leaves wording
@@ -514,14 +424,6 @@ f-string fragments separately.)
 | `xǁFlushedKeyǁ__post_init____mutmut_5` | `_require_uint64("team_id", self.team_id)` → `_require_uint64("XXteam_idXX", self.team_id)` | field-name arg feeds only the error message; pinned by test_flushed_key_field_validation.
 | `xǁFlushedKeyǁ__post_init____mutmut_11` | `_require_int64("first_offset", self.first_offset)` → `_require_int64("XXfirst_offsetXX", self.first_offset)` | same — pinned by test_flushed_key_field_validation.
 | `xǁFlushedKeyǁ__post_init____mutmut_17` | `_require_int64("last_offset", self.last_offset)` → `_require_int64("XXlast_offsetXX", self.last_offset)` | same — pinned by test_flushed_key_field_validation.
-| `x_poison_key__mutmut_5` | `_require_int64("offset", offset)` → `_require_int64("XXoffsetXX", offset)` | field-name arg feeds only the error message; pinned by test_poison_key_round_trip_and_order (match='offset').
-| `xǁPoisonValueǁ__post_init____mutmut_5` | `raise ValueError("reason must be non-empty")` → `raise ValueError("XXreason must be non-emptyXX")` | error text only; pinned by test_poison_value_validation (match='reason must be non-empty' survives the decoration).
-| `xǁPoisonValueǁ__post_init____mutmut_28` | `_require_uint64("quarantined_at_us", self.quarantined_at_us)` → `_require_uint64("XXquarantined_at_usXX", self.quarantined_at_us)` | field-name arg feeds only the error message; pinned by test_poison_value_validation (match='quarantined_at_us' survives the XX wrapping).
-| `x_decode_poison_value__mutmut_7` | `raise ValueError(f"unknown poison value version {data[0]}")` → `raise ValueError(f"unknown poison value version {data[1]}")` | the reported byte in the message, not the raise; pinned by test_poison_value_decode_refusals (match='version').
-| `x_decode_poison_value__mutmut_126` | `f"trailing bytes ({len(data) - pos} left at {pos})"` → `f"trailing bytes ({len(data) + pos} left at {pos})"` | arithmetic inside the message, not the guard; pinned by test_poison_value_decode_refusals (match='trailing|length mismatch').
-| `x_decode_poison_value__mutmut_123` | `if len(data) < pos + 4:` → `if len(data) < pos - 4:` | which of the two guards refuses a valueless-envelope truncation, not WHETHER it is refused: the v1 tail's `len(data) != pos` backstop (and v2's `!= pos + 8`) catches every cut the weakened first guard lets through; both messages carry the pinned "length mismatch" (test_poison_value_truncation_stages_without_a_value), and no input parses under one form and refuses under the other. |
-| `x_decode_poison_value__mutmut_145` | `f"({len(data) - pos} byte(s) left at {pos}, need exactly 8)"` → `f"({len(data) + pos} byte(s) left at {pos}, need exactly 8)"` | arithmetic inside the v2-tail truncation message, not the guard; pinned by test_poison_value_v2_truncated_timestamp_tail (match='quarantined_at_us').
-| `x_decode_poison_value__mutmut_157` | `f"poison value length mismatch: trailing bytes "` fragment → the same fragment's `len(data) - pos` → `len(data) + pos` | arithmetic inside the message, not the guard; pinned by test_poison_value_decode_refusals (match='length mismatch').
 | `x_team_prepared_range__mutmut_5` | `_require_uint64("team_id", team_id)` → `_require_uint64("XXteam_idXX", team_id)` | field-name arg feeds only the error message; pinned by test_team_prepared_range_validates_team_id (loose match still finds 'team_id'). (M4's outstanding-entry gate range.)
 <!-- total 135 -->
 

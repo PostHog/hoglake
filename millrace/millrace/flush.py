@@ -4,7 +4,7 @@ One key's flush (docs/kafka-ingestion.md §The flush planner and §The
 wire contract) — a key is one hoglake partition tuple's staged rows
 (the consumer staged each record under the tuple the destination's spec
 gave it at consume time): scan the staged range → decode payloads (v1:
-JSON values) → clamp/quarantine junk ``event_time`` → one parquet file
+JSON values) → clamp/drop junk ``event_time`` → one parquet file
 per partition tuple under the table's LIVE partition spec (exactly one
 file in the steady state, where the staged tuple and the live spec
 agree; more when the group was keyed under an older spec or the junk
@@ -79,30 +79,20 @@ Refusal taxonomy (each recovery pinned by its own test):
   the IDENTICAL persisted request, bounded attempts. Exhaustion leaves
   the persisted entry in place; the next sweep replays it (receipt
   lookup first).
-- 422 ``record_validation``: quarantine the DECISION — every row of the
-  window is written to ``poison/`` (the original payloads, WHOLE — a
-  flush-time quarantine is never capped, because the staged rows are
-  deleted at settlement and the poison entry is the only surviving copy)
-  and the range is settled WITHOUT a commit (no receipt exists to
-  reconcile, so recovery never looks for one) — recorded, counted,
-  logged, and the loop is never wedged. ``record_validation`` — the
-  server judging RECORDS — is the ONLY 422 that may do this
-  (:data:`_is_record_validation_refusal`); it is deliberately precise,
-  and no current server emits it (footer-shipping means the server never
-  opens the parquet, so its whole 422 vocabulary is request-shape). A
-  422 saying the idempotency key was reused with a DIFFERENT request is
-  its own halt: with deterministic derivation that means a foreign
-  writer or broken determinism, and the pipeline halts instead of
-  settling rows a stranger may not have published.
+- A 422 saying the idempotency key was reused with a DIFFERENT request
+  is its own halt (``idempotency_key_reused``): with deterministic
+  derivation that means a foreign writer or broken determinism, and the
+  pipeline halts instead of settling rows a stranger may not have
+  published.
 - EVERY OTHER answered 4xx (a 401/403 from a proxy, a 413 from an
-  ingress, a plain 400, a request-shape ``validation`` 422): HALT with
-  the rows staged, exactly like ``idempotency_key_reused`` and
-  ``destination_missing`` — the payload was judged by something, but a
-  refusal that does not name bad RECORDS says nothing about the rows,
-  and the persisted ``prepared/`` entry plus the staged rows are the
-  operator's reconciliation material. (The pre-fix behavior quarantined
-  the whole window — truncated and deleted — on any answered 4xx, which
-  is why this paragraph exists.)
+  ingress, a plain 400, any 422 — request-shape ``validation`` or
+  otherwise): HALT (``commit_refused``) with the rows staged, exactly
+  like ``idempotency_key_reused`` and ``destination_missing``. No
+  answered refusal deletes staged rows: the persisted ``prepared/``
+  entry plus the staged rows are the operator's reconciliation
+  material. (The pre-fix behavior discarded
+  the whole window on any answered 4xx, which is why this paragraph
+  exists.)
 
 The staged scan order is KAFKA-RECORD time (the row key's timestamp is
 the record timestamp the consumer staged under); the catalog's sort spec
@@ -197,16 +187,16 @@ corruption rather than replayed under it.
 Junk ``event_time`` policy: the check applies to the decoded values of
 the live partition spec's TEMPORAL source columns (a ``month(timestamp)``
 spec makes ``timestamp`` the checked column). Out-of-window values are
-quarantined (the original payload lands in ``poison/`` with the
-consumer's durability discipline) or clamped to the window edge,
-per config; staged rows are NEVER mutated. A spec without a temporal
+dropped (logged and counted under ``event_time_out_of_window``; the
+row is deleted by its window's ordinary settlement) or clamped to the
+window edge, per config; staged rows are NEVER mutated. A spec without a temporal
 source leaves the policy with nothing to check (a documented no-op).
 
 Decoder: v1 is JSON objects behind the :class:`PayloadDecoder`
 protocol (a registry/Avro decoder slots in later). Column values are
 coerced per record with per-record failure routing: a record that
-cannot decode or cast lands in ``poison/`` and never crashes the
-flush. Strict JSON: the NaN/Infinity literals are refused at parse
+cannot decode or cast is dropped (logged and counted) and never crashes
+the flush. Strict JSON: the NaN/Infinity literals are refused at parse
 time, and magnitude-overflow literals (``1e400`` parses to ``inf``
 WITHOUT tripping the parse hook) are refused at coercion — nothing
 non-finite reaches a float column or its stats, and integer values
@@ -225,8 +215,9 @@ binary-as-base64, uuid, decimal, date, time, and the timestamp family
 from epoch ints in the column's own unit or strict ISO-8601 strings);
 ``json``/nested/``variant`` columns are a STARTUP refusal naming the
 column, not a runtime surprise. Should a value still defeat the batch
-build (encoder drift), the build isolates the guilty record and
-quarantines it — one malformed record never loses the batch.
+build (encoder drift), the build isolates the guilty record and drops
+it (``uncastable_column``) — one malformed record never loses the
+batch.
 
 Sync/async discipline: pyhoglake is synchronous, so every client call
 (table reads, uploads, commits, receipt lookups) runs on the flusher's
@@ -250,6 +241,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import timedelta
 from functools import partial
 from typing import Any, Final, Literal, Protocol, TypeVar
@@ -316,8 +308,8 @@ from .planner import (
     plan_flush,
 )
 from .stage import (
+    DroppedRecord,
     PartitionStage,
-    PoisonedRecord,
     RecoveredPrepared,
     StageClosedError,
     StageCorruptionError,
@@ -332,12 +324,11 @@ _R = TypeVar("_R")
 
 _MICROS_PER_SECOND: Final = 1_000_000
 
-# -- the flush's bounded quarantine vocabulary (the keyspace poison envelope
-# stores these strings; the decode half — undecodable_payload,
-# uncastable_column — lives in coerce.py, and the consumer's REASON_*
-# constants cover the consume-time half) --
+# -- the flush's bounded drop vocabulary (the
+# ``millrace_records_dropped_total`` reason label; the decode half —
+# undecodable_payload, uncastable_column — lives in coerce.py, and the
+# consumer's REASON_* constants cover the consume-time half) --
 REASON_EVENT_TIME_OUT_OF_WINDOW: Final = "event_time_out_of_window"
-REASON_FLUSH_REFUSED: Final = "flush_refused"
 
 # The publish retry ladders. 503 commit_queue_timeout / 5xx / transport
 # failures are AMBIGUOUS and retry the identical persisted request; a plain
@@ -366,20 +357,6 @@ _ASSUMED_RETENTION_S: Final = 1800.0
 # {error, detail} and for a 422 the sentence is in the detail).
 _REUSED_KEY_MARKER: Final = "idempotency_key reused"
 
-# The ONLY answered refusal that may quarantine staged rows: a 422 whose
-# error code is the reserved ``record_validation`` — the server judged the
-# RECORDS, not the request. hoglake's commit path emits no such code today:
-# footer-shipping means the server never opens the parquet, so every 422 it
-# can produce is ``error="validation"`` over the REQUEST's shape (blank
-# path, bad counts, stats naming a dead field id, partition arity, key
-# reuse — CommitService.validateFiles' whole vocabulary) — a writer bug or
-# a stale basis, never a bad row. This arm is therefore deliberately
-# unreachable against the current wire, and every OTHER answered 4xx halts
-# with the rows staged (fail-safe: an unknown 422 shape is never answered
-# by deleting data). A future server-side per-record refusal lands here by
-# emitting exactly this code.
-_RECORD_VALIDATION_CODE: Final = "record_validation"
-
 # How long the offsets line of a commit message may be, in bytes (the
 # server stores `message` as unbounded text; this bound is millrace's own).
 # Truncation keeps the FIRST and LAST range verbatim — the last range's end
@@ -390,6 +367,7 @@ _MESSAGE_OFFSETS_LIMIT: Final = 16384
 _TEMPORAL_TRANSFORMS: Final = frozenset({"year", "month", "day", "hour"})
 
 _ORPHAN_URIS_LOGGED: Final = 20
+_DROPPED_OFFSETS_LOGGED: Final = 20
 
 _VERSION: str | None = None
 
@@ -424,11 +402,10 @@ class FlushStartupError(FlushError):
 class FlushHalted(FlushError):
     """The pipeline must stop loudly (viaduck lesson 3/4 posture):
     ``table_recreated``, a 410 below the expiry floor, an idempotency-key
-    identity anomaly, the destination gone, an answered 4xx that is NOT
-    a per-record validation (``commit_refused`` — the rows stay staged
-    and the persisted entry stays for an operator; only a 422
-    ``record_validation`` may quarantine, never a request-shape
-    refusal), a settlement that disagrees with the scan, a fanout the
+    identity anomaly, the destination gone, any other answered 4xx
+    (``commit_refused`` — the rows stay staged and the persisted entry
+    stays for an operator; no answered refusal deletes rows), a
+    settlement that disagrees with the scan, a fanout the
     commit bound cannot hold, or a persisted ``prepared/`` entry whose
     receipt 404s PAST the receipt horizon (replaying it could duplicate
     an already-executed commit — operator reconciliation, never a blind
@@ -458,14 +435,17 @@ class FlushStats:
     """Cumulative flush counters (passive observability — nothing here
     feeds control flow; the operational surface reads a snapshot).
     ``commit_attempts`` counts every commit RPC including retried ones;
-    ``commit_retries`` counts only the retried ones, split by cause."""
+    ``commit_retries`` counts only the retried ones, split by cause.
+    ``records_dropped`` maps a flush-time drop reason to its row count;
+    ``decisions_dropped`` counts decisions that dropped EVERY row (settled
+    without a commit)."""
 
     flushes_committed: int = 0
     flushes_replayed: int = 0
     receipt_settlements: int = 0
     reprepares: int = 0
-    decisions_quarantined: int = 0
-    records_quarantined: int = 0
+    decisions_dropped: int = 0
+    records_dropped: Mapping[str, int] = dataclass_field(default_factory=dict)
     rows_published: int = 0
     files_written: int = 0
     bytes_written: int = 0
@@ -579,7 +559,7 @@ class PayloadDecoder(Protocol):
 
 class JsonObjectDecoder:
     """v1 decoder: staged payloads are JSON objects; keys are column
-    names. Defensive per record (the flush quarantines failures, never
+    names. Defensive per record (the flush drops failures, never
     crashes): strict JSON (no NaN/Infinity literals — and no
     magnitude-overflow literals: ``1e400`` parses to ``inf`` without
     tripping the parse hook, and the float coercion refuses anything
@@ -944,7 +924,7 @@ def format_commit_message(
     group: str,
     trigger: FlushTrigger,
     records: int,
-    quarantined: int,
+    dropped: int,
     files: int,
     partitions: int,
     staged_bytes: int,
@@ -976,7 +956,7 @@ def format_commit_message(
     """
     summary = (
         f"millrace=v1 table={table_uuid} group={group} trigger={trigger} "
-        f"records={records} quarantined={quarantined} files={files} "
+        f"records={records} dropped={dropped} files={files} "
         f"partitions={partitions} staged_bytes={staged_bytes} "
         f"arrow_bytes={arrow_bytes} millrace={_message_token(version)}"
     )
@@ -1019,7 +999,7 @@ def parse_message_offsets(
     writes or a bug), refused loudly rather than guessed at. The first
     range's start and the LAST range's end are the window's bounds —
     truncation elides only middle ranges, so they always survive.
-    Staged offsets are non-negative (the consumer quarantines anything
+    Staged offsets are non-negative (the consumer drops anything
     else), which is what makes the ``f-l`` spelling unambiguous."""
     for line in message.splitlines():
         match = _OFFSETS_LINE.match(line)
@@ -1058,7 +1038,7 @@ def parse_message_offsets(
 
 #: What one flush becomes on the wire.
 FlushOutcome = Literal[
-    "committed", "replayed", "receipt_settled", "reprepare", "quarantined", "empty"
+    "committed", "replayed", "receipt_settled", "reprepare", "dropped", "empty"
 ]
 
 
@@ -1098,7 +1078,8 @@ def _covered_window(
     in-record offset in ``[m, K]`` is scanned — ranges are walked
     against the sorted scan; a range fully covered is skipped
     arithmetically, a range with a hole ends the window at the hole.
-    Runs of offsets belonging to other groups or to quarantined records
+    Runs of offsets belonging to other groups or to records the consumer
+    dropped
     (gaps BETWEEN ranges) need no coverage.
 
     Pure; deterministic in its inputs (the window's identity comes from
@@ -1161,16 +1142,17 @@ class PreparedPlan:
     """The pure half of a flush: the complete commit request and the
     parquet it registers, built without a single I/O.
 
-    ``payload`` is None exactly when every scanned row was quarantined
-    (nothing may be committed; the decision settles as quarantined).
+    ``payload`` is None exactly when every scanned row was dropped
+    (nothing may be committed; the decision settles as dropped).
     ``uploads`` are the buffers to write; ``uris`` names every one of
-    them in input order for orphan accounting. ``quarantined`` holds the
-    poison entries to persist BEFORE publication."""
+    them in input order for orphan accounting. ``dropped_records`` are
+    the rows left out of the payload (scan order) — counted and logged by
+    the caller, deleted by the window's ordinary settlement."""
 
     payload: dict[str, Any] | None
     uploads: tuple[Upload, ...]
     uris: tuple[str, ...]
-    quarantined: tuple[PoisonedRecord, ...]
+    dropped_records: tuple[DroppedRecord, ...]
     records: int
     files: int
     partition_tuples: int
@@ -1237,29 +1219,17 @@ def build_prepared_plan(
 
     staged_bytes = sum(len(payload) for _, payload in records)
     good: list[tuple[keyspace.RowKey, bytes, DecodedRecord]] = []
-    quarantined: list[PoisonedRecord] = []
+    dropped_records: list[DroppedRecord] = []
     dropped_keys: set[str] = set()
 
-    def poison(row_key: keyspace.RowKey, payload: bytes, reason: str) -> None:
-        # The WHOLE payload, never truncated: the staged row is deleted
-        # at settlement, so the poison entry is the only surviving copy —
-        # a flush-time quarantine is not the consumer's forensic cap
-        # (PR #331 review).
-        quarantined.append(
-            PoisonedRecord(
-                offset=row_key.offset,
-                reason=reason,
-                key=None,
-                value=payload,
-                value_bytes_original=len(payload),
-            )
-        )
+    def drop(row_key: keyspace.RowKey, reason: str) -> None:
+        dropped_records.append(DroppedRecord(row_key.offset, reason))
 
     for row_key, payload_bytes in records:
         try:
             record = decoder.decode_record(payload_bytes)
         except DecodeError as e:
-            poison(row_key, payload_bytes, e.reason)
+            drop(row_key, e.reason)
             continue
         dropped_keys.update(record.dropped_keys)
         junked = False
@@ -1270,8 +1240,8 @@ def build_prepared_plan(
             value_us = _value_to_micros(column.type, value)
             if window.contains(value_us):
                 continue
-            if event_time_policy is EventTimePolicy.QUARANTINE:
-                poison(row_key, payload_bytes, REASON_EVENT_TIME_OUT_OF_WINDOW)
+            if event_time_policy is EventTimePolicy.DROP:
+                drop(row_key, REASON_EVENT_TIME_OUT_OF_WINDOW)
                 junked = True
                 break
             # clamp mode: rewrite the DECODED value to the window edge —
@@ -1283,20 +1253,20 @@ def build_prepared_plan(
         good.append((row_key, payload_bytes, record))
 
     # The batch build. Coercion is total — every per-record failure above
-    # is a DecodeError and landed in the quarantine — so a failure HERE is
-    # encoder drift (a coercion that under-refuses). Isolate the guilty
-    # record and quarantine it rather than losing the whole batch to one
-    # value (one malformed record must never wedge the flush).
+    # is a DecodeError and was dropped — so a failure HERE is encoder
+    # drift (a coercion that under-refuses). Isolate the guilty record and
+    # drop it rather than losing the whole batch to one value (one
+    # malformed record must never wedge the flush).
     table, encoded, build_guilty = _build_batch_isolating(good, decoder.columns)
-    for bad_key, bad_payload, _bad_record in build_guilty:
-        poison(bad_key, bad_payload, REASON_UNCASTABLE_COLUMN)
+    for bad_key, _bad_payload, _bad_record in build_guilty:
+        drop(bad_key, REASON_UNCASTABLE_COLUMN)
 
     if not good:
         return PreparedPlan(
             payload=None,
             uploads=(),
             uris=(),
-            quarantined=tuple(quarantined),
+            dropped_records=tuple(dropped_records),
             records=0,
             files=0,
             partition_tuples=0,
@@ -1343,7 +1313,7 @@ def build_prepared_plan(
         group=keyspace.group_label(ctx.group_fields, ctx.group),
         trigger=ctx.trigger,
         records=sum(part.num_rows for _, part in groups),
-        quarantined=len(quarantined),
+        dropped=len(dropped_records),
         files=len(groups),
         partitions=sum(1 for values, _ in groups if values is not None),
         staged_bytes=staged_bytes,
@@ -1372,7 +1342,7 @@ def build_prepared_plan(
             if not prepared_schema_matches(parquet.schema_arrow, encode_schema):
                 # Unreachable while the decoder and the schema builder
                 # agree; a failure here is a bug in THIS process, so the
-                # decision raises (contained, loud) rather than quarantines.
+                # decision raises (contained, loud) rather than drops.
                 raise FlushError(
                     "encoded parquet schema/field ids differ from the "
                     "destination schema — a millrace encoder bug"
@@ -1413,7 +1383,7 @@ def build_prepared_plan(
         payload=payload,
         uploads=tuple(uploads),
         uris=tuple(uris),
-        quarantined=tuple(quarantined),
+        dropped_records=tuple(dropped_records),
         records=sum(part.num_rows for _, part in groups),
         files=len(groups),
         partition_tuples=sum(1 for values, _ in groups if values is not None),
@@ -1438,7 +1408,8 @@ def canonical_body(payload: Mapping[str, Any]) -> bytes:
 class FlushReport:
     """The outcome of one decision's flush (or replay). ``records`` are
     the rows THIS process published — 0 for a receipt settlement (some
-    earlier process published them) and for quarantines."""
+    earlier process published them) and for drops. ``dropped`` counts
+    the window's rows left out of the publication."""
 
     topic: str
     partition: int
@@ -1449,7 +1420,7 @@ class FlushReport:
     last_offset: int
     records: int = 0
     files: int = 0
-    quarantined: int = 0
+    dropped: int = 0
     snapshot_id: int | None = None
     idempotency_key: str | None = None
 
@@ -1469,30 +1440,6 @@ def _error_text(exc: HoglakeError) -> str:
     sentence is in the detail; a matcher that reads only ``message``
     matches nothing on a real response)."""
     return f"{exc.message} {exc.detail or ''}".lower()
-
-
-def _is_record_validation_refusal(exc: HoglakeError) -> bool:
-    """True iff this answered refusal is a 422 whose error code is the
-    reserved ``record_validation`` — the server judged RECORDS, not the
-    request, which is the ONLY refusal that may quarantine staged rows
-    (PR #331 review: the pre-fix shape quarantined the whole window on
-    ANY answered 4xx — a proxy's 401/403, an ingress 413, a transient
-    400, a request-shape ``validation`` 422 from an operator's mistaken
-    schema change — truncating to the poison cap and deleting the rows).
-
-    Precise by construction: pyhoglake maps 422 → ``ValidationError``
-    with ``message`` = the body's ``error`` field, so the match is
-    (a ``ValidationError``, status 422, code exactly
-    ``record_validation``) — never a substring of prose. hoglake's
-    commit path emits no such code today (the server never opens the
-    parquet, so its 422s are all request-shape), so this is deliberately
-    unreachable on the current wire; an unknown 422 shape fails safe
-    (the caller halts)."""
-    return (
-        isinstance(exc, ValidationError)
-        and exc.status_code == 422
-        and exc.message == _RECORD_VALIDATION_CODE
-    )
 
 
 def _payload_uris(payload: Mapping[str, Any]) -> tuple[str, ...]:
@@ -1828,8 +1775,8 @@ class HoglakeFlusher:
         self._flushes_replayed = 0
         self._receipt_settlements = 0
         self._reprepares = 0
-        self._decisions_quarantined = 0
-        self._records_quarantined = 0
+        self._decisions_dropped = 0
+        self._records_dropped: dict[str, int] = {}
         self._rows_published = 0
         self._files_written = 0
         self._bytes_written = 0
@@ -1882,8 +1829,8 @@ class HoglakeFlusher:
             flushes_replayed=self._flushes_replayed,
             receipt_settlements=self._receipt_settlements,
             reprepares=self._reprepares,
-            decisions_quarantined=self._decisions_quarantined,
-            records_quarantined=self._records_quarantined,
+            decisions_dropped=self._decisions_dropped,
+            records_dropped=dict(self._records_dropped),
             rows_published=self._rows_published,
             files_written=self._files_written,
             bytes_written=self._bytes_written,
@@ -2166,7 +2113,7 @@ class HoglakeFlusher:
                 ):
                     # An answered 4xx the taxonomy does not name: the
                     # payload was judged and cannot change by waiting —
-                    # the caller's quarantine arm decides.
+                    # the caller's refusal arms decide.
                     self._drop_shape()
                     raise
                 self._drop_shape()
@@ -2326,7 +2273,7 @@ class HoglakeFlusher:
             )
         window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
         # The window's rows as they stand now — the settlement guard's
-        # count, and (on a 422) the quarantine's payloads.
+        # count.
         window_rows = [
             (row_key, payload_bytes)
             async for row_key, payload_bytes in stage.scan_group_rows(group)
@@ -2446,32 +2393,9 @@ class HoglakeFlusher:
                     _payload_uris(payload),
                 ) from e
             status = e.status_code
-            if _is_record_validation_refusal(e):
-                # The server judged the RECORDS (not the request): the
-                # payload was judged, zero writes. Quarantine the
-                # window's rows — WHOLE payloads, never capped — and
-                # settle WITHOUT a commit (no receipt exists, so recovery
-                # never looks for one). Recorded, counted, logged, never
-                # wedging the loop.
-                self._count_orphans(
-                    _payload_uris(payload),
-                    f"the persisted commit for group {label} was refused "
-                    f"with {status} {_RECORD_VALIDATION_CODE}; the decision "
-                    "is quarantined",
-                    reason="commit_refused",
-                )
-                return await self._quarantine_window(
-                    stage,
-                    window,
-                    window_rows,
-                    key,
-                    status,
-                    _error_text(e),
-                    trigger="recovery",
-                )
             if status is not None and 400 <= status < 500:
                 # Any OTHER answered 4xx (a proxy's 401/403, an ingress
-                # 413, a plain 400, a request-shape "validation" 422):
+                # 413, a plain 400, any 422):
                 # nothing about it says the ROWS can never publish.
                 # Halt with the rows staged and the entry persisted —
                 # the operator reconciles — rather than truncate-and-delete
@@ -2481,9 +2405,8 @@ class HoglakeFlusher:
                     f"the persisted commit for {stage.topic}"
                     f"[{stage.partition}] group {label} offsets "
                     f"{first_offset}-{last_offset} (idempotency key {key}) "
-                    f"was answered {status}: {_error_text(e)}. An answered "
-                    "refusal that does not name a per-record validation "
-                    "proves nothing about the rows — they stay staged and "
+                    f"was answered {status}: {_error_text(e)}. No answered "
+                    "refusal deletes staged rows — they stay staged and "
                     "the pipeline halts for an operator.",
                     _payload_uris(payload),
                 ) from e
@@ -2517,72 +2440,37 @@ class HoglakeFlusher:
             idempotency_key=key,
         )
 
-    # -- quarantine settlement ----------------------------------------------------
+    # -- drops -------------------------------------------------------------------
 
-    async def _quarantine_window(
-        self,
-        stage: PartitionStage,
-        window: FlushedKey,
-        window_rows: list[tuple[keyspace.RowKey, bytes]],
-        key: str | None,
-        status: int | None,
-        detail: str,
-        *,
-        trigger: FlushTrigger | Literal["recovery"],
-    ) -> FlushReport:
-        """Quarantine a whole flush decision — reachable ONLY from the
-        ``record_validation`` 422 arm (the server judged the records, not
-        the request; every other answered 4xx halts). Every row of the
-        window lands in ``poison/`` with its ORIGINAL payload WHOLE — a
-        flush-time quarantine is never capped: the staged rows are
-        deleted at settlement, so the poison entry is the only surviving
-        copy (the consumer's ``poison_value_max_bytes`` cap is the
-        consume-time forensic path's, and does not apply here — PR #331
-        review) — then the range settles WITHOUT a commit (no receipt
-        exists, so recovery has nothing to reconcile). Recorded, counted,
-        logged; the loop is never wedged."""
-        await stage.poison_records(
-            (
-                PoisonedRecord(
-                    offset=row_key.offset,
-                    reason=REASON_FLUSH_REFUSED,
-                    key=None,
-                    value=payload,
-                    value_bytes_original=len(payload),
-                )
-                for row_key, payload in window_rows
-            ),
-            # stamped, so the retention purge reaches them
-            now_us=self._now_us(),
-        )
-        report = await stage.settle_quarantined(window)
-        self._guard_settlement(window, len(window_rows), report.rows_deleted)
-        self._decisions_quarantined += 1
-        self._records_quarantined += len(window_rows)
-        log.warning(
-            "flush decision quarantined: %s[%d] group %s offsets %d-%d "
-            "(%d rows to poison/) — the server refused the commit with %s: "
-            "%s",
-            stage.topic,
-            stage.partition,
-            window.label,
-            window.first_offset,
-            window.last_offset,
-            len(window_rows),
-            status,
-            detail,
-        )
-        return FlushReport(
-            topic=stage.topic,
-            partition=stage.partition,
-            group=window.group,
-            trigger=trigger,
-            outcome="quarantined",
-            first_offset=window.first_offset,
-            last_offset=window.last_offset,
-            quarantined=len(window_rows),
-            idempotency_key=key,
-        )
+    def _note_drops(
+        self, stage: PartitionStage, label: str, dropped: Sequence[DroppedRecord]
+    ) -> None:
+        """Count flush-time drops per reason
+        (``millrace_records_dropped_total{reason}``) and log them: one
+        WARNING per reason per decision, naming the group and the
+        offsets (the first :data:`_DROPPED_OFFSETS_LOGGED` of them).
+        Counted per build, so at-least-once: a decision rebuilt after an
+        upload or persist failure, or re-prepared after
+        ``ddl_since_read_snapshot``, counts and logs the same drops again
+        (the consumer's tally has the same property)."""
+        by_reason: dict[str, list[int]] = {}
+        for entry in dropped:
+            by_reason.setdefault(entry.reason, []).append(entry.offset)
+        for reason, offsets in sorted(by_reason.items()):
+            self._records_dropped[reason] = self._records_dropped.get(reason, 0) + len(
+                offsets
+            )
+            shown = offsets[:_DROPPED_OFFSETS_LOGGED]
+            log.warning(
+                "flush dropped %d records: %s[%d] group %s reason=%s offsets=%s%s",
+                len(offsets),
+                stage.topic,
+                stage.partition,
+                label,
+                reason,
+                ",".join(str(o) for o in shown),
+                "" if len(offsets) == len(shown) else ",…",
+            )
 
     def _guard_settlement(self, window: FlushedKey, scanned: int, deleted: int) -> None:
         """The settlement must delete EXACTLY the rows the flush saw:
@@ -2807,38 +2695,28 @@ class HoglakeFlusher:
                 )
         self._dropped_payload_keys += len(plan.dropped_keys)
 
-        # Quarantine BEFORE publication: a settlement never deletes a
-        # staged row whose poison entry has not survived it.
-        if plan.quarantined:
-            written = await stage.poison_records(
-                plan.quarantined, now_us=self._now_us()
-            )
-            self._records_quarantined += written
-            for entry in plan.quarantined:
-                log.warning(
-                    "flush-time quarantine: %s[%d]@%d reason=%s",
-                    stage.topic,
-                    stage.partition,
-                    entry.offset,
-                    entry.reason,
-                )
+        # Drops are counted and logged once per build; the dropped rows
+        # stay staged until the window's settlement deletes them with
+        # the published ones.
+        if plan.dropped_records:
+            self._note_drops(stage, label, plan.dropped_records)
 
         if plan.payload is None:
-            # Every row quarantined: nothing may be committed (a commit
+            # Every row dropped: nothing may be committed (a commit
             # registers at least one file). Settle WITHOUT a commit.
             window = FlushedKey(group, first_offset, last_offset, group_fields=fields)
-            report = await stage.settle_quarantined(window)
+            report = await stage.commit_flushed(window)
             self._guard_settlement(window, len(rows), report.rows_deleted)
-            self._decisions_quarantined += 1
+            self._decisions_dropped += 1
             return FlushReport(
                 topic=stage.topic,
                 partition=stage.partition,
                 group=group,
                 trigger=decision.trigger,
-                outcome="quarantined",
+                outcome="dropped",
                 first_offset=first_offset,
                 last_offset=last_offset,
-                quarantined=len(plan.quarantined),
+                dropped=len(plan.dropped_records),
                 idempotency_key=key,
             )
 
@@ -2954,32 +2832,9 @@ class HoglakeFlusher:
                     plan.uris,
                 ) from e
             status = e.status_code
-            if _is_record_validation_refusal(e):
-                # The server judged the RECORDS (not the request), zero
-                # writes. Quarantine the decision — whole payloads, never
-                # capped — and settle WITHOUT a commit.
-                self._count_orphans(
-                    plan.uris,
-                    f"the commit for group {label} was refused with "
-                    f"{status} {_RECORD_VALIDATION_CODE}; the decision is "
-                    "quarantined",
-                    reason="commit_refused",
-                )
-                window = FlushedKey(
-                    group, first_offset, last_offset, group_fields=fields
-                )
-                return await self._quarantine_window(
-                    stage,
-                    window,
-                    rows,
-                    key,
-                    status,
-                    _error_text(e),
-                    trigger=decision.trigger,
-                )
             if status is not None and 400 <= status < 500:
                 # Any OTHER answered 4xx (a proxy's 401/403, an ingress
-                # 413, a plain 400, a request-shape "validation" 422):
+                # 413, a plain 400, any 422):
                 # nothing about it says the ROWS can never publish. Halt
                 # with the rows staged and the prepared/ entry persisted —
                 # exactly the idempotency_key_reused / destination_missing
@@ -2990,8 +2845,7 @@ class HoglakeFlusher:
                     f"the commit for {stage.topic}[{stage.partition}] group "
                     f"{label} offsets {first_offset}-{last_offset} "
                     f"(idempotency key {key}) was answered {status}: "
-                    f"{_error_text(e)}. An answered refusal that does not "
-                    "name a per-record validation proves nothing about the "
+                    f"{_error_text(e)}. No answered refusal deletes staged "
                     "rows — they stay staged and the pipeline halts for an "
                     "operator.",
                     plan.uris,
@@ -3032,7 +2886,7 @@ class HoglakeFlusher:
             last_offset=last_offset,
             records=plan.records,
             files=plan.files,
-            quarantined=len(plan.quarantined),
+            dropped=len(plan.dropped_records),
             snapshot_id=result.snapshot_id,
             idempotency_key=key,
         )
@@ -3088,7 +2942,7 @@ class SweepReport:
     replayed: int
     receipt_settled: int
     reprepared: int
-    quarantined: int
+    dropped: int
     empty: int
     failed: int
     fenced: int = 0
@@ -3280,7 +3134,7 @@ class FlushRunner:
         self._reconciled &= open_set
         self._fenced &= open_set
         decisions = committed = replayed = receipt_settled = 0
-        reprepared = quarantined = empty = failed = 0
+        reprepared = dropped = empty = failed = 0
         gauge_map: dict[tuple[str, int], StageGauges] = {}
         eligible_oldest: dict[tuple[str, int], int] = {}
         work: list[tuple[PartitionStage, FlushDecision]] = []
@@ -3347,7 +3201,7 @@ class FlushRunner:
                     replayed += report.outcome == "replayed"
                     receipt_settled += report.outcome == "receipt_settled"
                     reprepared += report.outcome == "reprepare"
-                    quarantined += report.outcome == "quarantined"
+                    dropped += report.outcome == "dropped"
                     empty += report.outcome == "empty"
             try:
                 stats = await self._assemble_stats(stage)
@@ -3396,7 +3250,7 @@ class FlushRunner:
             replayed += report.outcome == "replayed"
             receipt_settled += report.outcome == "receipt_settled"
             reprepared += report.outcome == "reprepare"
-            quarantined += report.outcome == "quarantined"
+            dropped += report.outcome == "dropped"
             empty += report.outcome == "empty"
         self._sweeps += 1
         sweep = SweepReport(
@@ -3406,7 +3260,7 @@ class FlushRunner:
             replayed=replayed,
             receipt_settled=receipt_settled,
             reprepared=reprepared,
-            quarantined=quarantined,
+            dropped=dropped,
             empty=empty,
             failed=failed,
             fenced=len(self._fenced),
@@ -3415,7 +3269,7 @@ class FlushRunner:
         if decisions:
             log.info(
                 "flush sweep %d: %d decisions — %d committed, %d replayed, "
-                "%d receipt-settled, %d re-prepared, %d quarantined, "
+                "%d receipt-settled, %d re-prepared, %d dropped, "
                 "%d empty, %d failed",
                 self._sweeps,
                 decisions,
@@ -3423,7 +3277,7 @@ class FlushRunner:
                 replayed,
                 receipt_settled,
                 reprepared,
-                quarantined,
+                dropped,
                 empty,
                 failed,
             )

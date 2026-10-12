@@ -12,7 +12,6 @@ from millrace.config import (
     Config,
     ConfigError,
     EventTimePolicy,
-    PoisonConfig,
     load_config,
 )
 
@@ -54,13 +53,10 @@ def test_minimal_env_yields_the_documented_defaults():
     assert cfg.slow_lane_deadline_s == 21600
     assert cfg.min_flush_bytes == 1024 * 1024
     assert cfg.max_files_per_commit == 512
-    assert cfg.poison == PoisonConfig(
-        max_records_per_run=1000, value_max_bytes=1024 * 1024
-    )
     assert cfg.consume_batch_size == 65536
     assert cfg.consume_batch_max_bytes == 256 * 1024 * 1024
     assert cfg.poll_timeout_ms == 500
-    assert cfg.event_time_policy is EventTimePolicy.QUARANTINE
+    assert cfg.event_time_policy is EventTimePolicy.DROP
     assert cfg.metrics_port == 8000
     assert cfg.receipt_horizon_s == 6 * 86400  # below the server's 7 d default
     # The fleet policy default: latest (millpond's whole-retention
@@ -340,10 +336,6 @@ def test_stage_url_unknown_scheme():
         "MILLRACE_SLOW_LANE_DEADLINE_S",
         "MILLRACE_MIN_FLUSH_BYTES",
         "MILLRACE_MAX_FILES_PER_COMMIT",
-        "MILLRACE_POISON_MAX_RECORDS",
-        "MILLRACE_POISON_VALUE_MAX_BYTES",
-        "MILLRACE_POISON_RETENTION_S",
-        "MILLRACE_POISON_SWEEP_S",
         "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES",
         "MILLRACE_SLATEDB_L0_MAX_SSTS",
         "MILLRACE_CONSUME_BATCH_SIZE",
@@ -370,8 +362,6 @@ def test_positive_int_knobs_accept_valid_values():
             "MILLRACE_SLOW_LANE_DEADLINE_S": "43200",
             "MILLRACE_MIN_FLUSH_BYTES": "32",
             "MILLRACE_MAX_FILES_PER_COMMIT": "3",
-            "MILLRACE_POISON_MAX_RECORDS": "7",
-            "MILLRACE_POISON_VALUE_MAX_BYTES": "64",
             "MILLRACE_CONSUME_BATCH_SIZE": "11",
             "MILLRACE_CONSUME_BATCH_MAX_BYTES": "4096",
             "MILLRACE_POLL_TIMEOUT_MS": "42",
@@ -383,26 +373,10 @@ def test_positive_int_knobs_accept_valid_values():
     assert cfg.slow_lane_deadline_s == 43200
     assert cfg.min_flush_bytes == 32
     assert cfg.max_files_per_commit == 3
-    assert cfg.poison.max_records_per_run == 7
-    assert cfg.poison.value_max_bytes == 64
     assert cfg.consume_batch_size == 11
     assert cfg.consume_batch_max_bytes == 4096
     assert cfg.poll_timeout_ms == 42
     assert cfg.receipt_horizon_s == 3600
-
-
-# -- config-object guards --------------------------------------------------------------
-
-
-def test_poison_config_guards_direct_construction():
-    with pytest.raises(ValueError, match="MILLRACE_POISON_MAX_RECORDS"):
-        PoisonConfig(max_records_per_run=0, value_max_bytes=1)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_VALUE_MAX_BYTES"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=0)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_RETENTION_S"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=1, retention_s=0)
-    with pytest.raises(ValueError, match="MILLRACE_POISON_SWEEP_S"):
-        PoisonConfig(max_records_per_run=1, value_max_bytes=1, sweep_s=-5)
 
 
 # -- SlateDB writer tuning (T9) ------------------------------------------------------
@@ -452,31 +426,17 @@ def test_slatedb_knobs_parse_and_validate():
     assert "MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES" in p and "l0_sst_size_bytes" in p
 
 
-def test_poison_retention_knobs_parse():
-    cfg = load(MINIMAL_ENV)
-    assert cfg.poison.retention_s == 7 * 86400
-    assert cfg.poison.sweep_s == 3600
-    cfg = load(
-        MINIMAL_ENV
-        | {"MILLRACE_POISON_RETENTION_S": "86400", "MILLRACE_POISON_SWEEP_S": "60"}
-    )
-    assert cfg.poison.retention_s == 86400
-    assert cfg.poison.sweep_s == 60
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_POISON_RETENTION_S": "0"})
-    assert "MILLRACE_POISON_RETENTION_S" in p
-
-
 # -- remaining knobs ----------------------------------------------------------------------
 
 
 def test_event_time_policy():
-    assert load(MINIMAL_ENV).event_time_policy is EventTimePolicy.QUARANTINE
+    assert load(MINIMAL_ENV).event_time_policy is EventTimePolicy.DROP
     assert (
         load(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "clamp"}).event_time_policy
         is EventTimePolicy.CLAMP
     )
-    (p,) = problems(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "drop"})
-    assert "MILLRACE_EVENT_TIME_POLICY" in p and "clamp" in p and "quarantine" in p
+    (p,) = problems(MINIMAL_ENV | {"MILLRACE_EVENT_TIME_POLICY": "quarantine"})
+    assert "MILLRACE_EVENT_TIME_POLICY" in p and "clamp" in p and "drop" in p
 
 
 @pytest.mark.parametrize("raw", ["abc", "-1", "65536"])

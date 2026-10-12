@@ -30,9 +30,11 @@ deletes exactly the published rows after the server's receipt.
 publication:
 
 - A Kafka offset is committed only after every record at or below it is
-  durable in SlateDB (as a row or as a quarantine entry).
-- A staged row is deleted only after a commit receipt (or after it has
-  been durably copied to the quarantine).
+  durable in SlateDB or was dropped and counted (section 4, "Dropped
+  records").
+- A staged row is deleted only by the settlement of its window: after a
+  commit receipt, or with no commit when the flush dropped every row of
+  the window.
 - Every commit carries an idempotency key derived from `(table_uuid,
   topic, partition, partition tuple, first_offset, last_offset)`, and the request
   bytes are persisted before the first send. A replay republishes the
@@ -63,7 +65,6 @@ flowchart LR
   subgraph POD["millrace process (one per replica)"]
     C["consume loop<br/>consumer.py MillraceConsumer"]
     F["flush loop<br/>flush.py FlushRunner + HoglakeFlusher"]
-    PS["poison sweeper<br/>main.py PoisonSweeper"]
     OPS["ops server :8000<br/>/metrics /healthz /readyz"]
   end
   subgraph STORE["object store: staging root"]
@@ -81,7 +82,6 @@ flowchart LR
   C -->|"stage_batch"| S1
   F -->|"stats scan, row scan, settle"| S0
   F -->|"stats scan, row scan, settle"| S1
-  PS -->|"purge expired poison"| S0
   F -->|"PUT parquet"| LAKE
   F -->|"commit/prepared, commit/receipts"| H
   M -->|"run_gc_once, compactor state view"| STORE
@@ -89,8 +89,8 @@ flowchart LR
   P -->|"scrape"| M
 ```
 
-Inside one process the consume loop, the flush loop and the poison
-sweeper are asyncio tasks on one event loop sharing one
+Inside one process the consume loop and the flush loop are asyncio
+tasks on one event loop sharing one
 `stage.py:StageManager`. Blocking calls stay off that loop: librdkafka
 calls run on one dedicated worker thread (its consumer is
 single-threaded); pyhoglake calls and the parquet build run on the
@@ -100,7 +100,7 @@ with the pipeline.
 
 | Entry point | Owns | Exit codes |
 |---|---|---|
-| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, `PoisonSweeper`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM), 1 other failure (incl. poison flood and destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
+| `millrace` console script (`main.py:main`; also `python -m millrace.main`) | One topic → one table: config, `StageManager` (one SlateDB per claimed partition), `MillraceConsumer`, `HoglakeFlusher` + `FlushRunner`, ops server on `MILLRACE_METRICS_PORT` (default 8000) | 0 clean stop (SIGINT/SIGTERM), 1 other failure (incl. destination resolution failure at startup), 2 invalid config or missing `HOGLAKE_URL`, 3 flush pipeline halted (`FlushHalted`), 4 consumer fenced (`ConsumerFencedError`). Fenced outranks halted outranks generic (`main.py:_exit_code_for`). |
 | `python -m millrace.maintenance` (`maintenance.py:main`) | GC and L0-debt monitoring for every SlateDB under one staging root, all topics; ops server on `MILLRACE_MAINTENANCE_METRICS_PORT` (default 8001) | 0 clean stop, 1 failure, 2 invalid config |
 | Ops HTTP server (`server.py:serve`, a thread inside each process) | `GET /metrics` (Prometheus exposition), `/healthz` (liveness), `/readyz` (readiness); 404 otherwise | n/a |
 
@@ -198,13 +198,12 @@ one well-formed tuple.
 
 | Prefix | Key bytes | Value | Written by | Read by | Deleted by |
 |---|---|---|---|---|---|
-| `rows/` | `rows/` + group + record_ts_us i64ob + offset i64ob | Raw Kafka payload bytes | `stage.py:PartitionStage.stage_batch` | `scan_group_rows_bounded`, `scan_group_rows` (flush, recovery) | Settlement transaction (`commit_flushed`, `settle_quarantined`) |
+| `rows/` | `rows/` + group + record_ts_us i64ob + offset i64ob | Raw Kafka payload bytes | `stage.py:PartitionStage.stage_batch` | `scan_group_rows_bounded`, `scan_group_rows` (flush, recovery) | Settlement transaction (`commit_flushed`) |
 | `stats/` | `stats/` + group | v1, 33 B: `staged_bytes u64, first_staged_ts i64, last_staged_ts i64, row_count u64` | `stage_batch` (merge) | `iter_key_stats` (planner + gauges), `read_group_stats` (age/slow point reads) | Settlement (subtract, or delete on drain), `reconcile_stats` |
 | `sched_age/` | `sched_age/` + first_staged_ts i64ob + group | empty | `stage_batch`, when the group's stats entry is created | `iter_sched_age_through` (flush sweep) | Settlement on drain, `reconcile_stats` |
 | `offsets/` | `offsets/` + group | v1: count u16, then per range `topic_len u16, topic, partition u32, first i64, last i64`, sorted canonically | `stage_batch` (one span per group per batch; overlapping spans coalesced) | `read_offsets` (flush window and commit message) | Settlement clips the window out; key dropped with its last range |
 | `prepared/` | `prepared/` + group + first_offset i64ob | v4: `idempotency_key, topic, partition`, the group as hoglake partition values (`arity u8`, then per field `name, tag, value?`), `body` (exact request bytes), `persisted_at u64 µs`. Only v4 decodes. | `persist_prepared` (flush, before publication) | `list_prepared` (per-group gate), `load_prepared` via `recover` | Settlement transaction, `drop_prepared` (re-prepare) |
 | `flushed/` | legacy | legacy marker | nothing on this branch | nothing (not decoded) | `recover` collects leftovers in pages of 1000 |
-| `poison/` | `poison/` + offset i64ob (15 B) | v2: `reason, key?, value?, value_bytes_original u32, quarantined_at_us u64`. v1 has no stamp and is never purged. | `stage_batch` (consume-time, stamped), `poison_records` (flush-time, stamped) | `purge_poison_expired` (sweeper), `scan_poison` (forensics/tests); nothing on the data path | `purge_poison_expired` |
 
 `first_staged_ts` is set once, when a group's stats entry is created, and
 never advanced by later arrivals; it is born again only after a flush
@@ -212,12 +211,13 @@ drains the group's last row. After a partial settlement it keeps the
 older timestamp, which can only make the remaining rows flush earlier.
 
 Three durable units touch these prefixes. Everything one poll stages
-into one partition (rows, stats, sched, offsets, poison) is one
+into one partition (rows, stats, sched, offsets) is one
 `WriteBatch`, and `stage_batch` returns only after `await_durable()`, so
 accounting cannot drift from data even on a hard kill. `persist_prepared`
-is one durable `WriteBatch`. Settlement (`commit_flushed`,
-`settle_quarantined`) is one `SERIALIZABLE_SNAPSHOT` transaction run only
-with the receipt in hand, so the only ambiguous state after a crash is a
+is one durable `WriteBatch`. Settlement (`commit_flushed`) is one
+`SERIALIZABLE_SNAPSHOT` transaction run only with the receipt in hand
+(or with no commit at all, when the flush dropped every row of the
+window), so the only ambiguous state after a crash is a
 surviving `prepared/` entry. One asyncio lock per instance serializes
 this process's mutations (consume and flush share the instance); reads
 take no lock, and SlateDB iterators are snapshots as of creation.
@@ -272,13 +272,13 @@ sequenceDiagram
   K-->>W: records + rebalance callbacks
   W-->>C: messages
   C->>SM: apply queued assign/revoke via sync_assignment
-  C->>C: classify each record: parse JSON, key by partition tuple → StagedRecord, or PoisonedRecord
-  par one task per partition
-    C->>P0: stage_batch(rows, poison)
+  C->>C: classify each record: parse JSON, key by partition tuple → StagedRecord, or DroppedRecord (logged, counted)
+  par one task per partition with staged rows
+    C->>P0: stage_batch(rows)
     P0->>OS: WAL write
     OS-->>P0: durable
   and
-    C->>P1: stage_batch(rows, poison)
+    C->>P1: stage_batch(rows)
     P1->>OS: WAL write
     OS-->>P1: durable
   end
@@ -299,18 +299,18 @@ sequenceDiagram
    its fetched records are skipped; the new owner replays them.
 3. **Classify** each record (`classify_message`): parse the value once
    as a strict JSON object (`coerce.py:load_json_object`) and stage it
-   under the keyer's partition tuple; anything else is poison (below).
+   under the keyer's partition tuple; anything else is dropped (below).
    The Kafka message key is never read for staging. Error events and
    records without coordinates are counted and skipped, never committed
-   past explicitly. If this run's quarantined total would exceed
-   `MILLRACE_POISON_MAX_RECORDS`, raise `PoisonLimitExceeded` before
-   staging or committing anything from this poll.
-4. **Stage concurrently**: one `stage_batch` task per touched partition,
+   past explicitly.
+4. **Stage concurrently**: one `stage_batch` task per partition with
+   staged rows,
    `asyncio.gather(return_exceptions=True)`, so every partition's WAL
    write and durability wait overlap and every batch settles before any
    outcome is examined.
 5. **Commit** once, synchronously, for all touched partitions at
-   `last_handled + 1` (handled = staged or quarantined), only if every
+   `last_handled + 1` (handled = staged or dropped; a partition whose
+   poll was all drops commits with no `stage_batch`), only if every
    batch succeeded. Retry ladder: 3 attempts, 0.5 s then 1.0 s;
    exhaustion raises (offsets unadvanced, restart replays).
 
@@ -369,27 +369,28 @@ at once.
 | Consume: a `stage_batch` raises `Closed(FENCED)` | Close the fenced stages locally, raise `ConsumerFencedError` naming them. The failed batch's offsets are not committed. `/healthz` and `/readyz` 503 from that moment; the process exits 4, distinct from a crash because a restart onto the same assignment reopens the path, fences the new owner, and leaves two pods fencing each other with offsets never advancing. Any other `Closed` reason takes the generic error path. |
 | Flush: any `SlateError.Closed` at recovery, planning or mid-decision | `FlushRunner._note_fenced`: the partition leaves flush scheduling, logged once, listed in `fenced_partitions` and `millrace_flush_partition_fenced`; `/healthz` 503s. The mark clears when the assignment revokes the partition. This is how an idle partition's fence surfaces. |
 
-### Poison records
+### Dropped records
 
-A record that can never become a row is written to `poison/<offset>` in
-the same durable batch as the poll's rows, so the offset commit covers it
-like a staged row: counted (`millrace_records_poisoned_total`), logged,
-never silently dropped, never wedging the loop.
+A record that can never become a row is dropped: nothing is written for
+it, and the offset commit covers it trivially. `classify_message`
+returns `stage.py:DroppedRecord(offset, reason)`; `_note_drop` counts it
+in `millrace_records_dropped_total{reason}` and logs it at WARNING with
+topic, partition, offset and the full reason, at most one line per
+(partition, reason) per `consumer.py:DROP_LOG_INTERVAL_S` (10 s) of the
+monotonic clock — the first drop of a reason always logs, a later line
+carries the count suppressed since the last one.
 
-| Reason | Cause |
-|---|---|
-| `invalid_offset` | Offset < 0 or > int64 max |
-| `missing_timestamp` / `invalid_timestamp` | `TIMESTAMP_NOT_AVAILABLE`, or ms × 1000 overflows int64 |
-| `missing_value` | Tombstone |
-| `malformed_value` | The value is not a strict JSON object (not JSON, not an object, NaN/Infinity literals) |
-| `malformed_partition_source:<path>` | A partition source scalar is the wrong JSON type, fails its column's coercion, cannot take the transform (e.g. an instant outside Python's datetime range), sits under a non-object parent, or renders past 65,535 bytes; `<path>` is the source's dotted path. An absent or null source is a null component, not poison. |
+| Reason (log) | Label | Cause |
+|---|---|---|
+| `invalid_offset` | same | Offset < 0 or > int64 max |
+| `missing_timestamp` / `invalid_timestamp` | same | `TIMESTAMP_NOT_AVAILABLE`, or ms × 1000 overflows int64 |
+| `missing_value` | same | Tombstone |
+| `malformed_value` | same | The value is not a strict JSON object (not JSON, not an object, NaN/Infinity literals) |
+| `malformed_partition_source:<path>` | `malformed_partition_source` | A partition source scalar is the wrong JSON type, fails its column's coercion, cannot take the transform (e.g. an instant outside Python's datetime range), sits under a non-object parent, or renders past 65,535 bytes; `<path>` is the source's dotted path, kept out of the label (`consumer.py:drop_reason_label`). An absent or null source is a null component, not a drop. |
 
-The stored value is truncated to `MILLRACE_POISON_VALUE_MAX_BYTES` with the
-original length recorded. A flood (more than `MILLRACE_POISON_MAX_RECORDS`
-per process run) means a producer bug or payloads that do not match the
-destination's partition spec: the loop raises
-`PoisonLimitExceeded` without committing past the flood, the process exits
-1, and the restart replays and trips again until the cause is fixed.
+The flush drops records too (section 5, step 6); those share the
+counter under their own reasons. The count is per classification: a
+poll whose batch fails and replays counts its drops again.
 
 ### `auto.offset.reset`
 
@@ -486,7 +487,7 @@ sequenceDiagram
     FL->>ST: scan_group_rows_bounded(group, max_rows, max_bytes)
     FL->>ST: read_offsets(group)
     FL->>FL: window, idempotency key, build_prepared_plan (pure)
-    FL->>ST: poison_records(flush-time quarantines)
+    FL->>FL: count and log dropped records
     FL->>L: upload parquet files
     FL->>ST: persist_prepared(group, first_offset, exact body)
     FL->>H: POST /v1/catalogs/c/commit/prepared
@@ -525,14 +526,16 @@ sequenceDiagram
 5. **Build** (`build_prepared_plan`, pure, on the I/O pool): decode each
    payload as a JSON object against the table's columns
    (`JsonObjectDecoder`; undecodable or uncastable records are
-   quarantined, unknown keys dropped and logged once per key); apply the
-   junk `event_time` window `[now − MILLRACE_EVENT_TIME_MAX_PAST_S, now +
+   dropped — `undecodable_payload` / `uncastable_column` — unknown keys
+   dropped from the row and logged once per key); apply the junk
+   `event_time` window `[now − MILLRACE_EVENT_TIME_MAX_PAST_S, now +
    MILLRACE_EVENT_TIME_MAX_FUTURE_S]` to the decoded values of the
    partition spec's temporal sources (`year`/`month`/`day`/`hour`):
-   `quarantine` (default) poisons the record, `clamp` rewrites the
-   decoded value to the window edge, staged rows are never mutated;
-   Arrow build, isolating and quarantining any record that still defeats
-   it (`uncastable_column`); sort by the table's live sort spec (staging
+   `drop` (default) drops the record (`event_time_out_of_window`),
+   `clamp` rewrites the decoded value to the window edge, staged rows
+   are never mutated; Arrow build (`_build_batch_isolating`), isolating
+   and dropping the one record that still defeats it
+   (`uncastable_column`) so it cannot fail the batch; sort by the table's live sort spec (staging
    order is Kafka record time, the sort spec is payload time); fan out
    by the live partition spec, one file per tuple (exactly one when the
    staged group was keyed under the live spec and no temporal source was
@@ -544,10 +547,17 @@ sequenceDiagram
    `column_stats` only when the realized file is ≥
    `max(1, int(target × 0.5))` bytes (262,144,000 B at default; smaller
    files register without stats and the server's hydrator backfills).
-6. **Quarantine before publication.** Flush-time poison entries are
-   written durably, with whole payloads (never capped), before anything
-   is published. If every row was quarantined there is no payload: the
-   window settles via `settle_quarantined` with no commit.
+6. **Drops.** The plan's dropped records are counted in
+   `millrace_records_dropped_total{reason}` and logged, one WARNING per
+   reason per decision naming the group and the offsets (the first 20).
+   Nothing is written for them: they stay staged until the window's
+   settlement deletes them with the published rows. The count is per
+   build, so at-least-once: a decision rebuilt after an upload or
+   persist failure, or re-prepared after `ddl_since_read_snapshot`,
+   counts and logs the same drops again (as the consume side does for
+   a replayed poll). If every row was
+   dropped there is no payload: the window settles via `commit_flushed`
+   with no commit (outcome `dropped`).
 7. **Upload, then persist, then publish.** Upload failure counts the
    completed URIs as orphans and re-raises (contained); persist failure
    counts the whole fanout. The persisted body is
@@ -572,7 +582,7 @@ The request body:
 
 The message has no wall-clock or per-attempt content: line 1 is
 `millrace=v1 table=<uuid> group=<human form> trigger=<lane> records=…
-quarantined=… files=… partitions=… staged_bytes=… arrow_bytes=…
+dropped=… files=… partitions=… staged_bytes=… arrow_bytes=…
 millrace=<version>`,
 line 2 is `offsets topic=<t> partition=<p> ranges=a-b,c-d` (above 16,384
 bytes it keeps the first and last ranges and elides the middle).
@@ -588,13 +598,12 @@ stateDiagram-v2
   Staged --> Staged: more arrivals, first_staged_ts unchanged
   Staged --> Decided: a lane trips at a sweep
   Decided --> Empty: zero-row scan, reconcile_stats
-  Decided --> Settled: every row quarantined, settle_quarantined
+  Decided --> Settled: every row dropped, commit_flushed with no commit
   Decided --> Staged: upload or persist fails, orphans counted
   Decided --> Prepared: persist_prepared
   Prepared --> Committed: commit returns, or receipt 200 at recovery
   Prepared --> Staged: ddl_since_read_snapshot, entry dropped
   Prepared --> Prepared: ladder exhausted, replayed next sweep
-  Prepared --> Settled: 422 record_validation, window quarantined
   Prepared --> Halted: other answered 4xx, table_recreated, table_dropped, 410, past horizon
   Committed --> Settled: commit_flushed transaction
   Settled --> Empty: group drained
@@ -618,16 +627,12 @@ nothing: the payload is never resent.
 | 410 read snapshot expired | halt | `FlushHalted("read_snapshot_expired")` with the server's reconcile detail | `test_410_halts_with_the_servers_reconcile_instructions` |
 | 404 destination | halt | `FlushHalted("destination_missing")` | — |
 | 422 `idempotency_key reused` | halt | `FlushHalted("idempotency_key_reused")`: foreign writer or broken determinism | `test_422_reused_idempotency_key_halts` |
-| 422 with error code exactly `record_validation` | quarantine | Every window row to `poison/` (reason `flush_refused`, whole payload), `settle_quarantined`, no commit | `test_422_record_validation_quarantines_uncapped` |
-| Any other answered 4xx (400, 401, 403, 413, request-shape `validation` 422) except 408/429 | halt | `FlushHalted("commit_refused")`, rows and `prepared/` entry kept | `test_422_request_shape_halts_with_rows_staged`, `test_answered_4xx_halts_with_rows_staged` |
+| Any other answered 4xx (400, 401, 403, 413, any other 422 — request-shape `validation` or `record_validation`) except 408/429 | halt | `FlushHalted("commit_refused")`, rows and `prepared/` entry kept; no answered refusal deletes staged rows | `test_422_request_shape_halts_with_rows_staged`, `test_422_record_validation_halts_with_rows_staged`, `test_answered_4xx_halts_with_rows_staged` |
 | 503 `commit_queue_timeout`, other 5xx, 408, 429 | ambiguous | Resend identical bytes; up to 8 attempts, delay `max(min(0.5 × 2^(n−1), 30), Retry-After)`; then `FlushPublishExhausted`, entry kept | `test_503_commit_queue_timeout_backs_off_per_retry_after` |
 | Transport error (httpx/OSError) | ambiguous | Same as 5xx | `test_dropped_commit_response_replays_persisted_bytes_in_process` |
 
 `Retry-After` is captured from 429/503 responses by an httpx response
-hook (delta-seconds only) and consumed once. hoglake's commit path does
-not emit `record_validation` today (it never opens the parquet), so that
-arm is unreachable on the current server and every 422 it can produce
-halts. Every halt with uploaded objects counts and names them in
+hook (delta-seconds only) and consumed once. Every halt with uploaded objects counts and names them in
 `millrace_flush_orphaned_uploads_total` and the log, except
 `receipt_horizon_exceeded`, whose objects may be live data. All tests in
 this table are in `tests/test_flush.py`.
@@ -642,7 +647,7 @@ separate and never wait on each other.
 
 | Checkpoint | Where | Advances when |
 |---|---|---|
-| Consume | Kafka committed offset per partition | Every record at or below it is durable in SlateDB |
+| Consume | Kafka committed offset per partition | Every record at or below it is durable in SlateDB or was dropped and counted |
 | Publication | Per-group `prepared/` entry, then its removal in the settle transaction | Entry written after upload and before the first send; removed atomically with the published rows after the receipt |
 
 ### On open: `PartitionStage.recover`
@@ -691,7 +696,7 @@ at 30 d, where the server knob defaults to 7 d and refuses values under
 
 | Failure point | State left | On restart / next sweep |
 |---|---|---|
-| Before `stage_batch` is durable | Nothing committed in Kafka | Records re-consumed from last commit and re-staged; row and poison keys are derived from the record, so re-puts are idempotent |
+| Before `stage_batch` is durable | Nothing committed in Kafka | Records re-consumed from last commit and re-staged; row keys are derived from the record, so re-puts are idempotent |
 | After durable stage, before offset commit | Rows staged, offset behind | Same records re-put in place; `stats/` counters inflate (settle subtracts actuals; residue is removed by `reconcile_stats` when the group scans empty) |
 | After upload, before `persist_prepared` | Objects in lake, no entry | Orphans are counted only when the persist failed in-process (a crash counts nothing); next sweep rebuilds the window, same key and object names if the window is unchanged |
 | After persist, before commit landed | `prepared/` entry | Receipt 404 → verbatim replay inside the horizon |
@@ -783,17 +788,13 @@ default.
 | `MILLRACE_SLOW_LANE_DEADLINE_S` | 21600 (6 h) | 21600–86400 | Slow lane deadline |
 | `MILLRACE_MIN_FLUSH_BYTES` | 1048576 (1 MiB) | positive | Age lane size floor |
 | `MILLRACE_MAX_FILES_PER_COMMIT` | 512 | positive | Max files one decision may fan out to; exceeding it halts |
-| `MILLRACE_POISON_MAX_RECORDS` | 1000 | positive | Consume-time quarantines per process run before `PoisonLimitExceeded` |
-| `MILLRACE_POISON_VALUE_MAX_BYTES` | 1048576 (1 MiB) | positive | Cap on a consume-time quarantined value |
-| `MILLRACE_POISON_RETENTION_S` | 604800 (7 d) | positive | Age past which stamped `poison/` entries are purged |
-| `MILLRACE_POISON_SWEEP_S` | 3600 | positive | Poison sweeper cadence |
 | `MILLRACE_SLATEDB_GC_ENABLED` | `false` | true/false/1/0/yes/no | Writer-embedded SlateDB GC |
 | `MILLRACE_SLATEDB_MAX_UNFLUSHED_BYTES` | 268435456 (256 MiB) | positive, > 67108864 (64 MiB, the unoverridden `l0_sst_size_bytes`) | Per-instance unflushed memtable+WAL bound |
 | `MILLRACE_SLATEDB_L0_MAX_SSTS` | 8 | positive | L0 depth at which writes stall |
 | `MILLRACE_CONSUME_BATCH_SIZE` | 65536 | positive | Record cap per poll |
 | `MILLRACE_CONSUME_BATCH_MAX_BYTES` | 268435456 (256 MiB) | positive | Byte cap per poll (via observed mean record size) |
 | `MILLRACE_POLL_TIMEOUT_MS` | 500 | positive | Poll block bound; also stop latency |
-| `MILLRACE_EVENT_TIME_POLICY` | `quarantine` | `quarantine` \| `clamp` | Flush-time junk `event_time` handling |
+| `MILLRACE_EVENT_TIME_POLICY` | `drop` | `drop` \| `clamp` | Flush-time junk `event_time` handling |
 | `MILLRACE_EVENT_TIME_MAX_PAST_S` | 2592000 (30 d) | positive | Junk window lower bound |
 | `MILLRACE_EVENT_TIME_MAX_FUTURE_S` | 86400 (1 d) | positive | Junk window upper bound |
 | `MILLRACE_RECEIPT_HORIZON_S` | 518400 (6 d) | positive | Max age of a `prepared/` entry that may be replayed on a receipt 404 |
@@ -826,7 +827,7 @@ feeds control flow.
 |---|---|---|---|
 | `millrace_messages_consumed_total` | counter | — | Kafka messages returned by `consume()` |
 | `millrace_records_staged_total` | counter | — | Rows durably staged |
-| `millrace_records_poisoned_total` | counter | — | Consume-time quarantines |
+| `millrace_records_dropped_total` | counter | `reason` | Malformed records dropped, consume and flush time (section 4, "Dropped records"; section 5, step 6). Consume reasons: `invalid_offset`, `missing_timestamp`, `invalid_timestamp`, `missing_value`, `malformed_value`, `malformed_partition_source`. Flush reasons: `undecodable_payload`, `uncastable_column`, `event_time_out_of_window` |
 | `millrace_kafka_commits_total` | counter | — | Offset commit attempts, including retries |
 | `millrace_flushes_committed_total` | counter | — | Decisions committed by this process |
 | `millrace_flushes_replayed_total` | counter | — | Persisted requests republished at reconciliation |
@@ -835,8 +836,6 @@ feeds control flow.
 | `millrace_flush_rows_published_total` | counter | — | Rows in committed files |
 | `millrace_flush_files_written_total` | counter | — | Parquet files committed |
 | `millrace_flush_orphaned_uploads_total` | counter | — | Uploaded objects no commit references (upper bound; names are logged) |
-| `millrace_flush_records_quarantined_total` | counter | — | Flush-time quarantined rows |
-| `millrace_poison_entries_purged_total` | counter | — | `poison/` entries deleted by retention |
 | `millrace_flush_partition_fenced` | gauge (1) | `topic`, `partition` | Partition fenced out of flush scheduling |
 | `millrace_staged_bytes` | gauge | — | Staged payload bytes, pod total |
 | `millrace_staged_rows` | gauge | — | Staged rows, pod total |
@@ -967,7 +966,7 @@ cooperative for deployments without a barrier.
 | `millrace_slatedb_write_stalls_total`, `millrace_slatedb_l0_stalls_total` | Flat | Increasing |
 | `millrace_maintenance_compaction_l0_ssts_max` | Well below `MILLRACE_SLATEDB_L0_MAX_SSTS` (8) | Approaching it: a writer's compactor is losing |
 | `millrace_maintenance_sweep_truncated`, `..._sweep_failures_total` | 0 / flat | Truncation every sweep: raise the budget |
-| `millrace_records_poisoned_total`, `millrace_flush_records_quarantined_total` | Near zero | Steps: payloads that do not match the partition spec, a producer bug, or junk event time |
+| `millrace_records_dropped_total` | Near zero | Steps: payloads that do not match the partition spec, a producer bug, or junk event time (the `reason` label says which) |
 | `millrace_flush_orphaned_uploads_total` | Flat | Increasing: delete the logged object names, never the shared prefix |
 
 ## 11. Invariants
@@ -976,7 +975,7 @@ Each is pinned by the named test(s) under `tests/`.
 
 | # | Invariant | Tests |
 |---|---|---|
-| 1 | Offsets commit only after the staged batch is remotely durable. | `test_consumer.py::test_end_to_end_staged_rows_and_committed_offsets_cover`, `test_stage.py::test_offset_commit_invariant_call_order`, `test_stage.py::test_ack_hook_fires_only_after_remote_durability`, `test_stage.py::test_every_write_path_awaits_durability_before_returning` |
+| 1 | Offsets commit only after the staged batch is remotely durable; a dropped record needs no ack. | `test_consumer.py::test_end_to_end_staged_rows_and_committed_offsets_cover`, `test_stage.py::test_offset_commit_invariant_call_order`, `test_stage.py::test_ack_hook_fires_only_after_remote_durability`, `test_stage.py::test_every_write_path_awaits_durability_before_returning` |
 | 2 | One poll's partitions stage concurrently, and the single commit follows every ack. | `test_consumer.py::test_partitions_stage_concurrently_within_one_poll` |
 | 3 | A failed stage or exhausted commit ladder commits nothing. | `test_consumer.py::test_a_failed_batch_commits_nothing`, `test_consumer.py::test_commit_exhaustion_raises_without_committing` |
 | 4 | Every acknowledged row survives SIGKILL, byte-exact, batch-atomic, with stats reconciled. | `test_stage_integration.py::test_durability_across_hard_kill` |
@@ -989,13 +988,13 @@ Each is pinned by the named test(s) under `tests/`.
 | 11 | A receipt 404 replays only inside the horizon; past it the pipeline halts and stays halted. | `test_flush.py::test_entry_at_exactly_the_horizon_still_replays`, `test_flush.py::test_entry_past_the_horizon_halts_without_replaying`, `test_flush.py::test_the_runner_halts_and_stays_halted_past_the_horizon` |
 | 12 | Two partitions flushing one group over the same offsets get distinct keys and object URIs; an entry naming another partition or another partition tuple is corruption. | `test_keyspace.py::test_identical_window_on_two_partitions_yields_different_keys`, `test_flush.py::test_two_partitions_same_group_same_offsets_distinct_keys_and_uris`, `test_flush.py::test_a_prepared_entry_naming_another_partition_is_corruption`, `test_flush.py::test_an_envelope_naming_another_partition_tuple_is_corruption` |
 | 13 | Every commit carries `read_snapshot` and `expected_table_uuid`; every table read is `totals=false`; the shape read precedes the scan; the cache TTL is retention ÷ 4. | `test_flush.py::test_flush_commits_the_wire_contract`, `test_flush.py::test_identity_reads_are_totals_false_everywhere`, `test_flush.py::test_the_shape_read_precedes_the_staged_scan`, `test_flush.py::test_shape_cache_ttl_is_a_quarter_of_retention` |
-| 14 | Only a 422 coded `record_validation` quarantines a window, uncapped; every other answered 4xx halts with rows staged. | `test_flush.py::test_422_record_validation_quarantines_uncapped`, `test_flush.py::test_record_validation_refusal_matcher_is_precise`, `test_flush.py::test_answered_4xx_halts_with_rows_staged`, `test_flush.py::test_recovery_replay_answered_plain_422_halts` |
+| 14 | No answered refusal deletes staged rows: every answered 4xx other than the named arms (`record_validation` 422 included) halts with rows and `prepared/` entry staged. | `test_flush.py::test_422_record_validation_halts_with_rows_staged`, `test_flush.py::test_422_request_shape_halts_with_rows_staged`, `test_flush.py::test_answered_4xx_halts_with_rows_staged`, `test_flush.py::test_recovery_replay_answered_plain_422_halts` |
 | 15 | `ddl_since_read_snapshot` rebuilds and never replays. | `test_flush.py::test_ddl_since_read_snapshot_rebuilds_never_replays` |
 | 16 | A fenced consumer closes the stage locally and halts with the distinct error without committing; fenced maps to exit 4 and outranks halted. | `test_consumer.py::test_a_fenced_partition_closes_locally_and_halts_distinctly`, `test_consumer.py::test_a_non_fenced_closed_stage_error_is_not_the_fenced_path`, `test_main.py::test_exit_code_classification` |
 | 17 | A fence seen by the flush loop is terminal for that partition, logged once, and other partitions continue. | `test_flush.py::test_a_fence_detected_mid_decision_is_logged_once_and_terminal`, `test_flush.py::test_a_fence_surfacing_at_planning_is_terminal`, `test_flush.py::test_a_real_contested_open_fences_the_live_flusher` |
 | 18 | SlateDB fences lazily on a contested open. | `test_slatedb_parity.py::test_writer_fencing_on_contested_open_memory`, `test_slatedb_parity.py::test_writer_fencing_on_contested_open_file` |
-| 19 | Poison quarantines durably and never blocks commits; a flood halts without committing past it. | `test_consumer.py::test_poison_records_quarantine_durably_and_never_block`, `test_consumer.py::test_poison_flood_halts_loudly_without_committing_past_it` |
-| 20 | Flush-time quarantines keep whole payloads. | `test_flush.py::test_a_quarantined_payload_is_never_capped`, `test_flush.py::test_quarantine_mode_lands_original_payloads_in_poison` |
+| 19 | A malformed record is dropped at consume time: nothing staged, counted per bounded reason label, logged rate-limited per (partition, reason), and covered by the commit even when the poll staged nothing. | `test_consumer.py::test_malformed_records_are_dropped_counted_and_never_block`, `test_consumer.py::test_a_poll_of_only_dropped_records_still_commits`, `test_consumer.py::test_drop_logging_is_rate_limited_per_partition_and_reason`, `test_consumer.py::test_drop_reason_label_collapses_only_the_partition_source_path`, `test_main.py::test_records_dropped_total_merges_consume_and_flush_reasons` |
+| 20 | A flush-time drop leaves the record out of the payload, counts it, and its window's settlement deletes it; the one record that defeats the Arrow build is dropped, never the batch; an all-dropped window settles with no commit. | `test_flush.py::test_drop_mode_leaves_junk_out_and_settles_it`, `test_flush.py::test_bad_records_are_dropped_and_good_rows_flush`, `test_flush.py::test_pure_builder_drops_the_record_that_defeats_the_build`, `test_flush.py::test_an_all_junk_window_drops_and_settles_without_a_commit` |
 | 21 | Files are key-nondecreasing under the live sort spec even when record time and payload time invert. | `test_flush.py::test_inverted_kafka_and_payload_timestamps_flush_key_nondecreasing` |
 | 22 | A catch-up slice drains in bounded windows; a cap-boundary inversion narrows the window; an oversized single row still flushes. | `test_flush.py::test_catchup_flush_is_bounded_and_drains_over_sweeps`, `test_flush.py::test_a_timestamp_inversion_at_the_cap_boundary_narrows_the_window`, `test_flush.py::test_a_single_row_larger_than_the_byte_budget_still_flushes` |
 | 23 | Settlement that disagrees with the scan halts. | `test_flush.py::test_a_settlement_that_disagrees_with_the_scan_halts` |
@@ -1010,7 +1009,7 @@ Each is pinned by the named test(s) under `tests/`.
 | 32 | The consumer's partition tuple is the flush fanout's tuple for the same payload across the full scalar type × transform matrix; a pair the keyer refuses at build is one the flush's array path refuses too. | `test_grouping.py::test_the_keyers_tuple_is_the_flush_fanouts_tuple`, `test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build` |
 | 33 | A group keyed under the live spec flushes as exactly one file; one keyed under an older spec still fans out correctly by the live spec. | `test_flush.py::test_one_flush_per_group_writes_exactly_one_file_under_a_matching_spec`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
 | 34 | A spec refresh starts new groups and leaves the old group staged and flushable; a transient re-read failure keeps the old keyer; a recreated table halts the consume loop without committing. | `test_consumer.py::test_a_spec_refresh_mid_stream_starts_new_groups_and_keeps_the_old`, `test_consumer.py::test_a_failed_shape_reread_keeps_the_old_keyer`, `test_consumer.py::test_a_recreated_table_at_reread_halts_the_loop_without_committing`, `test_flush.py::test_another_incarnation_halts_table_recreated` |
-| 35 | The Kafka key is never read; a malformed partition source is poison naming the field. | `test_consumer.py::test_the_kafka_key_is_never_read`, `test_consumer.py::test_a_malformed_source_is_poison_naming_the_field`, `test_consumer.py::test_a_keyless_topic_stages_by_the_payloads_partition_tuple` |
+| 35 | The Kafka key is never read; a malformed partition source is dropped naming the field. | `test_consumer.py::test_the_kafka_key_is_never_read`, `test_consumer.py::test_a_malformed_source_is_dropped_naming_the_field`, `test_consumer.py::test_a_keyless_topic_stages_by_the_payloads_partition_tuple` |
 | 36 | The idempotency key is a function of the staged tuple alone (positional names), never of the spec live at flush time. | `test_keyspace.py::test_idempotency_key_new_form_names_the_group_positionally`, `test_keyspace.py::test_idempotency_key_golden_vector`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
 
 The live suite (`tests/live/`, `just millrace live`) covers end-to-end
@@ -1038,7 +1037,7 @@ freshness, the DDL race, drop+recreate halt, and compaction observation.
 | Re-prepare | Dropping a refused prepared entry and rebuilding from staged rows against a fresh read |
 | Halt | `FlushHalted`: the flush loop stops; exit 3 |
 | Fence | SlateDB's single-writer enforcement: a newer open closes the older writer with `Closed(FENCED)`; exit 4 at the consumer, scheduling exclusion at the flush loop |
-| Poison / quarantine | `poison/<offset>` entries for records that cannot become rows (consume time) or cannot be published (flush time) |
+| Dropped record | A record that cannot become a row (consume time) or cannot be published (flush time): nothing is written for it, it is logged and counted in `millrace_records_dropped_total{reason}` |
 | Orphan | An uploaded parquet object no commit references |
 | Incarnation | A table's `table_uuid`; pinned at startup and sent as `expected_table_uuid` |
 | Shape | `TableInfo`: columns, partition spec, sort spec, `read_snapshot_id` |
@@ -1060,5 +1059,7 @@ Only items the code or README explicitly defers.
   consumer's keyer reads it by path, from reaching the flush), nested
   sort sources and nested partition sources in the flusher (top-level
   only), and schema evolution from payloads (unknown keys are dropped).
-- Per-record server validation: the `record_validation` 422 arm has no
-  emitter on the current server.
+- A per-record server refusal (e.g. a 422 `record_validation`): no
+  server emits one today, and any answered 4xx halts with the rows
+  staged; whether such a refusal may ever delete staged rows is
+  undecided.

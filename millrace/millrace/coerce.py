@@ -9,7 +9,7 @@ record the flush's fanout puts in that tuple's file (the fanout stays
 the correctness backstop either way).
 
 Every coercer is TOTAL over JSON values: it returns the column's Python
-value or raises :class:`DecodeError` carrying the poison vocabulary —
+value or raises :class:`DecodeError` carrying the drop vocabulary —
 never an ``OverflowError`` or a ``UnicodeEncodeError`` that would escape
 per-record failure routing. Strict JSON (:func:`load_json_object`)
 refuses the NaN/Infinity literals at parse time; magnitude-overflow
@@ -40,8 +40,8 @@ EPOCH_DATE: Final = date(1970, 1, 1)
 # constructor; the function that subtracts this takes naive-UTC inputs).
 _EPOCH_DATETIME: Final = datetime.fromisoformat("1970-01-01T00:00:00")
 
-# The decode half of the bounded quarantine vocabulary (the keyspace
-# poison envelope stores these strings).
+# The decode half of the bounded drop vocabulary (the
+# ``millrace_records_dropped_total`` reason label).
 REASON_UNDECODABLE_PAYLOAD: Final = "undecodable_payload"
 REASON_UNCASTABLE_COLUMN: Final = "uncastable_column"
 
@@ -49,8 +49,8 @@ REASON_UNCASTABLE_COLUMN: Final = "uncastable_column"
 class DecodeError(ValueError):
     """One staged payload cannot become a row: not a JSON document/object,
     or a value that cannot be coerced to its catalog column. Per-record —
-    the flush quarantines the record and moves on. ``reason`` is the
-    poison-envelope vocabulary."""
+    the flush drops the record and moves on. ``reason`` is the
+    drop vocabulary (the metric's reason label)."""
 
     def __init__(self, message: str, *, reason: str) -> None:
         super().__init__(message)
@@ -210,7 +210,7 @@ def _coerce_str(value: Any) -> str:
         # pa.ArrowException nor OverflowError — outside the batch
         # build's per-record isolation taxonomy), so one such record
         # would fail its whole flush window identically forever.
-        # Refuse here instead: per-record quarantine, the batch
+        # Refuse here instead: per-record drop, the batch
         # survives.
         raise DecodeError(
             f"string is not valid UTF-8 ({e}); refusing a surrogate-bearing "

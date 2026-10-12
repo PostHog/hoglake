@@ -54,12 +54,8 @@ from millrace.keyspace import (
     StatsValue,
 )
 from millrace.stage import (
-    _POISON_WRITE_CHUNK as _POISON_PURGE_CHUNK,
-)
-from millrace.stage import (
     AckHook,
     PartitionStage,
-    PoisonedRecord,
     RecoveredPrepared,
     RecoveryReport,
     StageAck,
@@ -758,9 +754,8 @@ async def test_ack_hook_fires_only_after_remote_durability(stage_factory):
 
 async def test_every_write_path_awaits_durability_before_returning(stage_factory):
     """The same pin for the other "durable before return" contracts:
-    ``persist_prepared`` (the replay-before-publish guard),
-    ``poison_records``, and the settlement transaction's commit handle
-    (``commit_flushed``)."""
+    ``persist_prepared`` (the replay-before-publish guard) and the
+    settlement transaction's commit handle (``commit_flushed``)."""
     stage = await stage_factory()
     db = _RecordingDb(stage._db)
     stage._db = db
@@ -771,19 +766,6 @@ async def test_every_write_path_awaits_durability_before_returning(stage_factory
         prepared("k", team=1),
     )
     assert db.write_handles and all(h.awaited for h in db.write_handles)
-
-    await stage.poison_records(
-        [
-            PoisonedRecord(
-                offset=7,
-                reason="missing_key",
-                key=None,
-                value=None,
-                value_bytes_original=0,
-            )
-        ]
-    )
-    assert all(h.awaited for h in db.write_handles)
 
     await stage.stage_batch([rec(1, 100, 0)], now_us=NOW)
     await stage.commit_flushed(window(1, 0, 0))
@@ -843,179 +825,6 @@ async def test_a_stage_opens_writes_and_closes_with_gc_disabled(stage_factory):
     rows = [rk.offset async for rk, _ in stage.scan_group_rows(g(1))]
     assert rows == [0]
     await stage.close()
-
-
-# -- poison retention: the purge (stage side of MILLRACE_POISON_RETENTION_S) ------
-
-
-def _poison(offset: int, *, ts: int | None = None) -> PoisonedRecord:
-    return PoisonedRecord(
-        offset=offset,
-        reason="malformed_key",
-        key=None,
-        value=b"junk",
-        value_bytes_original=4,
-        quarantined_at_us=ts,
-    )
-
-
-async def test_stage_batch_stamps_poison_with_the_staging_clock(stage_factory):
-    """Consume-side quarantine entries are stamped with the batch's
-    ``now_us`` (the v2 envelope) — the purge's age basis. A batch that
-    lost the stamp would keep its poison forever (red without it)."""
-    stage = await stage_factory()
-    await stage.stage_batch([rec(1, 100, 0)], poison=[_poison(1)], now_us=NOW)
-    (entry,) = await stage.scan_poison()
-    assert entry.offset == 1
-    assert entry.quarantined_at_us == NOW
-    await stage.close()
-
-
-async def test_poison_records_stamp_policy(stage_factory):
-    """``poison_records`` stamps entries from its ``now_us`` argument,
-    keeps an entry's own stamp when it carries one, and writes v1
-    (unstamped, never purged) when no clock is available — the flush
-    caller's seam until it passes its clock (integrator follow-up)."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(0, ts=NOW - 5), _poison(1)], now_us=NOW)
-    await stage.poison_records([_poison(2)])  # no clock: stays v1
-    by_offset = {p.offset: p for p in await stage.scan_poison()}
-    assert by_offset[0].quarantined_at_us == NOW - 5  # the entry's own wins
-    assert by_offset[1].quarantined_at_us == NOW  # filled from now_us
-    assert by_offset[2].quarantined_at_us is None  # unknown age, kept forever
-    await stage.close()
-
-
-async def test_purge_poison_expired_deletes_only_expired_entries(stage_factory):
-    """The retention rule, exactly: entries stamped before the cutoff go;
-    younger entries, and entries with NO stamp (v1 — unknown age), stay.
-    Staged rows are untouched."""
-    stage = await stage_factory()
-    await stage.poison_records(
-        [_poison(0, ts=NOW - 8 * 86400_000_000), _poison(1, ts=NOW - 60_000_000)],
-        now_us=NOW,
-    )  # entry ts wins over now_us; offsets 0,1
-    await stage.poison_records([_poison(2)], now_us=NOW - 10 * 86400_000_000)
-    await stage.poison_records([_poison(3)])  # v1: unknown age
-    await stage.stage_batch([rec(9, 100, 10)], now_us=NOW)
-
-    cutoff = NOW - 7 * 86400_000_000  # 7-day retention edge
-    await stage.poison_records([_poison(4, ts=cutoff)])  # exactly AT the edge
-    report = await stage.purge_poison_expired(cutoff)
-    assert report.deleted == 2  # offsets 0 and 2
-    assert report.unreadable == 0
-    assert not report.truncated
-    remaining = await stage.scan_poison()
-    # the boundary entry stays: expiry is STRICTLY older than the cutoff
-    assert [p.offset for p in remaining] == [1, 3, 4]
-    # the staged row is not the purge's business
-    assert [rk.offset async for rk, _ in stage.scan_group_rows(g(9))] == [10]
-
-    # Idempotent: a second pass over the same cutoff deletes nothing.
-    again = await stage.purge_poison_expired(cutoff)
-    assert again.deleted == 0
-    assert again.scanned == 3
-    await stage.close()
-
-
-async def test_purge_poison_expired_bounds_its_scan_and_delete_batches(stage_factory):
-    """Bounded work per pass: the scan stops at the budget (truncated,
-    the next pass restarts at the front), and deletes land one
-    ``_POISON_WRITE_CHUNK``-sized durable batch at a time — never one
-    unbounded batch."""
-    stage = await stage_factory()
-    total = 2 * _POISON_PURGE_CHUNK + 1
-    await stage.poison_records(
-        [_poison(o, ts=NOW - 10) for o in range(total)], now_us=NOW
-    )
-    before = _write_batch_count(stage)
-    report = await stage.purge_poison_expired(NOW)  # everything is expired
-    assert report.deleted == total
-    assert not report.truncated
-    # one write batch per full chunk plus the remainder — not one giant one
-    assert _write_batch_count(stage) - before == 3
-
-    # the scan budget caps one pass; the prefix stays consistent
-    await stage.poison_records([_poison(o, ts=NOW - 10) for o in range(7)], now_us=NOW)
-    capped = await stage.purge_poison_expired(NOW, scan_budget=3)
-    assert capped.scanned == 3 and capped.deleted == 3 and capped.truncated
-    rest = await stage.purge_poison_expired(NOW)
-    assert rest.deleted == 4 and not rest.truncated
-    assert await stage.scan_poison() == []
-    await stage.close()
-
-
-async def test_purge_poison_expired_keeps_and_counts_undecodable_entries(
-    stage_factory,
-):
-    """A poison value that fails to decode (foreign write, or a NEWER
-    build's envelope mid-rollout) is kept and counted — a purge never
-    deletes what it cannot read, and one bad entry never wedges the pass."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(0, ts=NOW - 10), _poison(2, ts=NOW - 10)])
-    handle = await stage._db.write(_raw_put(keyspace.poison_key(1), b"\x9f garbage"))
-    await handle.await_durable()
-
-    report = await stage.purge_poison_expired(NOW)
-    assert report.scanned == 3
-    assert report.deleted == 2  # the decodable expired entries
-    assert report.unreadable == 1
-    raw = await stage._db.get(keyspace.poison_key(1))
-    assert raw == b"\x9f garbage"  # kept
-    await stage.close()
-
-
-async def test_purge_poison_holds_no_lock_across_the_scan(stage_factory, monkeypatch):
-    """The scan phase takes no write lock: a concurrent ``stage_batch``
-    lands while a purge scan is parked mid-iteration. Reds if the purge
-    ever takes the write lock around the whole pass (the batch would
-    deadlock behind it — this test holds the scan open and requires the
-    batch through first)."""
-    stage = await stage_factory()
-    await stage.poison_records([_poison(o, ts=NOW - 10) for o in range(5)])
-
-    real_iter = stage._iter_range
-    scan_parked = asyncio.Event()
-    release_scan = asyncio.Event()
-    parked = False
-
-    async def parked_iter(start: bytes, end: bytes):
-        nonlocal parked
-        async for k, v in real_iter(start, end):
-            yield k, v
-            if not parked:
-                parked = True
-                scan_parked.set()
-                await release_scan.wait()
-
-    monkeypatch.setattr(stage, "_iter_range", parked_iter)
-    purge = asyncio.create_task(stage.purge_poison_expired(NOW))
-    await asyncio.wait_for(scan_parked.wait(), timeout=10)
-    # With the scan parked, a write batch must complete (the scan holds
-    # no lock; the purge has not reached its first delete batch).
-    await asyncio.wait_for(stage.stage_batch([rec(1, 100, 42)], now_us=NOW), timeout=10)
-    release_scan.set()
-    report = await asyncio.wait_for(purge, timeout=10)
-    assert report.deleted == 5
-    await stage.close()
-
-
-def _write_batch_count(stage: PartitionStage) -> int:
-    from millrace.slatedb_metrics import snapshot_recorder
-
-    return sum(
-        m.value or 0
-        for m in snapshot_recorder(stage.metrics_recorder)
-        if m.name == "slatedb.db.write_batch_count"
-    )
-
-
-def _raw_put(key: bytes, value: bytes) -> object:
-    from slatedb.uniffi import WriteBatch
-
-    batch = WriteBatch()
-    batch.put(key, value)
-    return batch
 
 
 # -- reopen, limits, guards ---------------------------------------------------------

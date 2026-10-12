@@ -24,7 +24,7 @@ payload to its tuple:
 
 A malformed source scalar (wrong JSON type, uncoercible, a transform
 the value cannot take, a parent that is not an object) raises
-:class:`PartitionSourceError` naming the field; the consumer quarantines
+:class:`PartitionSourceError` naming the field; the consumer drops
 the record. The tuple is an OPTIMIZATION of file layout, never its
 truth: the flush fans every window out by the table's LIVE spec
 (``flush.build_prepared_plan``), so a keyer built from an older spec
@@ -91,7 +91,7 @@ class GroupKeyError(ValueError):
 
 class PartitionSourceError(ValueError):
     """One payload's partition source scalar is malformed. ``path`` is
-    the source column's dotted path (the quarantine reason names it)."""
+    the source column's dotted path (the drop reason names it)."""
 
     def __init__(self, path: str, detail: str) -> None:
         super().__init__(f"partition source {path!r}: {detail}")
@@ -245,7 +245,7 @@ class GroupKeyer:
                 ) from e
             # transform_value(…, None) short-circuits bucket/truncate on a
             # null before the type gate, so check those gates here — or
-            # every record would construct fine and then poison.
+            # every record would construct fine and then drop.
             gate = {"bucket": _BUCKETABLE, "truncate": _TRUNCATABLE}.get(
                 field.transform
             )

@@ -42,7 +42,6 @@ from millrace.config import (
     AssignmentMode,
     Config,
     EventTimePolicy,
-    PoisonConfig,
 )
 from millrace.stage import PartitionStage
 
@@ -357,10 +356,9 @@ def make_config(**overrides: Any) -> Config:
         "slow_lane_deadline_s": 21600,
         "min_flush_bytes": 1024 * 1024,
         "max_files_per_commit": 512,
-        "poison": PoisonConfig(max_records_per_run=1000, value_max_bytes=1 << 20),
         "consume_batch_size": 100,
         "poll_timeout_ms": 50,
-        "event_time_policy": EventTimePolicy.QUARANTINE,
+        "event_time_policy": EventTimePolicy.DROP,
         "metrics_port": 8000,
     }
     return Config(**{**base, **overrides})

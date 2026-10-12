@@ -6,7 +6,6 @@
     offsets/<group>                            → sorted (topic, partition, first, last) ranges
     prepared/<group><first_offset>             → PreparedRequest envelope
     flushed/…                                  → LEGACY: never written
-    poison/<offset>                            → PoisonValue envelope
 
 ``<group>`` is ONE HOGLAKE PARTITION TUPLE of the destination table: the
 wire strings the commit's ``partition_values`` carry for a file of that
@@ -99,16 +98,6 @@ Value formats
                unreachable and nothing writes the prefix any more;
                :meth:`PartitionStage.recover` collects leftover markers in
                bounded pages WITHOUT decoding them.
-- ``poison``:  version(1) reason_len(u16) reason(utf8) has_key(u8)
-               [key_len(u32) key] has_value(u8) [value_len(u32) value]
-               value_bytes_original(u32). The consume-time quarantine:
-               records that can never become rows, stored aside durably
-               (never silently dropped) with the rejection reason.
-               Version 2 appends ``quarantined_at_us`` (u64, micros
-               since the Unix epoch) — the retention purge's age basis
-               (``PartitionStage.purge_poison_expired``). v1 envelopes
-               decode with ``quarantined_at_us=None``: unknown age,
-               never purged (the safe direction for forensic state).
 
 The settlement window
 ---------------------
@@ -171,7 +160,6 @@ SCHED_AGE_PREFIX: Final = b"sched_age/"
 OFFSETS_PREFIX: Final = b"offsets/"
 PREPARED_PREFIX: Final = b"prepared/"
 FLUSHED_PREFIX: Final = b"flushed/"
-POISON_PREFIX: Final = b"poison/"
 
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
@@ -184,10 +172,6 @@ _SIGN_OFFSET: Final = 1 << 63
 STATS_VERSION: Final = 1
 OFFSETS_VERSION: Final = 1
 PREPARED_VERSION: Final = 4
-POISON_VERSION: Final = 2
-#: The pre-retention shape (no ``quarantined_at_us`` tail). An encode of
-#: an entry without the stamp writes these exact bytes.
-POISON_VERSION_LEGACY: Final = 1
 
 #: Component tags of the partition-tuple encoding.
 GROUP_NULL: Final = 0x00
@@ -201,7 +185,6 @@ PartitionTuple = tuple[str | None, ...]
 
 _TS_OFFSET_LEN: Final = 8 + 8
 STATS_VALUE_LEN: Final = 1 + 8 + 8 + 8 + 8
-POISON_KEY_LEN: Final = len(POISON_PREFIX) + 8
 
 
 def _require_uint64(name: str, value: int) -> None:
@@ -871,208 +854,6 @@ def row_in_flushed_range(row: RowKey, flushed: FlushedKey) -> bool:
     return (
         row.group == flushed.group
         and flushed.first_offset <= row.offset <= flushed.last_offset
-    )
-
-
-# -- poison/ ------------------------------------------------------------------
-#
-# The consume-time quarantine (docs/kafka-ingestion.md §Delivery semantics):
-# a record that can never become a row — a payload that is not a JSON object,
-# a malformed partition source, no usable timestamp, a tombstone — is written here, keyed by its Kafka offset,
-# in the SAME write batch as the poll cycle's staged rows. The offset commit
-# that follows the batch therefore covers quarantined records exactly the way
-# it covers staged ones: offsets commit strictly after durable staging, a
-# poison record is durably stored aside (never silently dropped), and the
-# loop never wedges on one. Nothing on the flush path reads this prefix; it
-# is forensic state with an exact decode. Keys are offset-ordered within the
-# partition instance, which also makes a redelivered poison record's re-put
-# idempotent.
-
-
-def poison_key(offset: int) -> bytes:
-    """The ``poison/`` key quarantining one consumed record, by Kafka offset."""
-    _require_int64("offset", offset)
-    return POISON_PREFIX + _encode_i64_ordered(offset)
-
-
-def decode_poison_key(data: bytes) -> int:
-    """Inverse of :func:`poison_key`: the quarantined record's Kafka offset."""
-    if len(data) != POISON_KEY_LEN:
-        raise ValueError(f"expected {POISON_KEY_LEN} bytes, got {len(data)}")
-    _require_key(POISON_PREFIX, data, min_length=POISON_KEY_LEN)
-    return _decode_i64_ordered(data[len(POISON_PREFIX) :])
-
-
-def poison_range() -> tuple[bytes, bytes]:
-    """Half-open range selecting every ``poison/`` entry of the instance."""
-    return POISON_PREFIX, _prefix_successor(POISON_PREFIX)
-
-
-@dataclass(frozen=True, slots=True)
-class PoisonValue:
-    """Decoded form of a ``poison/`` value — the quarantine envelope.
-
-    ``reason`` is the bounded rejection vocabulary (consumer.py's
-    ``REASON_*`` constants). ``key`` / ``value`` are the record's raw bytes
-    (None when the record carried none — a tombstone quarantines with
-    ``value=None`` and ``value_bytes_original == 0``). The consumer caps the
-    stored ``value`` at its poison byte limit; ``value_bytes_original`` then
-    exceeds ``len(value)`` and records what was cut. The FLUSH path never
-    caps (flush.py): its quarantines persist the whole payload, because
-    settlement deletes the staged row and this entry is the only
-    surviving copy.
-
-    ``quarantined_at_us`` (v2) is the staging-clock instant the entry was
-    written — the retention purge's age basis. None means unknown age
-    (a v1 envelope from a pre-retention build, or a writer that had no
-    clock to stamp): the purge KEEPS such entries, the safe direction
-    for forensic state.
-    """
-
-    reason: str
-    key: bytes | None
-    value: bytes | None
-    value_bytes_original: int
-    quarantined_at_us: int | None = None
-
-    def __post_init__(self) -> None:
-        reason_len = len(self.reason.encode("utf-8"))
-        if reason_len == 0:
-            raise ValueError("reason must be non-empty")
-        if reason_len > _UINT16_MAX:
-            raise ValueError(f"reason does not fit in a u16 length: {reason_len} bytes")
-        if self.key is not None and len(self.key) > _UINT32_MAX:
-            raise ValueError(f"poison key too long: {len(self.key)} bytes")
-        if self.value is None:
-            if self.value_bytes_original != 0:
-                raise ValueError(
-                    f"value is absent but value_bytes_original is "
-                    f"{self.value_bytes_original}"
-                )
-        else:
-            if len(self.value) > _UINT32_MAX:
-                raise ValueError(f"poison value too long: {len(self.value)} bytes")
-            if self.value_bytes_original < len(self.value):
-                raise ValueError(
-                    f"value_bytes_original {self.value_bytes_original} < stored "
-                    f"value length {len(self.value)}"
-                )
-        if self.value_bytes_original > _UINT32_MAX:
-            raise ValueError(
-                f"value_bytes_original does not fit in a u32 field: "
-                f"{self.value_bytes_original}"
-            )
-        if self.quarantined_at_us is not None:
-            _require_uint64("quarantined_at_us", self.quarantined_at_us)
-
-
-def encode_poison_value(value: PoisonValue) -> bytes:
-    """Version 2: version(1) reason_len(u16) reason(utf8) has_key(u8)
-    [key_len(u32) key] has_value(u8) [value_len(u32) value]
-    value_bytes_original(u32) quarantined_at_us(u64).
-
-    An entry WITHOUT a quarantine stamp (``quarantined_at_us=None``)
-    encodes as the exact version-1 bytes — the shape every build of this
-    branch already reads — so stamping is the only wire change."""
-    out = bytearray()
-    out.append(
-        POISON_VERSION if value.quarantined_at_us is not None else POISON_VERSION_LEGACY
-    )
-    reason = value.reason.encode("utf-8")
-    out += len(reason).to_bytes(2, "big")
-    out += reason
-    if value.key is None:
-        out.append(0)
-    else:
-        out.append(1)
-        out += len(value.key).to_bytes(4, "big")
-        out += value.key
-    if value.value is None:
-        out.append(0)
-    else:
-        out.append(1)
-        out += len(value.value).to_bytes(4, "big")
-        out += value.value
-    out += value.value_bytes_original.to_bytes(4, "big")
-    if value.quarantined_at_us is not None:
-        out += value.quarantined_at_us.to_bytes(8, "big")
-    return bytes(out)
-
-
-def decode_poison_value(data: bytes) -> PoisonValue:
-    """Inverse of :func:`encode_poison_value`. Versions 1 and 2 decode;
-    v1 yields ``quarantined_at_us=None`` (unknown age — never purged)."""
-    if len(data) < 4:
-        raise ValueError(f"poison value too short: {len(data)} bytes")
-    if data[0] not in (POISON_VERSION_LEGACY, POISON_VERSION):
-        raise ValueError(f"unknown poison value version {data[0]}")
-    version = data[0]
-    reason_len = int.from_bytes(data[1:3], "big")
-    if len(data) < 3 + reason_len + 1:
-        raise ValueError("truncated poison value: reason")
-    reason = bytes(data[3 : 3 + reason_len]).decode("utf-8")
-    pos = 3 + reason_len
-
-    has_key = data[pos]
-    if has_key not in (0, 1):
-        raise ValueError(f"poison has_key flag must be 0 or 1, got {has_key}")
-    pos += 1
-    key: bytes | None = None
-    if has_key:
-        if len(data) < pos + 4:
-            raise ValueError("truncated poison value: key length")
-        key_len = int.from_bytes(data[pos : pos + 4], "big")
-        pos += 4
-        # +1: the has_value flag must follow the key bytes.
-        if len(data) < pos + key_len + 1:
-            raise ValueError("truncated poison value: key")
-        key = bytes(data[pos : pos + key_len])
-        pos += key_len
-
-    # On the has_key=0 path nothing so far guaranteed this flag exists.
-    if len(data) < pos + 1:
-        raise ValueError("truncated poison value: flags")
-    has_value = data[pos]
-    if has_value not in (0, 1):
-        raise ValueError(f"poison has_value flag must be 0 or 1, got {has_value}")
-    pos += 1
-    value: bytes | None = None
-    if has_value:
-        if len(data) < pos + 4:
-            raise ValueError("truncated poison value: value length")
-        value_len = int.from_bytes(data[pos : pos + 4], "big")
-        pos += 4
-        if len(data) < pos + value_len + 4:
-            raise ValueError("truncated poison value: value")
-        value = bytes(data[pos : pos + value_len])
-        pos += value_len
-
-    if len(data) < pos + 4:
-        raise ValueError(
-            f"poison value length mismatch: value_bytes_original missing or "
-            f"trailing bytes ({len(data) - pos} left at {pos})"
-        )
-    value_bytes_original = int.from_bytes(data[pos : pos + 4], "big")
-    pos += 4
-    quarantined_at_us: int | None = None
-    if version == POISON_VERSION:
-        if len(data) != pos + 8:
-            raise ValueError(
-                f"truncated poison value: quarantined_at_us "
-                f"({len(data) - pos} byte(s) left at {pos}, need exactly 8)"
-            )
-        quarantined_at_us = int.from_bytes(data[pos : pos + 8], "big")
-    elif len(data) != pos:
-        raise ValueError(
-            f"poison value length mismatch: trailing bytes "
-            f"({len(data) - pos} left at {pos})"
-        )
-    return PoisonValue(
-        reason=reason,
-        key=key,
-        value=value,
-        value_bytes_original=value_bytes_original,
-        quarantined_at_us=quarantined_at_us,
     )
 
 

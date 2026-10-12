@@ -27,7 +27,7 @@ Design: [docs/kafka-ingestion.md](../docs/kafka-ingestion.md).
 Build/test sequence: [docs/kafka-ingestion-plan.md](../docs/kafka-ingestion-plan.md).
 
 Status: Phase 5 — `keyspace.py` (staging key codecs, side prefixes,
-idempotency-key derivation, the `poison/` quarantine codec),
+idempotency-key derivation),
 `planner.py` (pure per-key flush decisions: the size/age/slow
 three-lane policy behind a policy seam), `grouping.py` (the
 partition-tuple keyer: payload → the destination's partition tuple; it
@@ -41,7 +41,7 @@ poll → stage → commit with offsets strictly after durable staging and
 the poll's per-partition stage batches overlapped (one WAL durability
 wait per partition, in flight together), staging under the partition
 tuple with the keyer re-read on the flusher's shape TTL (the Kafka key
-is never read), the FENCED halt below, poison quarantine), `flush.py`
+is never read), the FENCED halt below, malformed-record drops), `flush.py`
 (the flush
 loop: planner-driven sweeps, staged range → Arrow → live-spec partition
 fanout (a fanout past `MILLRACE_MAX_FILES_PER_COMMIT` halts
@@ -53,7 +53,7 @@ identity reads, retention/4 shape cache), the full refusal taxonomy
 (a 409 `commit_conflict` resends the identical bytes up to 5 attempts,
 then `FlushPublishExhausted`) with pinned
 recoveries, byte-identical replay of persisted requests, receipt-based
-recovery handoff, junk `event_time` clamp/quarantine, orphan
+recovery handoff, junk `event_time` clamp/drop, orphan
 accounting), `maintenance.py` (the external GC + compaction-debt
 service, `python -m millrace.maintenance`, deployed beside the
 replicas — writers shed the embedded GC by default
@@ -69,7 +69,7 @@ marker `live`, run by `ci/live-millrace.sh`) covers the ten Phase 5
 scenarios: end-to-end truth with exact per-tenant reconciliation,
 kill -9 mid-flush, the lost commit response (an in-test TCP proxy drops
 the response AFTER the server commits), static and cooperative
-reassignment, junk `event_time` quarantine, whale overload + tail
+reassignment, junk `event_time` drop, whale overload + tail
 freshness, the freshness SLA measurement, the DDL race, drop+recreate
 incarnation halt, and a compaction observation. Code-level map:
 [architecture.md](architecture.md).
@@ -161,21 +161,28 @@ arithmetic, not trust):
   poll) is the one pilot question the local bench cannot answer, and
   the debt series is its tripwire.
 
-## Quarantine retention (`poison/`)
+## Dropped records
 
-Quarantined records are forensic state with a bounded lifetime, not an
-unbounded prefix: every entry carries the staging-clock stamp of its
-write, and a per-process sweeper (off the consume/flush path) deletes
-entries older than `MILLRACE_POISON_RETENTION_S` (default 7 d, matching
-the server's default receipt retention — the incidents poison matters
-to live inside that window) per partition every
-`MILLRACE_POISON_SWEEP_S` (default 1 h), in bounded batches.
-`millrace_poison_entries_purged_total` counts deletions. Every write
-path stamps its entries — consume-time and flush-time quarantines alike;
-an entry without a stamp (a v1 envelope, written only by a caller that
-passes no clock) is kept forever — unknown age is never deleted.
-Nothing depends on poison presence, so a pod that is down at expiry
-simply purges at its next sweep.
+Malformed records are dropped, logged and metered; nothing is
+quarantined or retained. Each drop increments
+`millrace_records_dropped_total{reason}` and logs at WARNING.
+
+| Where | `reason` label | Cause |
+|---|---|---|
+| Consume | `invalid_offset` | Offset < 0 or > int64 max |
+| Consume | `missing_timestamp` / `invalid_timestamp` | `TIMESTAMP_NOT_AVAILABLE`, or ms × 1000 overflows int64 |
+| Consume | `missing_value` | Tombstone |
+| Consume | `malformed_value` | Not a strict JSON object |
+| Consume | `malformed_partition_source` | A partition source scalar cannot be keyed; the log line names the path (`malformed_partition_source:<path>`), the label does not |
+| Flush | `undecodable_payload` / `uncastable_column` | The payload does not decode or cast against the table's columns, or defeats the Arrow build |
+| Flush | `event_time_out_of_window` | Junk `event_time` under `MILLRACE_EVENT_TIME_POLICY=drop` (the default) |
+
+Consume-time drop lines name topic, partition, offset and reason, at
+most one per (partition, reason) per 10 s (the first drop of a reason
+always logs; later lines carry the suppressed count); the offset commit
+covers a dropped record like a staged one. Flush-time drops log one
+line per reason per decision with the group and offsets; the dropped
+rows are deleted by their window's ordinary settlement.
 
 ## Probes and per-partition metrics
 

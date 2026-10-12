@@ -1,16 +1,18 @@
 """Kafka consumption and offset management (docs/kafka-ingestion.md §The
 problem's consume loop).
 
-Poll → stage → commit: every polled record is staged through
-:meth:`millrace.stage.PartitionStage.stage_batch` — under
-``rows/(group, record_ts, offset)`` for well-formed records, under
-``poison/<offset>`` for records that can never become a row — and the
+Poll → stage → commit: every well-formed polled record is staged through
+:meth:`millrace.stage.PartitionStage.stage_batch` under
+``rows/(group, record_ts, offset)``; a record that can never become a
+row is DROPPED — logged and counted, nothing written — and the
 partition's Kafka offset commits STRICTLY after the batch's remote
 durability (rows-then-offset, AGENT.md invariant 10 restated for a
-staging area). The consume loop never waits on the flush loop: staging
-is the buffer. There is no in-memory accumulation — every consumed
-record is either durable-and-committed or, on a crash, replayed from the
-last commit (at-least-once by construction).
+staging area): an offset is committed only once every record at or
+below it is durable in SlateDB or was dropped and counted. The consume
+loop never waits on the flush loop: staging is the buffer. There is no
+in-memory accumulation — every consumed record is either
+durable-and-committed, dropped-and-counted, or, on a crash, replayed
+from the last commit (at-least-once by construction).
 
 The ``group`` a record stages under is the destination table's
 PARTITION TUPLE for it (:class:`millrace.grouping.GroupKeyer`): the
@@ -90,13 +92,15 @@ alerts and never read by the loop (docs/kafka-ingestion.md
 compactor behind) stalls the staging write itself and surfaces through
 SlateDB's metrics.
 
-Poison pills are quarantined, counted and logged, never silently
-dropped: they land in the same durable write batch as the cycle's staged
-rows, the commit covers them, and the loop moves on. A FLOOD of poison
-(records quarantined this run exceeding the configured bound) means a
-producer bug or a payload that does not match the destination's
-partition spec, and halts the loop loudly —
-before committing past the flood — via :class:`PoisonLimitExceeded`.
+Malformed records are dropped, logged and metered: each drop counts in
+``millrace_records_dropped_total{reason}`` (the label collapses
+``malformed_partition_source:<path>`` to ``malformed_partition_source``
+to keep cardinality bounded) and logs at WARNING with topic, partition,
+offset and the full reason — rate-limited to one line per (partition,
+reason) per :data:`DROP_LOG_INTERVAL_S` seconds, the first drop of a
+reason always logging and later lines carrying the suppressed count.
+The commit covers a dropped record trivially (there is nothing to
+stage), and the loop moves on.
 
 Async discipline: the confluent-kafka Consumer is single-threaded
 (librdkafka), so every blocking call — ``consume``, ``commit``,
@@ -143,7 +147,7 @@ from .coerce import DecodeError, load_json_object
 from .config import AssignmentMode, Config
 from .flush import FlushHalted
 from .grouping import GroupKeyer, PartitionSourceError
-from .stage import PoisonedRecord, StagedRecord, StageManager
+from .stage import DroppedRecord, StagedRecord, StageManager
 
 log = logging.getLogger(__name__)
 
@@ -153,8 +157,8 @@ _MICROS_PER_MILLI: Final = 1_000
 _INT64_MIN: Final = -(1 << 63)
 _INT64_MAX: Final = (1 << 63) - 1
 
-# The bounded poison rejection vocabulary (the keyspace poison envelope
-# stores these strings).
+# The bounded consume-time drop vocabulary (the
+# ``millrace_records_dropped_total`` reason label).
 REASON_INVALID_OFFSET: Final = "invalid_offset"
 REASON_MISSING_TIMESTAMP: Final = "missing_timestamp"
 REASON_INVALID_TIMESTAMP: Final = "invalid_timestamp"
@@ -162,9 +166,13 @@ REASON_MISSING_VALUE: Final = "missing_value"
 # The payload is not a strict JSON object (the keyer has nothing to read).
 REASON_MALFORMED_VALUE: Final = "malformed_value"
 # A partition source scalar is the wrong JSON type, uncoercible to its
-# column, or untransformable. The stored reason names the field:
-# ``malformed_partition_source:<dotted path>``.
+# column, or untransformable. The logged reason names the field:
+# ``malformed_partition_source:<dotted path>``; the metric label does not.
 REASON_MALFORMED_PARTITION_SOURCE: Final = "malformed_partition_source"
+
+#: At most one drop log line per (partition, reason) per this many
+#: seconds of the injected monotonic clock.
+DROP_LOG_INTERVAL_S: Final = 10.0
 
 _COMMIT_MAX_ATTEMPTS: Final = 3
 _COMMIT_BASE_DELAY_S: Final = 0.5
@@ -178,15 +186,6 @@ _COMMIT_BASE_DELAY_S: Final = 0.5
 _OFFSET_STORAGE_WARMUP_MAX_ATTEMPTS: Final = 24
 _OFFSET_STORAGE_WARMUP_RETRY_S: Final = 0.5
 _OFFSET_STORAGE_WARMUP_TIMEOUT_S: Final = 5.0
-
-
-class PoisonLimitExceeded(Exception):
-    """The quarantine outgrew its bound. A flood of unstageable records
-    means a producer bug or payloads that do not match the destination's
-    partition spec, and committing
-    past it would hide the damage — so the loop halts loudly WITHOUT
-    committing past the flood, and the restart replays it and trips
-    again until the cause is fixed."""
 
 
 class ConsumerFencedError(Exception):
@@ -271,60 +270,54 @@ def classify_message(
     keyer: GroupKeyer,
     *,
     offset: int,
-    key: bytes | None,
     value: bytes | None,
     timestamp: tuple[int, int],
-    poison_value_max_bytes: int,
-) -> StagedRecord | PoisonedRecord:
+) -> StagedRecord | DroppedRecord:
     """One consumed record's fields → the record to stage under its
-    partition tuple, or the poison quarantine entry.
+    partition tuple, or the drop with its reason.
 
-    TOTAL over record content — a malformed record routes to the
-    quarantine with a reason (the first failing check names it), so the
-    loop never wedges on one record and never silently drops one. A
-    poison entry's value is truncated to ``poison_value_max_bytes`` with
-    the original length recorded; ``key`` is carried into the envelope
-    for forensics only (the Kafka key is never read for staging).
+    TOTAL over record content — a malformed record becomes a
+    :class:`~millrace.stage.DroppedRecord` with a reason (the first
+    failing check names it), so the loop never wedges on one record.
     ``timestamp`` is the Kafka ``(type, milliseconds)`` pair;
-    TIMESTAMP_NOT_AVAILABLE can never key a row, so it quarantines.
+    TIMESTAMP_NOT_AVAILABLE can never key a row, so it drops. The Kafka
+    message key is never read.
 
     The value is parsed ONCE as a strict JSON object (not an object →
     ``malformed_value``) and the keyer extracts the tuple from it; a
-    malformed partition source scalar quarantines with the reason
+    malformed partition source scalar drops with the reason
     ``malformed_partition_source:<field path>``.
     """
-
-    def poison(reason: str) -> PoisonedRecord:
-        stored = value if value is None else value[:poison_value_max_bytes]
-        return PoisonedRecord(
-            offset=offset,
-            reason=reason,
-            key=key,
-            value=stored,
-            value_bytes_original=len(value) if value is not None else 0,
-        )
-
     if offset < 0 or offset > _INT64_MAX:
-        return poison(REASON_INVALID_OFFSET)
+        return DroppedRecord(offset, REASON_INVALID_OFFSET)
     ts_type, ts_ms = timestamp
     if ts_type == TIMESTAMP_NOT_AVAILABLE:
-        return poison(REASON_MISSING_TIMESTAMP)
+        return DroppedRecord(offset, REASON_MISSING_TIMESTAMP)
     event_ts_us = ts_ms * _MICROS_PER_MILLI
     if not _INT64_MIN <= event_ts_us <= _INT64_MAX:
-        return poison(REASON_INVALID_TIMESTAMP)
+        return DroppedRecord(offset, REASON_INVALID_TIMESTAMP)
     if value is None:
-        return poison(REASON_MISSING_VALUE)
+        return DroppedRecord(offset, REASON_MISSING_VALUE)
     try:
         doc = load_json_object(value)
     except DecodeError:
-        return poison(REASON_MALFORMED_VALUE)
+        return DroppedRecord(offset, REASON_MALFORMED_VALUE)
     try:
         group = keyer.group_for(doc)
     except PartitionSourceError as exc:
-        return poison(f"{REASON_MALFORMED_PARTITION_SOURCE}:{exc.path}")
+        return DroppedRecord(offset, f"{REASON_MALFORMED_PARTITION_SOURCE}:{exc.path}")
     return StagedRecord(
         group=group, event_ts_us=event_ts_us, offset=offset, payload=value
     )
+
+
+def drop_reason_label(reason: str) -> str:
+    """The ``millrace_records_dropped_total`` label for a drop reason:
+    the reason itself, except ``malformed_partition_source:<path>``
+    collapses to ``malformed_partition_source`` (bounded cardinality;
+    the log line keeps the path)."""
+    head, sep, _path = reason.partition(":")
+    return head if sep and head == REASON_MALFORMED_PARTITION_SOURCE else reason
 
 
 class ShapeSource(Protocol):
@@ -343,11 +336,12 @@ class ConsumerStats:
     """Cumulative counters for the run so far (the operational surface's
     input; passive observability — nothing here feeds control flow).
     ``commit_attempts`` counts every commit RPC including retried ones;
-    ``commit_retries`` counts only the retried ones."""
+    ``commit_retries`` counts only the retried ones. ``records_dropped``
+    maps a drop reason label (:func:`drop_reason_label`) to its count."""
 
     messages_consumed: int
     records_staged: int
-    records_poisoned: int
+    records_dropped: Mapping[str, int]
     kafka_error_events: int
     messages_skipped_revoked: int
     commit_attempts: int
@@ -453,10 +447,13 @@ class MillraceConsumer:
         # classified records) feeding the per-poll byte cap — see _step.
         self._observed_records = 0
         self._observed_bytes = 0
-        self._poisoned_total = 0
         self._messages_consumed = 0
         self._records_staged = 0
-        self._records_poisoned = 0
+        self._records_dropped: dict[str, int] = {}
+        # Drop-log rate limit per (topic, partition, reason): the
+        # monotonic time of the last logged line and the drops since.
+        self._drop_log_at: dict[tuple[str, int, str], float] = {}
+        self._drop_log_suppressed: dict[tuple[str, int, str], int] = {}
         self._kafka_error_events = 0
         self._messages_skipped_revoked = 0
         self._commit_attempts = 0
@@ -553,10 +550,10 @@ class MillraceConsumer:
             None, self._executor.shutdown, True
         )
         log.info(
-            "consumer closed (%d messages, %d staged, %d poisoned, %d commits)",
+            "consumer closed (%d messages, %d staged, %d dropped, %d commits)",
             self._messages_consumed,
             self._records_staged,
-            self._records_poisoned,
+            sum(self._records_dropped.values()),
             self._commit_attempts,
         )
 
@@ -576,7 +573,7 @@ class MillraceConsumer:
         return ConsumerStats(
             messages_consumed=self._messages_consumed,
             records_staged=self._records_staged,
-            records_poisoned=self._records_poisoned,
+            records_dropped=dict(self._records_dropped),
             kafka_error_events=self._kafka_error_events,
             messages_skipped_revoked=self._messages_skipped_revoked,
             commit_attempts=self._commit_attempts,
@@ -811,9 +808,7 @@ class MillraceConsumer:
         the commit, not acks in sequence."""
         claimed = set(self._stages.partitions())
         staged: dict[tuple[str, int], list[StagedRecord]] = {}
-        poisoned: dict[tuple[str, int], list[PoisonedRecord]] = {}
         last_handled: dict[tuple[str, int], int] = {}
-        cycle_poison = 0
         for msg in msgs:
             err = msg.error()
             if err is not None:
@@ -827,8 +822,8 @@ class MillraceConsumer:
             topic, partition, offset = msg.topic(), msg.partition(), msg.offset()
             if topic is None or partition is None or offset is None:
                 # A record without coordinates can neither be staged nor
-                # quarantined (the poison key IS the offset). Counted,
-                # logged, never committed past explicitly.
+                # committed past (there is no offset to commit). Counted,
+                # logged, skipped.
                 self._kafka_error_events += 1
                 log.warning(
                     "kafka record without coordinates dropped from the "
@@ -847,10 +842,8 @@ class MillraceConsumer:
             outcome = classify_message(
                 self._keyer,
                 offset=offset,
-                key=raw_key,
                 value=raw_value,
                 timestamp=msg.timestamp(),
-                poison_value_max_bytes=self._cfg.poison.value_max_bytes,
             )
             # The byte cap's observation (key + value bytes per
             # classified record — the in-memory shape the cap guards).
@@ -861,36 +854,13 @@ class MillraceConsumer:
             last_handled[key] = max(
                 outcome.offset, last_handled.get(key, outcome.offset)
             )
-            if isinstance(outcome, PoisonedRecord):
-                cycle_poison += 1
-                poisoned.setdefault(key, []).append(outcome)
-                log.warning(
-                    "poison record quarantined: %s[%d]@%d reason=%s",
-                    key[0],
-                    key[1],
-                    outcome.offset,
-                    outcome.reason,
-                )
+            if isinstance(outcome, DroppedRecord):
+                self._note_drop(topic, partition, outcome)
             else:
                 staged.setdefault(key, []).append(outcome)
 
-        if (
-            cycle_poison
-            and self._poisoned_total + cycle_poison
-            > self._cfg.poison.max_records_per_run
-        ):
-            raise PoisonLimitExceeded(
-                f"poison limit exceeded: "
-                f"{self._poisoned_total + cycle_poison} quarantined records "
-                f"this run would exceed "
-                f"MILLRACE_POISON_MAX_RECORDS={self._cfg.poison.max_records_per_run}; "
-                f"a flood of unstageable records means a producer bug or "
-                f"payloads that do not match the destination's partition "
-                f"spec — halting WITHOUT committing past the flood"
-            )
-
         now_us = self._now_us()
-        keys = sorted(staged.keys() | poisoned.keys())
+        keys = sorted(staged)
         # One task per partition: the WAL PUTs and durability waits are
         # in flight together; gather (return_exceptions) settles EVERY
         # batch before the outcome is examined, so a failure never
@@ -898,9 +868,7 @@ class MillraceConsumer:
         # whatever did land durably.
         tasks = [
             asyncio.create_task(
-                self._stages.stage(*key).stage_batch(
-                    staged.get(key, []), poison=poisoned.get(key, []), now_us=now_us
-                ),
+                self._stages.stage(*key).stage_batch(staged[key], now_us=now_us),
                 name=f"millrace-stage-{key[0]}-{key[1]}",
             )
             for key in keys
@@ -916,7 +884,6 @@ class MillraceConsumer:
                     errors.append(result)
                 continue
             self._records_staged += result.rows
-            self._records_poisoned += result.poisoned
         if fenced:
             for exc in errors:
                 log.warning(
@@ -931,7 +898,6 @@ class MillraceConsumer:
             # The batch's offsets never commit; the durable siblings are
             # restaged idempotently by the replay.
             raise errors[0]
-        self._poisoned_total += cycle_poison
 
         if last_handled:
             # Committed offsets are next-to-fetch: last handled + 1. One
@@ -944,6 +910,35 @@ class MillraceConsumer:
             await self._commit_offsets(offsets)
             for key, last in last_handled.items():
                 self._committed[key] = last + 1
+
+    def _note_drop(self, topic: str, partition: int, dropped: DroppedRecord) -> None:
+        """Count one dropped record and log it — at most one line per
+        (partition, reason) per :data:`DROP_LOG_INTERVAL_S`; the first
+        drop of a reason always logs, and a later line names how many
+        drops of that reason were suppressed since the last one. Counted
+        when classified: a poll whose batch then fails replays and
+        counts its drops again (the counter is an at-least-once tally,
+        like the staged count)."""
+        label = drop_reason_label(dropped.reason)
+        self._records_dropped[label] = self._records_dropped.get(label, 0) + 1
+        slot = (topic, partition, dropped.reason)
+        now = self._monotonic()
+        last = self._drop_log_at.get(slot)
+        if last is not None and now - last < DROP_LOG_INTERVAL_S:
+            self._drop_log_suppressed[slot] = self._drop_log_suppressed.get(slot, 0) + 1
+            return
+        suppressed = self._drop_log_suppressed.pop(slot, 0)
+        self._drop_log_at[slot] = now
+        log.warning(
+            "record dropped: topic=%s partition=%d offset=%d reason=%s "
+            "(%d more of this reason on this partition suppressed since the "
+            "last line)",
+            topic,
+            partition,
+            dropped.offset,
+            dropped.reason,
+            suppressed,
+        )
 
     async def _relinquish_fenced(self, partitions: Sequence[tuple[str, int]]) -> None:
         """Close fenced partitions' stages locally (best-effort: the

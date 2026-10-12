@@ -10,8 +10,7 @@ partition, opened with the ``MILLRACE_SLATEDB_*`` settings — T9) +
 :class:`~millrace.flush.HoglakeFlusher` (resolves the
 destination and pins its incarnation) + :class:`~millrace.consumer.
 MillraceConsumer` and :class:`~millrace.flush.FlushRunner` sharing the
-StageManager on one asyncio loop, plus the poison sweeper (retention for
-the ``poison/`` quarantine) and the operational HTTP surface
+StageManager on one asyncio loop, plus the operational HTTP surface
 (:mod:`millrace.server`).
 
 Beyond the ``MILLRACE_*`` knobs (config.py), the process reads:
@@ -55,7 +54,7 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from functools import partial
 from typing import Any
 
@@ -178,107 +177,6 @@ def _s3_kwargs(env: Mapping[str, str]) -> dict[str, Any]:
     return out
 
 
-class PoisonSweeper:
-    """The ``poison/`` retention loop (S14): quarantine entries are
-    forensic state with a bounded lifetime
-    (``MILLRACE_POISON_RETENTION_S``); without this sweeper the prefix
-    only ever grows.
-
-    One sweep per ``sweep_s``: for every currently open partition,
-    :meth:`millrace.stage.PartitionStage.purge_poison_expired` with the
-    cutoff ``now − retention`` — bounded per call, per-partition
-    contained (a fenced/revoked partition is skipped, a broken one is
-    logged and counted, neither stops the sweep). The loop body never
-    raises: retention is hygiene, not correctness, and a dying sweeper
-    must not take the pipeline with it. It is also SAFE to be down at
-    expiry — nothing depends on poison presence, the next sweep catches
-    up — so it runs as a side task off the consume/flush path.
-    """
-
-    def __init__(
-        self,
-        stages: StageManager,
-        *,
-        retention_s: int,
-        sweep_s: int,
-        now_us: Callable[[], int] = _now_us,
-        sleep: Callable[[float], Awaitable[None]] | None = None,
-    ) -> None:
-        if retention_s < 1:
-            raise ValueError(f"retention_s must be >= 1, got {retention_s}")
-        if sweep_s < 1:
-            raise ValueError(f"sweep_s must be >= 1, got {sweep_s}")
-        self._stages = stages
-        self._retention_us = retention_s * _MICROS_PER_SECOND
-        self._sweep_s = float(sweep_s)
-        self._now_us = now_us
-        self._stop_event = asyncio.Event()
-        self._sleep = sleep if sleep is not None else self._interruptible_sleep
-        self._stopping = False
-        self.purged_total = 0
-        self.sweeps_total = 0
-        self.partition_failures_total = 0
-
-    async def _interruptible_sleep(self, seconds: float) -> None:
-        try:
-            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
-        except TimeoutError:
-            pass
-
-    async def sweep_once(self) -> int:
-        """One pass over the open partitions; returns entries purged."""
-        cutoff = self._now_us() - self._retention_us
-        purged = 0
-        for topic, partition in self._stages.partitions():
-            try:
-                stage = self._stages.stage(topic, partition)
-            except KeyError:
-                continue  # revoked mid-sweep
-            try:
-                report = await stage.purge_poison_expired(cutoff)
-            except Exception:
-                # Contained: SlateDB Error.Closed (a fence/revoke under
-                # us), a store hiccup — the partition is retried next
-                # sweep; hygiene never wedges the pipeline.
-                self.partition_failures_total += 1
-                log.exception(
-                    "poison sweep failed for %s[%d]; retried next sweep",
-                    topic,
-                    partition,
-                )
-                continue
-            purged += report.deleted
-            if report.deleted or report.truncated or report.unreadable:
-                log.info(
-                    "poison sweep %s[%d]: deleted=%d scanned=%d unreadable=%d "
-                    "truncated=%s",
-                    topic,
-                    partition,
-                    report.deleted,
-                    report.scanned,
-                    report.unreadable,
-                    report.truncated,
-                )
-        self.purged_total += purged
-        self.sweeps_total += 1
-        return purged
-
-    async def run(self) -> None:
-        """Sweep, pause, repeat until :meth:`stop`. A failed ITERATION is
-        logged and counted and the loop continues."""
-        while not self._stopping:
-            try:
-                await self.sweep_once()
-            except Exception:
-                log.exception("poison sweep iteration failed; continuing")
-            await self._sleep(self._sweep_s)
-
-    def stop(self) -> None:
-        """Stop after the in-flight sweep; wakes the between-sweep pause."""
-        self._stopping = True
-        self._stop_event.set()
-
-
 class _PipelineCollector:
     """Prometheus view of the pipeline counters and staging gauges.
 
@@ -328,7 +226,6 @@ class _PipelineCollector:
         loop: asyncio.AbstractEventLoop,
         *,
         runner: FlushRunner | None = None,
-        sweeper: PoisonSweeper | None = None,
         gauge_max_staleness_s: float | None = None,
     ) -> None:
         self._consumer = consumer
@@ -336,7 +233,6 @@ class _PipelineCollector:
         self._stages = stages
         self._loop = loop
         self._runner = runner
-        self._sweeper = sweeper
         self._gauge_max_staleness_s = gauge_max_staleness_s
 
     def collect(self) -> Any:
@@ -352,11 +248,6 @@ class _PipelineCollector:
                 "millrace_records_staged_total",
                 "Records durably staged",
                 c.records_staged,
-            ),
-            (
-                "millrace_records_poisoned_total",
-                "Records quarantined at consume",
-                c.records_poisoned,
             ),
             (
                 "millrace_kafka_commits_total",
@@ -398,20 +289,20 @@ class _PipelineCollector:
                 "Uploaded objects abandoned without a commit",
                 f.orphaned_uploads,
             ),
-            (
-                "millrace_flush_records_quarantined_total",
-                "Rows quarantined at flush",
-                f.records_quarantined,
-            ),
         ]
         for name, doc, value in counters:
             yield CounterMetricFamily(name, doc, value=value)
-        if self._sweeper is not None:
-            yield CounterMetricFamily(
-                "millrace_poison_entries_purged_total",
-                "Quarantined (poison) entries deleted by the retention sweeper",
-                value=self._sweeper.purged_total,
-            )
+        dropped = CounterMetricFamily(
+            "millrace_records_dropped_total",
+            "Records dropped as malformed (consume or flush time), by reason",
+            labels=["reason"],
+        )
+        by_reason: dict[str, int] = dict(c.records_dropped)
+        for reason, count in f.records_dropped.items():
+            by_reason[reason] = by_reason.get(reason, 0) + count
+        for reason, count in sorted(by_reason.items()):
+            dropped.add_metric([reason], count)
+        yield dropped
         if self._runner is not None:
             runner = self._runner  # narrowing survives the lambda below
             fenced = GaugeMetricFamily(
@@ -565,11 +456,6 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             sweep_s=float(cfg.flush_sweep_s),
             concurrency=cfg.flush_concurrency,
         )
-        sweeper = PoisonSweeper(
-            stages,
-            retention_s=cfg.poison.retention_s,
-            sweep_s=cfg.poison.sweep_s,
-        )
         started = asyncio.Event()
         consumer_fenced = asyncio.Event()
 
@@ -599,7 +485,6 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
                 stages,
                 asyncio.get_running_loop(),
                 runner=runner,
-                sweeper=sweeper,
                 gauge_max_staleness_s=2.0 * cfg.flush_sweep_s,
             )
         )
@@ -612,7 +497,6 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
             # stops separately would leave the consumer running forever.
             consumer.stop()
             runner.stop()
-            sweeper.stop()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             loop.add_signal_handler(sig, stop_all)
@@ -630,14 +514,12 @@ async def _run(cfg: Config, hoglake_url: str, s3_kwargs: Mapping[str, Any]) -> i
 
         consumer_task = asyncio.create_task(consume_loop(), name="millrace-consumer")
         runner_task = asyncio.create_task(runner.run(), name="millrace-flush")
-        sweeper_task = asyncio.create_task(sweeper.run(), name="millrace-poison-sweep")
-        tasks = {consumer_task, runner_task, sweeper_task}
+        tasks = {consumer_task, runner_task}
         await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
         # A halt (or any task failure, or a clean consumer stop) ends the
         # process: stop both loops, then drain every task before leaving.
         consumer.stop()
         runner.stop()
-        sweeper.stop()
         outcomes = await asyncio.gather(*tasks, return_exceptions=True)
         for outcome in outcomes:
             if isinstance(outcome, ConsumerFencedError):

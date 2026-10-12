@@ -119,8 +119,6 @@ stats/<group>                             → {staged_bytes, first_staged_ts, la
 sched_age/<first_staged_ts_ob><group>     → ∅
 offsets/<group>                           → staged (topic, partition, first, last) spans
 prepared/<group><first_offset_ob>         → persisted commit request (v4 envelope)
-poison/<offset_ob>                        → quarantine envelope (stamped; purged at
-                                            MILLRACE_POISON_RETENTION_S, default 7 d)
 ```
 
 `<group>` is the partition tuple, prefix-free: `arity u8`, then per
@@ -131,12 +129,10 @@ numeric order, negatives included. No separators: the group is
 self-delimiting and the timestamp/offset fields are fixed-width.
 
 The keyspace carries no partition component: the instance *is* the
-partition. `poison/` is the quarantine — forensic state with a bounded
-lifetime: entries carry the staging-clock stamp of their write and a
-per-pod sweeper deletes expired ones in bounded batches (nothing
-depends on poison presence; a pod down at expiry purges later);
-unstamped (v1) entries are kept forever — unknown age is never
-deleted.
+partition. There is no quarantine: a record that can never become a row
+is dropped, logged and metered (`millrace_records_dropped_total{reason}`),
+at consume time (nothing is staged for it) or at flush time (it is left
+out of the payload and deleted with its window's settlement).
 
 Which group a staged record lands under is computed from its PAYLOAD,
 never from the Kafka key: the consumer parses the value as a JSON object
@@ -146,8 +142,8 @@ scalar by path (the keyer reads a struct leaf such as
 refuses struct columns at startup until nested-column support lands),
 coerces it with the same column coercer the flush decoder uses, applies
 the transform and renders the wire string pyhoglake's commit carries
-(`grouping.py:GroupKeyer`). A malformed source scalar quarantines the
-record with the field named; an absent or null source is a null
+(`grouping.py:GroupKeyer`). A malformed source scalar drops the record
+(the log line names the field); an absent or null source is a null
 component. The consumer reads the table shape at startup (the flusher's
 resolve, same pinned incarnation) and re-reads it on the flusher's TTL;
 a spec change just starts new groups, and the old ones drain by age or
@@ -193,7 +189,7 @@ re-puts its own staged keys.
 - Kafka metadata (`topic, partition, first_offset, last_offset`) is
   recorded per staged range in a side prefix; it is the flush's
   identity material (below), not the row key.
-- `event_time` outliers are clamped or quarantined **at flush time**
+- `event_time` outliers are clamped or dropped **at flush time**
   (Arrow compute over the staged range), never by mutating staged rows.
 
 ## The flush planner
@@ -258,7 +254,7 @@ SLA. The policy itself is a seam: the planner takes a policy object, and
 this three-lane policy is the default — pluggable policies are a later,
 small step precisely because the planner is pure.)
 
-A flush of one key: scan the staged range → Arrow → filter/quarantine →
+A flush of one key: scan the staged range → Arrow → filter/drop →
 sort by the live sort spec → one parquet file per partition tuple under
 the table's LIVE partition spec (whatever it is — one file when the
 staged group was keyed under the same spec) →
@@ -328,13 +324,11 @@ shape (AGENT.md invariant 12 exists because of that shape):
   over the same offset range must never share a key or the object URIs
   derived from it. The same rows re-flushed produce the same request,
   and the server's receipt dedupes the replay.
-- An answered refusal is judged, not retried — and judged precisely:
-  only a 422 whose error code names a per-record validation quarantines
-  the window (whole payloads, never truncated — the settlement deletes
-  the staged rows, so the poison entry is the only surviving copy).
-  Every other answered 4xx — a proxy's 401/403, an ingress's 413, a
-  request-shape `validation` 422 — halts the pipeline with the rows
-  staged: nothing about it says the rows can never publish, and the
+- An answered refusal is judged, not retried, and never deletes staged
+  rows. Every answered 4xx outside the named arms — a proxy's 401/403,
+  an ingress's 413, a request-shape `validation` 422, a per-record
+  `record_validation` 422 (no server emits one today) — halts the
+  pipeline with the rows staged: nothing about it says the rows can never publish, and the
   staged rows plus the persisted entry are the operator's
   reconciliation material.
 - Partition values are computed under the spec the `read_snapshot`
@@ -358,7 +352,8 @@ which arrive on the age/slow lanes.
 ## Delivery semantics
 
 At-least-once end to end, hedgerow's contract restated for a staging
-area: Kafka offsets commit strictly after durable staging; staged ranges
+area: a Kafka offset commits only after every record at or below it is
+durable in SlateDB or was dropped and counted; staged ranges
 are deleted strictly after a commit receipt. Crash between commit and
 delete → the range re-flushes → the persisted prepared request replays
 byte-identically → the receipt dedupes it. Duplicates require a flush
@@ -485,12 +480,12 @@ observability, never control flow. Fail-fast config at
 startup: resolve catalog, namespace and table (the destination must
 exist and report `read_snapshot_id`) and pin the incarnation the read
 returns. Junk
-`event_time` policy (clamp vs quarantine) is config, validated at boot.
+`event_time` policy (clamp vs drop) is config, validated at boot.
 
 Metrics are passive — they never feed control flow — and scraped from
 each pod's ops server: millrace's own counters and gauges (staged
 bytes/rows, oldest-eligible staged age, flush counters including
-orphans and quarantines) plus a whitelist of SlateDB internals, bridged via
+orphans and `millrace_records_dropped_total{reason}`) plus a whitelist of SlateDB internals, bridged via
 SlateDB's `DefaultMetricsRecorder` polled at scrape time
 (`snapshot()` is in-process atomics — no loop hop) and **aggregated
 across the pod's partition instances** — per-partition series at K
