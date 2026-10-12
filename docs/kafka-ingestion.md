@@ -137,10 +137,10 @@ out of the payload and deleted with its window's settlement).
 Which group a staged record lands under is computed from its PAYLOAD,
 never from the Kafka key: the consumer parses the value as a JSON object
 once and, per field of the table's live partition spec, reads the source
-scalar by path (the keyer reads a struct leaf such as
-`properties.team_id`, but such a table cannot run yet: the flusher
-refuses struct columns at startup until nested-column support lands),
-coerces it with the same column coercer the flush decoder uses, applies
+scalar by path (a struct leaf such as `properties.team_id` included; a
+source under a list or a map, or on a container or a json column, is
+refused when the keyer is built and at the flusher's
+startup), coerces it with the same column coercer the flush decoder uses, applies
 the transform and renders the wire string pyhoglake's commit carries
 (`grouping.py:GroupKeyer`). A malformed source scalar drops the record
 (the log line names the field); an absent or null source is a null

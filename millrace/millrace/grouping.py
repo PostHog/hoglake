@@ -12,7 +12,8 @@ payload to its tuple:
 1. locate each partition field's source column by ``source_field_id``
    in the column TREE (a struct leaf is a legal partition source; its
    dotted path is recorded — a source under a list or a map, or a
-   container itself, is refused: a row has no single value there);
+   container itself, is refused: a row has no single value there; so is
+   a json column, which has no transform domain);
 2. read that scalar from the payload by path (absent or null anywhere
    along the path → a null component);
 3. coerce it with the column's coercer (:func:`millrace.coerce.
@@ -69,6 +70,10 @@ from .keyspace import PartitionTuple
 #: row); a source BELOW a list or a map has many values per row.
 _CONTAINER_TYPES: Final = frozenset({"list", "struct", "map"})
 _REPEATED_TYPES: Final = frozenset({"list", "map"})
+#: Column types the JSON coercers fill but no partition source may be:
+#: a json value has no transform domain (flush.py refuses the same
+#: sources at startup).
+_UNKEYABLE_TYPES: Final = frozenset({"json"})
 _TEMPORAL_TRANSFORMS: Final = frozenset({"year", "month", "day", "hour"})
 _EPOCH_NAIVE: Final = datetime.fromisoformat("1970-01-01T00:00:00")
 _EPOCH_UTC: Final = datetime(1970, 1, 1, tzinfo=UTC)
@@ -79,8 +84,8 @@ class GroupKeyError(ValueError):
     """The table's partition spec cannot be keyed by this writer, decided
     when the keyer is BUILT (never per record). Refused: a source field
     id that resolves to no column; a container source (list/struct/map);
-    a source under a list or a map; a source column type the JSON
-    coercers do not support (json, variant); an unknown transform; a
+    a source under a list or a map; a json source; a source column the
+    JSON coercers do not support (variant); an unknown transform; a
     ``bucket``/``truncate`` without its positive parameter; a temporal
     transform (year/month/day/hour) on a type pyhoglake's temporal gate
     refuses; ``bucket`` on a type outside pyhoglake's bucketable set
@@ -229,6 +234,11 @@ class GroupKeyer:
                 raise GroupKeyError(
                     f"partition source {dotted!r} sits under {repeated.name!r}, a "
                     f"{repeated.type!r}: a row has many such values"
+                )
+            if leaf.type in _UNKEYABLE_TYPES:
+                raise GroupKeyError(
+                    f"partition source {dotted!r} cannot be keyed: a {leaf.type!r} "
+                    "column is not a partition source"
                 )
             try:
                 coerce = coercer_for(leaf)

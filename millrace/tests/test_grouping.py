@@ -12,7 +12,8 @@ Pinned here:
   keyer's tuple is string-for-string the tuple the flush's fanout
   (``flush._partition_groups`` over the decoded Arrow batch) files the
   same payload under — the property that makes a steady-state flush
-  exactly one file.
+  exactly one file — and the same for struct-leaf sources (read by path
+  on both sides; a null or absent struct is a null component).
 """
 
 from __future__ import annotations
@@ -29,8 +30,8 @@ from millrace.grouping import GroupKeyer, GroupKeyError, field_names
 
 UUID = "0b8ee9ba-79a1-4f3e-b7e5-6a0b6ab6f012"
 
-#: One column per scalar type the JSON coercers support (the flush
-#: decoder refuses containers, so the parity table is flat).
+#: One column per scalar type the JSON coercers support (STRUCT_LEAVES
+#: below repeats the table one level down).
 SCALARS: list[dict[str, Any]] = [
     {"name": "a", "type": "long", "field_id": 1, "ordinal": 0},
     {"name": "ts", "type": "timestamp", "field_id": 2, "ordinal": 1},
@@ -167,9 +168,13 @@ def test_construction_refuses_a_spec_it_cannot_key(spec, columns, match):
         GroupKeyer(info(spec, columns))
 
 
-def test_an_unsupported_source_column_type_is_refused():
-    columns = [{"name": "j", "type": "json", "field_id": 1, "ordinal": 0}]
-    with pytest.raises(GroupKeyError, match="'j' cannot be keyed"):
+@pytest.mark.parametrize(
+    ("col_type", "match"),
+    [("json", "'j' cannot be keyed: a 'json'"), ("variant", "'j' cannot be keyed")],
+)
+def test_a_json_or_variant_source_is_refused(col_type, match):
+    columns = [{"name": "j", "type": col_type, "field_id": 1, "ordinal": 0}]
+    with pytest.raises(GroupKeyError, match=match):
         GroupKeyer(info([(1, "identity", None)], columns))
 
 
@@ -310,3 +315,49 @@ def test_a_null_non_nullable_source_is_a_null_component_and_the_flush_drops():
     assert GroupKeyer(table).group_for(load_json_object(raw)) == (None,)
     with pytest.raises(DecodeError, match="not nullable"):
         flush.JsonObjectDecoder(table.columns).decode_record(raw)
+
+
+#: The scalar table again, every column moved one level down into a
+#: ``props`` struct (field ids shifted by 100), beside the original
+#: top-level ``a``.
+STRUCT_LEAVES: list[dict[str, Any]] = [
+    {"name": "a", "type": "long", "field_id": 1, "ordinal": 0},
+    {
+        "name": "props",
+        "type": "struct",
+        "field_id": 100,
+        "ordinal": 1,
+        "children": [{**c, "field_id": c["field_id"] + 100} for c in SCALARS],
+    },
+]
+
+STRUCT_PARITY_SPECS: list[list[tuple[int, str, int | None]]] = [
+    [(101, "identity", None)],
+    [(1, "identity", None), (102, "month", None), (103, "day", None)],
+    [(104, "year", None), (106, "truncate", 3), (107, "bucket", 4)],
+    [(108, "hour", None), (110, "bucket", 7), (111, "identity", None)],
+    [(105, "identity", None), (113, "truncate", 10), (115, "identity", None)],
+]
+
+
+@pytest.mark.parametrize("spec", STRUCT_PARITY_SPECS)
+@pytest.mark.parametrize(
+    "doc",
+    [{"a": 1, "props": d} for d in PARITY_DOCS]
+    + [{"a": 2, "props": None}, {"a": 3}, {"props": {}}],
+)
+def test_a_struct_leaf_sources_tuple_is_the_flush_fanouts_tuple(spec, doc):
+    """The parity property for struct-leaf sources: the keyer reads the
+    leaf by path from the payload, the fanout by ``struct_field`` from the
+    decoded Arrow batch; a null or absent struct is a null component on
+    both sides."""
+    table = info(spec, STRUCT_LEAVES)
+    keyer = GroupKeyer(table)
+    raw = json.dumps(doc).encode()
+    group = keyer.group_for(load_json_object(raw))
+
+    record = flush.JsonObjectDecoder(table.columns).decode_record(raw)
+    _, encoded = flush._build_batch([record], table.columns)
+    assert table.partition_spec is not None
+    ((fanout_tuple, _),) = flush._partition_groups(encoded, table, table.partition_spec)
+    assert group == fanout_tuple

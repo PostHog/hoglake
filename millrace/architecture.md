@@ -134,13 +134,12 @@ The consumer computes it per record (`grouping.py:GroupKeyer.group_for`,
 section 4):
 
 1. find each partition field's source column by `source_field_id` in the
-   column tree — the keyer accepts a struct leaf (its dotted path, e.g.
-   `properties.team_id`, is recorded), but no table with one can run
-   yet: the flusher's startup refuses struct columns
-   (`coerce.py:coercer_for`, until package 4). When the keyer is built
-   it refuses (`GroupKeyError`): an unknown field id; a container
-   source; a source under a list or map; a source type the JSON
-   coercers do not support (json, variant); an unknown transform;
+   column tree — a struct leaf is a legal source, read by its dotted
+   path (e.g. `properties.team_id`) here and by `pc.struct_field` in
+   the flush's fanout. When the keyer is built it refuses
+   (`GroupKeyError`): an unknown field id; a container source; a source
+   under a list or map; a json source; a variant source (its column
+   is refused, below); an unknown transform;
    `bucket`/`truncate` without its positive parameter; a temporal
    transform on a type pyhoglake's temporal gate refuses; `bucket` on a
    type outside pyhoglake's bucketable set (boolean, float, double,
@@ -157,7 +156,10 @@ section 4):
 
 The keyer's tuple equals the tuple the flush's fanout files the same
 payload under, across the full scalar type × transform matrix
-(`test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build`).
+(`test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build`)
+and for struct-leaf sources, where a null or absent struct is a null
+component on both sides
+(`test_grouping.py::test_a_struct_leaf_sources_tuple_is_the_flush_fanouts_tuple`).
 The group is a layout optimization, not the source of truth: the flush
 still fans every window out by the table's **live** spec
 (`flush.py:_partition_groups`), so a group keyed under an older spec
@@ -346,6 +348,16 @@ spec: the flush's fanout by the live spec keeps files correct. A spec
 change therefore just starts new groups; groups keyed under the old
 spec drain by the age or slow lane, each flushing as several files.
 
+The flusher's own startup check (`HoglakeFlusher.resolve`,
+`FlushStartupError`, exit 1) refuses by column only what the decoder
+cannot fill — an unknown type, a `variant` (at any depth; see "Not yet
+built"), a malformed container, a map whose key child is a container or
+`json` (a JSON object key is a string, which no such key coerces),
+nesting past 8 — and by spec a
+partition or sort source that is not one scalar per row: a container, a
+json column, or a leaf under a list or a map
+(`flush.py:_source_fault`; a struct leaf is accepted).
+
 librdkafka config (`kafka_consumer_config`): `enable.auto.commit=false`,
 `enable.auto.offset.store=false`, `auto.offset.reset` from config,
 fetch knobs from config; cooperative mode adds
@@ -533,31 +545,65 @@ sequenceDiagram
    window.
 5. **Build** (`build_prepared_plan`, pure, on the I/O pool): decode each
    payload as a JSON object against the table's columns
-   (`JsonObjectDecoder`; undecodable or uncastable records are
-   dropped — `undecodable_payload` / `uncastable_column` — unknown keys
-   dropped from the row and logged once per key); apply the junk
+   (`JsonObjectDecoder`, the per-column coercers of
+   `coerce.py:coercer_for`; undecodable or uncastable records are
+   dropped — `undecodable_payload` / `uncastable_column` — unknown
+   top-level keys dropped from the row and logged once per key, unknown
+   keys inside a struct ignored). Column types, by coercer:
+
+   | Catalog type | JSON value | Lands as |
+   |---|---|---|
+   | scalars | the scalar's JSON form (`coerce.py` module docstring) | the scalar |
+   | `struct` | object | one value per catalog child; absent or null child → NULL; keys the catalog does not name ignored |
+   | `list` | array | coerced elements |
+   | `map` | object | `(key, value)` pairs in object order; the key STRING goes through the key child's coercer as-is, then (for a non-string key child) parsed as a strict JSON number/boolean (`"42"` → `long` 42). The string form wins: a temporal key that is valid ISO text is read as such (`"20260101"` is a `date` 2026-01-01, never an epoch day); the numeric fallback applies only to non-ISO strings. Two keys coercing to one STORED value (a `float` key compared after float32 narrowing) → `uncastable_column`. A container or `json` key child is refused at startup |
+   | `json` | any | canonical text, `json.dumps(v, separators=(",", ":"), ensure_ascii=False, allow_nan=False)`, in the `pa.json_()` string storage |
+   | `variant` | — | refused at startup (`UnsupportedColumnError` naming the column; "Not yet built") |
+
+   A top-level JSON `null` (or an absent key) is SQL NULL for every
+   type, json included; inside a container a `null` is SQL
+   NULL too. Either is refused (`uncastable_column`) where the catalog
+   says the column or child is not nullable. A non-object/non-array
+   where a container expects one is `uncastable_column`. Every decode
+   failure carries the dotted catalog path of the refusing column or
+   child (`DecodeError.path`, e.g. `properties.inner.id`, `attrs.key`),
+   which the drop log names (step 6). Nesting is bounded by
+   pyhoglake's `MAX_COLUMN_NESTING_DEPTH` (8). Apply the junk
    `event_time` window `[now − MILLRACE_EVENT_TIME_MAX_PAST_S, now +
    MILLRACE_EVENT_TIME_MAX_FUTURE_S]` to the decoded values of the
-   partition spec's temporal sources (`year`/`month`/`day`/`hour`):
-   `drop` (default) drops the record (`event_time_out_of_window`),
-   `clamp` rewrites the decoded value to the window edge, staged rows
-   are never mutated; Arrow build (`_build_batch_isolating`), isolating
-   and dropping the one record that still defeats it
-   (`uncastable_column`) so it cannot fail the batch; sort by the table's live sort spec (staging
-   order is Kafka record time, the sort spec is payload time); fan out
-   by the live partition spec, one file per tuple (exactly one when the
-   staged group was keyed under the live spec and no temporal source was
-   clamped), halting
+   partition spec's temporal sources (`year`/`month`/`day`/`hour`; a
+   struct leaf is read and clamped by path): `drop` (default) drops the
+   record (`event_time_out_of_window`), `clamp` rewrites the decoded
+   value to the window edge, staged rows are never mutated. Arrow build
+   (`_build_batch_isolating`): each column is built with `pa.array` at
+   `flush.py:_build_type` (uuid as its 16-byte storage, json as string,
+   timestamptz as naive micros, at any depth) and cast once to the
+   catalog type. The one record that still defeats the build is
+   isolated and dropped (`uncastable_column`) so it cannot fail the
+   batch. Sort by the table's live sort spec (staging
+   order is Kafka record time, the sort spec is payload time; a
+   struct-leaf key is read by `pc.struct_field` into a shadow table);
+   fan out by the live partition spec (a struct-leaf source likewise),
+   one file per tuple (exactly one when the staged group was keyed
+   under the live spec and no temporal source was clamped), halting
    `fanout_exceeds_commit_bound` above `MILLRACE_MAX_FILES_PER_COMMIT`
-   before any I/O; format the commit message; per file, write parquet,
-   check schema/field ids, and register `path, record_count,
-   file_size_bytes, footer_size`, `partition_values` if partitioned, and
-   `column_stats` only when the realized file is ≥
-   `max(1, int(target × 0.5))` bytes (262,144,000 B at default; smaller
-   files register without stats and the server's hydrator backfills).
+   before any I/O; format the commit message; per file, write parquet
+   (`timestamp_s` stored as milliseconds at any depth); check
+   schema/field ids at every level (a map's entries struct compared
+   under Arrow's default name, `flush.py:file_schema`), and register `path, record_count, file_size_bytes,
+   footer_size`, `partition_values` if partitioned, and `column_stats`
+   (pyhoglake's `extract_column_stats`: leaves only, nested leaves
+   included, nothing for a container) only when the
+   realized file is ≥ `max(1, int(target × 0.5))` bytes (262,144,000 B
+   at default; smaller files register without stats and the server's
+   hydrator backfills).
 6. **Drops.** The plan's dropped records are counted in
    `millrace_records_dropped_total{reason}` and logged, one WARNING per
-   reason per decision naming the group and the offsets (the first 20).
+   reason per decision naming the group, the offsets (the first 20)
+   and, for a decode failure, the first refusing column's dotted path
+   (`first_path=properties.inner.id (offset 7)` — catalog names only,
+   never a payload value; the flush-side counterpart of the consumer's
+   `malformed_partition_source:<path>`).
    Nothing is written for them: they stay staged until the window's
    settlement deletes them with the published rows. The count is per
    build, so at-least-once: a decision rebuilt after an upload or
@@ -1047,12 +1093,15 @@ Each is pinned by the named test(s) under `tests/`.
 | 29 | Liveness latches only terminal states. | `test_main.py::test_liveness_status_latches_only` |
 | 30 | Writers cannot drop their embedded compactor; external GC is safe beside a live writer. | `test_slatedb_parity.py::test_compactor_disabled_stalls_memtable_flushes_at_l0_max_ssts`, `test_slatedb_parity.py::test_external_gc_concurrent_with_active_writer` |
 | 31 | The group encoding round-trips (empty tuple, nulls, unicode), is total on decode, and is prefix-free: a tuple whose components are a byte prefix of another's never leaks into its row or `prepared/` range. | `test_keyspace.py::test_group_round_trip`, `test_keyspace.py::test_decode_group_never_raises_anything_but_value_error`, `test_keyspace.py::test_no_group_encoding_is_a_byte_prefix_of_another`, `test_keyspace.py::test_a_tuple_whose_components_prefix_another_never_leaks_into_its_range` |
-| 32 | The consumer's partition tuple is the flush fanout's tuple for the same payload across the full scalar type × transform matrix; a pair the keyer refuses at build is one the flush's array path refuses too. | `test_grouping.py::test_the_keyers_tuple_is_the_flush_fanouts_tuple`, `test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build` |
+| 32 | The consumer's partition tuple is the flush fanout's tuple for the same payload across the full scalar type × transform matrix and for struct-leaf sources; a pair the keyer refuses at build is one the flush's array path refuses too. | `test_grouping.py::test_the_keyers_tuple_is_the_flush_fanouts_tuple`, `test_grouping.py::test_the_full_type_transform_matrix_keys_like_the_fanout_or_refuses_at_build`, `test_grouping.py::test_a_struct_leaf_sources_tuple_is_the_flush_fanouts_tuple` |
 | 33 | A group keyed under the live spec flushes as exactly one file; one keyed under an older spec still fans out correctly by the live spec. | `test_flush.py::test_one_flush_per_group_writes_exactly_one_file_under_a_matching_spec`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
 | 34 | A spec refresh starts new groups and leaves the old group staged and flushable; a transient re-read failure keeps the old keyer; a recreated table halts the consume loop without committing. | `test_consumer.py::test_a_spec_refresh_mid_stream_starts_new_groups_and_keeps_the_old`, `test_consumer.py::test_a_failed_shape_reread_keeps_the_old_keyer`, `test_consumer.py::test_a_recreated_table_at_reread_halts_the_loop_without_committing`, `test_flush.py::test_another_incarnation_halts_table_recreated` |
 | 35 | The Kafka key is never read; a malformed partition source is dropped naming the field. | `test_consumer.py::test_the_kafka_key_is_never_read`, `test_consumer.py::test_a_malformed_source_is_dropped_naming_the_field`, `test_consumer.py::test_a_keyless_topic_stages_by_the_payloads_partition_tuple` |
 | 36 | The idempotency key is a function of the staged tuple alone (positional names), never of the spec live at flush time. | `test_keyspace.py::test_idempotency_key_new_form_names_the_group_positionally`, `test_keyspace.py::test_idempotency_key_golden_vector`, `test_flush.py::test_a_group_keyed_under_an_older_spec_still_fans_out_by_the_live_one` |
 | 37 | A recovered entry's replay answered 410 or `ddl_since_read_snapshot` never halts: the entry is dropped, its objects are counted unresolved (never orphaned), the re-prepare is counted by reason, and the rows publish on a later sweep against a fresh read under the same key and fresh object names that no earlier build used. A fresh publish's 410 still halts. | `test_flush.py::test_a_410_at_reconcile_reprepares_and_never_halts`, `test_flush.py::test_a_ddl_refusal_at_reconcile_counts_unresolved_not_orphaned`, `test_flush.py::test_the_runner_reprepares_an_aged_survivor_on_410_without_halting`, `test_flush.py::test_410_halts_with_the_servers_reconcile_instructions` |
+| 38 | Every leaf type at depth 2 and 3 inside a struct, a list and a map coerces, builds and reads back as the payload's value, with a field id on every level; a null into a non-nullable child (at any depth) is `uncastable_column` naming its dotted path; nesting stops at pyhoglake's depth cap; a `variant` column at any depth, and a map keyed by a container or json, is a startup refusal; map keys collide as stored (float32 narrowed); a nested drop's log line names the dotted path and never the value. | `test_coerce.py::test_every_leaf_type_inside_every_container_round_trips`, `test_coerce.py::test_a_null_into_a_non_nullable_child_names_its_path`, `test_coerce.py::test_a_nested_decode_error_carries_its_path`, `test_coerce.py::test_nesting_is_bounded_by_pyhoglakes_depth_cap`, `test_coerce.py::test_a_variant_column_is_refused_at_any_depth`, `test_coerce.py::test_float32_map_keys_collide_as_stored`, `test_flush.py::test_unfillable_columns_are_a_startup_refusal`, `test_flush.py::test_a_nested_drop_logs_the_dotted_path_never_the_value` |
+| 39 | A `json` value is stored as its canonical text; a JSON `null` is SQL NULL (refused when not nullable); a value with no valid text is `uncastable_column`. | `test_coerce.py::test_json_is_stored_as_canonical_text`, `test_coerce.py::test_json_null_is_sql_null_and_refused_when_not_nullable`, `test_coerce.py::test_json_without_valid_text_is_uncastable` |
+| 40 | Struct-leaf partition and sort sources work end to end (fanout by the leaf, a null struct as the null tuple, files key-nondecreasing by the leaf, the junk window applied to a temporal leaf); leaf-only column stats ship for nested leaves and none for a container; a source under a list or a map, on a container, or on a json column is a startup refusal. | `test_flush.py::test_nested_and_json_columns_flush_end_to_end`, `test_flush.py::test_a_nested_partition_source_keyed_by_the_consumer_flushes_one_file`, `test_flush.py::test_a_temporal_struct_leaf_source_takes_the_junk_window`, `test_flush.py::test_an_unreadable_source_refuses_at_resolve` |
 
 The live suite (`tests/live/`, `just millrace live`) covers end-to-end
 per-tenant reconciliation, kill -9 mid-flush, a lost commit response,
@@ -1085,6 +1134,8 @@ freshness, the DDL race, drop+recreate halt, and compaction observation.
 | Shape | `TableInfo`: columns, partition spec, sort spec, `read_snapshot_id` |
 | Compression ratio | Parquet bytes ÷ staged bytes, the size lane's estimate |
 | Eligible | Claimed by some lane at the last sweep |
+| Struct leaf | A scalar column reached through structs only (no list or map on its path), named by its dotted path (`properties.team_id`); a legal partition and sort source |
+| Canonical JSON text | `json.dumps(v, separators=(",", ":"), ensure_ascii=False, allow_nan=False)` of the parsed value: what a `json` column stores. Object keys keep PAYLOAD order (fidelity), so one logical object can have several texts |
 
 ## Not yet built
 
@@ -1096,11 +1147,17 @@ Only items the code or README explicitly defers.
   `stats/` (`flush.py:FlushRunner._assemble_stats`).
 - Non-JSON payload decoding (schema registry, Avro/Proto) behind
   `flush.py:PayloadDecoder`.
-- `json`, nested and `variant` destination columns (flusher startup
-  refusal — which also keeps a struct-leaf partition source, though the
-  consumer's keyer reads it by path, from reaching the flush), nested
-  sort sources and nested partition sources in the flusher (top-level
-  only), and schema evolution from payloads (unknown keys are dropped).
+- `variant` destination columns (startup refusal, `coerce.py`): hoglake
+  takes a variant only as a native Parquet `VARIANT(1)` group, pyarrow
+  cannot write that annotation, and pyhoglake's Arrow writer refuses
+  variant destinations for the same reason. A footer rewriter that
+  stamps the annotation after `pq.write_table` was built and removed as
+  too much Parquet format surface for an ingestion service; the fix is
+  upstream (pyarrow or pyhoglake).
+- Partition and sort sources under a list or a map (startup refusal in
+  the flusher and the keyer): a row has many values there.
+- Schema evolution from payloads (unknown top-level keys are dropped and
+  logged; unknown keys inside a struct are ignored, uncounted).
 - A per-record server refusal (e.g. a 422 `record_validation`): no
   server emits one today, and any answered 4xx halts with the rows
   staged; whether such a refusal may ever delete staged rows is

@@ -14,6 +14,36 @@ never an ``OverflowError`` or a ``UnicodeEncodeError`` that would escape
 per-record failure routing. Strict JSON (:func:`load_json_object`)
 refuses the NaN/Infinity literals at parse time; magnitude-overflow
 literals (``1e400`` parses to ``inf``) are refused at coercion.
+
+Column types (:func:`coercer_for`):
+
+- scalars: one coercer per catalog type (below);
+- ``struct``: a JSON object → a dict with one entry per catalog child
+  (an absent or null child → None; keys the catalog does not name are
+  ignored); anything but an object is a :class:`DecodeError`;
+- ``list``: a JSON array → a list of coerced elements;
+- ``map``: a JSON object → a list of ``(key, value)`` pairs in the
+  object's order; the key child coerces the key STRING (a key child
+  that is not a string type first tries the string as-is, then the
+  string parsed as a strict JSON number or boolean — ``"42"`` for a
+  ``long`` key, ``"true"`` for a ``boolean`` one). The string form
+  WINS: for a temporal key type (date, time, the timestamp family) a
+  key that is valid ISO-8601 text is read as such — ``"20260101"`` is
+  ISO-basic, so a ``date`` key reads it as 2026-01-01, never as epoch
+  day 20,260,101 — and the numeric fallback applies only to a string
+  that is not valid ISO text. Two keys that coerce to one value are
+  refused, compared as the column stores them (a ``float`` key narrowed
+  to float32 first). A key child that is a container or ``json`` is a
+  startup refusal: a JSON object key is a string, which no such key
+  coerces;
+- ``json``: any JSON value → its canonical text (:func:`canonical_json`).
+
+Inside a container a null element, child or value is SQL NULL, refused
+(naming the dotted path) where the catalog says the child is not
+nullable. Nesting is bounded by pyhoglake's
+``MAX_COLUMN_NESTING_DEPTH``. A ``variant`` column, at any depth, is
+refused (:class:`UnsupportedColumnError`): pyarrow cannot write the
+native Parquet VARIANT annotation hoglake requires.
 """
 
 from __future__ import annotations
@@ -23,6 +53,7 @@ import binascii
 import json
 import math
 import re
+import struct
 import uuid as _uuid
 from collections.abc import Callable
 from datetime import date, datetime, timedelta
@@ -32,6 +63,7 @@ from typing import Any, Final
 
 import pyarrow as pa
 from pyhoglake import Column
+from pyhoglake.types import MAX_COLUMN_NESTING_DEPTH
 
 _MICROS_PER_SECOND: Final = 1_000_000
 MICROS_PER_DAY: Final = 86_400_000_000
@@ -50,18 +82,26 @@ class DecodeError(ValueError):
     """One staged payload cannot become a row: not a JSON document/object,
     or a value that cannot be coerced to its catalog column. Per-record —
     the flush drops the record and moves on. ``reason`` is the
-    drop vocabulary (the metric's reason label)."""
+    drop vocabulary (the metric's reason label). ``path`` is the dotted
+    catalog path of the column or child that failed (``properties.ts``,
+    ``tags.element``, ``attrs.key``) when one is known — catalog names
+    only, never a payload value, so it is safe to log where the message
+    (which may quote the value) is not."""
 
-    def __init__(self, message: str, *, reason: str) -> None:
+    def __init__(self, message: str, *, reason: str, path: str | None = None) -> None:
         super().__init__(message)
         self.reason = reason
+        self.path = path
 
 
 class UnsupportedColumnError(ValueError):
-    """The destination table carries a column type the v1 JSON decoder
-    does not support (json / list / struct / map / variant), or a
-    decimal whose type_params do not build. Named with the column; the
-    flusher's startup resolution re-raises it as a startup refusal."""
+    """The destination table carries a column the JSON decoder cannot
+    fill: an unknown type, a decimal whose type_params do not build, a
+    container whose children do not match its type, a column nested past
+    ``MAX_COLUMN_NESTING_DEPTH``, or a ``variant`` (pyarrow cannot write
+    the native Parquet VARIANT annotation hoglake requires).
+    Named with the column; the flusher's startup resolution re-raises it
+    as a startup refusal."""
 
 
 _INT_BOUNDS: Final = {
@@ -446,7 +486,33 @@ def _coerce_timestamp(value: Any, type_name: str, *, tz: bool) -> int:
     return result
 
 
-def coercer_for(column: Column) -> Callable[[Any], Any]:
+def canonical_json(value: Any) -> str:
+    """The text a ``json`` value is stored as: compact separators,
+    non-ASCII kept as UTF-8, object keys in PAYLOAD order (payload
+    fidelity — so one logical object can have several texts:
+    ``{"a":1,"b":2}`` and ``{"b":2,"a":1}`` are stored as written, not
+    normalised), numbers as Python's ``json`` spells them (integers
+    exactly, floats shortest round-trip). Raises ``ValueError`` for a non-finite float
+    (``1e400`` parses to ``inf``) and ``RecursionError`` past the
+    interpreter's depth."""
+    return json.dumps(value, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _coerce_json_text(value: Any, *, reason: str) -> str:
+    try:
+        text = canonical_json(value)
+    except (ValueError, RecursionError) as e:
+        raise DecodeError(f"value has no JSON text: {e}", reason=reason) from e
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as e:
+        # A lone surrogate (legal JSON: "\ud800") — Arrow's UTF-8
+        # conversion would raise outside the build isolation's taxonomy.
+        raise DecodeError(f"JSON text is not valid UTF-8 ({e})", reason=reason) from e
+    return text
+
+
+def _scalar_coercer(column: Column) -> Callable[[Any], Any]:
     t = column.type
     if t == "boolean":
         return _coerce_bool
@@ -489,12 +555,184 @@ def coercer_for(column: Column) -> Callable[[Any], Any]:
         return lambda v: _coerce_timestamp(v, t, tz=False)
     if t == "timestamptz":
         return lambda v: _coerce_timestamp(v, t, tz=True)
+    if t == "json":
+        return lambda v: _coerce_json_text(v, reason=REASON_UNCASTABLE_COLUMN)
     raise UnsupportedColumnError(
-        f"column {column.name!r} has type {t!r}, which the v1 JSON decoder "
-        "does not support (supported: boolean, the int widths, float/double, "
-        "string, binary, uuid, decimal, date, time and the timestamp family; "
-        "json, nested and variant columns need a later decoder)"
+        f"column {column.name!r} has type {t!r}, which the JSON decoder does "
+        "not know (supported: boolean, the int widths, float/double, string, "
+        "binary, uuid, decimal, date, time, the timestamp family, json, "
+        "struct, list and map)"
     )
+
+
+_CONTAINER_TYPES: Final = frozenset({"struct", "list", "map"})
+#: What a map key STRING may parse to (strict JSON) when the key child's
+#: coercer refuses the string as-is: the number and boolean key types.
+_KEY_RETRY: Final = (int, float, bool)
+
+
+def _null_child(path: str) -> DecodeError:
+    return DecodeError(
+        f"{path} is not nullable and the payload has no usable value",
+        reason=REASON_UNCASTABLE_COLUMN,
+        path=path,
+    )
+
+
+def _float32(value: float) -> float:
+    """The float32 a catalog ``float`` value is stored as."""
+    return float(struct.unpack(">f", struct.pack(">f", value))[0])
+
+
+def _children(column: Column, path: str) -> tuple[Column, ...]:
+    """A container's children in ordinal order, shape-checked against
+    its type (Iceberg's synthetic names for list/map)."""
+    children = tuple(sorted(column.children or (), key=lambda c: c.ordinal))
+    want = {"list": ("element",), "map": ("key", "value")}.get(column.type)
+    if want is not None and tuple(c.name for c in children) != want:
+        raise UnsupportedColumnError(
+            f"column {path!r} is a {column.type} whose children are "
+            f"{[c.name for c in children]}, not {list(want)}"
+        )
+    if not children:
+        raise UnsupportedColumnError(f"column {path!r} is a struct with no children")
+    return children
+
+
+def _child_coercer(child: Column, path: str, depth: int) -> Callable[[Any], Any]:
+    """A container child's coercer: null → None (refused when the child
+    is not nullable), anything else coerced, a scalar failure re-raised
+    naming the child's dotted path (container failures name their own)."""
+    inner = _coercer(child, path, depth)
+    nested = child.type in _CONTAINER_TYPES
+    nullable = child.nullable
+
+    def coerce(value: Any) -> Any:
+        if value is None:
+            if not nullable:
+                raise _null_child(path)
+            return None
+        if nested:
+            return inner(value)
+        try:
+            return inner(value)
+        except DecodeError as e:
+            raise DecodeError(f"{path}: {e}", reason=e.reason, path=path) from e
+
+    return coerce
+
+
+def _parse_key(text: str) -> Any:
+    try:
+        return json.loads(text, parse_constant=reject_constant)
+    except (ValueError, RecursionError):
+        return None
+
+
+def _coercer(column: Column, path: str, depth: int) -> Callable[[Any], Any]:
+    if depth > MAX_COLUMN_NESTING_DEPTH:
+        raise UnsupportedColumnError(
+            f"column {path!r} nests deeper than the maximum "
+            f"{MAX_COLUMN_NESTING_DEPTH} (a top-level column is depth 1)"
+        )
+    t = column.type
+    if t == "variant":
+        raise UnsupportedColumnError(
+            f"column {path!r} is a variant: hoglake takes a variant only as a "
+            "native Parquet VARIANT group, and pyarrow cannot write that "
+            "annotation (pyhoglake's Arrow writer refuses it for the same reason)"
+        )
+    if t == "struct":
+        fields = tuple(
+            (c.name, _child_coercer(c, f"{path}.{c.name}", depth + 1))
+            for c in _children(column, path)
+        )
+
+        def coerce_struct(value: Any) -> dict[str, Any]:
+            if not isinstance(value, dict):
+                raise DecodeError(
+                    f"{path}: expected a JSON object for a struct, got "
+                    f"{type(value).__name__}",
+                    reason=REASON_UNCASTABLE_COLUMN,
+                    path=path,
+                )
+            return {name: coerce(value.get(name)) for name, coerce in fields}
+
+        return coerce_struct
+    if t == "list":
+        (element,) = _children(column, path)
+        coerce_element = _child_coercer(element, f"{path}.element", depth + 1)
+
+        def coerce_list(value: Any) -> list[Any]:
+            if not isinstance(value, list):
+                raise DecodeError(
+                    f"{path}: expected a JSON array for a list, got "
+                    f"{type(value).__name__}",
+                    reason=REASON_UNCASTABLE_COLUMN,
+                    path=path,
+                )
+            return [coerce_element(v) for v in value]
+
+        return coerce_list
+    if t == "map":
+        key, item = _children(column, path)
+        key_path = f"{path}.key"
+        if key.type in _CONTAINER_TYPES or key.type == "json":
+            raise UnsupportedColumnError(
+                f"column {key_path!r} is a {key.type!r} map key: a JSON object "
+                "key is a string, which no such key coerces"
+            )
+        coerce_key = _coercer(key, key_path, depth + 1)
+        narrow = _float32 if key.type == "float" else None
+        coerce_item = _child_coercer(item, f"{path}.value", depth + 1)
+        key_is_string = key.type == "string"
+
+        def key_of(text: str) -> Any:
+            try:
+                return coerce_key(text)
+            except DecodeError as first:
+                parsed = None if key_is_string else _parse_key(text)
+                if not isinstance(parsed, _KEY_RETRY):
+                    raise DecodeError(
+                        f"{key_path}: {first}", reason=first.reason, path=key_path
+                    ) from first
+            try:
+                return coerce_key(parsed)
+            except DecodeError as e:
+                raise DecodeError(
+                    f"{key_path}: {e}", reason=e.reason, path=key_path
+                ) from e
+
+        def coerce_map(value: Any) -> list[tuple[Any, Any]]:
+            if not isinstance(value, dict):
+                raise DecodeError(
+                    f"{path}: expected a JSON object for a map, got "
+                    f"{type(value).__name__}",
+                    reason=REASON_UNCASTABLE_COLUMN,
+                    path=path,
+                )
+            pairs = [(key_of(k), coerce_item(v)) for k, v in value.items()]
+            # Compared as stored: a float32 key narrows in Arrow, so two
+            # doubles that differ only below float32 precision collide.
+            stored = {narrow(k) if narrow else k for k, _ in pairs}
+            if len(stored) != len(pairs):
+                raise DecodeError(
+                    f"{key_path}: two keys of the object coerce to one map key",
+                    reason=REASON_UNCASTABLE_COLUMN,
+                    path=key_path,
+                )
+            return pairs
+
+        return coerce_map
+    return _scalar_coercer(column)
+
+
+def coercer_for(column: Column) -> Callable[[Any], Any]:
+    """The coercer of one catalog column (the module docstring's rules),
+    applied to a NON-null JSON value — the caller decides what a null
+    or absent top-level value means. Raises
+    :class:`UnsupportedColumnError` for a column it cannot fill."""
+    return _coercer(column, column.name, 1)
 
 
 def load_json_object(payload: bytes) -> dict[str, Any]:

@@ -28,9 +28,11 @@ idempotency-key derivation),
 `planner.py` (pure per-key flush decisions: the size/age/slow
 three-lane policy behind a policy seam), `grouping.py` (the
 partition-tuple keyer: payload → the destination's partition tuple; it
-reads nested struct-leaf sources by path, but the flusher still refuses
-struct columns at startup, so such a table cannot run yet), `coerce.py` (the per-column JSON
-coercers the keyer and the flush decoder share), `stage.py`
+reads struct-leaf sources such as `properties.team_id` by path),
+`coerce.py` (the per-column JSON coercers the keyer and the flush decoder
+share: scalars, `json` and `struct`/`list`/`map` at any depth; a
+`variant` column is a startup refusal, as pyarrow cannot write the
+native Parquet VARIANT annotation), `stage.py`
 (the per-partition SlateDB staging layer:
 `PartitionStage` + `StageManager`), `consumer.py` (the consume loop:
 static and cooperative assignment claiming via `StageManager.sync_assignment`,
@@ -171,7 +173,7 @@ quarantined or retained. Each drop increments
 | Consume | `missing_value` | Tombstone |
 | Consume | `malformed_value` | Not a strict JSON object |
 | Consume | `malformed_partition_source` | A partition source scalar cannot be keyed; the log line names the path (`malformed_partition_source:<path>`), the label does not |
-| Flush | `undecodable_payload` / `uncastable_column` | The payload does not decode or cast against the table's columns, or defeats the Arrow build |
+| Flush | `undecodable_payload` / `uncastable_column` | The payload does not decode or cast against the table's columns (the drop log line names the first refusing column's dotted path, `first_path=properties.inner.id`, never the value), or defeats the Arrow build |
 | Flush | `event_time_out_of_window` | Junk `event_time` under `MILLRACE_EVENT_TIME_POLICY=drop` (the default) |
 
 Consume-time drop lines name topic, partition, offset and reason, at

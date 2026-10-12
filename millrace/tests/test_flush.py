@@ -105,7 +105,9 @@ from flushkit import (
     team_group,
     team_label,
 )
+from pyhoglake import TableInfo
 from pyhoglake.models import Column
+from pyhoglake.parquet_schema import prepared_schema_matches
 from slatedb.uniffi import CloseReason
 from slatedb.uniffi import Error as SlateError
 from stagekit import NOW, fast_flush_settings
@@ -490,24 +492,70 @@ class TestJsonDecoder:
         with pytest.raises(DecodeError):
             decoder.decode_record(b'{"d": 12345678901}')  # precision 10 exceeded
 
-    def test_unsupported_column_types_are_a_startup_refusal(self) -> None:
-        for t in ("json", "list", "struct", "map", "variant"):
-            wire = [{"name": "c", "type": t, "field_id": 1, "ordinal": 0}]
-            if t in ("list", "struct", "map"):
-                wire[0]["children"] = [
-                    {"name": "element", "type": "long", "field_id": 2, "ordinal": 0}
-                ]
-                if t == "struct":
-                    wire[0]["children"] = [
-                        {"name": "leaf", "type": "long", "field_id": 2, "ordinal": 0}
-                    ]
-                if t == "map":
-                    wire[0]["children"] = [
-                        {"name": "key", "type": "string", "field_id": 2, "ordinal": 0},
-                        {"name": "value", "type": "long", "field_id": 3, "ordinal": 1},
-                    ]
-            with pytest.raises(UnsupportedColumnError, match="'c'"):
-                JsonObjectDecoder(columns(wire))
+    def test_unfillable_columns_are_a_startup_refusal(self) -> None:
+        """What is still refused by shape: an unknown type, a variant (top
+        level or below a container), a container whose children do not
+        match its type, and a map whose key is a container or json (a
+        JSON object key is a string, which no such key coerces — without
+        the refusal every non-empty map would drop at flush time)."""
+        variant_in_struct = {
+            "name": "c",
+            "type": "struct",
+            "field_id": 1,
+            "ordinal": 0,
+            "children": [{"name": "v", "type": "variant", "field_id": 2, "ordinal": 0}],
+        }
+        bad_list = {
+            "name": "c",
+            "type": "list",
+            "field_id": 1,
+            "ordinal": 0,
+            "children": [{"name": "item", "type": "long", "field_id": 2, "ordinal": 0}],
+        }
+        variant = {"name": "c", "type": "variant", "field_id": 1, "ordinal": 0}
+
+        def map_keyed_by(key: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "name": "c",
+                "type": "map",
+                "field_id": 1,
+                "ordinal": 0,
+                "children": [
+                    {"name": "key", "field_id": 2, "ordinal": 0, "nullable": False}
+                    | key,
+                    {"name": "value", "type": "long", "field_id": 9, "ordinal": 1},
+                ],
+            }
+
+        struct_key = map_keyed_by(
+            {
+                "type": "struct",
+                "children": [
+                    {"name": "x", "type": "long", "field_id": 3, "ordinal": 0}
+                ],
+            }
+        )
+        list_key = map_keyed_by(
+            {
+                "type": "list",
+                "children": [
+                    {"name": "element", "type": "long", "field_id": 3, "ordinal": 0}
+                ],
+            }
+        )
+        json_key = map_keyed_by({"type": "json"})
+        unknown = {"name": "c", "type": "interval", "field_id": 1, "ordinal": 0}
+        for wire in (
+            variant_in_struct,
+            bad_list,
+            variant,
+            unknown,
+            struct_key,
+            list_key,
+            json_key,
+        ):
+            with pytest.raises(UnsupportedColumnError, match="'c[.']"):
+                JsonObjectDecoder(columns([wire]))
 
     def test_timestamp_int_passthrough_is_bounded_per_unit(self) -> None:
         """An epoch integer outside the column unit's int64 range is a
@@ -3746,9 +3794,19 @@ class TestStartupValidation:
     ) -> None:
         wire = table_wire(
             columns=COLUMNS_WIRE
-            + [{"name": "props", "type": "json", "field_id": 4, "ordinal": 3}]
+            + [
+                {
+                    "name": "props",
+                    "type": "struct",
+                    "field_id": 4,
+                    "ordinal": 3,
+                    "children": [
+                        {"name": "v", "type": "variant", "field_id": 5, "ordinal": 0}
+                    ],
+                }
+            ]
         )
-        with pytest.raises(FlushStartupError, match="'props'"):
+        with pytest.raises(FlushStartupError, match="'props.v'"):
             flusher_factory(store=store, table=wire)
 
     async def test_missing_read_snapshot_id_refuses_at_resolve(
@@ -6044,3 +6102,438 @@ class TestFencedFlusher:
                 survivors.extend(kv.key for kv in batch)
             assert len(survivors) == 1  # the sacrificial record never landed
             await rival.shutdown()
+
+
+# =====================================================================================
+# Nested and json columns end to end
+# =====================================================================================
+
+#: A destination with every column shape the decoder fills beyond scalars:
+#: a struct (holding the partition and sort sources), a list of structs, a
+#: map and a json column.
+NESTED_COLUMNS_WIRE: list[dict[str, Any]] = [
+    {"name": "id", "type": "long", "field_id": 1, "ordinal": 0, "nullable": False},
+    {
+        "name": "properties",
+        "type": "struct",
+        "field_id": 2,
+        "ordinal": 1,
+        "children": [
+            {"name": "team_id", "type": "long", "field_id": 3, "ordinal": 0},
+            {"name": "ts", "type": "timestamp", "field_id": 4, "ordinal": 1},
+            {"name": "u", "type": "uuid", "field_id": 5, "ordinal": 2},
+            {"name": "tz", "type": "timestamptz", "field_id": 6, "ordinal": 3},
+        ],
+    },
+    {
+        "name": "items",
+        "type": "list",
+        "field_id": 7,
+        "ordinal": 2,
+        "children": [
+            {
+                "name": "element",
+                "type": "struct",
+                "field_id": 8,
+                "ordinal": 0,
+                "children": [
+                    {"name": "sku", "type": "string", "field_id": 9, "ordinal": 0},
+                    {"name": "qty", "type": "int", "field_id": 10, "ordinal": 1},
+                ],
+            }
+        ],
+    },
+    {
+        "name": "attrs",
+        "type": "map",
+        "field_id": 11,
+        "ordinal": 3,
+        "children": [
+            {
+                "name": "key",
+                "type": "string",
+                "field_id": 12,
+                "ordinal": 0,
+                "nullable": False,
+            },
+            {"name": "value", "type": "double", "field_id": 13, "ordinal": 1},
+        ],
+    },
+    {"name": "payload", "type": "json", "field_id": 14, "ordinal": 4},
+]
+#: identity(properties.team_id) — a struct-leaf partition source.
+NESTED_SPEC_WIRE: dict[str, Any] = {
+    "spec_id": 9,
+    "fields": [{"source_field_id": 3, "transform": "identity"}],
+}
+#: properties.ts asc, nulls first — a struct-leaf sort source.
+NESTED_SORT_WIRE: dict[str, Any] = {
+    "sort_id": 4,
+    "fields": [{"source_field_id": 4, "direction": "asc", "null_order": "nulls_first"}],
+}
+HOUR_US = 3_600_000_000
+
+
+def nested_payload(
+    row: int, team: int | None, ts_us: int | None, **extra: Any
+) -> bytes:
+    doc: dict[str, Any] = {
+        "id": row,
+        "properties": None
+        if team is None
+        else {
+            "team_id": team,
+            "ts": ts_us,
+            "u": "12345678-1234-5678-1234-56781234567" + str(row % 10),
+            "tz": "2027-01-15T01:00:00+01:00",
+        },
+        "items": [{"sku": f"s{row}", "qty": row}, {"sku": None}],
+        "attrs": {"a": row / 2, "b": None},
+        "payload": {"row": row, "nested": [True, None, "é"]},
+    }
+    doc.update(extra)
+    return json.dumps(doc).encode()
+
+
+@component
+class TestNestedJsonColumns:
+    async def test_nested_and_json_columns_flush_end_to_end(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        tmp_path: Any,
+    ) -> None:
+        """Rows staged under an older UNPARTITIONED spec (group ``()``)
+        fan out by the live struct-leaf source ``properties.team_id`` —
+        one file per team plus the null tuple of a row whose
+        ``properties`` is null — each sorted by the struct-leaf sort
+        source ``properties.ts``. A row whose list is not a JSON array is
+        dropped as ``uncastable_column`` and the batch lands. Every file
+        is readable at the catalog schema (field ids on every level),
+        passes ``prepared_schema_matches``, and ships leaf-only column
+        stats with nothing for a container."""
+        from millrace.stage import StagedRecord
+
+        wire = table_wire(
+            columns=NESTED_COLUMNS_WIRE, spec=NESTED_SPEC_WIRE, sort=NESTED_SORT_WIRE
+        )
+        rows = [
+            nested_payload(0, 1, JAN_US + 3 * HOUR_US),
+            nested_payload(1, 2, JAN_US + 1 * HOUR_US),
+            nested_payload(2, 1, JAN_US + 2 * HOUR_US),
+            nested_payload(3, None, None),
+            nested_payload(4, 1, JAN_US, items={"not": "a list"}),
+            nested_payload(5, 2, JAN_US, payload="scalar"),
+            nested_payload(6, 1, None),
+        ]
+        stage = await stage_factory()
+        await stage.stage_batch(
+            [
+                StagedRecord(group=(), event_ts_us=JAN_US, offset=i, payload=p)
+                for i, p in enumerate(rows)
+            ],
+            now_us=fake_clock(),
+        )
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(
+            store=store, cfg=make_config(target_output_bytes=1), table=wire
+        )
+
+        report = await flusher.flush_key(
+            stage,
+            decision((), trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+
+        assert (report.outcome, report.records, report.files, report.dropped) == (
+            "committed",
+            6,
+            3,
+            1,
+        )
+        assert flusher.stats().records_dropped == {REASON_UNCASTABLE_COLUMN: 1}
+        files = capture.payloads[0]["appends"][0]["files"]
+        by_team = {f["partition_values"][0]: f for f in files}
+        assert set(by_team) == {"1", "2", None}
+
+        info = TableInfo.from_wire(wire)
+        want_ids = {3, 4, 5, 6, 9, 10, 12, 13, 14, 1}
+        ids_by_team: dict[str | None, list[int]] = {}
+        for team, registration in by_team.items():
+            key = registration["path"].removeprefix("s3://")
+            path = tmp_path / f"{team}.parquet"
+            path.write_bytes(store.files[key])
+            with pq.ParquetFile(path) as parquet:
+                assert prepared_schema_matches(
+                    flush_mod.file_schema(parquet.schema_arrow),
+                    flush_mod._encode_schema(flush_mod.arrow_schema(info.columns)),
+                )
+                table = parquet.read()
+            props = table.column("properties").to_pylist()
+            assert {None if p is None else p["team_id"] for p in props} == {
+                None if team is None else int(team)
+            }
+            ts = [None if p is None else p["ts"] for p in props]
+            # nulls first, then nondecreasing payload time
+            present = [t for t in ts if t is not None]
+            assert ts == [None] * (len(ts) - len(present)) + sorted(present)
+            stats = registration["column_stats"]
+            ids_by_team[team] = sorted(s["field_id"] for s in stats)
+            # leaves only: no container (2, 7, 8, 11)
+            assert set(ids_by_team[team]) == want_ids
+            ids_by_team[team] = [r["id"] for r in table.to_pylist()]
+            if team == "1":
+                assert ids_by_team[team] == [6, 2, 0]  # row 4 dropped
+                first = table.to_pylist()[2]
+                assert first["items"] == [
+                    {"sku": "s0", "qty": 0},
+                    {"sku": None, "qty": None},
+                ]
+                assert first["attrs"] == [("a", 0.0), ("b", None)]
+                assert first["payload"] == '{"row":0,"nested":[true,null,"é"]}'
+                assert first["properties"]["tz"].isoformat() == (
+                    "2027-01-15T00:00:00+00:00"
+                )
+            if team == "2":
+                assert ids_by_team[team] == [5, 1]
+                assert table.column("payload").to_pylist()[0] == '"scalar"'
+            if team is None:
+                assert ids_by_team[team] == [3]
+        assert await stage.iter_key_stats() == []
+
+    async def test_a_nested_drop_logs_the_dotted_path_never_the_value(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A value refused deep inside a container is dropped with its
+        dotted catalog path in the drop log line (the operator's only view
+        of it); the refused payload value never reaches the log."""
+        from millrace.stage import StagedRecord
+
+        wire = table_wire(columns=NESTED_COLUMNS_WIRE, spec=NESTED_SPEC_WIRE)
+        bad = nested_payload(1, 1, JAN_US, attrs={"a": "secret-value-xyz"})
+        stage = await stage_factory()
+        await stage.stage_batch(
+            [
+                StagedRecord(
+                    group=(),
+                    event_ts_us=JAN_US,
+                    offset=0,
+                    payload=nested_payload(0, 1, JAN_US),
+                ),
+                StagedRecord(group=(), event_ts_us=JAN_US, offset=1, payload=bad),
+            ],
+            now_us=fake_clock(),
+        )
+        script_options(httpx_mock)
+        CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, table=wire)
+        with caplog.at_level(logging.WARNING):
+            report = await flusher.flush_key(
+                stage,
+                decision((), trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+            )
+        assert (report.outcome, report.records, report.dropped) == ("committed", 1, 1)
+        (line,) = [
+            r.getMessage() for r in caplog.records if "flush dropped" in r.getMessage()
+        ]
+        assert "reason=uncastable_column" in line
+        assert "first_path=attrs.value (offset 1)" in line
+        assert not [r for r in caplog.records if "secret-value-xyz" in r.getMessage()]
+
+    async def test_a_nested_partition_source_keyed_by_the_consumer_flushes_one_file(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """The steady state: the consumer keyed each row by
+        ``properties.team_id``; one group flushes as exactly one file
+        under that tuple."""
+        from millrace.consumer import classify_message
+        from millrace.grouping import GroupKeyer
+        from millrace.stage import StagedRecord
+
+        wire = table_wire(
+            columns=NESTED_COLUMNS_WIRE, spec=NESTED_SPEC_WIRE, sort=NESTED_SORT_WIRE
+        )
+        keyer = GroupKeyer(TableInfo.from_wire(wire))
+        records = []
+        for offset, (team, ts) in enumerate(
+            [(1, JAN_US + HOUR_US), (2, JAN_US), (1, JAN_US)]
+        ):
+            record = classify_message(
+                keyer,
+                offset=offset,
+                value=nested_payload(offset, team, ts),
+                timestamp=(1, JAN_US // 1000),
+            )
+            assert isinstance(record, StagedRecord)
+            records.append(record)
+        assert [r.group for r in records] == [("1",), ("2",), ("1",)]
+        stage = await stage_factory()
+        await stage.stage_batch(records, now_us=fake_clock())
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(store=store, table=wire)
+
+        report = await flusher.flush_key(
+            stage,
+            decision(("1",), trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+
+        assert (report.outcome, report.records, report.files) == ("committed", 2, 1)
+        (registration,) = capture.payloads[0]["appends"][0]["files"]
+        assert registration["partition_values"] == ["1"]
+        table = parquet_rows(store, registration["path"])
+        assert table.column("id").to_pylist() == [2, 0]  # sorted by properties.ts
+
+    async def test_a_temporal_struct_leaf_source_takes_the_junk_window(
+        self,
+        httpx_mock: Any,
+        stage_factory: Any,
+        fake_clock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+        sleeper: Sleeper,
+    ) -> None:
+        """``month(properties.ts)``: the junk event_time window reads the
+        struct leaf by path — a far-future ts is clamped (policy clamp)
+        inside the decoded struct, the staged payload untouched."""
+        from millrace.stage import StagedRecord
+
+        spec = {
+            "spec_id": 9,
+            "fields": [{"source_field_id": 4, "transform": "month"}],
+        }
+        wire = table_wire(columns=NESTED_COLUMNS_WIRE, spec=spec)
+        far = JAN_US + 400 * 86_400_000_000
+        payload = nested_payload(0, 1, far)
+        stage = await stage_factory()
+        await stage.stage_batch(
+            [StagedRecord(group=(), event_ts_us=JAN_US, offset=0, payload=payload)],
+            now_us=fake_clock(),
+        )
+        script_options(httpx_mock)
+        capture = CommitCapture(httpx_mock, [commit_ok(50)])
+        flusher = flusher_factory(
+            store=store,
+            cfg=make_config(event_time_policy=EventTimePolicy.CLAMP),
+            table=wire,
+        )
+        report = await flusher.flush_key(
+            stage,
+            decision((), trigger="size", staged_bytes=100, first_staged_ts=JAN_US),
+        )
+        assert (report.outcome, report.records) == ("committed", 1)
+        (registration,) = capture.payloads[0]["appends"][0]["files"]
+        table = parquet_rows(store, registration["path"])
+        clamped = ts_micros(table.column("properties").to_pylist()[0]["ts"])
+        assert clamped == fake_clock() + make_config().event_time_max_future_s * (
+            1_000_000
+        )
+        assert registration["partition_values"] == [month_wire(clamped)]
+
+
+@component
+class TestNestedSourceStartupRefusals:
+    @pytest.mark.parametrize(
+        ("spec", "sort", "match"),
+        [
+            # a partition source under a list
+            (
+                {
+                    "spec_id": 5,
+                    "fields": [{"source_field_id": 9, "transform": "identity"}],
+                },
+                None,
+                "'items.element.sku' sits under 'items'",
+            ),
+            # a map value
+            (
+                {
+                    "spec_id": 5,
+                    "fields": [{"source_field_id": 13, "transform": "identity"}],
+                },
+                None,
+                "sits under 'attrs'",
+            ),
+            # a json partition source
+            (
+                {
+                    "spec_id": 5,
+                    "fields": [{"source_field_id": 14, "transform": "identity"}],
+                },
+                None,
+                "'payload' is a 'json' column",
+            ),
+            # a container partition source
+            (
+                {
+                    "spec_id": 5,
+                    "fields": [{"source_field_id": 2, "transform": "identity"}],
+                },
+                None,
+                "'properties' is a 'struct' column",
+            ),
+            # a json sort source
+            (
+                None,
+                {
+                    "sort_id": 1,
+                    "fields": [
+                        {
+                            "source_field_id": 14,
+                            "direction": "asc",
+                            "null_order": "nulls_first",
+                        }
+                    ],
+                },
+                "'payload' is a 'json' column",
+            ),
+            # a sort source under a list
+            (
+                None,
+                {
+                    "sort_id": 1,
+                    "fields": [
+                        {
+                            "source_field_id": 10,
+                            "direction": "asc",
+                            "null_order": "nulls_first",
+                        }
+                    ],
+                },
+                "'items.element.qty' sits under 'items'",
+            ),
+        ],
+    )
+    async def test_an_unreadable_source_refuses_at_resolve(
+        self,
+        spec: dict[str, Any] | None,
+        sort: dict[str, Any] | None,
+        match: str,
+        httpx_mock: Any,
+        flusher_factory: Any,
+        store: FakeObjectStore,
+    ) -> None:
+        wire = table_wire(
+            columns=NESTED_COLUMNS_WIRE,
+            spec=spec if spec is not None else NESTED_SPEC_WIRE,
+            sort=sort,
+        )
+        with pytest.raises(FlushStartupError, match=match):
+            flusher_factory(store=store, table=wire)

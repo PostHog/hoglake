@@ -54,7 +54,7 @@ born correct; it does not repeat millpond's blind-append shape):
   may have registered. The cost: a crash between upload and persist
   leaves objects nothing names or counts. The payload is assembled here
   over pyhoglake's primitives
-  (:func:`pyhoglake.types.columns_to_arrow_schema`,
+  (:func:`pyhoglake.types.column_to_arrow_field`,
   :func:`pyhoglake.parquet_schema.prepared_schema_matches`,
   :func:`pyhoglake.stats.extract_column_stats`,
   :mod:`pyhoglake.transforms`, :mod:`pyhoglake.upload`) instead of via
@@ -228,12 +228,17 @@ isolation's taxonomy, so unhandled it would wedge the whole window.
 Supported column types
 are the scalars (boolean, the int widths, float/double, string,
 binary-as-base64, uuid, decimal, date, time, and the timestamp family
-from epoch ints in the column's own unit or strict ISO-8601 strings);
-``json``/nested/``variant`` columns are a STARTUP refusal naming the
-column, not a runtime surprise. Should a value still defeat the batch
-build (encoder drift), the build isolates the guilty record and drops
-it (``uncastable_column``) — one malformed record never loses the
-batch.
+from epoch ints in the column's own unit or strict ISO-8601 strings),
+``json`` (any JSON value, stored as its canonical text), ``struct``/
+``list``/``map`` at any depth up to pyhoglake's nesting cap (a JSON
+object, array, and object respectively, each child coerced by its own
+catalog type; :mod:`millrace.coerce` has the exact rules). A column the
+decoder cannot fill (a ``variant`` — pyarrow cannot write the native
+Parquet VARIANT annotation hoglake requires — or a malformed container)
+is a STARTUP refusal naming the column, not a runtime surprise. Should
+a value still defeat the batch build (encoder drift), the build
+isolates the guilty record and drops it (``uncastable_column``) — one
+malformed record never loses the batch.
 
 Sync/async discipline: pyhoglake is synchronous, so every client call
 (table reads, uploads, commits, receipt lookups) runs on the flusher's
@@ -282,6 +287,7 @@ from pyhoglake import (
     ReadSnapshotExpiredError,
     Table,
     TableInfo,
+    UnsupportedTypeError,
     ValidationError,
 )
 from pyhoglake.models import PartitionSpec
@@ -292,7 +298,7 @@ from pyhoglake.transforms import (
     transform_strings,
     transform_value,
 )
-from pyhoglake.types import columns_to_arrow_schema
+from pyhoglake.types import column_to_arrow_field
 from pyhoglake.upload import (
     Upload,
     perform_upload,
@@ -314,7 +320,7 @@ from .coerce import (
     load_json_object,
 )
 from .config import Config, EventTimePolicy
-from .grouping import field_names
+from .grouping import column_chains, field_names
 from .keyspace import FlushedKey, OffsetRange, PreparedRequest
 from .planner import (
     DEFAULT_COMPRESSION_RATIO,
@@ -596,6 +602,10 @@ class JsonObjectDecoder:
         self._columns = tuple(columns)
         self._plans = tuple((c, coercer_for(c)) for c in self._columns)
         self._names = frozenset(c.name for c in self._columns)
+        # The Arrow schema is built once here too, so a column the batch
+        # build could not describe (a malformed container) is a startup
+        # refusal like any other.
+        arrow_schema(self._columns)
 
     @property
     def columns(self) -> tuple[Column, ...]:
@@ -612,10 +622,18 @@ class JsonObjectDecoder:
                         f"column {column.name!r} is not nullable and the "
                         "payload has no usable value",
                         reason=REASON_UNCASTABLE_COLUMN,
+                        path=column.name,
                     )
                 values[column.name] = None
-            else:
+                continue
+            try:
                 values[column.name] = coerce(raw)
+            except DecodeError as e:
+                # A nested failure already names its child's path; a
+                # top-level scalar's is the column itself.
+                if e.path is None:
+                    e.path = column.name
+                raise
         dropped = tuple(sorted(k for k in doc if k not in self._names))
         return DecodedRecord(values=values, dropped_keys=dropped)
 
@@ -658,60 +676,183 @@ def _micros_to_value(col_type: str, micros: int) -> Any:
     return micros // TIMESTAMP_UNITS[col_type]
 
 
-def _temporal_sources(info: TableInfo) -> tuple[tuple[Any, Column], ...]:
-    """The live spec's temporal partition sources as (field, column)
-    pairs — the columns the junk event_time policy checks. Startup
-    validation has already refused nested or unknown sources."""
+def _temporal_sources(info: TableInfo) -> tuple[tuple[Any, tuple[str, ...], str], ...]:
+    """The live spec's temporal partition sources as ``(field, path,
+    column type)`` — the decoded values the junk event_time policy
+    checks, by path (a struct leaf such as ``properties.ts`` included).
+    Startup validation refuses sources under a list or a map and unknown
+    sources; one that appears under a warm shape cache is skipped here
+    and refused by :func:`_partition_groups`."""
     spec = info.partition_spec
     if spec is None or not spec.fields:
         return ()
-    columns = {c.field_id: c for c in info.columns}
+    chains = column_chains(info.columns)
     return tuple(
-        (field, columns[field.source_field_id])
+        (
+            field,
+            tuple(c.name for c in chains[field.source_field_id]),
+            chains[field.source_field_id][-1].type,
+        )
         for field in spec.fields
-        if field.transform in _TEMPORAL_TRANSFORMS and field.source_field_id in columns
+        if field.transform in _TEMPORAL_TRANSFORMS
+        and field.source_field_id in chains
+        # A shape that changed under a warm cache to a source this writer
+        # cannot read is refused loudly by the fanout, not crashed on here.
+        and _source_fault(chains[field.source_field_id]) is None
     )
+
+
+def _leaf_value(values: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    """A decoded record's value at a struct path (None when any struct on
+    the path is null)."""
+    value: Any = values
+    for step in path:
+        if value is None:
+            return None
+        value = value[step]
+    return value
+
+
+def _set_leaf(values: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    """Rewrite a decoded value at a struct path (the clamp policy). The
+    decoded dicts are this record's own, built by the coercers; the
+    staged payload is never touched."""
+    parent: Any = values
+    for step in path[:-1]:
+        parent = parent[step]
+    parent[path[-1]] = value
 
 
 # -- Arrow building -------------------------------------------------------------
 
 
+def arrow_schema(columns: Sequence[Column]) -> pa.Schema:
+    """The batch's Arrow schema: pyhoglake's
+    (:func:`~pyhoglake.types.column_to_arrow_field` — field ids on every
+    level). Raises :class:`UnsupportedColumnError` naming a column it
+    cannot describe."""
+    fields = []
+    for column in sorted(columns, key=lambda c: c.ordinal):
+        try:
+            fields.append(column_to_arrow_field(column))
+        except (UnsupportedTypeError, ValidationError) as e:
+            raise UnsupportedColumnError(
+                f"column {column.name!r} has no Arrow form this writer can build: {e}"
+            ) from e
+    return pa.schema(fields)
+
+
+def _build_type(t: pa.DataType) -> pa.DataType:
+    """The type ``pa.array`` builds a column's coerced Python values at,
+    before ONE cast to the catalog type — the single place the leaf
+    conversions live, at any depth: ``uuid`` is built as its 16-byte
+    storage (pyarrow cannot build an extension value from Python inside
+    a container), ``json`` as its string storage, ``timestamptz`` as the
+    naive micros it is coerced to (no int → tz kernel). Field names,
+    nullability and field-id metadata are kept, so the cast lands on the
+    catalog type exactly. A type that needs none of this is returned as
+    is (equal, and the cast is then skipped)."""
+    if isinstance(t, pa.BaseExtensionType):
+        return t.storage_type
+    if pa.types.is_timestamp(t) and t.tz is not None:
+        return pa.timestamp(t.unit)
+    if pa.types.is_struct(t):
+        fields = [_build_field(t.field(i)) for i in range(t.num_fields)]
+        if all(f.type == t.field(i).type for i, f in enumerate(fields)):
+            return t
+        return pa.struct(fields)
+    if pa.types.is_map(t):
+        key, item = _build_field(t.key_field), _build_field(t.item_field)
+        if key.type == t.key_type and item.type == t.item_type:
+            return t
+        return pa.map_(key, item, keys_sorted=t.keys_sorted)
+    if pa.types.is_list(t):
+        value = _build_field(t.value_field)
+        if value.type == t.value_type:
+            return t
+        return pa.list_(value)
+    return t
+
+
+def _build_field(f: pa.Field) -> pa.Field:
+    built = _build_type(f.type)
+    return f if built == f.type else f.with_type(built)
+
+
 def _array_for(column: Column, arrow_type: pa.DataType, values: list[Any]) -> pa.Array:
     """One column's Arrow array from coerced values, at exactly the type
-    ``columns_to_arrow_schema`` gives the column (so ``Table.from_arrays``
-    against that schema needs no cast)."""
-    if column.type == "uuid":
-        # pa.uuid() is an extension over fixed_size_binary(16); build the
-        # storage and wrap it (pyarrow >= 21 stamps the parquet UUID
-        # annotation hoglake's wire form requires).
-        storage = pa.array(values, type=pa.binary(16))
-        if isinstance(arrow_type, pa.BaseExtensionType):
-            return pa.ExtensionArray.from_storage(arrow_type, storage)
-        return storage
-    if column.type == "timestamptz":
-        # int64 micros → naive micros → tz-aware (a direct int → tz cast
-        # is not a kernel pyarrow offers).
-        return (
-            pa.array(values, type=pa.int64()).cast(pa.timestamp("us")).cast(arrow_type)
+    :func:`arrow_schema` gives the column (so ``Table.from_arrays``
+    against that schema needs no cast): built at :func:`_build_type` and
+    cast once."""
+    build = _build_type(arrow_type)
+    if build == arrow_type:
+        return pa.array(values, type=arrow_type)
+    return pa.array(values, type=build).cast(arrow_type)
+
+
+def _encode_type(t: pa.DataType) -> pa.DataType:
+    """``t`` with every ``timestamp[s]`` — at any depth — stored as
+    milliseconds (Parquet has no seconds unit)."""
+    if t == pa.timestamp("s"):
+        return pa.timestamp("ms")
+    if pa.types.is_struct(t):
+        return pa.struct([_encode_field(t.field(i)) for i in range(t.num_fields)])
+    if pa.types.is_map(t):
+        return pa.map_(
+            _encode_field(t.key_field),
+            _encode_field(t.item_field),
+            keys_sorted=t.keys_sorted,
         )
-    if column.type == "time":
-        return pa.array(values, type=pa.int64()).cast(arrow_type)
-    return pa.array(values, type=arrow_type)
+    if pa.types.is_list(t):
+        return pa.list_(_encode_field(t.value_field))
+    return t
+
+
+def _encode_field(f: pa.Field) -> pa.Field:
+    return f.with_type(_encode_type(f.type))
+
+
+def _map_entries_type(t: pa.DataType) -> pa.DataType:
+    """``t`` with every map's entries struct under Arrow's default name.
+    A parquet round trip names a map's entries after the COLUMN (pyarrow
+    reads ``map<k, v ('m')>`` back for a column ``m`` it wrote as
+    ``entries``), and Arrow type equality compares that name; nothing
+    else about the type, field ids included, is touched."""
+    if pa.types.is_map(t):
+        return pa.map_(
+            t.key_field.with_type(_map_entries_type(t.key_type)),
+            t.item_field.with_type(_map_entries_type(t.item_type)),
+            keys_sorted=t.keys_sorted,
+        )
+    if pa.types.is_struct(t):
+        return pa.struct(
+            [
+                t.field(i).with_type(_map_entries_type(t.field(i).type))
+                for i in range(t.num_fields)
+            ]
+        )
+    if pa.types.is_list(t):
+        return pa.list_(t.value_field.with_type(_map_entries_type(t.value_type)))
+    return t
+
+
+def file_schema(schema: pa.Schema) -> pa.Schema:
+    """A written file's Arrow schema, comparable with the encoding schema
+    (:func:`_map_entries_type`)."""
+    return pa.schema(
+        [f.with_type(_map_entries_type(f.type)) for f in schema],
+        metadata=schema.metadata,
+    )
 
 
 def _encode_schema(schema: pa.Schema) -> pa.Schema:
     """The parquet-encoding schema: the catalog schema with field ids,
     plus the one storage conversion pyhoglake's writer path makes —
     Parquet has no seconds timestamp unit, so ``timestamp_s`` is stored
-    as milliseconds (mirrors ``Table._prepare_append``)."""
+    as milliseconds (mirrors ``Table._prepare_append``, which does it for
+    top-level columns; this does it at every depth)."""
     return pa.schema(
-        [
-            field.with_type(pa.timestamp("ms"))
-            if field.type == pa.timestamp("s")
-            else field
-            for field in schema
-        ],
-        metadata=schema.metadata,
+        [_encode_field(field) for field in schema], metadata=schema.metadata
     )
 
 
@@ -725,7 +866,7 @@ def _build_arrow(
     before the partition fanout — the sort, not the scan order, is what
     the ingest-sort / catalog-sort-spec convergence rests on
     (docs/kafka-ingestion.md §What the server owns)."""
-    schema = columns_to_arrow_schema(list(columns))
+    schema = arrow_schema(columns)
     arrays = [
         _array_for(
             column,
@@ -745,35 +886,65 @@ _SORT_DIRECTIONS: Final = {"asc": "ascending", "desc": "descending"}
 _SORT_NULL_ORDERS: Final = {"nulls_first": "at_start", "nulls_last": "at_end"}
 
 
-def _spec_sort_keys(info: TableInfo) -> list[tuple[str, str, str]]:
-    """The table's LIVE sort spec as Arrow sort keys — ``(column name,
-    direction, null placement)`` per field, in spec order; ``[]`` for an
-    unsorted table.
+#: Column types that are no partition or sort source: containers have no
+#: single value per row, and a json value has no order or transform this
+#: writer (or the server) defines.
+_UNORDERED_TYPES: Final = frozenset({"struct", "list", "map", "json"})
+_REPEATED_TYPES: Final = frozenset({"list", "map"})
 
-    A field that does not resolve to a live top-level column, or carries
-    a direction/null_order outside the wire vocabulary, is a shape this
-    writer cannot honor — refused LOUDLY (the same posture as the
-    partition-spec guard below), never silently unsorted: an unsorted
-    file under a sorted spec is exactly what compaction's sortedness
-    check demotes, so "looked odd, skipped it" would tax every file
-    forever. Startup validation (:meth:`HoglakeFlusher.resolve`) refuses
-    the same shapes fail-fast; this guard covers a spec that changed
-    under a warm shape cache.
+
+def _source_fault(chain: tuple[Column, ...]) -> str | None:
+    """Why a partition/sort source chain cannot be read as one scalar per
+    row, or None: a container or json leaf, or a leaf under a
+    list or a map (many values per row). A struct leaf is fine — it is
+    read by path."""
+    leaf = chain[-1]
+    path = ".".join(c.name for c in chain)
+    if leaf.type in _UNORDERED_TYPES:
+        return f"{path!r} is a {leaf.type!r} column"
+    repeated = next((c for c in chain[:-1] if c.type in _REPEATED_TYPES), None)
+    if repeated is not None:
+        return (
+            f"{path!r} sits under {repeated.name!r}, a {repeated.type!r}: a row "
+            "has many such values"
+        )
+    return None
+
+
+def _spec_sort_keys(info: TableInfo) -> list[tuple[tuple[str, ...], str, str]]:
+    """The table's LIVE sort spec as Arrow sort keys — ``(column path,
+    direction, null placement)`` per field, in spec order (a struct leaf
+    is its root-to-leaf name path); ``[]`` for an unsorted table.
+
+    A field that does not resolve to a live column, resolves to one that
+    is not one scalar per row (a container, json, or a leaf
+    under a list or a map), or carries a direction/null_order outside the
+    wire vocabulary, is a shape this writer cannot honor — refused
+    LOUDLY (the same posture as the partition-spec guard below), never
+    silently unsorted: an unsorted file under a sorted spec is exactly
+    what compaction's sortedness check demotes, so "looked odd, skipped
+    it" would tax every file forever. Startup validation
+    (:meth:`HoglakeFlusher.resolve`) refuses the same shapes fail-fast;
+    this guard covers a spec that changed under a warm shape cache.
     """
     spec = info.sort_spec
     if spec is None or not spec.fields:
         return []
-    columns = {c.field_id: c for c in info.columns}
-    keys: list[tuple[str, str, str]] = []
+    chains = column_chains(info.columns)
+    keys: list[tuple[tuple[str, ...], str, str]] = []
     for field in spec.fields:
-        column = columns.get(field.source_field_id)
-        if column is None:
+        chain = chains.get(field.source_field_id)
+        if chain is None:
             raise FlushError(
                 f"sort spec (sort_id={spec.sort_id}) references field_id "
-                f"{field.source_field_id}, which is not a live top-level "
-                f"column of {info.namespace}.{info.name} (a struct leaf is "
-                "legal on the wire but this writer has no nested columns — "
-                "startup refuses those)"
+                f"{field.source_field_id}, which is not a live column of "
+                f"{info.namespace}.{info.name}"
+            )
+        fault = _source_fault(chain)
+        if fault is not None:
+            raise FlushError(
+                f"sort spec (sort_id={spec.sort_id}) field "
+                f"{field.source_field_id} cannot be a sort source: {fault}"
             )
         direction = _SORT_DIRECTIONS.get(field.direction)
         null_order = _SORT_NULL_ORDERS.get(field.null_order)
@@ -784,37 +955,47 @@ def _spec_sort_keys(info: TableInfo) -> list[tuple[str, str, str]]:
                 f"{field.direction!r} null_order={field.null_order!r}, "
                 "outside the asc/desc × nulls_first/nulls_last vocabulary"
             )
-        keys.append((column.name, direction, null_order))
+        keys.append((tuple(c.name for c in chain), direction, null_order))
     return keys
 
 
-def _sort_batch_by_spec(data: pa.Table, keys: list[tuple[str, str, str]]) -> pa.Table:
+def _sort_batch_by_spec(
+    data: pa.Table, keys: list[tuple[tuple[str, ...], str, str]]
+) -> pa.Table:
     """Sort the encoded batch by the catalog's sort keys — native Arrow
     compute (``pc.sort_indices`` + ``take``; ``take`` preserves the
     schema's field-id metadata).
 
-    Extension-typed columns (``uuid``) have no Arrow sort kernel, so they
-    sort on their STORAGE via a shadow table — fixed-size binary compares
-    unsigned-lexicographic in Arrow exactly as the server comparator reads
-    the same physical bytes (ParquetRewriter's BINARY/FIXED_LEN_BYTE_ARRAY
-    arm), so the orders agree. NaN cannot appear (the decoder refuses
-    non-finite floats), so Arrow's NaN placement never diverges from the
-    server's NaN-greatest rule here.
+    The keys are computed into a SHADOW table, one temporary column per
+    key, and only the permutation is applied to ``data`` (so nothing is
+    added to or dropped from the batch). A struct-leaf key is the leaf
+    read by path (``pc.struct_field``; a null struct on the path is a
+    null key). Extension-typed keys (``uuid``) have no Arrow sort
+    kernel, so they sort on their STORAGE — fixed-size binary compares
+    unsigned-lexicographic in Arrow exactly as the server comparator
+    reads the same physical bytes (ParquetRewriter's
+    BINARY/FIXED_LEN_BYTE_ARRAY arm), so the orders agree. NaN cannot
+    appear (the decoder refuses non-finite floats), so Arrow's NaN
+    placement never diverges from the server's NaN-greatest rule here.
     """
-    shadow = data
-    for name, _, _ in keys:
-        index = shadow.schema.get_field_index(name)
-        field = shadow.schema.field(index)
-        if isinstance(field.type, pa.BaseExtensionType):
-            chunked: pa.ChunkedArray = shadow.column(index)
-            storage = pa.chunked_array(
-                [chunk.storage for chunk in chunked.chunks],
-                type=field.type.storage_type,
+    names: list[str] = []
+    arrays: list[pa.ChunkedArray] = []
+    sort_keys: list[tuple[str, str, str]] = []
+    for i, (path, direction, null_order) in enumerate(keys):
+        column: pa.ChunkedArray = data.column(path[0])
+        for step in path[1:]:
+            column = pc.struct_field(column, step)
+        if isinstance(column.type, pa.BaseExtensionType):
+            column = pa.chunked_array(
+                [chunk.storage for chunk in column.chunks],
+                type=column.type.storage_type,
             )
-            shadow = shadow.set_column(
-                index, field.with_type(field.type.storage_type), storage
-            )
-    return data.take(pc.sort_indices(shadow, sort_keys=keys))
+        name = f"__millrace_sort_{i}"
+        names.append(name)
+        arrays.append(column)
+        sort_keys.append((name, direction, null_order))
+    shadow = pa.table(dict(zip(names, arrays, strict=True)))
+    return data.take(pc.sort_indices(shadow, sort_keys=sort_keys))
 
 
 #: What the Arrow batch build (array construction plus the parquet-encoding
@@ -890,26 +1071,31 @@ def _partition_groups(
     implementation); the grouping is millrace's — pyhoglake's own
     ``_partition_groups`` and millpond's are the same shape, kept local
     because the prepared path puts row-to-partition correctness on the
-    caller. A null source value forms its own group, per Iceberg.
+    caller. A null source value forms its own group, per Iceberg; a
+    struct-leaf source under a null struct is a null source value.
     """
-    columns = {c.field_id: c for c in info.columns}
+    chains = column_chains(info.columns)
     key_names = [f"__millrace_pk_{i}" for i in range(len(spec.fields))]
     key_arrays: list[pa.Array] = []
     for field in spec.fields:
-        column = columns.get(field.source_field_id)
-        if column is None:  # startup validation refuses this; re-refuse loudly
+        chain = chains.get(field.source_field_id)
+        if chain is None:  # startup validation refuses this; re-refuse loudly
             raise FlushError(
                 f"partition spec (spec_id={spec.spec_id}) references field_id "
                 f"{field.source_field_id}, which is not a live column of "
                 f"{info.namespace}.{info.name}"
             )
+        leaf = chain[-1]
+        # A struct leaf is read by path (pyhoglake's partition_source_array
+        # walks it with struct_field and refuses a container or a source
+        # under a list/map itself).
         key_arrays.append(
             transform_strings(
                 field.transform,
                 field.transform_param,
-                partition_source_array(data, [column]),
-                column.type,
-                column.type_params,
+                partition_source_array(data, list(chain)),
+                leaf.type,
+                leaf.type_params,
             )
         )
     keyed = pa.table(
@@ -1256,22 +1442,22 @@ def build_prepared_plan(
     dropped_records: list[DroppedRecord] = []
     dropped_keys: set[str] = set()
 
-    def drop(row_key: keyspace.RowKey, reason: str) -> None:
-        dropped_records.append(DroppedRecord(row_key.offset, reason))
+    def drop(row_key: keyspace.RowKey, reason: str, path: str | None = None) -> None:
+        dropped_records.append(DroppedRecord(row_key.offset, reason, path))
 
     for row_key, payload_bytes in records:
         try:
             record = decoder.decode_record(payload_bytes)
         except DecodeError as e:
-            drop(row_key, e.reason)
+            drop(row_key, e.reason, e.path)
             continue
         dropped_keys.update(record.dropped_keys)
         junked = False
-        for _field, column in temporal:
-            value = record.values[column.name]
+        for _field, path, col_type in temporal:
+            value = _leaf_value(record.values, path)
             if value is None:
                 continue
-            value_us = _value_to_micros(column.type, value)
+            value_us = _value_to_micros(col_type, value)
             if window.contains(value_us):
                 continue
             if event_time_policy is EventTimePolicy.DROP:
@@ -1281,7 +1467,7 @@ def build_prepared_plan(
             # clamp mode: rewrite the DECODED value to the window edge —
             # the staged row is never mutated.
             clamped = min(max(value_us, window.min_us), window.max_us)
-            record.values[column.name] = _micros_to_value(column.type, clamped)
+            _set_leaf(record.values, path, _micros_to_value(col_type, clamped))
         if junked:
             continue
         good.append((row_key, payload_bytes, record))
@@ -1373,7 +1559,9 @@ def build_prepared_plan(
         pq.write_table(part, sink)
         raw = sink.getvalue()
         with pq.ParquetFile(pa.BufferReader(raw)) as parquet:
-            if not prepared_schema_matches(parquet.schema_arrow, encode_schema):
+            if not prepared_schema_matches(
+                file_schema(parquet.schema_arrow), encode_schema
+            ):
                 # Unreachable while the decoder and the schema builder
                 # agree; a failure here is a bug in THIS process, so the
                 # decision raises (contained, loud) rather than drops.
@@ -1696,34 +1884,43 @@ class HoglakeFlusher:
         flusher._shape_fingerprint = _shape_fingerprint(info)
         flusher._resolved_info = info
         # Startup validation: the decoder supports every column, and the
-        # live partition spec is one this writer can honor — top-level
-        # sources (v1) with transforms pyhoglake accepts for the source
-        # type. `transform_value(..., None)` is the validity dry-run: it
-        # checks the vocabulary, the param and the temporal-type gate
-        # without fabricating data.
+        # live partition spec is one this writer can honor — each source
+        # one scalar per row (a top-level column or a struct leaf; never a
+        # container, a json column, or a leaf under a list or a
+        # map) with a transform pyhoglake accepts for the source type.
+        # `transform_value(..., None)` is the validity dry-run: it checks
+        # the vocabulary, the param and the temporal-type gate without
+        # fabricating data.
         try:
             JsonObjectDecoder(info.columns)
         except UnsupportedColumnError as e:
             raise FlushStartupError(str(e)) from e
         spec = info.partition_spec
         if spec is not None:
-            flat = {c.field_id: c for c in info.columns}
+            chains = column_chains(info.columns)
             for field in spec.fields:
-                column = flat.get(field.source_field_id)
-                if column is None:
+                chain = chains.get(field.source_field_id)
+                if chain is None:
                     raise FlushStartupError(
                         f"partition spec (spec_id={spec.spec_id}) references "
                         f"field_id {field.source_field_id}, which is not a "
-                        f"TOP-LEVEL column of {info.namespace}.{info.name}: "
-                        "v1 supports top-level partition sources only"
+                        f"live column of {info.namespace}.{info.name}"
                     )
+                fault = _source_fault(chain)
+                if fault is not None:
+                    raise FlushStartupError(
+                        f"partition spec (spec_id={spec.spec_id}) field "
+                        f"{field.source_field_id} cannot be a partition "
+                        f"source: {fault}"
+                    )
+                leaf = chain[-1]
                 try:
                     transform_value(
                         field.transform,
                         field.transform_param,
-                        column.type,
+                        leaf.type,
                         None,
-                        column.type_params,
+                        leaf.type_params,
                     )
                 except ValidationError as e:
                     raise FlushStartupError(
@@ -2498,22 +2695,32 @@ class HoglakeFlusher:
     ) -> None:
         """Count flush-time drops per reason
         (``millrace_records_dropped_total{reason}``) and log them: one
-        WARNING per reason per decision, naming the group and the
-        offsets (the first :data:`_DROPPED_OFFSETS_LOGGED` of them).
+        WARNING per reason per decision, naming the group, the offsets
+        (the first :data:`_DROPPED_OFFSETS_LOGGED` of them) and the first
+        refusing column's dotted path when the decoder knew it
+        (``first_path=properties.inner.id``; never a payload value).
         Counted per build, so at-least-once: a decision rebuilt after an
         upload or persist failure, or re-prepared after
         ``ddl_since_read_snapshot``, counts and logs the same drops again
         (the consumer's tally has the same property)."""
         by_reason: dict[str, list[int]] = {}
+        first_path: dict[str, str] = {}
         for entry in dropped:
             by_reason.setdefault(entry.reason, []).append(entry.offset)
+            if entry.path is not None:
+                # The first refusing column path per reason — catalog
+                # names only, never the payload value (the consumer's
+                # malformed_partition_source:<path> line, flush side).
+                first_path.setdefault(
+                    entry.reason, f" first_path={entry.path} (offset {entry.offset})"
+                )
         for reason, offsets in sorted(by_reason.items()):
             self._records_dropped[reason] = self._records_dropped.get(reason, 0) + len(
                 offsets
             )
             shown = offsets[:_DROPPED_OFFSETS_LOGGED]
             log.warning(
-                "flush dropped %d records: %s[%d] group %s reason=%s offsets=%s%s",
+                "flush dropped %d records: %s[%d] group %s reason=%s offsets=%s%s%s",
                 len(offsets),
                 stage.topic,
                 stage.partition,
@@ -2521,6 +2728,7 @@ class HoglakeFlusher:
                 reason,
                 ",".join(str(o) for o in shown),
                 "" if len(offsets) == len(shown) else ",…",
+                first_path.get(reason, ""),
             )
 
     def _guard_settlement(self, window: FlushedKey, scanned: int, deleted: int) -> None:

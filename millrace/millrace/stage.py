@@ -191,10 +191,16 @@ class DroppedRecord:
     usable timestamp, a tombstone. Nothing is written for it: the
     consumer logs and counts the drop, and the offset commit that follows
     covers it trivially. ``reason`` is the consumer's bounded rejection
-    vocabulary (``malformed_partition_source:<path>`` names the field)."""
+    vocabulary (``malformed_partition_source:<path>`` names the field).
+    The flush drops records with the same shape; ``path`` is the dotted
+    catalog path of the column that refused the value (a nested child's
+    included, e.g. ``properties.inner.id``) when the decoder knows it —
+    catalog names only, never a payload value — and the flush's drop log
+    names it."""
 
     offset: int
     reason: str
+    path: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
